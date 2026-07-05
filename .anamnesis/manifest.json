@@ -1,0 +1,271 @@
+{
+  "version": 1,
+  "regions": [
+    {
+      "file": "AGENTS.md",
+      "region_id": "anamnesis-base",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "template_version": 17,
+      "base_rendered_hash": "sha256:0b7c1ab84216615136e409f788e97ff9d660604522cf5a4ea6396337596d5920",
+      "last_applied_hash": "sha256:ea33be2ddef6a30aaf89c8e6a10b4e7496f62fbe3416d339b8654f35b771da2d",
+      "current_user_hash": "sha256:ea33be2ddef6a30aaf89c8e6a10b4e7496f62fbe3416d339b8654f35b771da2d"
+    },
+    {
+      "file": "AGENTS.md",
+      "region_id": "codex-hook-inject-ontology",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "template_version": 17,
+      "base_rendered_hash": "sha256:11566d70f8ea7e4a1779340d0b31982cd10412d84e7ce83be8d0ede7f7ba05a7",
+      "last_applied_hash": "sha256:11566d70f8ea7e4a1779340d0b31982cd10412d84e7ce83be8d0ede7f7ba05a7",
+      "current_user_hash": "sha256:11566d70f8ea7e4a1779340d0b31982cd10412d84e7ce83be8d0ede7f7ba05a7"
+    },
+    {
+      "file": "AGENTS.md",
+      "region_id": "codex-hook-remind-uncommitted",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "template_version": 17,
+      "base_rendered_hash": "sha256:054341d449ddcaba8967bd36dcadab1621c1ca85b4636f9b650992f1c18fa234",
+      "last_applied_hash": "sha256:054341d449ddcaba8967bd36dcadab1621c1ca85b4636f9b650992f1c18fa234",
+      "current_user_hash": "sha256:054341d449ddcaba8967bd36dcadab1621c1ca85b4636f9b650992f1c18fa234"
+    },
+    {
+      "file": "AGENTS.md",
+      "region_id": "codex-hook-inject-handoff",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "template_version": 17,
+      "base_rendered_hash": "sha256:66093b64d0e638bd5be0078243e13e7535efa6b0e4146de775287dc3a2132a43",
+      "last_applied_hash": "sha256:66093b64d0e638bd5be0078243e13e7535efa6b0e4146de775287dc3a2132a43",
+      "current_user_hash": "sha256:66093b64d0e638bd5be0078243e13e7535efa6b0e4146de775287dc3a2132a43"
+    },
+    {
+      "file": "AGENTS.md",
+      "region_id": "codex-hook-handoff-reminder",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "template_version": 17,
+      "base_rendered_hash": "sha256:fa562948246b282627a63d33f48b5587ca9c68706ef8ce2d7d81dff444c3e6d8",
+      "last_applied_hash": "sha256:fa562948246b282627a63d33f48b5587ca9c68706ef8ce2d7d81dff444c3e6d8",
+      "current_user_hash": "sha256:fa562948246b282627a63d33f48b5587ca9c68706ef8ce2d7d81dff444c3e6d8"
+    },
+    {
+      "file": "AGENTS.md",
+      "region_id": "codex-cmd-load-context",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "template_version": 17,
+      "base_rendered_hash": "sha256:e1572a1db878152706984511e60a1da846b4014c1a1eb8791ce471b81c037446",
+      "last_applied_hash": "sha256:e1572a1db878152706984511e60a1da846b4014c1a1eb8791ce471b81c037446",
+      "current_user_hash": "sha256:e1572a1db878152706984511e60a1da846b4014c1a1eb8791ce471b81c037446"
+    },
+    {
+      "file": "AGENTS.md",
+      "region_id": "codex-cmd-handoff-prepare",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "template_version": 17,
+      "base_rendered_hash": "sha256:b3da7bf6c6d002c05dd5d98906ffeafc63663a0af3ad821cec65489173e1c366",
+      "last_applied_hash": "sha256:b3da7bf6c6d002c05dd5d98906ffeafc63663a0af3ad821cec65489173e1c366",
+      "current_user_hash": "sha256:b3da7bf6c6d002c05dd5d98906ffeafc63663a0af3ad821cec65489173e1c366"
+    },
+    {
+      "file": "AGENTS.md",
+      "region_id": "codex-skill-load-context",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "template_version": 17,
+      "base_rendered_hash": "sha256:00771bf96116cf47827038488184c49fdd61f76788df6e4c082a3ca52578f03c",
+      "last_applied_hash": "sha256:00771bf96116cf47827038488184c49fdd61f76788df6e4c082a3ca52578f03c",
+      "current_user_hash": "sha256:00771bf96116cf47827038488184c49fdd61f76788df6e4c082a3ca52578f03c"
+    },
+    {
+      "file": "AGENTS.md",
+      "region_id": "codex-skill-ontology-enrich",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "template_version": 17,
+      "base_rendered_hash": "sha256:da4a54906e79aca64e567e90356a79674f25295d8dba00cabf70eb0daefaa571",
+      "last_applied_hash": "sha256:da4a54906e79aca64e567e90356a79674f25295d8dba00cabf70eb0daefaa571",
+      "current_user_hash": "sha256:da4a54906e79aca64e567e90356a79674f25295d8dba00cabf70eb0daefaa571"
+    },
+    {
+      "file": "AGENTS.md",
+      "region_id": "codex-skill-anamnesis-init",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "template_version": 17,
+      "base_rendered_hash": "sha256:ed3c6049cb9c0c4bf4fb92c0ad3823c07672723e59ffbbf89547f6ad1b8013f7",
+      "last_applied_hash": "sha256:ed3c6049cb9c0c4bf4fb92c0ad3823c07672723e59ffbbf89547f6ad1b8013f7",
+      "current_user_hash": "sha256:ed3c6049cb9c0c4bf4fb92c0ad3823c07672723e59ffbbf89547f6ad1b8013f7"
+    },
+    {
+      "file": "CLAUDE.md",
+      "region_id": "anamnesis-claude-code-entrypoint",
+      "fragment_id": "anamnesis-claude-code",
+      "fragment_version": 1,
+      "template_version": 1,
+      "base_rendered_hash": "sha256:f43212100a900f095a11e1c4fd28f8fb0637e5f5bfb09dac55f4d10a4eca3def",
+      "last_applied_hash": "sha256:f43212100a900f095a11e1c4fd28f8fb0637e5f5bfb09dac55f4d10a4eca3def",
+      "current_user_hash": "sha256:f43212100a900f095a11e1c4fd28f8fb0637e5f5bfb09dac55f4d10a4eca3def"
+    }
+  ],
+  "files": [
+    {
+      "path": ".anamnesis/ontology/base.yaml",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:e331f7f50907190667d80c75762a565ff8ccf6faa6de66481a5e8e0e64f673d0",
+      "current_user_hash": "sha256:e331f7f50907190667d80c75762a565ff8ccf6faa6de66481a5e8e0e64f673d0"
+    },
+    {
+      "path": ".claude/hooks/inject-ontology.sh",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:5551481556e698a6c0a0f818c6db67d42dd84b69dd9ed4205c4764b3f3b6f206",
+      "current_user_hash": "sha256:5551481556e698a6c0a0f818c6db67d42dd84b69dd9ed4205c4764b3f3b6f206"
+    },
+    {
+      "path": ".claude/hooks/remind-uncommitted.sh",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:4985edb6597504a6f47a2f8759a4d8c738023b14b3a53f7a2305246a16b748dc",
+      "current_user_hash": "sha256:4985edb6597504a6f47a2f8759a4d8c738023b14b3a53f7a2305246a16b748dc"
+    },
+    {
+      "path": ".claude/hooks/inject-handoff.sh",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:0f2ac04b3c76b101505030c0fb937675777e1b84a1a3d474995b7d0c8fce9d04",
+      "current_user_hash": "sha256:0f2ac04b3c76b101505030c0fb937675777e1b84a1a3d474995b7d0c8fce9d04"
+    },
+    {
+      "path": ".claude/hooks/handoff-reminder.sh",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:a20d7fee24577cc25200225a1279bdf0bdbd6700519f01e2b4260b38058a8d98",
+      "current_user_hash": "sha256:a20d7fee24577cc25200225a1279bdf0bdbd6700519f01e2b4260b38058a8d98"
+    },
+    {
+      "path": ".claude/commands/load-context.md",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:465bb926f4073dfd3ec47a8ea88466c1ce0c9e5ec3f6bf6c268cf2428360bf23",
+      "current_user_hash": "sha256:465bb926f4073dfd3ec47a8ea88466c1ce0c9e5ec3f6bf6c268cf2428360bf23"
+    },
+    {
+      "path": ".claude/commands/handoff-prepare.md",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:5e62a16ec96693f86bbe12f6d096416aaf73c37c02dd5ac271439ffe0bb6de9b",
+      "current_user_hash": "sha256:5e62a16ec96693f86bbe12f6d096416aaf73c37c02dd5ac271439ffe0bb6de9b"
+    },
+    {
+      "path": ".claude/skills/load-context/SKILL.md",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:498d95d6a032eeb630d0ad09fb6f27055fa480abb08a8d703ede72f85c40374b",
+      "current_user_hash": "sha256:498d95d6a032eeb630d0ad09fb6f27055fa480abb08a8d703ede72f85c40374b"
+    },
+    {
+      "path": ".claude/skills/ontology-enrich/SKILL.md",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:06c3baa9d857fcaf248d5ec1dd2f0387e838286c13edd13acf89b99e29544b1f",
+      "current_user_hash": "sha256:06c3baa9d857fcaf248d5ec1dd2f0387e838286c13edd13acf89b99e29544b1f"
+    },
+    {
+      "path": ".claude/skills/anamnesis-init/SKILL.md",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:92ce5f4d9cdca79e60ab9e3aa2b470fb1f1ff4b808c1b6781b401c83f9aefdf3",
+      "current_user_hash": "sha256:92ce5f4d9cdca79e60ab9e3aa2b470fb1f1ff4b808c1b6781b401c83f9aefdf3"
+    },
+    {
+      "path": ".anamnesis/task-harnesses/context-continuity.yaml",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:6a0d037b43df1a9cba9afb501295f78103660c18bf99a0a87f37a6d68c56df97",
+      "current_user_hash": "sha256:6a0d037b43df1a9cba9afb501295f78103660c18bf99a0a87f37a6d68c56df97"
+    },
+    {
+      "path": ".anamnesis/codex-native-hooks/session-start.mjs",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:d5a8199d2910b4b87cd36e15ec45aa3e1174d1e1ad303a0489dcbb028025f631",
+      "current_user_hash": "sha256:d5a8199d2910b4b87cd36e15ec45aa3e1174d1e1ad303a0489dcbb028025f631"
+    },
+    {
+      "path": ".anamnesis/codex-hooks/base-PostToolUse-Edit-remind-uncommitted.sh",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:4985edb6597504a6f47a2f8759a4d8c738023b14b3a53f7a2305246a16b748dc",
+      "current_user_hash": "sha256:4985edb6597504a6f47a2f8759a4d8c738023b14b3a53f7a2305246a16b748dc"
+    },
+    {
+      "path": ".anamnesis/codex-native-hooks/base-PostToolUse-Edit-remind-uncommitted.mjs",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:3dbf96b0b1cd15326bac8ea2bf97b7317d6828b854f3a7362111e56e7e1a44d9",
+      "current_user_hash": "sha256:3dbf96b0b1cd15326bac8ea2bf97b7317d6828b854f3a7362111e56e7e1a44d9"
+    },
+    {
+      "path": ".git/hooks/pre-commit",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:7540150da6cab04377afe418a2aef88f1a78a54d7f81dc966809dee64db7f44e",
+      "current_user_hash": "sha256:7540150da6cab04377afe418a2aef88f1a78a54d7f81dc966809dee64db7f44e"
+    },
+    {
+      "path": ".anamnesis/codex-hooks/base-Stop-handoff-reminder.sh",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:a20d7fee24577cc25200225a1279bdf0bdbd6700519f01e2b4260b38058a8d98",
+      "current_user_hash": "sha256:a20d7fee24577cc25200225a1279bdf0bdbd6700519f01e2b4260b38058a8d98"
+    },
+    {
+      "path": ".anamnesis/codex-native-hooks/base-Stop-handoff-reminder.mjs",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:897e214a4c5fdf697d16013e5f931da90d05249cc51afdd88ee349d59ce0db45",
+      "current_user_hash": "sha256:897e214a4c5fdf697d16013e5f931da90d05249cc51afdd88ee349d59ce0db45"
+    },
+    {
+      "path": ".cursor/rules/load-context-cmd.mdc",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:1140ddbbc687897253c6e651acb1df93f543c615ba8619ab8f8a306818832bac",
+      "current_user_hash": "sha256:1140ddbbc687897253c6e651acb1df93f543c615ba8619ab8f8a306818832bac"
+    },
+    {
+      "path": ".cursor/rules/handoff-prepare-cmd.mdc",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:c50a2ebf66c86cbeced17f3a2c0f7962bdaf702d2a2e81a14630e80f81945552",
+      "current_user_hash": "sha256:c50a2ebf66c86cbeced17f3a2c0f7962bdaf702d2a2e81a14630e80f81945552"
+    },
+    {
+      "path": ".cursor/rules/load-context.mdc",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:d1826b1adc00feca6412bb3ff531df2b62abf91e5692d68870d0d8f4d7ddfa1f",
+      "current_user_hash": "sha256:d1826b1adc00feca6412bb3ff531df2b62abf91e5692d68870d0d8f4d7ddfa1f"
+    },
+    {
+      "path": ".cursor/rules/ontology-enrich.mdc",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:1f59243d744b6e0e3cf63c7646d491186dd2cded9d580ba2c9782d16b5009f5d",
+      "current_user_hash": "sha256:1f59243d744b6e0e3cf63c7646d491186dd2cded9d580ba2c9782d16b5009f5d"
+    },
+    {
+      "path": ".cursor/rules/anamnesis-init.mdc",
+      "fragment_id": "base",
+      "fragment_version": 17,
+      "last_applied_hash": "sha256:66894b84f694ddf6201492a643cfdaa56292d67c8fa119cb983a375d707c2970",
+      "current_user_hash": "sha256:66894b84f694ddf6201492a643cfdaa56292d67c8fa119cb983a375d707c2970"
+    }
+  ]
+}

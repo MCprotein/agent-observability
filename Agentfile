@@ -1,0 +1,10 @@
+version: 1
+project:
+  name: agent-observability
+tools:
+  - claude-code
+  - codex
+  - cursor
+fragments:
+  - id: base
+    version: 17

@@ -1,0 +1,20 @@
+schema_version: anamnesis.system_graph.v1
+generated_by: anamnesis project context bootstrap
+project:
+  name: agent-observability
+evidence_sources:
+  - README.md
+invariants:
+  - id: protect-secrets
+    severity: must
+    rule: Do not quote, expose, commit, or summarize secret values from .env files,
+      Terraform tfvars/state, PEM keys, OAuth tokens, Slack tokens, Supabase keys, AWS
+      credentials, or logs.
+  - id: verify-production-side-effects
+    severity: must
+    rule: Do not run production deploys, database migrations, remote SSH/SSM commands, or
+      external-service writes without explicit user instruction.
+open_questions:
+  - id: semantic-relationships-review
+    question: Review this generated draft with /ontology-enrich when project-specific intent
+      or operational constraints need stronger evidence.
