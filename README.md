@@ -31,6 +31,7 @@ Storage, dashboard, cost tracking, alerts
 - agent별 공식 또는 사실상 공식 surface를 우선 사용한다.
 - prompt, output, tool output은 기본적으로 redaction과 opt-in 정책을 거친다.
 - 로컬 adapter는 원본 로그를 읽고, 내부 collector에는 정규화된 event/span만 보낸다.
+- 여러 agent를 동시에 쓰더라도 collector 뒤에서는 하나의 trace/span schema로 합친다.
 - backend는 교체 가능해야 하며, 특정 벤더나 구현체에 종속하지 않는다.
 - Desktop App과 CLI/IDE extension은 설정 상속 방식이 다르므로 제품별 PoC가 필요하다.
 
@@ -102,6 +103,116 @@ Storage, dashboard, cost tracking, alerts
 │ - audit/export                               │
 └─────────────────────────────────────────────┘
 ```
+
+## 통합 수집 컨셉
+
+사용자가 Codex, Claude Code, Cursor, 다른 CLI agent를 동시에 쓰더라도 관측 시스템은
+agent별 화면을 따로 만드는 방식으로 시작하지 않는다. 각 agent 옆에 local adapter를 두고,
+adapter가 서로 다른 hook/transcript/native telemetry를 같은 내부 event/span schema로
+정규화한다. collector는 agent별 세부 파싱을 하지 않고, 이미 정규화된 데이터를 검증하고
+저장소와 dashboard로 라우팅한다.
+
+핵심 흐름:
+
+```text
+Agent A adapter ─┐
+Agent B adapter ─┼─> Internal collector ─> trace/metrics/audit storage ─> dashboard
+Agent C adapter ─┘
+       same schema      same ingest API       same query model
+```
+
+이렇게 하면 agent가 몇 개로 늘어나도 뒤쪽 시스템은 다음 질문을 같은 방식으로 답할 수 있다.
+
+- 특정 repo에서 오늘 어떤 agent가 token을 많이 썼는가
+- 한 세션 안에서 LLM 호출과 tool 실행 시간이 어디에 몰렸는가
+- permission denied, timeout, retry, compaction이 어떤 turn에서 발생했는가
+- 같은 작업을 여러 agent가 병렬로 처리했을 때 비용과 실패율이 어떻게 달라졌는가
+- content logging off 상태에서도 원문 없이 비용, latency, error를 볼 수 있는가
+
+## OpenTelemetry-compatible 전송
+
+collector 입력은 OpenTelemetry의 trace/span/event/metric 모델과 호환되게 잡는다. 반드시
+외부 collector를 써야 한다는 뜻이 아니라, 내부 collector의 ingest 형식을 OTLP-compatible하게
+정의해서 adapter와 backend 사이의 결합을 낮추자는 의미다.
+
+전송 방식:
+
+- 1차: OTLP-compatible HTTP JSON endpoint
+- 2차: OTLP/gRPC endpoint
+- fallback: 같은 필드를 담는 internal REST endpoint
+
+권장 span 계층:
+
+```text
+Workstream span
+  Agent session span
+    Turn span
+      LLM request span
+      Tool execution span
+      Tool execution span
+      Approval event
+      Compaction event
+      Redaction event
+```
+
+`Workstream span`은 같은 사용자, repo, task label, 시간 범위로 묶이는 논리 그룹이다.
+서로 독립적인 agent 실행을 무리하게 하나의 trace로 합치지는 않는다. 대신
+`workstream.id`, `repo.name`, `task.label`, `user.id` 같은 correlation key로 dashboard에서
+같이 조회할 수 있게 한다.
+
+예시 envelope:
+
+```json
+{
+  "schema_version": "agent_observability.v1",
+  "trace_id": "trace_...",
+  "span_id": "span_...",
+  "parent_span_id": "span_...",
+  "span_name": "agent.turn",
+  "start_time": "2026-07-06T00:00:00.000Z",
+  "end_time": "2026-07-06T00:00:12.345Z",
+  "resource": {
+    "service.name": "agent-observability-adapter",
+    "agent.name": "codex",
+    "agent.instance.id": "local-user-host-session",
+    "repo.name": "agent-observability",
+    "project.name": "agent-observability"
+  },
+  "attributes": {
+    "workstream.id": "workstream_...",
+    "session.id": "session_...",
+    "turn.id": "turn_...",
+    "model.name": "model-id",
+    "sandbox.mode": "workspace-write",
+    "approval.mode": "on-request",
+    "token.input": 1200,
+    "token.output": 480,
+    "duration.ms": 12345
+  },
+  "events": [
+    {
+      "name": "redaction.applied",
+      "attributes": {
+        "redaction.count": 3,
+        "content.prompts.stored": false,
+        "content.outputs.stored": false
+      }
+    }
+  ]
+}
+```
+
+metrics는 span에서 파생하거나 adapter가 별도 전송한다.
+
+- `agent.tokens.input`
+- `agent.tokens.output`
+- `agent.tokens.cached_input`
+- `agent.tokens.reasoning_output`
+- `agent.turn.duration_ms`
+- `agent.tool.duration_ms`
+- `agent.error.count`
+- `agent.permission.denied.count`
+- `agent.cost.estimated`
 
 ## Local Adapter
 
