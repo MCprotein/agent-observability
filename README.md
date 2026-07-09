@@ -23,7 +23,7 @@ Local adapter
 Internal collector
         |
         v
-Storage, dashboard, cost tracking, alerts
+Storage, static report, cost tracking, alerts
 ```
 
 핵심 원칙은 다음과 같다.
@@ -98,7 +98,7 @@ Storage, dashboard, cost tracking, alerts
 │ Storage and UI                               │
 │ - trace store                                │
 │ - metrics store                              │
-│ - dashboard                                  │
+│ - static HTML report                         │
 │ - alerting                                   │
 │ - audit/export                               │
 └─────────────────────────────────────────────┘
@@ -110,13 +110,13 @@ Storage, dashboard, cost tracking, alerts
 agent별 화면을 따로 만드는 방식으로 시작하지 않는다. 각 agent 옆에 local adapter를 두고,
 adapter가 서로 다른 hook/transcript/native telemetry를 같은 내부 event/span schema로
 정규화한다. collector는 agent별 세부 파싱을 하지 않고, 이미 정규화된 데이터를 검증하고
-저장소와 dashboard로 라우팅한다.
+저장소와 static report로 라우팅한다.
 
 핵심 흐름:
 
 ```text
 Agent A adapter ─┐
-Agent B adapter ─┼─> Internal collector ─> trace/metrics/audit storage ─> dashboard
+Agent B adapter ─┼─> Internal collector ─> trace/metrics/audit storage ─> static report
 Agent C adapter ─┘
        same schema      same ingest API       same query model
 ```
@@ -157,7 +157,7 @@ Workstream span
 
 `Workstream span`은 같은 사용자, repo, task label, 시간 범위로 묶이는 논리 그룹이다.
 서로 독립적인 agent 실행을 무리하게 하나의 trace로 합치지는 않는다. 대신
-`workstream.id`, `repo.name`, `task.label`, `user.id` 같은 correlation key로 dashboard에서
+`workstream.id`, `repo.name`, `task.label`, `user.id` 같은 correlation key로 report에서
 같이 조회할 수 있게 한다.
 
 예시 envelope:
@@ -256,6 +256,53 @@ adapter 책임:
 - tool call은 parent LLM turn 아래 child span으로 표현한다.
 - 중앙 전송 실패 시 local queue에 저장하고 재시도한다.
 - content logging 정책과 redaction 정책을 전송 전에 적용한다.
+
+## Static HTML Report
+
+1차 PoC의 조회 화면은 서버형 dashboard가 아니라 정적 HTML report로 시작한다. 미리 만든
+템플릿에 수집 데이터를 주입해 self-contained `report.html`을 만들고, 사용자는 브라우저로
+그 파일을 열어본다.
+
+```text
+Local adapter
+        |
+        v
+~/.agent-observability/events.jsonl
+        |
+        | report renderer
+        v
+agent-observability-report.html
+        |
+        v
+Browser file open
+```
+
+이 방식의 장점:
+
+- 별도 web server, database server, background dashboard process가 필요 없다.
+- 파일 하나로 공유하거나 archive할 수 있다.
+- content logging off 정책과 redaction이 적용된 결과만 HTML에 들어간다.
+- local-only PoC와 중앙 collector PoC를 분리할 수 있다.
+
+권장 report 생성 방식:
+
+```text
+agent-observability report \
+  --input ~/.agent-observability/events.jsonl \
+  --output ./agent-observability-report.html
+```
+
+`report.html`은 외부 network 요청 없이 동작한다. 브라우저의 `file://` 제약을 피하기 위해
+JSONL을 따로 fetch하지 않고, 생성 시점에 필요한 데이터를 HTML 안에 주입한다.
+
+report에서 보여줄 1차 화면:
+
+- session 목록과 각 session의 총 token, 예상 비용, duration
+- turn별 LLM span과 tool span tree
+- model별 input/output/cached/reasoning token 집계
+- repo/user/team/project별 비용 집계
+- error, timeout, permission denied, compaction timeline
+- redaction count와 content logging 상태
 
 ## 공통 데이터 모델
 
@@ -433,7 +480,7 @@ backend는 다음 논리 컴포넌트로 나눈다.
 - trace store: turn/tool/span 원본 구조 저장
 - metrics store: token, latency, error count 집계
 - audit store: permission, policy, redaction event 저장
-- dashboard: session, repo, team, model별 조회
+- static HTML report: session, repo, team, model별 조회
 - alerting: error spike, cost spike, timeout, repeated denied permission 알림
 
 처음에는 단일 내부 collector와 단일 저장소로 시작하고, traffic이 늘면 trace와 metrics 저장소를
@@ -464,10 +511,11 @@ backend는 다음 논리 컴포넌트로 나눈다.
    - redaction count 검증
    - retry-safe ingest
 
-5. Dashboard
+5. Static HTML report
    - repo/session/turn별 trace viewer
    - token/cost/latency chart
    - error and permission timeline
+   - self-contained HTML export
 
 6. Optional gateway PoC
    - OpenAI-compatible request routing
@@ -478,7 +526,7 @@ backend는 다음 논리 컴포넌트로 나눈다.
 
 - agent별 turn이 같은 trace schema로 조회된다.
 - LLM span과 tool span의 parent/child 관계가 유지된다.
-- token usage와 latency가 dashboard에 표시된다.
+- token usage와 latency가 static HTML report에 표시된다.
 - content logging off 상태에서 원문 prompt/output이 중앙 저장소에 남지 않는다.
 - redaction 테스트 fixture가 모두 통과한다.
 - adapter가 collector 장애 시 local queue로 유실 없이 재시도한다.
