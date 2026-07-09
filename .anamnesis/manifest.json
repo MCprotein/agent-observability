@@ -88,8 +88,8 @@
       "fragment_version": 17,
       "template_version": 17,
       "base_rendered_hash": "sha256:da4a54906e79aca64e567e90356a79674f25295d8dba00cabf70eb0daefaa571",
-      "last_applied_hash": "sha256:da4a54906e79aca64e567e90356a79674f25295d8dba00cabf70eb0daefaa571",
-      "current_user_hash": "sha256:da4a54906e79aca64e567e90356a79674f25295d8dba00cabf70eb0daefaa571"
+      "last_applied_hash": "sha256:00fe88ab6f97cf34114334eb56619c0a4876303e2dfa07bb09e1f3504822f4aa",
+      "current_user_hash": "sha256:00fe88ab6f97cf34114334eb56619c0a4876303e2dfa07bb09e1f3504822f4aa"
     },
     {
       "file": "AGENTS.md",
@@ -173,8 +173,8 @@
       "path": ".claude/skills/ontology-enrich/SKILL.md",
       "fragment_id": "base",
       "fragment_version": 17,
-      "last_applied_hash": "sha256:06c3baa9d857fcaf248d5ec1dd2f0387e838286c13edd13acf89b99e29544b1f",
-      "current_user_hash": "sha256:06c3baa9d857fcaf248d5ec1dd2f0387e838286c13edd13acf89b99e29544b1f"
+      "last_applied_hash": "sha256:f87069ffb20396951b3f52ecce4309add342d76b6bea6d5364d654a78f0354f5",
+      "current_user_hash": "sha256:f87069ffb20396951b3f52ecce4309add342d76b6bea6d5364d654a78f0354f5"
     },
     {
       "path": ".claude/skills/anamnesis-init/SKILL.md",
@@ -257,8 +257,8 @@
       "path": ".cursor/rules/ontology-enrich.mdc",
       "fragment_id": "base",
       "fragment_version": 17,
-      "last_applied_hash": "sha256:1f59243d744b6e0e3cf63c7646d491186dd2cded9d580ba2c9782d16b5009f5d",
-      "current_user_hash": "sha256:1f59243d744b6e0e3cf63c7646d491186dd2cded9d580ba2c9782d16b5009f5d"
+      "last_applied_hash": "sha256:2b061f9b2399ef69bdb700bf36e984a80b8619cfb1f5e2b0707eccf8988bf9c5",
+      "current_user_hash": "sha256:2b061f9b2399ef69bdb700bf36e984a80b8619cfb1f5e2b0707eccf8988bf9c5"
     },
     {
       "path": ".cursor/rules/anamnesis-init.mdc",

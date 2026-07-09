@@ -52,7 +52,7 @@ Layer B is re-runnable. Existing semantic entries are user-reviewed project memo
    flows:
      - id: "image-push"
        name: "image push"
-       path: "developer → automation runner → zot.zot.svc.cluster.local:5000"
+      path: "developer → automation runner → zot.zot.svc.cluster.local:5000"
        evidence:
          - "docs/architecture.md: image publishing"
        confidence: "medium"
