@@ -7,12 +7,15 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 `v0.1.0`은 local event log foundation을 구현한다.
+현재 `v0.2.0`은 local event log foundation 위에 Codex local adapter를 구현한다.
 
 - `agent_observability.v1` span record schema
 - parent/child span 관계 검증
 - append-only JSONL writer
 - durable write 전 content logging / secret / sensitive path redaction
+- Codex session JSONL / notify payload 정규화
+- Codex session, turn, LLM request, tool execution span 생성
+- Codex token / latency metric capture
 - Node test fixture
 
 검증:
@@ -20,6 +23,8 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 ```bash
 npm test
 ```
+
+`v0.3.0`은 서버 없이 열 수 있는 static HTML report를 추가한다.
 
 ## 결론
 
