@@ -43,7 +43,7 @@ error, 예상 비용을 하나의 trace/span schema로 볼 수 있게 만든다.
 
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
-| v0.1.0 | Planned | Trace schema and local event log foundation | `agent_observability.v1` event/span schema, append-only JSONL writer, parent/child span fixture, redaction-before-write fixture |
+| v0.1.0 | Released | Trace schema and local event log foundation | `agent_observability.v1` event/span schema, append-only JSONL writer, parent/child span fixture, redaction-before-write fixture |
 | v0.2.0 | Planned | Codex local adapter | Codex notify/session source parsing, turn/tool span generation, token/latency capture, local event log smoke |
 | v0.3.0 | Planned | Static HTML report | Self-contained HTML renderer, session/repo/turn trace viewer, token/latency/error summary, browser file-open smoke |
 | v0.4.0 | Planned | Cost estimate fields | rate table format, `estimated_cost`, `rate_table.version`, `cost.assumption`, unknown/incomplete pricing behavior |
@@ -60,6 +60,20 @@ error, 예상 비용을 하나의 trace/span schema로 볼 수 있게 만든다.
 | --- | --- | --- | --- |
 | v1.1.0 | Planned | Report usability improvements | richer timelines, saved filters, regression fixture for large local event logs |
 | v1.2.0 | Planned | Local retention and archive policy | disk budget, retention config, archive/export smoke |
+
+## Branch Strategy
+
+- `main` is the stable line. It should only receive verified version work.
+- Each planned version starts from current `main` on `release/vX.Y.Z`.
+- Use focused `feat/vX.Y.Z/<topic>` branches only when a version is too large to
+  keep reviewable on one release branch.
+- Do not skip the active train. Finish or explicitly mark the current version
+  `Blocked` / `Superseded` before starting the next one.
+- Merge a release branch to `main` only after the version scope, tests, docs,
+  privacy checks, and review evidence are complete.
+- Tagging/publishing rules can be added when the project has an actual package
+  distribution path; until then, the merge commit plus roadmap status is the
+  release record.
 
 ## Future TODO
 

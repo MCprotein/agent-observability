@@ -1,0 +1,13 @@
+{
+  "name": "agent-observability",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first observability primitives for coding agents.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
