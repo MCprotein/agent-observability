@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { estimateCostForRecords, estimateSpanCost, normalizeRateTable } from "../cost.js";
+import { redactText } from "../redaction.js";
 
 const SAFE_ATTRIBUTE_KEYS = new Set([
   "source",
@@ -26,7 +27,7 @@ export function reportDataFromRecords(records, options = {}) {
 
   return {
     generatedAt: options.generated_at ?? new Date().toISOString(),
-    title: options.title ?? "Agent Observability Report",
+    title: redactText(options.title ?? "Agent Observability Report", "title"),
     summary: summarize(spans),
     cost: estimateCostForRecords(
       records.filter((record) => record?.record_type === "span"),
@@ -575,7 +576,7 @@ function safeSpan(record, rateTable) {
     spanId: record.span_id,
     parentSpanId: record.parent_span_id,
     kind: record.span_kind,
-    name: String(record.name),
+    name: spanDisplayName(record, attributes),
     status: record.status?.code ?? "unset",
     startTimeUnixMs: record.start_time_unix_ms,
     endTimeUnixMs: record.end_time_unix_ms,
@@ -661,9 +662,9 @@ function traceSummaries(spans) {
 
 function safeAgent(agent) {
   return compactObject({
-    name: scalarString(agent.name),
-    model: scalarString(agent.model),
-    version: scalarString(agent.version),
+    name: safeString(agent.name, "agent.name"),
+    model: safeString(agent.model, "agent.model"),
+    version: safeString(agent.version, "agent.version"),
   });
 }
 
@@ -674,11 +675,40 @@ function safeAttributes(attributes) {
     if (value === undefined || value === null) {
       continue;
     }
-    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    if (typeof value === "string") {
+      safe[key] = redactText(value, key);
+    } else if (typeof value === "number" || typeof value === "boolean") {
       safe[key] = value;
     }
   }
   return safe;
+}
+
+function spanDisplayName(record, attributes) {
+  if (record.span_kind === "agent.session") {
+    return `${safeString(record.agent?.name, "agent.name") ?? "Agent"} session`;
+  }
+  if (record.span_kind === "turn") {
+    return attributes.turn_id ? `Turn ${shortDisplayId(attributes.turn_id)}` : "Turn";
+  }
+  if (record.span_kind === "llm.request") {
+    return safeString(record.agent?.model, "agent.model")
+      ? `LLM ${safeString(record.agent.model, "agent.model")}`
+      : "LLM request";
+  }
+  if (record.span_kind === "tool.execution") {
+    return attributes.tool_name ?? "Tool execution";
+  }
+  if (record.span_kind === "permission") {
+    return "Permission";
+  }
+  if (record.span_kind === "compaction") {
+    return "Compaction";
+  }
+  if (record.span_kind === "workstream") {
+    return "Workstream";
+  }
+  return redactText(String(record.name ?? record.span_kind), "name");
 }
 
 function safeMetrics(metrics) {
@@ -700,7 +730,7 @@ function safeMetrics(metrics) {
 }
 
 function repoName(record) {
-  const name = scalarString(record.project?.name);
+  const name = safeString(record.project?.name, "project.name");
   if (name) {
     return name;
   }
@@ -711,7 +741,7 @@ function repoName(record) {
   }
 
   const parts = repoPath.split(/[\\/]+/).filter(Boolean);
-  return parts.at(-1) ?? "unknown";
+  return redactText(parts.at(-1) ?? "unknown", "repo.name");
 }
 
 function sessionIdFromSpan(record) {
@@ -763,6 +793,15 @@ function metricNumber(value) {
 
 function scalarString(value) {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function safeString(value, key) {
+  return typeof value === "string" && value.length > 0 ? redactText(value, key) : undefined;
+}
+
+function shortDisplayId(value) {
+  const text = redactText(String(value), "id");
+  return text.length > 24 ? `${text.slice(0, 10)}...${text.slice(-6)}` : text;
 }
 
 function compactObject(object) {

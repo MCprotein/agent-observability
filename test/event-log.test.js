@@ -90,6 +90,7 @@ test("redacts content and secrets before durable write", async () => {
     "content.output",
     "content.prompt",
     "content.tool_input",
+    "name",
   ]);
 
   const raw = await readFile(logPath, "utf8");
