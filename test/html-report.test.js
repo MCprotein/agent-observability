@@ -45,6 +45,7 @@ function reportFixture() {
     span_kind: "llm.request",
     name: "Codex LLM gpt-test",
     status: "ok",
+    agent: { name: "codex", model: "gpt-test" },
     project: { name: "agent-observability" },
     metrics: {
       input_tokens: 42,
@@ -80,6 +81,7 @@ function reportFixture() {
 test("builds report data with summaries and without raw content", () => {
   const data = reportDataFromRecords(reportFixture(), {
     generated_at: "2026-07-10T00:00:00.000Z",
+    rate_table: reportRateTable(),
   });
 
   assert.equal(data.summary.sessions, 1);
@@ -89,6 +91,9 @@ test("builds report data with summaries and without raw content", () => {
   assert.equal(data.summary.errors, 1);
   assert.equal(data.summary.inputTokens, 42);
   assert.equal(data.summary.outputTokens, 17);
+  assert.equal(data.summary.estimatedCost, 0.000286);
+  assert.equal(data.cost.status, "estimated");
+  assert.equal(data.cost.rate_table.version, "report-test");
   assert.deepEqual(data.filters.repos, ["agent-observability"]);
   assert.deepEqual(data.filters.sessions, ["session-report-1"]);
   assert.deepEqual(data.filters.turns, ["turn-report-1"]);
@@ -100,10 +105,21 @@ test("builds report data with summaries and without raw content", () => {
   assert.equal(serialized.includes("/private/repo"), false);
 });
 
+test("marks report cost unknown when no rate table is supplied", () => {
+  const data = reportDataFromRecords(reportFixture(), {
+    generated_at: "2026-07-10T00:00:00.000Z",
+  });
+
+  assert.equal(data.cost.status, "unknown");
+  assert.equal(data.cost.reason, "missing_rate_table");
+  assert.equal(data.summary.estimatedCost, 0);
+});
+
 test("renders a self-contained static HTML report", () => {
   const html = renderStaticHtmlReport(reportFixture(), {
     title: "Agent Report",
     generated_at: "2026-07-10T00:00:00.000Z",
+    rate_table: reportRateTable(),
   });
 
   assert.equal(html.startsWith("<!doctype html>"), true);
@@ -124,6 +140,7 @@ test("writes an HTML report file and executes the inline renderer", async () => 
   const result = await writeStaticHtmlReport(reportPath, reportFixture(), {
     title: "Local Agent Report",
     generated_at: "2026-07-10T00:00:00.000Z",
+    rate_table: reportRateTable(),
   });
   const html = await readFile(reportPath, "utf8");
 
@@ -137,6 +154,7 @@ test("writes an HTML report file and executes the inline renderer", async () => 
   const data = JSON.parse(dataJson);
   assert.equal(data.summary.inputTokens, 42);
   assert.equal(data.summary.outputTokens, 17);
+  assert.equal(data.summary.estimatedCost, 0.000286);
 
   const dom = createReportDom(dataJson);
   new Script(extractRendererScript(html)).runInContext(createContext({ document: dom.document }));
@@ -146,6 +164,7 @@ test("writes an HTML report file and executes the inline renderer", async () => 
   assert.equal(dom.element("kpi-llm").textContent, "1");
   assert.equal(dom.element("kpi-tools").textContent, "1");
   assert.equal(dom.element("kpi-tokens").textContent, "59");
+  assert.equal(dom.element("kpi-cost").textContent, "USD 0.000286");
   assert.equal(dom.element("kpi-errors").textContent, "1");
   assert.equal(dom.element("trace-list").children.length, 1);
   assert.equal(dom.element("span-table").children.length, 4);
@@ -153,10 +172,57 @@ test("writes an HTML report file and executes the inline renderer", async () => 
   assert.equal(dom.element("span-table").innerHTML.includes("exec_command"), true);
 });
 
+test("renders incomplete cost status with the partial amount", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-observability-report-incomplete-"));
+  const reportPath = join(dir, "report.html");
+  const partialRateTable = {
+    ...reportRateTable(),
+    models: {
+      "gpt-test": {
+        input_tokens: 2,
+      },
+    },
+  };
+
+  await writeStaticHtmlReport(reportPath, reportFixture(), {
+    title: "Incomplete Cost Report",
+    generated_at: "2026-07-10T00:00:00.000Z",
+    rate_table: partialRateTable,
+  });
+
+  const html = await readFile(reportPath, "utf8");
+  const dataJson = extractReportDataJson(html);
+  const data = JSON.parse(dataJson);
+  assert.equal(data.cost.status, "incomplete");
+  assert.equal(data.cost.estimated_cost, 0.000084);
+
+  const dom = createReportDom(dataJson);
+  new Script(extractRendererScript(html)).runInContext(createContext({ document: dom.document }));
+
+  assert.equal(dom.element("kpi-cost").textContent, "USD 0.000084 incomplete");
+});
+
 function extractReportDataJson(html) {
   const match = /<script id="report-data" type="application\/json">([\s\S]*?)<\/script>/.exec(html);
   assert.ok(match, "report data script should exist");
   return match[1];
+}
+
+function reportRateTable() {
+  return {
+    version: "report-test",
+    currency: "USD",
+    unit: "per_1m_tokens",
+    assumption: "Fixture report rates.",
+    models: {
+      "gpt-test": {
+        input_tokens: 2,
+        output_tokens: 8,
+        cached_input_tokens: 1,
+        reasoning_output_tokens: 20,
+      },
+    },
+  };
 }
 
 function extractRendererScript(html) {
@@ -181,6 +247,7 @@ function createReportDom(reportDataJson) {
     "kpi-llm",
     "kpi-tools",
     "kpi-tokens",
+    "kpi-cost",
     "kpi-errors",
   ];
 

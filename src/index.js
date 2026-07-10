@@ -9,6 +9,11 @@ export {
 export { redactRecord } from "./redaction.js";
 export { appendEventLog, readEventLog } from "./event-log.js";
 export {
+  normalizeRateTable,
+  estimateSpanCost,
+  estimateCostForRecords,
+} from "./cost.js";
+export {
   parseCodexSessionJsonl,
   codexRecordsFromEvents,
   normalizeCodexNotifyPayload,
