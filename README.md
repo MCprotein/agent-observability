@@ -532,6 +532,9 @@ redaction 단계:
 
 ## PoC 순서
 
+버전별 릴리즈 범위와 완료 기준은 [ROADMAP.md](ROADMAP.md)를 기준으로 한다. 아래는
+구현 순서의 개념 요약이다.
+
 1. Codex local adapter
    - notify payload 수집
    - session JSONL parsing
