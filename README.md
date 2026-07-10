@@ -558,16 +558,16 @@ redaction 단계:
    - shell/MCP/tool span 생성
    - workspace/file edit metadata 수집
 
-5. Optional internal collector
-   - auth
-   - schema validation
-   - redaction count 검증
-   - retry-safe ingest
+Future TODO (버전 미확정):
 
-6. Optional gateway PoC
-   - OpenAI-compatible request routing
-   - Anthropic-compatible request routing
-   - Desktop App 설정 상속 검증
+- Optional internal collector
+  - auth
+  - schema validation
+  - redaction count 검증
+  - retry-safe ingest
+- Optional gateway PoC
+  - provider-compatible request routing
+  - Desktop App 설정 상속 검증
 
 ## 성공 기준
 
