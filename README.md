@@ -5,6 +5,22 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 이 문서는 사내 적용을 목표로 정리한 독자 아키텍처 초안이다.
 
+## 현재 구현 상태
+
+현재 `v0.1.0`은 local event log foundation을 구현한다.
+
+- `agent_observability.v1` span record schema
+- parent/child span 관계 검증
+- append-only JSONL writer
+- durable write 전 content logging / secret / sensitive path redaction
+- Node test fixture
+
+검증:
+
+```bash
+npm test
+```
+
 ## 결론
 
 AI coding agent 관측은 OS/network proxy로 모델 요청을 몰래 가로채는 방식보다,
