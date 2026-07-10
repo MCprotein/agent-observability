@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { estimateCostForRecords, estimateSpanCost, normalizeRateTable } from "../cost.js";
 
 const SAFE_ATTRIBUTE_KEYS = new Set([
   "source",
@@ -17,15 +18,20 @@ const SAFE_ATTRIBUTE_KEYS = new Set([
 ]);
 
 export function reportDataFromRecords(records, options = {}) {
+  const rateTable = normalizeRateTable(options.rate_table ?? options.rateTable);
   const spans = records
     .filter((record) => record?.record_type === "span")
-    .map((record) => safeSpan(record))
+    .map((record) => safeSpan(record, rateTable))
     .sort((left, right) => left.startTimeUnixMs - right.startTimeUnixMs);
 
   return {
     generatedAt: options.generated_at ?? new Date().toISOString(),
     title: options.title ?? "Agent Observability Report",
     summary: summarize(spans),
+    cost: estimateCostForRecords(
+      records.filter((record) => record?.record_type === "span"),
+      rateTable,
+    ),
     filters: filterValues(spans),
     traces: traceSummaries(spans),
     spans,
@@ -103,7 +109,7 @@ export function renderStaticHtmlReport(records, options = {}) {
 
     .kpis {
       display: grid;
-      grid-template-columns: repeat(6, minmax(0, 1fr));
+      grid-template-columns: repeat(7, minmax(0, 1fr));
       gap: 10px;
       margin-bottom: 16px;
     }
@@ -313,6 +319,7 @@ export function renderStaticHtmlReport(records, options = {}) {
       <div class="kpi"><div class="kpi-label">LLM</div><div class="kpi-value" id="kpi-llm">0</div></div>
       <div class="kpi"><div class="kpi-label">Tools</div><div class="kpi-value" id="kpi-tools">0</div></div>
       <div class="kpi"><div class="kpi-label">Tokens</div><div class="kpi-value" id="kpi-tokens">0</div></div>
+      <div class="kpi"><div class="kpi-label">Cost</div><div class="kpi-value" id="kpi-cost">unknown</div></div>
       <div class="kpi"><div class="kpi-label">Errors</div><div class="kpi-value" id="kpi-errors">0</div></div>
     </section>
 
@@ -346,6 +353,7 @@ export function renderStaticHtmlReport(records, options = {}) {
                 <th>Repo</th>
                 <th>Turn</th>
                 <th>Tokens</th>
+                <th>Cost</th>
                 <th>Latency</th>
                 <th>Parent</th>
               </tr>
@@ -397,6 +405,7 @@ export function renderStaticHtmlReport(records, options = {}) {
         setText("kpi-llm", summary.llmRequests);
         setText("kpi-tools", summary.toolExecutions);
         setText("kpi-tokens", formatNumber(summary.inputTokens + summary.outputTokens));
+        document.getElementById("kpi-cost").textContent = formatCost(summary.estimatedCost, data.cost);
         setText("kpi-errors", summary.errors);
         els.traceCount.textContent = traces.length;
         els.spanCount.textContent = visibleSpans.length;
@@ -453,6 +462,7 @@ export function renderStaticHtmlReport(records, options = {}) {
             '<td>' + escapeHtml(span.repo) + '</td>' +
             '<td class="mono">' + escapeHtml(span.turnId || "") + '</td>' +
             '<td>' + formatNumber((span.metrics.inputTokens || 0) + (span.metrics.outputTokens || 0)) + '</td>' +
+            '<td>' + formatCost(span.estimatedCost, span.cost) + '</td>' +
             '<td>' + formatDuration(span.metrics.latencyMs || span.metrics.durationMs) + '</td>' +
             '<td class="mono">' + escapeHtml(shortId(span.parentSpanId || "")) + '</td>';
           return row;
@@ -470,6 +480,7 @@ export function renderStaticHtmlReport(records, options = {}) {
           errors: 0,
           inputTokens: 0,
           outputTokens: 0,
+          estimatedCost: 0,
         };
         for (const span of spans) {
           if (span.sessionId) sessions.add(span.sessionId);
@@ -479,6 +490,7 @@ export function renderStaticHtmlReport(records, options = {}) {
           if (span.status === "error") summary.errors += 1;
           summary.inputTokens += span.metrics.inputTokens || 0;
           summary.outputTokens += span.metrics.outputTokens || 0;
+          summary.estimatedCost += span.estimatedCost || 0;
         }
         summary.sessions = sessions.size;
         summary.turns = turns.size;
@@ -513,6 +525,14 @@ export function renderStaticHtmlReport(records, options = {}) {
         return value.toLocaleString() + " ms";
       }
 
+      function formatCost(value, cost) {
+        if (cost?.status === "unknown" && (!Number.isFinite(value) || value === 0)) return "unknown";
+        if (!Number.isFinite(value)) return cost?.status || "unknown";
+        const currency = cost?.currency || data.cost?.currency || "USD";
+        const amount = currency + " " + Number(value.toPrecision(12)).toString();
+        return cost?.status === "incomplete" ? amount + " incomplete" : amount;
+      }
+
       function shortId(value) {
         if (!value) return "";
         return value.length > 18 ? value.slice(0, 8) + "..." + value.slice(-6) : value;
@@ -543,10 +563,11 @@ export async function writeStaticHtmlReport(filePath, records, options = {}) {
   };
 }
 
-function safeSpan(record) {
+function safeSpan(record, rateTable) {
   const attributes = safeAttributes(record.attributes ?? {});
   const sessionId = attributes.session_id ?? sessionIdFromSpan(record);
   const turnId = attributes.turn_id ?? turnIdFromSpan(record);
+  const estimatedCost = estimateSpanCost(record, rateTable);
 
   return {
     schemaVersion: record.schema_version,
@@ -565,6 +586,8 @@ function safeSpan(record) {
     toolName: attributes.tool_name,
     attributes,
     metrics: safeMetrics(record.metrics ?? {}),
+    estimatedCost: estimatedCost.estimated_cost,
+    cost: estimatedCost,
   };
 }
 
@@ -582,6 +605,7 @@ function summarize(spans) {
     reasoningOutputTokens: sumMetric(spans, "reasoningOutputTokens"),
     latencyMs: sumMetric(spans, "latencyMs"),
     durationMs: sumMetric(spans, "durationMs"),
+    estimatedCost: sumCost(spans),
   };
 }
 
@@ -603,6 +627,7 @@ function traceSummaries(spans) {
       errors: 0,
       inputTokens: 0,
       outputTokens: 0,
+      estimatedCost: 0,
       startTimeUnixMs: span.startTimeUnixMs,
       endTimeUnixMs: span.endTimeUnixMs,
       sessions: new Set(),
@@ -613,6 +638,7 @@ function traceSummaries(spans) {
     group.errors += span.status === "error" ? 1 : 0;
     group.inputTokens += span.metrics.inputTokens ?? 0;
     group.outputTokens += span.metrics.outputTokens ?? 0;
+    group.estimatedCost += span.estimatedCost ?? 0;
     group.startTimeUnixMs = Math.min(group.startTimeUnixMs, span.startTimeUnixMs);
     group.endTimeUnixMs = maxNullable(group.endTimeUnixMs, span.endTimeUnixMs);
     if (span.sessionId) {
@@ -711,6 +737,10 @@ function countKind(spans, kind) {
 
 function sumMetric(spans, key) {
   return spans.reduce((sum, span) => sum + (span.metrics[key] ?? 0), 0);
+}
+
+function sumCost(spans) {
+  return spans.reduce((sum, span) => sum + (span.estimatedCost ?? 0), 0);
 }
 
 function uniqueSorted(values) {

@@ -7,8 +7,8 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 `v0.3.0`은 local event log foundation과 Codex local adapter 위에 static HTML
-report를 구현한다.
+현재 `v0.4.0`은 local event log foundation, Codex local adapter, static HTML report
+위에 rate table 기반 예상 비용 필드를 구현한다.
 
 - `agent_observability.v1` span record schema
 - parent/child span 관계 검증
@@ -20,6 +20,8 @@ report를 구현한다.
 - self-contained static HTML report renderer
 - session / repo / turn trace viewer
 - token / latency / error summary
+- rate table 기반 `estimated_cost`, `rate_table.version`, `cost.assumption`
+- unknown / incomplete pricing 상태
 - Node test fixture
 
 검증:
@@ -28,7 +30,7 @@ report를 구현한다.
 npm test
 ```
 
-`v0.4.0`은 rate table 기반 예상 비용 필드를 추가한다.
+`v0.5.0`은 privacy와 redaction hardening을 추가한다.
 
 ## 결론
 
@@ -276,6 +278,25 @@ estimated_cost =
 - 실패 요청 과금 여부, retry, cache discount, 구독형/번들형 과금은 별도 보정값으로 다룬다.
 - report에는 `estimated_cost`, `rate_table.version`, `cost.assumption`을 같이 남긴다.
 
+rate table 예시:
+
+```json
+{
+  "version": "local-rates-2026-07",
+  "currency": "USD",
+  "unit": "per_1m_tokens",
+  "assumption": "Local static rates; not a billing statement.",
+  "models": {
+    "gpt-test": {
+      "input_tokens": 2,
+      "output_tokens": 8,
+      "cached_input_tokens": 0.5,
+      "reasoning_output_tokens": 10
+    }
+  }
+}
+```
+
 ## Local Adapter
 
 로컬 adapter는 agent별 차이를 흡수하는 얇은 프로세스다.
@@ -365,10 +386,12 @@ report에서 보여줄 1차 화면:
 - turn별 LLM span과 tool span tree
 - model별 input/output/cached/reasoning token 집계
 - repo/session/turn별 trace 조회
+- 예상 비용과 cost 상태
 - error, timeout, permission denied, compaction timeline
 - redaction count와 content logging 상태
 
-예상 비용과 cost aggregation은 rate table이 들어가는 v0.4.0 범위다.
+예상 비용과 cost aggregation은 rate table이 제공될 때 표시하고, 단가표나 모델 단가가
+없으면 unknown/incomplete 상태로 표시한다.
 
 ## 공통 데이터 모델
 
@@ -570,7 +593,7 @@ redaction 단계:
 
 2. Static HTML report
    - self-contained HTML template
-   - token/latency/error summary
+   - token/cost/latency/error summary
    - repo/session/turn별 trace viewer
    - error and permission timeline
 
