@@ -7,7 +7,8 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 `v0.2.0`은 local event log foundation 위에 Codex local adapter를 구현한다.
+현재 `v0.3.0`은 local event log foundation과 Codex local adapter 위에 static HTML
+report를 구현한다.
 
 - `agent_observability.v1` span record schema
 - parent/child span 관계 검증
@@ -16,6 +17,9 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 - Codex session JSONL / notify payload 정규화
 - Codex session, turn, LLM request, tool execution span 생성
 - Codex token / latency metric capture
+- self-contained static HTML report renderer
+- session / repo / turn trace viewer
+- token / latency / error summary
 - Node test fixture
 
 검증:
@@ -24,7 +28,7 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 npm test
 ```
 
-`v0.3.0`은 서버 없이 열 수 있는 static HTML report를 추가한다.
+`v0.4.0`은 rate table 기반 예상 비용 필드를 추가한다.
 
 ## 결론
 
@@ -357,12 +361,14 @@ JSONL을 따로 fetch하지 않고, 생성 시점에 필요한 데이터를 HTML
 
 report에서 보여줄 1차 화면:
 
-- session 목록과 각 session의 총 token, 예상 비용, duration
+- session 목록과 각 session의 총 token, latency/duration
 - turn별 LLM span과 tool span tree
 - model별 input/output/cached/reasoning token 집계
-- repo/user/team/project별 비용 집계
+- repo/session/turn별 trace 조회
 - error, timeout, permission denied, compaction timeline
 - redaction count와 content logging 상태
+
+예상 비용과 cost aggregation은 rate table이 들어가는 v0.4.0 범위다.
 
 ## 공통 데이터 모델
 
@@ -564,7 +570,7 @@ redaction 단계:
 
 2. Static HTML report
    - self-contained HTML template
-   - token/cost/latency chart
+   - token/latency/error summary
    - repo/session/turn별 trace viewer
    - error and permission timeline
 

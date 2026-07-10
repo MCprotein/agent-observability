@@ -14,3 +14,8 @@ export {
   normalizeCodexNotifyPayload,
   appendCodexSessionJsonl,
 } from "./adapters/codex.js";
+export {
+  reportDataFromRecords,
+  renderStaticHtmlReport,
+  writeStaticHtmlReport,
+} from "./report/html.js";
