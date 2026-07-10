@@ -20,6 +20,12 @@ export {
   appendCodexSessionJsonl,
 } from "./adapters/codex.js";
 export {
+  parseClaudeCodeJsonl,
+  claudeCodeRecordsFromEvents,
+  normalizeClaudeCodeHookPayload,
+  appendClaudeCodeJsonl,
+} from "./adapters/claude-code.js";
+export {
   reportDataFromRecords,
   renderStaticHtmlReport,
   writeStaticHtmlReport,

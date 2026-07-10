@@ -48,7 +48,7 @@ error, 예상 비용을 하나의 trace/span schema로 볼 수 있게 만든다.
 | v0.3.0 | Released | Static HTML report | Self-contained HTML renderer, session/repo/turn trace viewer, token/latency/error summary, browser file-open smoke |
 | v0.4.0 | Released | Cost estimate fields | rate table format, `estimated_cost`, `rate_table.version`, `cost.assumption`, unknown/incomplete pricing behavior |
 | v0.5.0 | Released | Privacy and redaction hardening | content logging off fixture, secret/path/key redaction fixture, no raw prompt/output in log/report/export |
-| v0.6.0 | Planned | Claude Code adapter | hook/transcript parsing, tool duration, permission event, compaction event, shared schema parity |
+| v0.6.0 | Released | Claude Code adapter | hook/transcript parsing, tool duration, permission event, compaction event, shared schema parity, raw prompt/output leak fixture |
 | v0.7.0 | Planned | Cursor adapter | generation correlation, shell/tool span capture, workspace/file edit metadata, shared schema parity |
 | v0.8.0 | Planned | Cross-agent local report polish | repo/session/team/model filters, redacted snapshot export polish, local disk retention note |
 | v0.9.0 | Planned | Local-only release candidate | install/config path, CLI command shape, docs, fixtures, independent review |
