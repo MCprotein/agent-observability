@@ -44,7 +44,7 @@ error, 예상 비용을 하나의 trace/span schema로 볼 수 있게 만든다.
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
 | v0.1.0 | Released | Trace schema and local event log foundation | `agent_observability.v1` event/span schema, append-only JSONL writer, parent/child span fixture, redaction-before-write fixture |
-| v0.2.0 | Planned | Codex local adapter | Codex notify/session source parsing, turn/tool span generation, token/latency capture, local event log smoke |
+| v0.2.0 | Released | Codex local adapter | Codex notify/session source parsing, turn/tool span generation, token/latency capture, local event log smoke |
 | v0.3.0 | Planned | Static HTML report | Self-contained HTML renderer, session/repo/turn trace viewer, token/latency/error summary, browser file-open smoke |
 | v0.4.0 | Planned | Cost estimate fields | rate table format, `estimated_cost`, `rate_table.version`, `cost.assumption`, unknown/incomplete pricing behavior |
 | v0.5.0 | Planned | Privacy and redaction hardening | content logging off fixture, secret/path/key redaction fixture, no raw prompt/output in log/report/export |
