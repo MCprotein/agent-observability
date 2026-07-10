@@ -7,8 +7,8 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 `v0.4.0`은 local event log foundation, Codex local adapter, static HTML report
-위에 rate table 기반 예상 비용 필드를 구현한다.
+현재 `v0.5.0`은 local event log foundation, Codex local adapter, static HTML report,
+rate table 기반 예상 비용 필드 위에 privacy/redaction hardening을 구현한다.
 
 - `agent_observability.v1` span record schema
 - parent/child span 관계 검증
@@ -22,6 +22,9 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 - token / latency / error summary
 - rate table 기반 `estimated_cost`, `rate_table.version`, `cost.assumption`
 - unknown / incomplete pricing 상태
+- span display name 안전화
+- redacted JSON snapshot export
+- local log / report / export raw content leak fixture
 - Node test fixture
 
 검증:
@@ -30,7 +33,7 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 npm test
 ```
 
-`v0.5.0`은 privacy와 redaction hardening을 추가한다.
+`v0.6.0`은 Claude Code adapter를 추가한다.
 
 ## 결론
 
@@ -571,7 +574,7 @@ redaction 단계:
 - local event log: turn/tool/span 구조 저장
 - report renderer: token, latency, error count 집계
 - static HTML report: session, repo, team, model별 조회
-- export artifact: 정적 HTML과 필요 시 redacted JSON snapshot
+- export artifact: 정적 HTML과 redacted JSON snapshot
 
 중앙화가 필요해지면 선택적으로 internal collector를 추가한다.
 

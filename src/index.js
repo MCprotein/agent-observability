@@ -24,3 +24,7 @@ export {
   renderStaticHtmlReport,
   writeStaticHtmlReport,
 } from "./report/html.js";
+export {
+  redactedSnapshotFromRecords,
+  writeRedactedJsonSnapshot,
+} from "./export.js";

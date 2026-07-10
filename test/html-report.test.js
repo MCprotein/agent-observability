@@ -168,7 +168,7 @@ test("writes an HTML report file and executes the inline renderer", async () => 
   assert.equal(dom.element("kpi-errors").textContent, "1");
   assert.equal(dom.element("trace-list").children.length, 1);
   assert.equal(dom.element("span-table").children.length, 4);
-  assert.equal(dom.element("span-table").innerHTML.includes("Codex LLM gpt-test"), true);
+  assert.equal(dom.element("span-table").innerHTML.includes("LLM gpt-test"), true);
   assert.equal(dom.element("span-table").innerHTML.includes("exec_command"), true);
 });
 
