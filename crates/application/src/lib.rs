@@ -1,0 +1,849 @@
+//! Pure application use cases for local pricing and cost aggregation.
+
+use agent_observability_contracts::{
+    AttributesV1, CostComponentV1, CostDetailV1, CostEstimateV1, DurableRecordV1, MetricsV1,
+    REPORT_DTO_VERSION, RateTableRefV1, ReportAgentV1, ReportAttributesV1, ReportDtoV1,
+    ReportFiltersV1, ReportMetricsV1, ReportSpanV1, ReportSummaryV1, ScalarValueV1, TraceSummaryV1,
+    hash_opaque_identifier, redact_sensitive_text, sanitize_durable_record,
+};
+use agent_observability_domain::SpanKind;
+use agent_observability_domain::StatusCode;
+use agent_observability_domain::{
+    DomainError, DomainSpanState, LifecycleReducer, validate_topology,
+};
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+
+const TOKEN_KEYS: [&str; 5] = [
+    "input_tokens",
+    "output_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "reasoning_output_tokens",
+];
+const OVERLAP_KEYS: [&str; 3] = [
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "reasoning_output_tokens",
+];
+const DEFAULT_ASSUMPTION: &str =
+    "Estimated from a local static rate table; not a billing statement.";
+const NO_TABLE_ASSUMPTION: &str = "No local rate table was supplied.";
+
+/// Reduces one canonical observation into current application state and validates topology.
+///
+/// # Errors
+///
+/// Returns [`DomainError`] when lifecycle, identity, metrics, or topology cannot converge.
+pub fn reduce_observation_state(
+    states: &mut Vec<DomainSpanState>,
+    incoming: DomainSpanState,
+) -> Result<DomainSpanState, DomainError> {
+    let reduced = if let Some(index) = states
+        .iter()
+        .position(|existing| existing.span_id == incoming.span_id)
+    {
+        let reduced_states = LifecycleReducer::reduce([states[index].clone(), incoming])?;
+        let Some(reduced) = reduced_states.into_iter().next() else {
+            return Err(DomainError::LifecycleConflict {
+                span_id: states[index].span_id.clone(),
+            });
+        };
+        states[index] = reduced.clone();
+        reduced
+    } else {
+        states.push(incoming.clone());
+        incoming
+    };
+    validate_topology(states)?;
+    Ok(reduced)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TokenSemantics {
+    Exclusive,
+    IncludedInTotal,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelRates {
+    pub input_tokens: Option<f64>,
+    pub output_tokens: Option<f64>,
+    pub cached_input_tokens: Option<f64>,
+    pub cache_creation_input_tokens: Option<f64>,
+    pub reasoning_output_tokens: Option<f64>,
+    pub token_semantics: BTreeMap<String, TokenSemantics>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RateTable {
+    version: String,
+    currency: String,
+    unit: String,
+    assumption: String,
+    models: BTreeMap<String, ModelRates>,
+}
+
+impl Default for RateTable {
+    fn default() -> Self {
+        Self {
+            version: "unversioned".into(),
+            currency: "USD".into(),
+            unit: "per_1m_tokens".into(),
+            assumption: DEFAULT_ASSUMPTION.into(),
+            models: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RateTableInput {
+    pub version: Option<String>,
+    pub currency: Option<String>,
+    pub unit: Option<String>,
+    pub assumption: Option<String>,
+    pub models: BTreeMap<String, ModelRatesInput>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelRatesInput {
+    pub input_tokens: Option<f64>,
+    pub output_tokens: Option<f64>,
+    pub cached_input_tokens: Option<f64>,
+    pub cache_creation_input_tokens: Option<f64>,
+    pub reasoning_output_tokens: Option<f64>,
+    pub token_semantics: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReportProjectionError {
+    InvalidRecord {
+        index: usize,
+        source: agent_observability_contracts::ContractError,
+    },
+    InvalidReport(agent_observability_contracts::ContractError),
+    InvalidSummaryMetric {
+        field: &'static str,
+        value: f64,
+    },
+}
+
+impl Display for ReportProjectionError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRecord { index, source } => {
+                write!(formatter, "record {index} is invalid: {source}")
+            }
+            Self::InvalidReport(source) => {
+                write!(formatter, "projected report is invalid: {source}")
+            }
+            Self::InvalidSummaryMetric { field, value } => {
+                write!(
+                    formatter,
+                    "summary metric {field} must be an unsigned integer: {value}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for ReportProjectionError {}
+
+/// Projects validated durable spans into the privacy-safe report DTO.
+///
+/// The projector is pure: it does not inspect or copy durable content, and it rejects the
+/// complete input when any record or derived report value cannot satisfy the wire contract.
+///
+/// # Errors
+///
+/// Returns [`ReportProjectionError`] when an input record or derived report value is invalid.
+pub fn project_report(
+    records: &[DurableRecordV1],
+    generated_at: impl Into<String>,
+    title: impl Into<String>,
+    table: Option<&RateTable>,
+) -> Result<ReportDtoV1, ReportProjectionError> {
+    let records = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            sanitize_durable_record(record)
+                .map_err(|source| ReportProjectionError::InvalidRecord { index, source })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut spans = records
+        .iter()
+        .map(|record| report_span(record, table))
+        .collect::<Vec<_>>();
+    spans.sort_by(|left, right| {
+        left.start_time_unix_ms
+            .total_cmp(&right.start_time_unix_ms)
+            .then_with(|| left.trace_id.cmp(&right.trace_id))
+            .then_with(|| left.span_id.cmp(&right.span_id))
+    });
+
+    let summary = summarize_report(&spans)?;
+    let cost = estimate_cost_for_records(&records, table);
+    let report = ReportDtoV1 {
+        schema_version: REPORT_DTO_VERSION.into(),
+        generated_at: generated_at.into(),
+        title: redact_sensitive_text(&title.into(), "title"),
+        summary,
+        cost,
+        filters: report_filters(&spans),
+        traces: trace_summaries(&spans),
+        spans,
+    };
+    report
+        .validate()
+        .map_err(ReportProjectionError::InvalidReport)?;
+    Ok(report)
+}
+
+fn report_span(record: &DurableRecordV1, table: Option<&RateTable>) -> ReportSpanV1 {
+    let attributes = report_attributes(&record.attributes);
+    let metrics = report_metrics(&record.metrics);
+    let cost = estimate_span_cost(record, table);
+    ReportSpanV1 {
+        schema_version: record.schema_version.clone(),
+        trace_id: hash_opaque_identifier(&record.trace_id),
+        span_id: hash_opaque_identifier(&record.span_id),
+        parent_span_id: record.parent_span_id.as_deref().map(hash_opaque_identifier),
+        kind: record.span_kind,
+        name: span_name(record, &attributes),
+        status: record.status.code,
+        start_time_unix_ms: record.start_time_unix_ms,
+        end_time_unix_ms: record.end_time_unix_ms,
+        repo: repo_name(record),
+        agent: ReportAgentV1 {
+            name: record.agent.name.clone(),
+            model: record.agent.model.clone(),
+            version: record.agent.version.clone(),
+        },
+        session_id: scalar_string(attributes.session_id.as_ref()),
+        turn_id: scalar_string(attributes.turn_id.as_ref()),
+        tool_name: scalar_string(attributes.tool_name.as_ref()),
+        attributes,
+        metrics,
+        estimated_cost: cost.estimated_cost,
+        cost,
+    }
+}
+
+fn report_attributes(attributes: &AttributesV1) -> ReportAttributesV1 {
+    ReportAttributesV1 {
+        source: attributes.source.clone(),
+        event_type: attributes.event_type.clone(),
+        envelope_type: attributes.envelope_type.clone(),
+        session_id: hash_scalar_identifier(attributes.session_id.as_ref()),
+        turn_id: hash_scalar_identifier(attributes.turn_id.as_ref()),
+        request_id: hash_scalar_identifier(attributes.request_id.as_ref()),
+        call_id: hash_scalar_identifier(attributes.call_id.as_ref()),
+        tool_name: attributes.tool_name.clone(),
+        phase: attributes.phase.clone(),
+        exit_code: attributes.exit_code.clone(),
+        sandbox: attributes.sandbox.clone(),
+        approval: attributes.approval.clone(),
+    }
+}
+
+fn hash_scalar_identifier(value: Option<&ScalarValueV1>) -> Option<ScalarValueV1> {
+    match value {
+        Some(ScalarValueV1::String(value)) => {
+            Some(ScalarValueV1::String(hash_opaque_identifier(value)))
+        }
+        Some(value) => Some(value.clone()),
+        None => None,
+    }
+}
+
+fn report_metrics(metrics: &MetricsV1) -> ReportMetricsV1 {
+    ReportMetricsV1 {
+        input_tokens: metrics.input_tokens,
+        output_tokens: metrics.output_tokens,
+        cached_input_tokens: metrics.cached_input_tokens,
+        cache_creation_input_tokens: metrics.cache_creation_input_tokens,
+        reasoning_output_tokens: metrics.reasoning_output_tokens,
+        total_tokens: metrics.total_tokens,
+        latency_ms: metrics.latency_ms,
+        duration_ms: metrics.duration_ms,
+        total_input_tokens: metrics.total_input_tokens,
+        total_output_tokens: metrics.total_output_tokens,
+        total_cached_input_tokens: metrics.total_cached_input_tokens,
+        total_reasoning_output_tokens: metrics.total_reasoning_output_tokens,
+        total_accumulated_tokens: metrics.total_accumulated_tokens,
+        context_window_tokens: metrics.context_window_tokens,
+    }
+}
+
+fn span_name(record: &DurableRecordV1, attributes: &ReportAttributesV1) -> String {
+    match record.span_kind {
+        SpanKind::AgentSession => format!(
+            "{} session",
+            record.agent.name.as_deref().unwrap_or("Agent")
+        ),
+        SpanKind::Turn => "Turn".into(),
+        SpanKind::LlmRequest => record
+            .agent
+            .model
+            .as_deref()
+            .map_or_else(|| "LLM request".into(), |model| format!("LLM {model}")),
+        SpanKind::ToolExecution => {
+            scalar_string(attributes.tool_name.as_ref()).unwrap_or_else(|| "Tool execution".into())
+        }
+        SpanKind::Permission => "Permission".into(),
+        SpanKind::Compaction => "Compaction".into(),
+        SpanKind::Workstream => "Workstream".into(),
+    }
+}
+
+fn repo_name(record: &DurableRecordV1) -> String {
+    if let Some(name) = record
+        .project
+        .name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+    {
+        return name.into();
+    }
+    "unknown".into()
+}
+
+fn scalar_string(value: Option<&ScalarValueV1>) -> Option<String> {
+    match value {
+        Some(ScalarValueV1::String(value)) if !value.is_empty() => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn summarize_report(spans: &[ReportSpanV1]) -> Result<ReportSummaryV1, ReportProjectionError> {
+    Ok(ReportSummaryV1 {
+        generated_spans: spans.len() as u64,
+        sessions: count_kind(spans, SpanKind::AgentSession),
+        turns: count_kind(spans, SpanKind::Turn),
+        llm_requests: count_kind(spans, SpanKind::LlmRequest),
+        tool_executions: count_kind(spans, SpanKind::ToolExecution),
+        errors: spans
+            .iter()
+            .filter(|span| span.status == StatusCode::Error)
+            .count() as u64,
+        input_tokens: sum_integer_metric(spans, |metrics| metrics.input_tokens, "inputTokens")?,
+        output_tokens: sum_integer_metric(spans, |metrics| metrics.output_tokens, "outputTokens")?,
+        cached_input_tokens: sum_integer_metric(
+            spans,
+            |metrics| metrics.cached_input_tokens,
+            "cachedInputTokens",
+        )?,
+        cache_creation_input_tokens: sum_integer_metric(
+            spans,
+            |metrics| metrics.cache_creation_input_tokens,
+            "cacheCreationInputTokens",
+        )?,
+        reasoning_output_tokens: sum_integer_metric(
+            spans,
+            |metrics| metrics.reasoning_output_tokens,
+            "reasoningOutputTokens",
+        )?,
+        latency_ms: sum_integer_metric(spans, |metrics| metrics.latency_ms, "latencyMs")?,
+        duration_ms: sum_integer_metric(spans, |metrics| metrics.duration_ms, "durationMs")?,
+        estimated_cost: spans
+            .iter()
+            .map(|span| span.estimated_cost.unwrap_or(0.0))
+            .sum::<f64>(),
+    })
+}
+
+fn count_kind(spans: &[ReportSpanV1], kind: SpanKind) -> u64 {
+    spans.iter().filter(|span| span.kind == kind).count() as u64
+}
+
+fn sum_integer_metric(
+    spans: &[ReportSpanV1],
+    get: impl Fn(&ReportMetricsV1) -> Option<f64>,
+    field: &'static str,
+) -> Result<u64, ReportProjectionError> {
+    let mut total = 0_u64;
+    for value in spans.iter().filter_map(|span| get(&span.metrics)) {
+        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > MAX_EXACT_U64 {
+            return Err(ReportProjectionError::InvalidSummaryMetric { field, value });
+        }
+        total = total.checked_add(exact_u64(value)).ok_or(
+            ReportProjectionError::InvalidSummaryMetric {
+                field,
+                value: f64::INFINITY,
+            },
+        )?;
+    }
+    Ok(total)
+}
+
+fn report_filters(spans: &[ReportSpanV1]) -> ReportFiltersV1 {
+    ReportFiltersV1 {
+        repos: unique_sorted(spans.iter().map(|span| span.repo.clone())),
+        sessions: unique_sorted(spans.iter().filter_map(|span| span.session_id.clone())),
+        turns: unique_sorted(spans.iter().filter_map(|span| span.turn_id.clone())),
+    }
+}
+
+fn unique_sorted(values: impl Iterator<Item = String>) -> Vec<String> {
+    values
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn trace_summaries(spans: &[ReportSpanV1]) -> Vec<TraceSummaryV1> {
+    let mut groups = BTreeMap::<String, TraceSummaryV1>::new();
+    for span in spans {
+        let group = groups
+            .entry(span.trace_id.clone())
+            .or_insert_with(|| TraceSummaryV1 {
+                trace_id: span.trace_id.clone(),
+                repo: span.repo.clone(),
+                start_time_unix_ms: span.start_time_unix_ms,
+                end_time_unix_ms: span.end_time_unix_ms,
+                ..TraceSummaryV1::default()
+            });
+        group.spans += 1;
+        group.errors += u64::from(span.status == StatusCode::Error);
+        group.input_tokens += exact_u64(span.metrics.input_tokens.unwrap_or(0.0));
+        group.output_tokens += exact_u64(span.metrics.output_tokens.unwrap_or(0.0));
+        group.estimated_cost += span.estimated_cost.unwrap_or(0.0);
+        group.start_time_unix_ms = group.start_time_unix_ms.min(span.start_time_unix_ms);
+        group.end_time_unix_ms = max_nullable(group.end_time_unix_ms, span.end_time_unix_ms);
+        if let Some(value) = &span.session_id {
+            group.sessions.push(value.clone());
+        }
+        if let Some(value) = &span.turn_id {
+            group.turns.push(value.clone());
+        }
+    }
+    let mut traces = groups.into_values().collect::<Vec<_>>();
+    for trace in &mut traces {
+        trace.sessions.sort();
+        trace.sessions.dedup();
+        trace.turns.sort();
+        trace.turns.dedup();
+    }
+    traces.sort_by(|left, right| {
+        left.start_time_unix_ms
+            .total_cmp(&right.start_time_unix_ms)
+            .then_with(|| left.trace_id.cmp(&right.trace_id))
+    });
+    traces
+}
+
+const MAX_EXACT_U64: f64 = 9_007_199_254_740_991.0;
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn exact_u64(value: f64) -> u64 {
+    value as u64
+}
+
+fn max_nullable(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (left, right) {
+        (None, value) | (value, None) => value,
+        (Some(left), Some(right)) => Some(left.max(right)),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PricingError {
+    UnsupportedUnit,
+    InvalidRate(String),
+    UnsupportedSemantic(String),
+}
+
+impl Display for PricingError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedUnit => formatter.write_str("rate table unit must be per_1m_tokens"),
+            Self::InvalidRate(label) => write!(
+                formatter,
+                "rate table {label} must be a non-negative finite number"
+            ),
+            Self::UnsupportedSemantic(key) => write!(
+                formatter,
+                "rate table token_semantics.{key} is not supported"
+            ),
+        }
+    }
+}
+
+impl Error for PricingError {}
+
+/// Validates and normalizes a local rate table. Rates are always per million tokens.
+///
+/// # Errors
+///
+/// Returns [`PricingError`] when the unit, rate, or token semantic is invalid.
+pub fn normalize_rate_table(input: RateTableInput) -> Result<RateTable, PricingError> {
+    if input
+        .unit
+        .as_deref()
+        .is_some_and(|unit| unit != "per_1m_tokens")
+    {
+        return Err(PricingError::UnsupportedUnit);
+    }
+    let mut models = BTreeMap::new();
+    for (model, rates) in input.models {
+        let normalized = ModelRates {
+            input_tokens: normalize_rate(rates.input_tokens, &format!("{model}.input_tokens"))?,
+            output_tokens: normalize_rate(rates.output_tokens, &format!("{model}.output_tokens"))?,
+            cached_input_tokens: normalize_rate(
+                rates.cached_input_tokens,
+                &format!("{model}.cached_input_tokens"),
+            )?,
+            cache_creation_input_tokens: normalize_rate(
+                rates.cache_creation_input_tokens,
+                &format!("{model}.cache_creation_input_tokens"),
+            )?,
+            reasoning_output_tokens: normalize_rate(
+                rates.reasoning_output_tokens,
+                &format!("{model}.reasoning_output_tokens"),
+            )?,
+            token_semantics: normalize_semantics(rates.token_semantics)?,
+        };
+        models.insert(model, normalized);
+    }
+    Ok(RateTable {
+        version: nonempty_or(input.version, "unversioned"),
+        currency: nonempty_or(input.currency, "USD"),
+        unit: "per_1m_tokens".into(),
+        assumption: nonempty_or(input.assumption, DEFAULT_ASSUMPTION),
+        models,
+    })
+}
+
+#[must_use]
+pub fn estimate_span_cost(record: &DurableRecordV1, table: Option<&RateTable>) -> CostEstimateV1 {
+    let Some(table) = table else {
+        return unknown_cost("missing_rate_table");
+    };
+    let model = record.agent.model.clone();
+    let Some(model_name) = model.as_deref() else {
+        return cost_result(
+            table,
+            "unknown",
+            Some("missing_model"),
+            model,
+            None,
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        );
+    };
+    let Some(rates) = table.models.get(model_name) else {
+        return cost_result(
+            table,
+            "unknown",
+            Some("missing_model_rate"),
+            model,
+            None,
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        );
+    };
+    let (mut tokens, semantic_errors) = billable_metrics(&record.metrics, rates);
+    let mut missing = Vec::new();
+    let mut components = BTreeMap::new();
+    let mut amount = 0.0;
+    for key in TOKEN_KEYS {
+        let Some(token_count) = tokens.remove(key) else {
+            continue;
+        };
+        if token_count == 0.0 {
+            continue;
+        }
+        let rate = rate_for(rates, key);
+        let Some(rate) = rate else {
+            missing.push(key.into());
+            continue;
+        };
+        let component_cost = token_count / 1_000_000.0 * rate;
+        components.insert(
+            key.into(),
+            CostComponentV1 {
+                tokens: token_count,
+                rate_per_1m: rate,
+                estimated_cost: round_currency(component_cost),
+            },
+        );
+        amount += component_cost;
+    }
+    if components.is_empty() && missing.is_empty() && semantic_errors.is_empty() {
+        return cost_result(
+            table,
+            "unknown",
+            Some("missing_token_metrics"),
+            model,
+            None,
+            components,
+            missing,
+            semantic_errors,
+        );
+    }
+    let status = if missing.is_empty() && semantic_errors.is_empty() {
+        "estimated"
+    } else {
+        "incomplete"
+    };
+    let reason = if !semantic_errors.is_empty() {
+        Some("ambiguous_token_semantics")
+    } else if !missing.is_empty() {
+        Some("missing_token_rates")
+    } else {
+        None
+    };
+    cost_result(
+        table,
+        status,
+        reason,
+        model,
+        Some(round_currency(amount)),
+        components,
+        missing,
+        semantic_errors,
+    )
+}
+
+#[must_use]
+pub fn estimate_cost_for_records(
+    records: &[DurableRecordV1],
+    table: Option<&RateTable>,
+) -> CostEstimateV1 {
+    let Some(table) = table else {
+        return unknown_cost("missing_rate_table");
+    };
+    let billable: Vec<_> = records
+        .iter()
+        .filter(|record| has_token_metrics(&record.metrics))
+        .collect();
+    if billable.is_empty() {
+        return cost_result(
+            table,
+            "unknown",
+            Some("missing_token_metrics"),
+            None,
+            None,
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        );
+    }
+    let costs: Vec<_> = billable
+        .into_iter()
+        .map(|record| estimate_span_cost(record, Some(table)))
+        .collect();
+    let incomplete = costs
+        .iter()
+        .filter(|cost| cost.status == "incomplete")
+        .count() as u64;
+    let unknown = costs.iter().filter(|cost| cost.status == "unknown").count() as u64;
+    let estimated = costs
+        .iter()
+        .filter(|cost| cost.status == "estimated")
+        .count();
+    let status = if estimated == 0 && incomplete == 0 {
+        "unknown"
+    } else if incomplete > 0 || unknown > 0 {
+        "incomplete"
+    } else {
+        "estimated"
+    };
+    let amount = costs
+        .iter()
+        .map(|cost| cost.estimated_cost.unwrap_or(0.0))
+        .sum();
+    CostEstimateV1 {
+        status: status.into(),
+        reason: None,
+        estimated_cost: Some(round_currency(amount)),
+        currency: Some(table.currency.clone()),
+        model: None,
+        rate_table: table_ref(table),
+        cost: CostDetailV1 {
+            assumption: table.assumption.clone(),
+            incomplete_count: Some(incomplete),
+            unknown_count: Some(unknown),
+            ..CostDetailV1::default()
+        },
+    }
+}
+
+fn normalize_rate(rate: Option<f64>, label: &str) -> Result<Option<f64>, PricingError> {
+    match rate {
+        None => Ok(None),
+        Some(value) if value.is_finite() && value >= 0.0 => Ok(Some(value)),
+        Some(_) => Err(PricingError::InvalidRate(label.into())),
+    }
+}
+fn normalize_semantics(
+    input: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, TokenSemantics>, PricingError> {
+    input
+        .into_iter()
+        .map(|(key, value)| {
+            if !OVERLAP_KEYS.contains(&key.as_str()) {
+                return Err(PricingError::UnsupportedSemantic(key));
+            }
+            let semantic = match value.as_str() {
+                "exclusive" => TokenSemantics::Exclusive,
+                "included_in_total" => TokenSemantics::IncludedInTotal,
+                _ => return Err(PricingError::UnsupportedSemantic(key)),
+            };
+            Ok((key, semantic))
+        })
+        .collect()
+}
+fn nonempty_or(value: Option<String>, default: &str) -> String {
+    value
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.into())
+}
+fn rate_for(rates: &ModelRates, key: &str) -> Option<f64> {
+    match key {
+        "input_tokens" => rates.input_tokens,
+        "output_tokens" => rates.output_tokens,
+        "cached_input_tokens" => rates.cached_input_tokens,
+        "cache_creation_input_tokens" => rates.cache_creation_input_tokens,
+        "reasoning_output_tokens" => rates.reasoning_output_tokens,
+        _ => None,
+    }
+}
+fn metric(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && *value >= 0.0)
+}
+fn billable_metrics(
+    metrics: &MetricsV1,
+    rates: &ModelRates,
+) -> (BTreeMap<&'static str, f64>, Vec<String>) {
+    let mut values = BTreeMap::from([
+        ("input_tokens", metric(metrics.input_tokens)),
+        ("output_tokens", metric(metrics.output_tokens)),
+        ("cached_input_tokens", metric(metrics.cached_input_tokens)),
+        (
+            "cache_creation_input_tokens",
+            metric(metrics.cache_creation_input_tokens),
+        ),
+        (
+            "reasoning_output_tokens",
+            metric(metrics.reasoning_output_tokens),
+        ),
+    ])
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|value| (key, value)))
+    .collect::<BTreeMap<_, _>>();
+    let mut errors = Vec::new();
+    for (total, breakdowns) in [
+        (
+            "input_tokens",
+            ["cached_input_tokens", "cache_creation_input_tokens"].as_slice(),
+        ),
+        ("output_tokens", ["reasoning_output_tokens"].as_slice()),
+    ] {
+        let mut included = Vec::new();
+        let present: Vec<_> = breakdowns
+            .iter()
+            .copied()
+            .filter(|key| values.contains_key(*key))
+            .collect();
+        for key in present {
+            match rates.token_semantics.get(key) {
+                Some(TokenSemantics::IncludedInTotal) => included.push(key),
+                Some(TokenSemantics::Exclusive) => {}
+                None => {
+                    errors.push(format!("{key}:missing_semantics"));
+                    values.remove(key);
+                }
+            }
+        }
+        if included.is_empty() {
+            continue;
+        }
+        let included_total: f64 = included.iter().map(|key| values[key]).sum();
+        let Some(total_value) = values.get_mut(total) else {
+            errors.push(format!("{total}:invalid_included_breakdown"));
+            for key in included {
+                values.remove(key);
+            }
+            continue;
+        };
+        if included_total > *total_value {
+            errors.push(format!("{total}:invalid_included_breakdown"));
+            for key in included {
+                values.remove(key);
+            }
+        } else {
+            *total_value -= included_total;
+        }
+    }
+    (values, errors)
+}
+fn table_ref(table: &RateTable) -> RateTableRefV1 {
+    RateTableRefV1 {
+        version: Some(table.version.clone()),
+        unit: Some("per_1m_tokens".into()),
+    }
+}
+fn unknown_cost(reason: &str) -> CostEstimateV1 {
+    CostEstimateV1 {
+        status: "unknown".into(),
+        reason: Some(reason.into()),
+        estimated_cost: None,
+        currency: None,
+        model: None,
+        rate_table: RateTableRefV1::default(),
+        cost: CostDetailV1 {
+            assumption: NO_TABLE_ASSUMPTION.into(),
+            ..CostDetailV1::default()
+        },
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn cost_result(
+    table: &RateTable,
+    status: &str,
+    reason: Option<&str>,
+    model: Option<String>,
+    amount: Option<f64>,
+    components: BTreeMap<String, CostComponentV1>,
+    missing: Vec<String>,
+    semantic_errors: Vec<String>,
+) -> CostEstimateV1 {
+    CostEstimateV1 {
+        status: status.into(),
+        reason: reason.map(str::to_owned),
+        estimated_cost: amount,
+        currency: Some(table.currency.clone()),
+        model,
+        rate_table: table_ref(table),
+        cost: CostDetailV1 {
+            assumption: table.assumption.clone(),
+            missing,
+            semantic_errors,
+            components,
+            ..CostDetailV1::default()
+        },
+    }
+}
+fn has_token_metrics(metrics: &MetricsV1) -> bool {
+    [
+        metrics.input_tokens,
+        metrics.output_tokens,
+        metrics.cached_input_tokens,
+        metrics.cache_creation_input_tokens,
+        metrics.reasoning_output_tokens,
+    ]
+    .into_iter()
+    .any(|value| metric(value).is_some())
+}
+fn round_currency(value: f64) -> f64 {
+    (value * 1_000_000_000.0).round() / 1_000_000_000.0
+}
+
+#[cfg(test)]
+mod tests;

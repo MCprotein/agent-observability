@@ -1,17 +1,16 @@
 [package]
-name = "agent-observability-cli"
+name = "agent-observability-application"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "agent-observability"
-path = "src/main.rs"
-
 [dependencies]
 agent-observability-contracts = { path = "../contracts" }
-agent-observability-local-store = { path = "../local-store" }
+agent-observability-domain = { path = "../domain" }
+
+[dev-dependencies]
+serde_json = "1"
 
 [lints]
 workspace = true

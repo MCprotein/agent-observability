@@ -50,7 +50,7 @@ gate를 통과해 추가한다.
 
 | Major | Status | Scope |
 | --- | --- | --- |
-| v0.x | Planned | Local-only PoC를 작은 minor release로 쪼개 검증한다. |
+| v0.x | Active | Local-only PoC를 작은 minor release로 쪼개 검증한다. |
 | v1.x | Planned | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
 
 ## Active Train: v0.1.0-v1.0.0
@@ -65,7 +65,7 @@ gate를 통과해 추가한다.
 | v0.6.0 | Released | Claude Code adapter | hook/transcript parsing, tool duration, permission event, compaction event, shared schema parity, raw prompt/output leak fixture |
 | v0.6.1 | Released | Baseline correctness and contract freeze | Codex/Claude source-to-durable and cross-agent report golden fixture, strict metadata allowlist, fail-closed privacy regression, private artifact permissions, explicit correlation fields without downstream agent-ID parsing, deterministic sequential replay/no-op plus identity-conflict fixture, overlap-aware token pricing, independent review |
 | v0.7.0 | Released | Rust contract foundation | Cargo workspace and CLI composition root, complete `SourceObservation` correlation/event boundary, wire-compatible `DurableRecordV1`/`ReportDtoV1`, closed shared JSON Schemas plus manifest, JavaScript schema conformance and fixture byte lock, typed Rust golden harness, independent architecture and code review; team ingest disabled |
-| v0.8.0 | Planned | Rust core and durable I/O | deterministic reducer, topology validation, fail-closed projectors, exact Rust serialization parity against v0.7 closed schemas/golden baseline, embedded transaction for source cursor/stable event/local record/profile-neutral delivery outcome, JSONL projection replay, crash-point idempotency, pricing policy parity; team envelope/outbox/network remain disabled until Future TODO G0 promotion |
+| v0.8.0 | Released | Rust core and durable I/O | deterministic reducer, topology validation, fail-closed projectors, schema-semantic Rust serialization parity against v0.7 closed schemas/golden baseline, embedded transaction for source cursor/stable event/local record/profile-neutral delivery outcome, JSONL projection replay, crash-point idempotency, pricing policy parity, independent architecture/code/test review; team envelope/outbox/network remain disabled until Future TODO G0 promotion |
 | v0.9.0 | Planned | Rust Codex adapter | official-surface capability entry, primary/supplement source dedupe, bounded local handoff, canonical correlation, unsupported-event diagnostics, end-to-end CLI parity |
 | v0.10.0 | Planned | Rust Claude Code adapter | official-surface capability entry, telemetry/hook precedence, permission and compaction events, interrupted and out-of-order fixture parity |
 | v0.11.0 | Planned | Rust Cursor adapter | official-hook capability entry, generation correlation, shell/tool operation capture, safe workspace/file edit metadata, shared contract parity |

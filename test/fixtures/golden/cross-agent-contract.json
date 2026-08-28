@@ -111,6 +111,601 @@
       "id:sha256:78f5b7e69f24f356e0bbb3ec4316504caed0e8d42bb5025a7a6c2d0c641cb73a",
       "id:sha256:920abbc0bddae67b7cd570e3b03af649270b4ff5fc566665e39831016e5bcc20"
     ],
-    "spanAgents": ["codex", "codex", "codex", "claude-code", "claude-code", "claude-code"]
+    "spanAgents": [
+      "codex",
+      "codex",
+      "codex",
+      "claude-code",
+      "claude-code",
+      "claude-code"
+    ]
+  },
+  "durable_full": {
+    "codex": [
+      {
+        "schema_version": "agent_observability.v1",
+        "record_type": "span",
+        "trace_id": "codex:golden-codex",
+        "span_id": "codex-session:golden-codex",
+        "parent_span_id": null,
+        "span_kind": "agent.session",
+        "name": "Codex session",
+        "start_time_unix_ms": 1785542400000,
+        "end_time_unix_ms": null,
+        "status": {
+          "code": "unset"
+        },
+        "agent": {
+          "name": "codex",
+          "model": "gpt-golden"
+        },
+        "project": {
+          "name": "golden-project"
+        },
+        "attributes": {
+          "source": "codex.notify_or_session_jsonl",
+          "event_type": "session.started",
+          "session_id": "golden-codex"
+        },
+        "metrics": {},
+        "content": {},
+        "redaction": {
+          "applied": false,
+          "count": 0,
+          "fields": []
+        }
+      },
+      {
+        "schema_version": "agent_observability.v1",
+        "record_type": "span",
+        "trace_id": "codex:golden-codex",
+        "span_id": "codex-turn:golden-codex:turn-codex",
+        "parent_span_id": "codex-session:golden-codex",
+        "span_kind": "turn",
+        "name": "Codex turn turn-codex",
+        "start_time_unix_ms": 1785542401000,
+        "end_time_unix_ms": null,
+        "status": {
+          "code": "unset"
+        },
+        "agent": {
+          "name": "codex"
+        },
+        "project": {
+          "name": "golden-project"
+        },
+        "attributes": {
+          "source": "codex.notify_or_session_jsonl",
+          "event_type": "turn.started",
+          "turn_id": "turn-codex",
+          "session_id": "golden-codex"
+        },
+        "metrics": {},
+        "content": {},
+        "redaction": {
+          "applied": false,
+          "count": 0,
+          "fields": []
+        }
+      },
+      {
+        "schema_version": "agent_observability.v1",
+        "record_type": "span",
+        "trace_id": "codex:golden-codex",
+        "span_id": "codex-llm:golden-codex:turn-codex:request-codex",
+        "parent_span_id": "codex-turn:golden-codex:turn-codex",
+        "span_kind": "llm.request",
+        "name": "Codex LLM gpt-golden",
+        "start_time_unix_ms": 1785542402000,
+        "end_time_unix_ms": null,
+        "status": {
+          "code": "ok"
+        },
+        "agent": {
+          "name": "codex",
+          "model": "gpt-golden"
+        },
+        "project": {
+          "name": "golden-project"
+        },
+        "attributes": {
+          "source": "codex.notify_or_session_jsonl",
+          "event_type": "llm.completed",
+          "turn_id": "turn-codex",
+          "session_id": "golden-codex",
+          "request_id": "request-codex"
+        },
+        "metrics": {
+          "input_tokens": 100,
+          "output_tokens": 40,
+          "cached_input_tokens": 20,
+          "reasoning_output_tokens": 10
+        },
+        "content": {},
+        "redaction": {
+          "applied": false,
+          "count": 0,
+          "fields": []
+        }
+      }
+    ],
+    "claude_code": [
+      {
+        "schema_version": "agent_observability.v1",
+        "record_type": "span",
+        "trace_id": "claude-code:golden-claude",
+        "span_id": "claude-code-session:golden-claude",
+        "parent_span_id": null,
+        "span_kind": "agent.session",
+        "name": "Claude Code session",
+        "start_time_unix_ms": 1785542460000,
+        "end_time_unix_ms": null,
+        "status": {
+          "code": "unset"
+        },
+        "agent": {
+          "name": "claude-code",
+          "model": "claude-golden"
+        },
+        "project": {
+          "name": "golden-project"
+        },
+        "attributes": {
+          "source": "claude_code.hook",
+          "event_type": "session.started",
+          "envelope_type": "SessionStart",
+          "session_id": "golden-claude"
+        },
+        "metrics": {},
+        "content": {},
+        "redaction": {
+          "applied": false,
+          "count": 0,
+          "fields": []
+        }
+      },
+      {
+        "schema_version": "agent_observability.v1",
+        "record_type": "span",
+        "trace_id": "claude-code:golden-claude",
+        "span_id": "claude-code-turn:golden-claude:turn-claude",
+        "parent_span_id": "claude-code-session:golden-claude",
+        "span_kind": "turn",
+        "name": "Claude Code turn turn-claude",
+        "start_time_unix_ms": 1785542461000,
+        "end_time_unix_ms": null,
+        "status": {
+          "code": "unset"
+        },
+        "agent": {
+          "name": "claude-code"
+        },
+        "project": {
+          "name": "golden-project"
+        },
+        "attributes": {
+          "source": "claude_code.hook",
+          "event_type": "turn.started",
+          "envelope_type": "UserPromptSubmit",
+          "turn_id": "turn-claude",
+          "session_id": "golden-claude"
+        },
+        "metrics": {},
+        "content": {},
+        "redaction": {
+          "applied": false,
+          "count": 0,
+          "fields": []
+        }
+      },
+      {
+        "schema_version": "agent_observability.v1",
+        "record_type": "span",
+        "trace_id": "claude-code:golden-claude",
+        "span_id": "claude-code-llm:golden-claude:turn-claude:request-claude",
+        "parent_span_id": "claude-code-turn:golden-claude:turn-claude",
+        "span_kind": "llm.request",
+        "name": "Claude Code LLM claude-golden",
+        "start_time_unix_ms": 1785542462000,
+        "end_time_unix_ms": null,
+        "status": {
+          "code": "ok"
+        },
+        "agent": {
+          "name": "claude-code",
+          "model": "claude-golden"
+        },
+        "project": {
+          "name": "golden-project"
+        },
+        "attributes": {
+          "source": "claude_code.transcript",
+          "event_type": "llm.completed",
+          "envelope_type": "assistant",
+          "turn_id": "turn-claude",
+          "session_id": "golden-claude",
+          "request_id": "request-claude"
+        },
+        "metrics": {
+          "input_tokens": 80,
+          "output_tokens": 30,
+          "cached_input_tokens": 8,
+          "cache_creation_input_tokens": 4
+        },
+        "content": {},
+        "redaction": {
+          "applied": false,
+          "count": 0,
+          "fields": []
+        }
+      }
+    ]
+  },
+  "report_full": {
+    "schemaVersion": "agent_observability.report.v1",
+    "generatedAt": "2026-08-01T01:00:00.000Z",
+    "title": "Agent Observability Report",
+    "summary": {
+      "generatedSpans": 6,
+      "sessions": 2,
+      "turns": 2,
+      "llmRequests": 2,
+      "toolExecutions": 0,
+      "errors": 0,
+      "inputTokens": 180,
+      "outputTokens": 70,
+      "cachedInputTokens": 28,
+      "cacheCreationInputTokens": 4,
+      "reasoningOutputTokens": 10,
+      "latencyMs": 0,
+      "durationMs": 0,
+      "estimatedCost": 0.001118
+    },
+    "cost": {
+      "status": "estimated",
+      "estimated_cost": 0.001118,
+      "currency": "USD",
+      "rate_table": {
+        "version": "golden-rates",
+        "unit": "per_1m_tokens"
+      },
+      "cost": {
+        "assumption": "Golden fixture rates.",
+        "incomplete_count": 0,
+        "unknown_count": 0
+      }
+    },
+    "filters": {
+      "repos": [
+        "golden-project"
+      ],
+      "sessions": [
+        "id:sha256:118dd9da522133ccb49909f7799729afb08b30af4a468db704431743b66986d7",
+        "id:sha256:177eb75276c51ae6dbe8f202f93dfa1becf969e195b38512745754083c99bf6d"
+      ],
+      "turns": [
+        "id:sha256:985ad7b74961ae33c5ef59a56780bd95601c0a4f999dcb94646bc0e23199aaeb",
+        "id:sha256:f49289cdeb433353f08a4c6ad9f9d701a430af0e550de1fa3e233f170eb41bd3"
+      ]
+    },
+    "traces": [
+      {
+        "traceId": "id:sha256:78f5b7e69f24f356e0bbb3ec4316504caed0e8d42bb5025a7a6c2d0c641cb73a",
+        "repo": "golden-project",
+        "spans": 3,
+        "errors": 0,
+        "inputTokens": 100,
+        "outputTokens": 40,
+        "estimatedCost": 0.00062,
+        "startTimeUnixMs": 1785542400000,
+        "endTimeUnixMs": null,
+        "sessions": [
+          "id:sha256:177eb75276c51ae6dbe8f202f93dfa1becf969e195b38512745754083c99bf6d"
+        ],
+        "turns": [
+          "id:sha256:f49289cdeb433353f08a4c6ad9f9d701a430af0e550de1fa3e233f170eb41bd3"
+        ]
+      },
+      {
+        "traceId": "id:sha256:920abbc0bddae67b7cd570e3b03af649270b4ff5fc566665e39831016e5bcc20",
+        "repo": "golden-project",
+        "spans": 3,
+        "errors": 0,
+        "inputTokens": 80,
+        "outputTokens": 30,
+        "estimatedCost": 0.000498,
+        "startTimeUnixMs": 1785542460000,
+        "endTimeUnixMs": null,
+        "sessions": [
+          "id:sha256:118dd9da522133ccb49909f7799729afb08b30af4a468db704431743b66986d7"
+        ],
+        "turns": [
+          "id:sha256:985ad7b74961ae33c5ef59a56780bd95601c0a4f999dcb94646bc0e23199aaeb"
+        ]
+      }
+    ],
+    "spans": [
+      {
+        "schemaVersion": "agent_observability.v1",
+        "traceId": "id:sha256:78f5b7e69f24f356e0bbb3ec4316504caed0e8d42bb5025a7a6c2d0c641cb73a",
+        "spanId": "id:sha256:14fce16180ca2c8dbd951f4974c306f0ab242f9067f421391758b7faa2b1ad20",
+        "parentSpanId": null,
+        "kind": "agent.session",
+        "name": "codex session",
+        "status": "unset",
+        "startTimeUnixMs": 1785542400000,
+        "endTimeUnixMs": null,
+        "repo": "golden-project",
+        "agent": {
+          "name": "codex",
+          "model": "gpt-golden"
+        },
+        "sessionId": "id:sha256:177eb75276c51ae6dbe8f202f93dfa1becf969e195b38512745754083c99bf6d",
+        "attributes": {
+          "source": "codex.notify_or_session_jsonl",
+          "event_type": "session.started",
+          "session_id": "id:sha256:177eb75276c51ae6dbe8f202f93dfa1becf969e195b38512745754083c99bf6d"
+        },
+        "metrics": {},
+        "cost": {
+          "status": "unknown",
+          "reason": "missing_token_metrics",
+          "currency": "USD",
+          "model": "gpt-golden",
+          "rate_table": {
+            "version": "golden-rates",
+            "unit": "per_1m_tokens"
+          },
+          "cost": {
+            "assumption": "Golden fixture rates."
+          }
+        }
+      },
+      {
+        "schemaVersion": "agent_observability.v1",
+        "traceId": "id:sha256:78f5b7e69f24f356e0bbb3ec4316504caed0e8d42bb5025a7a6c2d0c641cb73a",
+        "spanId": "id:sha256:79f5ab87045659b95803ba4d7a9fd5773387acb6be79d21b3d357c26a15b52d7",
+        "parentSpanId": "id:sha256:14fce16180ca2c8dbd951f4974c306f0ab242f9067f421391758b7faa2b1ad20",
+        "kind": "turn",
+        "name": "Turn",
+        "status": "unset",
+        "startTimeUnixMs": 1785542401000,
+        "endTimeUnixMs": null,
+        "repo": "golden-project",
+        "agent": {
+          "name": "codex"
+        },
+        "sessionId": "id:sha256:177eb75276c51ae6dbe8f202f93dfa1becf969e195b38512745754083c99bf6d",
+        "turnId": "id:sha256:f49289cdeb433353f08a4c6ad9f9d701a430af0e550de1fa3e233f170eb41bd3",
+        "attributes": {
+          "source": "codex.notify_or_session_jsonl",
+          "event_type": "turn.started",
+          "session_id": "id:sha256:177eb75276c51ae6dbe8f202f93dfa1becf969e195b38512745754083c99bf6d",
+          "turn_id": "id:sha256:f49289cdeb433353f08a4c6ad9f9d701a430af0e550de1fa3e233f170eb41bd3"
+        },
+        "metrics": {},
+        "cost": {
+          "status": "unknown",
+          "reason": "missing_model",
+          "currency": "USD",
+          "rate_table": {
+            "version": "golden-rates",
+            "unit": "per_1m_tokens"
+          },
+          "cost": {
+            "assumption": "Golden fixture rates."
+          }
+        }
+      },
+      {
+        "schemaVersion": "agent_observability.v1",
+        "traceId": "id:sha256:78f5b7e69f24f356e0bbb3ec4316504caed0e8d42bb5025a7a6c2d0c641cb73a",
+        "spanId": "id:sha256:139f14a519b52e6a4c6d0fd8b589c793b9acb41b8c83eac44672ed8a8e2406b9",
+        "parentSpanId": "id:sha256:79f5ab87045659b95803ba4d7a9fd5773387acb6be79d21b3d357c26a15b52d7",
+        "kind": "llm.request",
+        "name": "LLM gpt-golden",
+        "status": "ok",
+        "startTimeUnixMs": 1785542402000,
+        "endTimeUnixMs": null,
+        "repo": "golden-project",
+        "agent": {
+          "name": "codex",
+          "model": "gpt-golden"
+        },
+        "sessionId": "id:sha256:177eb75276c51ae6dbe8f202f93dfa1becf969e195b38512745754083c99bf6d",
+        "turnId": "id:sha256:f49289cdeb433353f08a4c6ad9f9d701a430af0e550de1fa3e233f170eb41bd3",
+        "attributes": {
+          "source": "codex.notify_or_session_jsonl",
+          "event_type": "llm.completed",
+          "session_id": "id:sha256:177eb75276c51ae6dbe8f202f93dfa1becf969e195b38512745754083c99bf6d",
+          "turn_id": "id:sha256:f49289cdeb433353f08a4c6ad9f9d701a430af0e550de1fa3e233f170eb41bd3",
+          "request_id": "id:sha256:a85ef5a9b30c198b8b2d9b31dbcee047e6865daadd778ad721156344f5b1a2d0"
+        },
+        "metrics": {
+          "inputTokens": 100,
+          "outputTokens": 40,
+          "cachedInputTokens": 20,
+          "reasoningOutputTokens": 10
+        },
+        "estimatedCost": 0.00062,
+        "cost": {
+          "status": "estimated",
+          "estimated_cost": 0.00062,
+          "currency": "USD",
+          "model": "gpt-golden",
+          "rate_table": {
+            "version": "golden-rates",
+            "unit": "per_1m_tokens"
+          },
+          "cost": {
+            "assumption": "Golden fixture rates.",
+            "components": {
+              "input_tokens": {
+                "tokens": 80,
+                "rate_per_1m": 2,
+                "estimated_cost": 0.00016
+              },
+              "output_tokens": {
+                "tokens": 30,
+                "rate_per_1m": 8,
+                "estimated_cost": 0.00024
+              },
+              "cached_input_tokens": {
+                "tokens": 20,
+                "rate_per_1m": 1,
+                "estimated_cost": 0.00002
+              },
+              "reasoning_output_tokens": {
+                "tokens": 10,
+                "rate_per_1m": 20,
+                "estimated_cost": 0.0002
+              }
+            }
+          }
+        }
+      },
+      {
+        "schemaVersion": "agent_observability.v1",
+        "traceId": "id:sha256:920abbc0bddae67b7cd570e3b03af649270b4ff5fc566665e39831016e5bcc20",
+        "spanId": "id:sha256:2fa3e180727364fd232a42aac3a173613ff4ad79af85a57b03b36b97459d7a07",
+        "parentSpanId": null,
+        "kind": "agent.session",
+        "name": "claude-code session",
+        "status": "unset",
+        "startTimeUnixMs": 1785542460000,
+        "endTimeUnixMs": null,
+        "repo": "golden-project",
+        "agent": {
+          "name": "claude-code",
+          "model": "claude-golden"
+        },
+        "sessionId": "id:sha256:118dd9da522133ccb49909f7799729afb08b30af4a468db704431743b66986d7",
+        "attributes": {
+          "source": "claude_code.hook",
+          "event_type": "session.started",
+          "envelope_type": "SessionStart",
+          "session_id": "id:sha256:118dd9da522133ccb49909f7799729afb08b30af4a468db704431743b66986d7"
+        },
+        "metrics": {},
+        "cost": {
+          "status": "unknown",
+          "reason": "missing_token_metrics",
+          "currency": "USD",
+          "model": "claude-golden",
+          "rate_table": {
+            "version": "golden-rates",
+            "unit": "per_1m_tokens"
+          },
+          "cost": {
+            "assumption": "Golden fixture rates."
+          }
+        }
+      },
+      {
+        "schemaVersion": "agent_observability.v1",
+        "traceId": "id:sha256:920abbc0bddae67b7cd570e3b03af649270b4ff5fc566665e39831016e5bcc20",
+        "spanId": "id:sha256:91b088ea969b1210709dc9694d35fa2e111e34c2a80a3216397a7a7d41b12a47",
+        "parentSpanId": "id:sha256:2fa3e180727364fd232a42aac3a173613ff4ad79af85a57b03b36b97459d7a07",
+        "kind": "turn",
+        "name": "Turn",
+        "status": "unset",
+        "startTimeUnixMs": 1785542461000,
+        "endTimeUnixMs": null,
+        "repo": "golden-project",
+        "agent": {
+          "name": "claude-code"
+        },
+        "sessionId": "id:sha256:118dd9da522133ccb49909f7799729afb08b30af4a468db704431743b66986d7",
+        "turnId": "id:sha256:985ad7b74961ae33c5ef59a56780bd95601c0a4f999dcb94646bc0e23199aaeb",
+        "attributes": {
+          "source": "claude_code.hook",
+          "event_type": "turn.started",
+          "envelope_type": "UserPromptSubmit",
+          "session_id": "id:sha256:118dd9da522133ccb49909f7799729afb08b30af4a468db704431743b66986d7",
+          "turn_id": "id:sha256:985ad7b74961ae33c5ef59a56780bd95601c0a4f999dcb94646bc0e23199aaeb"
+        },
+        "metrics": {},
+        "cost": {
+          "status": "unknown",
+          "reason": "missing_model",
+          "currency": "USD",
+          "rate_table": {
+            "version": "golden-rates",
+            "unit": "per_1m_tokens"
+          },
+          "cost": {
+            "assumption": "Golden fixture rates."
+          }
+        }
+      },
+      {
+        "schemaVersion": "agent_observability.v1",
+        "traceId": "id:sha256:920abbc0bddae67b7cd570e3b03af649270b4ff5fc566665e39831016e5bcc20",
+        "spanId": "id:sha256:b4167a97d18b7b5bc15f2d52bf72cb1b62c96ce4d93704dce48d7b03a299510c",
+        "parentSpanId": "id:sha256:91b088ea969b1210709dc9694d35fa2e111e34c2a80a3216397a7a7d41b12a47",
+        "kind": "llm.request",
+        "name": "LLM claude-golden",
+        "status": "ok",
+        "startTimeUnixMs": 1785542462000,
+        "endTimeUnixMs": null,
+        "repo": "golden-project",
+        "agent": {
+          "name": "claude-code",
+          "model": "claude-golden"
+        },
+        "sessionId": "id:sha256:118dd9da522133ccb49909f7799729afb08b30af4a468db704431743b66986d7",
+        "turnId": "id:sha256:985ad7b74961ae33c5ef59a56780bd95601c0a4f999dcb94646bc0e23199aaeb",
+        "attributes": {
+          "source": "claude_code.transcript",
+          "event_type": "llm.completed",
+          "envelope_type": "assistant",
+          "session_id": "id:sha256:118dd9da522133ccb49909f7799729afb08b30af4a468db704431743b66986d7",
+          "turn_id": "id:sha256:985ad7b74961ae33c5ef59a56780bd95601c0a4f999dcb94646bc0e23199aaeb",
+          "request_id": "id:sha256:536180180ecb7526795b4331265e0b505c02edd7b57767e973ebc44788986acc"
+        },
+        "metrics": {
+          "inputTokens": 80,
+          "outputTokens": 30,
+          "cachedInputTokens": 8,
+          "cacheCreationInputTokens": 4
+        },
+        "estimatedCost": 0.000498,
+        "cost": {
+          "status": "estimated",
+          "estimated_cost": 0.000498,
+          "currency": "USD",
+          "model": "claude-golden",
+          "rate_table": {
+            "version": "golden-rates",
+            "unit": "per_1m_tokens"
+          },
+          "cost": {
+            "assumption": "Golden fixture rates.",
+            "components": {
+              "input_tokens": {
+                "tokens": 68,
+                "rate_per_1m": 3,
+                "estimated_cost": 0.000204
+              },
+              "output_tokens": {
+                "tokens": 30,
+                "rate_per_1m": 9,
+                "estimated_cost": 0.00027
+              },
+              "cached_input_tokens": {
+                "tokens": 8,
+                "rate_per_1m": 1,
+                "estimated_cost": 0.000008
+              },
+              "cache_creation_input_tokens": {
+                "tokens": 4,
+                "rate_per_1m": 4,
+                "estimated_cost": 0.000016
+              }
+            }
+          }
+        }
+      }
+    ]
   }
 }
