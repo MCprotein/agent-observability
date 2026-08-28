@@ -1,10 +1,28 @@
-use agent_observability_adapter_codex::{AdapterItem, read_handoff_file};
+use agent_observability_adapter_claude_code::{
+    AdapterItem as ClaudeAdapterItem, read_handoff_file as read_claude_handoff_file,
+};
+use agent_observability_adapter_codex::{
+    AdapterItem as CodexAdapterItem, read_handoff_file as read_codex_handoff_file,
+};
+use agent_observability_contracts::{
+    AdapterDispositionCode, AdapterDispositionKind, SourceCheckpoint, SourceObservation,
+};
 use agent_observability_contracts::{CONTRACT_MANIFEST, ContractManifest};
 use agent_observability_local_store::{IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore};
 use std::env;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: agent-observability [contracts|storage-check <directory>|codex-ingest <store-directory> <handoff-jsonl>|version|help]";
+const USAGE: &str = "usage: agent-observability [contracts|storage-check <directory>|codex-ingest <store-directory> <handoff-jsonl>|claude-code-ingest <store-directory> <handoff-jsonl>|version|help]";
+
+enum IngestItem<'a> {
+    Observation(&'a SourceObservation),
+    Disposition {
+        checkpoint: &'a SourceCheckpoint,
+        disposition: AdapterDispositionKind,
+        code: AdapterDispositionCode,
+        payload_hash: Option<&'a str>,
+    },
+}
 
 fn main() -> ExitCode {
     match run(env::args().skip(1)) {
@@ -39,52 +57,40 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
             ))
         }
         [command, directory, handoff] if command == "codex-ingest" => {
-            let batch = read_handoff_file(handoff).map_err(|error| error.to_string())?;
-            let mut store = LocalStore::open(directory).map_err(|error| error.to_string())?;
-            let mut observations = 0_u64;
-            let mut diagnostics = 0_u64;
-            let mut suppressed = 0_u64;
-            let ingest_result: Result<(), String> =
-                batch.items.iter().try_for_each(|item| match item {
-                    AdapterItem::Observation(observation) => {
-                        let status = store
-                            .ingest_deferred_projection(observation)
-                            .map_err(|error| error.to_string())?;
-                        if status == IngestStatus::Suppressed {
-                            suppressed += 1;
-                        } else {
-                            observations += 1;
-                        }
-                        Ok(())
+            let batch = read_codex_handoff_file(handoff).map_err(|error| error.to_string())?;
+            ingest_items(
+                directory,
+                "codex",
+                batch.items.iter().map(|item| match item {
+                    CodexAdapterItem::Observation(observation) => {
+                        IngestItem::Observation(observation)
                     }
-                    AdapterItem::Disposition(diagnostic) => {
-                        store
-                            .ingest_disposition_with_payload(
-                                &diagnostic.checkpoint,
-                                diagnostic.disposition,
-                                diagnostic.code,
-                                diagnostic.payload_hash.as_deref(),
-                            )
-                            .map_err(|error| error.to_string())?;
-                        match diagnostic.disposition {
-                            agent_observability_contracts::AdapterDispositionKind::Diagnostic => {
-                                diagnostics += 1;
-                            }
-                            agent_observability_contracts::AdapterDispositionKind::Suppressed => {
-                                suppressed += 1;
-                            }
-                        }
-                        Ok(())
+                    CodexAdapterItem::Disposition(diagnostic) => IngestItem::Disposition {
+                        checkpoint: &diagnostic.checkpoint,
+                        disposition: diagnostic.disposition,
+                        code: diagnostic.code,
+                        payload_hash: diagnostic.payload_hash.as_deref(),
+                    },
+                }),
+            )
+        }
+        [command, directory, handoff] if command == "claude-code-ingest" => {
+            let batch = read_claude_handoff_file(handoff).map_err(|error| error.to_string())?;
+            ingest_items(
+                directory,
+                "claude-code",
+                batch.items.iter().map(|item| match item {
+                    ClaudeAdapterItem::Observation(observation) => {
+                        IngestItem::Observation(observation)
                     }
-                });
-            let projection_result = store
-                .rebuild_projection()
-                .map_err(|error| error.to_string());
-            ingest_result?;
-            projection_result?;
-            Ok(format!(
-                "source=codex\nobservations={observations}\ndiagnostics={diagnostics}\nsuppressed={suppressed}\nteam_ingest=disabled"
-            ))
+                    ClaudeAdapterItem::Disposition(diagnostic) => IngestItem::Disposition {
+                        checkpoint: &diagnostic.checkpoint,
+                        disposition: diagnostic.disposition,
+                        code: diagnostic.code,
+                        payload_hash: diagnostic.payload_hash.as_deref(),
+                    },
+                }),
+            )
         }
         [command] if matches!(command.as_str(), "version" | "--version" | "-V") => {
             Ok(env!("CARGO_PKG_VERSION").into())
@@ -94,6 +100,51 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
         [command] => Err(format!("unknown command {command}")),
         _ => Err(USAGE.into()),
     }
+}
+
+fn ingest_items<'a>(
+    directory: &str,
+    source: &str,
+    items: impl Iterator<Item = IngestItem<'a>>,
+) -> Result<String, String> {
+    let mut store = LocalStore::open(directory).map_err(|error| error.to_string())?;
+    let mut observations = 0_u64;
+    let mut diagnostics = 0_u64;
+    let mut suppressed = 0_u64;
+    for item in items {
+        match item {
+            IngestItem::Observation(observation) => {
+                let status = store
+                    .ingest_deferred_projection(observation)
+                    .map_err(|error| error.to_string())?;
+                if status == IngestStatus::Suppressed {
+                    suppressed += 1;
+                } else {
+                    observations += 1;
+                }
+            }
+            IngestItem::Disposition {
+                checkpoint,
+                disposition,
+                code,
+                payload_hash,
+            } => {
+                store
+                    .ingest_disposition_with_payload(checkpoint, disposition, code, payload_hash)
+                    .map_err(|error| error.to_string())?;
+                match disposition {
+                    AdapterDispositionKind::Diagnostic => diagnostics += 1,
+                    AdapterDispositionKind::Suppressed => suppressed += 1,
+                }
+            }
+        }
+    }
+    store
+        .rebuild_projection()
+        .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "source={source}\nobservations={observations}\ndiagnostics={diagnostics}\nsuppressed={suppressed}\nteam_ingest=disabled"
+    ))
 }
 
 #[cfg(test)]

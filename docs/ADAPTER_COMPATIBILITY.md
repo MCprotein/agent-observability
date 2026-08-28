@@ -1,6 +1,6 @@
 # Adapter Compatibility Contract
 
-Status: Codex experimental entry implemented; remaining adapters proposed
+Status: Codex and Claude Code experimental entries implemented; Cursor proposed
 Last verified: 2026-08-28
 
 이 문서는 Codex, Claude Code, Cursor adapter가 어떤 공식 surface를 어떤 우선순위로 사용하고,
@@ -55,10 +55,10 @@ Each entry in `crates/contracts/capabilities/adapter-capability-v1.yaml` contain
 - correlation keys, closed privacy flags, known gaps, fixture IDs and input/projection fixture hashes
 
 `cargo test -p agent-observability-contracts adapter_capability_v1` validates schema, field ownership and
-privacy closure. The Codex adapter suite verifies declared input/projection fixture hashes, exact replay output,
-bounded input, restart, rotation and privacy behavior. Cross-version/OS/profile execution, foreground deadline
-and load evidence remain future support gates; the manifest therefore
-marks Codex `0.150.1` as `experimental`, not generally supported.
+privacy closure. The Codex and Claude Code adapter suites verify declared input/projection fixture hashes, exact
+replay output, bounded input, restart/idempotency and privacy behavior. Claude Code additionally locks permission,
+compaction, interrupted lifecycle and out-of-order timestamp fixtures. Cross-version/OS/profile execution,
+foreground deadline and load evidence remain future support gates; both entries therefore remain `experimental`.
 
 | Scenario | Required evidence |
 | --- | --- |
@@ -76,8 +76,9 @@ version and rerun when an official surface or schema changes.
 
 ## Current planning assumptions
 
-The JavaScript baseline retains partial Codex and Claude Code file/hook adapters. The Rust Codex adapter now
-implements a bounded canonical handoff parser, primary/supplement dedupe, fixed-code disposition persistence,
-fixture hash validation and CLI-to-private-store replay. It does not implement an OTLP HTTP/gRPC receiver or
-foreground notify spool writer, and official documentation does not freeze concrete OTLP attribute keys.
-Claude Code/Cursor Rust adapters, cross-version verification and full performance evidence remain roadmap work.
+The JavaScript baseline retains partial Codex and Claude Code file/hook adapters. Rust Codex and Claude Code
+adapters implement bounded canonical handoff parsers, fixed source precedence, content-free dispositions,
+fixture hash validation and CLI-to-private-store replay. Claude Code uses documented OTel events as primary,
+hooks only for lifecycle, and does not parse the explicitly internal transcript format. Neither adapter includes
+an OTLP HTTP/gRPC receiver or foreground spool writer. Cursor Rust support, cross-version execution and full
+performance evidence remain roadmap work.

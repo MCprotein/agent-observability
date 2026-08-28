@@ -809,6 +809,8 @@ fn metrics_from_usage(usage: &TokenUsage) -> Result<MetricsV1, ContractError> {
             .map(exact_json_integer)
             .transpose()?,
         context_window_tokens: usage.context_window.map(exact_json_integer).transpose()?,
+        input_tokens_before: usage.input_before.map(exact_json_integer).transpose()?,
+        input_tokens_after: usage.input_after.map(exact_json_integer).transpose()?,
         ..MetricsV1::default()
     })
 }
@@ -1603,6 +1605,16 @@ mod tests {
         assert_eq!(codex.product_versions.oldest, "0.150.1");
         assert!(!codex.privacy.content_fields_accepted);
         assert!(!codex.privacy.raw_identifiers_durable);
+        let claude = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.adapter_family == "claude-code")
+            .expect("Claude Code capability exists");
+        assert_eq!(claude.support_status, "experimental");
+        assert_eq!(claude.product_versions.oldest, "2.1.248");
+        assert_eq!(claude.product_versions.newest, "2.1.248");
+        assert!(!claude.privacy.content_fields_accepted);
+        assert!(!claude.privacy.raw_identifiers_durable);
     }
 
     #[test]

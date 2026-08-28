@@ -6,10 +6,10 @@
 
 ## Current and target stack
 
-현재 `v0.9.0`은 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
-보존하면서 experimental Rust Codex adapter를 추가한다. Rust 경로는 closed contract,
+현재 `v0.10.0`은 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
+보존하면서 experimental Rust Codex와 Claude Code adapter를 제공한다. Rust 경로는 closed contract,
 deterministic lifecycle reduction, topology validation, pricing/report projection, bounded Codex
-handoff와 private embedded transaction을 구현한다. SQLite `local_state.v2`가 source cursor,
+및 Claude Code handoff와 private embedded transaction을 구현한다. SQLite `local_state.v2`가 source cursor,
 stable observation, current reduced record, adapter disposition과 profile-neutral delivery outcome의
 정본이며 JSONL은 정본에서 재생성하는 projection이다. Team envelope, outbox와 network는 활성
 계약이 아니다.
@@ -85,11 +85,12 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
-v0.9.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
+v0.10.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
+`crates/adapter-claude-code`,
 `crates/application`, `crates/local-store`, `crates/cli`로 나뉜다. domain은 외부 형식을
 모르고, contracts는 transient
 source와 durable/report DTO 경계를 소유한다. application은 pricing과 report projection을,
-adapter-codex는 source precedence/correlation/dedupe를, local-store는 SQLite transaction과 JSONL
+inbound adapters는 제품별 source precedence/correlation/dedupe를, local-store는 SQLite transaction과 JSONL
 projection을, CLI는 composition root를 소유한다.
 `contracts/*.schema.json`은 closed wire contract이고 `contracts/contract-manifest.v1`은 현재
 활성 schema path/version과 `team_ingest=disabled` 경계를 runtime 중립적으로 고정한다.

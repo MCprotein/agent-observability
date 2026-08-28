@@ -93,6 +93,8 @@ pub struct TokenUsage {
     pub total_reasoning_output: Option<u64>,
     pub total_accumulated: Option<u64>,
     pub context_window: Option<u64>,
+    pub input_before: Option<u64>,
+    pub input_after: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

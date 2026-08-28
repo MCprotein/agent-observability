@@ -889,6 +889,10 @@ struct StoredTokenUsage {
     total_reasoning_output: Option<u64>,
     total_accumulated: Option<u64>,
     context_window: Option<u64>,
+    #[serde(default)]
+    input_before: Option<u64>,
+    #[serde(default)]
+    input_after: Option<u64>,
 }
 
 fn state_to_json(state: &DomainSpanState) -> Result<String, StoreError> {
@@ -948,6 +952,8 @@ fn state_to_json(state: &DomainSpanState) -> Result<String, StoreError> {
             total_reasoning_output: state.token_usage.total_reasoning_output,
             total_accumulated: state.token_usage.total_accumulated,
             context_window: state.token_usage.context_window,
+            input_before: state.token_usage.input_before,
+            input_after: state.token_usage.input_after,
         },
     })?)
 }
@@ -987,6 +993,8 @@ fn state_from_json(value: &str) -> Result<DomainSpanState, StoreError> {
             total_reasoning_output: stored.token_usage.total_reasoning_output,
             total_accumulated: stored.token_usage.total_accumulated,
             context_window: stored.token_usage.context_window,
+            input_before: stored.token_usage.input_before,
+            input_after: stored.token_usage.input_after,
         },
     })
 }

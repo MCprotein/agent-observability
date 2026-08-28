@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/adapter-claude-code",
     "crates/adapter-codex",
     "crates/application",
     "crates/cli",
@@ -10,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 license = "UNLICENSED"
 rust-version = "1.97"

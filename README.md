@@ -7,10 +7,10 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 `v0.9.0`은 JavaScript migration baseline 위에 experimental Rust Codex
-adapter를 추가한다. Rust 경로는 bounded canonical handoff JSONL에서 OTel log/notify signal을
-정규화해 private local state에 저장한다. Native OTel endpoint와 foreground notify spool writer,
-Claude Code/Cursor Rust adapter, Rust static HTML 생성은 아직 구현하지 않았다.
+현재 `v0.10.0`은 JavaScript migration baseline 위에 experimental Rust Codex와 Claude Code
+adapter를 제공한다. Rust 경로는 bounded canonical handoff JSONL에서 각 제품의 OTel log와
+lifecycle supplement를 정규화해 private local state에 저장한다. Native OTel endpoint와 foreground
+spool writer, Cursor Rust adapter, Rust static HTML 생성은 아직 구현하지 않았다.
 
 현재 구현 기술은 Node.js 20+ ESM JavaScript 기준선과 Rust 1.97 Cargo workspace다.
 Rust workspace는 다음 책임으로 분리된다.
@@ -20,6 +20,8 @@ Rust workspace는 다음 책임으로 분리된다.
   `ReportDtoV1`, adapter capability와 disposition checkpoint contract
 - `crates/adapter-codex`: bounded Codex handoff parser, canonical correlation,
   primary/supplement dedupe, content-free diagnostic
+- `crates/adapter-claude-code`: Claude Code OTel/hook precedence, permission/compaction,
+  interrupted lifecycle와 out-of-order timestamp normalization
 - `crates/application`: pricing policy와 privacy-safe report DTO projection
 - `crates/local-store`: private SQLite authority, atomic cursor/event/current-record/disposition
   commit, replayable JSONL projection, `local_state.v1` -> `local_state.v2` migration
@@ -72,10 +74,11 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p agent-observability-cli -- contracts
 cargo run -p agent-observability-cli -- codex-ingest <private-store-dir> <private-handoff.jsonl>
+cargo run -p agent-observability-cli -- claude-code-ingest <private-store-dir> <private-handoff.jsonl>
 ```
 
-`v0.9.0` Rust Codex adapter는 구현, privacy/replay 검증과 독립 리뷰가 완료되었다. 다음 release
-train은 `v0.10.0` Rust Claude Code adapter다.
+`v0.10.0` Rust Claude Code adapter는 구현과 privacy/replay fixture 검증을 완료했으며 독립 리뷰를
+release gate로 실행한다. 다음 release train은 `v0.11.0` Rust Cursor adapter다.
 
 ## 아키텍처 요약
 
@@ -92,15 +95,15 @@ Codex / Claude Code
              |-> local JSONL -> JS report projection -> self-contained HTML
              `-> redacted JSON snapshot
 
-CURRENT v0.9 - IMPLEMENTED (experimental Rust Codex adapter)
+CURRENT v0.10 - IMPLEMENTED (experimental Rust Codex + Claude Code adapters)
 
 Closed schemas + manifest -> deterministic domain reducer + fail-closed projectors
-Codex OTel/notify canonical handoff -> bounded Rust adapter
+Codex OTel/notify or Claude Code OTel/hook canonical handoff -> bounded Rust adapters
         -> SourceObservation or fixed-code diagnostic/suppression
         -> private SQLite authority (cursor + stable event + current record + disposition)
              `-> replayable JSONL current-record projection
 Pricing policy + aggregation -> ReportDtoV1
-Rust CLI -> contracts inspection / local storage health check / Codex handoff ingest
+Rust CLI -> contracts inspection / local storage health check / Codex and Claude Code handoff ingest
 No Node.js <-> Rust FFI or subprocess production path
 
 TARGET - PLANNED (Rust + TypeScript)
@@ -600,46 +603,46 @@ unsupported/content event는 private disposition ledger에서 cursor와 함께 �
 
 현재 Rust 흐름:
 
-1. foreground receiver/shim이 OTel 또는 notify payload를 최대 1 MiB, 4096 record,
-   record당 64 KiB인 private `codex_handoff.v1` JSONL로 넘긴다.
-2. adapter가 conversation/turn/request/call tuple을 길이 구분 digest span ID로 만든다.
+1. foreground receiver/shim이 OTel 또는 lifecycle supplement payload를 최대 1 MiB, 4096 record,
+   record당 64 KiB인 private `codex_handoff.v1` 또는 `claude_handoff.v1` JSONL로 넘긴다.
+2. adapter가 공식 session/prompt/request/tool tuple을 길이 구분 digest span ID로 만든다.
 3. allowlisted model/token/duration/status/tool/decision만 `SourceObservation`으로 옮긴다.
 4. prompt, assistant message, tool output, cwd와 임의 오류 문자열은 복사하지 않는다.
-5. background `codex-ingest`가 observation 또는 fixed-code disposition을 순서대로 commit하고
-   JSONL projection을 batch 마지막에 한 번 재생성한다.
+5. background `codex-ingest` 또는 `claude-code-ingest`가 observation과 fixed-code disposition을
+   순서대로 commit하고 JSONL projection을 batch 마지막에 한 번 재생성한다.
 
 현재 제한:
 
 - 공식 문서는 대표 OTel event 의미를 설명하지만 실제 OTLP attribute key를 고정하지 않는다.
   따라서 handoff producer는 별도 versioned canonical mapping이 필요하며 미확인 key를 추측하지 않는다.
 - native OTel HTTP/gRPC receiver와 foreground notify spool writer는 이 release에 포함되지 않는다.
-- capability는 로컬에서 확인한 Codex CLI `0.150.1`만 experimental로 선언한다.
+- capability는 로컬 실행으로 검증한 Codex CLI `0.150.1`과 Claude Code `2.1.248`만
+  experimental로 선언한다. 공식 문서의 이전 버전 필드 도입 시점은 실행 호환성 증거로 간주하지 않는다.
 
 ## Claude Code Adapter
 
-현재 v0.6.1 baseline은 hook 이벤트와 transcript를 결합한다. Target Rust adapter는 공식 native
-telemetry를 usage/cost/tool metric의 primary로 사용하고 hook을 lifecycle supplement로 사용한다.
+JavaScript v0.6.1 baseline은 hook 이벤트와 transcript를 결합한다. Rust adapter는 공식 native
+telemetry를 usage/tool/permission/compaction의 primary로 사용하고 hook을 session/turn lifecycle
+supplement로만 사용한다. 내부 transcript 형식은 Rust contract dependency가 아니다.
 
 주요 이벤트:
 
 - session start
 - user prompt submit
-- pre tool use
-- post tool use
-- stop
-- permission request
-- permission denied
+- API request
+- tool result
+- tool decision
 - compaction
-- session end
+- stop / stop failure
 
 예상 흐름:
 
-1. session start에서 session state를 초기화한다.
-2. user prompt submit에서 trace id와 parent turn span을 만든다.
-3. pre tool use에서 tool start time을 저장한다.
-4. post tool use에서 tool metadata, duration, exit status, redacted summary를 기록한다.
-5. stop 이후 transcript를 읽는 별도 보강 단계에서 model, token usage를 보강한다.
-6. LLM span과 tool spans를 로컬 event log에 기록한다. 내부 collector 동기화는 Future TODO다.
+1. `SessionStart`에서 session state와 allowlisted model을 초기화한다.
+2. `claude_code.user_prompt`의 `prompt.id`를 turn correlation key로 사용한다.
+3. `claude_code.api_request`에서 model, duration, input/output/cache token을 한 번만 기록한다.
+4. `tool_result`와 `tool_decision`은 `tool_use_id`로 tool/permission observation을 구분한다.
+5. compaction은 trigger, duration, pre/post token만 저장하고 error/summary는 버린다.
+6. `Stop`/`StopFailure`는 turn lifecycle만 보완하며 usage를 다시 만들지 않는다.
 
 동시 hook 입력은 daemon의 local transactional state에서 serialize한다. Hook마다 별도 state file을
 만들거나 team network 완료를 기다리지 않는다.

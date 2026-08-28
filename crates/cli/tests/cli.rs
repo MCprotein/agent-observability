@@ -149,6 +149,60 @@ fn codex_ingest_process_commits_observations_and_bounded_diagnostics() {
 
 #[cfg(unix)]
 #[test]
+fn claude_code_ingest_process_is_private_and_idempotent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-claude-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let handoff = root.join("claude-handoff.jsonl");
+    fs::write(
+        &handoff,
+        include_str!("../../adapter-claude-code/tests/fixtures/claude-handoff.jsonl"),
+    )
+    .unwrap();
+    fs::set_permissions(&handoff, fs::Permissions::from_mode(0o600)).unwrap();
+    let store = root.join("store");
+
+    for _ in 0..2 {
+        let output = binary()
+            .args([
+                "claude-code-ingest",
+                store.to_str().unwrap(),
+                handoff.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("source=claude-code"));
+        assert!(stdout.contains("observations=7"));
+    }
+
+    let projection = fs::read_to_string(store.join("observations.jsonl")).unwrap();
+    assert_eq!(projection.lines().count(), 6);
+    for secret in [
+        "RAW_PROMPT_SECRET",
+        "RAW_RESPONSE_SECRET",
+        "RAW_TOOL_INPUT_SECRET",
+        "RAW_ASSISTANT_SECRET",
+        "raw@example.invalid",
+    ] {
+        assert!(!projection.contains(secret));
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
 fn codex_ingest_process_restarts_from_an_appended_tail() {
     use std::os::unix::fs::PermissionsExt;
 
