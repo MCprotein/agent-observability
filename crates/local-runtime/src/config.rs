@@ -173,7 +173,11 @@ fn private_dir(path: &Path, create: bool) -> Result<(), ConfigError> {
     if create && !path.exists() {
         let mut builder = fs::DirBuilder::new();
         builder.mode(0o700);
-        builder.create(path)?;
+        match builder.create(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
