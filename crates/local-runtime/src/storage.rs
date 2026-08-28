@@ -74,11 +74,17 @@ impl StorageBudget {
         Self::allocated_blocks(path).map(|blocks| blocks * BLOCK)
     }
     pub fn allocated_tree_bytes(path: &Path) -> Result<u64, StorageAccountingError> {
-        let mut pending = vec![path.to_path_buf()];
+        let mut pending = vec![(path.to_path_buf(), true)];
         let mut entries = 1_usize;
         let mut bytes = 0_u64;
-        while let Some(current) = pending.pop() {
-            let metadata = fs::symlink_metadata(&current).map_err(StorageAccountingError::Io)?;
+        while let Some((current, is_root)) = pending.pop() {
+            let metadata = match fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+                Err(error) if !is_root && error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => return Err(StorageAccountingError::Io(error)),
+            };
             if metadata.file_type().is_symlink() {
                 return Err(StorageAccountingError::Symlink);
             }
@@ -86,12 +92,23 @@ impl StorageBudget {
                 .checked_add(allocated_metadata_bytes(&metadata))
                 .ok_or(StorageAccountingError::Overflow)?;
             if metadata.is_dir() {
-                for entry in fs::read_dir(&current).map_err(StorageAccountingError::Io)? {
+                let directory = match fs::read_dir(&current) {
+                    Ok(directory) => directory,
+                    Err(error) if !is_root && error.kind() == std::io::ErrorKind::NotFound => {
+                        continue;
+                    }
+                    Err(error) => return Err(StorageAccountingError::Io(error)),
+                };
+                for entry in directory {
                     entries = entries.saturating_add(1);
                     if entries > MAX_ACCOUNTING_ENTRIES {
                         return Err(StorageAccountingError::EntryLimit);
                     }
-                    pending.push(entry.map_err(StorageAccountingError::Io)?.path());
+                    match entry {
+                        Ok(entry) => pending.push((entry.path(), false)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(StorageAccountingError::Io(error)),
+                    }
                 }
             } else if !metadata.is_file() {
                 return Err(StorageAccountingError::UnsupportedFileType);
@@ -221,6 +238,18 @@ mod tests {
         fs::write(root.join("state/data"), vec![0_u8; 5000]).unwrap();
         assert!(StorageBudget::allocated_tree_bytes(&root).unwrap() >= 8192);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn allocated_tree_still_rejects_a_missing_root() {
+        let root =
+            std::env::temp_dir().join(format!("runtime-accounting-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        assert!(matches!(
+            StorageBudget::allocated_tree_bytes(&root),
+            Err(StorageAccountingError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
     }
 
     #[cfg(unix)]

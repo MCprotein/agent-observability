@@ -20,6 +20,7 @@ workload:
   channel_capacity: 64
   normalization_workers: 1
   enqueue_deadline_ms: 10
+  enabled_rejection_percent_max: 1
   foreground_response: bounded enqueue acceptance, never durable commit
   worker: asynchronous LocalStore drain and final projection rebuild
   command_measurement: subprocess round-trip through bounded local-runtime enqueue; durable commit is asynchronous worker evidence
@@ -53,3 +54,4 @@ evidence:
   output: docs/evidence/local/performance/<run>/manifest.yaml
   required_fields: [machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]
   fail_closed: missing or breached required metrics produce non-zero exit
+  event_reconciliation: after graceful fixture shutdown enabled enqueued events must equal durable observations; every rejection remains explicit

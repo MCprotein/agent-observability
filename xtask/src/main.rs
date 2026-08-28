@@ -16,14 +16,14 @@ use agent_observability_domain::{
     TokenUsage, TraceId,
 };
 use agent_observability_local_runtime::{
-    Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressOutcome, LocalRuntimeConfigV1, PressureSample,
-    RuntimeControl, StorageBudget,
+    Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressMessage, IngressOutcome, LocalRuntimeConfigV1,
+    PressureSample, RuntimeControl, StorageBudget,
 };
 use agent_observability_local_store::LocalStore;
 
 const USAGE: &str = "usage: cargo run -p xtask -- perf local --profile <release|smoke> --check";
 const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-performance-v1.yaml");
-const REQUIRED_PROTOCOL_LINES: [&str; 25] = [
+const REQUIRED_PROTOCOL_LINES: [&str; 27] = [
     "schema_version: local_performance.v1",
     "warmup_seconds: 60",
     "idle_seconds: 900",
@@ -46,8 +46,10 @@ const REQUIRED_PROTOCOL_LINES: [&str; 25] = [
     "channel_capacity: 64",
     "normalization_workers: 1",
     "enqueue_deadline_ms: 10",
+    "enabled_rejection_percent_max: 1",
     "required_fields: [machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]",
     "fail_closed: missing or breached required metrics produce non-zero exit",
+    "event_reconciliation: after graceful fixture shutdown enabled enqueued events must equal durable observations; every rejection remains explicit",
     "output: docs/evidence/local/performance/<run>/manifest.yaml",
 ];
 const SOURCES: [(&str, AgentSource); 3] = [
@@ -111,6 +113,7 @@ struct RunResult {
     run: usize,
     events: usize,
     rejected_events: usize,
+    durable_events: u64,
     latencies_us: Vec<u128>,
     samples: Vec<Sample>,
     durable_bytes: u64,
@@ -346,6 +349,14 @@ fn execute_run(
     }
     let durable_bytes = StorageBudget::allocated_tree_bytes(&path)
         .map_err(|e| format!("measure allocated durable bytes: {e}"))?;
+    let durable_events = if enabled {
+        LocalStore::open(&path)
+            .map_err(|e| format!("reopen durable store for reconciliation: {e}"))?
+            .observation_count()
+            .map_err(|e| format!("count durable observations: {e}"))?
+    } else {
+        0
+    };
     if latencies_us.len() != config.burst || samples.is_empty() {
         return Err("required subprocess latency or resource samples are missing".into());
     }
@@ -354,6 +365,7 @@ fn execute_run(
         run,
         events: latencies_us.len(),
         rejected_events,
+        durable_events,
         latencies_us,
         samples,
         durable_bytes,
@@ -486,7 +498,7 @@ fn worker() -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let drain_path = PathBuf::from(path);
     thread::spawn(move || {
-        let _ = tx.send(drain(receiver, &drain_path));
+        let _ = tx.send(drain(&receiver, &drain_path));
     });
     for line in io::stdin().lock().lines() {
         let command = line.map_err(|e| format!("read worker command: {e}"))?;
@@ -510,38 +522,40 @@ fn worker() -> Result<(), String> {
         .map_err(|_| "local runtime drain stopped".to_string())??;
     Ok(())
 }
-fn drain(
-    receiver: std::sync::mpsc::Receiver<agent_observability_local_runtime::IngressMessage>,
-    path: &Path,
-) -> Result<(), String> {
+fn drain(receiver: &std::sync::mpsc::Receiver<IngressMessage>, path: &Path) -> Result<(), String> {
     let mut store = LocalStore::open(path).map_err(|e| format!("open local durable store: {e}"))?;
     let config = LocalRuntimeConfigV1::default();
     let mut control = RuntimeControl::new(&config).map_err(|e| e.to_string())?;
-    let mut reserved_records = 0_u16;
     let mut previous = BTreeMap::new();
-    for message in receiver {
-        if reserved_records == 0 {
-            if control
-                .admit(path, u64::from(config.collection.max_batch_bytes))
-                .map_err(|e| e.to_string())?
-                == Admission::Denied
-            {
-                return Err("local storage admission denied the durable batch".into());
-            }
-            reserved_records = config.collection.max_batch_records;
+    let mut pending = None;
+    while let Some(messages) = receive_batch(
+        receiver,
+        &mut pending,
+        usize::from(config.collection.max_batch_records),
+        usize::try_from(config.collection.max_batch_bytes).unwrap_or(usize::MAX),
+    )? {
+        if control
+            .admit(path, u64::from(config.collection.max_batch_bytes))
+            .map_err(|e| e.to_string())?
+            == Admission::Denied
+        {
+            return Err("local storage admission denied the durable batch".into());
         }
-        let observation = observation(
-            std::str::from_utf8(&message.0).map_err(|_| "ingress payload is not UTF-8")?,
-            &previous,
-        )?;
-        previous.insert(
-            observation.source.as_str(),
-            observation.source_cursor.clone(),
-        );
+        let mut observations = Vec::with_capacity(messages.len());
+        for message in messages {
+            let observation = observation(
+                std::str::from_utf8(&message.0).map_err(|_| "ingress payload is not UTF-8")?,
+                &previous,
+            )?;
+            previous.insert(
+                observation.source.as_str(),
+                observation.source_cursor.clone(),
+            );
+            observations.push(observation);
+        }
         store
-            .ingest_deferred_projection(&observation)
-            .map_err(|e| format!("local durable commit: {e}"))?;
-        reserved_records = reserved_records.saturating_sub(1);
+            .ingest_batch_deferred_projection(&observations)
+            .map_err(|e| format!("local durable batch commit: {e}"))?;
     }
     let allocated = StorageBudget::allocated_tree_bytes(path)
         .map_err(|e| format!("measure local state: {e}"))?;
@@ -559,6 +573,40 @@ fn drain(
             .map_err(|e| format!("rebuild local projection: {e}"))?;
     }
     Ok(())
+}
+
+fn receive_batch(
+    receiver: &std::sync::mpsc::Receiver<IngressMessage>,
+    pending: &mut Option<IngressMessage>,
+    max_records: usize,
+    max_bytes: usize,
+) -> Result<Option<Vec<IngressMessage>>, String> {
+    let first = match pending.take() {
+        Some(message) => message,
+        None => match receiver.recv() {
+            Ok(message) => message,
+            Err(_) => return Ok(None),
+        },
+    };
+    if first.0.len() > max_bytes || max_records == 0 {
+        return Err("ingress message exceeds the durable batch policy".into());
+    }
+    let mut bytes = first.0.len();
+    let mut batch = Vec::with_capacity(max_records);
+    batch.push(first);
+    while batch.len() < max_records {
+        let message = match receiver.try_recv() {
+            Ok(message) => message,
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+        };
+        if bytes.saturating_add(message.0.len()) > max_bytes {
+            *pending = Some(message);
+            break;
+        }
+        bytes = bytes.saturating_add(message.0.len());
+        batch.push(message);
+    }
+    Ok(Some(batch))
 }
 fn observation(
     command: &str,
@@ -767,7 +815,7 @@ fn render_manifest(config: Config, results: &[RunResult], errors: &[String]) -> 
     for result in results {
         let _ = writeln!(
             out,
-            "  - mode: {}\n    run: {}\n    events: {}\n    rejected_events: {}\n    durable_bytes: {}\n    burst_cpu_percent: {}\n    peak_rss_kib: {}\n    peak_disk_bytes: {}\n    hook_latency_us: {:?}\n    samples:",
+            "  - mode: {}\n    run: {}\n    attempted_events: {}\n    enqueued_events: {}\n    rejected_events: {}\n    durable_events: {}\n    durable_bytes: {}\n    burst_cpu_percent: {}\n    peak_rss_kib: {}\n    peak_disk_bytes: {}\n    hook_latency_us: {:?}\n    samples:",
             if result.enabled {
                 "enabled"
             } else {
@@ -775,7 +823,9 @@ fn render_manifest(config: Config, results: &[RunResult], errors: &[String]) -> 
             },
             result.run,
             result.events,
+            result.events.saturating_sub(result.rejected_events),
             result.rejected_events,
+            result.durable_events,
             result.durable_bytes,
             result.burst_cpu_percent,
             result.peak_rss_kib,
@@ -991,15 +1041,23 @@ fn validate_results(
     if !errors.is_empty() || results.len() != config.runs * 2 {
         return Err("incomplete baseline/enabled evidence".into());
     }
-    if results.iter().any(|r| {
-        r.events != config.burst
-            || r.rejected_events != 0
-            || r.latencies_us.is_empty()
-            || r.samples.is_empty()
-    }) {
+    if results
+        .iter()
+        .any(|r| r.events != config.burst || r.latencies_us.is_empty() || r.samples.is_empty())
+    {
         return Err("incomplete event, latency, or sample evidence".into());
     }
     for result in results {
+        if result.enabled {
+            let enqueued = result.events.saturating_sub(result.rejected_events);
+            if result.durable_events != u64::try_from(enqueued).unwrap_or(u64::MAX)
+                || result.rejected_events.saturating_mul(100) > result.events
+            {
+                return Err("enabled event reconciliation or rejection budget failed".into());
+            }
+        } else if result.rejected_events != 0 || result.durable_events != 0 {
+            return Err("baseline event accounting is invalid".into());
+        }
         for phase in ["warmup", "idle", "active"] {
             if !result.samples.iter().any(|s| s.phase == phase) {
                 return Err(format!("missing {phase} samples"));
@@ -1098,6 +1156,7 @@ mod tests {
             run: 1,
             events: 1,
             rejected_events: 0,
+            durable_events: u64::from(enabled),
             latencies_us: vec![1],
             samples,
             durable_bytes: 1,
@@ -1203,6 +1262,25 @@ mod tests {
     }
 
     #[test]
+    fn enabled_rejections_are_bounded_and_reconciled_with_durable_events() {
+        let mut config = c();
+        config.burst = 100;
+        let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
+        for result in &mut results {
+            result.events = 100;
+            result.latencies_us = vec![1; 100];
+        }
+        results[1].rejected_events = 1;
+        results[1].durable_events = 99;
+        assert!(validate_results(config, &results, &[]).is_ok());
+        results[1].rejected_events = 2;
+        results[1].durable_events = 98;
+        assert!(validate_results(config, &results, &[]).is_err());
+        results[1].rejected_events = 1;
+        assert!(validate_results(config, &results, &[]).is_err());
+    }
+
+    #[test]
     fn manifest_contains_computed_phase_and_network_evidence() {
         let manifest = render_manifest(c(), &pair(enabled(0.1, 0.1, 1.0, 1, 0)), &[]);
         assert!(manifest.contains("idle_average_cpu_delta_percent: 0"));
@@ -1233,7 +1311,7 @@ mod tests {
                 .unwrap();
         }
         drop(sender);
-        drain(receiver, &root).unwrap();
+        drain(&receiver, &root).unwrap();
         assert_eq!(
             LocalStore::open(&root)
                 .unwrap()
@@ -1242,5 +1320,30 @@ mod tests {
             3
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_batches_enforce_record_and_byte_bounds_without_dropping_overflow() {
+        let (sender, receiver) = mpsc::channel();
+        for payload in [b"1234".to_vec(), b"5678".to_vec(), b"90".to_vec()] {
+            sender.send(IngressMessage(payload)).unwrap();
+        }
+        drop(sender);
+        let mut pending = None;
+        let first = receive_batch(&receiver, &mut pending, 3, 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first.iter().map(|item| item.0.len()).sum::<usize>(), 8);
+        let second = receive_batch(&receiver, &mut pending, 3, 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].0, b"90");
+        assert!(
+            receive_batch(&receiver, &mut pending, 3, 8)
+                .unwrap()
+                .is_none()
+        );
     }
 }

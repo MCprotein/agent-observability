@@ -146,7 +146,10 @@ deterministic-clock fixture.
 burst, one-second sampler, CPU normalization, machine/OS/filesystem/power metadata, cold/warm cache, three-adapter
 schedule and threshold calculation. The xtask command emits
 `docs/evidence/local/performance/<run>/manifest.yaml` and exits non-zero on any budget breach. No v0.13/v1.0
-release can pass with a missing manifest or a daemon-only sample.
+release can pass with a missing manifest or a daemon-only sample. The enabled burst records attempted,
+enqueued, rejected and durable counts, permits at most 1% explicit fail-open rejection, and requires
+enqueued and durable counts to match after graceful fixture shutdown. Enqueue is not a foreground
+durability guarantee.
 
 ## 3. V1 transport contract
 

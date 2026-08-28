@@ -253,6 +253,41 @@ impl LocalStore {
         self.ingest_at(observation, None, false)
     }
 
+    /// Atomically commits an ordered observation batch while deferring projection rebuild.
+    ///
+    /// Every observation shares one transaction. A failure rolls back the entire batch, including
+    /// cursor advancement, so callers can retry the same ordered input without partial progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::ingest`].
+    pub fn ingest_batch_deferred_projection(
+        &mut self,
+        observations: &[SourceObservation],
+    ) -> Result<Vec<IngestStatus>, StoreError> {
+        self.ingest_batch_at(observations, None)
+    }
+
+    fn ingest_batch_at(
+        &mut self,
+        observations: &[SourceObservation],
+        crash: Option<CrashPoint>,
+    ) -> Result<Vec<IngestStatus>, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let mut statuses = Vec::with_capacity(observations.len());
+        for observation in observations {
+            statuses.push(Self::ingest_in_transaction(&tx, observation, None)?);
+        }
+        if crash == Some(CrashPoint::BeforeCommit) {
+            return Err(StoreError::Crash(CrashPoint::BeforeCommit));
+        }
+        tx.commit()?;
+        if crash == Some(CrashPoint::AfterCommit) {
+            return Err(StoreError::Crash(CrashPoint::AfterCommit));
+        }
+        Ok(statuses)
+    }
+
     /// Atomically records a content-free adapter diagnostic or suppression and advances its
     /// source cursor without creating a synthetic observation.
     ///
@@ -348,15 +383,30 @@ impl LocalStore {
         self.ingest_at(observation, Some(crash), true)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the ordered cursor, dedupe, commit, and crash-point transaction stays contiguous"
-    )]
     fn ingest_at(
         &mut self,
         observation: &SourceObservation,
         crash: Option<CrashPoint>,
         rebuild_projection: bool,
+    ) -> Result<IngestStatus, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let status = Self::ingest_in_transaction(&tx, observation, crash)?;
+        tx.commit()?;
+        if crash == Some(CrashPoint::AfterCommit) {
+            return Err(StoreError::Crash(CrashPoint::AfterCommit));
+        }
+        self.rebuild_if_enabled(rebuild_projection, crash)?;
+        Ok(status)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ordered cursor, dedupe, and crash-point transaction stays contiguous"
+    )]
+    fn ingest_in_transaction(
+        tx: &Transaction<'_>,
+        observation: &SourceObservation,
+        crash: Option<CrashPoint>,
     ) -> Result<IngestStatus, StoreError> {
         let source = source_name(observation);
         let generation = private_source_generation(observation);
@@ -367,16 +417,13 @@ impl LocalStore {
         let projected_json = prepared.projected_json;
         let payload_hash = prepared.payload_hash;
         let event_id = prepared.event_id;
-        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         if let Some((disposition, code, existing_hash)) =
-            existing_disposition(&tx, source, &generation, cursor)?
+            existing_disposition(tx, source, &generation, cursor)?
         {
             if disposition == AdapterDispositionKind::Suppressed.as_str()
                 && code == AdapterDispositionCode::DuplicateObservation.as_str()
                 && existing_hash == payload_hash
             {
-                drop(tx);
-                self.rebuild_if_enabled(rebuild_projection, None)?;
                 return Ok(IngestStatus::Suppressed);
             }
             return Err(StoreError::PayloadConflict);
@@ -392,11 +439,9 @@ impl LocalStore {
             if existing_event != event_id || existing_hash != payload_hash {
                 return Err(StoreError::PayloadConflict);
             }
-            drop(tx);
-            self.rebuild_if_enabled(rebuild_projection, None)?;
             return Ok(IngestStatus::Duplicate);
         }
-        if !cursor_matches(&tx, observation)? {
+        if !cursor_matches(tx, observation)? {
             return Err(StoreError::CursorConflict);
         }
         if let Some(existing_state_json) = tx
@@ -407,19 +452,14 @@ impl LocalStore {
             )
             .optional()?
         {
-            ensure_static_record_compatibility(&tx, state.span_id.as_str(), &incoming_record)?;
+            ensure_static_record_compatibility(tx, state.span_id.as_str(), &incoming_record)?;
             let existing_state = state_from_json(&existing_state_json)?;
             if same_canonical_observation(&existing_state, &state) {
-                insert_duplicate_disposition(&tx, observation)?;
+                insert_duplicate_disposition(tx, observation)?;
                 if crash == Some(CrashPoint::BeforeCommit) {
                     return Err(StoreError::Crash(CrashPoint::BeforeCommit));
                 }
-                mark_projection_dirty(&tx)?;
-                tx.commit()?;
-                if crash == Some(CrashPoint::AfterCommit) {
-                    return Err(StoreError::Crash(CrashPoint::AfterCommit));
-                }
-                self.rebuild_if_enabled(rebuild_projection, crash)?;
+                mark_projection_dirty(tx)?;
                 return Ok(IngestStatus::Suppressed);
             }
         }
@@ -438,21 +478,16 @@ impl LocalStore {
                 "INSERT INTO source_inputs(source, generation, cursor, event_id, payload_hash) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![source, generation, cursor, event_id, payload_hash],
             )?;
-            advance_cursor(&tx, observation)?;
-            mark_projection_dirty(&tx)?;
+            advance_cursor(tx, observation)?;
+            mark_projection_dirty(tx)?;
             if crash == Some(CrashPoint::BeforeCommit) {
                 return Err(StoreError::Crash(CrashPoint::BeforeCommit));
             }
-            tx.commit()?;
-            if crash == Some(CrashPoint::AfterCommit) {
-                return Err(StoreError::Crash(CrashPoint::AfterCommit));
-            }
-            self.rebuild_if_enabled(rebuild_projection, crash)?;
             return Ok(IngestStatus::Duplicate);
         }
-        let existing = load_state(&tx, state.span_id.as_str())?;
+        let existing = load_state(tx, state.span_id.as_str())?;
         if existing.is_some() {
-            ensure_static_record_compatibility(&tx, state.span_id.as_str(), &incoming_record)?;
+            ensure_static_record_compatibility(tx, state.span_id.as_str(), &incoming_record)?;
         }
         let reduced = reduce_span_state(existing.as_ref(), state).map_err(map_reduction_error)?;
         let projection_observation = projection_observation(observation, &reduced);
@@ -468,15 +503,15 @@ impl LocalStore {
         let state_json = state_to_json(&reduced)?;
         let parent = reduced.parent_span_id.as_ref().map(SpanId::as_str);
         let unresolved = match parent {
-            Some(parent_id) => i32::from(!topology_contains(&tx, parent_id)?),
+            Some(parent_id) => i32::from(!topology_contains(tx, parent_id)?),
             None => 0,
         };
         tx.execute("INSERT INTO observations(event_id, source, generation, observation_id, payload_hash, projected_json) VALUES (?1,?2,?3,?4,?5,?6)", params![event_id, source, generation, hash_opaque_identifier(observation.observation_id.as_str()), payload_hash, projected_json])?;
         tx.execute("INSERT INTO source_inputs(source, generation, cursor, event_id, payload_hash) VALUES (?1,?2,?3,?4,?5)", params![source, generation, cursor, event_id, payload_hash])?;
         tx.execute("INSERT INTO records(span_id, trace_id, parent_span_id, kind, state_json, record_json) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(span_id) DO UPDATE SET state_json=excluded.state_json, record_json=excluded.record_json", params![reduced.span_id.as_str(), reduced.trace_id.as_str(), parent, kind_name(reduced.kind), state_json, record_json])?;
         tx.execute("INSERT INTO topology(span_id, trace_id, parent_span_id, kind, unresolved) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(span_id) DO UPDATE SET unresolved=excluded.unresolved", params![reduced.span_id.as_str(), reduced.trace_id.as_str(), parent, kind_name(reduced.kind), unresolved])?;
-        validate_topology_chain(&tx, reduced.span_id.as_str())?;
-        validate_direct_children(&tx, reduced.span_id.as_str())?;
+        validate_topology_chain(tx, reduced.span_id.as_str())?;
+        validate_direct_children(tx, reduced.span_id.as_str())?;
         tx.execute(
             "UPDATE topology SET unresolved=0 WHERE parent_span_id=?1",
             [reduced.span_id.as_str()],
@@ -485,16 +520,11 @@ impl LocalStore {
             "INSERT INTO delivery_outcomes(event_id, outcome) VALUES (?1, 'not_applicable')",
             [event_id.as_str()],
         )?;
-        advance_cursor(&tx, observation)?;
-        mark_projection_dirty(&tx)?;
+        advance_cursor(tx, observation)?;
+        mark_projection_dirty(tx)?;
         if crash == Some(CrashPoint::BeforeCommit) {
             return Err(StoreError::Crash(CrashPoint::BeforeCommit));
         }
-        tx.commit()?;
-        if crash == Some(CrashPoint::AfterCommit) {
-            return Err(StoreError::Crash(CrashPoint::AfterCommit));
-        }
-        self.rebuild_if_enabled(rebuild_projection, crash)?;
         Ok(IngestStatus::Committed)
     }
 
@@ -1773,6 +1803,86 @@ mod tests {
             "0"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_batch_commits_ordered_cursors_atomically() {
+        let dir = temp_dir("deferred-batch");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let batch = [
+            observation("1", "session", None),
+            observation_after("2", Some("1"), "turn", Some("session")),
+        ];
+        assert_eq!(
+            store.ingest_batch_deferred_projection(&batch).unwrap(),
+            [IngestStatus::Committed, IngestStatus::Committed]
+        );
+        assert_eq!(store.observation_count().unwrap(), 2);
+        assert_eq!(
+            store.cursor("codex", "generation").unwrap().as_deref(),
+            Some("2")
+        );
+        assert_eq!(fs::read_to_string(store.projection_path()).unwrap(), "");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_batch_rolls_back_cursor_and_records_on_failure() {
+        let dir = temp_dir("deferred-batch-rollback");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let batch = [
+            observation("1", "session", None),
+            observation_after("2", None, "turn", Some("session")),
+        ];
+        assert!(matches!(
+            store.ingest_batch_deferred_projection(&batch),
+            Err(StoreError::CursorConflict)
+        ));
+        assert_eq!(store.observation_count().unwrap(), 0);
+        assert_eq!(store.source_input_count().unwrap(), 0);
+        assert_eq!(store.cursor("codex", "generation").unwrap(), None);
+        let repaired = [
+            observation("1", "session", None),
+            observation_after("2", Some("1"), "turn", Some("session")),
+        ];
+        assert!(store.ingest_batch_deferred_projection(&repaired).is_ok());
+        assert_eq!(store.observation_count().unwrap(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_batch_crash_boundaries_reopen_without_partial_progress() {
+        for (label, point, expected) in [
+            ("batch-before-commit", CrashPoint::BeforeCommit, 0),
+            ("batch-after-commit", CrashPoint::AfterCommit, 2),
+        ] {
+            let dir = temp_dir(label);
+            let _ = fs::remove_dir_all(&dir);
+            let batch = [
+                observation("1", "session", None),
+                observation_after("2", Some("1"), "turn", Some("session")),
+            ];
+            let mut store = LocalStore::open(&dir).unwrap();
+            assert!(matches!(
+                store.ingest_batch_at(&batch, Some(point)),
+                Err(StoreError::Crash(actual)) if actual == point
+            ));
+            drop(store);
+            let mut reopened = LocalStore::open(&dir).unwrap();
+            assert_eq!(reopened.observation_count().unwrap(), expected);
+            if expected == 0 {
+                assert!(reopened.ingest_batch_deferred_projection(&batch).is_ok());
+            } else {
+                assert_eq!(
+                    reopened.ingest_batch_deferred_projection(&batch).unwrap(),
+                    [IngestStatus::Duplicate, IngestStatus::Duplicate]
+                );
+            }
+            assert_eq!(reopened.observation_count().unwrap(), 2);
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

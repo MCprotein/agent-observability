@@ -226,7 +226,9 @@ anti-corruption layer다.
 - foreground ingress는 1 MiB raw input, 64 KiB projected message, 64-slot channel과 one worker로
   고정한다. full/unavailable/oversized는 nonblocking fail-open outcome이다. 현재 이 foreground
   ingress/worker composition은 `xtask` release fixture가 검증하며, CLI handoff ingest는 이미 만들어진
-  bounded batch를 singleton 아래 transaction store에 직접 반영한다.
+  bounded batch를 singleton 아래 transaction store에 직접 반영한다. Release fixture는 enabled burst의
+  fail-open rejection을 1% 이하로 제한하고 graceful shutdown 뒤 enqueued count와 durable observation
+  count를 대조한다. Foreground enqueue 자체는 durability를 보장하지 않는다.
 - 저장소 용량은 allocated block과 worst-case write로 admission하며, age retention은 v1.2 범위다.
 - SQLite authority는 `projection_dirty`를 transaction에 포함하고 clean reopen에서 전체 projection
   rebuild를 생략한다. 자세한 운영 계약은 [LOCAL_RUNTIME.md](LOCAL_RUNTIME.md)를 따른다.

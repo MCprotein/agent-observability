@@ -79,5 +79,7 @@ cargo run -p xtask -- perf local --profile release --check
 smoke is non-normative and deletes its temporary output. release uses the protocol in
 crates/contracts/performance/local-performance-v1.yaml, writes sanitized evidence under
 docs/evidence/local/performance/, and exits nonzero for missing or breached latency, CPU, RSS,
-disk, or network evidence. Both profiles delete measured durable stores after validation; release
-retains only the sanitized manifest.
+disk, network, or queue-admission evidence. Enabled runs permit at most 1% explicit fail-open
+rejections and, after graceful fixture shutdown, must reconcile every enqueued event with one durable
+observation. Foreground enqueue does not itself imply durability. Both profiles
+delete measured durable stores after validation; release retains only the sanitized manifest.
