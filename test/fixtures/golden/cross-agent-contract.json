@@ -107,6 +107,15 @@
       "id:sha256:985ad7b74961ae33c5ef59a56780bd95601c0a4f999dcb94646bc0e23199aaeb",
       "id:sha256:f49289cdeb433353f08a4c6ad9f9d701a430af0e550de1fa3e233f170eb41bd3"
     ],
+    "agentsFilter": [
+      "claude-code",
+      "codex"
+    ],
+    "modelsFilter": [
+      "claude-golden",
+      "gpt-golden",
+      "unknown"
+    ],
     "traceIds": [
       "id:sha256:78f5b7e69f24f356e0bbb3ec4316504caed0e8d42bb5025a7a6c2d0c641cb73a",
       "id:sha256:920abbc0bddae67b7cd570e3b03af649270b4ff5fc566665e39831016e5bcc20"
@@ -386,6 +395,15 @@
       "turns": [
         "id:sha256:985ad7b74961ae33c5ef59a56780bd95601c0a4f999dcb94646bc0e23199aaeb",
         "id:sha256:f49289cdeb433353f08a4c6ad9f9d701a430af0e550de1fa3e233f170eb41bd3"
+      ],
+      "agents": [
+        "claude-code",
+        "codex"
+      ],
+      "models": [
+        "claude-golden",
+        "gpt-golden",
+        "unknown"
       ]
     },
     "traces": [

@@ -1,0 +1,488 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "generatedAt",
+    "title",
+    "summary",
+    "cost",
+    "filters",
+    "traces",
+    "spans"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "agent_observability.report.v1"
+    },
+    "generatedAt": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    },
+    "cost": {
+      "$ref": "#/$defs/cost"
+    },
+    "filters": {
+      "$ref": "#/$defs/filters"
+    },
+    "traces": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/trace"
+      }
+    },
+    "spans": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/span"
+      }
+    }
+  },
+  "$defs": {
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generatedSpans",
+        "sessions",
+        "turns",
+        "llmRequests",
+        "toolExecutions",
+        "errors",
+        "inputTokens",
+        "outputTokens",
+        "cachedInputTokens",
+        "cacheCreationInputTokens",
+        "reasoningOutputTokens",
+        "latencyMs",
+        "durationMs",
+        "estimatedCost"
+      ],
+      "properties": {
+        "generatedSpans": {
+          "type": "number"
+        },
+        "sessions": {
+          "type": "number"
+        },
+        "turns": {
+          "type": "number"
+        },
+        "llmRequests": {
+          "type": "number"
+        },
+        "toolExecutions": {
+          "type": "number"
+        },
+        "errors": {
+          "type": "number"
+        },
+        "inputTokens": {
+          "type": "number"
+        },
+        "outputTokens": {
+          "type": "number"
+        },
+        "cachedInputTokens": {
+          "type": "number"
+        },
+        "cacheCreationInputTokens": {
+          "type": "number"
+        },
+        "reasoningOutputTokens": {
+          "type": "number"
+        },
+        "latencyMs": {
+          "type": "number"
+        },
+        "durationMs": {
+          "type": "number"
+        },
+        "estimatedCost": {
+          "type": "number"
+        }
+      }
+    },
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "rate_table",
+        "cost"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "estimated",
+            "incomplete",
+            "unknown"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "estimated_cost": {
+          "type": "number"
+        },
+        "currency": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "rate_table": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "version": {
+              "type": "string"
+            },
+            "unit": {
+              "type": "string"
+            }
+          }
+        },
+        "cost": {
+          "$ref": "#/$defs/cost_detail"
+        }
+      }
+    },
+    "cost_detail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "assumption"
+      ],
+      "properties": {
+        "assumption": {
+          "type": "string"
+        },
+        "incomplete_count": {
+          "type": "number"
+        },
+        "unknown_count": {
+          "type": "number"
+        },
+        "missing": {
+          "$ref": "#/$defs/strings"
+        },
+        "semantic_errors": {
+          "$ref": "#/$defs/strings"
+        },
+        "components": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/cost_component"
+          }
+        }
+      }
+    },
+    "cost_component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tokens",
+        "rate_per_1m",
+        "estimated_cost"
+      ],
+      "properties": {
+        "tokens": {
+          "type": "number"
+        },
+        "rate_per_1m": {
+          "type": "number"
+        },
+        "estimated_cost": {
+          "type": "number"
+        }
+      }
+    },
+    "filters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repos",
+        "sessions",
+        "turns"
+      ],
+      "properties": {
+        "repos": {
+          "$ref": "#/$defs/strings"
+        },
+        "sessions": {
+          "$ref": "#/$defs/strings"
+        },
+        "turns": {
+          "$ref": "#/$defs/strings"
+        },
+        "agents": {
+          "$ref": "#/$defs/strings"
+        },
+        "models": {
+          "$ref": "#/$defs/strings"
+        }
+      }
+    },
+    "trace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "traceId",
+        "repo",
+        "spans",
+        "errors",
+        "inputTokens",
+        "outputTokens",
+        "estimatedCost",
+        "startTimeUnixMs",
+        "endTimeUnixMs",
+        "sessions",
+        "turns"
+      ],
+      "properties": {
+        "traceId": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "spans": {
+          "type": "number"
+        },
+        "errors": {
+          "type": "number"
+        },
+        "inputTokens": {
+          "type": "number"
+        },
+        "outputTokens": {
+          "type": "number"
+        },
+        "estimatedCost": {
+          "type": "number"
+        },
+        "startTimeUnixMs": {
+          "type": "number"
+        },
+        "endTimeUnixMs": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "sessions": {
+          "$ref": "#/$defs/strings"
+        },
+        "turns": {
+          "$ref": "#/$defs/strings"
+        }
+      }
+    },
+    "span": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "traceId",
+        "spanId",
+        "parentSpanId",
+        "kind",
+        "name",
+        "status",
+        "startTimeUnixMs",
+        "endTimeUnixMs",
+        "repo",
+        "agent",
+        "attributes",
+        "metrics",
+        "cost"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "type": "string"
+        },
+        "traceId": {
+          "type": "string"
+        },
+        "spanId": {
+          "type": "string"
+        },
+        "parentSpanId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "startTimeUnixMs": {
+          "type": "number"
+        },
+        "endTimeUnixMs": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "repo": {
+          "type": "string"
+        },
+        "agent": {
+          "$ref": "#/$defs/agent"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "toolName": {
+          "type": "string"
+        },
+        "attributes": {
+          "$ref": "#/$defs/attributes"
+        },
+        "metrics": {
+          "$ref": "#/$defs/metrics"
+        },
+        "estimatedCost": {
+          "type": "number"
+        },
+        "cost": {
+          "$ref": "#/$defs/cost"
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      }
+    },
+    "attributes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/scalar"
+        },
+        "event_type": {
+          "$ref": "#/$defs/scalar"
+        },
+        "envelope_type": {
+          "$ref": "#/$defs/scalar"
+        },
+        "session_id": {
+          "$ref": "#/$defs/scalar"
+        },
+        "turn_id": {
+          "$ref": "#/$defs/scalar"
+        },
+        "request_id": {
+          "$ref": "#/$defs/scalar"
+        },
+        "call_id": {
+          "$ref": "#/$defs/scalar"
+        },
+        "tool_name": {
+          "$ref": "#/$defs/scalar"
+        },
+        "phase": {
+          "$ref": "#/$defs/scalar"
+        },
+        "exit_code": {
+          "$ref": "#/$defs/scalar"
+        },
+        "sandbox": {
+          "$ref": "#/$defs/scalar"
+        },
+        "approval": {
+          "$ref": "#/$defs/scalar"
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "inputTokens": {
+          "type": "number"
+        },
+        "outputTokens": {
+          "type": "number"
+        },
+        "cachedInputTokens": {
+          "type": "number"
+        },
+        "cacheCreationInputTokens": {
+          "type": "number"
+        },
+        "reasoningOutputTokens": {
+          "type": "number"
+        },
+        "totalTokens": {
+          "type": "number"
+        },
+        "latencyMs": {
+          "type": "number"
+        },
+        "durationMs": {
+          "type": "number"
+        },
+        "totalInputTokens": {
+          "type": "number"
+        },
+        "totalOutputTokens": {
+          "type": "number"
+        },
+        "totalCachedInputTokens": {
+          "type": "number"
+        },
+        "totalReasoningOutputTokens": {
+          "type": "number"
+        },
+        "totalAccumulatedTokens": {
+          "type": "number"
+        },
+        "contextWindowTokens": {
+          "type": "number"
+        }
+      }
+    },
+    "scalar": {
+      "type": [
+        "string",
+        "number",
+        "boolean"
+      ]
+    },
+    "strings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

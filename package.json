@@ -1,13 +1,25 @@
 {
   "name": "agent-observability",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "private": true,
   "type": "module",
   "description": "Local-first observability primitives for coding agents.",
   "scripts": {
-    "test": "node --test"
+    "build:report-ui": "node scripts/build-report-ui.mjs",
+    "setup:browser": "playwright-core install chromium --no-shell",
+    "pretest": "npm run setup:browser",
+    "test:browser": "node scripts/browser-smoke.mjs",
+    "typecheck": "tsc -p tsconfig.report.json --noEmit",
+    "test": "npm run build:report-ui && npm run typecheck && node --test && npm run test:browser"
   },
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "ajv": "^8.20.0",
+    "esbuild": "^0.28.2",
+    "json-schema-to-typescript": "^16.0.0",
+    "playwright-core": "1.62.1",
+    "typescript": "^7.0.2"
   }
 }

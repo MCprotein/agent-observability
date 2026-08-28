@@ -69,6 +69,8 @@ function reportContract(report) {
     costStatus: report.cost.status,
     sessionsFilter: report.filters.sessions,
     turnsFilter: report.filters.turns,
+    agentsFilter: report.filters.agents,
+    modelsFilter: report.filters.models,
     traceIds: report.traces.map((trace) => trace.traceId),
     spanAgents: report.spans.map((span) => span.agent.name),
   };

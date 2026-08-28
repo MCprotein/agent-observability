@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { estimateCostForRecords, estimateSpanCost, normalizeRateTable } from "../cost.js";
 import { enforcePrivateFile, preparePrivateArtifact } from "../private-artifact.js";
@@ -17,6 +18,10 @@ const SAFE_ATTRIBUTE_KEYS = new Set([
   "sandbox",
   "approval",
 ]);
+const REPORT_UI_SOURCE = readFileSync(
+  new URL("./generated/report-ui.js", import.meta.url),
+  "utf8",
+);
 
 export function reportDataFromRecords(records, options = {}) {
   const rateTable = normalizeRateTable(options.rate_table ?? options.rateTable);
@@ -139,7 +144,7 @@ export function renderStaticHtmlReport(records, options = {}) {
 
     .controls {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 10px;
       margin-bottom: 16px;
       padding: 12px;
@@ -156,7 +161,8 @@ export function renderStaticHtmlReport(records, options = {}) {
     }
 
     select,
-    input {
+    input,
+    button {
       width: 100%;
       min-height: 34px;
       border: 1px solid var(--line);
@@ -165,6 +171,33 @@ export function renderStaticHtmlReport(records, options = {}) {
       color: var(--text);
       padding: 6px 8px;
       font: inherit;
+    }
+
+    button { cursor: pointer; }
+    button:disabled { cursor: default; opacity: 0.55; }
+    select:focus-visible,
+    input:focus-visible,
+    button:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+
+    .control-actions {
+      display: grid;
+      grid-column: 1 / -1;
+      grid-template-columns: minmax(120px, 180px) minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+    }
+
+    .filter-status { color: var(--muted); font-size: 12px; }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
     }
 
     .layout {
@@ -191,6 +224,9 @@ export function renderStaticHtmlReport(records, options = {}) {
       border-bottom: 1px solid var(--line);
       background: var(--surface-strong);
       font-weight: 700;
+      margin: 0;
+      font-size: 14px;
+      letter-spacing: 0;
     }
 
     .trace-list {
@@ -304,6 +340,9 @@ export function renderStaticHtmlReport(records, options = {}) {
       .timestamp { white-space: normal; }
       .kpis,
       .controls { grid-template-columns: 1fr; }
+      select,
+      input,
+      button { min-height: 44px; }
     }
   </style>
 </head>
@@ -325,39 +364,46 @@ export function renderStaticHtmlReport(records, options = {}) {
       <div class="kpi"><div class="kpi-label">Errors</div><div class="kpi-value" id="kpi-errors">0</div></div>
     </section>
 
-    <section class="controls" aria-label="filters">
+    <fieldset class="controls">
+      <legend class="sr-only">Report filters</legend>
       <label>Repo<select id="repo-filter"></select></label>
       <label>Session<select id="session-filter"></select></label>
-      <label>Turn<select id="turn-filter"></select></label>
+      <label>Agent<select id="agent-filter"></select></label>
+      <label>Model<select id="model-filter"></select></label>
       <label>Text<input id="text-filter" type="search" autocomplete="off"></label>
-    </section>
+      <div class="control-actions">
+        <button id="clear-filters" type="button" disabled>Clear filters</button>
+        <span class="filter-status" id="filter-status" aria-live="polite"></span>
+      </div>
+    </fieldset>
 
     <section class="layout">
-      <aside class="panel">
-        <div class="panel-title">
+      <aside class="panel" aria-labelledby="traces-heading">
+        <h2 class="panel-title" id="traces-heading">
           <span>Traces</span>
           <span class="badge" id="trace-count">0</span>
-        </div>
+        </h2>
         <div class="trace-list" id="trace-list"></div>
       </aside>
-      <section class="panel">
-        <div class="panel-title">
+      <section class="panel" aria-labelledby="spans-heading">
+        <h2 class="panel-title" id="spans-heading">
           <span>Spans</span>
           <span class="badge" id="span-count">0</span>
-        </div>
+        </h2>
         <div class="table-wrap">
           <table>
+            <caption class="sr-only">Filtered agent observation spans</caption>
             <thead>
               <tr>
-                <th>Kind</th>
-                <th>Name</th>
-                <th>Status</th>
-                <th>Repo</th>
-                <th>Turn</th>
-                <th>Tokens</th>
-                <th>Cost</th>
-                <th>Latency</th>
-                <th>Parent</th>
+                <th scope="col">Kind</th>
+                <th scope="col">Name</th>
+                <th scope="col">Status</th>
+                <th scope="col">Repo</th>
+                <th scope="col">Turn</th>
+                <th scope="col">Tokens</th>
+                <th scope="col">Cost</th>
+                <th scope="col">Latency</th>
+                <th scope="col">Parent</th>
               </tr>
             </thead>
             <tbody id="span-table"></tbody>
@@ -367,190 +413,7 @@ export function renderStaticHtmlReport(records, options = {}) {
     </section>
   </main>
   <script id="report-data" type="application/json">${jsonForHtml(data)}</script>
-  <script>
-    (() => {
-      const data = JSON.parse(document.getElementById("report-data").textContent);
-      const state = { repo: "all", session: "all", turn: "all", text: "", trace: "all" };
-      const els = {
-        repo: document.getElementById("repo-filter"),
-        session: document.getElementById("session-filter"),
-        turn: document.getElementById("turn-filter"),
-        text: document.getElementById("text-filter"),
-        traces: document.getElementById("trace-list"),
-        table: document.getElementById("span-table"),
-        traceCount: document.getElementById("trace-count"),
-        spanCount: document.getElementById("span-count"),
-      };
-
-      fillSelect(els.repo, ["all", ...data.filters.repos]);
-      fillSelect(els.session, ["all", ...data.filters.sessions]);
-      fillSelect(els.turn, ["all", ...data.filters.turns]);
-
-      els.repo.addEventListener("change", () => { state.repo = els.repo.value; render(); });
-      els.session.addEventListener("change", () => { state.session = els.session.value; render(); });
-      els.turn.addEventListener("change", () => { state.turn = els.turn.value; render(); });
-      els.text.addEventListener("input", () => { state.text = els.text.value.trim().toLowerCase(); render(); });
-
-      render();
-
-      function render() {
-        const spans = filteredSpans();
-        const traces = data.traces.filter((trace) => spans.some((span) => span.traceId === trace.traceId));
-        if (state.trace !== "all" && !traces.some((trace) => trace.traceId === state.trace)) {
-          state.trace = "all";
-        }
-        const visibleSpans = state.trace === "all" ? spans : spans.filter((span) => span.traceId === state.trace);
-        const summary = summarizeVisible(visibleSpans);
-
-        setText("kpi-sessions", summary.sessions);
-        setText("kpi-turns", summary.turns);
-        setText("kpi-llm", summary.llmRequests);
-        setText("kpi-tools", summary.toolExecutions);
-        setText("kpi-tokens", formatNumber(summary.inputTokens + summary.outputTokens));
-        document.getElementById("kpi-cost").textContent = formatCost(summary.estimatedCost, data.cost);
-        setText("kpi-errors", summary.errors);
-        els.traceCount.textContent = traces.length;
-        els.spanCount.textContent = visibleSpans.length;
-        renderTraces(traces);
-        renderSpans(visibleSpans);
-      }
-
-      function filteredSpans() {
-        return data.spans.filter((span) => {
-          if (state.repo !== "all" && span.repo !== state.repo) return false;
-          if (state.session !== "all" && span.sessionId !== state.session) return false;
-          if (state.turn !== "all" && span.turnId !== state.turn) return false;
-          if (state.text) {
-            const haystack = [span.name, span.kind, span.status, span.toolName, span.traceId, span.spanId].join(" ").toLowerCase();
-            if (!haystack.includes(state.text)) return false;
-          }
-          return true;
-        });
-      }
-
-      function renderTraces(traces) {
-        if (traces.length === 0) {
-          els.traces.innerHTML = '<div class="empty">No traces</div>';
-          return;
-        }
-        els.traces.replaceChildren(...traces.map((trace) => {
-          const button = document.createElement("button");
-          button.type = "button";
-          button.className = "trace-row" + (state.trace === trace.traceId ? " active" : "");
-          button.addEventListener("click", () => {
-            state.trace = state.trace === trace.traceId ? "all" : trace.traceId;
-            render();
-          });
-          button.innerHTML =
-            '<div class="trace-main"><span class="mono">' + escapeHtml(shortId(trace.traceId)) + '</span>' +
-            '<span class="badge ' + (trace.errors ? "error" : "ok") + '">' + (trace.errors ? trace.errors + " error" : "ok") + '</span></div>' +
-            '<div class="trace-meta"><span>' + escapeHtml(trace.repo) + '</span><span>' + trace.spans + ' spans</span><span>' +
-            formatNumber(trace.inputTokens + trace.outputTokens) + ' tokens</span></div>';
-          return button;
-        }));
-      }
-
-      function renderSpans(spans) {
-        if (spans.length === 0) {
-          els.table.innerHTML = '<tr><td class="empty" colspan="8">No spans</td></tr>';
-          return;
-        }
-        els.table.replaceChildren(...spans.map((span) => {
-          const row = document.createElement("tr");
-          row.innerHTML =
-            '<td><span class="badge">' + escapeHtml(span.kind) + '</span></td>' +
-            '<td>' + escapeHtml(span.name) + (span.toolName ? '<div class="mono">' + escapeHtml(span.toolName) + '</div>' : '') + '</td>' +
-            '<td><span class="badge ' + statusClass(span.status) + '">' + escapeHtml(span.status) + '</span></td>' +
-            '<td>' + escapeHtml(span.repo) + '</td>' +
-            '<td class="mono">' + escapeHtml(span.turnId || "") + '</td>' +
-            '<td>' + formatNumber((span.metrics.inputTokens || 0) + (span.metrics.outputTokens || 0)) + '</td>' +
-            '<td>' + formatCost(span.estimatedCost, span.cost) + '</td>' +
-            '<td>' + formatDuration(span.metrics.latencyMs || span.metrics.durationMs) + '</td>' +
-            '<td class="mono">' + escapeHtml(shortId(span.parentSpanId || "")) + '</td>';
-          return row;
-        }));
-      }
-
-      function summarizeVisible(spans) {
-        const sessions = new Set();
-        const turns = new Set();
-        const summary = {
-          sessions: 0,
-          turns: 0,
-          llmRequests: 0,
-          toolExecutions: 0,
-          errors: 0,
-          inputTokens: 0,
-          outputTokens: 0,
-          estimatedCost: 0,
-        };
-        for (const span of spans) {
-          if (span.sessionId) sessions.add(span.sessionId);
-          if (span.turnId) turns.add(span.turnId);
-          if (span.kind === "llm.request") summary.llmRequests += 1;
-          if (span.kind === "tool.execution") summary.toolExecutions += 1;
-          if (span.status === "error") summary.errors += 1;
-          summary.inputTokens += span.metrics.inputTokens || 0;
-          summary.outputTokens += span.metrics.outputTokens || 0;
-          summary.estimatedCost += span.estimatedCost || 0;
-        }
-        summary.sessions = sessions.size;
-        summary.turns = turns.size;
-        return summary;
-      }
-
-      function fillSelect(select, values) {
-        select.replaceChildren(...values.map((value) => {
-          const option = document.createElement("option");
-          option.value = value;
-          option.textContent = value;
-          return option;
-        }));
-      }
-
-      function setText(id, value) {
-        document.getElementById(id).textContent = formatNumber(value);
-      }
-
-      function statusClass(status) {
-        if (status === "error") return "error";
-        if (status === "ok") return "ok";
-        return "warning";
-      }
-
-      function formatNumber(value) {
-        return Number(value || 0).toLocaleString();
-      }
-
-      function formatDuration(value) {
-        if (!Number.isFinite(value)) return "";
-        return value.toLocaleString() + " ms";
-      }
-
-      function formatCost(value, cost) {
-        if (cost?.status === "unknown" && (!Number.isFinite(value) || value === 0)) return "unknown";
-        if (!Number.isFinite(value)) return cost?.status || "unknown";
-        const currency = cost?.currency || data.cost?.currency || "USD";
-        const amount = currency + " " + Number(value.toPrecision(12)).toString();
-        return cost?.status === "incomplete" ? amount + " incomplete" : amount;
-      }
-
-      function shortId(value) {
-        if (!value) return "";
-        return value.length > 18 ? value.slice(0, 8) + "..." + value.slice(-6) : value;
-      }
-
-      function escapeHtml(value) {
-        return String(value ?? "").replace(/[&<>"']/g, (char) => ({
-          "&": "&amp;",
-          "<": "&lt;",
-          ">": "&gt;",
-          '"': "&quot;",
-          "'": "&#39;",
-        }[char]));
-      }
-    })();
-  </script>
+  <script>${REPORT_UI_SOURCE}</script>
 </body>
 </html>`;
 }
@@ -619,6 +482,8 @@ function filterValues(spans) {
     repos: uniqueSorted(spans.map((span) => span.repo)),
     sessions: uniqueSorted(spans.map((span) => span.sessionId).filter(Boolean)),
     turns: uniqueSorted(spans.map((span) => span.turnId).filter(Boolean)),
+    agents: uniqueSorted(spans.map((span) => span.agent.name ?? "unknown")),
+    models: uniqueSorted(spans.map((span) => span.agent.model ?? "unknown")),
   };
 }
 

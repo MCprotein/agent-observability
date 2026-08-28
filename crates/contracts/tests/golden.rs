@@ -21,7 +21,7 @@ const CROSS_AGENT_CONTRACT: &[u8] =
 fn javascript_migration_baseline_is_byte_locked() {
     assert_eq!(fnv1a64(CODEX_SOURCE), 0xfae4_e9d6_12ec_5bea);
     assert_eq!(fnv1a64(CLAUDE_SOURCE), 0xcd0f_27e2_36f7_ab05);
-    assert_eq!(fnv1a64(CROSS_AGENT_CONTRACT), 0xa998_50d1_c43e_f0f7);
+    assert_eq!(fnv1a64(CROSS_AGENT_CONTRACT), 0xea40_6190_5e72_c7af);
 }
 
 #[test]
@@ -470,6 +470,15 @@ fn report_json_uses_camel_case_and_omits_optional_nested_fields() {
     assert!(value["summary"].get("generated_spans").is_none());
     assert!(value["cost"].get("reason").is_none());
     let decoded: ReportDtoV1 = serde_json::from_value(value).expect("report deserializes");
+    assert_eq!(decoded, report);
+    let mut legacy = serde_json::to_value(&report).expect("legacy report serializes");
+    let filters = legacy["filters"]
+        .as_object_mut()
+        .expect("filters are an object");
+    filters.remove("agents");
+    filters.remove("models");
+    let decoded: ReportDtoV1 =
+        serde_json::from_value(legacy).expect("pre-v0.12 report deserializes");
     assert_eq!(decoded, report);
 }
 

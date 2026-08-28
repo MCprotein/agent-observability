@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "agent_observability.report_view_reduction.v1",
+  "cases": [
+    { "name": "no billable spans", "statuses": [], "expectedStatus": "unknown" },
+    { "name": "estimated only", "statuses": ["estimated", "estimated"], "expectedStatus": "estimated" },
+    { "name": "unknown only", "statuses": ["unknown"], "expectedStatus": "unknown" },
+    { "name": "estimated and unknown", "statuses": ["estimated", "unknown"], "expectedStatus": "incomplete" },
+    { "name": "incomplete only", "statuses": ["incomplete"], "expectedStatus": "incomplete" },
+    { "name": "estimated and incomplete", "statuses": ["estimated", "incomplete"], "expectedStatus": "incomplete" }
+  ]
+}

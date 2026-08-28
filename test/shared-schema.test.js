@@ -30,6 +30,10 @@ test("shared closed schemas accept the frozen JavaScript durable and report cont
     assert.deepEqual(validateJsonSchema(serialized(record), durableSchema), []);
   }
   assert.deepEqual(validateJsonSchema(report, reportSchema), []);
+  const legacyFilters = { ...report.filters };
+  delete legacyFilters.agents;
+  delete legacyFilters.models;
+  assert.deepEqual(validateJsonSchema({ ...report, filters: legacyFilters }, reportSchema), []);
 
   const wideLegacyRecord = serialized({
     ...records[0],

@@ -99,6 +99,8 @@ test("builds report data with summaries and without raw content", () => {
   assert.match(data.filters.sessions[0], /^id:sha256:[a-f0-9]{64}$/);
   assert.equal(data.filters.turns.length, 1);
   assert.match(data.filters.turns[0], /^id:sha256:[a-f0-9]{64}$/);
+  assert.deepEqual(data.filters.agents, ["codex", "unknown"]);
+  assert.deepEqual(data.filters.models, ["gpt-test", "unknown"]);
 
   const serialized = JSON.stringify(data);
   assert.equal(serialized.includes("RAW_PROMPT_SECRET"), false);
@@ -173,6 +175,129 @@ test("writes an HTML report file and executes the inline renderer", async () => 
   assert.equal(dom.element("span-table").children.length, 4);
   assert.equal(dom.element("span-table").innerHTML.includes("LLM gpt-test"), true);
   assert.equal(dom.element("span-table").innerHTML.includes("exec_command"), true);
+
+  const modelFilter = dom.element("model-filter");
+  modelFilter.value = optionValue(modelFilter, "gpt-test");
+  modelFilter.listeners.change();
+  assert.equal(dom.element("kpi-llm").textContent, "1");
+  assert.equal(dom.element("kpi-tools").textContent, "0");
+  assert.equal(dom.element("span-table").children.length, 2);
+  assert.equal(dom.element("filter-status").textContent, "2 spans match the active filters.");
+  assert.equal(dom.element("trace-list").children[0].innerHTML.includes("2 spans"), true);
+
+  const selectedTrace = dom.element("trace-list").children[0];
+  selectedTrace.listeners.click();
+  assert.equal(dom.element("trace-list").children[0].attributes["aria-pressed"], "true");
+
+  const agentFilter = dom.element("agent-filter");
+  agentFilter.value = optionValue(agentFilter, "codex");
+  agentFilter.listeners.change();
+  assert.equal(dom.element("trace-list").children[0].attributes["aria-pressed"], "false");
+
+  const repoFilter = dom.element("repo-filter");
+  repoFilter.value = optionValue(repoFilter, "agent-observability");
+  repoFilter.listeners.change();
+  const sessionFilter = dom.element("session-filter");
+  sessionFilter.value = optionValue(sessionFilter, data.filters.sessions[0]);
+  sessionFilter.listeners.change();
+  const textFilter = dom.element("text-filter");
+  textFilter.value = "llm gpt-test";
+  textFilter.listeners.input();
+  assert.equal(dom.element("span-table").children.length, 1);
+  assert.equal(dom.element("kpi-llm").textContent, "1");
+
+  agentFilter.value = optionValue(agentFilter, "Unknown");
+  agentFilter.listeners.change();
+  assert.equal(dom.element("span-table").innerHTML.includes("No spans match"), true);
+
+  dom.element("clear-filters").listeners.click();
+  assert.equal(dom.element("span-table").children.length, 4);
+  assert.equal(dom.element("clear-filters").disabled, true);
+});
+
+test("renders legacy v1 report data without additive agent and model filters", () => {
+  const html = renderStaticHtmlReport(reportFixture(), {
+    generated_at: "2026-07-10T00:00:00.000Z",
+  });
+  const data = reportDataFromRecords(reportFixture(), {
+    generated_at: "2026-07-10T00:00:00.000Z",
+  });
+  delete data.filters.agents;
+  delete data.filters.models;
+  const dom = createReportDom(JSON.stringify(data));
+
+  new Script(extractRendererScript(html)).runInContext(createContext({ document: dom.document }));
+
+  assert.doesNotThrow(() => optionValue(dom.element("agent-filter"), "codex"));
+  assert.doesNotThrow(() => optionValue(dom.element("agent-filter"), "Unknown"));
+  assert.doesNotThrow(() => optionValue(dom.element("model-filter"), "gpt-test"));
+  assert.doesNotThrow(() => optionValue(dom.element("model-filter"), "Unknown"));
+  assert.equal(dom.element("span-table").children.length, 4);
+});
+
+test("fails closed when embedded report data violates the DTO schema", () => {
+  const html = renderStaticHtmlReport(reportFixture(), {
+    generated_at: "2026-07-10T00:00:00.000Z",
+  });
+  const dom = createReportDom('{"schemaVersion":"agent_observability.report.v1"}');
+
+  new Script(extractRendererScript(html)).runInContext(createContext({ document: dom.document }));
+
+  assert.equal(dom.document.body.children.length, 1);
+  assert.equal(
+    dom.document.body.children[0].textContent,
+    "Report data does not match agent_observability.report.v1.",
+  );
+});
+
+test("fails closed when embedded report data is malformed JSON", () => {
+  const html = renderStaticHtmlReport(reportFixture(), {
+    generated_at: "2026-07-10T00:00:00.000Z",
+  });
+  const dom = createReportDom('{"schemaVersion":');
+
+  assert.doesNotThrow(() => {
+    new Script(extractRendererScript(html)).runInContext(createContext({ document: dom.document }));
+  });
+  assert.equal(dom.document.body.children.length, 1);
+  assert.equal(
+    dom.document.body.children[0].textContent,
+    "Report data does not match agent_observability.report.v1.",
+  );
+});
+
+test("keeps the literal all value selectable as report data", () => {
+  const html = renderStaticHtmlReport(reportFixture(), {
+    generated_at: "2026-07-10T00:00:00.000Z",
+  });
+  const data = reportDataFromRecords(reportFixture(), {
+    generated_at: "2026-07-10T00:00:00.000Z",
+  });
+  for (const span of data.spans) span.repo = "all";
+  data.filters.repos = ["all"];
+  const dom = createReportDom(JSON.stringify(data));
+
+  new Script(extractRendererScript(html)).runInContext(createContext({ document: dom.document }));
+  const repoFilter = dom.element("repo-filter");
+  repoFilter.value = optionValue(repoFilter, "all");
+  repoFilter.listeners.change();
+
+  assert.equal(dom.element("span-table").children.length, 4);
+  assert.equal(dom.element("clear-filters").disabled, false);
+});
+
+test("escapes schema-valid hostile currency text in span rows", () => {
+  const html = renderStaticHtmlReport(reportFixture(), {
+    generated_at: "2026-07-10T00:00:00.000Z",
+    rate_table: { ...reportRateTable(), currency: "<img src=x>" },
+  });
+  const dataJson = extractReportDataJson(html);
+  const dom = createReportDom(dataJson);
+
+  new Script(extractRendererScript(html)).runInContext(createContext({ document: dom.document }));
+
+  assert.equal(dom.element("span-table").innerHTML.includes("<img"), false);
+  assert.equal(dom.element("span-table").innerHTML.includes("&lt;img"), true);
 });
 
 test("renders incomplete cost status with the partial amount", async () => {
@@ -242,13 +367,22 @@ function extractRendererScript(html) {
   return scripts.at(-1)[1];
 }
 
+function optionValue(select, label) {
+  const option = select.children.find((candidate) => candidate.textContent === label);
+  assert.ok(option, `missing option ${label}`);
+  return option.value;
+}
+
 function createReportDom(reportDataJson) {
   const elements = new Map();
   const ids = [
     "repo-filter",
     "session-filter",
-    "turn-filter",
+    "agent-filter",
+    "model-filter",
     "text-filter",
+    "clear-filters",
+    "filter-status",
     "trace-list",
     "span-table",
     "trace-count",
@@ -270,6 +404,7 @@ function createReportDom(reportDataJson) {
   elements.set("report-data", reportData);
 
   const document = {
+    body: new MiniElement("body"),
     createElement(tagName) {
       return new MiniElement(tagName);
     },
@@ -294,6 +429,9 @@ function tagNameForId(id) {
   if (id === "text-filter") {
     return "input";
   }
+  if (id === "clear-filters") {
+    return "button";
+  }
   if (id === "span-table") {
     return "tbody";
   }
@@ -309,6 +447,8 @@ class MiniElement {
     this.value = "";
     this.className = "";
     this.type = "";
+    this.disabled = false;
+    this.attributes = {};
     this._innerHTML = "";
     this.textContent = "";
   }
@@ -328,6 +468,12 @@ class MiniElement {
   addEventListener(eventName, callback) {
     this.listeners[eventName] = callback;
   }
+
+  setAttribute(name, value) {
+    this.attributes[name] = String(value);
+  }
+
+  focus() {}
 
   replaceChildren(...children) {
     this.children = children;
