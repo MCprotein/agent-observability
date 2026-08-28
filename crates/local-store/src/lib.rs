@@ -1505,8 +1505,8 @@ mod tests {
     use super::*;
     use agent_observability_contracts::{AgentSource, ObservationEvent};
     use agent_observability_domain::{
-        CorrelationIds, ObservationId, SourceCursor, SourceGeneration, SpanId, Timing, TokenUsage,
-        TraceId,
+        CompactionId, CorrelationIds, ObservationId, SourceCursor, SourceGeneration, SpanId,
+        Timing, TokenUsage, TraceId,
     };
 
     fn observation(cursor: &str, span: &str, parent: Option<&str>) -> SourceObservation {
@@ -2184,6 +2184,60 @@ mod tests {
             Err(StoreError::PayloadConflict)
         ));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_v10_state_without_compaction_metrics_reopens_and_reduces_an_update() {
+        let dir = temp_dir("pre-v10-compaction-state");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let mut existing = observation("1", "compaction", None);
+        existing.event = ObservationEvent::Compaction {
+            trigger: Some("auto".into()),
+        };
+        existing.correlation.compaction_id = Some(CompactionId::parse("compact-1").unwrap());
+        store.ingest(&existing).unwrap();
+        let database = store.database_path();
+        drop(store);
+
+        let connection = Connection::open(&database).unwrap();
+        let state_json: String = connection
+            .query_row("SELECT state_json FROM records", [], |row| row.get(0))
+            .unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+        let token_usage = legacy
+            .get_mut("token_usage")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        token_usage.remove("input_before");
+        token_usage.remove("input_after");
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        assert!(!legacy_json.contains("input_before"));
+        assert!(!legacy_json.contains("input_after"));
+        connection
+            .execute("UPDATE records SET state_json=?1", params![legacy_json])
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE adapter_dispositions;
+                 UPDATE metadata SET value='local_state.v1' WHERE key='schema_version';",
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut reopened = LocalStore::open(&dir).unwrap();
+        let mut update = observation_after("2", Some("1"), "compaction", None);
+        update.event = ObservationEvent::Compaction {
+            trigger: Some("auto".into()),
+        };
+        update.correlation.compaction_id = Some(CompactionId::parse("compact-1").unwrap());
+        update.token_usage.input_before = Some(120_000);
+        update.token_usage.input_after = Some(64_000);
+        assert_eq!(reopened.ingest(&update).unwrap(), IngestStatus::Committed);
+        let projection = fs::read_to_string(reopened.projection_path()).unwrap();
+        assert!(projection.contains("\"input_tokens_before\":120000.0"));
+        assert!(projection.contains("\"input_tokens_after\":64000.0"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

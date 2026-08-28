@@ -62,7 +62,7 @@ foreground deadline and load evidence remain future support gates; both entries 
 
 | Scenario | Required evidence |
 | --- | --- |
-| session and turn | stable boundaries, restart, interrupted turn and timestamp ordering fixtures |
+| session and turn | stable boundaries, restart, terminal lifecycle, timestamp ordering, and either explicit interrupt support or a verified interrupt gap |
 | LLM usage | model availability state and input/output/cache token semantics without double counting |
 | tool lifecycle | parent relation, start/end or bounded duration, status and bounded reason category |
 | identity | explicit/default profile, purpose-specific email match, ambiguous source-only and cross-principal denial |
