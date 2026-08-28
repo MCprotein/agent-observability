@@ -80,8 +80,8 @@ cargo run -p agent-observability-cli -- claude-code-ingest <private-store-dir> <
 cargo run -p agent-observability-cli -- cursor-ingest <private-store-dir> <private-handoff.jsonl>
 ```
 
-`v0.11.0` Rust Cursor adapter는 구현과 privacy/replay fixture 검증을 완료했으며 독립 리뷰를
-release gate로 실행한다. 다음 release train은 `v0.12.0` TypeScript static report UI다.
+`v0.11.0` Rust Cursor adapter는 구현, privacy/replay fixture 검증, 독립 아키텍처·코드·테스트
+review gate를 완료했다. 다음 release train은 `v0.12.0` TypeScript static report UI다.
 
 ## 아키텍처 요약
 
@@ -98,20 +98,20 @@ Codex / Claude Code
              |-> local JSONL -> JS report projection -> self-contained HTML
              `-> redacted JSON snapshot
 
-CURRENT v0.10 - IMPLEMENTED (experimental Rust Codex + Claude Code adapters)
+CURRENT v0.11 - IMPLEMENTED (experimental Rust Codex + Claude Code + Cursor adapters)
 
 Closed schemas + manifest -> deterministic domain reducer + fail-closed projectors
-Codex OTel/notify or Claude Code OTel/hook canonical handoff -> bounded Rust adapters
+Codex OTel/notify, Claude Code OTel/hook, or Cursor Hook v1 canonical handoff -> bounded Rust adapters
         -> SourceObservation or fixed-code diagnostic/suppression
         -> private SQLite authority (cursor + stable event + current record + disposition)
              `-> replayable JSONL current-record projection
 Pricing policy + aggregation -> ReportDtoV1
-Rust CLI -> contracts inspection / local storage health check / Codex and Claude Code handoff ingest
+Rust CLI -> contracts inspection / local storage health check / Codex, Claude Code, and Cursor handoff ingest
 No Node.js <-> Rust FFI or subprocess production path
 
 TARGET - PLANNED (Rust + TypeScript)
 
-Agent logs/hooks, including planned Cursor support
+Agent logs/hooks for Codex, Claude Code, and Cursor
         -> bounded local handoff + Rust inbound adapters
         -> SourceObservation (transient, never durable)
         -> domain lifecycle state and application use cases
