@@ -191,7 +191,7 @@ pub fn parse_handoff_jsonl(input: &str) -> Result<AdapterBatch, AdapterError> {
     }
     let mut batch = AdapterBatch::default();
     let mut raw_cursors = BTreeMap::<String, String>::new();
-    let mut observation_positions = BTreeMap::<(String, String), usize>::new();
+    let mut observation_positions = BTreeMap::<(String, String, String), usize>::new();
     for (index, line) in input.lines().enumerate() {
         if index >= MAX_HANDOFF_LINES {
             return Err(AdapterError::TooManyRecords);
@@ -223,9 +223,12 @@ pub fn parse_handoff_jsonl(input: &str) -> Result<AdapterBatch, AdapterError> {
             };
         match mapping {
             Mapping::Observation(observation) => {
+                let payload_hash = canonical_observation_payload_hash(&observation)
+                    .map_err(|_| AdapterError::InvalidFieldType)?;
                 let key = (
                     observation.source_generation.as_str().to_owned(),
                     observation.span_id.as_str().to_owned(),
+                    payload_hash.clone(),
                 );
                 match observation_positions.entry(key) {
                     std::collections::btree_map::Entry::Occupied(_) => {
@@ -236,10 +239,7 @@ pub fn parse_handoff_jsonl(input: &str) -> Result<AdapterBatch, AdapterError> {
                                 code: DiagnosticCode::DuplicateObservation,
                                 checkpoint,
                                 disposition: AdapterDispositionKind::Suppressed,
-                                payload_hash: Some(
-                                    canonical_observation_payload_hash(&observation)
-                                        .map_err(|_| AdapterError::InvalidFieldType)?,
-                                ),
+                                payload_hash: Some(payload_hash),
                             }));
                     }
                     std::collections::btree_map::Entry::Vacant(entry) => {
@@ -697,16 +697,19 @@ mod tests {
 
     const FIXTURE: &str = include_str!("../tests/fixtures/codex-handoff.jsonl");
     const EXPECTED_PROJECTION: &str = include_str!("../tests/fixtures/codex-projection.jsonl");
+    const EXPECTED_HANDOFF_HASH: &str =
+        "sha256:0b30a1810b6e34152310691a3a660ecf33e98d4940fc63fe9b340811241f526c";
+    const EXPECTED_PROJECTION_HASH: &str =
+        "sha256:6dc1fa2ad7837c0e9ac2dcd6ac0dca52da1b0c11872db203d53ae742c97ee45a";
 
     #[test]
-    fn maps_primary_and_supplement_sources_without_duplicate_turns() {
+    fn maps_primary_and_supplement_sources_without_losing_timing_updates() {
         let batch = parse_handoff_jsonl(FIXTURE).expect("fixture parses");
-        assert_eq!(batch.observations().count(), 5);
+        assert_eq!(batch.observations().count(), 6);
         let diagnostics = batch.diagnostics().collect::<Vec<_>>();
-        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(diagnostics.len(), 2);
         assert_eq!(diagnostics[0].code, DiagnosticCode::ContentEventIgnored);
         assert_eq!(diagnostics[1].code, DiagnosticCode::UnsupportedEvent);
-        assert_eq!(diagnostics[2].code, DiagnosticCode::DuplicateObservation);
         let requests = batch
             .observations()
             .filter(|observation| {
@@ -725,8 +728,10 @@ mod tests {
             .observations()
             .filter(|observation| matches!(observation.event, ObservationEvent::Turn))
             .collect::<Vec<_>>();
-        assert_eq!(turns.len(), 1);
+        assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].lifecycle, LifecycleState::Completed);
+        assert_eq!(turns[1].lifecycle, LifecycleState::Completed);
+        assert!(turns[1].timing.end_unix_ms > turns[0].timing.end_unix_ms);
         assert_eq!(
             turns[0].previous_source_cursor.as_ref().unwrap().as_str(),
             "6"
@@ -915,7 +920,7 @@ mod tests {
             Err(AdapterError::InsecurePermissions)
         ));
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(read_handoff_file(&path).unwrap().observations().count(), 5);
+        assert_eq!(read_handoff_file(&path).unwrap().observations().count(), 6);
         let oversized = root.join("oversized.jsonl");
         fs::write(
             &oversized,
@@ -964,9 +969,9 @@ mod tests {
                 }
             }
         }
-        assert_eq!(store.observation_count().unwrap(), 5);
+        assert_eq!(store.observation_count().unwrap(), 6);
         assert_eq!(store.record_count().unwrap(), 5);
-        assert_eq!(store.disposition_count().unwrap(), 3);
+        assert_eq!(store.disposition_count().unwrap(), 2);
         assert_eq!(
             store.cursor("codex", "codex-0.150.1").unwrap().as_deref(),
             Some("8")
@@ -1034,8 +1039,8 @@ mod tests {
             }
         }
         store.rebuild_projection().unwrap();
-        assert_eq!(store.observation_count().unwrap(), 5);
-        assert_eq!(store.disposition_count().unwrap(), 3);
+        assert_eq!(store.observation_count().unwrap(), 6);
+        assert_eq!(store.disposition_count().unwrap(), 2);
         assert_eq!(
             store.cursor("codex", "codex-0.150.1").unwrap().as_deref(),
             Some("8")
@@ -1066,13 +1071,15 @@ mod tests {
             .iter()
             .find(|entry| entry.adapter_family == "codex")
             .unwrap();
+        assert_eq!(fixture_hash(FIXTURE), EXPECTED_HANDOFF_HASH);
+        assert_eq!(fixture_hash(EXPECTED_PROJECTION), EXPECTED_PROJECTION_HASH);
         assert_eq!(
             codex.fixture_hashes.get("codex-handoff.jsonl"),
-            Some(&fixture_hash(FIXTURE))
+            Some(&EXPECTED_HANDOFF_HASH.to_owned())
         );
         assert_eq!(
             codex.fixture_hashes.get("codex-projection.jsonl"),
-            Some(&fixture_hash(EXPECTED_PROJECTION))
+            Some(&EXPECTED_PROJECTION_HASH.to_owned())
         );
     }
 }

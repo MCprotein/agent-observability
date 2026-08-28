@@ -17,7 +17,7 @@ adapter family, source generation, 공식 session/conversation/generation identi
 | Adapter | Primary source | Supplement / fallback | Verified official reference |
 | --- | --- | --- | --- |
 | Codex | native telemetry for model/API/token/tool signals | `agent-turn-complete` notify for turn lifecycle; local session output is not used by the Rust adapter | [Advanced configuration](https://developers.openai.com/codex/config-advanced), [Configuration reference](https://developers.openai.com/codex/config-reference) |
-| Claude Code | native telemetry for usage, cost and tool metrics | hooks for lifecycle events; documented transcript fields only as a version-gated reconciliation fallback | [Hooks reference](https://code.claude.com/docs/en/hooks), [Monitoring usage](https://code.claude.com/docs/en/monitoring-usage) |
+| Claude Code | native telemetry for usage, cost and tool metrics | hooks for lifecycle events; no transcript dependency in the Rust adapter | [Hooks reference](https://code.claude.com/docs/en/hooks), [Monitoring usage](https://code.claude.com/docs/en/monitoring-usage) |
 | Cursor | official hooks for conversation, generation, model, user-email and transcript references | project/team hook coverage where local and cloud execution differ; transcript parsing only for documented fields and validated fixtures | [Hooks reference](https://cursor.com/docs/hooks) |
 
 Raw email supplied by a product surface is used only for local profile matching. It is immediately resolved to
@@ -57,7 +57,7 @@ Each entry in `crates/contracts/capabilities/adapter-capability-v1.yaml` contain
 `cargo test -p agent-observability-contracts adapter_capability_v1` validates schema, field ownership and
 privacy closure. The Codex and Claude Code adapter suites verify declared input/projection fixture hashes, exact
 replay output, bounded input, restart/idempotency and privacy behavior. Claude Code additionally locks permission,
-compaction, interrupted lifecycle and out-of-order timestamp fixtures. Cross-version/OS/profile execution,
+compaction, failed lifecycle, interrupt-gap and out-of-order timestamp fixtures. Cross-version/OS/profile execution,
 foreground deadline and load evidence remain future support gates; both entries therefore remain `experimental`.
 
 | Scenario | Required evidence |

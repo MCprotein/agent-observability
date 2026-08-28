@@ -118,9 +118,10 @@ fn codex_ingest_process_commits_observations_and_bounded_diagnostics() {
         String::from_utf8_lossy(&first.stderr)
     );
     let stdout = String::from_utf8_lossy(&first.stdout);
-    assert!(stdout.contains("observations=5"));
+    assert!(stdout.contains("observations=6"));
     assert!(stdout.contains("diagnostics=2"));
-    assert!(stdout.contains("suppressed=1"));
+    assert!(stdout.contains("duplicates=0"));
+    assert!(stdout.contains("suppressed=0"));
 
     let second = binary()
         .args([
@@ -168,7 +169,7 @@ fn claude_code_ingest_process_is_private_and_idempotent() {
     fs::set_permissions(&handoff, fs::Permissions::from_mode(0o600)).unwrap();
     let store = root.join("store");
 
-    for _ in 0..2 {
+    for run in 0..2 {
         let output = binary()
             .args([
                 "claude-code-ingest",
@@ -184,7 +185,17 @@ fn claude_code_ingest_process_is_private_and_idempotent() {
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("source=claude-code"));
-        assert!(stdout.contains("observations=7"));
+        if run == 0 {
+            assert!(stdout.contains("observations=7"));
+            assert!(stdout.contains("diagnostics=2"));
+            assert!(stdout.contains("duplicates=0"));
+            assert!(stdout.contains("suppressed=1"));
+        } else {
+            assert!(stdout.contains("observations=0"));
+            assert!(stdout.contains("diagnostics=0"));
+            assert!(stdout.contains("duplicates=10"));
+            assert!(stdout.contains("suppressed=0"));
+        }
     }
 
     let projection = fs::read_to_string(store.join("observations.jsonl")).unwrap();
@@ -198,6 +209,88 @@ fn claude_code_ingest_process_is_private_and_idempotent() {
     ] {
         assert!(!projection.contains(secret));
     }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_code_ingest_restarts_from_a_failed_prefix_and_tail() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-claude-tail-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let fixture = include_str!("../../adapter-claude-code/tests/fixtures/claude-handoff.jsonl");
+    let prefix = root.join("prefix.jsonl");
+    let tail = root.join("tail.jsonl");
+    fs::write(
+        &prefix,
+        fixture.lines().take(3).collect::<Vec<_>>().join("\n"),
+    )
+    .unwrap();
+    fs::write(
+        &tail,
+        fixture.lines().skip(3).collect::<Vec<_>>().join("\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&prefix, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&tail, fs::Permissions::from_mode(0o600)).unwrap();
+    let split_store = root.join("split-store");
+
+    for handoff in [&prefix, &tail] {
+        let output = binary()
+            .args([
+                "claude-code-ingest",
+                split_store.to_str().unwrap(),
+                handoff.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let full_handoff = root.join("full.jsonl");
+    fs::write(&full_handoff, fixture).unwrap();
+    fs::set_permissions(&full_handoff, fs::Permissions::from_mode(0o600)).unwrap();
+    let full_store = root.join("full-store");
+    let full = binary()
+        .args([
+            "claude-code-ingest",
+            full_store.to_str().unwrap(),
+            full_handoff.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        full.status.success(),
+        "{}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+
+    assert_eq!(
+        fs::read_to_string(split_store.join("observations.jsonl")).unwrap(),
+        fs::read_to_string(full_store.join("observations.jsonl")).unwrap()
+    );
+    let split_state = agent_observability_local_store::LocalStore::open(&split_store).unwrap();
+    let full_state = agent_observability_local_store::LocalStore::open(&full_store).unwrap();
+    assert_eq!(split_state.observation_count().unwrap(), 7);
+    assert_eq!(split_state.disposition_count().unwrap(), 3);
+    assert_eq!(
+        split_state.observation_count().unwrap(),
+        full_state.observation_count().unwrap()
+    );
+    assert_eq!(
+        split_state.disposition_count().unwrap(),
+        full_state.disposition_count().unwrap()
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -270,8 +363,8 @@ fn codex_ingest_process_restarts_from_an_appended_tail() {
     );
     let split_state = agent_observability_local_store::LocalStore::open(&store).unwrap();
     let full_state = agent_observability_local_store::LocalStore::open(&full_store).unwrap();
-    assert_eq!(split_state.observation_count().unwrap(), 5);
-    assert_eq!(split_state.disposition_count().unwrap(), 3);
+    assert_eq!(split_state.observation_count().unwrap(), 6);
+    assert_eq!(split_state.disposition_count().unwrap(), 2);
     assert_eq!(
         split_state.observation_count().unwrap(),
         full_state.observation_count().unwrap()

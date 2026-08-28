@@ -642,7 +642,11 @@ supplement로만 사용한다. 내부 transcript 형식은 Rust contract depende
 3. `claude_code.api_request`에서 model, duration, input/output/cache token을 한 번만 기록한다.
 4. `tool_result`와 `tool_decision`은 `tool_use_id`로 tool/permission observation을 구분한다.
 5. compaction은 trigger, duration, pre/post token만 저장하고 error/summary는 버린다.
-6. `Stop`/`StopFailure`는 turn lifecycle만 보완하며 usage를 다시 만들지 않는다.
+6. `Stop`은 completed, `StopFailure`는 failed lifecycle만 보완하며 usage를 다시 만들지 않는다.
+
+현재 공식 hook은 사용자 interrupt를 별도 lifecycle event로 제공하지 않으므로 interrupted 상태를
+`StopFailure`에서 추측하지 않는다. `prompt_id`가 없는 lifecycle 입력과 미등록 model은 고정 코드
+diagnostic으로 격리한다.
 
 동시 hook 입력은 daemon의 local transactional state에서 serialize한다. Hook마다 별도 state file을
 만들거나 team network 완료를 기다리지 않는다.

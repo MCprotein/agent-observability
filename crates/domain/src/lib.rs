@@ -437,6 +437,8 @@ fn merge_metrics(
     field!(total_reasoning_output);
     field!(total_accumulated);
     field!(context_window);
+    field!(input_before);
+    field!(input_after);
     Ok(())
 }
 
@@ -558,11 +560,13 @@ mod tests {
         first.timing = Timing::new(20, Some(30)).unwrap();
         first.correlation.turn_id = Some(super::TurnId::parse("turn").unwrap());
         first.token_usage.input = Some(4);
+        first.token_usage.input_before = Some(12);
         let mut second = first.clone();
         second.lifecycle = LifecycleState::Running;
         second.timing = Timing::new(10, None).unwrap();
         second.correlation.session_id = Some(super::SessionId::parse("session").unwrap());
         second.token_usage.output = Some(8);
+        second.token_usage.input_after = Some(6);
 
         let left = LifecycleReducer::reduce([first.clone(), second.clone()]).unwrap();
         let right = LifecycleReducer::reduce([second, first]).unwrap();
@@ -571,6 +575,8 @@ mod tests {
         assert_eq!(left[0].timing, Timing::new(10, Some(30)).unwrap());
         assert_eq!(left[0].token_usage.input, Some(4));
         assert_eq!(left[0].token_usage.output, Some(8));
+        assert_eq!(left[0].token_usage.input_before, Some(12));
+        assert_eq!(left[0].token_usage.input_after, Some(6));
     }
 
     #[test]
@@ -641,6 +647,24 @@ mod tests {
             LifecycleReducer::reduce([different_metric, conflicting_metric]),
             Err(DomainError::FieldConflict { .. })
         ));
+
+        for field in ["input_before", "input_after"] {
+            let mut left = state("span", SpanKind::Compaction, LifecycleState::Completed);
+            let mut right = left.clone();
+            let expected = if field == "input_before" {
+                left.token_usage.input_before = Some(100);
+                right.token_usage.input_before = Some(90);
+                "token_usage.input_before"
+            } else {
+                left.token_usage.input_after = Some(60);
+                right.token_usage.input_after = Some(50);
+                "token_usage.input_after"
+            };
+            assert!(matches!(
+                LifecycleReducer::reduce([left, right]),
+                Err(DomainError::FieldConflict { field: conflict, .. }) if conflict == expected
+            ));
+        }
     }
 
     #[test]

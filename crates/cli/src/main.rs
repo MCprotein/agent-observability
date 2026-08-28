@@ -110,6 +110,7 @@ fn ingest_items<'a>(
     let mut store = LocalStore::open(directory).map_err(|error| error.to_string())?;
     let mut observations = 0_u64;
     let mut diagnostics = 0_u64;
+    let mut duplicates = 0_u64;
     let mut suppressed = 0_u64;
     for item in items {
         match item {
@@ -117,10 +118,10 @@ fn ingest_items<'a>(
                 let status = store
                     .ingest_deferred_projection(observation)
                     .map_err(|error| error.to_string())?;
-                if status == IngestStatus::Suppressed {
-                    suppressed += 1;
-                } else {
-                    observations += 1;
+                match status {
+                    IngestStatus::Committed => observations += 1,
+                    IngestStatus::Duplicate => duplicates += 1,
+                    IngestStatus::Suppressed => suppressed += 1,
                 }
             }
             IngestItem::Disposition {
@@ -129,12 +130,16 @@ fn ingest_items<'a>(
                 code,
                 payload_hash,
             } => {
-                store
+                let status = store
                     .ingest_disposition_with_payload(checkpoint, disposition, code, payload_hash)
                     .map_err(|error| error.to_string())?;
-                match disposition {
-                    AdapterDispositionKind::Diagnostic => diagnostics += 1,
-                    AdapterDispositionKind::Suppressed => suppressed += 1,
+                match status {
+                    IngestStatus::Committed => match disposition {
+                        AdapterDispositionKind::Diagnostic => diagnostics += 1,
+                        AdapterDispositionKind::Suppressed => suppressed += 1,
+                    },
+                    IngestStatus::Duplicate => duplicates += 1,
+                    IngestStatus::Suppressed => suppressed += 1,
                 }
             }
         }
@@ -143,7 +148,7 @@ fn ingest_items<'a>(
         .rebuild_projection()
         .map_err(|error| error.to_string())?;
     Ok(format!(
-        "source={source}\nobservations={observations}\ndiagnostics={diagnostics}\nsuppressed={suppressed}\nteam_ingest=disabled"
+        "source={source}\nobservations={observations}\ndiagnostics={diagnostics}\nduplicates={duplicates}\nsuppressed={suppressed}\nteam_ingest=disabled"
     ))
 }
 

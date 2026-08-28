@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fmt::{self, Display, Formatter};
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::Path;
 
 pub const HANDOFF_SCHEMA_VERSION: &str = "claude_handoff.v1";
@@ -151,19 +151,40 @@ impl From<io::Error> for AdapterError {
 /// order, or invalid canonical identifiers.
 pub fn read_handoff_file(path: impl AsRef<Path>) -> Result<AdapterBatch, AdapterError> {
     let path = path.as_ref();
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
+    let path_metadata = fs::symlink_metadata(path)?;
+    if path_metadata.file_type().is_symlink() {
         return Err(AdapterError::SymbolicLink);
     }
-    if !metadata.is_file() {
+    if !path_metadata.is_file() {
+        return Err(AdapterError::InvalidFileType);
+    }
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || !same_file_identity(&path_metadata, &metadata) {
         return Err(AdapterError::InvalidFileType);
     }
     if metadata.len() > MAX_HANDOFF_BYTES {
         return Err(AdapterError::HandoffTooLarge);
     }
     private_file_permissions(&metadata)?;
-    let input = fs::read_to_string(path)?;
+    let mut input = String::new();
+    file.take(MAX_HANDOFF_BYTES + 1)
+        .read_to_string(&mut input)?;
+    if input.len() as u64 > MAX_HANDOFF_BYTES {
+        return Err(AdapterError::HandoffTooLarge);
+    }
     parse_handoff_jsonl(&input)
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    true
 }
 
 #[cfg(unix)]
@@ -330,7 +351,7 @@ fn observation_from_record(
             turn_observation(record, previous_cursor, LifecycleState::Completed)
         }
         (SourceSurface::Hook, "StopFailure") => {
-            turn_observation(record, previous_cursor, LifecycleState::Interrupted)
+            turn_observation(record, previous_cursor, LifecycleState::Failed)
         }
         (SourceSurface::Hook | SourceSurface::OtelLog, _) => {
             Ok(Mapping::Diagnostic(DiagnosticCode::UnsupportedEvent))
@@ -618,9 +639,11 @@ fn canonical_model(attributes: &BTreeMap<String, Value>) -> Result<Option<String
     let Some(model) = optional_string(attributes, "model")? else {
         return Ok(None);
     };
-    Ok(KNOWN_CLAUDE_MODELS
-        .contains(&model.as_str())
-        .then_some(model))
+    if KNOWN_CLAUDE_MODELS.contains(&model.as_str()) {
+        Ok(Some(model))
+    } else {
+        Err(AdapterError::InvalidFieldType)
+    }
 }
 
 fn canonical_tool_name(
@@ -739,6 +762,25 @@ mod tests {
 
     const FIXTURE: &str = include_str!("../tests/fixtures/claude-handoff.jsonl");
     const EXPECTED_PROJECTION: &str = include_str!("../tests/fixtures/claude-projection.jsonl");
+    const EXPECTED_HANDOFF_HASH: &str =
+        "sha256:316ae843b2d0d20ae5ad25a7507fb9e16d025d6f4442b9775048b789c9560a44";
+    const EXPECTED_PROJECTION_HASH: &str =
+        "sha256:a65f5439b7fb563547ac9daa311f71b799f34842e14e21c0451be2956c3bd4fc";
+    const RAW_SENTINELS: &[&str] = &[
+        "RAW_PROMPT_SECRET",
+        "RAW_RESPONSE_SECRET",
+        "RAW_COMMAND_SECRET",
+        "RAW_TOOL_INPUT_SECRET",
+        "RAW_TOOL_ERROR_SECRET",
+        "RAW_ERROR_SECRET",
+        "RAW_ASSISTANT_SECRET",
+        "RAW_COMPACTION_ERROR",
+        "RAW_CONTENT_EVENT_SECRET",
+        "RAW_UNKNOWN_SECRET",
+        "raw@example.invalid",
+        "/RAW/PRIVATE/PATH",
+        "/RAW/PRIVATE/TRANSCRIPT",
+    ];
 
     #[test]
     fn maps_otel_primary_and_hook_lifecycle_with_fixed_precedence() {
@@ -750,11 +792,11 @@ mod tests {
         assert_eq!(diagnostics[1].code, DiagnosticCode::UnsupportedEvent);
         assert_eq!(diagnostics[2].code, DiagnosticCode::DuplicateObservation);
 
-        let interrupted = batch.observations().find(|observation| {
+        let failed = batch.observations().find(|observation| {
             matches!(observation.event, ObservationEvent::Turn)
-                && observation.lifecycle == LifecycleState::Interrupted
+                && observation.lifecycle == LifecycleState::Failed
         });
-        assert!(interrupted.is_some());
+        assert!(failed.is_some());
 
         let request = batch
             .observations()
@@ -775,19 +817,19 @@ mod tests {
     #[test]
     fn accepts_out_of_order_timestamps_without_reordering_source_cursors() {
         let batch = parse_handoff_jsonl(FIXTURE).unwrap();
-        let interrupted = batch
+        let failed = batch
             .observations()
             .find(|observation| {
                 matches!(observation.event, ObservationEvent::Turn)
-                    && observation.lifecycle == LifecycleState::Interrupted
+                    && observation.lifecycle == LifecycleState::Failed
             })
             .unwrap();
         let request = batch
             .observations()
             .find(|observation| matches!(observation.event, ObservationEvent::ModelRequest { .. }))
             .unwrap();
-        assert!(interrupted.timing.end_unix_ms > request.timing.end_unix_ms);
-        assert_eq!(interrupted.source_cursor.as_str(), "3");
+        assert!(failed.timing.end_unix_ms > request.timing.end_unix_ms);
+        assert_eq!(failed.source_cursor.as_str(), "3");
         assert_eq!(
             request.previous_source_cursor.as_ref().unwrap().as_str(),
             "3"
@@ -795,18 +837,59 @@ mod tests {
     }
 
     #[test]
+    fn hook_supplement_cannot_override_otel_primary_usage_fields() {
+        let input = concat!(
+            "{\"schema_version\":\"claude_handoff.v1\",\"source_generation\":\"claude-code-2.1.248\",\"previous_cursor\":null,\"cursor\":\"1\",\"surface\":\"hook\",\"received_at_unix_ms\":100,\"event_name\":\"SessionStart\",\"attributes\":{\"session_id\":\"session-1\",\"model\":\"claude-test\"}}\n",
+            "{\"schema_version\":\"claude_handoff.v1\",\"source_generation\":\"claude-code-2.1.248\",\"previous_cursor\":\"1\",\"cursor\":\"2\",\"surface\":\"hook\",\"received_at_unix_ms\":300,\"event_name\":\"Stop\",\"attributes\":{\"session_id\":\"session-1\",\"prompt_id\":\"prompt-1\",\"model\":\"RAW_HOOK_MODEL\",\"input_tokens\":999,\"tool_name\":\"RAW_HOOK_TOOL\",\"decision\":\"reject\"}}\n",
+            "{\"schema_version\":\"claude_handoff.v1\",\"source_generation\":\"claude-code-2.1.248\",\"previous_cursor\":\"2\",\"cursor\":\"3\",\"surface\":\"otel_log\",\"received_at_unix_ms\":200,\"event_name\":\"claude_code.api_request\",\"attributes\":{\"session_id\":\"session-1\",\"prompt_id\":\"prompt-1\",\"request_id\":\"request-1\",\"model\":\"claude-sonnet-5\",\"input_tokens\":42,\"success\":true}}"
+        );
+        let batch = parse_handoff_jsonl(input).unwrap();
+        let requests = batch
+            .observations()
+            .filter(|observation| {
+                matches!(observation.event, ObservationEvent::ModelRequest { .. })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].token_usage.input, Some(42));
+        assert!(matches!(
+            &requests[0].event,
+            ObservationEvent::ModelRequest { model } if model.as_deref() == Some("claude-sonnet-5")
+        ));
+        let debug = format!("{batch:?}");
+        assert!(!debug.contains("RAW_HOOK_MODEL"));
+        assert!(!debug.contains("RAW_HOOK_TOOL"));
+    }
+
+    #[test]
+    fn missing_prompt_id_and_unknown_model_are_fixed_diagnostics() {
+        let input = concat!(
+            "{\"schema_version\":\"claude_handoff.v1\",\"source_generation\":\"claude-code-2.1.248\",\"previous_cursor\":null,\"cursor\":\"1\",\"surface\":\"hook\",\"received_at_unix_ms\":100,\"event_name\":\"Stop\",\"attributes\":{\"session_id\":\"session-1\"}}\n",
+            "{\"schema_version\":\"claude_handoff.v1\",\"source_generation\":\"claude-code-2.1.248\",\"previous_cursor\":\"1\",\"cursor\":\"2\",\"surface\":\"otel_log\",\"received_at_unix_ms\":200,\"event_name\":\"claude_code.api_request\",\"attributes\":{\"session_id\":\"session-1\",\"prompt_id\":\"prompt-1\",\"request_id\":\"request-1\",\"model\":\"RAW_UNKNOWN_MODEL\"}}"
+        );
+        let batch = parse_handoff_jsonl(input).unwrap();
+        let diagnostics = batch.diagnostics().collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].code, DiagnosticCode::MissingCorrelation);
+        assert_eq!(diagnostics[1].code, DiagnosticCode::InvalidFieldType);
+        assert!(!format!("{batch:?}").contains("RAW_UNKNOWN_MODEL"));
+    }
+
+    #[test]
+    fn duration_underflow_is_a_fixed_diagnostic() {
+        let input = "{\"schema_version\":\"claude_handoff.v1\",\"source_generation\":\"claude-code-2.1.248\",\"previous_cursor\":null,\"cursor\":\"1\",\"surface\":\"otel_log\",\"received_at_unix_ms\":10,\"event_name\":\"claude_code.api_request\",\"attributes\":{\"session_id\":\"session-1\",\"prompt_id\":\"prompt-1\",\"request_id\":\"request-1\",\"model\":\"claude-test\",\"duration_ms\":11}}";
+        let batch = parse_handoff_jsonl(input).unwrap();
+        assert_eq!(batch.observations().count(), 0);
+        assert_eq!(
+            batch.diagnostics().next().unwrap().code,
+            DiagnosticCode::InvalidFieldType
+        );
+    }
+
+    #[test]
     fn content_and_identity_never_cross_the_adapter_boundary() {
         let debug = format!("{:?}", parse_handoff_jsonl(FIXTURE).unwrap());
-        for secret in [
-            "RAW_PROMPT_SECRET",
-            "RAW_RESPONSE_SECRET",
-            "RAW_COMMAND_SECRET",
-            "RAW_TOOL_INPUT_SECRET",
-            "RAW_ERROR_SECRET",
-            "RAW_ASSISTANT_SECRET",
-            "raw@example.invalid",
-            "/RAW/PRIVATE/PATH",
-        ] {
+        for secret in RAW_SENTINELS {
             assert!(!debug.contains(secret));
         }
     }
@@ -834,10 +917,62 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn truncated_tail_fails_closed_without_returning_a_partial_batch() {
+        let truncated = format!("{}\n{{\"schema_version\":", FIXTURE.lines().next().unwrap());
+        assert!(matches!(
+            parse_handoff_jsonl(&truncated),
+            Err(AdapterError::InvalidJson)
+        ));
+    }
+
+    #[test]
+    fn source_generation_rotation_has_an_independent_cursor_scope() {
+        let input = concat!(
+            "{\"schema_version\":\"claude_handoff.v1\",\"source_generation\":\"claude-code-2.1.248-a\",\"previous_cursor\":null,\"cursor\":\"1\",\"surface\":\"hook\",\"received_at_unix_ms\":100,\"event_name\":\"SessionStart\",\"attributes\":{\"session_id\":\"session-1\",\"model\":\"claude-test\"}}\n",
+            "{\"schema_version\":\"claude_handoff.v1\",\"source_generation\":\"claude-code-2.1.248-b\",\"previous_cursor\":null,\"cursor\":\"1\",\"surface\":\"hook\",\"received_at_unix_ms\":200,\"event_name\":\"SessionStart\",\"attributes\":{\"session_id\":\"session-1\",\"model\":\"claude-test\"}}"
+        );
+        let batch = parse_handoff_jsonl(input).unwrap();
+        let observations = batch.observations().collect::<Vec<_>>();
+        assert_eq!(observations.len(), 2);
+        assert_ne!(
+            observations[0].source_generation,
+            observations[1].source_generation
+        );
+        assert_eq!(observations[0].source_cursor.as_str(), "1");
+        assert_eq!(observations[1].source_cursor.as_str(), "1");
+    }
+
+    #[test]
+    fn every_handoff_bound_accepts_its_limit_and_rejects_the_next_unit() {
+        let bounded_line = format!("{}\n", " ".repeat(MAX_HANDOFF_LINE_BYTES - 1));
+        let exact_bytes = bounded_line.repeat(16);
+        assert_eq!(exact_bytes.len() as u64, MAX_HANDOFF_BYTES);
+        assert!(parse_handoff_jsonl(&exact_bytes).is_ok());
+        assert!(matches!(
+            parse_handoff_jsonl(&(exact_bytes + "\n")),
+            Err(AdapterError::HandoffTooLarge)
+        ));
+
+        let exact_line = " ".repeat(MAX_HANDOFF_LINE_BYTES);
+        assert!(parse_handoff_jsonl(&exact_line).is_ok());
+        assert!(matches!(
+            parse_handoff_jsonl(&(exact_line + " ")),
+            Err(AdapterError::RecordTooLarge)
+        ));
+
+        let exact_records = "\n".repeat(MAX_HANDOFF_LINES);
+        assert!(parse_handoff_jsonl(&exact_records).is_ok());
+        assert!(matches!(
+            parse_handoff_jsonl(&(exact_records + "\n")),
+            Err(AdapterError::TooManyRecords)
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn file_reader_requires_a_private_regular_file() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let root = std::env::temp_dir().join(format!(
             "agent-observability-claude-file-{}",
@@ -854,6 +989,27 @@ mod tests {
         ));
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(read_handoff_file(&path).unwrap().observations().count(), 7);
+        let oversized = root.join("oversized.jsonl");
+        fs::write(
+            &oversized,
+            vec![b' '; usize::try_from(MAX_HANDOFF_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        fs::set_permissions(&oversized, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            read_handoff_file(&oversized),
+            Err(AdapterError::HandoffTooLarge)
+        ));
+        let link = root.join("handoff-link.jsonl");
+        symlink(&path, &link).unwrap();
+        assert!(matches!(
+            read_handoff_file(&link),
+            Err(AdapterError::SymbolicLink)
+        ));
+        assert!(matches!(
+            read_handoff_file(&root),
+            Err(AdapterError::InvalidFileType)
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -888,6 +1044,9 @@ mod tests {
         store.rebuild_projection().unwrap();
         let durable = fs::read_to_string(store.projection_path()).unwrap();
         assert_eq!(durable, EXPECTED_PROJECTION);
+        for secret in RAW_SENTINELS {
+            assert!(!durable.contains(secret));
+        }
         assert_eq!(store.observation_count().unwrap(), 7);
         assert_eq!(store.disposition_count().unwrap(), 3);
         assert_eq!(
@@ -922,13 +1081,15 @@ mod tests {
             .iter()
             .find(|entry| entry.adapter_family == "claude-code")
             .expect("Claude Code capability exists");
+        assert_eq!(hash(FIXTURE), EXPECTED_HANDOFF_HASH);
+        assert_eq!(hash(EXPECTED_PROJECTION), EXPECTED_PROJECTION_HASH);
         assert_eq!(
             capability.fixture_hashes.get("claude-handoff.jsonl"),
-            Some(&hash(FIXTURE))
+            Some(&EXPECTED_HANDOFF_HASH.to_owned())
         );
         assert_eq!(
             capability.fixture_hashes.get("claude-projection.jsonl"),
-            Some(&hash(EXPECTED_PROJECTION))
+            Some(&EXPECTED_PROJECTION_HASH.to_owned())
         );
     }
 }

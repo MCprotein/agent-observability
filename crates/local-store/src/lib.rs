@@ -804,6 +804,7 @@ fn same_canonical_observation(existing: &DomainSpanState, incoming: &DomainSpanS
         && existing.kind == incoming.kind
         && existing.lifecycle == incoming.lifecycle
         && existing.correlation == incoming.correlation
+        && existing.timing == incoming.timing
         && existing.token_usage == incoming.token_usage
 }
 
@@ -1690,7 +1691,7 @@ mod tests {
         store.ingest(&first).unwrap();
 
         let mut repeated = observation_after("2", Some("1"), "turn", None);
-        repeated.timing = Timing::new(200, Some(200)).unwrap();
+        repeated.timing = Timing::new(100, Some(100)).unwrap();
         assert_eq!(store.ingest(&repeated).unwrap(), IngestStatus::Suppressed);
         assert_eq!(store.observation_count().unwrap(), 1);
         assert_eq!(store.disposition_count().unwrap(), 1);
@@ -1706,6 +1707,29 @@ mod tests {
             store.ingest(&changed),
             Err(StoreError::PayloadConflict)
         ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn timing_change_at_a_new_cursor_reduces_instead_of_being_suppressed() {
+        let dir = temp_dir("timing-update");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let mut first = observation("1", "turn", None);
+        first.timing = Timing::new(100, Some(100)).unwrap();
+        store.ingest(&first).unwrap();
+
+        let mut later = observation_after("2", Some("1"), "turn", None);
+        later.timing = Timing::new(100, Some(200)).unwrap();
+        assert_eq!(store.ingest(&later).unwrap(), IngestStatus::Committed);
+        assert_eq!(store.observation_count().unwrap(), 2);
+        assert_eq!(store.disposition_count().unwrap(), 0);
+        assert_eq!(store.record_count().unwrap(), 1);
+        assert!(
+            fs::read_to_string(store.projection_path())
+                .unwrap()
+                .contains("\"end_time_unix_ms\":200.0")
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

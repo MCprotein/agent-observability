@@ -63,7 +63,7 @@
       ],
       "fixture_hashes": {
         "codex-handoff.jsonl": "sha256:0b30a1810b6e34152310691a3a660ecf33e98d4940fc63fe9b340811241f526c",
-        "codex-projection.jsonl": "sha256:88a16a5c708968d5afa6f832db09e3d6456992ddc5717251210e9a56c809a4a1"
+        "codex-projection.jsonl": "sha256:6dc1fa2ad7837c0e9ac2dcd6ac0dca52da1b0c11872db203d53ae742c97ee45a"
       }
     },
     {
@@ -125,12 +125,13 @@
         "Documentation describes correlation field availability before 2.1.248, but this entry has execution evidence only for 2.1.248",
         "The compaction event has no dedicated identifier, so the handoff producer derives compaction_id from the source generation and event sequence",
         "Transcript format is internal and is not an adapter contract dependency",
+        "Official hooks do not expose a distinct user-interrupt lifecycle event, so interrupted turns remain unknown rather than being inferred from StopFailure",
         "Enhanced trace spans are beta and are not part of the minimum surface"
       ],
       "fixture_ids": [
         "claude-code-otel-supported-v1",
         "claude-code-hook-lifecycle-v1",
-        "claude-code-interrupted-ordering-v1",
+        "claude-code-failed-ordering-v1",
         "claude-code-primary-supplement-dedupe-v1",
         "claude-code-content-omission-v1",
         "claude-code-bounded-handoff-v1"
