@@ -11,8 +11,23 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 rate table 기반 예상 비용 필드, privacy/redaction hardening 위에 Claude Code adapter를
 구현한다.
 
+현재 구현 기술은 Node.js 20+ ESM JavaScript와 `node:test`다. 이는 Rust migration 전의
+검증 기준선이며 목표 기술 스택은 다음과 같다.
+
+현재 JavaScript adapter는 전체 JSONL parsing과 순차 append를 포함하므로 foreground hook 성능
+sign-off 대상이 아니다. `v0.13.0`의 Rust end-to-end performance harness가 통과하기 전에는 사용자
+기기 성능 보호가 구현 완료되었다고 표시하지 않는다.
+
+- web UI: TypeScript
+- domain, application, agent adapters, storage, export, CLI, optional collector/query API: Rust
+- Rust와 TypeScript 사이: versioned JSON schema와 generated/validated types
+- report 실행 방식: 별도 server가 필요 없는 self-contained static HTML
+
+책임 경계, SOLID/OOP/FP 적용 원칙, 허용 패턴과 모델 호환성 규칙은
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)를 기준으로 한다.
+
 - `agent_observability.v1` span record schema
-- parent/child span 관계 검증
+- parent/child span field와 fixture
 - append-only JSONL writer
 - durable write 전 content logging / secret / sensitive path redaction
 - Codex session JSONL / notify payload 정규화
@@ -37,41 +52,92 @@ rate table 기반 예상 비용 필드, privacy/redaction hardening 위에 Claud
 npm test
 ```
 
-`v0.7.0`은 Cursor adapter를 추가한다.
+다음 단계는 `v0.6.1` correctness/contract freeze이고, `v0.7.0`부터 Rust architecture
+foundation을 시작한다. Cursor adapter는 공통 contract와 Rust core가 안정된 뒤 추가한다.
 
-## 결론
+## 아키텍처 요약
 
 AI coding agent 관측은 OS/network proxy로 모델 요청을 몰래 가로채는 방식보다,
 각 도구가 제공하는 hook, local transcript, session log, native telemetry, custom
 endpoint 설정을 조합하는 방식이 안전하다.
 
 ```text
-Codex / Claude Code / Cursor / other coding agents
-        |
-        | hooks, notify, local transcript, native telemetry
-        v
-Local adapter
-        |
-        | normalized events and spans
-        v
-Local event log (JSONL)
-        |\
-        | \ optional central sync
-        |  v
-        |  Internal collector, storage, cost tracking, alerts
-        |
-        | report renderer
-        v
-Static HTML report
+CURRENT v0.6 - IMPLEMENTED (Node.js ESM JavaScript)
+
+Codex / Claude Code
+        -> JS adapters and correlation
+        -> agent_observability.v1 records
+             |-> local JSONL -> JS report projection -> self-contained HTML
+             `-> redacted JSON snapshot
+
+MIGRATION
+
+Golden fixtures -> independent Rust CLI parity -> release-boundary cutover
+No Node.js <-> Rust FFI or subprocess production path
+
+TARGET - PLANNED (Rust + TypeScript)
+
+Agent logs/hooks, including planned Cursor support
+        -> bounded local handoff + Rust inbound adapters
+        -> SourceObservation (transient, never durable)
+        -> domain lifecycle state and application use cases
+             |-> atomic local state: source cursor + record + optional outbox
+             |       |-> fail-closed DurableRecordVx -> JSONL / snapshot projection
+             |       `-> strict TeamIngestEnvelopeV1 -> optional collector (Future TODO)
+             |-> pricing + aggregation -> fail-closed projector -> ReportDtoVx
+             |                                      -> TypeScript strict UI assets
+             |                                      -> self-contained HTML
+             `-> fail-closed diagnostic contract -> diagnostics
 ```
+
+TypeScript UI는 원본 agent payload나 JSONL을 직접 읽지 않는다. Rust가 생성한 versioned
+`ReportDtoVx`와 빌드된 UI asset을 Rust outbound infrastructure가 하나의 HTML artifact로
+조립한다. export나 선택적 collector도 각 sink 전용 fail-closed contract 뒤에만 추가한다.
+
+### 사용 프로필
+
+| Profile | 혼자 사용 | 팀 사용 |
+| --- | --- | --- |
+| Runtime | Rust CLI만 실행 | 각 사용자 Rust CLI + 선택적 collector |
+| Storage | private embedded state + JSONL/snapshot projections | same local state/outbox + tenant/workspace-scoped central store |
+| UI | 서버 없는 self-contained HTML | 같은 TypeScript UI의 hosted report 또는 정적 export |
+| Network/login | 불필요 | collector 사용 시에만 필요 |
+
+혼자 쓸 때도 모든 핵심 기능이 동작하며 팀 기능은 선택 사항이다. 팀 모드에서는
+전용 fail-closed projector가 허용된 관측 필드만 담은 `TeamIngestEnvelopeV1`을 만든다. local
+content logging opt-in 여부와 무관하게 전체 `DurableRecordVx`, 원본 `SourceObservation`,
+prompt/output/tool content는 로컬 밖으로 전송하지 않는다. 두 모드는 같은 domain 의미,
+pricing, privacy, report DTO와 UI component를 공유한다.
+
+collector는 client가 주장한 tenant/workspace/actor를 신뢰하지 않는다. 인증 주체의 membership과
+role로 scope를 결정하고 ingest, storage, query에 같은 tenant/workspace predicate를 적용한다.
+한 사람은 여러 verified email identity를 등록할 수 있고 회사/개인/고객/프로젝트 용도별
+`identity_binding_ref`를 Codex, Claude, Cursor adapter profile에 연결한다. Team envelope에는 raw
+email 대신 이 opaque binding만 들어가며 collector가 source, membership과 project scope를 검증한
+뒤 중앙 identity directory와 join한다. 따라서 이메일별 사용량을 조회하면서도 raw email을
+event, queue와 retry journal에 반복 저장하지 않는다. First GA의 사람 귀속 source는 한 principal에
+묶이고 그 사람의 여러 email identity만 선택할 수 있다. 공용/unbound source와 identity가 모호한
+session은 source-only로 남긴다. Raw email 조회·export는 별도 PII capability가 필요하다.
+상용 team profile의 tenancy, credential, RBAC, ingest, storage, retention/deletion, encryption,
+audit, quota, SLO/DR와 delivery gate는 [team architecture](docs/TEAM_ARCHITECTURE.md)를 따른다.
+Wire/API/DTO/state와 evidence 형식은 [team contracts](docs/TEAM_CONTRACTS.md)를 따른다.
+공통 분석 UI와 team 관리 UI는 [DESIGN.md](DESIGN.md)를 따른다.
+제품별 공식 수집 surface, source precedence와 지원 evidence는
+[adapter compatibility contract](docs/ADAPTER_COMPATIBILITY.md)를 따른다.
 
 핵심 원칙은 다음과 같다.
 
 - agent별 공식 또는 사실상 공식 surface를 우선 사용한다.
 - prompt, output, tool output은 기본적으로 redaction과 opt-in 정책을 거친다.
-- 로컬 adapter는 원본 로그를 읽고, 우선 로컬 JSONL에는 정규화된 event/span만 남긴다.
+- 로컬 adapter는 hook foreground에서 bounded local handoff만 수행하며 network나 전체 transcript parse를
+  기다리지 않는다.
+- source cursor, stable event ID, local record와 optional team outbox는 한 transaction으로 기록하고,
+  JSONL/HTML은 재생성 가능한 projection으로 취급한다.
+- file reconciliation, flush와 heartbeat 주기는 bounded config로 조정할 수 있고 jitter/adaptive backoff를
+  적용한다. CPU/RSS/disk budget을 넘으면 team sync와 report refresh를 먼저 늦추며 agent 실행을 막지 않는다.
 - 여러 agent를 동시에 쓰더라도 뒤에서는 하나의 trace/span schema로 합친다.
 - 중앙 collector는 1차 PoC의 필수 구성요소가 아니라 팀 단위 집계가 필요할 때 붙이는 선택 경로다.
+- standalone과 team은 별도 제품이 아니라 같은 core의 deployment profile이다.
 - backend는 교체 가능해야 하며, 특정 벤더나 구현체에 종속하지 않는다.
 - Desktop App과 CLI/IDE extension은 설정 상속 방식이 다르므로 제품별 PoC가 필요하다.
 
@@ -100,29 +166,37 @@ Static HTML report
 - 특정 외부 observability backend에 종속되는 구조
 - 모델 gateway와 observability collector를 처음부터 하나의 시스템으로 묶는 구조
 
-## 전체 아키텍처
+## v0.6 현재 아키텍처
+
+아래 그림은 migration baseline인 현재 JavaScript 구현의 논리 구조다. 목표 책임 분리와
+Rust-TypeScript 경계는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)를 기준으로 한다.
 
 ```text
 ┌─────────────────────────────────────────────┐
 │ Coding agent                                 │
 │ - Codex                                      │
 │ - Claude Code                                │
-│ - Cursor                                     │
-│ - 기타 CLI/IDE 기반 agent                    │
 └──────────────────────┬──────────────────────┘
                        │
-                       │ hook / notify / transcript / telemetry
+                       │ hook / notify / transcript
                        v
 ┌─────────────────────────────────────────────┐
 │ Local adapter                                │
 │ - raw log reader                             │
 │ - event correlator                           │
-│ - redaction policy                           │
 │ - span/event normalizer                      │
-│ - local append-only writer                   │
 └──────────────────────┬──────────────────────┘
                        │
-                       │ normalized JSONL
+                       │ agent_observability.v1 records
+                       v
+┌─────────────────────────────────────────────┐
+│ Shared event-log boundary                    │
+│ - schema validation                          │
+│ - pattern/content redaction                  │
+│ - append-only writer                         │
+└──────────────────────┬──────────────────────┘
+                       │
+                       │ sanitized JSONL
                        v
 ┌─────────────────────────────────────────────┐
 │ Local event log                              │
@@ -141,21 +215,24 @@ Static HTML report
 │ - embedded summary data                      │
 │ - no runtime server                          │
 └─────────────────────────────────────────────┘
-
-Optional central path:
-
-```text
-Local event log
-        |
-        | OTLP-compatible HTTP/gRPC or internal REST
-        v
-Internal collector
-        |
-        v
-Central trace/metrics/audit storage, alerts, exports
 ```
 
-## 통합 수집 컨셉
+Future TODO - optional central path:
+
+```text
+Domain/application state
+        |
+        v
+Strict team projector
+        |
+        v
+TeamIngestEnvelopeV1 -> bounded retry queue -> Internal collector
+                                                |
+                                                v
+                              Central trace/metrics/audit storage, alerts, exports
+```
+
+## 목표 통합 수집 컨셉
 
 사용자가 Codex, Claude Code, Cursor, 다른 CLI agent를 동시에 쓰더라도 관측 시스템은
 agent별 화면을 따로 만드는 방식으로 시작하지 않는다. 각 agent 옆에 local adapter를 두고,
@@ -163,13 +240,23 @@ adapter가 서로 다른 hook/transcript/native telemetry를 같은 내부 event
 정규화한다. 정적 report renderer와 선택적 central collector는 agent별 세부 파싱을 하지 않고,
 이미 정규화된 데이터를 같은 query model로 다룬다.
 
+Team alpha의 필수 adapter family는 Codex, Claude와 Cursor다. 세 adapter는 같은 Rust core,
+privacy projector, queue와 report contract를 공유하고 제품별 hook/session/transcript/native
+telemetry 차이만 inbound adapter에서 처리한다. 각 adapter installation은 별도 heartbeat를 보내
+online/idle, last seen, sync/queue 상태와 제공 가능한 capability를 표시한다. Heartbeat는 usage
+event가 아니며 실패분을 queue에 쌓아 재생하지 않는다.
+세 adapter 모두 session/turn, LLM token usage, tool lifecycle, timestamp/status, privacy sentinel과
+offline recovery canonical fixture를 통과해야 하며 필수 signal이 없는 제품/version은 지원 완료로
+표시하지 않는다.
+
 핵심 흐름:
 
 ```text
 Agent A adapter ─┐
-Agent B adapter ─┼─> local events.jsonl ─> static HTML report
-Agent C adapter ─┘             │
-       same schema             └─> optional central collector
+Agent B adapter ─┼─> domain/application state
+Agent C adapter ─┘              `-> atomic local state + outbox
+                                     |-> DurableRecordVx -> local events.jsonl -> static HTML report
+                                     `-> TeamIngestEnvelopeV1 -> retry queue -> optional collector
 ```
 
 이렇게 하면 agent가 몇 개로 늘어나도 뒤쪽 시스템은 다음 질문을 같은 방식으로 답할 수 있다.
@@ -180,18 +267,19 @@ Agent C adapter ─┘             │
 - 같은 작업을 여러 agent가 병렬로 처리했을 때 비용과 실패율이 어떻게 달라졌는가
 - content logging off 상태에서도 원문 없이 비용, latency, error를 볼 수 있는가
 
-## OpenTelemetry-compatible 전송
+## OpenTelemetry-compatible 전송 (Future TODO)
 
-adapter가 생성하는 내부 event/span schema는 OpenTelemetry의 trace/span/event/metric 모델과
-호환되게 잡는다. 1차 PoC에서는 이 schema를 로컬 JSONL에 저장하고 정적 HTML report로 렌더링한다.
-중앙 collector를 붙일 때는 같은 schema를 OTel-shaped internal JSON이나 실제 OTLP export
-payload로 매핑해서 adapter와 backend 사이의 결합을 낮춘다.
+adapter가 생성하는 내부 event/span 의미는 OpenTelemetry의 trace/span/event/metric 모델과
+호환되게 잡는다. 1차 PoC에서는 local durable schema를 JSONL에 저장하고 정적 HTML report로
+렌더링한다. 중앙 전송은 local event schema를 직접 보내지 않는다. strict team projector가 만든
+`TeamIngestEnvelopeV1`의 allowlisted observation field만 OTel-shaped internal JSON, 실제 OTLP
+export payload 또는 internal REST payload로 매핑해 adapter와 collector 사이의 결합을 낮춘다.
 
-선택적 중앙 전송 방식:
-
-- 1차: OTel-shaped internal HTTP JSON endpoint
-- 2차: OTLP/gRPC endpoint
-- fallback: 같은 필드를 담는 internal REST endpoint
+G0 승인을 위한 V1 proposal은 하나의 HTTPS JSON batch contract
+`POST /api/team/v1/ingest/batches`다. G0 decision record가 승인된 뒤에만 normative contract가
+된다. OpenTelemetry compatibility는 내부 의미와 후속
+export adapter의 기준이며 V1 forwarder가 여러 transport를 선택하게 만들지 않는다. 다른
+transport는 실제 interoperability 요구와 별도 contract fixture가 생긴 뒤 추가한다.
 
 권장 span 계층:
 
@@ -212,47 +300,42 @@ Workstream span
 `workstream.id`, `repo.name`, `task.label`, `user.id` 같은 correlation key로 report에서
 같이 조회할 수 있게 한다.
 
-예시 envelope:
+현재 v0.6 durable record의 축약 예시:
 
 ```json
 {
   "schema_version": "agent_observability.v1",
+  "record_type": "span",
   "trace_id": "trace_...",
   "span_id": "span_...",
-  "parent_span_id": "span_...",
-  "span_name": "agent.turn",
-  "start_time": "2026-07-06T00:00:00.000Z",
-  "end_time": "2026-07-06T00:00:12.345Z",
-  "resource": {
-    "service.name": "agent-observability-adapter",
-    "agent.name": "codex",
-    "agent.instance.id": "local-user-host-session",
-    "repo.name": "agent-observability",
-    "project.name": "agent-observability"
+  "parent_span_id": null,
+  "span_kind": "agent.session",
+  "name": "Codex session",
+  "start_time_unix_ms": 1783296000000,
+  "end_time_unix_ms": 1783296012345,
+  "status": { "code": "ok" },
+  "agent": {
+    "name": "codex",
+    "model": "model-id"
   },
+  "project": { "name": "agent-observability" },
   "attributes": {
-    "workstream.id": "workstream_...",
-    "session.id": "session_...",
-    "turn.id": "turn_...",
-    "model.name": "model-id",
-    "sandbox.mode": "workspace-write",
-    "approval.mode": "on-request",
-    "token.input": 1200,
-    "token.output": 480,
-    "duration.ms": 12345
+    "session_id": "session_..."
   },
-  "events": [
-    {
-      "name": "redaction.applied",
-      "attributes": {
-        "redaction.count": 3,
-        "content.prompts.stored": false,
-        "content.outputs.stored": false
-      }
-    }
-  ]
+  "metrics": {
+    "input_tokens": 1200,
+    "output_tokens": 480,
+    "duration_ms": 12345
+  },
+  "content": {},
+  "redaction": { "applied": false, "count": 0, "fields": [] }
 }
 ```
+
+이 schema의 현재 validator는 required field, enum, JSON value/plain-object 형태와 시간 범위를
+검사한다. parent/child topology 검증과 metadata allowlisting은 하지 않는다. 두 항목은
+`v0.6.1` blocker이며, 목표 Rust 계약에서는
+`SourceObservation`/domain state/`DurableRecordVx`/`ReportDtoVx`로 역할을 분리한다.
 
 metrics는 span에서 파생하거나 adapter가 별도 전송한다.
 
@@ -272,12 +355,14 @@ metrics는 span에서 파생하거나 adapter가 별도 전송한다.
 시점에 주입하거나 로컬 설정 파일에 둔다.
 
 ```text
-estimated_cost =
-  token.input * rate.input
-+ token.output * rate.output
-+ token.cached_input * rate.cached_input
-+ token.reasoning_output * rate.reasoning_output
+estimated_cost = sum(exclusive_billable_unit[kind] * rate[kind])
 ```
+
+이 식은 목표 pricing contract다. `exclusive_billable_unit`은 source별 token 의미를 해석한
+뒤 서로 겹치지 않게 만든 과금 단위다. cached input이나 reasoning output이 total에 이미
+포함된 source에서는 다시 더하지 않는다. 포함 관계를 판별할 수 없으면 비용을 완전한
+예상치로 만들지 않는다. 현재 v0.6 계산기는 이 포함 의미를 표현하지 못하므로 `v0.6.1`의
+correctness blocker로 취급한다.
 
 주의할 점:
 
@@ -308,7 +393,7 @@ rate table 예시:
 
 로컬 adapter는 agent별 차이를 흡수하는 얇은 프로세스다.
 
-권장 위치:
+목표 local artifact layout:
 
 ```text
 ~/.agent-observability/
@@ -318,15 +403,14 @@ rate table 예시:
   state/
 ```
 
-설정 예시:
+목표 설정 예시:
 
 ```json
 {
   "enabled": true,
   "project_name": "example-project",
-  "user_id": "user@example.com",
+  "local_profile_label": "personal",
   "local_event_log": "~/.agent-observability/events.jsonl",
-  "collector_endpoint": null,
   "content_logging": {
     "prompts": false,
     "outputs": false,
@@ -340,14 +424,23 @@ rate table 예시:
 }
 ```
 
-adapter 책임:
+Standalone local label은 이메일이나 계정 식별자가 아니다. Future TODO team profile은 별도 설정에서
+server-issued `identity_binding_ref`와 collector enrollment를 사용하며 raw email이나
+`collector_endpoint`를 standalone 설정 shape에 섞지 않는다.
+
+v0.6 legacy adapter 책임:
 
 - hook payload와 transcript/session log를 turn 단위로 결합한다.
 - token usage와 latency를 가능한 원천에서 읽는다.
-- tool call은 parent LLM turn 아래 child span으로 표현한다.
+- tool call은 parent turn 아래 child span으로 표현한다.
 - content logging 정책과 redaction 정책을 durable write 전에 적용한다.
 - 로컬 event log에 append-only로 기록한다.
-- 중앙 collector를 사용하는 경우 전송 실패 시 local queue에 저장하고 재시도한다.
+
+local queue 재시도와 중앙 collector 전송은 현재 v0.6 adapter 기능이 아니라 Future TODO다.
+
+목표 구조에서는 위 책임을 inbound adapter, application reducer, privacy projector, outbound
+writer로 분리한다. 새 Rust adapter는 source payload를 `SourceObservation`으로 번역하는
+책임만 가지며 durable write를 직접 수행하지 않는다.
 
 ## Static HTML Report
 
@@ -376,7 +469,7 @@ Browser file open
 - content logging off 정책과 redaction이 적용된 결과만 HTML에 들어간다.
 - local-only PoC와 중앙 collector PoC를 분리할 수 있다.
 
-권장 report 생성 방식:
+목표 CLI command shape (현재 package에는 CLI entry point가 없음):
 
 ```text
 agent-observability report \
@@ -387,20 +480,23 @@ agent-observability report \
 `report.html`은 외부 network 요청 없이 동작한다. 브라우저의 `file://` 제약을 피하기 위해
 JSONL을 따로 fetch하지 않고, 생성 시점에 필요한 데이터를 HTML 안에 주입한다.
 
-report에서 보여줄 1차 화면:
+현재 v0.6 report에서 확인 가능한 화면:
 
-- session 목록과 각 session의 총 token, latency/duration
-- turn별 LLM span과 tool span tree
-- model별 input/output/cached/reasoning token 집계
-- repo/session/turn별 trace 조회
-- 예상 비용과 cost 상태
+- repo/session/turn/text filter
+- trace 목록과 parent ID를 포함한 평면 span table
+- 현재 filter 결과의 token/cost/error KPI와 span별 latency/duration
+- permission/compaction span의 평면 table 표시
+
+목표 TypeScript UI에서 추가할 화면:
+
+- model별 input/output/cached/reasoning token 집계와 model filter
 - error, timeout, permission denied, compaction timeline
 - redaction count와 content logging 상태
 
 예상 비용과 cost aggregation은 rate table이 제공될 때 표시하고, 단가표나 모델 단가가
 없으면 unknown/incomplete 상태로 표시한다.
 
-## 공통 데이터 모델
+## 목표 공통 데이터 모델
 
 최소 trace 구조:
 
@@ -444,13 +540,21 @@ error.type
 error.message
 ```
 
-content logging이 꺼져 있으면 `input.value`, `output.value`, `tool.output` 같은 원문
-필드는 저장하지 않는다. 대신 size, hash, MIME type, redaction count 같은 메타데이터만
-남긴다.
+이 목록은 domain에서 구분할 수 있는 의미의 후보이며 모든 profile의 durable/transport/UI field
+목록이 아니다. Team에서는 `cwd`, path, command/arguments/output, raw `error.message`와 content를
+항상 제외하고 bounded reason code와 pseudonymous reference만 사용한다. Field별
+`available`/`omitted_by_policy`/`unavailable_in_profile`/`unknown_source` 상태는
+[team architecture](docs/TEAM_ARCHITECTURE.md)의 `ReportDtoV1` projection을 따른다.
+
+현재 v0.6은 content logging이 꺼져 있으면 prompt/output/tool content를 omission marker로
+대체하고 redaction count를 남긴다. size, hash, MIME type만 남기는 fallback은 목표
+`DurableRecordVx` projector에서 검증할 정책이며 아직 구현되지 않았다.
 
 ## Codex Adapter
 
-Codex는 notify hook과 session JSONL을 결합하는 방식이 적합하다.
+현재 v0.6 baseline은 notify hook과 session JSONL을 결합한다. Target Rust adapter는 공식 native
+telemetry를 token/model/API/tool signal의 primary로 사용하고 lifecycle hook을 보완 source로 사용한다.
+Session output parsing은 선언된 제품 version과 fixture가 있는 reconciliation fallback으로 제한한다.
 
 예상 흐름:
 
@@ -461,15 +565,16 @@ Codex는 notify hook과 session JSONL을 결합하는 방식이 적합하다.
 5. shell/function/apply_patch/web 같은 tool call을 child span으로 분리한다.
 6. approval mode, sandbox mode, cwd, workspace 정보를 span attribute로 붙인다.
 
-Codex에서 JSONL 기반 보강이 필요한 이유:
+현재 baseline에서 JSONL 기반 보강을 사용하는 이유:
 
 - notify payload만으로는 tool call과 token usage가 부족할 수 있다.
-- session JSONL이 turn 재구성의 기준 원천 역할을 한다.
+- 현재 구현에서는 session JSONL이 turn 재구성의 입력 역할을 한다.
 - lifecycle hook만으로는 일부 event가 누락될 수 있다.
 
 ## Claude Code Adapter
 
-Claude Code는 hook 이벤트와 transcript를 결합하는 방식이 적합하다.
+현재 v0.6 baseline은 hook 이벤트와 transcript를 결합한다. Target Rust adapter는 공식 native
+telemetry를 usage/cost/tool metric의 primary로 사용하고 hook을 lifecycle supplement로 사용한다.
 
 주요 이벤트:
 
@@ -490,13 +595,15 @@ Claude Code는 hook 이벤트와 transcript를 결합하는 방식이 적합하�
 3. pre tool use에서 tool start time을 저장한다.
 4. post tool use에서 tool metadata, duration, exit status, redacted summary를 기록한다.
 5. stop 이후 transcript를 읽는 별도 보강 단계에서 model, token usage를 보강한다.
-6. LLM span과 tool spans를 로컬 event log에 기록하고, 설정된 경우 내부 collector로 동기화한다.
+6. LLM span과 tool spans를 로컬 event log에 기록한다. 내부 collector 동기화는 Future TODO다.
 
-동시 hook 실행이 있을 수 있으므로 session별 state file과 lock이 필요하다.
+동시 hook 입력은 daemon의 local transactional state에서 serialize한다. Hook마다 별도 state file을
+만들거나 team network 완료를 기다리지 않는다.
 
-## Cursor Adapter
+## Cursor Adapter (Planned v0.11.0)
 
-Cursor는 hook과 generation id를 중심으로 trace를 구성한다.
+Cursor는 공식 hook surface의 conversation/generation identifier를 중심으로 trace를 구성한다. Local과
+cloud execution에서 제공되는 hook coverage 차이는 capability manifest에 version별로 기록한다.
 
 주요 이벤트:
 
@@ -516,7 +623,7 @@ Cursor는 hook과 generation id를 중심으로 trace를 구성한다.
 3. shell/MCP/tool 실행은 child span으로 분리한다.
 4. IDE extension 특성상 workspace, file path, edit summary를 함께 기록한다.
 
-## Native Telemetry Receiver
+## Native Telemetry Receiver (Future TODO)
 
 일부 agent는 native telemetry export를 지원할 수 있다. 이 경우 별도 local receiver가
 agent에서 내보내는 telemetry를 받아 내부 trace schema로 매핑한다.
@@ -530,8 +637,10 @@ receiver 책임:
 
 native telemetry가 있는 경우에도 hook/transcript adapter는 보완 수단으로 남긴다.
 제품별 telemetry가 모든 tool detail과 content policy를 충분히 담지 못할 수 있기 때문이다.
+같은 canonical field에는 primary source 하나만 지정해 supplement와 중복 집계하지 않는다. 상세
+우선순위와 공식 근거는 [adapter compatibility contract](docs/ADAPTER_COMPATIBILITY.md)를 따른다.
 
-## Internal LLM Gateway
+## Internal LLM Gateway (Future TODO)
 
 관측만으로 부족하고 모델 요청/응답 자체의 통제가 필요하면 내부 LLM gateway를 별도 PoC한다.
 
@@ -552,16 +661,17 @@ gateway가 담당할 수 있는 것:
 
 ## 보안과 개인정보
 
-기본 정책:
+목표 정책:
 
 - prompt/output 원문 저장은 opt-in이다.
 - secret, token, key, password, cookie, Authorization header는 전송 전에 redaction한다.
-- content logging과 redaction 정책은 local event log, local queue, static report, export,
-  collector 전송 같은 모든 durable write 전에 적용한다.
+- content logging과 fail-closed allowlist 정책은 local event log, local queue, static report,
+  export, diagnostic, collector 전송 같은 모든 durable/external output 전에 적용한다.
 - `.env`, private key, credential file, Terraform state 같은 파일 내용은 수집하지 않는다.
 - shell output은 기본적으로 길이 제한과 redaction을 적용한다.
 - 민감 repo는 project-level opt-out을 지원한다.
-- collector는 mTLS 또는 사내 인증을 요구한다.
+- collector ingest는 회전·폐기 가능한 source credential만 사용한다. Hosted query/control API는
+  짧은 수명의 사용자 session과 workspace membership/role 기반 authorization을 요구한다.
 
 redaction 단계:
 
@@ -571,13 +681,17 @@ redaction 단계:
 4. 길이 제한
 5. hash/size metadata만 남기는 fallback
 
+현재 v0.6은 content omission, 민감 key/path, secret pattern 치환까지 구현한다. unknown metadata
+거부, 길이 제한, hash/size fallback, project opt-out, collector 인증은 `v0.6.1` 또는 Future
+TODO의 검증 대상이다.
+
 ## 저장과 조회
 
 1차 local-only PoC는 다음 논리 컴포넌트로 나눈다.
 
 - local event log: turn/tool/span 구조 저장
 - report renderer: token, latency, error count 집계
-- static HTML report: session, repo, team, model별 조회
+- static HTML report: 현재 repo/session/turn 조회, 목표 team/model 조회
 - export artifact: 정적 HTML과 redacted JSON snapshot
 
 중앙화가 필요해지면 선택적으로 internal collector를 추가한다.
@@ -589,8 +703,9 @@ redaction 단계:
 
 ## PoC 순서
 
-버전별 릴리즈 범위와 완료 기준은 [ROADMAP.md](ROADMAP.md)를 기준으로 한다. 아래는
-구현 순서의 개념 요약이다.
+버전별 릴리즈 범위와 완료 기준은 [ROADMAP.md](ROADMAP.md)를 기준으로 한다. 아래 1~3은
+완료된 JavaScript baseline이고, 이후에는 contract freeze, Rust 수직 경로, TypeScript UI
+순서로 진행한다.
 
 1. Codex local adapter
    - notify payload 수집
@@ -602,7 +717,7 @@ redaction 단계:
    - self-contained HTML template
    - token/cost/latency/error summary
    - repo/session/turn별 trace viewer
-   - error and permission timeline
+   - trace tree와 token/latency/error summary
 
 3. Claude Code adapter
    - hook registration
@@ -610,18 +725,25 @@ redaction 단계:
    - tool duration 계산
    - permission/compaction event 기록
 
-4. Cursor adapter
-   - generation id 기반 correlation
-   - shell/MCP/tool span 생성
-   - workspace/file edit metadata 수집
+4. Contract freeze와 Rust 전환
+   - source/durable/report golden fixture 고정
+   - Rust core, durable I/O, agent adapter를 독립 CLI 경로로 구현
+   - adapter별 end-to-end parity 후 release boundary에서 기본 경로 전환
+
+5. TypeScript static report UI
+   - versioned `ReportDtoVx` type 생성 또는 검증
+   - self-contained HTML output과 브라우저 file-open smoke
 
 Future TODO (버전 미확정):
 
-- Optional internal collector
-  - auth
-  - schema validation
-  - redaction count 검증
-  - retry-safe ingest
+- Commercial team profile ([architecture](docs/TEAM_ARCHITECTURE.md), [contracts](docs/TEAM_CONTRACTS.md))
+  - principal-bound authentication, membership/RBAC, tenant isolation
+  - multi-email identity/profile binding, Codex/Claude/Cursor adapter parity and heartbeat
+  - configurable bounded cadence, local performance budgets and transactional source cursor/outbox
+  - strict batch ingest, atomic dedupe/metering, encrypted bounded retry queue
+  - append-only attribution correction and observation retraction
+  - scoped query/report, members, policy, retention, quota, audit and export UI
+  - deletion/key rotation/restore/load/fault-injection/SLO evidence before GA
 - Optional gateway PoC
   - provider-compatible request routing
   - Desktop App 설정 상속 검증
@@ -633,12 +755,17 @@ Future TODO (버전 미확정):
 - token usage와 latency가 static HTML report에 표시된다.
 - 예상 비용은 `estimated_cost`, `rate_table.version`, `cost.assumption`과 함께 표시되고,
   단가가 없거나 불완전하면 unknown/incomplete 상태로 표시된다.
-- content logging off 상태에서 원문 prompt/output이 report나 중앙 저장소에 남지 않는다.
-- content logging off 상태에서 원문 prompt/output이 local event log, queue, export에도 남지 않는다.
+- content logging off 상태에서 원문 prompt/output이 local event log, report, export에 남지 않는다.
+- team retry queue와 collector에는 content logging 설정과 무관하게 원문 prompt/output이 들어가지 않는다.
 - redaction 테스트 fixture가 모두 통과한다.
-- adapter가 local event log에 유실 없이 기록한다.
-- 중앙 collector를 사용하는 경우 장애 시 local queue로 유실 없이 재시도한다.
-- Desktop App/CLI/IDE extension별 설정 차이가 문서화된다.
+- target Rust adapter가 source cursor, stable event ID, local record와 optional outbox를 한 transaction으로
+  기록하고 crash-point replay에서 유실과 중복 집계를 만들지 않는다.
+- hook overhead와 idle/active CPU, RSS, disk growth가 declared local budget을 통과하고 pressure에서 team
+  sync/report refresh가 foreground agent 작업보다 먼저 강등된다.
+- Future TODO collector를 구현할 경우 accepted queue record는 at-least-once로 재시도하고,
+  bounded queue 용량을 넘는 장기 장애는 silent loss가 아닌 degraded/drop 상태로 표시한다.
+- Future TODO gateway/receiver를 구현할 경우 Desktop App/CLI/IDE extension별 설정 차이를
+  문서화한다.
 
 ## 남은 검증 항목
 
@@ -646,8 +773,8 @@ Future TODO (버전 미확정):
 - token usage 누락 시 fallback 계산 방식
 - long-running tool call과 interrupted turn 처리
 - compaction 전후 context size 추정 방식
-- local queue retention과 disk budget
-- 사내 인증 체계와 optional collector 연동 방식
+- team queue retention, disk budget과 source credential lifecycle
+- 첫 hosted data region, legal deletion wording과 enterprise identity 후속 우선순위
 - 민감 프로젝트 opt-out 정책
 
 ## 요약
