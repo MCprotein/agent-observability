@@ -40,24 +40,37 @@ pub fn reduce_observation_state(
     states: &mut Vec<DomainSpanState>,
     incoming: DomainSpanState,
 ) -> Result<DomainSpanState, DomainError> {
-    let reduced = if let Some(index) = states
+    let existing_index = states
         .iter()
-        .position(|existing| existing.span_id == incoming.span_id)
-    {
-        let reduced_states = LifecycleReducer::reduce([states[index].clone(), incoming])?;
-        let Some(reduced) = reduced_states.into_iter().next() else {
-            return Err(DomainError::LifecycleConflict {
-                span_id: states[index].span_id.clone(),
-            });
-        };
+        .position(|existing| existing.span_id == incoming.span_id);
+    let reduced = reduce_span_state(existing_index.map(|index| &states[index]), incoming)?;
+    if let Some(index) = existing_index {
         states[index] = reduced.clone();
-        reduced
     } else {
-        states.push(incoming.clone());
-        incoming
-    };
+        states.push(reduced.clone());
+    }
     validate_topology(states)?;
     Ok(reduced)
+}
+
+/// Reduces one span without loading unrelated topology state.
+///
+/// Callers that persist topology separately must validate the affected parent chain before commit.
+///
+/// # Errors
+///
+/// Returns [`DomainError`] when lifecycle, identity, or metrics cannot converge.
+pub fn reduce_span_state(
+    existing: Option<&DomainSpanState>,
+    incoming: DomainSpanState,
+) -> Result<DomainSpanState, DomainError> {
+    let Some(existing) = existing else {
+        return Ok(incoming);
+    };
+    let mut reduced = LifecycleReducer::reduce([existing.clone(), incoming])?;
+    reduced.pop().ok_or_else(|| DomainError::LifecycleConflict {
+        span_id: existing.span_id.clone(),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

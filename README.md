@@ -7,11 +7,11 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 `v0.12.0`은 JavaScript migration baseline 위에 experimental Rust Codex, Claude Code,
-Cursor adapter와 strict TypeScript static report UI를 제공한다. Rust 경로는 bounded canonical
-handoff JSONL에서 각 제품의 공식 telemetry 또는 hook event를 정규화해 private local state에
-저장한다. Native OTel endpoint, foreground spool writer와 Rust HTML artifact assembler는 아직
-구현하지 않았다.
+현재 release train은 `v0.13.0` local-only release candidate다. JavaScript migration baseline 위에
+experimental Rust Codex, Claude Code, Cursor adapter, strict TypeScript static report UI, private
+install/config 경계, bounded local runtime policy와 성능 검증 harness를 제공한다. Rust 경로는 bounded
+canonical handoff JSONL을 private local state에 저장한다. Native OTel endpoint와 Rust HTML artifact
+assembler는 아직 구현하지 않았다.
 
 현재 구현 기술은 Node.js 20+ ESM JavaScript 기준선과 Rust 1.97 Cargo workspace다.
 Rust workspace는 다음 책임으로 분리된다.
@@ -27,8 +27,11 @@ Rust workspace는 다음 책임으로 분리된다.
   specific-hook 격리와 content-free diagnostic
 - `crates/application`: pricing policy와 privacy-safe report DTO projection
 - `crates/local-store`: private SQLite authority, atomic cursor/event/current-record/disposition
-  commit, replayable JSONL projection, `local_state.v1` -> `local_state.v2` migration
+  commit, dirty-state 기반 replayable JSONL projection, `local_state.v1/v2` -> `local_state.v3` migration
+- `crates/local-runtime`: strict local config, private install layout, singleton lock, bounded
+  ingress, storage admission과 load-shedding state machine
 - `crates/cli`: Rust command path의 composition root
+- `xtask`: local-only 성능 protocol 실행과 fail-closed evidence 검증
 - `contracts/*.schema.json`: JavaScript/Rust/TypeScript가 공유하는 closed JSON Schema
 - `ui/report`: schema-generated DTO type, build-time standalone validator, strict TypeScript UI source
 - `src/report/generated`: self-contained HTML에 삽입하는 generated browser bundle
@@ -37,8 +40,8 @@ Rust workspace는 다음 책임으로 분리된다.
 목표 기술 스택은 다음과 같다.
 
 현재 JavaScript adapter는 전체 JSONL parsing과 순차 append를 포함하므로 foreground hook 성능
-sign-off 대상이 아니다. `v0.13.0`의 Rust end-to-end performance harness가 통과하기 전에는 사용자
-기기 성능 보호가 구현 완료되었다고 표시하지 않는다.
+sign-off 대상이 아니다. Rust release profile의 normative 성능 evidence가 통과하기 전에는 사용자
+기기 성능 보호가 release 완료되었다고 표시하지 않는다.
 
 - web UI: TypeScript
 - domain, application, agent adapters, storage, export, CLI, optional collector/query API: Rust
@@ -78,14 +81,18 @@ cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p agent-observability-cli -- contracts
-cargo run -p agent-observability-cli -- codex-ingest <private-store-dir> <private-handoff.jsonl>
-cargo run -p agent-observability-cli -- claude-code-ingest <private-store-dir> <private-handoff.jsonl>
-cargo run -p agent-observability-cli -- cursor-ingest <private-store-dir> <private-handoff.jsonl>
+cargo run -p agent-observability-cli -- init ~/.agent-observability
+cargo run -p agent-observability-cli -- config-check ~/.agent-observability/config.json
+cargo run -p agent-observability-cli -- runtime-check ~/.agent-observability
+cargo run -p agent-observability-cli -- codex-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+cargo run -p agent-observability-cli -- claude-code-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+cargo run -p agent-observability-cli -- cursor-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+cargo run -p xtask -- perf local --profile smoke --check
 ```
 
 `v0.12.0` TypeScript static report UI는 schema/type generation, fail-closed validation, fixed local
-scope, filter reduction parity, pinned browser smoke와 독립 review gate를 완료했다. 현재 release
-train은 `v0.13.0` local-only release candidate다.
+scope, filter reduction parity, pinned browser smoke와 독립 review gate를 완료했다. v0.13 runtime
+계약과 운영 방법은 [docs/LOCAL_RUNTIME.md](docs/LOCAL_RUNTIME.md)를 따른다.
 
 ## 아키텍처 요약
 
@@ -102,15 +109,20 @@ Codex / Claude Code
              |-> local JSONL -> JS report projection -> self-contained HTML
              `-> redacted JSON snapshot
 
-CURRENT v0.11 - IMPLEMENTED (experimental Rust Codex + Claude Code + Cursor adapters)
+CURRENT v0.13 - RELEASE CANDIDATE (Rust local runtime + TypeScript static UI)
 
 Closed schemas + manifest -> deterministic domain reducer + fail-closed projectors
 Codex OTel/notify, Claude Code OTel/hook, or Cursor Hook v1 canonical handoff -> bounded Rust adapters
         -> SourceObservation or fixed-code diagnostic/suppression
-        -> private SQLite authority (cursor + stable event + current record + disposition)
-             `-> replayable JSONL current-record projection
-Pricing policy + aggregation -> ReportDtoV1
-Rust CLI -> contracts inspection / local storage health check / Codex, Claude Code, and Cursor handoff ingest
+        -> CLI bounded batch + singleton + configured storage admission
+        -> private SQLite local_state.v3 authority
+             `-> dirty-state repaired JSONL current-record projection
+Strict local_runtime.v1 config -> private install layout + singleton lock + storage admission
+Pressure sampler -> normal / pressured / protected / probe bounded scheduling
+Pricing policy + aggregation -> ReportDtoV1 -> strict TypeScript static UI
+Rust CLI -> init / config-check / runtime-check / contracts / bounded product handoff ingest
+Rust xtask -> fixed local channel (64 slots, one worker, nonblocking outcomes)
+          -> local-only smoke and normative release performance evidence
 No Node.js <-> Rust FFI or subprocess production path
 
 TARGET - PLANNED (Rust + TypeScript)
@@ -435,7 +447,7 @@ rate table 예시:
 
 로컬 adapter는 agent별 차이를 흡수하는 얇은 프로세스다.
 
-목표 local artifact layout:
+구현된 local artifact layout:
 
 ```text
 ~/.agent-observability/
@@ -443,25 +455,23 @@ rate table 예시:
   logs/
   queue/
   state/
+  runtime/
 ```
 
-목표 설정 예시:
+현재 strict 설정 예시:
 
 ```json
 {
+  "schema_version": "local_runtime.v1",
   "enabled": true,
-  "project_name": "example-project",
-  "local_profile_label": "personal",
-  "local_event_log": "~/.agent-observability/events.jsonl",
-  "content_logging": {
-    "prompts": false,
-    "outputs": false,
-    "tool_inputs": false,
-    "tool_outputs": false
-  },
-  "redaction": {
-    "enabled": true,
-    "patterns": ["env", "token", "secret", "key", "password"]
+  "collection": {
+    "file_reconcile_interval_ms": 5000,
+    "flush_interval_ms": 5000,
+    "max_batch_records": 100,
+    "max_batch_bytes": 524288,
+    "active_heartbeat_interval_ms": 60000,
+    "idle_heartbeat_interval_ms": 300000,
+    "local_storage_budget_bytes": 1073741824
   }
 }
 ```
@@ -519,7 +529,7 @@ Browser file open
 - content logging off 정책과 redaction이 적용된 결과만 HTML에 들어간다.
 - local-only PoC와 중앙 collector PoC를 분리할 수 있다.
 
-목표 CLI command shape (현재 package에는 CLI entry point가 없음):
+목표 report command shape (현재 CLI에는 `report` subcommand가 없음):
 
 ```text
 agent-observability report \
@@ -615,16 +625,15 @@ lifecycle만 supplement로 사용한다. API attempt와 completed response는 �
 서로 다른 span으로 유지하고, usage는 completed response에만 둔다. 동일 canonical span의 재전달과
 unsupported/content event는 private disposition ledger에서 cursor와 함께 원자 commit한다.
 
-현재 Rust 흐름:
+현재 Rust가 지원하는 handoff 이후 흐름:
 
-1. foreground receiver/shim이 OTel 또는 lifecycle/hook payload를 최대 1 MiB, 4096 record,
-   record당 64 KiB인 private `codex_handoff.v1`, `claude_handoff.v1` 또는 `cursor_handoff.v1`
-   JSONL로 넘긴다.
+1. 별도 producer가 만든 최대 1 MiB, 4096 record, record당 64 KiB인 private
+   `codex_handoff.v1`, `claude_handoff.v1` 또는 `cursor_handoff.v1` JSONL을 입력받는다.
 2. adapter가 공식 session/prompt/request/tool tuple을 길이 구분 digest span ID로 만든다.
 3. allowlisted model/token/duration/status/tool/decision만 `SourceObservation`으로 옮긴다.
 4. prompt, assistant message, tool output, cwd와 임의 오류 문자열은 복사하지 않는다.
-5. background `codex-ingest`, `claude-code-ingest` 또는 `cursor-ingest`가 observation과 fixed-code
-   disposition을 순서대로 commit하고 JSONL projection을 batch 마지막에 한 번 재생성한다.
+5. one-shot `codex-ingest`, `claude-code-ingest` 또는 `cursor-ingest`가 singleton 아래 observation과
+   fixed-code disposition을 순서대로 commit하고 JSONL projection을 batch 마지막에 한 번 재생성한다.
 
 현재 제한:
 
@@ -663,8 +672,9 @@ supplement로만 사용한다. 내부 transcript 형식은 Rust contract depende
 `StopFailure`에서 추측하지 않는다. `prompt_id`가 없는 lifecycle 입력과 미등록 model은 고정 코드
 diagnostic으로 격리한다.
 
-동시 hook 입력은 daemon의 local transactional state에서 serialize한다. Hook마다 별도 state file을
-만들거나 team network 완료를 기다리지 않는다.
+현재 one-shot ingest의 동시 실행은 runtime singleton이 직렬화한다. 미래 receiver도 같은 local
+transaction authority를 사용해야 하며 Hook마다 별도 state file을 만들거나 team network 완료를
+기다리지 않는다.
 
 ## Cursor Adapter
 

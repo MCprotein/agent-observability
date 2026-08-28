@@ -1,0 +1,55 @@
+schema_version: local_performance.v1
+version: v0.13.0
+purpose: normative local-only performance evidence protocol
+profiles:
+  release:
+    warmup_seconds: 60
+    idle_seconds: 900
+    active_seconds: 900
+    burst_events: 10000
+    sample_interval_seconds: 1
+    baseline_runs: 5
+    enabled_runs: 5
+  smoke:
+    normative: false
+    release_check: false
+workload:
+  adapters: [codex, claude-code, cursor]
+  schedule: deterministic round-robin codex, claude-code, cursor SourceObservation ingress
+  fixture_host_scope: this manifest describes the host running xtask; it is not portable hardware evidence
+  channel_capacity: 64
+  normalization_workers: 1
+  enqueue_deadline_ms: 10
+  foreground_response: bounded enqueue acceptance, never durable commit
+  worker: asynchronous LocalStore drain and final projection rebuild
+  command_measurement: subprocess round-trip through bounded local-runtime enqueue; durable commit is asynchronous worker evidence
+  daemon_only_measurement: forbidden
+  durable_path: required local file-backed path; sanitized relative path in manifest
+metrics:
+  latency:
+    required_quantiles: [p95, p99]
+    foreground_hook_p95_ms_max: 20
+    foreground_hook_p99_ms_max: 50
+  cpu:
+    normalization: percent of one logical core
+    idle_average_percent_max: 0.5
+    active_average_percent_max: 2
+    active_any_minute_percent_max: 5
+    burst_integrated_and_sampled_percent_max: 100
+  rss:
+    p95_mib_max: 96
+    burst_and_drain_peak_required: true
+  disk:
+    total_bytes_max: 1073741824
+    accounting: allocated filesystem blocks including directories, durable state, final state, projections, crash and sampled temp artifacts
+  network:
+    mode: process-scoped samples plus bounded static product-surface scan
+    linux_evidence: worker has no socket descriptors at every sample
+    macos_evidence: nettop per-process cumulative bytes at every sample
+    static_evidence: product Rust crates contain no socket API or network dependency token
+    ingest_requests_in_flight_max: 0
+    required_bytes: 0
+evidence:
+  output: docs/evidence/local/performance/<run>/manifest.yaml
+  required_fields: [machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]
+  fail_closed: missing or breached required metrics produce non-zero exit
