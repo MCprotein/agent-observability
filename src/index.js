@@ -7,7 +7,7 @@ export {
   validateSpanRecord,
 } from "./schema.js";
 export { redactRecord } from "./redaction.js";
-export { appendEventLog, readEventLog } from "./event-log.js";
+export { appendEventLog, appendEventLogRecords, readEventLog } from "./event-log.js";
 export {
   normalizeRateTable,
   estimateSpanCost,

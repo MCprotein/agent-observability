@@ -158,6 +158,11 @@ test("parses Codex session JSONL into session, turn, LLM, and tool spans", () =>
   assert.equal(llm.metrics.latency_ms, 1200);
   assert.equal(tool.metrics.duration_ms, 30);
   assert.equal(tool.attributes.tool_name, "exec_command");
+  assert.equal(records.every((record) => record.attributes.session_id === "s1"), true);
+  assert.equal(
+    records.filter((record) => record.span_kind !== "agent.session").every((record) => record.attributes.turn_id === "t1"),
+    true,
+  );
 });
 
 test("parses real Codex session envelopes without copying raw content", () => {
@@ -188,6 +193,7 @@ test("parses real Codex session envelopes without copying raw content", () => {
   assert.equal(llm.metrics.total_input_tokens, 21);
   assert.equal(llm.metrics.total_output_tokens, 13);
   assert.equal(llm.metrics.context_window_tokens, 128000);
+  assert.equal(llm.agent.model, "gpt-test");
 
   const serialized = JSON.stringify(records);
   assert.equal(serialized.includes("RAW_USER_MESSAGE_SECRET"), false);
@@ -256,6 +262,24 @@ test("appends parsed synthetic Codex session spans to the local event log", asyn
   assert.equal(written.length, 4);
   assert.equal(records.length, 4);
   assert.equal(raw.includes("raw output should not be copied"), false);
+
+  const replayed = await appendCodexSessionJsonl(logPath, SESSION_JSONL, {
+    project_name: "agent-observability",
+  });
+  assert.deepEqual(replayed, []);
+  assert.equal((await readEventLog(logPath)).length, 4);
+});
+
+test("replays missing-timestamp payloads deterministically", () => {
+  const payload = {
+    type: "tool.completed",
+    session_id: "stable-session",
+    turn_id: "stable-turn",
+    call_id: "stable-call",
+    tool_name: "exec_command",
+  };
+
+  assert.deepEqual(normalizeCodexNotifyPayload(payload), normalizeCodexNotifyPayload(payload));
 });
 
 test("appends real Codex envelope spans without raw content", async () => {

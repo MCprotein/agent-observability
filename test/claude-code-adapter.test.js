@@ -203,6 +203,7 @@ test("parses Claude Code hook and transcript JSONL into shared schema spans", ()
   assert.equal(permission.status.code, "error");
   assert.equal(compaction.metrics.input_tokens_before, 120000);
   assert.equal(compaction.metrics.input_tokens_after, 64000);
+  assert.equal(records.every((record) => record.attributes.session_id === "cc-s1"), true);
 
   const serialized = JSON.stringify(records);
   assert.equal(serialized.includes("RAW_PROMPT_SECRET"), false);
@@ -292,4 +293,21 @@ test("appends Claude Code spans to the local event log without raw content", asy
   assert.equal(raw.includes("RAW_STDOUT_SECRET"), false);
   assert.equal(raw.includes("RAW_STDERR_SECRET"), false);
   assert.equal(raw.includes("RAW_PERMISSION_COMMAND_SECRET"), false);
+
+  const replayed = await appendClaudeCodeJsonl(logPath, CLAUDE_CODE_JSONL, {
+    project_name: "agent-observability",
+  });
+  assert.deepEqual(replayed, []);
+  assert.equal((await readEventLog(logPath)).length, 7);
+});
+
+test("replays missing-timestamp hook payloads deterministically", () => {
+  const payload = {
+    hook_event_name: "PostToolUse",
+    session_id: "stable-session",
+    tool_use_id: "stable-call",
+    tool_name: "Read",
+  };
+
+  assert.deepEqual(normalizeClaudeCodeHookPayload(payload), normalizeClaudeCodeHookPayload(payload));
 });

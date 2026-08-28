@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Script, createContext } from "node:vm";
@@ -31,7 +31,7 @@ function reportFixture() {
     name: "Codex turn </script><img src=x>",
     status: "ok",
     project: { name: "agent-observability" },
-    attributes: { turn_id: "turn-report-1" },
+    attributes: { session_id: "session-report-1", turn_id: "turn-report-1" },
     content: {
       prompt: "RAW_PROMPT_SECRET",
       output: "RAW_OUTPUT_SECRET",
@@ -54,7 +54,7 @@ function reportFixture() {
       reasoning_output_tokens: 3,
       latency_ms: 1200,
     },
-    attributes: { turn_id: "turn-report-1", request_id: "r1" },
+    attributes: { session_id: "session-report-1", turn_id: "turn-report-1", request_id: "r1" },
   });
 
   const tool = createSpanRecord({
@@ -67,11 +67,11 @@ function reportFixture() {
     project: { name: "agent-observability" },
     metrics: { duration_ms: 35 },
     attributes: {
+      session_id: "session-report-1",
       turn_id: "turn-report-1",
       call_id: "call-1",
       tool_name: "exec_command",
       phase: "output",
-      raw_argument_like_field: "RAW_ARGUMENT_SECRET",
     },
   });
 
@@ -91,7 +91,7 @@ test("builds report data with summaries and without raw content", () => {
   assert.equal(data.summary.errors, 1);
   assert.equal(data.summary.inputTokens, 42);
   assert.equal(data.summary.outputTokens, 17);
-  assert.equal(data.summary.estimatedCost, 0.000286);
+  assert.equal(data.summary.estimatedCost, 0.00025);
   assert.equal(data.cost.status, "estimated");
   assert.equal(data.cost.rate_table.version, "report-test");
   assert.deepEqual(data.filters.repos, ["agent-observability"]);
@@ -146,6 +146,7 @@ test("writes an HTML report file and executes the inline renderer", async () => 
 
   assert.equal(result.filePath, reportPath);
   assert.equal(result.bytes, Buffer.byteLength(html, "utf8"));
+  assert.equal((await stat(reportPath)).mode & 0o777, 0o600);
   assert.equal(html.includes("<title>Local Agent Report</title>"), true);
   assert.equal(html.includes('id="report-data"'), true);
   assert.equal(new URL(`file://${reportPath}`).protocol, "file:");
@@ -154,7 +155,7 @@ test("writes an HTML report file and executes the inline renderer", async () => 
   const data = JSON.parse(dataJson);
   assert.equal(data.summary.inputTokens, 42);
   assert.equal(data.summary.outputTokens, 17);
-  assert.equal(data.summary.estimatedCost, 0.000286);
+  assert.equal(data.summary.estimatedCost, 0.00025);
 
   const dom = createReportDom(dataJson);
   new Script(extractRendererScript(html)).runInContext(createContext({ document: dom.document }));
@@ -164,7 +165,7 @@ test("writes an HTML report file and executes the inline renderer", async () => 
   assert.equal(dom.element("kpi-llm").textContent, "1");
   assert.equal(dom.element("kpi-tools").textContent, "1");
   assert.equal(dom.element("kpi-tokens").textContent, "59");
-  assert.equal(dom.element("kpi-cost").textContent, "USD 0.000286");
+  assert.equal(dom.element("kpi-cost").textContent, "USD 0.00025");
   assert.equal(dom.element("kpi-errors").textContent, "1");
   assert.equal(dom.element("trace-list").children.length, 1);
   assert.equal(dom.element("span-table").children.length, 4);
@@ -180,6 +181,10 @@ test("renders incomplete cost status with the partial amount", async () => {
     models: {
       "gpt-test": {
         input_tokens: 2,
+        token_semantics: {
+          cached_input_tokens: "included_in_total",
+          reasoning_output_tokens: "included_in_total",
+        },
       },
     },
   };
@@ -194,12 +199,12 @@ test("renders incomplete cost status with the partial amount", async () => {
   const dataJson = extractReportDataJson(html);
   const data = JSON.parse(dataJson);
   assert.equal(data.cost.status, "incomplete");
-  assert.equal(data.cost.estimated_cost, 0.000084);
+  assert.equal(data.cost.estimated_cost, 0.000072);
 
   const dom = createReportDom(dataJson);
   new Script(extractRendererScript(html)).runInContext(createContext({ document: dom.document }));
 
-  assert.equal(dom.element("kpi-cost").textContent, "USD 0.000084 incomplete");
+  assert.equal(dom.element("kpi-cost").textContent, "USD 0.000072 incomplete");
 });
 
 function extractReportDataJson(html) {
@@ -220,6 +225,10 @@ function reportRateTable() {
         output_tokens: 8,
         cached_input_tokens: 1,
         reasoning_output_tokens: 20,
+        token_semantics: {
+          cached_input_tokens: "included_in_total",
+          reasoning_output_tokens: "included_in_total",
+        },
       },
     },
   };

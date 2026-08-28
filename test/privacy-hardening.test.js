@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -52,15 +52,9 @@ function privacyFixtureSpan() {
       tool_output: RAW_TOOL_OUTPUT,
     },
     attributes: {
+      session_id: "session-privacy",
       turn_id: "turn-privacy",
-      command: `cat /repo/.env && echo token=${RAW_TOKEN}`,
-      note: `Authorization: Bearer ${RAW_BEARER}`,
-      nested: {
-        refreshToken: RAW_REFRESH,
-      },
-      private_key: RAW_PRIVATE_KEY,
-      key_file: "/repo/id_rsa.key",
-      harmless: "kept",
+      source: `Authorization: Bearer ${RAW_BEARER}`,
     },
   });
 }
@@ -95,10 +89,7 @@ test("keeps raw prompt, output, and secrets out of local log, report, and export
   assert.equal(logRecords[0].content.output, "[content omitted]");
   assert.equal(logRecords[0].content.tool_input, "[content omitted]");
   assert.equal(logRecords[0].content.tool_output, "[content omitted]");
-  assert.equal(logRecords[0].attributes.nested.refreshToken, "[redacted]");
-  assert.equal(logRecords[0].attributes.private_key, "[redacted]");
-  assert.equal(logRecords[0].attributes.key_file, "[redacted path]");
-  assert.equal(logRecords[0].attributes.harmless, "kept");
+  assert.equal(logRecords[0].attributes.source, "Authorization: Bearer [redacted]");
   assertNoSentinels(rawLog);
 
   const html = renderStaticHtmlReport([span, workstream], {
@@ -128,6 +119,16 @@ test("keeps raw prompt, output, and secrets out of local log, report, and export
     },
   });
   assertNoSentinels(await readFile(exportPath, "utf8"));
+  assert.equal((await stat(exportPath)).mode & 0o777, 0o600);
+});
+
+test("rejects unknown metadata before any durable privacy projection", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-observability-privacy-reject-"));
+  const logPath = join(dir, "events.jsonl");
+  const record = privacyFixtureSpan();
+  record.attributes.private_key = RAW_PRIVATE_KEY;
+
+  await assert.rejects(() => appendEventLog(logPath, record), /attributes.private_key is not allowed/);
 });
 
 function assertNoSentinels(text) {

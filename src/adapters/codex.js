@@ -1,4 +1,4 @@
-import { appendEventLog } from "../event-log.js";
+import { appendEventLogRecords } from "../event-log.js";
 import { createSpanRecord } from "../schema.js";
 
 const SESSION_EVENT_TYPES = new Set(["session.started", "session_start", "session.created"]);
@@ -104,13 +104,7 @@ export function normalizeCodexNotifyPayload(payload, options = {}) {
 export async function appendCodexSessionJsonl(eventLogPath, sessionJsonl, options = {}) {
   const events = parseCodexSessionJsonl(sessionJsonl);
   const records = codexRecordsFromEvents(events, options);
-  const written = [];
-
-  for (const record of records) {
-    written.push(await appendEventLog(eventLogPath, record, options));
-  }
-
-  return written;
+  return appendEventLogRecords(eventLogPath, records, options);
 }
 
 function sessionRecord(event, state) {
@@ -172,6 +166,7 @@ function ensureTurnRecord(event, state) {
       event_type: event.type,
       envelope_type: event.envelope_type,
       turn_id: turnId,
+      session_id: state.sessionId,
     }),
   });
 
@@ -196,7 +191,7 @@ function llmRecord(event, state) {
     status: statusFromEvent(event),
     agent: compactObject({
       ...state.agent,
-      model: event.model,
+      model: event.model ?? state.currentModel,
     }),
     project: state.project,
     metrics: compactObject({
@@ -218,6 +213,7 @@ function llmRecord(event, state) {
       event_type: event.type,
       envelope_type: event.envelope_type,
       turn_id: turnId,
+      session_id: state.sessionId,
       request_id: requestId,
     }),
   });
@@ -254,6 +250,7 @@ function toolRecord(event, state) {
       event_type: event.type,
       envelope_type: event.envelope_type,
       turn_id: turnId,
+      session_id: state.sessionId,
       call_id: callId,
       tool_name: toolName,
       phase: event.phase,
@@ -283,6 +280,7 @@ function permissionRecord(event, state) {
       source: "codex.notify_or_session_jsonl",
       event_type: event.type,
       turn_id: turnId,
+      session_id: state.sessionId,
       permission_id: permissionId,
       decision: event.decision,
       command_kind: event.command_kind,
@@ -465,7 +463,7 @@ function objectValue(value) {
   return undefined;
 }
 
-function timestampMs(value, fallback, defaultValue = Date.now()) {
+function timestampMs(value, fallback, defaultValue = 0) {
   const candidate = value ?? fallback;
   if (candidate === null) {
     return defaultValue;
@@ -509,6 +507,7 @@ function ensureSessionRecord(event, state) {
       project: state.project,
       attributes: {
         source: "codex.synthetic_session",
+        session_id: state.sessionId,
       },
     });
   }

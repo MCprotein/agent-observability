@@ -2,6 +2,7 @@ const TOKEN_RATE_KEYS = [
   "input_tokens",
   "output_tokens",
   "cached_input_tokens",
+  "cache_creation_input_tokens",
   "reasoning_output_tokens",
 ];
 
@@ -9,8 +10,16 @@ const TOKEN_METRIC_KEYS = {
   input_tokens: "input_tokens",
   output_tokens: "output_tokens",
   cached_input_tokens: "cached_input_tokens",
+  cache_creation_input_tokens: "cache_creation_input_tokens",
   reasoning_output_tokens: "reasoning_output_tokens",
 };
+
+const TOKEN_SEMANTIC_KEYS = [
+  "cached_input_tokens",
+  "cache_creation_input_tokens",
+  "reasoning_output_tokens",
+];
+const TOKEN_SEMANTICS = ["exclusive", "included_in_total"];
 
 export function normalizeRateTable(rateTable) {
   if (!rateTable) {
@@ -35,6 +44,10 @@ export function normalizeRateTable(rateTable) {
     for (const key of TOKEN_RATE_KEYS) {
       normalizedModels[modelName][key] = optionalRate(modelRates[key], `${modelName}.${key}`);
     }
+    normalizedModels[modelName].token_semantics = normalizeTokenSemantics(
+      modelRates.token_semantics,
+      modelName,
+    );
   }
 
   return {
@@ -78,9 +91,10 @@ export function estimateSpanCost(record, rateTable) {
   let amount = 0;
   const components = {};
   const missing = [];
+  const { tokensByKey, semanticErrors } = billableTokenMetrics(record, modelRates);
 
   for (const key of TOKEN_RATE_KEYS) {
-    const tokens = metricNumber(record.metrics?.[TOKEN_METRIC_KEYS[key]]);
+    const tokens = tokensByKey[key];
     if (tokens === undefined || tokens === 0) {
       continue;
     }
@@ -100,7 +114,7 @@ export function estimateSpanCost(record, rateTable) {
     amount += cost;
   }
 
-  if (Object.keys(components).length === 0 && missing.length === 0) {
+  if (Object.keys(components).length === 0 && missing.length === 0 && semanticErrors.length === 0) {
     return costResult({
       status: "unknown",
       reason: "missing_token_metrics",
@@ -110,13 +124,19 @@ export function estimateSpanCost(record, rateTable) {
   }
 
   return costResult({
-    status: missing.length > 0 ? "incomplete" : "estimated",
-    reason: missing.length > 0 ? "missing_token_rates" : undefined,
+    status: missing.length > 0 || semanticErrors.length > 0 ? "incomplete" : "estimated",
+    reason:
+      semanticErrors.length > 0
+        ? "ambiguous_token_semantics"
+        : missing.length > 0
+          ? "missing_token_rates"
+          : undefined,
     rateTable: table,
     model,
     amount: roundCurrency(amount),
     components,
     missing,
+    semanticErrors,
   });
 }
 
@@ -175,6 +195,7 @@ function costResult({
   amount,
   components = {},
   missing = [],
+  semanticErrors = [],
 }) {
   return {
     status,
@@ -189,9 +210,91 @@ function costResult({
     cost: {
       assumption: rateTable.assumption,
       ...(missing.length > 0 ? { missing } : {}),
+      ...(semanticErrors.length > 0 ? { semantic_errors: semanticErrors } : {}),
       ...(Object.keys(components).length > 0 ? { components } : {}),
     },
   };
+}
+
+function normalizeTokenSemantics(value, modelName) {
+  if (value === undefined) {
+    return {};
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`rate table model ${modelName}.token_semantics must be an object`);
+  }
+
+  const normalized = {};
+  for (const key of Object.keys(value)) {
+    if (!TOKEN_SEMANTIC_KEYS.includes(key)) {
+      throw new Error(`rate table model ${modelName}.token_semantics.${key} is not supported`);
+    }
+    if (!TOKEN_SEMANTICS.includes(value[key])) {
+      throw new Error(
+        `rate table model ${modelName}.token_semantics.${key} must be one of ${TOKEN_SEMANTICS.join(", ")}`,
+      );
+    }
+    normalized[key] = value[key];
+  }
+  return normalized;
+}
+
+function billableTokenMetrics(record, modelRates) {
+  const tokensByKey = Object.fromEntries(
+    TOKEN_RATE_KEYS.map((key) => [key, metricNumber(record.metrics?.[TOKEN_METRIC_KEYS[key]])]),
+  );
+  const semanticErrors = [];
+
+  applyIncludedBreakdowns({
+    totalKey: "input_tokens",
+    breakdownKeys: ["cached_input_tokens", "cache_creation_input_tokens"],
+    tokensByKey,
+    semantics: modelRates.token_semantics,
+    semanticErrors,
+  });
+  applyIncludedBreakdowns({
+    totalKey: "output_tokens",
+    breakdownKeys: ["reasoning_output_tokens"],
+    tokensByKey,
+    semantics: modelRates.token_semantics,
+    semanticErrors,
+  });
+
+  return { tokensByKey, semanticErrors };
+}
+
+function applyIncludedBreakdowns({ totalKey, breakdownKeys, tokensByKey, semantics, semanticErrors }) {
+  const included = [];
+  for (const key of breakdownKeys) {
+    const tokens = tokensByKey[key];
+    if (tokens === undefined || tokens === 0) {
+      continue;
+    }
+    const semantic = semantics[key];
+    if (!semantic) {
+      semanticErrors.push(`${key}:missing_semantics`);
+      tokensByKey[key] = undefined;
+      continue;
+    }
+    if (semantic === "included_in_total") {
+      included.push(key);
+    }
+  }
+
+  if (included.length === 0) {
+    return;
+  }
+
+  const total = tokensByKey[totalKey];
+  const includedTotal = included.reduce((sum, key) => sum + tokensByKey[key], 0);
+  if (total === undefined || includedTotal > total) {
+    semanticErrors.push(`${totalKey}:invalid_included_breakdown`);
+    for (const key of included) {
+      tokensByKey[key] = undefined;
+    }
+    return;
+  }
+  tokensByKey[totalKey] = total - includedTotal;
 }
 
 function unknownCost(reason) {

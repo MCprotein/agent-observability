@@ -6,12 +6,13 @@
 
 ## Current and target stack
 
-현재 `v0.6.0`은 Node.js 20+ ESM JavaScript로 구현되어 있다. 외부 runtime dependency 없이
+현재 `v0.6.1`은 Node.js 20+ ESM JavaScript로 구현되어 있다. 외부 runtime dependency 없이
 `node:test`를 사용하고, static HTML renderer는 HTML, CSS, JavaScript 문자열을 한 파일로
 생성한다. 이 구현은 동작과 fixture를 보존해야 하는 migration baseline이다.
-현재 v0.6 경로가 이 문서의 목표 규칙을 이미 모두 만족한다는 뜻은 아니다. unknown metadata의
-fail-open 저장, token breakdown 중복 계산 가능성, 기본 파일 permission은 migration 전에
-고쳐야 할 알려진 blocker다.
+`v0.6.1`은 unknown metadata를 거부하고, token breakdown의 포함 의미를 rate table에 명시하며,
+local artifact를 private permission으로 생성한다. 다만 concurrent writer/crash atomicity,
+out-of-order lifecycle reduction과 topology validation은 Rust transaction/reducer 단계의 남은
+blocker다.
 
 목표 스택은 다음과 같다.
 

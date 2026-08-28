@@ -29,6 +29,8 @@ sign-off 대상이 아니다. `v0.13.0`의 Rust end-to-end performance harness�
 - `agent_observability.v1` span record schema
 - parent/child span field와 fixture
 - append-only JSONL writer
+- sequential replay no-op과 stable identity conflict 거부
+- private local artifact permission과 strict metadata allowlist
 - durable write 전 content logging / secret / sensitive path redaction
 - Codex session JSONL / notify payload 정규화
 - Codex session, turn, LLM request, tool execution span 생성
@@ -52,8 +54,8 @@ sign-off 대상이 아니다. `v0.13.0`의 Rust end-to-end performance harness�
 npm test
 ```
 
-다음 단계는 `v0.6.1` correctness/contract freeze이고, `v0.7.0`부터 Rust architecture
-foundation을 시작한다. Cursor adapter는 공통 contract와 Rust core가 안정된 뒤 추가한다.
+`v0.6.1` correctness/contract freeze까지 완료되었다. 다음 단계는 `v0.7.0` Rust architecture
+foundation이다. Cursor adapter는 공통 contract와 Rust core가 안정된 뒤 추가한다.
 
 ## 아키텍처 요약
 
@@ -300,7 +302,7 @@ Workstream span
 `workstream.id`, `repo.name`, `task.label`, `user.id` 같은 correlation key로 report에서
 같이 조회할 수 있게 한다.
 
-현재 v0.6 durable record의 축약 예시:
+현재 v0.6.1 durable record의 축약 예시:
 
 ```json
 {
@@ -332,9 +334,9 @@ Workstream span
 }
 ```
 
-이 schema의 현재 validator는 required field, enum, JSON value/plain-object 형태와 시간 범위를
-검사한다. parent/child topology 검증과 metadata allowlisting은 하지 않는다. 두 항목은
-`v0.6.1` blocker이며, 목표 Rust 계약에서는
+이 schema의 현재 validator는 required field, enum, JSON value/plain-object 형태, 시간 범위와
+top-level/nested metadata allowlist를 검사한다. parent/child topology 검증은 Rust reducer 단계의
+blocker다. 목표 Rust 계약에서는
 `SourceObservation`/domain state/`DurableRecordVx`/`ReportDtoVx`로 역할을 분리한다.
 
 metrics는 span에서 파생하거나 adapter가 별도 전송한다.
@@ -361,8 +363,8 @@ estimated_cost = sum(exclusive_billable_unit[kind] * rate[kind])
 이 식은 목표 pricing contract다. `exclusive_billable_unit`은 source별 token 의미를 해석한
 뒤 서로 겹치지 않게 만든 과금 단위다. cached input이나 reasoning output이 total에 이미
 포함된 source에서는 다시 더하지 않는다. 포함 관계를 판별할 수 없으면 비용을 완전한
-예상치로 만들지 않는다. 현재 v0.6 계산기는 이 포함 의미를 표현하지 못하므로 `v0.6.1`의
-correctness blocker로 취급한다.
+예상치로 만들지 않는다. v0.6.1 rate table은 breakdown별 `token_semantics`를 요구하며 의미가
+없으면 `ambiguous_token_semantics` incomplete 결과를 낸다.
 
 주의할 점:
 
@@ -383,7 +385,11 @@ rate table 예시:
       "input_tokens": 2,
       "output_tokens": 8,
       "cached_input_tokens": 0.5,
-      "reasoning_output_tokens": 10
+      "reasoning_output_tokens": 10,
+      "token_semantics": {
+        "cached_input_tokens": "included_in_total",
+        "reasoning_output_tokens": "included_in_total"
+      }
     }
   }
 }
@@ -428,15 +434,23 @@ Standalone local label은 이메일이나 계정 식별자가 아니다. Future 
 server-issued `identity_binding_ref`와 collector enrollment를 사용하며 raw email이나
 `collector_endpoint`를 standalone 설정 shape에 섞지 않는다.
 
-v0.6 legacy adapter 책임:
+v0.6.1 legacy adapter 책임:
 
 - hook payload와 transcript/session log를 turn 단위로 결합한다.
 - token usage와 latency를 가능한 원천에서 읽는다.
 - tool call은 parent turn 아래 child span으로 표현한다.
 - content logging 정책과 redaction 정책을 durable write 전에 적용한다.
 - 로컬 event log에 append-only로 기록한다.
+- ordered source stream 안에서 stable `span_id` replay는 no-op으로 처리하고, 같은 ID의 다른
+  payload는 conflict로 거부한다.
 
-local queue 재시도와 중앙 collector 전송은 현재 v0.6 adapter 기능이 아니라 Future TODO다.
+동일 파일에 대한 concurrent writer와 crash 원자성, out-of-order event 재정렬은 보장하지 않는다.
+timestamp가 없는 동일 입력은 deterministic replay를 위해 `0`으로 정규화한다. 이 한계와 local
+queue 재시도, 중앙 collector 전송은 현재 v0.6.1 adapter 기능이 아니며 transaction/reducer 또는
+Future TODO 범위다.
+중단되거나 잘린 source에서 완료 event가 없으면 synthetic 완료를 만들지 않고 open span의
+`end_time_unix_ms: null`, `status.code: unset`을 유지한다. 입력 JSONL의 손상된 record는 조용히
+건너뛰지 않고 read/parse error로 거부한다.
 
 목표 구조에서는 위 책임을 inbound adapter, application reducer, privacy projector, outbound
 writer로 분리한다. 새 Rust adapter는 source payload를 `SourceObservation`으로 번역하는
@@ -480,7 +494,7 @@ agent-observability report \
 `report.html`은 외부 network 요청 없이 동작한다. 브라우저의 `file://` 제약을 피하기 위해
 JSONL을 따로 fetch하지 않고, 생성 시점에 필요한 데이터를 HTML 안에 주입한다.
 
-현재 v0.6 report에서 확인 가능한 화면:
+현재 v0.6.1 report에서 확인 가능한 화면:
 
 - repo/session/turn/text filter
 - trace 목록과 parent ID를 포함한 평면 span table
@@ -546,13 +560,13 @@ error.message
 `available`/`omitted_by_policy`/`unavailable_in_profile`/`unknown_source` 상태는
 [team architecture](docs/TEAM_ARCHITECTURE.md)의 `ReportDtoV1` projection을 따른다.
 
-현재 v0.6은 content logging이 꺼져 있으면 prompt/output/tool content를 omission marker로
+현재 v0.6.1은 content logging이 꺼져 있으면 prompt/output/tool content를 omission marker로
 대체하고 redaction count를 남긴다. size, hash, MIME type만 남기는 fallback은 목표
 `DurableRecordVx` projector에서 검증할 정책이며 아직 구현되지 않았다.
 
 ## Codex Adapter
 
-현재 v0.6 baseline은 notify hook과 session JSONL을 결합한다. Target Rust adapter는 공식 native
+현재 v0.6.1 baseline은 notify hook과 session JSONL을 결합한다. Target Rust adapter는 공식 native
 telemetry를 token/model/API/tool signal의 primary로 사용하고 lifecycle hook을 보완 source로 사용한다.
 Session output parsing은 선언된 제품 version과 fixture가 있는 reconciliation fallback으로 제한한다.
 
@@ -573,7 +587,7 @@ Session output parsing은 선언된 제품 version과 fixture가 있는 reconcil
 
 ## Claude Code Adapter
 
-현재 v0.6 baseline은 hook 이벤트와 transcript를 결합한다. Target Rust adapter는 공식 native
+현재 v0.6.1 baseline은 hook 이벤트와 transcript를 결합한다. Target Rust adapter는 공식 native
 telemetry를 usage/cost/tool metric의 primary로 사용하고 hook을 lifecycle supplement로 사용한다.
 
 주요 이벤트:
@@ -681,9 +695,9 @@ redaction 단계:
 4. 길이 제한
 5. hash/size metadata만 남기는 fallback
 
-현재 v0.6은 content omission, 민감 key/path, secret pattern 치환까지 구현한다. unknown metadata
-거부, 길이 제한, hash/size fallback, project opt-out, collector 인증은 `v0.6.1` 또는 Future
-TODO의 검증 대상이다.
+현재 v0.6.1은 content omission, 민감 key/path, secret pattern 치환과 unknown metadata 거부까지
+구현한다. 길이 제한, hash/size fallback, project opt-out, collector 인증은 이후 local release 또는
+Future TODO의 검증 대상이다.
 
 ## 저장과 조회
 

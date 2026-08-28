@@ -1,0 +1,107 @@
+{
+  "durable": {
+    "codex": [
+      {
+        "span_kind": "agent.session",
+        "span_id": "codex-session:golden-codex",
+        "parent_span_id": null,
+        "agent_name": "codex",
+        "model": "gpt-golden",
+        "session_id": "golden-codex",
+        "turn_id": null,
+        "request_id": null,
+        "start_time_unix_ms": 1785542400000,
+        "metrics": {}
+      },
+      {
+        "span_kind": "turn",
+        "span_id": "codex-turn:golden-codex:turn-codex",
+        "parent_span_id": "codex-session:golden-codex",
+        "agent_name": "codex",
+        "model": null,
+        "session_id": "golden-codex",
+        "turn_id": "turn-codex",
+        "request_id": null,
+        "start_time_unix_ms": 1785542401000,
+        "metrics": {}
+      },
+      {
+        "span_kind": "llm.request",
+        "span_id": "codex-llm:golden-codex:turn-codex:request-codex",
+        "parent_span_id": "codex-turn:golden-codex:turn-codex",
+        "agent_name": "codex",
+        "model": "gpt-golden",
+        "session_id": "golden-codex",
+        "turn_id": "turn-codex",
+        "request_id": "request-codex",
+        "start_time_unix_ms": 1785542402000,
+        "metrics": {
+          "input_tokens": 100,
+          "output_tokens": 40,
+          "cached_input_tokens": 20,
+          "reasoning_output_tokens": 10
+        }
+      }
+    ],
+    "claude_code": [
+      {
+        "span_kind": "agent.session",
+        "span_id": "claude-code-session:golden-claude",
+        "parent_span_id": null,
+        "agent_name": "claude-code",
+        "model": "claude-golden",
+        "session_id": "golden-claude",
+        "turn_id": null,
+        "request_id": null,
+        "start_time_unix_ms": 1785542460000,
+        "metrics": {}
+      },
+      {
+        "span_kind": "turn",
+        "span_id": "claude-code-turn:golden-claude:turn-claude",
+        "parent_span_id": "claude-code-session:golden-claude",
+        "agent_name": "claude-code",
+        "model": null,
+        "session_id": "golden-claude",
+        "turn_id": "turn-claude",
+        "request_id": null,
+        "start_time_unix_ms": 1785542461000,
+        "metrics": {}
+      },
+      {
+        "span_kind": "llm.request",
+        "span_id": "claude-code-llm:golden-claude:turn-claude:request-claude",
+        "parent_span_id": "claude-code-turn:golden-claude:turn-claude",
+        "agent_name": "claude-code",
+        "model": "claude-golden",
+        "session_id": "golden-claude",
+        "turn_id": "turn-claude",
+        "request_id": "request-claude",
+        "start_time_unix_ms": 1785542462000,
+        "metrics": {
+          "input_tokens": 80,
+          "output_tokens": 30,
+          "cached_input_tokens": 8,
+          "cache_creation_input_tokens": 4
+        }
+      }
+    ]
+  },
+  "report": {
+    "schemaVersion": "agent_observability.report.v1",
+    "sessions": 2,
+    "turns": 2,
+    "llmRequests": 2,
+    "inputTokens": 180,
+    "outputTokens": 70,
+    "cachedInputTokens": 28,
+    "cacheCreationInputTokens": 4,
+    "reasoningOutputTokens": 10,
+    "estimatedCost": 0.001118,
+    "costStatus": "estimated",
+    "sessionsFilter": ["golden-claude", "golden-codex"],
+    "turnsFilter": ["turn-claude", "turn-codex"],
+    "traceIds": ["codex:golden-codex", "claude-code:golden-claude"],
+    "spanAgents": ["codex", "codex", "codex", "claude-code", "claude-code", "claude-code"]
+  }
+}
