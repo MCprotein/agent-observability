@@ -2,9 +2,9 @@
 
 use agent_observability_application::reduce_observation_state;
 use agent_observability_contracts::{
-    AdapterDispositionCode, AdapterDispositionKind, DurableRecordV1, SourceCheckpoint,
-    SourceObservation, canonical_observation_payload_hash, hash_opaque_identifier,
-    project_durable_record, sanitize_durable_record,
+    AdapterDispositionCode, AdapterDispositionKind, DurableRecordV1, ObservationEvent,
+    SourceCheckpoint, SourceObservation, canonical_observation_payload_hash,
+    hash_opaque_identifier, project_durable_record, sanitize_durable_record,
 };
 use agent_observability_domain::{
     CompactionId, CorrelationIds, DomainSpanState, LifecycleState, OperationId, PermissionId,
@@ -433,9 +433,13 @@ impl LocalStore {
             ensure_static_record_compatibility(&tx, state.span_id.as_str(), &incoming_record)?;
         }
         let reduced = reduce_observation_state(&mut states, state).map_err(map_reduction_error)?;
+        let projection_observation = projection_observation(observation, &reduced);
         let record = sanitize_durable_record(
-            &project_durable_record(observation, &projection_state(observation, &reduced))
-                .map_err(|_| StoreError::InvalidObservation)?,
+            &project_durable_record(
+                &projection_observation,
+                &projection_state(&projection_observation, &reduced),
+            )
+            .map_err(|_| StoreError::InvalidObservation)?,
         )
         .map_err(|_| StoreError::InvalidObservation)?;
         let record_json = serde_json::to_string(&record)?;
@@ -734,6 +738,22 @@ fn projection_state(observation: &SourceObservation, reduced: &DomainSpanState) 
         timing: reduced.timing,
         token_usage: reduced.token_usage,
     }
+}
+
+fn projection_observation(
+    observation: &SourceObservation,
+    reduced: &DomainSpanState,
+) -> SourceObservation {
+    let mut projected = observation.clone();
+    if let ObservationEvent::ToolOperation { phase, .. } = &mut projected.event {
+        *phase = match reduced.lifecycle {
+            LifecycleState::Running => Some("start".into()),
+            LifecycleState::Completed => Some("result".into()),
+            LifecycleState::Failed | LifecycleState::Interrupted => Some("failure".into()),
+            LifecycleState::Observed => phase.clone(),
+        };
+    }
+    projected
 }
 
 fn cursor_matches(
@@ -1086,7 +1106,6 @@ fn ensure_static_record_compatibility(
         && existing.attributes.event_type == incoming.attributes.event_type
         && existing.attributes.envelope_type == incoming.attributes.envelope_type
         && existing.attributes.tool_name == incoming.attributes.tool_name
-        && existing.attributes.phase == incoming.attributes.phase
         && existing.attributes.decision == incoming.attributes.decision
         && existing.attributes.trigger == incoming.attributes.trigger;
     if !compatible {

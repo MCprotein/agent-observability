@@ -1,6 +1,6 @@
 # Adapter Compatibility Contract
 
-Status: Codex and Claude Code experimental entries implemented; Cursor proposed
+Status: Codex, Claude Code and Cursor experimental entries implemented
 Last verified: 2026-08-28
 
 이 문서는 Codex, Claude Code, Cursor adapter가 어떤 공식 surface를 어떤 우선순위로 사용하고,
@@ -18,7 +18,11 @@ adapter family, source generation, 공식 session/conversation/generation identi
 | --- | --- | --- | --- |
 | Codex | native telemetry for model/API/token/tool signals | `agent-turn-complete` notify for turn lifecycle; local session output is not used by the Rust adapter | [Advanced configuration](https://developers.openai.com/codex/config-advanced), [Configuration reference](https://developers.openai.com/codex/config-reference) |
 | Claude Code | native telemetry for usage, cost and tool metrics | hooks for lifecycle events; no transcript dependency in the Rust adapter | [Hooks reference](https://code.claude.com/docs/en/hooks), [Monitoring usage](https://code.claude.com/docs/en/monitoring-usage) |
-| Cursor | official hooks for conversation, generation, model, user-email and transcript references | project/team hook coverage where local and cloud execution differ; transcript parsing only for documented fields and validated fixtures | [Hooks reference](https://cursor.com/docs/hooks) |
+| Cursor | generic `preToolUse`/`postToolUse`/`postToolUseFailure` hooks with `tool_use_id` | session/turn lifecycle hooks; specific shell/MCP/file hooks are diagnostic-only because they lack a shared operation ID | [Hooks reference](https://cursor.com/docs/hooks) |
+
+Cursor의 durable `tool.name`은 원문 이름이 아니라 `shell`, `mcp`, `file`, `agent`, `other` 중 하나인
+bounded canonical category다. 같은 `tool_use_id`의 start/result/failure source observation은 append-only로
+보존하고 current durable record와 report에서는 하나의 operation span으로 reduce한다.
 
 Raw email supplied by a product surface is used only for local profile matching. It is immediately resolved to
 an opaque `identity_binding_ref`; raw email is not written to observation records, local outbox, retry queue,
@@ -55,10 +59,10 @@ Each entry in `crates/contracts/capabilities/adapter-capability-v1.yaml` contain
 - correlation keys, closed privacy flags, known gaps, fixture IDs and input/projection fixture hashes
 
 `cargo test -p agent-observability-contracts adapter_capability_v1` validates schema, field ownership and
-privacy closure. The Codex and Claude Code adapter suites verify declared input/projection fixture hashes, exact
-replay output, bounded input, restart/idempotency and privacy behavior. Claude Code additionally locks permission,
+privacy closure. The Codex, Claude Code and Cursor adapter suites verify declared input/projection fixture hashes,
+exact replay output, bounded input, restart/idempotency and privacy behavior. Claude Code additionally locks permission,
 compaction, failed lifecycle, interrupt-gap and out-of-order timestamp fixtures. Cross-version/OS/profile execution,
-foreground deadline and load evidence remain future support gates; both entries therefore remain `experimental`.
+foreground deadline and load evidence remain future support gates; all three entries therefore remain `experimental`.
 
 | Scenario | Required evidence |
 | --- | --- |
@@ -76,10 +80,11 @@ version and rerun when an official surface or schema changes.
 
 ## Current planning assumptions
 
-The JavaScript baseline retains partial Codex and Claude Code file/hook adapters. Rust Codex and Claude Code
-adapters implement bounded canonical handoff parsers, fixed source precedence, content-free dispositions,
-fixture hash validation and CLI-to-private-store replay. Claude Code uses documented OTel events as primary,
-hooks only for lifecycle, and does not parse the explicitly internal transcript format. Neither adapter includes
-an OTLP HTTP/gRPC receiver or foreground spool writer. Cursor Rust support, cross-version execution and full
-performance evidence remain roadmap work. The current private file handoff reader is supported only on Unix;
+The JavaScript baseline retains partial Codex and Claude Code file/hook adapters. Rust Codex, Claude Code and
+Cursor adapters implement bounded canonical handoff parsers, fixed source precedence, content-free dispositions,
+fixture hash validation and CLI-to-private-store replay. Claude Code uses documented OTel events as primary and
+hooks only for lifecycle. Cursor uses generic tool hooks as primary and lifecycle hooks as supplement; specific
+shell/MCP/file hooks remain diagnostic-only, and raw transcript/content fields are not parsed. No adapter includes
+an OTLP HTTP/gRPC receiver or foreground spool writer. Cross-version execution and full performance evidence
+remain roadmap work. The current private file handoff reader is supported only on Unix;
 other platforms fail closed until equivalent no-follow, identity and permission evidence exists.

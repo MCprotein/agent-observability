@@ -4,6 +4,9 @@ use agent_observability_adapter_claude_code::{
 use agent_observability_adapter_codex::{
     AdapterItem as CodexAdapterItem, read_handoff_file as read_codex_handoff_file,
 };
+use agent_observability_adapter_cursor::{
+    AdapterItem as CursorAdapterItem, read_handoff_file as read_cursor_handoff_file,
+};
 use agent_observability_contracts::{
     AdapterDispositionCode, AdapterDispositionKind, SourceCheckpoint, SourceObservation,
 };
@@ -12,7 +15,7 @@ use agent_observability_local_store::{IngestStatus, LOCAL_STORE_SCHEMA_VERSION, 
 use std::env;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: agent-observability [contracts|storage-check <directory>|codex-ingest <store-directory> <handoff-jsonl>|claude-code-ingest <store-directory> <handoff-jsonl>|version|help]";
+const USAGE: &str = "usage: agent-observability [contracts|storage-check <directory>|codex-ingest <store-directory> <handoff-jsonl>|claude-code-ingest <store-directory> <handoff-jsonl>|cursor-ingest <store-directory> <handoff-jsonl>|version|help]";
 
 enum IngestItem<'a> {
     Observation(&'a SourceObservation),
@@ -84,6 +87,24 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
                         IngestItem::Observation(observation)
                     }
                     ClaudeAdapterItem::Disposition(diagnostic) => IngestItem::Disposition {
+                        checkpoint: &diagnostic.checkpoint,
+                        disposition: diagnostic.disposition,
+                        code: diagnostic.code,
+                        payload_hash: diagnostic.payload_hash.as_deref(),
+                    },
+                }),
+            )
+        }
+        [command, directory, handoff] if command == "cursor-ingest" => {
+            let batch = read_cursor_handoff_file(handoff).map_err(|error| error.to_string())?;
+            ingest_items(
+                directory,
+                "cursor",
+                batch.items.iter().map(|item| match item {
+                    CursorAdapterItem::Observation(observation) => {
+                        IngestItem::Observation(observation)
+                    }
+                    CursorAdapterItem::Disposition(diagnostic) => IngestItem::Disposition {
                         checkpoint: &diagnostic.checkpoint,
                         disposition: diagnostic.disposition,
                         code: diagnostic.code,

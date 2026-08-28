@@ -375,3 +375,111 @@ fn codex_ingest_process_restarts_from_an_appended_tail() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+#[cfg(unix)]
+#[test]
+fn cursor_ingest_process_is_private_idempotent_and_restartable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-cursor-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let fixture = include_str!("../../adapter-cursor/tests/fixtures/cursor-handoff.jsonl");
+    let prefix = root.join("prefix.jsonl");
+    let tail = root.join("tail.jsonl");
+    let full = root.join("full.jsonl");
+    fs::write(
+        &prefix,
+        fixture.lines().take(4).collect::<Vec<_>>().join("\n"),
+    )
+    .unwrap();
+    fs::write(
+        &tail,
+        fixture.lines().skip(4).collect::<Vec<_>>().join("\n"),
+    )
+    .unwrap();
+    fs::write(&full, fixture).unwrap();
+    for path in [&prefix, &tail, &full] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let split_store = root.join("split-store");
+    for handoff in [&prefix, &tail] {
+        let output = binary()
+            .args([
+                "cursor-ingest",
+                split_store.to_str().unwrap(),
+                handoff.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let replay = binary()
+        .args([
+            "cursor-ingest",
+            split_store.to_str().unwrap(),
+            full.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(replay.status.success());
+
+    let full_store = root.join("full-store");
+    let output = binary()
+        .args([
+            "cursor-ingest",
+            full_store.to_str().unwrap(),
+            full.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("source=cursor"));
+
+    let split_projection = fs::read_to_string(split_store.join("observations.jsonl")).unwrap();
+    let full_projection = fs::read_to_string(full_store.join("observations.jsonl")).unwrap();
+    assert_eq!(split_projection, full_projection);
+    let tool_executions = split_projection
+        .lines()
+        .filter(|line| line.contains("\"span_kind\":\"tool.execution\""))
+        .count();
+    assert_eq!(tool_executions, 2);
+    let shell_record = split_projection
+        .lines()
+        .find(|line| line.contains("\"tool_name\":\"shell\""))
+        .unwrap();
+    assert!(shell_record.contains("\"phase\":\"failure\""));
+    assert!(shell_record.contains("\"status\":{\"code\":\"error\"}"));
+    assert!(shell_record.contains("\"start_time_unix_ms\":1787875200200.0"));
+    assert!(shell_record.contains("\"end_time_unix_ms\":1787875200400.0"));
+    assert!(shell_record.contains(
+        "\"call_id\":\"id:sha256:7998d275087ee3f171d53721137f16ed6632d7f7d3a07f9663fbf5ad6108742f\""
+    ));
+    for secret in [
+        "RAW_EMAIL",
+        "RAW_PATH",
+        "RAW_COMMAND",
+        "RAW_PROMPT",
+        "RAW_OUTPUT",
+        "RAW_MCP",
+    ] {
+        assert!(!split_projection.contains(secret));
+    }
+    let split_state = agent_observability_local_store::LocalStore::open(&split_store).unwrap();
+    assert_eq!(split_state.observation_count().unwrap(), 7);
+    assert_eq!(split_state.disposition_count().unwrap(), 6);
+    let _ = fs::remove_dir_all(root);
+}

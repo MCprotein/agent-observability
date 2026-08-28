@@ -141,6 +141,58 @@
         "claude-handoff.jsonl": "sha256:316ae843b2d0d20ae5ad25a7507fb9e16d025d6f4442b9775048b789c9560a44",
         "claude-projection.jsonl": "sha256:a65f5439b7fb563547ac9daa311f71b799f34842e14e21c0451be2956c3bd4fc"
       }
+    },
+    {
+      "adapter_family": "cursor",
+      "support_status": "experimental",
+      "product_versions": {
+        "oldest": "3.17.21",
+        "newest": "3.17.21"
+      },
+      "verified_at": "2026-08-28",
+      "official_references": [
+        "https://cursor.com/docs/hooks"
+      ],
+      "surfaces": [
+        {
+          "id": "generic_tool_hooks_v1",
+          "role": "primary",
+          "events": ["preToolUse", "postToolUse", "postToolUseFailure"],
+          "owned_fields": ["tool.name", "tool.status", "tool.duration_ms"]
+        },
+        {
+          "id": "lifecycle_hooks_v1",
+          "role": "supplement",
+          "events": ["sessionStart", "sessionEnd", "beforeSubmitPrompt", "stop"],
+          "owned_fields": ["session.lifecycle", "session.model", "turn.lifecycle"]
+        }
+      ],
+      "correlation_keys": ["conversation_id", "generation_id", "tool_use_id"],
+      "privacy": {
+        "content_fields_accepted": false,
+        "raw_identifiers_durable": false
+      },
+      "known_gaps": [
+        "The hook configuration schema is version 1, but the event payloads do not publish a separate schema version",
+        "Generic and specific tool hooks may both fire without documented ordering or exactly-once delivery guarantees",
+        "Specific shell, MCP, read-file and file-edit hooks do not expose tool_use_id and remain diagnostic-only",
+        "Raw prompt, output, command, path, edit, transcript, workspace and email fields are never durable",
+        "Privacy flags describe the adapter output and durable boundaries; the foreground hook-to-handoff projector remains a separate release gate",
+        "Unrecognized model slugs preserve lifecycle observations with model recorded as unknown",
+        "The private file handoff reader is supported only on Unix until equivalent path identity and permission checks are implemented elsewhere",
+        "Execution evidence covers Cursor 3.17.21 only"
+      ],
+      "fixture_ids": [
+        "cursor-hook-lifecycle-v1",
+        "cursor-generic-tool-primary-v1",
+        "cursor-specific-tool-diagnostic-isolation-v1",
+        "cursor-content-omission-v1",
+        "cursor-bounded-handoff-v1"
+      ],
+      "fixture_hashes": {
+        "cursor-handoff.jsonl": "sha256:4cf6068af8bd16470d27d58efd85bd3a08bcf376717f7691b28700ebc49890f3",
+        "cursor-projection.jsonl": "sha256:05dcb372927b809192ec9f307f1c537fdfb8753d9fb78ce02bc1742e8d4bef27"
+      }
     }
   ]
 }

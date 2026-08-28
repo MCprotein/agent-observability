@@ -1615,6 +1615,14 @@ mod tests {
         assert_eq!(claude.product_versions.newest, "2.1.248");
         assert!(!claude.privacy.content_fields_accepted);
         assert!(!claude.privacy.raw_identifiers_durable);
+        let cursor = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.adapter_family == "cursor")
+            .expect("Cursor capability exists");
+        assert_eq!(cursor.support_status, "experimental");
+        assert!(!cursor.privacy.content_fields_accepted);
+        assert!(!cursor.privacy.raw_identifiers_durable);
     }
 
     #[test]

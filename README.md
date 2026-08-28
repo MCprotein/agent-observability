@@ -7,10 +7,10 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 `v0.10.0`은 JavaScript migration baseline 위에 experimental Rust Codex와 Claude Code
-adapter를 제공한다. Rust 경로는 bounded canonical handoff JSONL에서 각 제품의 OTel log와
-lifecycle supplement를 정규화해 private local state에 저장한다. Native OTel endpoint와 foreground
-spool writer, Cursor Rust adapter, Rust static HTML 생성은 아직 구현하지 않았다.
+현재 `v0.11.0`은 JavaScript migration baseline 위에 experimental Rust Codex, Claude Code, Cursor
+adapter를 제공한다. Rust 경로는 bounded canonical handoff JSONL에서 각 제품의 공식 telemetry 또는
+hook event를 정규화해 private local state에 저장한다. Native OTel endpoint와 foreground spool writer,
+Rust static HTML 생성은 아직 구현하지 않았다.
 
 현재 구현 기술은 Node.js 20+ ESM JavaScript 기준선과 Rust 1.97 Cargo workspace다.
 Rust workspace는 다음 책임으로 분리된다.
@@ -22,6 +22,8 @@ Rust workspace는 다음 책임으로 분리된다.
   primary/supplement dedupe, content-free diagnostic
 - `crates/adapter-claude-code`: Claude Code OTel/hook precedence, permission/compaction,
   failed lifecycle, explicit interrupt gap과 out-of-order timestamp normalization
+- `crates/adapter-cursor`: Cursor Hook v1 lifecycle/generic-tool mapping, generation correlation,
+  specific-hook 격리와 content-free diagnostic
 - `crates/application`: pricing policy와 privacy-safe report DTO projection
 - `crates/local-store`: private SQLite authority, atomic cursor/event/current-record/disposition
   commit, replayable JSONL projection, `local_state.v1` -> `local_state.v2` migration
@@ -75,10 +77,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p agent-observability-cli -- contracts
 cargo run -p agent-observability-cli -- codex-ingest <private-store-dir> <private-handoff.jsonl>
 cargo run -p agent-observability-cli -- claude-code-ingest <private-store-dir> <private-handoff.jsonl>
+cargo run -p agent-observability-cli -- cursor-ingest <private-store-dir> <private-handoff.jsonl>
 ```
 
-`v0.10.0` Rust Claude Code adapter는 구현과 privacy/replay fixture 검증을 완료했으며 독립 리뷰를
-release gate로 실행한다. 다음 release train은 `v0.11.0` Rust Cursor adapter다.
+`v0.11.0` Rust Cursor adapter는 구현, privacy/replay fixture 검증, 독립 아키텍처·코드·테스트
+review gate를 완료했다. 다음 release train은 `v0.12.0` TypeScript static report UI다.
 
 ## 아키텍처 요약
 
@@ -95,20 +98,20 @@ Codex / Claude Code
              |-> local JSONL -> JS report projection -> self-contained HTML
              `-> redacted JSON snapshot
 
-CURRENT v0.10 - IMPLEMENTED (experimental Rust Codex + Claude Code adapters)
+CURRENT v0.11 - IMPLEMENTED (experimental Rust Codex + Claude Code + Cursor adapters)
 
 Closed schemas + manifest -> deterministic domain reducer + fail-closed projectors
-Codex OTel/notify or Claude Code OTel/hook canonical handoff -> bounded Rust adapters
+Codex OTel/notify, Claude Code OTel/hook, or Cursor Hook v1 canonical handoff -> bounded Rust adapters
         -> SourceObservation or fixed-code diagnostic/suppression
         -> private SQLite authority (cursor + stable event + current record + disposition)
              `-> replayable JSONL current-record projection
 Pricing policy + aggregation -> ReportDtoV1
-Rust CLI -> contracts inspection / local storage health check / Codex and Claude Code handoff ingest
+Rust CLI -> contracts inspection / local storage health check / Codex, Claude Code, and Cursor handoff ingest
 No Node.js <-> Rust FFI or subprocess production path
 
 TARGET - PLANNED (Rust + TypeScript)
 
-Agent logs/hooks, including planned Cursor support
+Agent logs/hooks for Codex, Claude Code, and Cursor
         -> bounded local handoff + Rust inbound adapters
         -> SourceObservation (transient, never durable)
         -> domain lifecycle state and application use cases
@@ -603,20 +606,21 @@ unsupported/content event는 private disposition ledger에서 cursor와 함께 �
 
 현재 Rust 흐름:
 
-1. foreground receiver/shim이 OTel 또는 lifecycle supplement payload를 최대 1 MiB, 4096 record,
-   record당 64 KiB인 private `codex_handoff.v1` 또는 `claude_handoff.v1` JSONL로 넘긴다.
+1. foreground receiver/shim이 OTel 또는 lifecycle/hook payload를 최대 1 MiB, 4096 record,
+   record당 64 KiB인 private `codex_handoff.v1`, `claude_handoff.v1` 또는 `cursor_handoff.v1`
+   JSONL로 넘긴다.
 2. adapter가 공식 session/prompt/request/tool tuple을 길이 구분 digest span ID로 만든다.
 3. allowlisted model/token/duration/status/tool/decision만 `SourceObservation`으로 옮긴다.
 4. prompt, assistant message, tool output, cwd와 임의 오류 문자열은 복사하지 않는다.
-5. background `codex-ingest` 또는 `claude-code-ingest`가 observation과 fixed-code disposition을
-   순서대로 commit하고 JSONL projection을 batch 마지막에 한 번 재생성한다.
+5. background `codex-ingest`, `claude-code-ingest` 또는 `cursor-ingest`가 observation과 fixed-code
+   disposition을 순서대로 commit하고 JSONL projection을 batch 마지막에 한 번 재생성한다.
 
 현재 제한:
 
 - 공식 문서는 대표 OTel event 의미를 설명하지만 실제 OTLP attribute key를 고정하지 않는다.
   따라서 handoff producer는 별도 versioned canonical mapping이 필요하며 미확인 key를 추측하지 않는다.
 - native OTel HTTP/gRPC receiver와 foreground notify spool writer는 이 release에 포함되지 않는다.
-- capability는 로컬 실행으로 검증한 Codex CLI `0.150.1`과 Claude Code `2.1.248`만
+- capability는 로컬 실행으로 검증한 Codex CLI `0.150.1`, Claude Code `2.1.248`, Cursor `3.17.21`만
   experimental로 선언한다. 공식 문서의 이전 버전 필드 도입 시점은 실행 호환성 증거로 간주하지 않는다.
 
 ## Claude Code Adapter
@@ -651,16 +655,18 @@ diagnostic으로 격리한다.
 동시 hook 입력은 daemon의 local transactional state에서 serialize한다. Hook마다 별도 state file을
 만들거나 team network 완료를 기다리지 않는다.
 
-## Cursor Adapter (Planned v0.11.0)
+## Cursor Adapter
 
-Cursor는 공식 hook surface의 conversation/generation identifier를 중심으로 trace를 구성한다. Local과
-cloud execution에서 제공되는 hook coverage 차이는 capability manifest에 version별로 기록한다.
+Cursor는 공식 Hook v1 surface의 `conversation_id`와 `generation_id`를 중심으로 trace와 turn을
+구성한다. `tool_use_id`가 있는 generic tool hook을 operation span의 primary로 사용하며, local/cloud
+실행의 hook coverage 차이는 capability manifest의 미검증 gap으로 남긴다.
 
 주요 이벤트:
 
 - session start/end
 - before submit prompt
-- after agent response
+- stop
+- generic pre/post/failure tool use
 - before shell execution
 - after shell execution
 - before MCP execution
@@ -669,10 +675,13 @@ cloud execution에서 제공되는 hook coverage 차이는 capability manifest�
 
 예상 흐름:
 
-1. generation id를 trace/turn correlation key로 사용한다.
-2. prompt 제출 전후와 agent response 이후 이벤트를 묶는다.
-3. shell/MCP/tool 실행은 child span으로 분리한다.
-4. IDE extension 특성상 workspace, file path, edit summary를 함께 기록한다.
+1. conversation ID를 session/trace, generation ID를 turn correlation key로 사용한다.
+2. `sessionStart`/`sessionEnd`와 `beforeSubmitPrompt`/`stop`으로 lifecycle을 보완한다.
+3. `preToolUse`/`postToolUse`/`postToolUseFailure`는 같은 `tool_use_id`의 append-only observation으로
+   기록하고, local reducer가 하나의 current operation span으로 합친다.
+4. specific shell/MCP/file hook은 동일 operation을 증명하는 ID가 없어 span을 만들지 않고 고정
+   `unsupported_event_variant` diagnostic으로 cursor만 진행한다.
+5. raw email, prompt, transcript, workspace, path, command, output, edit와 오류 문자열은 저장하지 않는다.
 
 ## Native Telemetry Receiver (Future TODO)
 
