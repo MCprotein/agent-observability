@@ -7,19 +7,22 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 `v0.8.0`은 JavaScript migration baseline 위에 독립 Rust core와 durable local I/O를
-추가한다. Codex/Claude Code adapter와 static HTML report는 JavaScript 기준선으로 유지되며,
-Rust 경로는 아직 agent source를 직접 수집하거나 report HTML을 생성하지 않는다.
+현재 `v0.9.0`은 JavaScript migration baseline 위에 experimental Rust Codex
+adapter를 추가한다. Rust 경로는 bounded canonical handoff JSONL에서 OTel log/notify signal을
+정규화해 private local state에 저장한다. Native OTel endpoint와 foreground notify spool writer,
+Claude Code/Cursor Rust adapter, Rust static HTML 생성은 아직 구현하지 않았다.
 
 현재 구현 기술은 Node.js 20+ ESM JavaScript 기준선과 Rust 1.97 Cargo workspace다.
 Rust workspace는 다음 책임으로 분리된다.
 
 - `crates/domain`: opaque ID, span/status/lifecycle, token usage 의미
 - `crates/contracts`: complete transient `SourceObservation`, wire-compatible `DurableRecordV1`와
-  `ReportDtoV1`, closed schema contract
+  `ReportDtoV1`, adapter capability와 disposition checkpoint contract
+- `crates/adapter-codex`: bounded Codex handoff parser, canonical correlation,
+  primary/supplement dedupe, content-free diagnostic
 - `crates/application`: pricing policy와 privacy-safe report DTO projection
-- `crates/local-store`: private SQLite authority, atomic cursor/event/current-record commit,
-  replayable JSONL projection
+- `crates/local-store`: private SQLite authority, atomic cursor/event/current-record/disposition
+  commit, replayable JSONL projection, `local_state.v1` -> `local_state.v2` migration
 - `crates/cli`: Rust command path의 composition root
 - `contracts/*.schema.json`: JavaScript/Rust/향후 TypeScript가 공유하는 closed JSON Schema
 - `contracts/contract-manifest.v1`: schema path와 version/boundary index
@@ -68,11 +71,11 @@ cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p agent-observability-cli -- contracts
+cargo run -p agent-observability-cli -- codex-ingest <private-store-dir> <private-handoff.jsonl>
 ```
 
-`v0.8.0` Rust core와 durable local I/O는 구현 및 독립 리뷰가 완료되었다. 다음 단계는
-`v0.9.0` Rust Codex adapter이며 Cursor adapter는 공통 contract와 Rust core가 안정된 뒤
-추가한다.
+`v0.9.0` Rust Codex adapter는 구현, privacy/replay 검증과 독립 리뷰가 완료되었다. 다음 release
+train은 `v0.10.0` Rust Claude Code adapter다.
 
 ## 아키텍처 요약
 
@@ -89,13 +92,15 @@ Codex / Claude Code
              |-> local JSONL -> JS report projection -> self-contained HTML
              `-> redacted JSON snapshot
 
-CURRENT v0.8 - IMPLEMENTED (Rust core and durable local I/O)
+CURRENT v0.9 - IMPLEMENTED (experimental Rust Codex adapter)
 
 Closed schemas + manifest -> deterministic domain reducer + fail-closed projectors
-        -> private SQLite authority (cursor + stable event + current record + not_applicable outcome)
+Codex OTel/notify canonical handoff -> bounded Rust adapter
+        -> SourceObservation or fixed-code diagnostic/suppression
+        -> private SQLite authority (cursor + stable event + current record + disposition)
              `-> replayable JSONL current-record projection
 Pricing policy + aggregation -> ReportDtoV1
-Rust CLI -> contracts inspection / local storage health check
+Rust CLI -> contracts inspection / local storage health check / Codex handoff ingest
 No Node.js <-> Rust FFI or subprocess production path
 
 TARGET - PLANNED (Rust + TypeScript)
@@ -587,24 +592,28 @@ error.message
 
 ## Codex Adapter
 
-현재 v0.6.1 baseline은 notify hook과 session JSONL을 결합한다. Target Rust adapter는 공식 native
-telemetry를 token/model/API/tool signal의 primary로 사용하고 lifecycle hook을 보완 source로 사용한다.
-Session output parsing은 선언된 제품 version과 fixture가 있는 reconciliation fallback으로 제한한다.
+JavaScript v0.6.1 baseline은 notify hook과 session JSONL을 결합한다. Rust v0.9은
+native telemetry의 model/API/token/tool signal을 primary로, `agent-turn-complete` notify의 turn
+lifecycle만 supplement로 사용한다. API attempt와 completed response는 같은 request ID로 correlate하되
+서로 다른 span으로 유지하고, usage는 completed response에만 둔다. 동일 canonical span의 재전달과
+unsupported/content event는 private disposition ledger에서 cursor와 함께 원자 commit한다.
 
-예상 흐름:
+현재 Rust 흐름:
 
-1. Codex turn completion 알림을 받는다.
-2. payload에서 session/thread/turn 식별자를 얻는다.
-3. 로컬 session JSONL에서 해당 turn 범위를 찾는다.
-4. user prompt, assistant response, model, token usage, duration을 추출한다.
-5. shell/function/apply_patch/web 같은 tool call을 child span으로 분리한다.
-6. approval mode, sandbox mode, cwd, workspace 정보를 span attribute로 붙인다.
+1. foreground receiver/shim이 OTel 또는 notify payload를 최대 1 MiB, 4096 record,
+   record당 64 KiB인 private `codex_handoff.v1` JSONL로 넘긴다.
+2. adapter가 conversation/turn/request/call tuple을 길이 구분 digest span ID로 만든다.
+3. allowlisted model/token/duration/status/tool/decision만 `SourceObservation`으로 옮긴다.
+4. prompt, assistant message, tool output, cwd와 임의 오류 문자열은 복사하지 않는다.
+5. background `codex-ingest`가 observation 또는 fixed-code disposition을 순서대로 commit하고
+   JSONL projection을 batch 마지막에 한 번 재생성한다.
 
-현재 baseline에서 JSONL 기반 보강을 사용하는 이유:
+현재 제한:
 
-- notify payload만으로는 tool call과 token usage가 부족할 수 있다.
-- 현재 구현에서는 session JSONL이 turn 재구성의 입력 역할을 한다.
-- lifecycle hook만으로는 일부 event가 누락될 수 있다.
+- 공식 문서는 대표 OTel event 의미를 설명하지만 실제 OTLP attribute key를 고정하지 않는다.
+  따라서 handoff producer는 별도 versioned canonical mapping이 필요하며 미확인 key를 추측하지 않는다.
+- native OTel HTTP/gRPC receiver와 foreground notify spool writer는 이 release에 포함되지 않는다.
+- capability는 로컬에서 확인한 Codex CLI `0.150.1`만 experimental로 선언한다.
 
 ## Claude Code Adapter
 

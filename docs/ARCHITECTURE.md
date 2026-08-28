@@ -6,12 +6,13 @@
 
 ## Current and target stack
 
-현재 `v0.8.0`은 Node.js 20+ ESM JavaScript 구현을 migration baseline으로 보존하면서 Rust
-core를 별도 command path로 확장한다. JavaScript 기준선은 static HTML과 기존 adapter fixture를
-소유한다. Rust 경로는 closed contract, deterministic lifecycle reduction, topology validation,
-pricing/report projection과 private embedded transaction을 구현한다. SQLite가 source cursor,
-stable observation, current reduced record와 profile-neutral delivery outcome의 정본이며 JSONL은
-정본에서 재생성하는 projection이다. Team envelope, outbox와 network는 활성 계약이 아니다.
+현재 `v0.9.0`은 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
+보존하면서 experimental Rust Codex adapter를 추가한다. Rust 경로는 closed contract,
+deterministic lifecycle reduction, topology validation, pricing/report projection, bounded Codex
+handoff와 private embedded transaction을 구현한다. SQLite `local_state.v2`가 source cursor,
+stable observation, current reduced record, adapter disposition과 profile-neutral delivery outcome의
+정본이며 JSONL은 정본에서 재생성하는 projection이다. Team envelope, outbox와 network는 활성
+계약이 아니다.
 
 목표 스택은 다음과 같다.
 
@@ -84,10 +85,12 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
-v0.8.0의 Rust core는 `crates/domain`, `crates/contracts`, `crates/application`,
-`crates/local-store`, `crates/cli`로 나뉜다. domain은 외부 형식을 모르고, contracts는 transient
+v0.9.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
+`crates/application`, `crates/local-store`, `crates/cli`로 나뉜다. domain은 외부 형식을
+모르고, contracts는 transient
 source와 durable/report DTO 경계를 소유한다. application은 pricing과 report projection을,
-local-store는 SQLite transaction과 JSONL projection을, CLI는 composition root를 소유한다.
+adapter-codex는 source precedence/correlation/dedupe를, local-store는 SQLite transaction과 JSONL
+projection을, CLI는 composition root를 소유한다.
 `contracts/*.schema.json`은 closed wire contract이고 `contracts/contract-manifest.v1`은 현재
 활성 schema path/version과 `team_ingest=disabled` 경계를 runtime 중립적으로 고정한다.
 
@@ -105,6 +108,7 @@ Domain lifecycle state + application use cases
         |
         +--> SQLite transaction --> source cursor + stable event + current record
         |                              `--> DurableRecordVx --> JSONL / snapshot
+        +--> fixed-code disposition --> source cursor + bounded diagnostic/suppression ledger
         +--> pricing + aggregation --> ReportDto projector --> TypeScript static UI
         +--> topology validation --> diagnostic projector --> diagnostics
 
@@ -123,7 +127,8 @@ domain/application state --> TeamIngestEnvelopeV1 --> bounded outbox --> optiona
   reference, idempotency와 관측 필드만 포함한다. Authoritative source identity는 collector가
   credential에서 resolve해 stored record에 추가한다.
 - `ReportDtoVx`: 가격과 집계를 적용한 뒤 UI에 전달하는 별도의 versioned allowlist contract.
-- local transactional state: source generation/cursor, stable observation identity, canonical record와
+- local transactional state: source generation/cursor, stable observation identity, canonical record,
+  bounded adapter disposition과
   optional outbox를 원자적으로 소유하는 runtime authority. 외부 wire contract가 아니다.
 
 재시작 후 source를 정확히 이어 읽기 위해 raw source cursor는 private SQLite control state에만
@@ -176,10 +181,18 @@ anti-corruption layer다.
   `operation_id` 등을 명시적으로 채운다.
 - 원문 prompt, output, command, diff, file content를 canonical metadata로 가장하지 않는다.
 - 같은 contract fixture suite를 모든 adapter에 적용한다.
+- Codex의 `api_request`와 `sse_event(response.completed)`는 같은 request ID로 correlate하되
+  transport attempt와 completed response를 별도 span으로 유지한다. usage는 completed response에만
+  두며, 동일 canonical span의 재전달만 adapter에서 억제한다.
+- unsupported, content-ignored와 duplicate-suppressed 입력도 raw payload 없이 fixed enum만
+  `adapter_dispositions`에 기록하며 같은 transaction에서 cursor를 진행한다.
 - hook path는 bounded local handoff만 수행하고 network, full transcript parse, report render나 queue drain을
   기다리지 않는다. File fallback은 persisted cursor와 source generation으로 incrementally reconcile한다.
 - 제품별 공식 source 우선순위와 지원 evidence는
   [`ADAPTER_COMPATIBILITY.md`](ADAPTER_COMPATIBILITY.md)를 따른다.
+- 현재 Codex adapter 입력은 private regular JSONL file로 제한하며 최대 1 MiB, 4096 record,
+  record당 64 KiB다. group/other permission이나 symbolic link는 거부한다. 이 parser를 foreground
+  hook에서 직접 실행하는 계약은 아니며 native receiver/spool writer는 별도 release gate다.
 
 ### Outbound infrastructure
 

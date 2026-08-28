@@ -1,0 +1,70 @@
+{
+  "schema_version": "adapter_capability.v1",
+  "entries": [
+    {
+      "adapter_family": "codex",
+      "support_status": "experimental",
+      "product_versions": {
+        "oldest": "0.150.1",
+        "newest": "0.150.1"
+      },
+      "verified_at": "2026-08-28",
+      "official_references": [
+        "https://developers.openai.com/codex/config-advanced",
+        "https://developers.openai.com/codex/config-reference"
+      ],
+      "surfaces": [
+        {
+          "id": "otel_log_v1",
+          "role": "primary",
+          "events": [
+            "codex.conversation_starts",
+            "codex.api_request",
+            "codex.sse_event",
+            "codex.tool_decision",
+            "codex.tool_result"
+          ],
+          "owned_fields": [
+            "session.model",
+            "request.status",
+            "request.duration_ms",
+            "request.input_tokens",
+            "request.output_tokens",
+            "request.cached_input_tokens",
+            "request.reasoning_output_tokens",
+            "tool.name",
+            "tool.status",
+            "tool.duration_ms",
+            "permission.decision"
+          ]
+        },
+        {
+          "id": "notify_agent_turn_complete_v1",
+          "role": "supplement",
+          "events": ["agent-turn-complete"],
+          "owned_fields": ["turn.lifecycle"]
+        }
+      ],
+      "correlation_keys": ["conversation.id", "turn.id", "request.id", "call.id"],
+      "privacy": {
+        "content_fields_accepted": false,
+        "raw_identifiers_durable": false
+      },
+      "known_gaps": [
+        "Official documentation lists representative log events but does not freeze OTLP attribute keys",
+        "notify supplies turn completion only and never supplies usage, model, or tool fields"
+      ],
+      "fixture_ids": [
+        "codex-otel-supported-v1",
+        "codex-notify-complete-v1",
+        "codex-primary-supplement-dedupe-v1",
+        "codex-unsupported-event-v1",
+        "codex-bounded-handoff-v1"
+      ],
+      "fixture_hashes": {
+        "codex-handoff.jsonl": "sha256:0b30a1810b6e34152310691a3a660ecf33e98d4940fc63fe9b340811241f526c",
+        "codex-projection.jsonl": "sha256:88a16a5c708968d5afa6f832db09e3d6456992ddc5717251210e9a56c809a4a1"
+      }
+    }
+  ]
+}

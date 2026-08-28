@@ -1,9 +1,10 @@
+use agent_observability_adapter_codex::{AdapterItem, read_handoff_file};
 use agent_observability_contracts::{CONTRACT_MANIFEST, ContractManifest};
-use agent_observability_local_store::LocalStore;
+use agent_observability_local_store::{IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore};
 use std::env;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: agent-observability [contracts|storage-check <directory>|version|help]";
+const USAGE: &str = "usage: agent-observability [contracts|storage-check <directory>|codex-ingest <store-directory> <handoff-jsonl>|version|help]";
 
 fn main() -> ExitCode {
     match run(env::args().skip(1)) {
@@ -34,7 +35,55 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
             let (observations, records, outcomes) =
                 store.counts().map_err(|error| error.to_string())?;
             Ok(format!(
-                "store_schema=local_state.v1\nobservations={observations}\nrecords={records}\ndelivery_outcomes={outcomes}\nteam_ingest=disabled"
+                "store_schema={LOCAL_STORE_SCHEMA_VERSION}\nobservations={observations}\nrecords={records}\ndelivery_outcomes={outcomes}\nteam_ingest=disabled"
+            ))
+        }
+        [command, directory, handoff] if command == "codex-ingest" => {
+            let batch = read_handoff_file(handoff).map_err(|error| error.to_string())?;
+            let mut store = LocalStore::open(directory).map_err(|error| error.to_string())?;
+            let mut observations = 0_u64;
+            let mut diagnostics = 0_u64;
+            let mut suppressed = 0_u64;
+            let ingest_result: Result<(), String> =
+                batch.items.iter().try_for_each(|item| match item {
+                    AdapterItem::Observation(observation) => {
+                        let status = store
+                            .ingest_deferred_projection(observation)
+                            .map_err(|error| error.to_string())?;
+                        if status == IngestStatus::Suppressed {
+                            suppressed += 1;
+                        } else {
+                            observations += 1;
+                        }
+                        Ok(())
+                    }
+                    AdapterItem::Disposition(diagnostic) => {
+                        store
+                            .ingest_disposition_with_payload(
+                                &diagnostic.checkpoint,
+                                diagnostic.disposition,
+                                diagnostic.code,
+                                diagnostic.payload_hash.as_deref(),
+                            )
+                            .map_err(|error| error.to_string())?;
+                        match diagnostic.disposition {
+                            agent_observability_contracts::AdapterDispositionKind::Diagnostic => {
+                                diagnostics += 1;
+                            }
+                            agent_observability_contracts::AdapterDispositionKind::Suppressed => {
+                                suppressed += 1;
+                            }
+                        }
+                        Ok(())
+                    }
+                });
+            let projection_result = store
+                .rebuild_projection()
+                .map_err(|error| error.to_string());
+            ingest_result?;
+            projection_result?;
+            Ok(format!(
+                "source=codex\nobservations={observations}\ndiagnostics={diagnostics}\nsuppressed={suppressed}\nteam_ingest=disabled"
             ))
         }
         [command] if matches!(command.as_str(), "version" | "--version" | "-V") => {
@@ -78,7 +127,7 @@ mod tests {
         ]
         .into_iter())
         .expect("storage check succeeds");
-        assert!(output.contains("store_schema=local_state.v1"));
+        assert!(output.contains("store_schema=local_state.v2"));
         assert!(output.contains("observations=0"));
         assert!(output.contains("team_ingest=disabled"));
         let _ = fs::remove_dir_all(directory);

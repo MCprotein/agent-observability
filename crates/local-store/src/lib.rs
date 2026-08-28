@@ -2,8 +2,9 @@
 
 use agent_observability_application::reduce_observation_state;
 use agent_observability_contracts::{
-    DurableRecordV1, SourceObservation, hash_opaque_identifier, project_durable_record,
-    sanitize_durable_record,
+    AdapterDispositionCode, AdapterDispositionKind, DurableRecordV1, SourceCheckpoint,
+    SourceObservation, canonical_observation_payload_hash, hash_opaque_identifier,
+    project_durable_record, sanitize_durable_record,
 };
 use agent_observability_domain::{
     CompactionId, CorrelationIds, DomainSpanState, LifecycleState, OperationId, PermissionId,
@@ -21,6 +22,7 @@ use std::time::Duration;
 
 const DB_NAME: &str = "local-store.sqlite3";
 const PROJECTION_NAME: &str = "observations.jsonl";
+pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v2";
 const SCHEMA_OBJECTS: &[(&str, &str, &str)] = &[
     (
         "table",
@@ -58,6 +60,11 @@ const SCHEMA_OBJECTS: &[(&str, &str, &str)] = &[
         "CREATE TABLE delivery_outcomes (event_id TEXT PRIMARY KEY REFERENCES observations(event_id), outcome TEXT NOT NULL CHECK(outcome = 'not_applicable'))",
     ),
     (
+        "table",
+        "adapter_dispositions",
+        "CREATE TABLE adapter_dispositions (source TEXT NOT NULL, generation TEXT NOT NULL, cursor TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition IN ('diagnostic','suppressed')), code TEXT NOT NULL, payload_hash TEXT NOT NULL, PRIMARY KEY(source, generation, cursor))",
+    ),
+    (
         "index",
         "topology_parent_idx",
         "CREATE INDEX topology_parent_idx ON topology(parent_span_id)",
@@ -77,6 +84,7 @@ pub enum CrashPoint {
 pub enum IngestStatus {
     Committed,
     Duplicate,
+    Suppressed,
 }
 
 /// Returns the stable identity used for replay deduplication.
@@ -186,7 +194,9 @@ impl LocalStore {
             |row| row.get(0),
         );
         let schema: String = schema.map_err(|_| StoreError::SchemaMismatch)?;
-        if schema != "local_state.v1" {
+        if schema == "local_state.v1" {
+            migrate_v1_to_v2(&db)?;
+        } else if schema != LOCAL_STORE_SCHEMA_VERSION {
             return Err(StoreError::SchemaMismatch);
         }
         validate_schema(&db)?;
@@ -202,7 +212,104 @@ impl LocalStore {
     /// Returns [`StoreError`] for cursor, payload, lifecycle, topology, projection, or storage
     /// failures.
     pub fn ingest(&mut self, observation: &SourceObservation) -> Result<IngestStatus, StoreError> {
-        self.ingest_at(observation, None)
+        self.ingest_at(observation, None, true)
+    }
+
+    /// Commits one observation while deferring the replayable JSONL rebuild to the batch owner.
+    ///
+    /// The `SQLite` transaction remains authoritative. Call [`Self::rebuild_projection`] after the
+    /// final item; reopening the store also repairs a missing projection after interruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::ingest`].
+    pub fn ingest_deferred_projection(
+        &mut self,
+        observation: &SourceObservation,
+    ) -> Result<IngestStatus, StoreError> {
+        self.ingest_at(observation, None, false)
+    }
+
+    /// Atomically records a content-free adapter diagnostic or suppression and advances its
+    /// source cursor without creating a synthetic observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for cursor conflicts, conflicting replay, or storage failure.
+    pub fn ingest_disposition(
+        &mut self,
+        checkpoint: &SourceCheckpoint,
+        disposition: AdapterDispositionKind,
+        code: AdapterDispositionCode,
+    ) -> Result<IngestStatus, StoreError> {
+        self.ingest_disposition_with_payload(checkpoint, disposition, code, None)
+    }
+
+    /// Atomically records a disposition bound to an optional privacy-safe canonical payload hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for invalid hashes, cursor conflicts, conflicting replay, or storage
+    /// failure.
+    pub fn ingest_disposition_with_payload(
+        &mut self,
+        checkpoint: &SourceCheckpoint,
+        disposition: AdapterDispositionKind,
+        code: AdapterDispositionCode,
+        canonical_payload_hash: Option<&str>,
+    ) -> Result<IngestStatus, StoreError> {
+        let source = checkpoint.source.as_str();
+        let generation = hash_opaque_identifier(checkpoint.source_generation.as_str());
+        let cursor = checkpoint.source_cursor.as_str();
+        if canonical_payload_hash.is_some_and(|value| {
+            value.len() != 71
+                || !value.starts_with("sha256:")
+                || !value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err(StoreError::InvalidObservation);
+        }
+        let payload_hash = canonical_payload_hash.map_or_else(
+            || {
+                disposition_payload_hash(
+                    source,
+                    checkpoint.source_generation.as_str(),
+                    cursor,
+                    disposition,
+                    code,
+                )
+            },
+            str::to_owned,
+        );
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        if let Some((existing_disposition, existing_code, existing_hash)) = tx
+            .query_row(
+                "SELECT disposition, code, payload_hash FROM adapter_dispositions WHERE source=?1 AND generation=?2 AND cursor=?3",
+                params![source, generation, cursor],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .optional()?
+        {
+            if existing_disposition != disposition.as_str()
+                || existing_code != code.as_str()
+                || existing_hash != payload_hash
+            {
+                return Err(StoreError::PayloadConflict);
+            }
+            return Ok(IngestStatus::Duplicate);
+        }
+        if cursor_exists(&tx, "source_inputs", source, &generation, cursor)? {
+            return Err(StoreError::PayloadConflict);
+        }
+        if !checkpoint_cursor_matches(&tx, checkpoint)? {
+            return Err(StoreError::CursorConflict);
+        }
+        tx.execute(
+            "INSERT INTO adapter_dispositions(source,generation,cursor,disposition,code,payload_hash) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![source, generation, cursor, disposition.as_str(), code.as_str(), payload_hash],
+        )?;
+        advance_checkpoint_cursor(&tx, checkpoint)?;
+        tx.commit()?;
+        Ok(IngestStatus::Committed)
     }
 
     /// Executes ingest while injecting a deterministic crash at the requested boundary.
@@ -215,13 +322,18 @@ impl LocalStore {
         observation: &SourceObservation,
         crash: CrashPoint,
     ) -> Result<IngestStatus, StoreError> {
-        self.ingest_at(observation, Some(crash))
+        self.ingest_at(observation, Some(crash), true)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ordered cursor, dedupe, commit, and crash-point transaction stays contiguous"
+    )]
     fn ingest_at(
         &mut self,
         observation: &SourceObservation,
         crash: Option<CrashPoint>,
+        rebuild_projection: bool,
     ) -> Result<IngestStatus, StoreError> {
         let source = source_name(observation);
         let generation = private_source_generation(observation);
@@ -233,6 +345,19 @@ impl LocalStore {
         let payload_hash = prepared.payload_hash;
         let event_id = prepared.event_id;
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        if let Some((disposition, code, existing_hash)) =
+            existing_disposition(&tx, source, &generation, cursor)?
+        {
+            if disposition == AdapterDispositionKind::Suppressed.as_str()
+                && code == AdapterDispositionCode::DuplicateObservation.as_str()
+                && existing_hash == payload_hash
+            {
+                drop(tx);
+                self.rebuild_if_enabled(rebuild_projection, None)?;
+                return Ok(IngestStatus::Suppressed);
+            }
+            return Err(StoreError::PayloadConflict);
+        }
         if let Some((existing_event, existing_hash)) = tx
             .query_row(
                 "SELECT event_id, payload_hash FROM source_inputs WHERE source = ?1 AND generation = ?2 AND cursor = ?3",
@@ -245,11 +370,34 @@ impl LocalStore {
                 return Err(StoreError::PayloadConflict);
             }
             drop(tx);
-            self.rebuild_projection()?;
+            self.rebuild_if_enabled(rebuild_projection, None)?;
             return Ok(IngestStatus::Duplicate);
         }
         if !cursor_matches(&tx, observation)? {
             return Err(StoreError::CursorConflict);
+        }
+        if let Some(existing_state_json) = tx
+            .query_row(
+                "SELECT state_json FROM records WHERE span_id=?1",
+                [state.span_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            ensure_static_record_compatibility(&tx, state.span_id.as_str(), &incoming_record)?;
+            let existing_state = state_from_json(&existing_state_json)?;
+            if same_canonical_observation(&existing_state, &state) {
+                insert_duplicate_disposition(&tx, observation)?;
+                if crash == Some(CrashPoint::BeforeCommit) {
+                    return Err(StoreError::Crash(CrashPoint::BeforeCommit));
+                }
+                tx.commit()?;
+                if crash == Some(CrashPoint::AfterCommit) {
+                    return Err(StoreError::Crash(CrashPoint::AfterCommit));
+                }
+                self.rebuild_if_enabled(rebuild_projection, crash)?;
+                return Ok(IngestStatus::Suppressed);
+            }
         }
         if let Some(existing) = tx
             .query_row(
@@ -274,7 +422,7 @@ impl LocalStore {
             if crash == Some(CrashPoint::AfterCommit) {
                 return Err(StoreError::Crash(CrashPoint::AfterCommit));
             }
-            self.rebuild_projection_with_crash(crash)?;
+            self.rebuild_if_enabled(rebuild_projection, crash)?;
             return Ok(IngestStatus::Duplicate);
         }
         let mut states = load_states(&tx)?;
@@ -316,8 +464,20 @@ impl LocalStore {
         if crash == Some(CrashPoint::AfterCommit) {
             return Err(StoreError::Crash(CrashPoint::AfterCommit));
         }
-        self.rebuild_projection_with_crash(crash)?;
+        self.rebuild_if_enabled(rebuild_projection, crash)?;
         Ok(IngestStatus::Committed)
+    }
+
+    fn rebuild_if_enabled(
+        &self,
+        enabled: bool,
+        crash: Option<CrashPoint>,
+    ) -> Result<(), StoreError> {
+        if enabled {
+            self.rebuild_projection_with_crash(crash)
+        } else {
+            Ok(())
+        }
     }
 
     /// Rebuilds JSONL from committed current records.
@@ -331,8 +491,10 @@ impl LocalStore {
 
     fn rebuild_projection_with_crash(&self, crash: Option<CrashPoint>) -> Result<(), StoreError> {
         let final_path = self.dir.join(PROJECTION_NAME);
-        if final_path.exists() {
-            private_file(&final_path)?;
+        match fs::symlink_metadata(&final_path) {
+            Ok(_) => private_file(&final_path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         remove_stale_projection_temps(&self.dir)?;
@@ -396,6 +558,14 @@ impl LocalStore {
     /// Returns [`StoreError`] when state cannot be queried.
     pub fn outcome_count(&self) -> Result<u64, StoreError> {
         count(&self.db, "delivery_outcomes")
+    }
+    /// Counts content-free adapter diagnostics and suppressions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when state cannot be queried.
+    pub fn disposition_count(&self) -> Result<u64, StoreError> {
+        count(&self.db, "adapter_dispositions")
     }
     /// Counts unresolved out-of-order parent links.
     ///
@@ -479,7 +649,8 @@ fn prepare_observation(observation: &SourceObservation) -> Result<PreparedObserv
     Ok(PreparedObservation {
         state: private_state(&raw_state)?,
         record,
-        payload_hash: digest(&projected_json),
+        payload_hash: canonical_observation_payload_hash(observation)
+            .map_err(|_| StoreError::InvalidObservation)?,
         projected_json,
         event_id: stable_event_id(observation),
     })
@@ -583,7 +754,92 @@ fn cursor_matches(
         .previous_source_cursor
         .as_ref()
         .map(agent_observability_domain::SourceCursor::as_str);
-    Ok(current.as_deref() == expected)
+    Ok(
+        observation.source_cursor.as_str() != expected.unwrap_or_default()
+            && current.as_deref() == expected,
+    )
+}
+
+fn cursor_exists(
+    tx: &Transaction<'_>,
+    table: &str,
+    source: &str,
+    generation: &str,
+    cursor: &str,
+) -> Result<bool, StoreError> {
+    let sql = match table {
+        "source_inputs" => {
+            "SELECT 1 FROM source_inputs WHERE source=?1 AND generation=?2 AND cursor=?3"
+        }
+        "adapter_dispositions" => {
+            "SELECT 1 FROM adapter_dispositions WHERE source=?1 AND generation=?2 AND cursor=?3"
+        }
+        _ => return Err(StoreError::SchemaMismatch),
+    };
+    Ok(tx
+        .query_row(sql, params![source, generation, cursor], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+fn existing_disposition(
+    tx: &Transaction<'_>,
+    source: &str,
+    generation: &str,
+    cursor: &str,
+) -> Result<Option<(String, String, String)>, StoreError> {
+    tx.query_row(
+        "SELECT disposition,code,payload_hash FROM adapter_dispositions WHERE source=?1 AND generation=?2 AND cursor=?3",
+        params![source, generation, cursor],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn same_canonical_observation(existing: &DomainSpanState, incoming: &DomainSpanState) -> bool {
+    existing.trace_id == incoming.trace_id
+        && existing.span_id == incoming.span_id
+        && existing.parent_span_id == incoming.parent_span_id
+        && existing.kind == incoming.kind
+        && existing.lifecycle == incoming.lifecycle
+        && existing.correlation == incoming.correlation
+        && existing.token_usage == incoming.token_usage
+}
+
+fn insert_duplicate_disposition(
+    tx: &Transaction<'_>,
+    observation: &SourceObservation,
+) -> Result<(), StoreError> {
+    let source = source_name(observation);
+    let generation = private_source_generation(observation);
+    let cursor = observation.source_cursor.as_str();
+    let disposition = AdapterDispositionKind::Suppressed;
+    let code = AdapterDispositionCode::DuplicateObservation;
+    let payload_hash = canonical_observation_payload_hash(observation)
+        .map_err(|_| StoreError::InvalidObservation)?;
+    tx.execute(
+        "INSERT INTO adapter_dispositions(source,generation,cursor,disposition,code,payload_hash) VALUES (?1,?2,?3,?4,?5,?6)",
+        params![source, generation, cursor, disposition.as_str(), code.as_str(), payload_hash],
+    )?;
+    advance_cursor(tx, observation)
+}
+
+fn disposition_payload_hash(
+    source: &str,
+    source_generation: &str,
+    cursor: &str,
+    disposition: AdapterDispositionKind,
+    code: AdapterDispositionCode,
+) -> String {
+    digest_components(&[
+        "agent-observability-disposition-v1",
+        source,
+        source_generation,
+        cursor,
+        disposition.as_str(),
+        code.as_str(),
+    ])
 }
 
 fn load_states(tx: &Transaction<'_>) -> Result<Vec<DomainSpanState>, StoreError> {
@@ -757,6 +1013,45 @@ fn advance_cursor(tx: &Transaction<'_>, observation: &SourceObservation) -> Resu
     Ok(())
 }
 
+fn checkpoint_cursor_matches(
+    tx: &Transaction<'_>,
+    checkpoint: &SourceCheckpoint,
+) -> Result<bool, StoreError> {
+    let current = tx
+        .query_row(
+            "SELECT cursor FROM source_cursors WHERE source=?1 AND generation=?2",
+            params![
+                checkpoint.source.as_str(),
+                hash_opaque_identifier(checkpoint.source_generation.as_str())
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let expected = checkpoint
+        .previous_source_cursor
+        .as_ref()
+        .map(agent_observability_domain::SourceCursor::as_str);
+    Ok(
+        checkpoint.source_cursor.as_str() != expected.unwrap_or_default()
+            && current.as_deref() == expected,
+    )
+}
+
+fn advance_checkpoint_cursor(
+    tx: &Transaction<'_>,
+    checkpoint: &SourceCheckpoint,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO source_cursors(source,generation,cursor) VALUES (?1,?2,?3) ON CONFLICT(source,generation) DO UPDATE SET cursor=excluded.cursor",
+        params![
+            checkpoint.source.as_str(),
+            hash_opaque_identifier(checkpoint.source_generation.as_str()),
+            checkpoint.source_cursor.as_str()
+        ],
+    )?;
+    Ok(())
+}
+
 fn private_source_generation(observation: &SourceObservation) -> String {
     hash_opaque_identifier(observation.source_generation.as_str())
 }
@@ -810,17 +1105,6 @@ fn parse_lifecycle(value: &str) -> Result<LifecycleState, StoreError> {
         "interrupted" => Ok(LifecycleState::Interrupted),
         _ => Err(StoreError::InvalidObservation),
     }
-}
-
-fn digest(value: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(value.as_bytes());
-    let mut output = String::with_capacity(64);
-    for byte in h.finalize() {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
 }
 
 fn digest_components(components: &[&str]) -> String {
@@ -1059,10 +1343,48 @@ fn initialize_empty_schema(db: &Connection) -> Result<(), StoreError> {
             tx.execute_batch(sql)?;
         }
         tx.execute(
-            "INSERT INTO metadata(key, value) VALUES ('schema_version', 'local_state.v1')",
-            [],
+            "INSERT INTO metadata(key, value) VALUES ('schema_version', ?1)",
+            [LOCAL_STORE_SCHEMA_VERSION],
         )?;
     }
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_v1_to_v2(db: &Connection) -> Result<(), StoreError> {
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let version: String = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StoreError::SchemaMismatch)?;
+    if version == "local_state.v2" {
+        tx.commit()?;
+        return Ok(());
+    }
+    if version != "local_state.v1" {
+        return Err(StoreError::SchemaMismatch);
+    }
+    let object_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'adapter_dispositions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if object_exists {
+        return Err(StoreError::SchemaMismatch);
+    }
+    let disposition_sql = SCHEMA_OBJECTS
+        .iter()
+        .find(|(_, name, _)| *name == "adapter_dispositions")
+        .map(|(_, _, sql)| *sql)
+        .ok_or(StoreError::SchemaMismatch)?;
+    tx.execute_batch(disposition_sql)?;
+    tx.execute(
+        "UPDATE metadata SET value='local_state.v2' WHERE key='schema_version'",
+        [],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -1133,6 +1455,17 @@ fn validate_schema(db: &Connection) -> Result<(), StoreError> {
             ],
         ),
         ("delivery_outcomes", &["event_id", "outcome"]),
+        (
+            "adapter_dispositions",
+            &[
+                "source",
+                "generation",
+                "cursor",
+                "disposition",
+                "code",
+                "payload_hash",
+            ],
+        ),
     ] {
         let mut statement = db.prepare(&format!("PRAGMA table_info({table})"))?;
         let actual = statement
@@ -1296,6 +1629,79 @@ mod tests {
     }
 
     #[test]
+    fn observation_and_disposition_cursors_share_one_idempotency_namespace() {
+        let dir = temp_dir("cross-kind-cursor");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let first = observation("1", "session", None);
+        store.ingest(&first).unwrap();
+
+        let reused = SourceCheckpoint {
+            source: AgentSource::Codex,
+            source_generation: SourceGeneration::parse("generation").unwrap(),
+            previous_source_cursor: Some(SourceCursor::parse("1").unwrap()),
+            source_cursor: SourceCursor::parse("1").unwrap(),
+        };
+        assert!(matches!(
+            store.ingest_disposition(
+                &reused,
+                AdapterDispositionKind::Diagnostic,
+                AdapterDispositionCode::UnsupportedEvent,
+            ),
+            Err(StoreError::PayloadConflict)
+        ));
+
+        let disposition = SourceCheckpoint {
+            source_cursor: SourceCursor::parse("2").unwrap(),
+            ..reused
+        };
+        store
+            .ingest_disposition(
+                &disposition,
+                AdapterDispositionKind::Diagnostic,
+                AdapterDispositionCode::UnsupportedEvent,
+            )
+            .unwrap();
+        let second = observation_after("2", Some("1"), "turn", Some("session"));
+        assert!(matches!(
+            store.ingest(&second),
+            Err(StoreError::PayloadConflict)
+        ));
+        assert_eq!(store.observation_count().unwrap(), 1);
+        assert_eq!(store.disposition_count().unwrap(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn canonical_duplicate_at_a_new_cursor_becomes_a_durable_suppression() {
+        let dir = temp_dir("semantic-duplicate");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let mut first = observation("1", "turn", None);
+        first.timing = Timing::new(100, Some(100)).unwrap();
+        store.ingest(&first).unwrap();
+
+        let mut repeated = observation_after("2", Some("1"), "turn", None);
+        repeated.timing = Timing::new(200, Some(200)).unwrap();
+        assert_eq!(store.ingest(&repeated).unwrap(), IngestStatus::Suppressed);
+        assert_eq!(store.observation_count().unwrap(), 1);
+        assert_eq!(store.disposition_count().unwrap(), 1);
+        assert_eq!(store.record_count().unwrap(), 1);
+        assert_eq!(
+            store.cursor("codex", "generation").unwrap().as_deref(),
+            Some("2")
+        );
+        assert_eq!(store.ingest(&repeated).unwrap(), IngestStatus::Suppressed);
+        let mut changed = repeated.clone();
+        changed.token_usage.input = Some(1);
+        assert!(matches!(
+            store.ingest(&changed),
+            Err(StoreError::PayloadConflict)
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn lifecycle_updates_reduce_to_one_current_record() {
         let dir = temp_dir("lifecycle");
         let _ = fs::remove_dir_all(&dir);
@@ -1321,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_event_at_new_cursor_advances_without_duplicate_outcome() {
+    fn duplicate_event_at_new_cursor_becomes_a_suppression() {
         let dir = temp_dir("event-alias");
         let _ = fs::remove_dir_all(&dir);
         let mut store = LocalStore::open(&dir).unwrap();
@@ -1330,9 +1736,10 @@ mod tests {
         let mut replay = first.clone();
         replay.previous_source_cursor = Some(SourceCursor::parse("1").unwrap());
         replay.source_cursor = SourceCursor::parse("2").unwrap();
-        assert_eq!(store.ingest(&replay).unwrap(), IngestStatus::Duplicate);
+        assert_eq!(store.ingest(&replay).unwrap(), IngestStatus::Suppressed);
         assert_eq!(store.observation_count().unwrap(), 1);
-        assert_eq!(store.source_input_count().unwrap(), 2);
+        assert_eq!(store.source_input_count().unwrap(), 1);
+        assert_eq!(store.disposition_count().unwrap(), 1);
         assert_eq!(store.record_count().unwrap(), 1);
         assert_eq!(store.outcome_count().unwrap(), 1);
         assert_eq!(
@@ -1429,19 +1836,62 @@ mod tests {
             let mut reopened = LocalStore::open(&dir).unwrap();
             let committed = point != CrashPoint::BeforeCommit;
             assert_eq!(reopened.observation_count().unwrap(), 1);
-            assert_eq!(
-                reopened.source_input_count().unwrap(),
-                u64::from(committed) + 1
-            );
+            assert_eq!(reopened.source_input_count().unwrap(), 1);
+            assert_eq!(reopened.disposition_count().unwrap(), u64::from(committed));
             assert_eq!(reopened.record_count().unwrap(), 1);
             assert_eq!(reopened.outcome_count().unwrap(), 1);
             assert_eq!(
                 reopened.cursor("codex", "generation").unwrap().as_deref(),
                 Some(if committed { "2" } else { "1" })
             );
-            assert_eq!(reopened.ingest(&alias).unwrap(), IngestStatus::Duplicate);
-            assert_eq!(reopened.source_input_count().unwrap(), 2);
+            assert_eq!(reopened.ingest(&alias).unwrap(), IngestStatus::Suppressed);
+            assert_eq!(reopened.source_input_count().unwrap(), 1);
+            assert_eq!(reopened.disposition_count().unwrap(), 1);
             assert_eq!(reopened.outcome_count().unwrap(), 1);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn same_store_suppression_retry_repairs_projection_after_every_crash_point() {
+        for (label, point) in [
+            ("suppression-retry-before-commit", CrashPoint::BeforeCommit),
+            ("suppression-retry-after-commit", CrashPoint::AfterCommit),
+            (
+                "suppression-retry-before-rename",
+                CrashPoint::BeforeProjectionRename,
+            ),
+            (
+                "suppression-retry-after-rename",
+                CrashPoint::AfterProjectionRename,
+            ),
+        ] {
+            let dir = temp_dir(label);
+            let _ = fs::remove_dir_all(&dir);
+            let mut store = LocalStore::open(&dir).unwrap();
+            let first = observation("1", "session", None);
+            store.ingest(&first).unwrap();
+            let clean_projection = fs::read_to_string(store.projection_path()).unwrap();
+            let mut alias = first.clone();
+            alias.previous_source_cursor = Some(SourceCursor::parse("1").unwrap());
+            alias.source_cursor = SourceCursor::parse("2").unwrap();
+            assert!(matches!(
+                store.ingest_with_crash(&alias, point),
+                Err(StoreError::Crash(value)) if value == point
+            ));
+
+            assert_eq!(store.ingest(&alias).unwrap(), IngestStatus::Suppressed);
+            assert_eq!(
+                fs::read_to_string(store.projection_path()).unwrap(),
+                clean_projection
+            );
+            assert_eq!(store.observation_count().unwrap(), 1);
+            assert_eq!(store.disposition_count().unwrap(), 1);
+            assert_eq!(store.record_count().unwrap(), 1);
+            assert_eq!(
+                store.cursor("codex", "generation").unwrap().as_deref(),
+                Some("2")
+            );
             let _ = fs::remove_dir_all(&dir);
         }
     }
@@ -1619,7 +2069,89 @@ mod tests {
             LocalStore::open(&store_dir),
             Err(StoreError::Symlink)
         ));
+
+        let projection_store = root.join("projection-store");
+        let store = LocalStore::open(&projection_store).unwrap();
+        let projection = store.projection_path();
+        drop(store);
+        fs::remove_file(&projection).unwrap();
+        symlink(root.join("missing-projection"), &projection).unwrap();
+        assert!(matches!(
+            LocalStore::open(&projection_store),
+            Err(StoreError::Symlink)
+        ));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v1_store_migrates_and_commits_bounded_dispositions() {
+        let dir = temp_dir("v1-migration");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let existing = observation("1", "session", None);
+        store.ingest(&existing).unwrap();
+        let database = store.database_path();
+        let projection = store.projection_path();
+        drop(store);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE adapter_dispositions;
+                 UPDATE metadata SET value='local_state.v1' WHERE key='schema_version';",
+            )
+            .unwrap();
+        drop(connection);
+        fs::remove_file(&projection).unwrap();
+
+        let mut store = LocalStore::open(&dir).unwrap();
+        assert_eq!(store.observation_count().unwrap(), 1);
+        assert_eq!(store.record_count().unwrap(), 1);
+        assert_eq!(store.outcome_count().unwrap(), 1);
+        assert_eq!(
+            store.cursor("codex", "generation").unwrap().as_deref(),
+            Some("1")
+        );
+        assert_eq!(fs::read_to_string(&projection).unwrap().lines().count(), 1);
+        let checkpoint = SourceCheckpoint {
+            source: AgentSource::Codex,
+            source_generation: SourceGeneration::parse("generation").unwrap(),
+            previous_source_cursor: Some(SourceCursor::parse("1").unwrap()),
+            source_cursor: SourceCursor::parse("diagnostic-1").unwrap(),
+        };
+        assert_eq!(
+            store
+                .ingest_disposition(
+                    &checkpoint,
+                    AdapterDispositionKind::Diagnostic,
+                    AdapterDispositionCode::UnsupportedEvent,
+                )
+                .unwrap(),
+            IngestStatus::Committed
+        );
+        assert_eq!(
+            store
+                .ingest_disposition(
+                    &checkpoint,
+                    AdapterDispositionKind::Diagnostic,
+                    AdapterDispositionCode::UnsupportedEvent,
+                )
+                .unwrap(),
+            IngestStatus::Duplicate
+        );
+        assert_eq!(store.disposition_count().unwrap(), 1);
+        assert_eq!(
+            store.cursor("codex", "generation").unwrap().as_deref(),
+            Some("diagnostic-1")
+        );
+        assert!(matches!(
+            store.ingest_disposition(
+                &checkpoint,
+                AdapterDispositionKind::Suppressed,
+                AdapterDispositionCode::DuplicateObservation,
+            ),
+            Err(StoreError::PayloadConflict)
+        ));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

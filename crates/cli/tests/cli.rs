@@ -82,3 +82,149 @@ fn concurrent_real_processes_initialize_one_store() {
     assert!(directory.join("observations.jsonl").is_file());
     let _ = fs::remove_dir_all(root);
 }
+
+#[cfg(unix)]
+#[test]
+fn codex_ingest_process_commits_observations_and_bounded_diagnostics() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-codex-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let handoff = root.join("codex-handoff.jsonl");
+    fs::write(
+        &handoff,
+        include_str!("../../adapter-codex/tests/fixtures/codex-handoff.jsonl"),
+    )
+    .unwrap();
+    fs::set_permissions(&handoff, fs::Permissions::from_mode(0o600)).unwrap();
+    let store = root.join("store");
+
+    let first = binary()
+        .args([
+            "codex-ingest",
+            store.to_str().unwrap(),
+            handoff.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(stdout.contains("observations=5"));
+    assert!(stdout.contains("diagnostics=2"));
+    assert!(stdout.contains("suppressed=1"));
+
+    let second = binary()
+        .args([
+            "codex-ingest",
+            store.to_str().unwrap(),
+            handoff.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let projection = fs::read_to_string(store.join("observations.jsonl")).unwrap();
+    assert_eq!(projection.lines().count(), 5);
+    for secret in [
+        "RAW_PROMPT_SECRET",
+        "RAW_TOOL_OUTPUT_SECRET",
+        "RAW_ASSISTANT_SECRET",
+    ] {
+        assert!(!projection.contains(secret));
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_ingest_process_restarts_from_an_appended_tail() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-codex-tail-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let fixture = include_str!("../../adapter-codex/tests/fixtures/codex-handoff.jsonl");
+    let prefix = root.join("prefix.jsonl");
+    let tail = root.join("tail.jsonl");
+    fs::write(
+        &prefix,
+        fixture.lines().take(7).collect::<Vec<_>>().join("\n"),
+    )
+    .unwrap();
+    fs::write(
+        &tail,
+        fixture.lines().skip(7).collect::<Vec<_>>().join("\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&prefix, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&tail, fs::Permissions::from_mode(0o600)).unwrap();
+    let store = root.join("store");
+
+    for handoff in [&prefix, &tail] {
+        let output = binary()
+            .args([
+                "codex-ingest",
+                store.to_str().unwrap(),
+                handoff.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let projection = fs::read_to_string(store.join("observations.jsonl")).unwrap();
+    let full_store = root.join("full-store");
+    let full_handoff = root.join("full.jsonl");
+    fs::write(&full_handoff, fixture).unwrap();
+    fs::set_permissions(&full_handoff, fs::Permissions::from_mode(0o600)).unwrap();
+    let full = binary()
+        .args([
+            "codex-ingest",
+            full_store.to_str().unwrap(),
+            full_handoff.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        full.status.success(),
+        "{}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+    assert_eq!(
+        projection,
+        fs::read_to_string(full_store.join("observations.jsonl")).unwrap()
+    );
+    let split_state = agent_observability_local_store::LocalStore::open(&store).unwrap();
+    let full_state = agent_observability_local_store::LocalStore::open(&full_store).unwrap();
+    assert_eq!(split_state.observation_count().unwrap(), 5);
+    assert_eq!(split_state.disposition_count().unwrap(), 3);
+    assert_eq!(
+        split_state.observation_count().unwrap(),
+        full_state.observation_count().unwrap()
+    );
+    assert_eq!(
+        split_state.disposition_count().unwrap(),
+        full_state.disposition_count().unwrap()
+    );
+    let _ = fs::remove_dir_all(root);
+}
