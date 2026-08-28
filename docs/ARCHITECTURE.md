@@ -85,6 +85,12 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
+v0.7.0의 Rust foundation은 `crates/domain`, `crates/contracts`, `crates/cli`로 나뉜다.
+domain은 외부 형식을 모르고, contracts는 transient source와 durable/report DTO 경계를
+소유하며, CLI만 composition root 역할을 한다. `contracts/*.schema.json`은 closed wire
+contract이고 `contracts/contract-manifest.v1`은 현재 활성 schema path/version과
+`team_ingest=disabled` 경계를 runtime 중립적으로 고정한다.
+
 ```text
 Agent logs, hooks and native telemetry
         |

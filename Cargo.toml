@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/cli",
+    "crates/contracts",
+    "crates/domain",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.7.0"
+edition = "2024"
+license = "UNLICENSED"
+rust-version = "1.97"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "deny"

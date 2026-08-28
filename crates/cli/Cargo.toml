@@ -1,0 +1,16 @@
+[package]
+name = "agent-observability-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "agent-observability"
+path = "src/main.rs"
+
+[dependencies]
+agent-observability-contracts = { path = "../contracts" }
+
+[lints]
+workspace = true
