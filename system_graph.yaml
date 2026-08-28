@@ -4,7 +4,79 @@ project:
   name: agent-observability
 evidence_sources:
   - README.md
+  - ROADMAP.md
+  - docs/ARCHITECTURE.md
+  - docs/TEAM_ARCHITECTURE.md
+  - docs/TEAM_CONTRACTS.md
+  - docs/ADAPTER_COMPATIBILITY.md
+  - DESIGN.md
 invariants:
+  - id: target-product-stack
+    severity: must
+    rule: Implement the web UI in TypeScript and all other product code in Rust;
+      treat the existing JavaScript v0.6 implementation only as a migration baseline.
+  - id: standalone-and-team-profiles
+    severity: must
+    rule: Keep standalone fully functional without network, login, or collector while allowing
+      an optional team profile to reuse the same domain semantics and report contract through a
+      separate strict ingest contract; never transmit SourceObservation, DurableRecordVx, or raw
+      content outside the local machine.
+  - id: hybrid-email-attribution
+    severity: must
+    rule: Support multiple verified purpose-specific email identities per human principal and bind
+      Codex, Claude, and Cursor adapter sessions through server-validated opaque identity references;
+      first-GA human-attributable sources must bind one principal, shared sources remain source-only,
+      and raw email requires field-level PII authorization and never enters ingest envelopes, retry
+      queues, ACK journals, or telemetry identifiers.
+  - id: identity-pii-deletion
+    severity: must
+    rule: Identity deletion must revoke bindings, destroy the per-identity PII key, and replicate a
+      PII-free tombstone that is applied before any pre-deletion backup restore; legal-hold mutation
+      and key destruction must share an epoch-checked purge fence.
+  - id: commercial-team-readiness
+    severity: must
+    rule: Do not call the team profile commercially ready until tenant isolation, credential
+      lifecycle, RBAC, retention and deletion, encryption and key rotation, audit, atomic
+      metering and quota, schema compatibility, restore and fault drills, and SLO evidence pass
+      the G0-G4 gates in docs/TEAM_ARCHITECTURE.md and docs/TEAM_CONTRACTS.md.
+  - id: architecture-dependency-direction
+    severity: must
+    rule: Keep domain and application independent from agent payload formats, filesystem,
+      storage, CLI, web UI, and pricing sources; connect those concerns through explicit ports.
+  - id: local-performance-isolation
+    severity: must
+    rule: Keep hook foreground work to a bounded local handoff with no synchronous network, full
+      transcript scan, report render, or queue drain; enforce configurable bounded cadence, resource
+      budgets, adaptive backoff, and load shedding that degrades team sync before coding-agent work.
+  - id: local-transactional-observation
+    severity: must
+    rule: Atomically commit source generation and cursor, deterministic observation identity, local
+      durable record, and optional team outbox; treat JSONL, snapshots, and HTML as projections rather
+      than cursor or delivery authority.
+  - id: explicit-team-delivery-outcome
+    severity: must
+    rule: Give every team-enabled local record exactly one durable delivery outcome and never advance
+      a source cursor with an unrecorded outbox admission failure or silent delivery drop.
+  - id: immutable-observation-revisions
+    severity: must
+    rule: Never mutate an accepted observation in place; represent attribution correction and report
+      retraction as idempotent append-only revisions with expected-revision conflict control, and keep
+      privacy deletion as a separate key-destruction workflow.
+  - id: aggregate-rebuild-authority
+    severity: must
+    rule: Retain a privacy-safe aggregate contribution journal and versioned checkpoints through
+      aggregate retention so correction, retract, reinstate, restore, and rebuild remain deterministic
+      after raw observations expire.
+  - id: official-adapter-surfaces
+    severity: must
+    rule: Maintain a versioned official-surface capability matrix for Codex, Claude, and Cursor, assign
+      one primary source per canonical field, and isolate unsupported source drift without scraping
+      credentials or silently relying on undocumented formats.
+  - id: target-fail-closed-output-boundary
+    severity: must
+    rule: Require every new or migrated durable sink and external transmission to use an
+      allowlisted privacy contract for logs, snapshots, queues, reports, exports, diagnostics,
+      and collector payloads; treat the current v0.6 fail-open path as a migration blocker.
   - id: protect-secrets
     severity: must
     rule: Do not quote, expose, commit, or summarize secret values from .env files,

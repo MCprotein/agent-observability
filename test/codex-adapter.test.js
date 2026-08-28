@@ -158,6 +158,11 @@ test("parses Codex session JSONL into session, turn, LLM, and tool spans", () =>
   assert.equal(llm.metrics.latency_ms, 1200);
   assert.equal(tool.metrics.duration_ms, 30);
   assert.equal(tool.attributes.tool_name, "exec_command");
+  assert.equal(records.every((record) => record.attributes.session_id === "s1"), true);
+  assert.equal(
+    records.filter((record) => record.span_kind !== "agent.session").every((record) => record.attributes.turn_id === "t1"),
+    true,
+  );
 });
 
 test("parses real Codex session envelopes without copying raw content", () => {
@@ -188,6 +193,7 @@ test("parses real Codex session envelopes without copying raw content", () => {
   assert.equal(llm.metrics.total_input_tokens, 21);
   assert.equal(llm.metrics.total_output_tokens, 13);
   assert.equal(llm.metrics.context_window_tokens, 128000);
+  assert.equal(llm.agent.model, "gpt-test");
 
   const serialized = JSON.stringify(records);
   assert.equal(serialized.includes("RAW_USER_MESSAGE_SECRET"), false);
@@ -236,6 +242,53 @@ test("does not copy raw Codex error strings into status messages", () => {
   assert.equal(JSON.stringify(records).includes("sk-raw-secret"), false);
 });
 
+test("keeps multiple Codex permission events without source IDs", () => {
+  const records = codexRecordsFromEvents([
+    { type: "permission.requested", session_id: "permission-session", turn_id: "permission-turn", source_index: 1 },
+    { type: "permission.requested", session_id: "permission-session", turn_id: "permission-turn", source_index: 2 },
+  ]);
+  const permissions = records.filter((record) => record.span_kind === "permission");
+
+  assert.equal(permissions.length, 2);
+  assert.notEqual(permissions[0].span_id, permissions[1].span_id);
+  assert.deepEqual(
+    permissions.map((record) => record.attributes.permission_id),
+    ["permission:1", "permission:2"],
+  );
+});
+
+test("rejects unstable and conflicting Codex permission identities", () => {
+  assert.throws(
+    () => codexRecordsFromEvents([
+      { type: "permission.requested", session_id: "s", turn_id: "t", timestamp: "2026-01-01T00:00:00Z" },
+      { type: "permission.denied", session_id: "s", turn_id: "t", timestamp: "2026-01-01T00:00:00Z" },
+    ]),
+    /requires a stable source identity/,
+  );
+  assert.throws(
+    () => codexRecordsFromEvents([
+      { type: "permission.requested", session_id: "s", turn_id: "t" },
+    ]),
+    /requires a stable source identity/,
+  );
+  assert.throws(
+    () => codexRecordsFromEvents([
+      { type: "permission.requested", session_id: "s", turn_id: "t", permission_id: "p" },
+      { type: "permission.denied", session_id: "s", turn_id: "t", permission_id: "p" },
+    ]),
+    /Conflicting adapter records/,
+  );
+});
+
+test("keeps delimiter-bearing Codex identity tuples distinct", () => {
+  const records = codexRecordsFromEvents([
+    { type: "tool.completed", session_id: "s", turn_id: "a:b", call_id: "c" },
+    { type: "tool.completed", session_id: "s", turn_id: "a", call_id: "b:c" },
+  ]);
+  const tools = records.filter((record) => record.span_kind === "tool.execution");
+  assert.equal(new Set(tools.map((record) => record.span_id)).size, 2);
+});
+
 test("appends parsed synthetic Codex session spans to the local event log", async () => {
   const dir = await mkdtemp(join(tmpdir(), "agent-observability-codex-"));
   const logPath = join(dir, "events.jsonl");
@@ -256,6 +309,24 @@ test("appends parsed synthetic Codex session spans to the local event log", asyn
   assert.equal(written.length, 4);
   assert.equal(records.length, 4);
   assert.equal(raw.includes("raw output should not be copied"), false);
+
+  const replayed = await appendCodexSessionJsonl(logPath, SESSION_JSONL, {
+    project_name: "agent-observability",
+  });
+  assert.deepEqual(replayed, []);
+  assert.equal((await readEventLog(logPath)).length, 4);
+});
+
+test("replays missing-timestamp payloads deterministically", () => {
+  const payload = {
+    type: "tool.completed",
+    session_id: "stable-session",
+    turn_id: "stable-turn",
+    call_id: "stable-call",
+    tool_name: "exec_command",
+  };
+
+  assert.deepEqual(normalizeCodexNotifyPayload(payload), normalizeCodexNotifyPayload(payload));
 });
 
 test("appends real Codex envelope spans without raw content", async () => {

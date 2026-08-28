@@ -13,8 +13,8 @@ PoC 순서를 설명하고, 실제 릴리즈 범위와 완료 기준은 이 문�
   `Superseded` 또는 `Blocked`로 표시하고 근거를 남긴다.
 - `Released`는 구현 완료만 뜻하지 않는다. 테스트, privacy/redaction 검증, 문서 갱신,
   독립 리뷰 또는 동등한 검증 evidence가 있어야 한다.
-- patch version은 회귀 수정, 문서 정합성 보정, release 복구처럼 기존 범위를 고치는
-  데만 쓴다.
+- patch version은 회귀 수정, 보안/정확성 보정, 문서 정합성, 기존 동작을 고정하는 fixture와
+  migration contract처럼 사용자 기능 범위를 늘리지 않는 작업에만 쓴다.
 - minor version은 작고 검증 가능한 기능 단위다. adapter, report panel, cost field,
   redaction fixture 같은 항목은 minor로 올린다.
 - major version은 제품의 운영 경계가 바뀌는 큰 단계에만 쓴다. 중앙 collector나
@@ -28,9 +28,23 @@ Semver는 v1.0.0부터 안정 계약으로 본다. v0.x 단계에서는 minor ve
 ## Product North Star
 
 여러 coding agent를 쓰더라도 token, latency, tool call, permission, compaction,
-error, 예상 비용을 하나의 trace/span schema로 볼 수 있게 만든다. 1차 제품은 서버를
-띄우지 않는 local-only observability다. 중앙 collector와 gateway는 local-only 경로가
-검증된 뒤 선택적으로 붙인다.
+error, 예상 비용을 하나의 trace/span schema로 볼 수 있게 만든다. 제품 구조는 server 없는
+`standalone`과 선택적 collector를 쓰는 `team` profile을 함께 수용한다. 1차 delivery는
+standalone이며, team collector와 gateway 구현은 local 경로가 검증된 뒤 Future TODO promotion
+gate를 통과해 추가한다.
+
+## Technology and Architecture Policy
+
+- web UI는 TypeScript로 구현한다.
+- domain, application, agent adapters, storage, export, CLI는 Rust로 구현한다.
+- 현재 JavaScript v0.6 구현은 migration baseline으로 유지한다. Rust는 별도 CLI 경로로
+  구현하고, 전체 command path의 contract parity가 확인된 release boundary에서 대체한다.
+- architecture와 engineering rule의 정본은 `docs/ARCHITECTURE.md`다.
+- standalone은 collector, login, network 없이 완전하게 동작해야 한다. team profile은 같은
+  domain 의미와 report contract를 사용하되 별도 strict ingest contract를 가지며 local 경로를
+  대체하거나 약화하지 않는다.
+- canonical contract와 privacy boundary를 안정화하기 전에 새 agent adapter를 추가하지
+  않는다.
 
 ## Major Lines
 
@@ -49,9 +63,14 @@ error, 예상 비용을 하나의 trace/span schema로 볼 수 있게 만든다.
 | v0.4.0 | Released | Cost estimate fields | rate table format, `estimated_cost`, `rate_table.version`, `cost.assumption`, unknown/incomplete pricing behavior |
 | v0.5.0 | Released | Privacy and redaction hardening | content logging off fixture, secret/path/key redaction fixture, no raw prompt/output in log/report/export |
 | v0.6.0 | Released | Claude Code adapter | hook/transcript parsing, tool duration, permission event, compaction event, shared schema parity, raw prompt/output leak fixture |
-| v0.7.0 | Planned | Cursor adapter | generation correlation, shell/tool span capture, workspace/file edit metadata, shared schema parity |
-| v0.8.0 | Planned | Cross-agent local report polish | repo/session/team/model filters, redacted snapshot export polish, local disk retention note |
-| v0.9.0 | Planned | Local-only release candidate | install/config path, CLI command shape, docs, fixtures, independent review |
+| v0.6.1 | Released | Baseline correctness and contract freeze | Codex/Claude source-to-durable and cross-agent report golden fixture, strict metadata allowlist, fail-closed privacy regression, private artifact permissions, explicit correlation fields without downstream agent-ID parsing, deterministic sequential replay/no-op plus identity-conflict fixture, overlap-aware token pricing, independent review |
+| v0.7.0 | Planned | Rust contract foundation | Cargo workspace and CLI composition root, `SourceObservation`/domain/`DurableRecordVx`/`ReportDtoVx` boundaries, shared schema and golden harness |
+| v0.8.0 | Planned | Rust core and durable I/O | deterministic reducer, topology validation, fail-closed projectors, embedded transaction for source cursor/stable event/local record/profile-neutral delivery outcome, JSONL projection replay, crash-point idempotency, pricing policy parity; team envelope/outbox/network remain disabled until Future TODO G0 promotion |
+| v0.9.0 | Planned | Rust Codex adapter | official-surface capability entry, primary/supplement source dedupe, bounded local handoff, canonical correlation, unsupported-event diagnostics, end-to-end CLI parity |
+| v0.10.0 | Planned | Rust Claude Code adapter | official-surface capability entry, telemetry/hook precedence, permission and compaction events, interrupted and out-of-order fixture parity |
+| v0.11.0 | Planned | Rust Cursor adapter | official-hook capability entry, generation correlation, shell/tool operation capture, safe workspace/file edit metadata, shared contract parity |
+| v0.12.0 | Planned | TypeScript static report UI | generated/validated report DTO types, repo/session/team/model filters, self-contained HTML smoke |
+| v0.13.0 | Planned | Local-only release candidate | install/config path, bounded collection/flush/storage policy, singleton/crash/full-channel fixtures, adaptive load shedding, retention/large-log bounds, `cargo run -p xtask -- perf local --profile release --check` evidence for hook latency and CPU/RSS/disk/network budgets, docs and independent review |
 | v1.0.0 | Planned | Local-only stable | Codex/Claude Code/Cursor adapters, static report, cost estimate, privacy fixtures, docs and smoke checks all pass |
 
 ## Later Lines
@@ -83,9 +102,13 @@ line으로 승격한다.
 
 | Item | Scope | Promotion Gate |
 | --- | --- | --- |
-| Optional internal collector | 팀/프로젝트 단위 집계, auth, schema validation, central trace/metrics/audit stores, retry-safe ingest | local-only report로는 해결되지 않는 팀 단위 운영 요구가 확인될 것 |
-| Team aggregation and alerting | team/repo dashboards, cost/error spike alerts, collector failure/retry tests | 여러 사용자의 실제 event log를 중앙 집계해야 하는 요구가 확인될 것 |
+| Commercial team profile | [Team architecture](docs/TEAM_ARCHITECTURE.md)와 [contracts](docs/TEAM_CONTRACTS.md)의 G0-G4: Rust collector/query API, strict `TeamIngestEnvelopeV1`, local transactional outbox, principal-bound multi-email profile, Codex/Claude/Cursor mandatory capability matrix, configurable bounded cadence, monotonic heartbeat, append-only correction/retraction, field-level identity PII authorization, identity/RBAC, tenant isolation, atomic dedupe/metering, retention/deletion, encryption, audit, quota, DR/SLO, hosted UI | standalone report로는 해결되지 않는 실제 다중 사용자 운영 요구가 있고 named business/legal/security approvers가 data ownership, deployment, authorization, retention and commercial scope를 G0 artifact로 승인할 것 |
+| Advanced team alerting | cost/error/latency spike rules, notification delivery, dedupe/suppression and alert audit | shared dashboard 이후 실제 notification 운영 요구와 incident owner가 확인될 것 |
 | Optional gateway/control plane | provider-compatible routing, request attribution, billing reconciliation assumptions, Desktop App setting inheritance checks | 관측만으로 부족하고 요청 통제/과금 보정이 필요하다는 evidence가 있을 것 |
+
+Team 항목은 collector endpoint 하나로 완료되지 않는다. `docs/TEAM_ARCHITECTURE.md`의 G0-G4를
+순서대로 통과하며 G0 전에는 버전을 배정하지 않고, G4 evidence 전에는 상용화 완료로 표시하지
+않는다.
 
 ## Version Cycle
 
@@ -102,12 +125,25 @@ line으로 승격한다.
 
 ## Non-Skippable Gates
 
-- 원문 prompt/output은 opt-in 없이는 local event log, queue, report, export, collector에
-  남지 않아야 한다.
+- 원문 prompt/output은 local opt-in 없이는 local event log, report, export에 남지 않아야 한다.
+  team retry queue와 collector에는 local opt-in 여부와 무관하게 들어갈 수 없다.
 - 비용은 실제 청구액으로 단정하지 않는다. 단가표 기반 예상치와 assumption을 함께
   표시한다.
 - central collector나 gateway는 local-only 경로가 깨끗하게 동작하기 전까지 필수
   경로가 아니다.
+- team profile이 추가되어도 standalone은 network, login, collector 없이 동일한 local 기능을
+  유지해야 한다.
 - agent별 adapter가 달라도 뒤쪽 schema는 하나로 유지한다.
+- hook foreground path는 local bounded handoff만 수행하고 network, full-file scan, report render나 queue
+  drain을 기다리지 않는다. Local release는 declared CPU/RSS/disk/latency budget과 pressure fixture를
+  통과해야 한다.
+- accepted observation을 직접 수정하지 않는다. 귀속 보정과 분석 제외는 idempotent append-only
+  revision으로 처리하고 privacy deletion과 구분한다.
 - unsupported 또는 불안정한 agent log/hook format은 추측으로 안정 계약처럼 쓰지
   않는다.
+- UI 이외의 새 제품 코드는 Rust로 작성하고, web UI는 TypeScript `strict` contract를
+  사용한다.
+- canonical schema, Rust domain, TypeScript report DTO 사이에 수동으로 중복 정의된 계약을
+  만들지 않는다.
+- JavaScript와 Rust를 한 command path 안에서 FFI나 subprocess로 혼합하지 않는다. Rust
+  수직 기능을 병렬 구현하고 golden parity가 확인된 release boundary에서 기본 경로를 전환한다.

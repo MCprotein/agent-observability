@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -18,6 +18,8 @@ const RAW_TOOL_OUTPUT = "RAW_TOOL_OUTPUT_SHOULD_NOT_LEAK";
 const RAW_TOKEN = "RAW_TOKEN_SHOULD_NOT_LEAK";
 const RAW_BEARER = "RAW_BEARER_SHOULD_NOT_LEAK";
 const RAW_REFRESH = "RAW_REFRESH_SHOULD_NOT_LEAK";
+const RAW_IDENTIFIER = "RAW_IDENTIFIER_SHOULD_NOT_LEAK";
+const RAW_STATUS = "RAW_STATUS_SHOULD_NOT_LEAK";
 const RAW_PRIVATE_KEY = [
   "-----BEGIN PRIVATE KEY-----",
   "RAW_PRIVATE_KEY_SHOULD_NOT_LEAK",
@@ -31,6 +33,8 @@ const SENTINELS = [
   RAW_TOKEN,
   RAW_BEARER,
   RAW_REFRESH,
+  RAW_IDENTIFIER,
+  RAW_STATUS,
   "RAW_PRIVATE_KEY_SHOULD_NOT_LEAK",
   "/repo/.env",
   "/repo/id_rsa.key",
@@ -52,15 +56,9 @@ function privacyFixtureSpan() {
       tool_output: RAW_TOOL_OUTPUT,
     },
     attributes: {
+      session_id: "session-privacy",
       turn_id: "turn-privacy",
-      command: `cat /repo/.env && echo token=${RAW_TOKEN}`,
-      note: `Authorization: Bearer ${RAW_BEARER}`,
-      nested: {
-        refreshToken: RAW_REFRESH,
-      },
-      private_key: RAW_PRIVATE_KEY,
-      key_file: "/repo/id_rsa.key",
-      harmless: "kept",
+      source: `Authorization: Bearer ${RAW_BEARER}`,
     },
   });
 }
@@ -79,35 +77,49 @@ function workstreamSpan() {
   });
 }
 
+function unsafeIdentifierSpan() {
+  const record = privacyFixtureSpan();
+  record.trace_id = RAW_IDENTIFIER;
+  record.span_id = RAW_IDENTIFIER;
+  record.attributes.session_id = RAW_IDENTIFIER;
+  return record;
+}
+
+function unsafeStatusSpan() {
+  const record = privacyFixtureSpan();
+  record.status.message = RAW_STATUS;
+  return record;
+}
+
 test("keeps raw prompt, output, and secrets out of local log, report, and export", async () => {
   const dir = await mkdtemp(join(tmpdir(), "agent-observability-privacy-"));
   const logPath = join(dir, "events.jsonl");
   const exportPath = join(dir, "snapshot.json");
   const span = privacyFixtureSpan();
   const workstream = workstreamSpan();
+  const unsafeIdentifier = unsafeIdentifierSpan();
+  const unsafeStatus = unsafeStatusSpan();
 
   const sanitized = await appendEventLog(logPath, span);
   const rawLog = await readFile(logPath, "utf8");
   const logRecords = await readEventLog(logPath);
 
-  assert.equal(sanitized.name, "Turn turn-privacy");
+  assert.equal(sanitized.name, "Turn");
   assert.equal(logRecords[0].content.prompt, "[content omitted]");
   assert.equal(logRecords[0].content.output, "[content omitted]");
   assert.equal(logRecords[0].content.tool_input, "[content omitted]");
   assert.equal(logRecords[0].content.tool_output, "[content omitted]");
-  assert.equal(logRecords[0].attributes.nested.refreshToken, "[redacted]");
-  assert.equal(logRecords[0].attributes.private_key, "[redacted]");
-  assert.equal(logRecords[0].attributes.key_file, "[redacted path]");
-  assert.equal(logRecords[0].attributes.harmless, "kept");
+  assert.equal(logRecords[0].attributes.source, "Authorization: Bearer [redacted]");
   assertNoSentinels(rawLog);
 
-  const html = renderStaticHtmlReport([span, workstream], {
+  const html = renderStaticHtmlReport([span, workstream, unsafeIdentifier, unsafeStatus], {
     title: "Privacy Report",
     generated_at: "2026-07-10T00:00:00.000Z",
   });
   assertNoSentinels(html);
 
-  const snapshot = redactedSnapshotFromRecords([span, workstream], {
+  assert.throws(() => redactedSnapshotFromRecords([unsafeStatus]), /status.message is not allowed/);
+  const snapshot = redactedSnapshotFromRecords([span, workstream, unsafeIdentifier], {
     generated_at: "2026-07-10T00:00:00.000Z",
     content_logging: {
       prompts: true,
@@ -118,7 +130,7 @@ test("keeps raw prompt, output, and secrets out of local log, report, and export
   });
   assertNoSentinels(JSON.stringify(snapshot));
 
-  await writeRedactedJsonSnapshot(exportPath, [span, workstream], {
+  await writeRedactedJsonSnapshot(exportPath, [span, workstream, unsafeIdentifier], {
     generated_at: "2026-07-10T00:00:00.000Z",
     content_logging: {
       prompts: true,
@@ -128,6 +140,16 @@ test("keeps raw prompt, output, and secrets out of local log, report, and export
     },
   });
   assertNoSentinels(await readFile(exportPath, "utf8"));
+  assert.equal((await stat(exportPath)).mode & 0o777, 0o600);
+});
+
+test("rejects unknown metadata before any durable privacy projection", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-observability-privacy-reject-"));
+  const logPath = join(dir, "events.jsonl");
+  const record = privacyFixtureSpan();
+  record.attributes.private_key = RAW_PRIVATE_KEY;
+
+  await assert.rejects(() => appendEventLog(logPath, record), /attributes.private_key is not allowed/);
 });
 
 function assertNoSentinels(text) {

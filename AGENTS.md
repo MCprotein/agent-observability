@@ -1,3 +1,47 @@
+## Project architecture rules
+
+이 저장소의 제품 코드와 설계 변경은 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)를
+정본으로 따른다. team profile은 [docs/TEAM_ARCHITECTURE.md](docs/TEAM_ARCHITECTURE.md)와
+[docs/TEAM_CONTRACTS.md](docs/TEAM_CONTRACTS.md), 제품·UI는 [DESIGN.md](DESIGN.md)의 더
+구체적인 계약을 함께 따른다. 아래 규칙은 새 코드와 Rust/TypeScript migration target에 즉시
+적용한다.
+기존 JavaScript v0.6 경로의 위반은 `v0.6.1`에서 고정할 migration blocker다.
+
+- 목표 기술 스택은 web UI의 TypeScript와 그 외 제품 코드의 Rust다. 기존
+  JavaScript v0.6 구현은 migration baseline이며, 새 runtime/core 기능을 JavaScript로
+  확장하지 않는다.
+- 제품은 `standalone`과 `team` deployment profile을 지원하는 구조로 설계한다. standalone은
+  server, login, collector 없이 완전하게 동작해야 하며, team 기능이 local path의 필수
+  dependency가 되면 안 된다.
+- 두 profile은 domain 의미와 report contract를 공유한다. team 전송은 전용 fail-closed
+  projector가 만든 `TeamIngestEnvelopeV1`만 사용한다. local opt-in 여부와 무관하게
+  `SourceObservation`, 원문 content, 전체 `DurableRecordVx`를 로컬 밖으로 보내지 않는다.
+- team collector는 client가 보낸 tenant/workspace/actor 값을 신뢰하지 않는다. 인증 주체,
+  membership, role에서 허용 scope를 server-side로 결정하고 모든 ingest/query/storage에
+  tenant predicate를 적용한다.
+- team 기능은 tenancy, credential lifecycle, RBAC, retention/deletion, encryption, audit,
+  metering/quota, schema compatibility, SLO/DR gate를 함께 충족해야 한다. collector endpoint만
+  구현한 상태를 상용 team 기능으로 취급하지 않는다.
+- 아키텍처는 domain, application, inbound adapter, outbound infrastructure, CLI,
+  web UI 책임을 분리한다. 의존성은 바깥에서 안쪽으로 향하고 domain은 I/O, agent format,
+  storage, UI, pricing source를 알지 않는다.
+- normalization, lifecycle reduction, privacy projection, cost calculation은 가능한 한
+  순수 함수와 불변 값으로 구현한다. 파일 시스템과 프로세스 실행은 얇은 imperative
+  shell에 격리한다.
+- SOLID는 추상화 수를 늘리는 구호가 아니라 변경 이유와 의존성 방향을 통제하는 규칙으로
+  적용한다. Rust trait은 교체 가능한 경계나 테스트 대역이 실제로 필요할 때만 만든다.
+- source adapter는 공통 canonical contract를 구현한다. downstream code가 agent별 span ID
+  문자열을 파싱해 의미를 복원하면 안 된다.
+- durable artifact와 외부 전송은 fail-closed allowlist projection을 거친다. 알려지지 않은
+  content나 metadata를 log, snapshot, queue, report, export, diagnostic, collector payload에
+  그대로 전달하지 않는다.
+- Rust와 TypeScript 사이 계약은 versioned schema에서 생성하거나 검증한다. 동일한 타입과
+  enum을 양쪽에서 수동으로 따로 정의하지 않는다.
+- 새 패턴과 추상화는 구체적인 중복, 변경 축, 테스트 경계를 해결해야 한다. speculative
+  abstraction, service locator, 전역 mutable state, 의미 없는 manager/service 계층은 금지한다.
+- 경계나 canonical schema를 바꾸는 작업은 migration, contract fixture, privacy fixture,
+  cross-agent parity test를 함께 제공한다.
+
 <!-- anamnesis:region id=anamnesis-base fragment=base@17 -->
 ## anamnesis baseline
 

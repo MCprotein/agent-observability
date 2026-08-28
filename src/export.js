@@ -1,7 +1,7 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { writeFile } from "node:fs/promises";
 import { assertValidSpanRecord } from "./schema.js";
 import { redactRecord, redactText } from "./redaction.js";
+import { enforcePrivateFile, preparePrivateArtifact } from "./private-artifact.js";
 
 export function redactedSnapshotFromRecords(records, options = {}) {
   return {
@@ -14,8 +14,9 @@ export function redactedSnapshotFromRecords(records, options = {}) {
 export async function writeRedactedJsonSnapshot(filePath, records, options = {}) {
   const snapshot = redactedSnapshotFromRecords(records, options);
   const body = `${JSON.stringify(snapshot, null, 2)}\n`;
-  await mkdir(dirname(filePath), { recursive: true });
-  await writeFile(filePath, body, "utf8");
+  await preparePrivateArtifact(filePath);
+  await writeFile(filePath, body, { encoding: "utf8", mode: 0o600 });
+  await enforcePrivateFile(filePath);
   return {
     filePath,
     bytes: Buffer.byteLength(body, "utf8"),

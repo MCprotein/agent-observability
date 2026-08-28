@@ -1,0 +1,3 @@
+{"hook_event_name":"SessionStart","session_id":"golden-claude","timestamp":"2026-08-01T00:01:00.000Z","model":"claude-golden"}
+{"hook_event_name":"UserPromptSubmit","session_id":"golden-claude","prompt_id":"turn-claude","timestamp":"2026-08-01T00:01:01.000Z","prompt":"RAW_GOLDEN_PROMPT"}
+{"type":"assistant","sessionId":"golden-claude","uuid":"request-claude","parent_uuid":"turn-claude","timestamp":"2026-08-01T00:01:02.000Z","message":{"id":"request-claude","model":"claude-golden","usage":{"input_tokens":80,"output_tokens":30,"cache_read_input_tokens":8,"cache_creation_input_tokens":4},"content":[{"type":"text","text":"RAW_GOLDEN_OUTPUT"}]}}

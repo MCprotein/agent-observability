@@ -1,7 +1,7 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { writeFile } from "node:fs/promises";
 import { estimateCostForRecords, estimateSpanCost, normalizeRateTable } from "../cost.js";
-import { redactText } from "../redaction.js";
+import { enforcePrivateFile, preparePrivateArtifact } from "../private-artifact.js";
+import { redactRecord, redactText } from "../redaction.js";
 
 const SAFE_ATTRIBUTE_KEYS = new Set([
   "source",
@@ -26,6 +26,7 @@ export function reportDataFromRecords(records, options = {}) {
     .sort((left, right) => left.startTimeUnixMs - right.startTimeUnixMs);
 
   return {
+    schemaVersion: "agent_observability.report.v1",
     generatedAt: options.generated_at ?? new Date().toISOString(),
     title: redactText(options.title ?? "Agent Observability Report", "title"),
     summary: summarize(spans),
@@ -556,8 +557,9 @@ export function renderStaticHtmlReport(records, options = {}) {
 
 export async function writeStaticHtmlReport(filePath, records, options = {}) {
   const html = renderStaticHtmlReport(records, options);
-  await mkdir(dirname(filePath), { recursive: true });
-  await writeFile(filePath, html, "utf8");
+  await preparePrivateArtifact(filePath);
+  await writeFile(filePath, html, { encoding: "utf8", mode: 0o600 });
+  await enforcePrivateFile(filePath);
   return {
     filePath,
     bytes: Buffer.byteLength(html, "utf8"),
@@ -565,28 +567,29 @@ export async function writeStaticHtmlReport(filePath, records, options = {}) {
 }
 
 function safeSpan(record, rateTable) {
-  const attributes = safeAttributes(record.attributes ?? {});
-  const sessionId = attributes.session_id ?? sessionIdFromSpan(record);
-  const turnId = attributes.turn_id ?? turnIdFromSpan(record);
-  const estimatedCost = estimateSpanCost(record, rateTable);
+  const sanitized = redactRecord(record);
+  const attributes = safeAttributes(sanitized.attributes ?? {});
+  const sessionId = attributes.session_id;
+  const turnId = attributes.turn_id;
+  const estimatedCost = estimateSpanCost(sanitized, rateTable);
 
   return {
-    schemaVersion: record.schema_version,
-    traceId: record.trace_id,
-    spanId: record.span_id,
-    parentSpanId: record.parent_span_id,
-    kind: record.span_kind,
-    name: spanDisplayName(record, attributes),
-    status: record.status?.code ?? "unset",
-    startTimeUnixMs: record.start_time_unix_ms,
-    endTimeUnixMs: record.end_time_unix_ms,
-    repo: repoName(record),
-    agent: safeAgent(record.agent ?? {}),
+    schemaVersion: sanitized.schema_version,
+    traceId: sanitized.trace_id,
+    spanId: sanitized.span_id,
+    parentSpanId: sanitized.parent_span_id,
+    kind: sanitized.span_kind,
+    name: spanDisplayName(sanitized, attributes),
+    status: sanitized.status?.code ?? "unset",
+    startTimeUnixMs: sanitized.start_time_unix_ms,
+    endTimeUnixMs: sanitized.end_time_unix_ms,
+    repo: repoName(sanitized),
+    agent: safeAgent(sanitized.agent ?? {}),
     sessionId,
     turnId,
     toolName: attributes.tool_name,
     attributes,
-    metrics: safeMetrics(record.metrics ?? {}),
+    metrics: safeMetrics(sanitized.metrics ?? {}),
     estimatedCost: estimatedCost.estimated_cost,
     cost: estimatedCost,
   };
@@ -603,6 +606,7 @@ function summarize(spans) {
     inputTokens: sumMetric(spans, "inputTokens"),
     outputTokens: sumMetric(spans, "outputTokens"),
     cachedInputTokens: sumMetric(spans, "cachedInputTokens"),
+    cacheCreationInputTokens: sumMetric(spans, "cacheCreationInputTokens"),
     reasoningOutputTokens: sumMetric(spans, "reasoningOutputTokens"),
     latencyMs: sumMetric(spans, "latencyMs"),
     durationMs: sumMetric(spans, "durationMs"),
@@ -689,7 +693,7 @@ function spanDisplayName(record, attributes) {
     return `${safeString(record.agent?.name, "agent.name") ?? "Agent"} session`;
   }
   if (record.span_kind === "turn") {
-    return attributes.turn_id ? `Turn ${shortDisplayId(attributes.turn_id)}` : "Turn";
+    return "Turn";
   }
   if (record.span_kind === "llm.request") {
     return safeString(record.agent?.model, "agent.model")
@@ -716,6 +720,7 @@ function safeMetrics(metrics) {
     inputTokens: metricNumber(metrics.input_tokens),
     outputTokens: metricNumber(metrics.output_tokens),
     cachedInputTokens: metricNumber(metrics.cached_input_tokens),
+    cacheCreationInputTokens: metricNumber(metrics.cache_creation_input_tokens),
     reasoningOutputTokens: metricNumber(metrics.reasoning_output_tokens),
     totalTokens: metricNumber(metrics.total_tokens),
     latencyMs: metricNumber(metrics.latency_ms),
@@ -742,23 +747,6 @@ function repoName(record) {
 
   const parts = repoPath.split(/[\\/]+/).filter(Boolean);
   return redactText(parts.at(-1) ?? "unknown", "repo.name");
-}
-
-function sessionIdFromSpan(record) {
-  if (record.span_kind === "agent.session") {
-    return record.span_id;
-  }
-  const match = /^codex-[^:]+:([^:]+)/.exec(record.span_id);
-  return match?.[1];
-}
-
-function turnIdFromSpan(record) {
-  if (record.span_kind === "turn") {
-    const prefix = /^codex-turn:[^:]+:(.+)$/.exec(record.span_id);
-    return prefix?.[1] ?? record.span_id;
-  }
-  const match = /^codex-(?:llm|tool|permission):[^:]+:([^:]+)/.exec(record.span_id);
-  return match?.[1];
 }
 
 function countKind(spans, kind) {
@@ -797,11 +785,6 @@ function scalarString(value) {
 
 function safeString(value, key) {
   return typeof value === "string" && value.length > 0 ? redactText(value, key) : undefined;
-}
-
-function shortDisplayId(value) {
-  const text = redactText(String(value), "id");
-  return text.length > 24 ? `${text.slice(0, 10)}...${text.slice(-6)}` : text;
 }
 
 function compactObject(object) {
