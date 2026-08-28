@@ -503,16 +503,16 @@ fn worker() -> Result<(), String> {
     for line in io::stdin().lock().lines() {
         let command = line.map_err(|e| format!("read worker command: {e}"))?;
         let deadline = Instant::now() + Duration::from_millis(ENQUEUE_DEADLINE_MS);
-        let outcome = loop {
-            match ingress.try_send_projected(command.len(), command.as_bytes()) {
-                IngressOutcome::Accepted => break "ok",
-                IngressOutcome::Full if Instant::now() < deadline => thread::yield_now(),
-                IngressOutcome::Full => break "full",
-                IngressOutcome::Oversized => break "oversized",
-                IngressOutcome::Unavailable => break "unavailable",
-            }
+        let outcome = enqueue_until(deadline, || {
+            ingress.try_send_projected(command.len(), command.as_bytes())
+        });
+        let response = match outcome {
+            IngressOutcome::Accepted => "ok",
+            IngressOutcome::Full => "full",
+            IngressOutcome::Oversized => "oversized",
+            IngressOutcome::Unavailable => "unavailable",
         };
-        writeln!(output, "{outcome}").map_err(|e| format!("write worker response: {e}"))?;
+        writeln!(output, "{response}").map_err(|e| format!("write worker response: {e}"))?;
         output
             .flush()
             .map_err(|e| format!("flush worker response: {e}"))?;
@@ -522,6 +522,29 @@ fn worker() -> Result<(), String> {
         .map_err(|_| "local runtime drain stopped".to_string())??;
     Ok(())
 }
+
+fn enqueue_until(deadline: Instant, mut attempt: impl FnMut() -> IngressOutcome) -> IngressOutcome {
+    let mut retrying = false;
+    loop {
+        if retrying && Instant::now() >= deadline {
+            return IngressOutcome::Full;
+        }
+        match attempt() {
+            IngressOutcome::Full => {
+                retrying = true;
+                sleep(retry_sleep(Instant::now(), deadline));
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+fn retry_sleep(now: Instant, deadline: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(now)
+        .min(Duration::from_micros(100))
+}
+
 fn drain(receiver: &std::sync::mpsc::Receiver<IngressMessage>, path: &Path) -> Result<(), String> {
     let mut store = LocalStore::open(path).map_err(|e| format!("open local durable store: {e}"))?;
     let config = LocalRuntimeConfigV1::default();
@@ -1345,5 +1368,30 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn enqueue_retry_never_attempts_acceptance_after_deadline() {
+        let mut attempts = 0;
+        let outcome = enqueue_until(Instant::now(), || {
+            attempts += 1;
+            if attempts == 1 {
+                IngressOutcome::Full
+            } else {
+                IngressOutcome::Accepted
+            }
+        });
+        assert_eq!(outcome, IngressOutcome::Full);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn enqueue_retry_sleep_is_capped_and_saturates_at_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            retry_sleep(now, now + Duration::from_secs(1)),
+            Duration::from_micros(100)
+        );
+        assert_eq!(retry_sleep(now, now), Duration::ZERO);
     }
 }
