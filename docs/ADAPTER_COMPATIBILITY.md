@@ -1,6 +1,6 @@
 # Adapter Compatibility Contract
 
-Status: proposed target contract
+Status: Codex experimental entry implemented; remaining adapters proposed
 Last verified: 2026-08-28
 
 이 문서는 Codex, Claude Code, Cursor adapter가 어떤 공식 surface를 어떤 우선순위로 사용하고,
@@ -16,7 +16,7 @@ adapter family, source generation, 공식 session/conversation/generation identi
 
 | Adapter | Primary source | Supplement / fallback | Verified official reference |
 | --- | --- | --- | --- |
-| Codex | native telemetry for model/API/token/tool signals | lifecycle hooks for local handoff and lifecycle gaps; documented local session output only as a version-gated reconciliation fallback | [Advanced configuration](https://learn.chatgpt.com/docs/config-file/config-advanced), [Configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) |
+| Codex | native telemetry for model/API/token/tool signals | `agent-turn-complete` notify for turn lifecycle; local session output is not used by the Rust adapter | [Advanced configuration](https://developers.openai.com/codex/config-advanced), [Configuration reference](https://developers.openai.com/codex/config-reference) |
 | Claude Code | native telemetry for usage, cost and tool metrics | hooks for lifecycle events; documented transcript fields only as a version-gated reconciliation fallback | [Hooks reference](https://code.claude.com/docs/en/hooks), [Monitoring usage](https://code.claude.com/docs/en/monitoring-usage) |
 | Cursor | official hooks for conversation, generation, model, user-email and transcript references | project/team hook coverage where local and cloud execution differ; transcript parsing only for documented fields and validated fixtures | [Hooks reference](https://cursor.com/docs/hooks) |
 
@@ -50,18 +50,15 @@ Support requires all mandatory scenarios below.
 
 Each entry in `crates/contracts/capabilities/adapter-capability-v1.yaml` contains:
 
-- adapter family, oldest/newest supported product version, OS/profile coverage and verification date
-- official reference URL and source surface version
-- event name, execution context (`local`/`cloud`), command mode (`async`/`sync_bounded`), failure behavior and
-  handler deadline
-- canonical field -> primary source map plus allowed supplement and correlation key
-- captured input fixture hash, expected observation fixture hash, privacy sentinel result and known gaps
-- duplicate/truncation/restart/source-rotation/slow-daemon/full-channel fixture IDs
+- adapter family, support status, oldest/newest checked product version and verification date
+- official reference URL, source surface ID/role, event names and uniquely owned canonical fields
+- correlation keys, closed privacy flags, known gaps, fixture IDs and input/projection fixture hashes
 
-`cargo test -p contracts adapter_capability_v1` validates schema and field ownership. The adapter-specific
-replay command tests every declared fixture; `cargo run -p xtask -- adapters verify --oldest-newest --check`
-fails on a missing product bound, stale fixture digest, duplicate primary field, unsupported mandatory signal or
-privacy/performance failure. Evidence is written only when the actual supported product versions are exercised.
+`cargo test -p agent-observability-contracts adapter_capability_v1` validates schema, field ownership and
+privacy closure. The Codex adapter suite verifies declared input/projection fixture hashes, exact replay output,
+bounded input, restart, rotation and privacy behavior. Cross-version/OS/profile execution, foreground deadline
+and load evidence remain future support gates; the manifest therefore
+marks Codex `0.150.1` as `experimental`, not generally supported.
 
 | Scenario | Required evidence |
 | --- | --- |
@@ -79,7 +76,8 @@ version and rerun when an official surface or schema changes.
 
 ## Current planning assumptions
 
-This matrix records source availability, not implementation completion. The current JavaScript baseline has
-partial Codex and Claude Code file/hook adapters. The Rust adapters, native telemetry receivers, Cursor support,
-capability manifest and performance evidence are roadmap work and must not be reported as released before their
-version gates pass.
+The JavaScript baseline retains partial Codex and Claude Code file/hook adapters. The Rust Codex adapter now
+implements a bounded canonical handoff parser, primary/supplement dedupe, fixed-code disposition persistence,
+fixture hash validation and CLI-to-private-store replay. It does not implement an OTLP HTTP/gRPC receiver or
+foreground notify spool writer, and official documentation does not freeze concrete OTLP attribute keys.
+Claude Code/Cursor Rust adapters, cross-version verification and full performance evidence remain roadmap work.

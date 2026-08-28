@@ -4,7 +4,7 @@ use agent_observability_domain::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -12,8 +12,116 @@ pub const CONTRACT_MANIFEST: &str = include_str!("../../../contracts/contract-ma
 pub const DURABLE_RECORD_SCHEMA: &str =
     include_str!("../../../contracts/durable-record-v1.schema.json");
 pub const REPORT_DTO_SCHEMA: &str = include_str!("../../../contracts/report-dto-v1.schema.json");
+pub const ADAPTER_CAPABILITY_V1: &str = include_str!("../capabilities/adapter-capability-v1.yaml");
 pub const DURABLE_RECORD_VERSION: &str = "agent_observability.v1";
 pub const REPORT_DTO_VERSION: &str = "agent_observability.report.v1";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct AdapterCapabilityManifestV1 {
+    pub schema_version: String,
+    pub entries: Vec<AdapterCapabilityEntryV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct AdapterCapabilityEntryV1 {
+    pub adapter_family: String,
+    pub support_status: String,
+    pub product_versions: ProductVersionRangeV1,
+    pub verified_at: String,
+    pub official_references: Vec<String>,
+    pub surfaces: Vec<AdapterSurfaceV1>,
+    pub correlation_keys: Vec<String>,
+    pub privacy: AdapterPrivacyV1,
+    pub known_gaps: Vec<String>,
+    pub fixture_ids: Vec<String>,
+    pub fixture_hashes: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct ProductVersionRangeV1 {
+    pub oldest: String,
+    pub newest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct AdapterSurfaceV1 {
+    pub id: String,
+    pub role: String,
+    pub events: Vec<String>,
+    pub owned_fields: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct AdapterPrivacyV1 {
+    pub content_fields_accepted: bool,
+    pub raw_identifiers_durable: bool,
+}
+
+impl AdapterCapabilityManifestV1 {
+    /// Parses the JSON-compatible YAML document and validates its closed invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractError::InvalidCapabilityManifest`] for malformed content, duplicate
+    /// ownership, unsupported roles, missing evidence, or privacy-open settings.
+    pub fn parse_and_validate(input: &str) -> Result<Self, ContractError> {
+        let manifest: Self =
+            serde_json::from_str(input).map_err(|_| ContractError::InvalidCapabilityManifest)?;
+        if manifest.schema_version != "adapter_capability.v1" || manifest.entries.is_empty() {
+            return Err(ContractError::InvalidCapabilityManifest);
+        }
+        for entry in &manifest.entries {
+            validate_capability_entry(entry)?;
+        }
+        Ok(manifest)
+    }
+}
+
+fn validate_capability_entry(entry: &AdapterCapabilityEntryV1) -> Result<(), ContractError> {
+    if entry.adapter_family.is_empty()
+        || !matches!(entry.support_status.as_str(), "experimental" | "supported")
+        || entry.product_versions.oldest.is_empty()
+        || entry.product_versions.newest.is_empty()
+        || entry.verified_at.is_empty()
+        || entry.official_references.is_empty()
+        || entry.surfaces.is_empty()
+        || entry.correlation_keys.is_empty()
+        || entry.fixture_ids.is_empty()
+        || entry.fixture_hashes.len() < 2
+        || entry.privacy.content_fields_accepted
+        || entry.privacy.raw_identifiers_durable
+    {
+        return Err(ContractError::InvalidCapabilityManifest);
+    }
+    if entry
+        .fixture_hashes
+        .values()
+        .any(|digest| digest.len() != 71 || !digest.starts_with("sha256:"))
+    {
+        return Err(ContractError::InvalidCapabilityManifest);
+    }
+    let mut ownership = BTreeSet::new();
+    let mut primary_count = 0_u8;
+    for surface in &entry.surfaces {
+        if surface.id.is_empty() || surface.events.is_empty() || surface.owned_fields.is_empty() {
+            return Err(ContractError::InvalidCapabilityManifest);
+        }
+        match surface.role.as_str() {
+            "primary" => primary_count = primary_count.saturating_add(1),
+            "supplement" => {}
+            _ => return Err(ContractError::InvalidCapabilityManifest),
+        }
+        for field in &surface.owned_fields {
+            if field.is_empty() || !ownership.insert(field) {
+                return Err(ContractError::InvalidCapabilityManifest);
+            }
+        }
+    }
+    if primary_count != 1 {
+        return Err(ContractError::InvalidCapabilityManifest);
+    }
+    Ok(())
+}
 
 pub const DURABLE_RECORD_FIELDS: &[&str] = &[
     "schema_version",
@@ -132,6 +240,67 @@ pub enum AgentSource {
     Cursor,
 }
 
+impl AgentSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude-code",
+            Self::Cursor => "cursor",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdapterDispositionKind {
+    Diagnostic,
+    Suppressed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdapterDispositionCode {
+    UnsupportedEvent,
+    UnsupportedEventVariant,
+    MissingCorrelation,
+    InvalidFieldType,
+    ContentEventIgnored,
+    PrimarySuperseded,
+    DuplicateObservation,
+}
+
+impl AdapterDispositionCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedEvent => "unsupported_event",
+            Self::UnsupportedEventVariant => "unsupported_event_variant",
+            Self::MissingCorrelation => "missing_correlation",
+            Self::InvalidFieldType => "invalid_field_type",
+            Self::ContentEventIgnored => "content_event_ignored",
+            Self::PrimarySuperseded => "primary_superseded",
+            Self::DuplicateObservation => "duplicate_observation",
+        }
+    }
+}
+
+impl AdapterDispositionKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Diagnostic => "diagnostic",
+            Self::Suppressed => "suppressed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceCheckpoint {
+    pub source: AgentSource,
+    pub source_generation: SourceGeneration,
+    pub previous_source_cursor: Option<SourceCursor>,
+    pub source_cursor: SourceCursor,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ObservationEvent {
     Session {
@@ -239,6 +408,36 @@ pub fn project_durable_record(
     };
     record.validate()?;
     Ok(record)
+}
+
+/// Returns a stable hash of the privacy-safe durable projection for one source observation.
+///
+/// # Errors
+///
+/// Returns [`ContractError`] when the observation cannot be projected or sanitized.
+pub fn canonical_observation_payload_hash(
+    observation: &SourceObservation,
+) -> Result<String, ContractError> {
+    let state = DomainSpanState {
+        trace_id: observation.trace_id.clone(),
+        span_id: observation.span_id.clone(),
+        parent_span_id: observation.parent_span_id.clone(),
+        kind: kind_for_event(&observation.event),
+        lifecycle: observation.lifecycle,
+        correlation: observation.correlation.clone(),
+        timing: observation.timing,
+        token_usage: observation.token_usage,
+    };
+    let record = sanitize_durable_record(&project_durable_record(observation, &state)?)?;
+    let encoded = serde_json::to_vec(&record).map_err(|_| ContractError::InvalidDurableHeader)?;
+    let mut hash = Sha256::new();
+    hash.update(encoded);
+    let mut output = String::from("sha256:");
+    for byte in hash.finalize() {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    Ok(output)
 }
 
 fn project_attributes(observation: &SourceObservation, state: &DomainSpanState) -> AttributesV1 {
@@ -1317,6 +1516,7 @@ pub enum ContractError {
     InvalidCostStatus,
     NonFiniteNumber,
     NegativeMetric,
+    InvalidCapabilityManifest,
     InvalidManifestLine(usize),
     MissingManifestKey(&'static str),
     ManifestMismatch {
@@ -1347,6 +1547,9 @@ impl Display for ContractError {
             Self::InvalidCostStatus => formatter.write_str("invalid cost status"),
             Self::NonFiniteNumber => formatter.write_str("contract numbers must be finite"),
             Self::NegativeMetric => formatter.write_str("durable metrics must not be negative"),
+            Self::InvalidCapabilityManifest => {
+                formatter.write_str("invalid adapter capability manifest")
+            }
             Self::InvalidManifestLine(line) => {
                 write!(formatter, "invalid contract manifest line {line}")
             }
@@ -1372,8 +1575,8 @@ impl Error for ContractError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTRACT_MANIFEST, ContractManifest, DURABLE_RECORD_SCHEMA, REPORT_DTO_SCHEMA,
-        redact_sensitive_text,
+        ADAPTER_CAPABILITY_V1, AdapterCapabilityManifestV1, CONTRACT_MANIFEST, ContractManifest,
+        DURABLE_RECORD_SCHEMA, REPORT_DTO_SCHEMA, redact_sensitive_text,
     };
 
     #[test]
@@ -1385,6 +1588,21 @@ mod tests {
         for schema in [DURABLE_RECORD_SCHEMA, REPORT_DTO_SCHEMA] {
             assert!(schema.contains("\"additionalProperties\": false"));
         }
+    }
+
+    #[test]
+    fn adapter_capability_v1_has_closed_ownership_and_privacy() {
+        let manifest = AdapterCapabilityManifestV1::parse_and_validate(ADAPTER_CAPABILITY_V1)
+            .expect("capability manifest validates");
+        let codex = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.adapter_family == "codex")
+            .expect("Codex capability exists");
+        assert_eq!(codex.support_status, "experimental");
+        assert_eq!(codex.product_versions.oldest, "0.150.1");
+        assert!(!codex.privacy.content_fields_accepted);
+        assert!(!codex.privacy.raw_identifiers_durable);
     }
 
     #[test]

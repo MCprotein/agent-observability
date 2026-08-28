@@ -3,8 +3,20 @@
 version = 4
 
 [[package]]
+name = "agent-observability-adapter-codex"
+version = "0.9.0"
+dependencies = [
+ "agent-observability-contracts",
+ "agent-observability-domain",
+ "agent-observability-local-store",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "agent-observability-application"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "agent-observability-contracts",
  "agent-observability-domain",
@@ -13,15 +25,16 @@ dependencies = [
 
 [[package]]
 name = "agent-observability-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
+ "agent-observability-adapter-codex",
  "agent-observability-contracts",
  "agent-observability-local-store",
 ]
 
 [[package]]
 name = "agent-observability-contracts"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "agent-observability-domain",
  "serde",
@@ -31,11 +44,11 @@ dependencies = [
 
 [[package]]
 name = "agent-observability-domain"
-version = "0.8.0"
+version = "0.9.0"
 
 [[package]]
 name = "agent-observability-local-store"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "agent-observability-application",
  "agent-observability-contracts",

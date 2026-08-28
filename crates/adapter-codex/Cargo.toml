@@ -1,17 +1,18 @@
 [package]
-name = "agent-observability-cli"
+name = "agent-observability-adapter-codex"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "agent-observability"
-path = "src/main.rs"
-
 [dependencies]
-agent-observability-adapter-codex = { path = "../adapter-codex" }
 agent-observability-contracts = { path = "../contracts" }
+agent-observability-domain = { path = "../domain" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.0"
+
+[dev-dependencies]
 agent-observability-local-store = { path = "../local-store" }
 
 [lints]
