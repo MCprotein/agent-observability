@@ -178,7 +178,9 @@ anti-corruption layer다.
   사용하며 source의 원문 오류 문자열이나 unknown metadata를 그대로 전달하지 않는다.
 - append/replay는 embedded transaction의 deterministic source observation key, stable event ID와 cursor로
   중복과 crash recovery를 통제한다.
-- 새 경로의 local artifact directory와 file은 private permission을 기본값으로 사용한다.
+- local artifact path의 상위 directory와 file은 각각 private permission `0700`과 `0600`이어야
+  한다. writer는 느슨한 기존 directory를 임의 변경하지 않고 쓰기를 거부하므로 호출자는 전용
+  artifact directory를 전달해야 한다.
   기존 v0.6 writer는 parity 대상이 되기 전에 이 조건을 충족해야 한다.
 - 손상된 trailing record와 schema migration 정책을 명시적으로 처리한다.
 

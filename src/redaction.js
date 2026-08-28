@@ -1,3 +1,5 @@
+import { hashOpaqueIdentifier } from "./identity.js";
+
 const DEFAULT_CONTENT_LOGGING = Object.freeze({
   prompts: false,
   outputs: false,
@@ -28,6 +30,7 @@ export function redactRecord(record, options = {}) {
   const result = structuredClone(record);
   const redactions = [];
 
+  sanitizeOpaqueIdentifiers(result, redactions);
   redactNode(result, [], redactions, contentLogging);
   sanitizeSpanDisplayFields(result, redactions);
 
@@ -39,6 +42,37 @@ export function redactRecord(record, options = {}) {
   };
 
   return result;
+}
+
+function sanitizeOpaqueIdentifiers(record, redactions) {
+  for (const key of ["trace_id", "span_id", "parent_span_id"]) {
+    if (record[key] === null || record[key] === undefined) {
+      continue;
+    }
+    const hashed = hashOpaqueIdentifier(record[key]);
+    if (hashed !== record[key]) {
+      record[key] = hashed;
+      redactions.push(key);
+    }
+  }
+
+  for (const key of [
+    "session_id",
+    "turn_id",
+    "request_id",
+    "call_id",
+    "permission_id",
+    "compaction_id",
+  ]) {
+    if (record.attributes?.[key] === undefined || record.attributes[key] === null) {
+      continue;
+    }
+    const hashed = hashOpaqueIdentifier(record.attributes[key]);
+    if (hashed !== record.attributes[key]) {
+      record.attributes[key] = hashed;
+      redactions.push(`attributes.${key}`);
+    }
+  }
 }
 
 function sanitizeSpanDisplayFields(record, redactions) {
@@ -58,9 +92,7 @@ function safeSpanName(record) {
     return `${redactText(record.agent?.name ?? "Agent", "agent.name")} session`;
   }
   if (record.span_kind === "turn") {
-    return record.attributes?.turn_id
-      ? `Turn ${redactText(String(record.attributes.turn_id), "turn_id")}`
-      : "Turn";
+    return "Turn";
   }
   if (record.span_kind === "llm.request") {
     return record.agent?.model

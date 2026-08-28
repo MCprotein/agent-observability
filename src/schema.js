@@ -33,7 +33,7 @@ const RECORD_KEYS = new Set([
   "redaction",
 ]);
 const INPUT_KEYS = new Set([...RECORD_KEYS].filter((key) => !["schema_version", "record_type"].includes(key)));
-const STATUS_KEYS = new Set(["code", "message"]);
+const STATUS_KEYS = new Set(["code"]);
 const AGENT_KEYS = new Set(["name", "version", "model"]);
 const PROJECT_KEYS = new Set(["name", "repo_path"]);
 const ATTRIBUTE_KEYS = new Set([
@@ -138,13 +138,6 @@ export function validateSpanRecord(record) {
   } else {
     rejectUnknownKeys(record.status, STATUS_KEYS, "status", errors);
     requireEnum(record.status, "code", STATUS_CODES, errors, "status.code");
-    if (
-      record.status.message !== undefined &&
-      record.status.message !== null &&
-      typeof record.status.message !== "string"
-    ) {
-      errors.push("status.message must be a string when present");
-    }
   }
 
   for (const key of ["agent", "project", "attributes", "metrics", "content", "redaction"]) {
@@ -196,6 +189,39 @@ export function validateSpanRecord(record) {
   return errors;
 }
 
+export function migrateLegacyV1Record(record) {
+  if (record?.schema_version !== SCHEMA_VERSION || record?.record_type !== "span") {
+    return record;
+  }
+
+  for (const key of ["status", "agent", "project", "attributes", "metrics", "content", "redaction"]) {
+    assertLegacyObject(record[key], key);
+  }
+  const migrated = pickKnown(record, RECORD_KEYS);
+  migrated.status = { code: record.status?.code ?? "unset" };
+  migrated.agent = pickKnown(record.agent, AGENT_KEYS);
+  migrated.project = pickKnown(record.project, PROJECT_KEYS);
+  migrated.attributes = pickKnown(record.attributes, ATTRIBUTE_KEYS);
+  migrated.metrics = pickKnown(record.metrics, METRIC_KEYS);
+  migrated.content = pickKnown(record.content, CONTENT_KEYS);
+  migrated.redaction = pickKnown(record.redaction, REDACTION_KEYS);
+  return migrated;
+}
+
+function assertLegacyObject(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Invalid legacy v1 record: ${label} must be an object`);
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error(`Invalid legacy v1 record: ${label} must be a plain object`);
+  }
+}
+
+function pickKnown(value, allowed) {
+  return Object.fromEntries(Object.entries(value).filter(([key]) => allowed.has(key)));
+}
+
 function assertKnownKeys(object, allowed, label) {
   const errors = [];
   if (!object || typeof object !== "object" || Array.isArray(object)) {
@@ -238,7 +264,6 @@ function normalizeStatus(status) {
 
   return {
     code: status.code ?? "unset",
-    ...(status.message ? { message: status.message } : {}),
   };
 }
 

@@ -266,6 +266,53 @@ test("normalizes Claude Code hook payloads without raw tool output", () => {
   assert.equal(JSON.stringify(records).includes("raw output should not be copied"), false);
 });
 
+test("keeps multiple Claude Code permission events without source IDs", () => {
+  const records = claudeCodeRecordsFromEvents([
+    { hook_event_name: "PermissionRequest", session_id: "permission-session", turn_id: "permission-turn", source_index: 1 },
+    { hook_event_name: "PermissionRequest", session_id: "permission-session", turn_id: "permission-turn", source_index: 2 },
+  ]);
+  const permissions = records.filter((record) => record.span_kind === "permission");
+
+  assert.equal(permissions.length, 2);
+  assert.notEqual(permissions[0].span_id, permissions[1].span_id);
+  assert.deepEqual(
+    permissions.map((record) => record.attributes.permission_id),
+    ["permission:1", "permission:2"],
+  );
+});
+
+test("rejects unstable and conflicting Claude Code permission identities", () => {
+  assert.throws(
+    () => claudeCodeRecordsFromEvents([
+      { hook_event_name: "PermissionRequest", session_id: "s", turn_id: "t", timestamp: "2026-01-01T00:00:00Z" },
+      { hook_event_name: "PermissionDenied", session_id: "s", turn_id: "t", timestamp: "2026-01-01T00:00:00Z" },
+    ]),
+    /requires a stable source identity/,
+  );
+  assert.throws(
+    () => claudeCodeRecordsFromEvents([
+      { hook_event_name: "PermissionRequest", session_id: "s", turn_id: "t" },
+    ]),
+    /requires a stable source identity/,
+  );
+  assert.throws(
+    () => claudeCodeRecordsFromEvents([
+      { hook_event_name: "PermissionRequest", session_id: "s", turn_id: "t", permission_id: "p" },
+      { hook_event_name: "PermissionDenied", session_id: "s", turn_id: "t", permission_id: "p" },
+    ]),
+    /Conflicting adapter records/,
+  );
+});
+
+test("keeps delimiter-bearing Claude Code identity tuples distinct", () => {
+  const records = claudeCodeRecordsFromEvents([
+    { hook_event_name: "PostToolUse", session_id: "s", turn_id: "a:b", tool_use_id: "c" },
+    { hook_event_name: "PostToolUse", session_id: "s", turn_id: "a", tool_use_id: "b:c" },
+  ]);
+  const tools = records.filter((record) => record.span_kind === "tool.execution");
+  assert.equal(new Set(tools.map((record) => record.span_id)).size, 2);
+});
+
 test("appends Claude Code spans to the local event log without raw content", async () => {
   const dir = await mkdtemp(join(tmpdir(), "agent-observability-claude-code-"));
   const logPath = join(dir, "events.jsonl");

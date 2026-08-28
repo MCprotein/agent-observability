@@ -95,8 +95,10 @@ test("builds report data with summaries and without raw content", () => {
   assert.equal(data.cost.status, "estimated");
   assert.equal(data.cost.rate_table.version, "report-test");
   assert.deepEqual(data.filters.repos, ["agent-observability"]);
-  assert.deepEqual(data.filters.sessions, ["session-report-1"]);
-  assert.deepEqual(data.filters.turns, ["turn-report-1"]);
+  assert.equal(data.filters.sessions.length, 1);
+  assert.match(data.filters.sessions[0], /^id:sha256:[a-f0-9]{64}$/);
+  assert.equal(data.filters.turns.length, 1);
+  assert.match(data.filters.turns[0], /^id:sha256:[a-f0-9]{64}$/);
 
   const serialized = JSON.stringify(data);
   assert.equal(serialized.includes("RAW_PROMPT_SECRET"), false);

@@ -1,5 +1,7 @@
 import { appendEventLogRecords } from "../event-log.js";
+import { composeSpanId, stableSourceIdentity } from "../identity.js";
 import { createSpanRecord } from "../schema.js";
+import { isDeepStrictEqual } from "node:util";
 
 const SESSION_EVENT_TYPES = new Set(["session.started", "session_start", "session.created"]);
 const TURN_EVENT_TYPES = new Set(["turn.started", "turn_start", "turn"]);
@@ -29,7 +31,7 @@ export function parseCodexSessionJsonl(text) {
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean)
-    .map((line, index) => parseJsonLine(line, index + 1));
+    .map((line, index) => ({ ...parseJsonLine(line, index + 1), source_index: index + 1 }));
 }
 
 export function codexRecordsFromEvents(events, options = {}) {
@@ -110,7 +112,7 @@ export async function appendCodexSessionJsonl(eventLogPath, sessionJsonl, option
 function sessionRecord(event, state) {
   state.sessionId = event.session_id ?? event.sessionId ?? state.sessionId;
   state.traceId = event.trace_id ?? event.traceId ?? state.traceId;
-  state.sessionSpanId = `codex-session:${state.sessionId}`;
+  state.sessionSpanId = composeSpanId("codex-session", state.sessionId);
   state.currentModel = event.model ?? state.currentModel;
 
   return createSpanRecord({
@@ -145,7 +147,7 @@ function ensureTurnRecord(event, state) {
   state.currentTurnId = turnId;
   state.currentModel = event.model ?? state.currentModel;
 
-  const spanId = `codex-turn:${state.sessionId}:${turnId}`;
+  const spanId = composeSpanId("codex-turn", state.sessionId, turnId);
   if (state.turnSpans.has(spanId)) {
     return state.turnSpans.get(spanId);
   }
@@ -182,8 +184,8 @@ function llmRecord(event, state) {
 
   return createSpanRecord({
     trace_id: state.traceId,
-    span_id: `codex-llm:${state.sessionId}:${turnId}:${requestId}`,
-    parent_span_id: `codex-turn:${state.sessionId}:${turnId}`,
+    span_id: composeSpanId("codex-llm", state.sessionId, turnId, requestId),
+    parent_span_id: composeSpanId("codex-turn", state.sessionId, turnId),
     span_kind: "llm.request",
     name: event.model ?? state.currentModel ? `Codex LLM ${event.model ?? state.currentModel}` : "Codex LLM request",
     start_time_unix_ms: timestampMs(event.timestamp, event.start_time_unix_ms),
@@ -222,19 +224,23 @@ function llmRecord(event, state) {
 function toolRecord(event, state) {
   const turnId = turnIdFromEvent(event, state);
   const callId = event.call_id ?? event.tool_call_id ?? event.id ?? `tool:${nextSequence(state)}`;
-  const toolKey = `${turnId}:${callId}`;
+  const toolKey = composeSpanId("tool-key", turnId, callId);
   const incomingToolName = event.tool_name ?? event.name;
   if (incomingToolName) {
     state.toolNamesByCallId.set(toolKey, incomingToolName);
   }
 
   const toolName = incomingToolName ?? state.toolNamesByCallId.get(toolKey) ?? "tool";
-  const phaseSuffix = event.phase ? `:${event.phase}` : "";
-
   return createSpanRecord({
     trace_id: state.traceId,
-    span_id: `codex-tool:${state.sessionId}:${turnId}:${callId}${phaseSuffix}`,
-    parent_span_id: `codex-turn:${state.sessionId}:${turnId}`,
+    span_id: composeSpanId(
+      "codex-tool",
+      state.sessionId,
+      turnId,
+      callId,
+      ...(event.phase ? [event.phase] : []),
+    ),
+    parent_span_id: composeSpanId("codex-turn", state.sessionId, turnId),
     span_kind: "tool.execution",
     name: toolName,
     start_time_unix_ms: timestampMs(event.timestamp, event.start_time_unix_ms),
@@ -263,12 +269,12 @@ function toolRecord(event, state) {
 
 function permissionRecord(event, state) {
   const turnId = turnIdFromEvent(event, state);
-  const permissionId = event.permission_id ?? event.id ?? event.type ?? "permission";
+  const permissionId = event.permission_id ?? event.id ?? stableSourceIdentity(event, "permission");
 
   return createSpanRecord({
     trace_id: state.traceId,
-    span_id: `codex-permission:${state.sessionId}:${turnId}:${permissionId}`,
-    parent_span_id: `codex-turn:${state.sessionId}:${turnId}`,
+    span_id: composeSpanId("codex-permission", state.sessionId, turnId, permissionId),
+    parent_span_id: composeSpanId("codex-turn", state.sessionId, turnId),
     span_kind: "permission",
     name: event.type ?? "Codex permission event",
     start_time_unix_ms: timestampMs(event.timestamp, event.start_time_unix_ms),
@@ -327,6 +333,7 @@ function normalizeCodexEvent(event, state) {
     envelope_type: envelopeType,
     source: "codex.session_jsonl",
     timestamp: event.timestamp ?? payload.timestamp ?? payload.started_at ?? payload.completed_at,
+    source_index: event.source_index,
   });
 
   if (envelopeType === "session_meta") {
@@ -548,12 +555,15 @@ function metricNumber(value) {
 }
 
 function uniqueBySpanId(records) {
-  const seen = new Set();
+  const seen = new Map();
   const unique = [];
   for (const record of records) {
-    if (!seen.has(record.span_id)) {
-      seen.add(record.span_id);
+    const previous = seen.get(record.span_id);
+    if (!previous) {
+      seen.set(record.span_id, record);
       unique.push(record);
+    } else if (record.span_kind !== "agent.session" && !isDeepStrictEqual(previous, record)) {
+      throw new Error(`Conflicting adapter records for span_id ${record.span_id}`);
     }
   }
   return unique;

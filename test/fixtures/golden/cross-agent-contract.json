@@ -99,9 +99,18 @@
     "reasoningOutputTokens": 10,
     "estimatedCost": 0.001118,
     "costStatus": "estimated",
-    "sessionsFilter": ["golden-claude", "golden-codex"],
-    "turnsFilter": ["turn-claude", "turn-codex"],
-    "traceIds": ["codex:golden-codex", "claude-code:golden-claude"],
+    "sessionsFilter": [
+      "id:sha256:118dd9da522133ccb49909f7799729afb08b30af4a468db704431743b66986d7",
+      "id:sha256:177eb75276c51ae6dbe8f202f93dfa1becf969e195b38512745754083c99bf6d"
+    ],
+    "turnsFilter": [
+      "id:sha256:985ad7b74961ae33c5ef59a56780bd95601c0a4f999dcb94646bc0e23199aaeb",
+      "id:sha256:f49289cdeb433353f08a4c6ad9f9d701a430af0e550de1fa3e233f170eb41bd3"
+    ],
+    "traceIds": [
+      "id:sha256:78f5b7e69f24f356e0bbb3ec4316504caed0e8d42bb5025a7a6c2d0c641cb73a",
+      "id:sha256:920abbc0bddae67b7cd570e3b03af649270b4ff5fc566665e39831016e5bcc20"
+    ],
     "spanAgents": ["codex", "codex", "codex", "claude-code", "claude-code", "claude-code"]
   }
 }
