@@ -6,10 +6,10 @@
 
 ## Current and target stack
 
-현재 `v0.10.0`은 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
-보존하면서 experimental Rust Codex와 Claude Code adapter를 제공한다. Rust 경로는 closed contract,
-deterministic lifecycle reduction, topology validation, pricing/report projection, bounded Codex
-및 Claude Code handoff와 private embedded transaction을 구현한다. SQLite `local_state.v2`가 source cursor,
+현재 `v0.11.0`은 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
+보존하면서 experimental Rust Codex, Claude Code와 Cursor adapter를 제공한다. Rust 경로는 closed contract,
+deterministic lifecycle reduction, topology validation, pricing/report projection, bounded product handoff와
+private embedded transaction을 구현한다. SQLite `local_state.v2`가 source cursor,
 stable observation, current reduced record, adapter disposition과 profile-neutral delivery outcome의
 정본이며 JSONL은 정본에서 재생성하는 projection이다. Team envelope, outbox와 network는 활성
 계약이 아니다.
@@ -85,8 +85,8 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
-v0.10.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
-`crates/adapter-claude-code`,
+v0.11.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
+`crates/adapter-claude-code`, `crates/adapter-cursor`,
 `crates/application`, `crates/local-store`, `crates/cli`로 나뉜다. domain은 외부 형식을
 모르고, contracts는 transient
 source와 durable/report DTO 경계를 소유한다. application은 pricing과 report projection을,
@@ -191,7 +191,7 @@ anti-corruption layer다.
   기다리지 않는다. File fallback은 persisted cursor와 source generation으로 incrementally reconcile한다.
 - 제품별 공식 source 우선순위와 지원 evidence는
   [`ADAPTER_COMPATIBILITY.md`](ADAPTER_COMPATIBILITY.md)를 따른다.
-- 현재 Codex adapter 입력은 private regular JSONL file로 제한하며 최대 1 MiB, 4096 record,
+- 현재 Rust adapter 입력은 private regular JSONL file로 제한하며 최대 1 MiB, 4096 record,
   record당 64 KiB다. group/other permission이나 symbolic link는 거부한다. 이 parser를 foreground
   hook에서 직접 실행하는 계약은 아니며 native receiver/spool writer는 별도 release gate다.
 
