@@ -81,4 +81,5 @@ adapters implement bounded canonical handoff parsers, fixed source precedence, c
 fixture hash validation and CLI-to-private-store replay. Claude Code uses documented OTel events as primary,
 hooks only for lifecycle, and does not parse the explicitly internal transcript format. Neither adapter includes
 an OTLP HTTP/gRPC receiver or foreground spool writer. Cursor Rust support, cross-version execution and full
-performance evidence remain roadmap work.
+performance evidence remain roadmap work. The current private file handoff reader is supported only on Unix;
+other platforms fail closed until equivalent no-follow, identity and permission evidence exists.

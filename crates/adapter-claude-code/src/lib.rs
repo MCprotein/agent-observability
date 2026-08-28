@@ -100,6 +100,7 @@ pub enum AdapterError {
     InvalidJson,
     InvalidSchema,
     InvalidCursorSequence,
+    UnsupportedPlatform,
     InsecurePermissions,
     SymbolicLink,
     InvalidFileType,
@@ -118,6 +119,7 @@ impl Display for AdapterError {
             Self::InvalidJson => "Claude Code handoff contains invalid JSON",
             Self::InvalidSchema => "Claude Code handoff schema is unsupported",
             Self::InvalidCursorSequence => "Claude Code handoff cursor sequence is invalid",
+            Self::UnsupportedPlatform => "Claude Code file handoff requires a Unix platform",
             Self::InsecurePermissions => "Claude Code handoff permissions are too broad",
             Self::SymbolicLink => "Claude Code handoff must not be a symbolic link",
             Self::InvalidFileType => "Claude Code handoff must be a regular file",
@@ -150,6 +152,9 @@ impl From<io::Error> for AdapterError {
 /// Returns [`AdapterError`] for unsafe paths, oversized input, malformed JSON, invalid cursor
 /// order, or invalid canonical identifiers.
 pub fn read_handoff_file(path: impl AsRef<Path>) -> Result<AdapterBatch, AdapterError> {
+    if !file_platform_supported() {
+        return Err(AdapterError::UnsupportedPlatform);
+    }
     let path = path.as_ref();
     let path_metadata = fs::symlink_metadata(path)?;
     if path_metadata.file_type().is_symlink() {
@@ -177,6 +182,16 @@ pub fn read_handoff_file(path: impl AsRef<Path>) -> Result<AdapterBatch, Adapter
 }
 
 #[cfg(unix)]
+const fn file_platform_supported() -> bool {
+    true
+}
+
+#[cfg(not(unix))]
+const fn file_platform_supported() -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     left.dev() == right.dev() && left.ino() == right.ino()
@@ -184,7 +199,7 @@ fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 
 #[cfg(not(unix))]
 fn same_file_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
-    true
+    false
 }
 
 #[cfg(unix)]
@@ -198,7 +213,7 @@ fn private_file_permissions(metadata: &fs::Metadata) -> Result<(), AdapterError>
 
 #[cfg(not(unix))]
 fn private_file_permissions(_metadata: &fs::Metadata) -> Result<(), AdapterError> {
-    Ok(())
+    Err(AdapterError::UnsupportedPlatform)
 }
 
 /// Parses the bounded handoff and returns content-free observations plus fixed-code diagnostics.

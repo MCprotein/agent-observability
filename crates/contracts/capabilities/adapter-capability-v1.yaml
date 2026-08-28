@@ -126,6 +126,7 @@
         "The compaction event has no dedicated identifier, so the handoff producer derives compaction_id from the source generation and event sequence",
         "Transcript format is internal and is not an adapter contract dependency",
         "Official hooks do not expose a distinct user-interrupt lifecycle event, so interrupted turns remain unknown rather than being inferred from StopFailure",
+        "The private file handoff reader is supported only on Unix until equivalent path identity and permission checks are implemented elsewhere",
         "Enhanced trace spans are beta and are not part of the minimum surface"
       ],
       "fixture_ids": [

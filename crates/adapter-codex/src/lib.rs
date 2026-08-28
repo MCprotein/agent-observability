@@ -587,9 +587,11 @@ fn canonical_model(attributes: &BTreeMap<String, Value>) -> Result<Option<String
     let Some(model) = optional_string(attributes, "model")? else {
         return Ok(None);
     };
-    Ok(KNOWN_CODEX_MODELS
-        .contains(&model.as_str())
-        .then_some(model))
+    if KNOWN_CODEX_MODELS.contains(&model.as_str()) {
+        Ok(Some(model))
+    } else {
+        Err(AdapterError::InvalidFieldType)
+    }
 }
 
 fn canonical_tool_name(
@@ -769,8 +771,8 @@ mod tests {
             "{\"schema_version\":\"codex_handoff.v1\",\"source_generation\":\"codex-0.150.1\",\"previous_cursor\":\"2\",\"cursor\":\"3\",\"surface\":\"otel_log\",\"received_at_unix_ms\":120,\"event_name\":\"codex.tool_decision\",\"attributes\":{\"conversation_id\":\"conversation-1\",\"turn_id\":\"turn-1\",\"call_id\":\"call-2\",\"decision\":\"RAW_DECISION_SECRET\"}}"
         );
         let batch = parse_handoff_jsonl(input).unwrap();
-        assert_eq!(batch.observations().count(), 2);
-        assert_eq!(batch.diagnostics().count(), 1);
+        assert_eq!(batch.observations().count(), 1);
+        assert_eq!(batch.diagnostics().count(), 2);
 
         let root = std::env::temp_dir().join(format!(
             "agent-observability-codex-metadata-{}",

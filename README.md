@@ -21,7 +21,7 @@ Rust workspace는 다음 책임으로 분리된다.
 - `crates/adapter-codex`: bounded Codex handoff parser, canonical correlation,
   primary/supplement dedupe, content-free diagnostic
 - `crates/adapter-claude-code`: Claude Code OTel/hook precedence, permission/compaction,
-  interrupted lifecycle와 out-of-order timestamp normalization
+  failed lifecycle, explicit interrupt gap과 out-of-order timestamp normalization
 - `crates/application`: pricing policy와 privacy-safe report DTO projection
 - `crates/local-store`: private SQLite authority, atomic cursor/event/current-record/disposition
   commit, replayable JSONL projection, `local_state.v1` -> `local_state.v2` migration
