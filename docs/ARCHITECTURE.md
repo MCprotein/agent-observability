@@ -6,13 +6,12 @@
 
 ## Current and target stack
 
-현재 `v0.6.1`은 Node.js 20+ ESM JavaScript로 구현되어 있다. 외부 runtime dependency 없이
-`node:test`를 사용하고, static HTML renderer는 HTML, CSS, JavaScript 문자열을 한 파일로
-생성한다. 이 구현은 동작과 fixture를 보존해야 하는 migration baseline이다.
-`v0.6.1`은 unknown metadata를 거부하고, token breakdown의 포함 의미를 rate table에 명시하며,
-local artifact를 private permission으로 생성한다. 다만 concurrent writer/crash atomicity,
-out-of-order lifecycle reduction과 topology validation은 Rust transaction/reducer 단계의 남은
-blocker다.
+현재 `v0.8.0`은 Node.js 20+ ESM JavaScript 구현을 migration baseline으로 보존하면서 Rust
+core를 별도 command path로 확장한다. JavaScript 기준선은 static HTML과 기존 adapter fixture를
+소유한다. Rust 경로는 closed contract, deterministic lifecycle reduction, topology validation,
+pricing/report projection과 private embedded transaction을 구현한다. SQLite가 source cursor,
+stable observation, current reduced record와 profile-neutral delivery outcome의 정본이며 JSONL은
+정본에서 재생성하는 projection이다. Team envelope, outbox와 network는 활성 계약이 아니다.
 
 목표 스택은 다음과 같다.
 
@@ -85,11 +84,12 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
-v0.7.0의 Rust foundation은 `crates/domain`, `crates/contracts`, `crates/cli`로 나뉜다.
-domain은 외부 형식을 모르고, contracts는 transient source와 durable/report DTO 경계를
-소유하며, CLI만 composition root 역할을 한다. `contracts/*.schema.json`은 closed wire
-contract이고 `contracts/contract-manifest.v1`은 현재 활성 schema path/version과
-`team_ingest=disabled` 경계를 runtime 중립적으로 고정한다.
+v0.8.0의 Rust core는 `crates/domain`, `crates/contracts`, `crates/application`,
+`crates/local-store`, `crates/cli`로 나뉜다. domain은 외부 형식을 모르고, contracts는 transient
+source와 durable/report DTO 경계를 소유한다. application은 pricing과 report projection을,
+local-store는 SQLite transaction과 JSONL projection을, CLI는 composition root를 소유한다.
+`contracts/*.schema.json`은 closed wire contract이고 `contracts/contract-manifest.v1`은 현재
+활성 schema path/version과 `team_ingest=disabled` 경계를 runtime 중립적으로 고정한다.
 
 ```text
 Agent logs, hooks and native telemetry
@@ -103,11 +103,13 @@ SourceObservation
         v
 Domain lifecycle state + application use cases
         |
-        +--> local transaction --> durable state + source cursor
-        |                         |--> DurableRecordVx --> JSONL / snapshot
-        |                         `--> TeamIngestEnvelopeV1 outbox --> optional collector (Future TODO)
+        +--> SQLite transaction --> source cursor + stable event + current record
+        |                              `--> DurableRecordVx --> JSONL / snapshot
         +--> pricing + aggregation --> ReportDto projector --> TypeScript static UI
         +--> topology validation --> diagnostic projector --> diagnostics
+
+Future TODO after promotion gate:
+domain/application state --> TeamIngestEnvelopeV1 --> bounded outbox --> optional collector
 ```
 
 경계 계약은 이름과 소유권을 분리한다.
@@ -123,6 +125,11 @@ Domain lifecycle state + application use cases
 - `ReportDtoVx`: 가격과 집계를 적용한 뒤 UI에 전달하는 별도의 versioned allowlist contract.
 - local transactional state: source generation/cursor, stable observation identity, canonical record와
   optional outbox를 원자적으로 소유하는 runtime authority. 외부 wire contract가 아니다.
+
+재시작 후 source를 정확히 이어 읽기 위해 raw source cursor는 private SQLite control state에만
+가역 보존한다. DB와 상위 directory는 각각 `0600`/`0700`을 강제한다. Source generation과 관측
+identifier는 해시하며, raw cursor는 `DurableRecordVx`, JSONL, report, diagnostic 또는 전송 경계에
+투영하지 않는다.
 
 `DurableRecordVx`와 `ReportDtoVx`는 각각 명시적인 fail-closed projector를 통과한다. 한쪽의
 privacy 검증을 다른 쪽이 암묵적으로 상속한다고 가정하지 않는다. canonical이라는 표현은
@@ -147,14 +154,16 @@ Domain은 파일 시스템, JSONL, HTML, CLI, 특정 agent payload, 단가표 �
 Application은 use case와 순서를 소유한다.
 
 - source event normalization 실행
-- deterministic lifecycle reducer와 replay/idempotency 처리
-- source cursor, stable event identity, durable record와 optional outbox의 atomic commit orchestration
+- deterministic lifecycle reducer와 topology validation 순서
+- storage port가 보장해야 하는 replay/idempotency와 atomic commit 계약 정의
 - durable record와 report DTO의 독립된 privacy projection 요청
 - pricing policy를 통한 예상 비용 계산
 - report DTO 생성
 
 Application은 구체적인 파일 writer나 agent parser를 직접 생성하지 않고 좁은 port에
 의존한다. 한 use case가 parsing, storage, UI formatting을 동시에 소유하지 않는다.
+SQLite adapter는 이 계약을 한 transaction으로 실행하고 JSONL materialization을 직렬화하지만,
+lifecycle/topology 의미와 privacy projection 규칙을 자체 구현하지 않는다.
 
 ### Inbound adapters
 
@@ -264,9 +273,12 @@ Parsing 이후의 normalization, reducer, privacy projection, cost calculation, 
 - provider-specific billable units or modifiers
 
 breakdown이 total에 포함되는지 여부는 source adapter와 pricing policy 계약에 명시한다.
-pricing identity는 최소 `provider`, canonical model ID, service tier, rate-table version을 가진다.
-alias와 snapshot은 구분하며, 장문 context 배율이나 cache-write 배율은 versioned pricing policy로
-표현한다. 수집된 billable dimension에 대응하는 규칙이 없으면 결과는 `estimated`가 아니라
+v1 parity contract의 pricing identity는 globally qualified canonical model ID와 rate-table version을
+사용한다. provider나 service tier에 따라 가격이 달라지는 경우에는 해당 차원을 canonical model
+ID/rate key에 포함해야 하며, 구분할 source evidence가 없으면 `estimated`를 반환하지 않는다.
+향후 schema가 provider와 service tier를 독립 field로 추가하면 migration fixture로 이 의미를
+보존한다. alias와 snapshot은 구분하며, 장문 context 배율이나 cache-write 배율은 versioned pricing
+policy로 표현한다. 수집된 billable dimension에 대응하는 규칙이 없으면 결과는 `estimated`가 아니라
 `incomplete` 또는 `unknown`이어야 한다.
 
 모델 호환성은 모델명을 인식하는 것만 뜻하지 않는다. fixture는 token semantics, inherited model

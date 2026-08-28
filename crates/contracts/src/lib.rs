@@ -1,7 +1,9 @@
 use agent_observability_domain::{
-    CorrelationIds, LifecycleState, ObservationId, SourceCursor, SourceGeneration, SpanId,
-    SpanKind, StatusCode, Timing, TokenUsage, TraceId,
+    CorrelationIds, DomainSpanState, LifecycleState, ObservationId, SourceCursor, SourceGeneration,
+    SpanId, SpanKind, StatusCode, Timing, TokenUsage, TraceId,
 };
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -43,6 +45,86 @@ pub const REPORT_DTO_FIELDS: &[&str] = &[
 ];
 pub const REDACTION_RECORD_FIELDS: [&str; 3] = ["applied", "count", "fields"];
 
+mod span_kind_serde {
+    use super::SpanKind;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S>(value: &SpanKind, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match value {
+            SpanKind::Workstream => "workstream",
+            SpanKind::AgentSession => "agent.session",
+            SpanKind::Turn => "turn",
+            SpanKind::LlmRequest => "llm.request",
+            SpanKind::ToolExecution => "tool.execution",
+            SpanKind::Permission => "permission",
+            SpanKind::Compaction => "compaction",
+        })
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<SpanKind, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "workstream" => Ok(SpanKind::Workstream),
+            "agent.session" => Ok(SpanKind::AgentSession),
+            "turn" => Ok(SpanKind::Turn),
+            "llm.request" => Ok(SpanKind::LlmRequest),
+            "tool.execution" => Ok(SpanKind::ToolExecution),
+            "permission" => Ok(SpanKind::Permission),
+            "compaction" => Ok(SpanKind::Compaction),
+            value => Err(serde::de::Error::unknown_variant(
+                value,
+                &[
+                    "workstream",
+                    "agent.session",
+                    "turn",
+                    "llm.request",
+                    "tool.execution",
+                    "permission",
+                    "compaction",
+                ],
+            )),
+        }
+    }
+}
+
+mod status_code_serde {
+    use super::StatusCode;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S>(value: &StatusCode, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match value {
+            StatusCode::Unset => "unset",
+            StatusCode::Ok => "ok",
+            StatusCode::Error => "error",
+        })
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<StatusCode, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "unset" => Ok(StatusCode::Unset),
+            "ok" => Ok(StatusCode::Ok),
+            "error" => Ok(StatusCode::Error),
+            value => Err(serde::de::Error::unknown_variant(
+                value,
+                &["unset", "ok", "error"],
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentSource {
     Codex,
@@ -76,6 +158,7 @@ pub enum ObservationEvent {
 pub struct SourceObservation {
     pub source: AgentSource,
     pub source_generation: SourceGeneration,
+    pub previous_source_cursor: Option<SourceCursor>,
     pub source_cursor: SourceCursor,
     pub observation_id: ObservationId,
     pub trace_id: TraceId,
@@ -88,7 +171,461 @@ pub struct SourceObservation {
     pub token_usage: TokenUsage,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// Projects transient source data and domain state into the durable, privacy-safe contract.
+///
+/// Only identifiers, lifecycle metadata, bounded classifications, and token counts cross this
+/// boundary. Source payloads are intentionally not represented by [`SourceObservation`].
+///
+/// # Errors
+///
+/// Returns [`ContractError`] when identity fields disagree or a numeric value cannot be projected
+/// exactly into the JSON number contract.
+pub fn project_durable_record(
+    observation: &SourceObservation,
+    state: &DomainSpanState,
+) -> Result<DurableRecordV1, ContractError> {
+    if observation.trace_id != state.trace_id
+        || observation.span_id != state.span_id
+        || observation.parent_span_id != state.parent_span_id
+        || state.kind != kind_for_event(&observation.event)
+    {
+        return Err(ContractError::ProjectionIdentityMismatch);
+    }
+
+    let (_, name, model, project) = event_projection(&observation.event);
+    let attributes = project_attributes(observation, state);
+    let record = DurableRecordV1 {
+        schema_version: DURABLE_RECORD_VERSION.into(),
+        record_type: "span".into(),
+        trace_id: observation.trace_id.as_str().into(),
+        span_id: observation.span_id.as_str().into(),
+        parent_span_id: observation
+            .parent_span_id
+            .as_ref()
+            .map(|id| id.as_str().into()),
+        span_kind: state.kind,
+        name: name.into(),
+        start_time_unix_ms: exact_json_integer(state.timing.start_unix_ms)?,
+        end_time_unix_ms: state
+            .timing
+            .end_unix_ms
+            .map(exact_json_integer)
+            .transpose()?,
+        status: StatusV1 {
+            code: status_for_lifecycle(state.lifecycle),
+        },
+        agent: AgentV1 {
+            name: Some(source_name(observation.source).into()),
+            version: None,
+            model: model.map(str::to_owned),
+        },
+        project: ProjectV1 {
+            name: project.map(str::to_owned),
+            repo_path: None,
+        },
+        attributes,
+        metrics: metrics_from_usage(&state.token_usage)?,
+        content: ContentV1::default(),
+        redaction: RedactionV1 {
+            applied: true,
+            count: 4,
+            fields: vec![
+                "prompt".into(),
+                "output".into(),
+                "tool_input".into(),
+                "tool_output".into(),
+            ],
+        },
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+fn project_attributes(observation: &SourceObservation, state: &DomainSpanState) -> AttributesV1 {
+    let (event_type, _, _, _) = event_projection(&observation.event);
+    let mut attributes = AttributesV1 {
+        source: Some(ScalarValueV1::String(
+            source_name(observation.source).into(),
+        )),
+        event_type: Some(ScalarValueV1::String(event_type.into())),
+        session_id: scalar_id(
+            state
+                .correlation
+                .session_id
+                .as_ref()
+                .map(agent_observability_domain::SessionId::as_str),
+        ),
+        turn_id: scalar_id(
+            state
+                .correlation
+                .turn_id
+                .as_ref()
+                .map(agent_observability_domain::TurnId::as_str),
+        ),
+        request_id: scalar_id(
+            state
+                .correlation
+                .request_id
+                .as_ref()
+                .map(agent_observability_domain::RequestId::as_str),
+        ),
+        call_id: scalar_id(
+            state
+                .correlation
+                .operation_id
+                .as_ref()
+                .map(agent_observability_domain::OperationId::as_str),
+        ),
+        permission_id: scalar_id(
+            state
+                .correlation
+                .permission_id
+                .as_ref()
+                .map(agent_observability_domain::PermissionId::as_str),
+        ),
+        compaction_id: scalar_id(
+            state
+                .correlation
+                .compaction_id
+                .as_ref()
+                .map(agent_observability_domain::CompactionId::as_str),
+        ),
+        ..AttributesV1::default()
+    };
+    match &observation.event {
+        ObservationEvent::ToolOperation { tool_name, phase } => {
+            attributes.tool_name = scalar_string(tool_name.as_deref());
+            attributes.phase = scalar_string(phase.as_deref());
+        }
+        ObservationEvent::Permission { decision } => {
+            attributes.decision = scalar_string(decision.as_deref());
+        }
+        ObservationEvent::Compaction { trigger } => {
+            attributes.trigger = scalar_string(trigger.as_deref());
+        }
+        ObservationEvent::Session { .. }
+        | ObservationEvent::Turn
+        | ObservationEvent::ModelRequest { .. } => {}
+    }
+    attributes
+}
+
+impl DurableRecordV1 {
+    /// Projects an observation through the closed privacy boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractError`] when the observation and reduced state disagree or cannot be
+    /// represented by the durable JSON contract.
+    pub fn from_observation(
+        observation: &SourceObservation,
+        state: &DomainSpanState,
+    ) -> Result<Self, ContractError> {
+        project_durable_record(observation, state)
+    }
+}
+
+fn scalar_id(value: Option<&str>) -> Option<ScalarValueV1> {
+    value.map(|id| ScalarValueV1::String(id.into()))
+}
+
+/// Returns the stable privacy projection for an opaque identifier.
+#[must_use]
+pub fn hash_opaque_identifier(value: &str) -> String {
+    const PREFIX: &str = "id:sha256:";
+    if value.starts_with(PREFIX) {
+        return value.into();
+    }
+    let mut hash = Sha256::new();
+    hash.update(value.as_bytes());
+    let mut output = String::from(PREFIX);
+    for byte in hash.finalize() {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+/// Applies the mandatory durable privacy boundary to a v1 record.
+///
+/// # Errors
+///
+/// Returns [`ContractError`] when the sanitized record violates the closed wire contract.
+pub fn sanitize_durable_record(input: &DurableRecordV1) -> Result<DurableRecordV1, ContractError> {
+    let mut record = input.clone();
+    let mut fields = Vec::new();
+    hash_record_id(&mut record.trace_id, "trace_id", &mut fields);
+    hash_record_id(&mut record.span_id, "span_id", &mut fields);
+    if let Some(parent) = &mut record.parent_span_id {
+        hash_record_id(parent, "parent_span_id", &mut fields);
+    }
+    sanitize_optional_text(&mut record.agent.name, "agent.name", &mut fields);
+    sanitize_optional_text(&mut record.agent.version, "agent.version", &mut fields);
+    sanitize_optional_text(&mut record.agent.model, "agent.model", &mut fields);
+    sanitize_optional_text(&mut record.project.name, "project.name", &mut fields);
+    sanitize_optional_text(
+        &mut record.project.repo_path,
+        "project.repo_path",
+        &mut fields,
+    );
+    sanitize_attributes(&mut record.attributes, &mut fields);
+    let safe_name = redact_sensitive_text(&record.name, "name");
+    if safe_name != record.name {
+        record.name = safe_name;
+        fields.push("name".into());
+    }
+    for (present, field) in [
+        (record.content.prompt.is_some(), "content.prompt"),
+        (record.content.output.is_some(), "content.output"),
+        (record.content.tool_input.is_some(), "content.tool_input"),
+        (record.content.tool_output.is_some(), "content.tool_output"),
+    ] {
+        if present {
+            fields.push(field.into());
+        }
+    }
+    record.content = ContentV1::default();
+    record.redaction.applied = record.redaction.applied || !fields.is_empty();
+    record.redaction.count = record
+        .redaction
+        .count
+        .saturating_add(u64::try_from(fields.len()).unwrap_or(u64::MAX));
+    record.redaction.fields.extend(fields);
+    record.redaction.fields.sort();
+    record.redaction.fields.dedup();
+    record.validate()?;
+    Ok(record)
+}
+
+fn hash_record_id(value: &mut String, field: &str, fields: &mut Vec<String>) {
+    let hashed = hash_opaque_identifier(value);
+    if hashed != *value {
+        *value = hashed;
+        fields.push(field.into());
+    }
+}
+
+fn sanitize_optional_text(value: &mut Option<String>, key: &str, fields: &mut Vec<String>) {
+    let Some(current) = value else {
+        return;
+    };
+    let safe = redact_sensitive_text(current, key);
+    if safe != *current {
+        *current = safe;
+        fields.push(key.into());
+    }
+}
+
+fn sanitize_scalar(value: &mut Option<ScalarValueV1>, key: &str, fields: &mut Vec<String>) {
+    let Some(ScalarValueV1::String(current)) = value else {
+        return;
+    };
+    let safe = if matches!(
+        key,
+        "session_id" | "turn_id" | "request_id" | "call_id" | "permission_id" | "compaction_id"
+    ) {
+        hash_opaque_identifier(current)
+    } else {
+        redact_sensitive_text(current, key)
+    };
+    if safe != *current {
+        *current = safe;
+        fields.push(format!("attributes.{key}"));
+    }
+}
+
+fn sanitize_attributes(attributes: &mut AttributesV1, fields: &mut Vec<String>) {
+    sanitize_scalar(&mut attributes.source, "source", fields);
+    sanitize_scalar(&mut attributes.event_type, "event_type", fields);
+    sanitize_scalar(&mut attributes.envelope_type, "envelope_type", fields);
+    sanitize_scalar(&mut attributes.session_id, "session_id", fields);
+    sanitize_scalar(&mut attributes.turn_id, "turn_id", fields);
+    sanitize_scalar(&mut attributes.request_id, "request_id", fields);
+    sanitize_scalar(&mut attributes.call_id, "call_id", fields);
+    sanitize_scalar(&mut attributes.tool_name, "tool_name", fields);
+    sanitize_scalar(&mut attributes.phase, "phase", fields);
+    sanitize_scalar(&mut attributes.exit_code, "exit_code", fields);
+    sanitize_scalar(&mut attributes.sandbox, "sandbox", fields);
+    sanitize_scalar(&mut attributes.approval, "approval", fields);
+    sanitize_scalar(&mut attributes.permission_id, "permission_id", fields);
+    sanitize_scalar(&mut attributes.decision, "decision", fields);
+    sanitize_scalar(&mut attributes.command_kind, "command_kind", fields);
+    sanitize_scalar(&mut attributes.compaction_id, "compaction_id", fields);
+    sanitize_scalar(&mut attributes.trigger, "trigger", fields);
+}
+
+/// Redacts secret-bearing or path-bearing free text without retaining the sensitive fragment.
+#[must_use]
+pub fn redact_sensitive_text(value: &str, key: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let normalized_whitespace = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    let key = key.to_ascii_lowercase();
+    let sensitive_key = [
+        "authorization",
+        "cookie",
+        "credential",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "access_key",
+        "private_key",
+        "refresh_token",
+        "session_key",
+    ]
+    .iter()
+    .any(|candidate| key.contains(candidate));
+    let secret_assignment = [
+        "authorization",
+        "cookie",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "id_token",
+        "api_key",
+        "api-key",
+        "access_token",
+        "refresh_token",
+    ]
+    .iter()
+    .any(|candidate| lower.contains(candidate))
+        && (lower.contains('=') || lower.contains(':'));
+    if sensitive_key
+        || secret_assignment
+        || value.chars().any(char::is_control)
+        || [
+            "authorization:",
+            "authorization=",
+            "cookie:",
+            "cookie=",
+            "password=",
+            "password:",
+            "passwd=",
+            "secret=",
+            "secret:",
+            "api_key=",
+            "api-key=",
+            "access_token=",
+            "refresh_token=",
+            "private key",
+        ]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+        || normalized_whitespace.contains("bearer ")
+    {
+        return "[redacted]".into();
+    }
+    let sensitive_extension = std::path::Path::new(&lower)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| matches!(extension, "pem" | "key"));
+    if lower == ".env"
+        || lower.starts_with(".env.")
+        || lower.contains("/.env")
+        || sensitive_extension
+        || lower.contains(".pem ")
+        || lower.contains(".key ")
+        || lower.contains(".tfstate")
+        || lower.contains(".tfvars")
+        || (key.contains("path") && (value.contains('/') || value.contains('\\')))
+    {
+        return "[redacted path]".into();
+    }
+    value.into()
+}
+
+fn scalar_string(value: Option<&str>) -> Option<ScalarValueV1> {
+    value.map(|value| ScalarValueV1::String(value.into()))
+}
+
+fn source_name(source: AgentSource) -> &'static str {
+    match source {
+        AgentSource::Codex => "codex",
+        AgentSource::ClaudeCode => "claude-code",
+        AgentSource::Cursor => "cursor",
+    }
+}
+
+fn event_projection(
+    event: &ObservationEvent,
+) -> (&'static str, &'static str, Option<&str>, Option<&str>) {
+    match event {
+        ObservationEvent::Session { model, project } => {
+            ("session", "session", model.as_deref(), project.as_deref())
+        }
+        ObservationEvent::Turn => ("turn", "turn", None, None),
+        ObservationEvent::ModelRequest { model } => {
+            ("model_request", "llm.request", model.as_deref(), None)
+        }
+        ObservationEvent::ToolOperation { .. } => ("tool_operation", "tool.execution", None, None),
+        ObservationEvent::Permission { .. } => ("permission", "permission", None, None),
+        ObservationEvent::Compaction { .. } => ("compaction", "compaction", None, None),
+    }
+}
+
+fn kind_for_event(event: &ObservationEvent) -> SpanKind {
+    match event {
+        ObservationEvent::Session { .. } => SpanKind::AgentSession,
+        ObservationEvent::Turn => SpanKind::Turn,
+        ObservationEvent::ModelRequest { .. } => SpanKind::LlmRequest,
+        ObservationEvent::ToolOperation { .. } => SpanKind::ToolExecution,
+        ObservationEvent::Permission { .. } => SpanKind::Permission,
+        ObservationEvent::Compaction { .. } => SpanKind::Compaction,
+    }
+}
+
+fn status_for_lifecycle(lifecycle: LifecycleState) -> StatusCode {
+    match lifecycle {
+        LifecycleState::Observed | LifecycleState::Running => StatusCode::Unset,
+        LifecycleState::Completed => StatusCode::Ok,
+        LifecycleState::Failed | LifecycleState::Interrupted => StatusCode::Error,
+    }
+}
+
+fn metrics_from_usage(usage: &TokenUsage) -> Result<MetricsV1, ContractError> {
+    Ok(MetricsV1 {
+        input_tokens: usage.input.map(exact_json_integer).transpose()?,
+        output_tokens: usage.output.map(exact_json_integer).transpose()?,
+        cached_input_tokens: usage.cached_input.map(exact_json_integer).transpose()?,
+        cache_creation_input_tokens: usage
+            .cache_creation_input
+            .map(exact_json_integer)
+            .transpose()?,
+        reasoning_output_tokens: usage.reasoning_output.map(exact_json_integer).transpose()?,
+        total_tokens: usage.total.map(exact_json_integer).transpose()?,
+        total_input_tokens: usage.total_input.map(exact_json_integer).transpose()?,
+        total_output_tokens: usage.total_output.map(exact_json_integer).transpose()?,
+        total_cached_input_tokens: usage
+            .total_cached_input
+            .map(exact_json_integer)
+            .transpose()?,
+        total_reasoning_output_tokens: usage
+            .total_reasoning_output
+            .map(exact_json_integer)
+            .transpose()?,
+        total_accumulated_tokens: usage
+            .total_accumulated
+            .map(exact_json_integer)
+            .transpose()?,
+        context_window_tokens: usage.context_window.map(exact_json_integer).transpose()?,
+        ..MetricsV1::default()
+    })
+}
+
+fn exact_json_integer(value: u64) -> Result<f64, ContractError> {
+    const MAX_EXACT_JSON_INTEGER: u64 = (1_u64 << f64::MANTISSA_DIGITS) - 1;
+    if value > MAX_EXACT_JSON_INTEGER {
+        return Err(ContractError::IntegerPrecisionLoss);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let projected = value as f64;
+    Ok(projected)
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
 pub enum JsonValue {
     Null,
     Boolean(bool),
@@ -98,94 +635,147 @@ pub enum JsonValue {
     Object(BTreeMap<String, Self>),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
 pub enum ScalarValueV1 {
     Boolean(bool),
     Number(f64),
     String(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StatusV1 {
+    #[serde(with = "status_code_serde")]
     pub code: StatusCode,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_path: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttributesV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub event_type: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub envelope_type: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub call_id: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub approval: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_id: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub command_kind: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_id: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<ScalarValueV1>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_output_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_input_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_output_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_cached_input_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_reasoning_output_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_accumulated_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens_before: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens_after: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<f64>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContentV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_input: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_output: Option<JsonValue>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RedactionV1 {
     pub applied: bool,
     pub count: u64,
     pub fields: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableRecordV1 {
-    pub schema_version: &'static str,
-    pub record_type: &'static str,
+    pub schema_version: String,
+    pub record_type: String,
     pub trace_id: String,
     pub span_id: String,
     pub parent_span_id: Option<String>,
+    #[serde(with = "span_kind_serde")]
     pub span_kind: SpanKind,
     pub name: String,
     pub start_time_unix_ms: f64,
@@ -249,7 +839,9 @@ impl DurableRecordV1 {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReportSummaryV1 {
     pub generated_spans: u64,
     pub sessions: u64,
@@ -267,111 +859,170 @@ pub struct ReportSummaryV1 {
     pub estimated_cost: f64,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportFiltersV1 {
     pub repos: Vec<String>,
     pub sessions: Vec<String>,
     pub turns: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CostComponentV1 {
     pub tokens: f64,
     pub rate_per_1m: f64,
     pub estimated_cost: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CostDetailV1 {
     pub assumption: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub incomplete_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unknown_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub semantic_errors: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub components: BTreeMap<String, CostComponentV1>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CostEstimateV1 {
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub rate_table: RateTableRefV1,
     pub cost: CostDetailV1,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateTableRefV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReportMetricsV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_output_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_input_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_output_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_cached_input_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_reasoning_output_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_accumulated_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<f64>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportAgentV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportAttributesV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub event_type: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub envelope_type: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub call_id: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<ScalarValueV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub approval: Option<ScalarValueV1>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReportSpanV1 {
     pub schema_version: String,
     pub trace_id: String,
     pub span_id: String,
     pub parent_span_id: Option<String>,
+    #[serde(with = "span_kind_serde")]
     pub kind: SpanKind,
     pub name: String,
+    #[serde(with = "status_code_serde")]
     pub status: StatusCode,
     pub start_time_unix_ms: f64,
     pub end_time_unix_ms: Option<f64>,
     pub repo: String,
     pub agent: ReportAgentV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
     pub attributes: ReportAttributesV1,
     pub metrics: ReportMetricsV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_cost: Option<f64>,
     pub cost: CostEstimateV1,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct TraceSummaryV1 {
     pub trace_id: String,
     pub repo: String,
@@ -386,9 +1037,11 @@ pub struct TraceSummaryV1 {
     pub turns: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReportDtoV1 {
-    pub schema_version: &'static str,
+    pub schema_version: String,
     pub generated_at: String,
     pub title: String,
     pub summary: ReportSummaryV1,
@@ -654,6 +1307,8 @@ impl ContractManifest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
+    ProjectionIdentityMismatch,
+    IntegerPrecisionLoss,
     EndBeforeStart,
     InvalidDurableHeader,
     MissingDurableIdentity,
@@ -674,6 +1329,12 @@ pub enum ContractError {
 impl Display for ContractError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ProjectionIdentityMismatch => {
+                formatter.write_str("source observation and domain state do not match")
+            }
+            Self::IntegerPrecisionLoss => {
+                formatter.write_str("integer cannot be represented exactly by the JSON contract")
+            }
             Self::EndBeforeStart => formatter.write_str("end time must not precede start time"),
             Self::InvalidDurableHeader => formatter.write_str("invalid durable record header"),
             Self::MissingDurableIdentity => {
@@ -710,7 +1371,10 @@ impl Error for ContractError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTRACT_MANIFEST, ContractManifest, DURABLE_RECORD_SCHEMA, REPORT_DTO_SCHEMA};
+    use super::{
+        CONTRACT_MANIFEST, ContractManifest, DURABLE_RECORD_SCHEMA, REPORT_DTO_SCHEMA,
+        redact_sensitive_text,
+    };
 
     #[test]
     fn shared_manifest_and_closed_schemas_match_release_boundary() {
@@ -721,5 +1385,23 @@ mod tests {
         for schema in [DURABLE_RECORD_SCHEMA, REPORT_DTO_SCHEMA] {
             assert!(schema.contains("\"additionalProperties\": false"));
         }
+    }
+
+    #[test]
+    fn secret_redaction_covers_generic_tokens_cookies_and_whitespace() {
+        for value in [
+            "token=RAW_SECRET",
+            "id_token: RAW_SECRET",
+            "Cookie: session=RAW_SECRET",
+            "Set-Cookie=RAW_SECRET",
+            "Bearer\tRAW_SECRET",
+        ] {
+            assert_eq!(redact_sensitive_text(value, "tool_name"), "[redacted]");
+        }
+        assert_eq!(
+            redact_sensitive_text("token budget", "tool_name"),
+            "token budget"
+        );
+        assert_eq!(redact_sensitive_text("value", "auth_token"), "[redacted]");
     }
 }

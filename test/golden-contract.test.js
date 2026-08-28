@@ -27,12 +27,15 @@ test("keeps Codex and Claude Code durable and report contracts in golden parity"
 
   assert.deepEqual(durableContract(codex), expected.durable.codex);
   assert.deepEqual(durableContract(claudeCode), expected.durable.claude_code);
+  assert.deepEqual(codex, expected.durable_full.codex);
+  assert.deepEqual(claudeCode, expected.durable_full.claude_code);
 
   const report = reportDataFromRecords([...codex, ...claudeCode], {
     generated_at: "2026-08-01T01:00:00.000Z",
     rate_table: goldenRateTable(),
   });
   assert.deepEqual(reportContract(report), expected.report);
+  assert.deepEqual(JSON.parse(JSON.stringify(report)), expected.report_full);
   assert.equal(JSON.stringify({ codex, claudeCode, report }).includes("RAW_GOLDEN_"), false);
 });
 

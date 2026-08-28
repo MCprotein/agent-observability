@@ -7,9 +7,9 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 `v0.7.0`은 JavaScript migration baseline 위에 독립 Rust CLI와 contract foundation을
-추가한다. local event log, Codex/Claude Code adapter, static HTML report, 예상 비용과
-privacy/redaction fixture는 JavaScript 기준선으로 유지된다.
+현재 `v0.8.0`은 JavaScript migration baseline 위에 독립 Rust core와 durable local I/O를
+추가한다. Codex/Claude Code adapter와 static HTML report는 JavaScript 기준선으로 유지되며,
+Rust 경로는 아직 agent source를 직접 수집하거나 report HTML을 생성하지 않는다.
 
 현재 구현 기술은 Node.js 20+ ESM JavaScript 기준선과 Rust 1.97 Cargo workspace다.
 Rust workspace는 다음 책임으로 분리된다.
@@ -17,6 +17,9 @@ Rust workspace는 다음 책임으로 분리된다.
 - `crates/domain`: opaque ID, span/status/lifecycle, token usage 의미
 - `crates/contracts`: complete transient `SourceObservation`, wire-compatible `DurableRecordV1`와
   `ReportDtoV1`, closed schema contract
+- `crates/application`: pricing policy와 privacy-safe report DTO projection
+- `crates/local-store`: private SQLite authority, atomic cursor/event/current-record commit,
+  replayable JSONL projection
 - `crates/cli`: Rust command path의 composition root
 - `contracts/*.schema.json`: JavaScript/Rust/향후 TypeScript가 공유하는 closed JSON Schema
 - `contracts/contract-manifest.v1`: schema path와 version/boundary index
@@ -67,8 +70,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p agent-observability-cli -- contracts
 ```
 
-`v0.7.0` Rust contract foundation과 독립 리뷰가 완료되었다. 다음 단계는 `v0.8.0`
-deterministic reducer와 durable I/O다. Cursor adapter는 공통 contract와 Rust core가 안정된 뒤
+`v0.8.0` Rust core와 durable local I/O는 구현 및 독립 리뷰가 완료되었다. 다음 단계는
+`v0.9.0` Rust Codex adapter이며 Cursor adapter는 공통 contract와 Rust core가 안정된 뒤
 추가한다.
 
 ## 아키텍처 요약
@@ -86,10 +89,13 @@ Codex / Claude Code
              |-> local JSONL -> JS report projection -> self-contained HTML
              `-> redacted JSON snapshot
 
-CURRENT v0.7 - IMPLEMENTED (Rust contract foundation)
+CURRENT v0.8 - IMPLEMENTED (Rust core and durable local I/O)
 
-Closed schemas + manifest -> domain + SourceObservation/DurableRecordV1/ReportDtoV1 -> Rust CLI
-JavaScript full schema conformance + golden fixture byte lock -> v0.8 Rust serialization parity
+Closed schemas + manifest -> deterministic domain reducer + fail-closed projectors
+        -> private SQLite authority (cursor + stable event + current record + not_applicable outcome)
+             `-> replayable JSONL current-record projection
+Pricing policy + aggregation -> ReportDtoV1
+Rust CLI -> contracts inspection / local storage health check
 No Node.js <-> Rust FFI or subprocess production path
 
 TARGET - PLANNED (Rust + TypeScript)
@@ -98,9 +104,9 @@ Agent logs/hooks, including planned Cursor support
         -> bounded local handoff + Rust inbound adapters
         -> SourceObservation (transient, never durable)
         -> domain lifecycle state and application use cases
-             |-> atomic local state: source cursor + record + optional outbox
-             |       |-> fail-closed DurableRecordVx -> JSONL / snapshot projection
-             |       `-> strict TeamIngestEnvelopeV1 -> optional collector (Future TODO)
+             |-> atomic local state: source cursor + record
+             |       `-> fail-closed DurableRecordVx -> JSONL / snapshot projection
+             |-> strict TeamIngestEnvelopeV1 -> optional collector (Future TODO only)
              |-> pricing + aggregation -> fail-closed projector -> ReportDtoVx
              |                                      -> TypeScript strict UI assets
              |                                      -> self-contained HTML
