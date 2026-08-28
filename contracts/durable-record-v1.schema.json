@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent_observability.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record_type", "trace_id", "span_id", "parent_span_id", "span_kind", "name", "start_time_unix_ms", "end_time_unix_ms", "status", "agent", "project", "attributes", "metrics", "content", "redaction"],
+  "properties": {
+    "schema_version": { "const": "agent_observability.v1" },
+    "record_type": { "const": "span" },
+    "trace_id": { "$ref": "#/$defs/id" },
+    "span_id": { "$ref": "#/$defs/id" },
+    "parent_span_id": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+    "span_kind": { "enum": ["workstream", "agent.session", "turn", "llm.request", "tool.execution", "permission", "compaction"] },
+    "name": { "type": "string", "minLength": 1 },
+    "start_time_unix_ms": { "type": "number" },
+    "end_time_unix_ms": { "type": ["number", "null"] },
+    "status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code"],
+      "properties": { "code": { "enum": ["unset", "ok", "error"] } }
+    },
+    "agent": { "$ref": "#/$defs/agent" },
+    "project": { "$ref": "#/$defs/project" },
+    "attributes": { "$ref": "#/$defs/attributes" },
+    "metrics": { "$ref": "#/$defs/metrics" },
+    "content": { "$ref": "#/$defs/content" },
+    "redaction": { "$ref": "#/$defs/redaction" }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1 },
+    "string": { "type": "string", "minLength": 1 },
+    "scalar": { "type": ["string", "number", "boolean"] },
+    "agent": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "name": { "$ref": "#/$defs/string" }, "version": { "$ref": "#/$defs/string" }, "model": { "$ref": "#/$defs/string" } }
+    },
+    "project": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "name": { "$ref": "#/$defs/string" }, "repo_path": { "$ref": "#/$defs/string" } }
+    },
+    "attributes": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "source": { "$ref": "#/$defs/scalar" }, "event_type": { "$ref": "#/$defs/scalar" }, "envelope_type": { "$ref": "#/$defs/scalar" },
+        "session_id": { "$ref": "#/$defs/scalar" }, "turn_id": { "$ref": "#/$defs/scalar" }, "request_id": { "$ref": "#/$defs/scalar" },
+        "call_id": { "$ref": "#/$defs/scalar" }, "tool_name": { "$ref": "#/$defs/scalar" }, "phase": { "$ref": "#/$defs/scalar" },
+        "exit_code": { "$ref": "#/$defs/scalar" }, "sandbox": { "$ref": "#/$defs/scalar" }, "approval": { "$ref": "#/$defs/scalar" },
+        "permission_id": { "$ref": "#/$defs/scalar" }, "decision": { "$ref": "#/$defs/scalar" }, "command_kind": { "$ref": "#/$defs/scalar" },
+        "compaction_id": { "$ref": "#/$defs/scalar" }, "trigger": { "$ref": "#/$defs/scalar" }
+      }
+    },
+    "metrics": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "input_tokens": { "$ref": "#/$defs/metric" }, "output_tokens": { "$ref": "#/$defs/metric" }, "cached_input_tokens": { "$ref": "#/$defs/metric" },
+        "cache_creation_input_tokens": { "$ref": "#/$defs/metric" }, "reasoning_output_tokens": { "$ref": "#/$defs/metric" }, "total_tokens": { "$ref": "#/$defs/metric" },
+        "total_input_tokens": { "$ref": "#/$defs/metric" }, "total_output_tokens": { "$ref": "#/$defs/metric" }, "total_cached_input_tokens": { "$ref": "#/$defs/metric" },
+        "total_reasoning_output_tokens": { "$ref": "#/$defs/metric" }, "total_accumulated_tokens": { "$ref": "#/$defs/metric" }, "context_window_tokens": { "$ref": "#/$defs/metric" },
+        "input_tokens_before": { "$ref": "#/$defs/metric" }, "input_tokens_after": { "$ref": "#/$defs/metric" }, "latency_ms": { "$ref": "#/$defs/metric" }, "duration_ms": { "$ref": "#/$defs/metric" }
+      }
+    },
+    "metric": { "type": "number", "minimum": 0 },
+    "content": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "prompt": {}, "output": {}, "tool_input": {}, "tool_output": {} }
+    },
+    "redaction": {
+      "type": "object", "additionalProperties": false,
+      "required": ["applied", "count", "fields"],
+      "properties": { "applied": { "type": "boolean" }, "count": { "type": "integer", "minimum": 0 }, "fields": { "type": "array", "items": { "type": "string" } } }
+    }
+  }
+}

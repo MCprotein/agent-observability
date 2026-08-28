@@ -7,12 +7,21 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 `v0.6.0`은 local event log foundation, Codex local adapter, static HTML report,
-rate table 기반 예상 비용 필드, privacy/redaction hardening 위에 Claude Code adapter를
-구현한다.
+현재 `v0.7.0`은 JavaScript migration baseline 위에 독립 Rust CLI와 contract foundation을
+추가한다. local event log, Codex/Claude Code adapter, static HTML report, 예상 비용과
+privacy/redaction fixture는 JavaScript 기준선으로 유지된다.
 
-현재 구현 기술은 Node.js 20+ ESM JavaScript와 `node:test`다. 이는 Rust migration 전의
-검증 기준선이며 목표 기술 스택은 다음과 같다.
+현재 구현 기술은 Node.js 20+ ESM JavaScript 기준선과 Rust 1.97 Cargo workspace다.
+Rust workspace는 다음 책임으로 분리된다.
+
+- `crates/domain`: opaque ID, span/status/lifecycle, token usage 의미
+- `crates/contracts`: complete transient `SourceObservation`, wire-compatible `DurableRecordV1`와
+  `ReportDtoV1`, closed schema contract
+- `crates/cli`: Rust command path의 composition root
+- `contracts/*.schema.json`: JavaScript/Rust/향후 TypeScript가 공유하는 closed JSON Schema
+- `contracts/contract-manifest.v1`: schema path와 version/boundary index
+
+목표 기술 스택은 다음과 같다.
 
 현재 JavaScript adapter는 전체 JSONL parsing과 순차 append를 포함하므로 foreground hook 성능
 sign-off 대상이 아니다. `v0.13.0`의 Rust end-to-end performance harness가 통과하기 전에는 사용자
@@ -52,10 +61,15 @@ sign-off 대상이 아니다. `v0.13.0`의 Rust end-to-end performance harness�
 
 ```bash
 npm test
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo run -p agent-observability-cli -- contracts
 ```
 
-`v0.6.1` correctness/contract freeze까지 완료되었다. 다음 단계는 `v0.7.0` Rust architecture
-foundation이다. Cursor adapter는 공통 contract와 Rust core가 안정된 뒤 추가한다.
+`v0.7.0` Rust contract foundation과 독립 리뷰가 완료되었다. 다음 단계는 `v0.8.0`
+deterministic reducer와 durable I/O다. Cursor adapter는 공통 contract와 Rust core가 안정된 뒤
+추가한다.
 
 ## 아키텍처 요약
 
@@ -64,7 +78,7 @@ AI coding agent 관측은 OS/network proxy로 모델 요청을 몰래 가로채�
 endpoint 설정을 조합하는 방식이 안전하다.
 
 ```text
-CURRENT v0.6 - IMPLEMENTED (Node.js ESM JavaScript)
+MIGRATION BASELINE v0.6 - IMPLEMENTED (Node.js ESM JavaScript)
 
 Codex / Claude Code
         -> JS adapters and correlation
@@ -72,9 +86,10 @@ Codex / Claude Code
              |-> local JSONL -> JS report projection -> self-contained HTML
              `-> redacted JSON snapshot
 
-MIGRATION
+CURRENT v0.7 - IMPLEMENTED (Rust contract foundation)
 
-Golden fixtures -> independent Rust CLI parity -> release-boundary cutover
+Closed schemas + manifest -> domain + SourceObservation/DurableRecordV1/ReportDtoV1 -> Rust CLI
+JavaScript full schema conformance + golden fixture byte lock -> v0.8 Rust serialization parity
 No Node.js <-> Rust FFI or subprocess production path
 
 TARGET - PLANNED (Rust + TypeScript)

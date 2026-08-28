@@ -1,0 +1,8 @@
+manifest_version=agent_observability.contract_manifest.v1
+source_observation=transient
+domain_state=agent_observability.domain.v1
+durable_record=agent_observability.v1
+report_dto=agent_observability.report.v1
+durable_schema=contracts/durable-record-v1.schema.json
+report_schema=contracts/report-dto-v1.schema.json
+team_ingest=disabled
