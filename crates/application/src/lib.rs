@@ -384,6 +384,16 @@ fn report_filters(spans: &[ReportSpanV1]) -> ReportFiltersV1 {
         repos: unique_sorted(spans.iter().map(|span| span.repo.clone())),
         sessions: unique_sorted(spans.iter().filter_map(|span| span.session_id.clone())),
         turns: unique_sorted(spans.iter().filter_map(|span| span.turn_id.clone())),
+        agents: unique_sorted(
+            spans
+                .iter()
+                .map(|span| span.agent.name.clone().unwrap_or_else(|| "unknown".into())),
+        ),
+        models: unique_sorted(
+            spans
+                .iter()
+                .map(|span| span.agent.model.clone().unwrap_or_else(|| "unknown".into())),
+        ),
     }
 }
 
@@ -638,6 +648,31 @@ pub fn estimate_cost_for_records(
         .into_iter()
         .map(|record| estimate_span_cost(record, Some(table)))
         .collect();
+    let aggregate = aggregate_costs(&costs);
+    CostEstimateV1 {
+        status: aggregate.status.into(),
+        reason: None,
+        estimated_cost: Some(round_currency(aggregate.amount)),
+        currency: Some(table.currency.clone()),
+        model: None,
+        rate_table: table_ref(table),
+        cost: CostDetailV1 {
+            assumption: table.assumption.clone(),
+            incomplete_count: Some(aggregate.incomplete),
+            unknown_count: Some(aggregate.unknown),
+            ..CostDetailV1::default()
+        },
+    }
+}
+
+struct AggregateCost {
+    status: &'static str,
+    amount: f64,
+    incomplete: u64,
+    unknown: u64,
+}
+
+fn aggregate_costs(costs: &[CostEstimateV1]) -> AggregateCost {
     let incomplete = costs
         .iter()
         .filter(|cost| cost.status == "incomplete")
@@ -654,23 +689,14 @@ pub fn estimate_cost_for_records(
     } else {
         "estimated"
     };
-    let amount = costs
-        .iter()
-        .map(|cost| cost.estimated_cost.unwrap_or(0.0))
-        .sum();
-    CostEstimateV1 {
-        status: status.into(),
-        reason: None,
-        estimated_cost: Some(round_currency(amount)),
-        currency: Some(table.currency.clone()),
-        model: None,
-        rate_table: table_ref(table),
-        cost: CostDetailV1 {
-            assumption: table.assumption.clone(),
-            incomplete_count: Some(incomplete),
-            unknown_count: Some(unknown),
-            ..CostDetailV1::default()
-        },
+    AggregateCost {
+        status,
+        amount: costs
+            .iter()
+            .map(|cost| cost.estimated_cost.unwrap_or(0.0))
+            .sum(),
+        incomplete,
+        unknown,
     }
 }
 

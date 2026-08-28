@@ -1,3 +1,4 @@
 .anamnesis/backups/
 .anamnesis/handoff/
 target/
+node_modules/

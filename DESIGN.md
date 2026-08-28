@@ -12,7 +12,7 @@ Evidence reviewed:
 - `docs/ARCHITECTURE.md`: Rust/TypeScript boundary and shared `ReportDtoVx`
 - `docs/TEAM_ARCHITECTURE.md`: tenancy, role, ingest, retention, quota and audit contracts
 - `docs/ADAPTER_COMPATIBILITY.md`: official adapter surfaces, precedence and support evidence
-- current JavaScript static report renderer; no TypeScript component system or screenshot baseline exists yet
+- v0.12 strict TypeScript static report renderer and desktop/mobile screenshot baseline
 
 This file is the product and UI source of truth. Backend and security decisions remain owned by the two
 architecture documents. Team screens described here are planned, not implemented.
@@ -187,8 +187,11 @@ Team management components:
 Stable dimensions are required for KPI rows, filters, trace trees, icon buttons and status cells so loading,
 unknown values and long identifiers do not shift the layout. Tables define column priority and minimum widths.
 
-TypeScript components do not calculate cost, privacy, aggregate or tenant scope. Rust application/projector
-code owns those decisions. Profile adapters own file-embedded DTO versus authenticated paginated query.
+TypeScript components do not calculate pricing, privacy, authoritative report aggregates or tenant scope. Rust
+application/projector code owns those decisions. The static UI may perform presentation-only filter reduction
+over sanitized spans and Rust-priced scalar/status fields; its completeness rule is locked to
+`contracts/report-view-reduction-v1.fixture.json` in Rust and TypeScript tests. Profile adapters own
+file-embedded DTO versus authenticated paginated query.
 
 ## Accessibility
 
@@ -251,6 +254,8 @@ implementation tutorials and keyboard-shortcut copy inside the main product surf
 - Rust owns domain, application, API, query, aggregate, privacy, cost and DTO projection.
 - Schema is generated or runtime-validated from a versioned source; Rust and TypeScript do not hand-copy it.
 - Standalone output remains one self-contained HTML file with no runtime network request.
+- Standalone scope is fixed local state. A team/workspace selector is forbidden until hosted query returns a
+  server-resolved authorized scope; agent and model remain report filter dimensions.
 - Team uses authenticated pagination and server-resolved scope; `TeamIngestEnvelopeV1` is never a UI DTO.
 - No analytics or font network dependency is required for the static artifact.
 - Tables and traces require virtualization or bounded pagination only after measured dataset thresholds.
@@ -258,6 +263,9 @@ implementation tutorials and keyboard-shortcut copy inside the main product surf
   support becomes a release contract at the TypeScript UI milestone.
 - Verification includes typecheck, unit/contract tests, file-open smoke, browser screenshots at desktop/mobile,
   keyboard/a11y checks, long-text overflow and empty/partial/offline/quota fixtures.
+- v0.12 provisions the Chromium revision paired with lockfile-pinned `playwright-core` in `npm test` pretest,
+  then runs file-open browser checks without a local server. It asserts desktop/mobile overflow, 44px mobile
+  controls, headings/landmarks, first-tab focus, filter/trace state, console errors and external network requests.
 
 ## Open questions
 

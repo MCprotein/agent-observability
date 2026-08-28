@@ -49,7 +49,10 @@
     },
     "filters": {
       "type": "object", "additionalProperties": false, "required": ["repos", "sessions", "turns"],
-      "properties": { "repos": { "$ref": "#/$defs/strings" }, "sessions": { "$ref": "#/$defs/strings" }, "turns": { "$ref": "#/$defs/strings" } }
+      "properties": {
+        "repos": { "$ref": "#/$defs/strings" }, "sessions": { "$ref": "#/$defs/strings" }, "turns": { "$ref": "#/$defs/strings" },
+        "agents": { "$ref": "#/$defs/strings" }, "models": { "$ref": "#/$defs/strings" }
+      }
     },
     "trace": {
       "type": "object", "additionalProperties": false,

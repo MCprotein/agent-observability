@@ -163,6 +163,8 @@ fn report_projection_is_ordered_aggregated_and_content_free() {
         sorted_hashes(&["session-1", "session-2"])
     );
     assert_eq!(report.filters.turns, sorted_hashes(&["turn-1", "turn-2"]));
+    assert_eq!(report.filters.agents, ["unknown"]);
+    assert_eq!(report.filters.models, ["gpt-test"]);
     assert_eq!(
         report
             .traces
@@ -321,6 +323,35 @@ fn parity_aggregates_states() {
     assert_eq!(cost.estimated_cost, Some(6.77));
     assert_eq!(cost.cost.incomplete_count, Some(1));
     assert_eq!(cost.cost.unknown_count, Some(1));
+}
+
+#[test]
+fn browser_view_cost_status_matches_the_versioned_contract() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../contracts/report-view-reduction-v1.fixture.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        fixture["schemaVersion"],
+        "agent_observability.report_view_reduction.v1"
+    );
+    for case in fixture["cases"].as_array().unwrap() {
+        let costs: Vec<_> = case["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|status| CostEstimateV1 {
+                status: status.as_str().unwrap().into(),
+                ..CostEstimateV1::default()
+            })
+            .collect();
+        assert_eq!(
+            aggregate_costs(&costs).status,
+            case["expectedStatus"].as_str().unwrap(),
+            "{}",
+            case["name"].as_str().unwrap()
+        );
+    }
 }
 #[test]
 fn parity_rejects_unsupported_units_and_rates() {

@@ -1066,6 +1066,10 @@ pub struct ReportFiltersV1 {
     pub repos: Vec<String>,
     pub sessions: Vec<String>,
     pub turns: Vec<String>,
+    #[serde(default)]
+    pub agents: Vec<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]

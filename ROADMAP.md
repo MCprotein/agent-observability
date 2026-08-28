@@ -69,7 +69,7 @@ gate를 통과해 추가한다.
 | v0.9.0 | Released | Rust Codex adapter | official-surface capability entry, primary/supplement source dedupe, bounded local handoff, canonical correlation, unsupported-event diagnostics, end-to-end CLI parity, independent architecture/code/test review |
 | v0.10.0 | Released | Rust Claude Code adapter | official-surface capability entry, telemetry/hook precedence, permission and compaction events, failed lifecycle, explicit interrupt gap, out-of-order fixture parity, independent architecture/code/test review |
 | v0.11.0 | Released | Rust Cursor adapter | official-hook capability entry, generation correlation, generic tool operation capture, specific shell/MCP/file hook diagnostic isolation, raw workspace/path/edit omission, shared contract parity, independent architecture/code/test review |
-| v0.12.0 | Planned | TypeScript static report UI | generated/validated report DTO types, repo/session/team/model filters, self-contained HTML smoke |
+| v0.12.0 | Planned | TypeScript static report UI | schema-generated and runtime-validated report DTO types, repo/session/agent/model filters, fixed local scope, versioned Rust/TypeScript view-reduction parity, self-contained file-open browser smoke |
 | v0.13.0 | Planned | Local-only release candidate | install/config path, bounded collection/flush/storage policy, singleton/crash/full-channel fixtures, adaptive load shedding, retention/large-log bounds, `cargo run -p xtask -- perf local --profile release --check` evidence for hook latency and CPU/RSS/disk/network budgets, docs and independent review |
 | v1.0.0 | Planned | Local-only stable | Codex/Claude Code/Cursor adapters, static report, cost estimate, privacy fixtures, docs and smoke checks all pass |
 

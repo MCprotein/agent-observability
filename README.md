@@ -7,10 +7,11 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 `v0.11.0`은 JavaScript migration baseline 위에 experimental Rust Codex, Claude Code, Cursor
-adapter를 제공한다. Rust 경로는 bounded canonical handoff JSONL에서 각 제품의 공식 telemetry 또는
-hook event를 정규화해 private local state에 저장한다. Native OTel endpoint와 foreground spool writer,
-Rust static HTML 생성은 아직 구현하지 않았다.
+현재 `v0.12.0` 개발선은 JavaScript migration baseline 위에 experimental Rust Codex, Claude Code,
+Cursor adapter와 strict TypeScript static report UI를 제공한다. Rust 경로는 bounded canonical
+handoff JSONL에서 각 제품의 공식 telemetry 또는 hook event를 정규화해 private local state에
+저장한다. Native OTel endpoint, foreground spool writer와 Rust HTML artifact assembler는 아직
+구현하지 않았다.
 
 현재 구현 기술은 Node.js 20+ ESM JavaScript 기준선과 Rust 1.97 Cargo workspace다.
 Rust workspace는 다음 책임으로 분리된다.
@@ -28,7 +29,9 @@ Rust workspace는 다음 책임으로 분리된다.
 - `crates/local-store`: private SQLite authority, atomic cursor/event/current-record/disposition
   commit, replayable JSONL projection, `local_state.v1` -> `local_state.v2` migration
 - `crates/cli`: Rust command path의 composition root
-- `contracts/*.schema.json`: JavaScript/Rust/향후 TypeScript가 공유하는 closed JSON Schema
+- `contracts/*.schema.json`: JavaScript/Rust/TypeScript가 공유하는 closed JSON Schema
+- `ui/report`: schema-generated DTO type, build-time standalone validator, strict TypeScript UI source
+- `src/report/generated`: self-contained HTML에 삽입하는 generated browser bundle
 - `contracts/contract-manifest.v1`: schema path와 version/boundary index
 
 목표 기술 스택은 다음과 같다.
@@ -81,7 +84,7 @@ cargo run -p agent-observability-cli -- cursor-ingest <private-store-dir> <priva
 ```
 
 `v0.11.0` Rust Cursor adapter는 구현, privacy/replay fixture 검증, 독립 아키텍처·코드·테스트
-review gate를 완료했다. 다음 release train은 `v0.12.0` TypeScript static report UI다.
+review gate를 완료했다. 현재 release train은 `v0.12.0` TypeScript static report UI다.
 
 ## 아키텍처 요약
 
@@ -526,16 +529,23 @@ agent-observability report \
 `report.html`은 외부 network 요청 없이 동작한다. 브라우저의 `file://` 제약을 피하기 위해
 JSONL을 따로 fetch하지 않고, 생성 시점에 필요한 데이터를 HTML 안에 주입한다.
 
-현재 v0.6.1 report에서 확인 가능한 화면:
+현재 v0.12.0 report에서 확인 가능한 화면:
 
-- repo/session/turn/text filter
+- repo/session/agent/model/text filter와 clear/filter-result state
 - trace 목록과 parent ID를 포함한 평면 span table
 - 현재 filter 결과의 token/cost/error KPI와 span별 latency/duration
+- filter KPI는 Rust가 산출한 sanitized span scalar/status만 축약하며 가격 규칙을 브라우저에서
+  다시 계산하지 않음
 - permission/compaction span의 평면 table 표시
+- malformed DTO의 fail-closed error state
 
-목표 TypeScript UI에서 추가할 화면:
+`npm test`의 `pretest`는 lockfile에 고정된 `playwright-core`와 맞는 Chromium을
+`npm run setup:browser`로 준비한다. 이어 별도 server 없이 임시 self-contained `file://` report를
+열어 desktop/mobile, keyboard, landmark, filter/trace interaction과 외부 request 부재를 검증한다.
 
-- model별 input/output/cached/reasoning token 집계와 model filter
+후속 report usability release에서 추가할 화면:
+
+- model별 input/output/cached/reasoning token breakdown
 - error, timeout, permission denied, compaction timeline
 - redaction count와 content logging 상태
 
@@ -751,7 +761,7 @@ Future TODO의 검증 대상이다.
 
 - local event log: turn/tool/span 구조 저장
 - report renderer: token, latency, error count 집계
-- static HTML report: 현재 repo/session/turn 조회, 목표 team/model 조회
+- static HTML report: repo/session/agent/model 조회와 고정 local scope
 - export artifact: 정적 HTML과 redacted JSON snapshot
 
 중앙화가 필요해지면 선택적으로 internal collector를 추가한다.
@@ -793,6 +803,7 @@ Future TODO의 검증 대상이다.
 5. TypeScript static report UI
    - versioned `ReportDtoVx` type 생성 또는 검증
    - self-contained HTML output과 브라우저 file-open smoke
+   - repo/session/agent/model filter와 malformed DTO fail-closed state
 
 Future TODO (버전 미확정):
 

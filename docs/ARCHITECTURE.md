@@ -62,8 +62,9 @@ write와 local report를 막아서는 안 된다.
 - persistence와 query는 항상 server-resolved tenant/workspace predicate를 포함한다. 다른
   tenant/workspace에 대한 ingest와 query는 deny하고 negative isolation fixture로 검증한다.
 - collector는 authorization, tenant isolation, deduplication, retention, audit와 query를 소유한다.
-- standalone과 team query는 모두 `ReportDtoVx`를 만들며 TypeScript UI가 집계 의미를 다시
-  구현하지 않는다.
+- standalone과 team query는 모두 `ReportDtoVx`를 만든다. TypeScript UI는 pricing, privacy,
+  completeness 또는 전체 report aggregate 의미를 다시 구현하지 않는다. UI filter 결과는 DTO의
+  sanitized span과 Rust가 이미 계산한 scalar/status만 축약하는 presentation-only view reduction이다.
 - collector 전송은 retry-safe outbound port다. 실패하면 bounded local queue에 남기되 local
   observability 경로는 계속 동작한다.
 - source cursor, stable event identity, local record와 optional team outbox는 한 local transaction으로
@@ -217,7 +218,8 @@ anti-corruption layer다.
 
 Web UI는 TypeScript `strict` mode를 사용한다.
 
-- UI는 집계 의미, privacy 판단, 가격 계산을 다시 구현하지 않는다.
+- UI는 privacy 판단과 가격 계산을 다시 구현하지 않는다. 전체 report aggregate는 Rust DTO를
+  authoritative source로 사용한다.
 - Rust가 생성한 sanitized report DTO만 입력으로 받는다.
 - DTO type은 versioned schema에서 생성하거나 runtime validation으로 확인한다.
 - 브라우저에서 외부 network 요청이나 상시 server 없이 동작한다.
@@ -227,6 +229,28 @@ Web UI는 TypeScript `strict` mode를 사용한다.
 - team profile의 hosted UI도 같은 `ReportDtoVx` schema와 UI component를 사용한다. transport와
   authentication/authorization만 profile별 composition root에서 달라진다. hosted query는
   server-resolved tenant/workspace scope 밖의 DTO를 생성할 수 없다.
+- standalone report는 team/workspace를 client-side field에서 추론하거나 filter로 제공하지 않는다.
+  local scope는 고정이며, hosted team scope는 Future TODO promotion 뒤 서버가 결정해 scope bar로
+  제공한다. v0.12 filter dimension은 sanitized repo, session, agent와 model이다.
+- v0.12 build는 canonical report schema에서 TypeScript declaration과 standalone validator를
+  생성하고 strict TypeScript UI를 하나의 browser IIFE로 bundle한다. HTML은 DTO와 bundle을 직접
+  삽입하며 runtime network request를 만들지 않는다.
+- v0.12 producer는 `filters.agents`와 `filters.models`를 출력한다. 두 필드는 additive optional v1
+  fields로 정의해 이전 v1 report를 계속 읽고, 이전 report에서는 UI가 sanitized span agent/model
+  값으로 filter option만 재구성한다.
+- filter KPI와 trace row는 현재 필터에 남은 sanitized span의 count/token/error와 이미 가격이 계산된
+  `estimatedCost`만 축약한다. cost completeness는 span별 `cost.status`를
+  `contracts/report-view-reduction-v1.fixture.json` 규칙으로 합치며 Rust와 generated TypeScript reducer가
+  같은 fixture를 검증한다. rate lookup, token overlap 또는 가격 계산은 브라우저에 존재하지 않는다.
+- additive optional field는 새 consumer가 이전 v1 report를 읽는 방향만 보장한다. closed v1 schema를
+  가진 N-1 consumer는 새 field를 거부할 수 있으므로 hosted/team transport를 도입하기 전에 contract
+  version negotiation 또는 새 DTO version이 필요하다. standalone artifact는 DTO와 동버전 bundle을
+  함께 조립한다.
+- `npm test`의 `pretest`는 lockfile에 고정된 `playwright-core`가 요구하는 Chromium revision을
+  `playwright-core install chromium --no-shell`로 준비한다. smoke는 해당 pinned executable만 사용해
+  self-contained `file://` artifact의 desktop/mobile overflow, mobile 44px target, heading/landmark,
+  keyboard focus, filter/trace interaction, console error와 외부 request 부재를 검증한다. 별도 web
+  server나 system browser 탐색은 사용하지 않는다.
 
 Framework는 필요성이 확인될 때 선택한다. TypeScript 자체가 목표이며 특정 UI framework는
 현재 architecture contract가 아니다. 사용자, route, component, interaction, accessibility와
