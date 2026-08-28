@@ -7,7 +7,7 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 `v0.12.0` 개발선은 JavaScript migration baseline 위에 experimental Rust Codex, Claude Code,
+현재 `v0.12.0`은 JavaScript migration baseline 위에 experimental Rust Codex, Claude Code,
 Cursor adapter와 strict TypeScript static report UI를 제공한다. Rust 경로는 bounded canonical
 handoff JSONL에서 각 제품의 공식 telemetry 또는 hook event를 정규화해 private local state에
 저장한다. Native OTel endpoint, foreground spool writer와 Rust HTML artifact assembler는 아직
@@ -83,8 +83,9 @@ cargo run -p agent-observability-cli -- claude-code-ingest <private-store-dir> <
 cargo run -p agent-observability-cli -- cursor-ingest <private-store-dir> <private-handoff.jsonl>
 ```
 
-`v0.11.0` Rust Cursor adapter는 구현, privacy/replay fixture 검증, 독립 아키텍처·코드·테스트
-review gate를 완료했다. 현재 release train은 `v0.12.0` TypeScript static report UI다.
+`v0.12.0` TypeScript static report UI는 schema/type generation, fail-closed validation, fixed local
+scope, filter reduction parity, pinned browser smoke와 독립 review gate를 완료했다. 현재 release
+train은 `v0.13.0` local-only release candidate다.
 
 ## 아키텍처 요약
 
