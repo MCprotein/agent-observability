@@ -754,7 +754,7 @@ fn network_bytes(pid: u32) -> Result<u64, String> {
                 );
             }
         }
-        return Ok(0);
+        Ok(0)
     }
     #[cfg(target_os = "macos")]
     {
