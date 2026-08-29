@@ -144,6 +144,7 @@ struct PressurePeaks {
     cpu_percent: f64,
     rss_kib: f64,
     disk_bytes: u64,
+    sample_count: usize,
     process_exit_observed: bool,
 }
 
@@ -185,9 +186,8 @@ impl DerefMut for ChildGuard {
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if self.0.try_wait().ok().flatten().is_none() {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        if let Err(error) = self.terminate() {
+            eprintln!("fallback worker cleanup failed: {error}");
         }
     }
 }
@@ -205,18 +205,22 @@ struct MetricSummary {
 #[derive(Clone, Debug)]
 struct HostEvidence {
     machine: String,
+    logical_cores: usize,
     filesystem: String,
     power_mode: String,
 }
 
 impl HostEvidence {
     fn collect(path: &Path) -> Result<Self, String> {
-        let logical_cores = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let logical_cores = thread::available_parallelism()
+            .map_err(|e| format!("inspect logical core count: {e}"))?
+            .get();
         Ok(Self {
             machine: format!(
                 "sanitized-{}-{logical_cores}-logical-core",
                 env::consts::ARCH
             ),
+            logical_cores,
             filesystem: filesystem_type(path)?,
             power_mode: power_mode()?,
         })
@@ -295,38 +299,48 @@ fn run(config: Config) -> Result<(), String> {
         }
     }
     let manifest_path = root.join("manifest.yaml");
-    fs::write(
-        &manifest_path,
-        render_manifest(config, &host, &results, &errors),
-    )
-    .map_err(|e| format!("write manifest: {e}"))?;
-    let pending_manifest =
-        fs::read_to_string(&manifest_path).map_err(|e| format!("read pending manifest: {e}"))?;
-    validate_manifest_shape(&pending_manifest)?;
-    let validation = validate_results(config, &results, &errors);
-    fs::remove_dir_all(&durable_root).map_err(|e| format!("remove durable evidence path: {e}"))?;
-    if let Err(error) = validation {
-        if config.profile == Profile::Smoke {
-            let _ = fs::remove_dir_all(&root);
-        }
-        return Err(format!(
-            "performance check failed; manifest: {}: {error}",
-            manifest_path.display()
-        ));
-    }
-    let finalized = fs::read_to_string(&manifest_path)
-        .map_err(|e| format!("read manifest: {e}"))?
-        .replace("status: pending-validation", "status: pass");
-    fs::write(&manifest_path, finalized).map_err(|e| format!("finalize manifest: {e}"))?;
-    if config.profile == Profile::Smoke {
-        fs::remove_dir_all(&root).map_err(|e| format!("remove smoke manifest: {e}"))?;
-    }
+    let completion = (|| -> Result<(), String> {
+        fs::write(
+            &manifest_path,
+            render_manifest(config, &host, &results, &errors),
+        )
+        .map_err(|e| format!("write manifest: {e}"))?;
+        let pending_manifest = fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("read pending manifest: {e}"))?;
+        validate_manifest_shape(&pending_manifest)?;
+        validate_results(config, &results, &errors).map_err(|error| {
+            format!(
+                "performance check failed; manifest: {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+        let finalized = pending_manifest.replace("status: pending-validation", "status: pass");
+        fs::write(&manifest_path, finalized).map_err(|e| format!("finalize manifest: {e}"))
+    })();
+    let durable_cleanup =
+        fs::remove_dir_all(&durable_root).map_err(|e| format!("remove durable evidence path: {e}"));
+    let smoke_cleanup = if config.profile == Profile::Smoke {
+        fs::remove_dir_all(&root).map_err(|e| format!("remove smoke manifest: {e}"))
+    } else {
+        Ok(())
+    };
+    combine_cleanup(combine_cleanup(completion, durable_cleanup), smoke_cleanup)?;
     println!(
         "manifest={}\nprofile={}\nstatus=pass",
         manifest_path.display(),
         profile_name(config.profile)
     );
     Ok(())
+}
+
+fn combine_cleanup(primary: Result<(), String>, cleanup: Result<(), String>) -> Result<(), String> {
+    match (primary, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            Err(format!("{error}; cleanup failed: {cleanup_error}"))
+        }
+    }
 }
 
 fn validate_protocol_contract() -> Result<(), String> {
@@ -455,14 +469,17 @@ fn execute_run_with_child(
         started,
         network_baseline,
     )?;
-    let mut drain_sampler = start_pressure_sampler(durable_dir.to_path_buf(), child.id(), true)?;
     drop(writer);
+    let mut drain_sampler = start_pressure_sampler(durable_dir.to_path_buf(), child.id(), true)?;
     let status_result = child.wait().map_err(|e| format!("wait for worker: {e}"));
     let drain_result = drain_sampler.stop();
     let status = status_result?;
     let drain_peaks = drain_result?;
     if !status.success() {
         return Err(format!("worker exited with {status}"));
+    }
+    if drain_peaks.sample_count == 0 {
+        return Err("drain pressure sampler produced no complete samples".into());
     }
     let durable_bytes = StorageBudget::allocated_tree_bytes(durable_dir)
         .map_err(|e| format!("measure allocated durable bytes: {e}"))?;
@@ -499,11 +516,10 @@ struct PressureSampler {
 
 impl Drop for PressureSampler {
     fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        if self.handle.is_some()
+            && let Err(error) = self.stop()
+        {
+            eprintln!("fallback pressure sampler cleanup failed: {error}");
         }
     }
 }
@@ -565,6 +581,7 @@ fn start_pressure_sampler(
                 StorageBudget::allocated_tree_bytes(&path)
                     .map_err(|e| format!("measure pressure disk peak: {e}"))?,
             );
+            peaks.sample_count = peaks.sample_count.saturating_add(1);
             if stop_rx.recv_timeout(Duration::from_millis(10)).is_ok() {
                 break;
             }
@@ -635,9 +652,10 @@ fn sample_phase(
     started: Instant,
     network_baseline: Option<u64>,
 ) -> Result<(), String> {
+    let previous_cpu = process_cpu_seconds(pid)?;
     let phase_started = Instant::now();
     let mut next_sample = phase_started + interval;
-    let mut previous_cpu = process_cpu_seconds(pid)?;
+    let mut previous_cpu = previous_cpu;
     let mut previous_at = phase_started;
     while phase_started.elapsed() < duration {
         sleep(next_sample.saturating_duration_since(Instant::now()));
@@ -699,6 +717,7 @@ fn worker() -> Result<(), String> {
                 .flush()
                 .map_err(|e| format!("flush worker response: {e}"))?;
         }
+        thread::sleep(Duration::from_millis(100));
         return Ok(());
     }
     let (ingress, receiver) = Ingress::new();
@@ -727,6 +746,7 @@ fn worker() -> Result<(), String> {
     drop(ingress);
     rx.recv()
         .map_err(|_| "local runtime drain stopped".to_string())??;
+    thread::sleep(Duration::from_millis(100));
     Ok(())
 }
 
@@ -1142,8 +1162,13 @@ fn power_mode() -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
         let root = Path::new("/sys/class/power_supply");
-        if !root.is_dir() {
-            return Ok("not-applicable-no-power-supply-interface".into());
+        match fs::metadata(root) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err("power supply interface is not a directory".into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok("not-applicable-no-power-supply-interface".into());
+            }
+            Err(error) => return Err(format!("inspect power supply interface: {error}")),
         }
         let mut has_battery = false;
         for entry in fs::read_dir(root).map_err(|e| format!("inspect power supplies: {e}"))? {
@@ -1209,7 +1234,7 @@ fn render_manifest(
         env::consts::OS,
         host.filesystem,
         host.power_mode,
-        thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        host.logical_cores,
         env!("CARGO_PKG_VERSION"),
         config.runs,
         config.runs,
@@ -1682,6 +1707,7 @@ mod tests {
     fn host() -> HostEvidence {
         HostEvidence {
             machine: "sanitized-test-4-logical-core".into(),
+            logical_cores: 4,
             filesystem: "testfs".into(),
             power_mode: "ac".into(),
         }
