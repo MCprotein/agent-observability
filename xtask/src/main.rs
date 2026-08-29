@@ -144,8 +144,7 @@ struct PressurePeaks {
     cpu_percent: f64,
     rss_kib: f64,
     disk_bytes: u64,
-    sample_count: usize,
-    sample_times: Vec<Instant>,
+    drain_sample_count: usize,
     process_exit_observed: bool,
 }
 
@@ -456,7 +455,8 @@ fn execute_run_with_child(
     )?;
     let cpu_before = process_cpu_seconds(child.id())?;
     let burst_started = Instant::now();
-    let mut burst_sampler = start_pressure_sampler(durable_dir.to_path_buf(), child.id(), false)?;
+    let mut burst_sampler =
+        start_pressure_sampler(durable_dir.to_path_buf(), child.id(), false, None)?;
     let mut latencies_us = Vec::with_capacity(config.burst);
     let mut rejected_events = 0_usize;
     let burst_result = (|| -> Result<(), String> {
@@ -511,11 +511,11 @@ fn execute_run_with_child(
         network_baseline,
     )?;
     drop(writer);
-    let mut drain_sampler = start_pressure_sampler(durable_dir.to_path_buf(), child.id(), true)?;
+    let drain_marker = enabled.then(|| path.join(".drain-active"));
+    let mut drain_sampler =
+        start_pressure_sampler(durable_dir.to_path_buf(), child.id(), true, drain_marker)?;
     read_worker_marker(&mut reader, "drain-start")?;
-    let drain_started = Instant::now();
     read_worker_marker(&mut reader, "drain-complete")?;
-    let drain_completed = Instant::now();
     let status_result = child.wait().map_err(|e| format!("wait for worker: {e}"));
     let drain_result = drain_sampler.stop();
     let status = status_result?;
@@ -523,12 +523,7 @@ fn execute_run_with_child(
     if !status.success() {
         return Err(format!("worker exited with {status}"));
     }
-    if enabled
-        && !drain_peaks
-            .sample_times
-            .iter()
-            .any(|sampled| *sampled >= drain_started && *sampled <= drain_completed)
-    {
+    if enabled && drain_peaks.drain_sample_count == 0 {
         return Err("drain pressure sampler produced no sample inside the drain boundary".into());
     }
     let durable_bytes = StorageBudget::allocated_tree_bytes(durable_dir)
@@ -594,6 +589,7 @@ fn start_pressure_sampler(
     path: PathBuf,
     pid: u32,
     allow_process_exit: bool,
+    drain_marker: Option<PathBuf>,
 ) -> Result<PressureSampler, String> {
     let (stop_tx, stop_rx) = mpsc::channel();
     let previous_cpu = process_cpu_seconds(pid)?;
@@ -610,6 +606,11 @@ fn start_pressure_sampler(
         let mut previous_cpu = previous_cpu;
         let mut previous_at = previous_at;
         loop {
+            let drain_active_before = drain_marker
+                .as_deref()
+                .map(marker_is_active)
+                .transpose()?
+                .unwrap_or(false);
             let current_cpu = match process_cpu_seconds(pid) {
                 Ok(value) => value,
                 Err(_) if allow_process_exit && !process_exists(pid) => {
@@ -631,8 +632,15 @@ fn start_pressure_sampler(
                 StorageBudget::allocated_tree_bytes(&path)
                     .map_err(|e| format!("measure pressure disk peak: {e}"))?,
             );
-            peaks.sample_count = peaks.sample_count.saturating_add(1);
-            peaks.sample_times.push(Instant::now());
+            if drain_active_before
+                && drain_marker
+                    .as_deref()
+                    .map(marker_is_active)
+                    .transpose()?
+                    .unwrap_or(false)
+            {
+                peaks.drain_sample_count = peaks.drain_sample_count.saturating_add(1);
+            }
             if stop_rx.recv_timeout(Duration::from_millis(10)).is_ok() {
                 break;
             }
@@ -643,6 +651,15 @@ fn start_pressure_sampler(
         stop: Some(stop_tx),
         handle: Some(handle),
     })
+}
+
+fn marker_is_active(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err("drain marker is not a regular file".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("inspect drain marker: {error}")),
+    }
 }
 
 fn interval_cpu_percent(previous: f64, current: f64, elapsed: Duration) -> f64 {
@@ -787,7 +804,7 @@ fn worker() -> Result<(), String> {
     }
     let (ingress, receiver) = Ingress::new();
     let (tx, rx) = mpsc::channel();
-    let drain_path = PathBuf::from(path);
+    let drain_path = PathBuf::from(&path);
     thread::spawn(move || {
         let _ = tx.send(drain(&receiver, &drain_path));
     });
@@ -813,8 +830,17 @@ fn worker() -> Result<(), String> {
     output
         .flush()
         .map_err(|e| format!("flush drain marker: {e}"))?;
-    rx.recv()
-        .map_err(|_| "local runtime drain stopped".to_string())??;
+    let drain_marker = PathBuf::from(&path).join(".drain-active");
+    fs::write(&drain_marker, []).map_err(|e| format!("create drain boundary: {e}"))?;
+    fs::set_permissions(&drain_marker, Permissions::from_mode(0o600))
+        .map_err(|e| format!("protect drain boundary: {e}"))?;
+    let drain_result = rx
+        .recv()
+        .map_err(|_| "local runtime drain stopped".to_string())?;
+    let marker_cleanup =
+        fs::remove_file(&drain_marker).map_err(|e| format!("remove drain boundary: {e}"));
+    drain_result?;
+    marker_cleanup?;
     writeln!(output, "drain-complete").map_err(|e| format!("write drain marker: {e}"))?;
     output
         .flush()
