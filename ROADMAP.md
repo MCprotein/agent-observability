@@ -12,7 +12,7 @@ PoC 순서를 설명하고, 실제 릴리즈 범위와 완료 기준은 이 문�
 - 활성 release train에서는 버전을 건너뛰지 않는다. 불가피하게 중단된 버전은
   `Superseded` 또는 `Blocked`로 표시하고 근거를 남긴다.
 - `Released`는 구현 완료만 뜻하지 않는다. 테스트, privacy/redaction 검증, 문서 갱신,
-  독립 리뷰 또는 동등한 검증 evidence가 있어야 한다.
+  작성 역할과 분리된 독립 리뷰 evidence가 있어야 한다.
 - patch version은 회귀 수정, 보안/정확성 보정, 문서 정합성, 기존 동작을 고정하는 fixture와
   migration contract처럼 사용자 기능 범위를 늘리지 않는 작업에만 쓴다.
 - minor version은 작고 검증 가능한 기능 단위다. adapter, report panel, cost field,
@@ -131,7 +131,7 @@ Team 항목은 collector endpoint 하나로 완료되지 않는다. `docs/TEAM_A
 3. 변경된 동작을 fixture나 smoke로 검증한다.
 4. privacy/redaction boundary가 약해지지 않았는지 확인한다.
 5. README와 ROADMAP의 상태를 같이 갱신한다.
-6. 독립 리뷰 또는 동등한 검증을 받고 blocking finding을 해결한다.
+6. 작성 역할과 분리된 독립 리뷰를 받고 blocking finding을 해결한다.
 7. 커밋 전에 금지된 외부 backend/vendor 참조가 들어오지 않았는지 검색한다.
 8. 완료 evidence가 모이고 PR이 mergeable이면 병합 직전에 상태를 `Released`로 바꾼다.
    병합이 완료되지 않으면 상태를 되돌린다.

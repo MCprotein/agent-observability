@@ -48,8 +48,14 @@ cargo fmt --all -- --check
 cargo test --workspace --no-fail-fast
 cargo clippy --workspace --all-targets -- -D warnings
 npm test
+git fetch origin main
+git diff --check origin/main...HEAD
 git diff --check
 ```
+
+GitHub의 `CI` workflow는 pull request에서 Rust 검사와 `npm test`를 다시 실행한다.
+CI 성공은 merge gate의 일부이며, 로컬에서만 실행할 수 있는 장시간 release performance
+검증을 대체하지 않는다.
 
 사용자 동작이나 성능 계약이 바뀌면 ROADMAP에 선언된 fixture, smoke, browser, performance
 검증도 추가한다. 생성된 evidence는 실제 실행 결과와 호환되는 protocol/manifest만
