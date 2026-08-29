@@ -144,9 +144,30 @@ struct PressurePeaks {
     cpu_percent: f64,
     rss_kib: f64,
     disk_bytes: u64,
+    process_exit_observed: bool,
 }
 
 struct ChildGuard(Child);
+
+impl ChildGuard {
+    fn terminate(&mut self) -> Result<(), String> {
+        if self
+            .0
+            .try_wait()
+            .map_err(|e| format!("inspect worker during cleanup: {e}"))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.0
+            .kill()
+            .map_err(|e| format!("terminate worker during cleanup: {e}"))?;
+        self.0
+            .wait()
+            .map_err(|e| format!("join worker during cleanup: {e}"))?;
+        Ok(())
+    }
+}
 
 impl Deref for ChildGuard {
     type Target = Child;
@@ -333,6 +354,25 @@ fn execute_run(
     fs::set_permissions(&path, Permissions::from_mode(0o700))
         .map_err(|e| format!("protect run artifact directory: {e}"))?;
     let mut child = ChildGuard(spawn_worker(&path, enabled)?);
+    let result = execute_run_with_child(config, enabled, run, durable_dir, &path, &mut child);
+    if let Err(error) = result {
+        child
+            .terminate()
+            .map_err(|cleanup| format!("{error}; worker cleanup failed: {cleanup}"))?;
+        return Err(error);
+    }
+    result
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_run_with_child(
+    config: Config,
+    enabled: bool,
+    run: usize,
+    durable_dir: &Path,
+    path: &Path,
+    child: &mut ChildGuard,
+) -> Result<RunResult, String> {
     let network_baseline = network_bytes(child.id()).ok();
     let mut writer = BufWriter::new(child.stdin.take().ok_or("worker stdin unavailable")?);
     let stdout = child.stdout.take().ok_or("worker stdout unavailable")?;
@@ -361,32 +401,36 @@ fn execute_run(
     )?;
     let cpu_before = process_cpu_seconds(child.id())?;
     let burst_started = Instant::now();
-    let burst_sampler = start_pressure_sampler(durable_dir.to_path_buf(), child.id())?;
+    let mut burst_sampler = start_pressure_sampler(durable_dir.to_path_buf(), child.id(), false)?;
     let mut latencies_us = Vec::with_capacity(config.burst);
     let mut rejected_events = 0_usize;
-    for event in 0..config.burst {
-        let (name, _) = SOURCES[event % SOURCES.len()];
-        let command = format!("{name}|{}", event / SOURCES.len());
-        let before = Instant::now();
-        writeln!(writer, "{command}").map_err(|e| format!("write workload command: {e}"))?;
-        writer
-            .flush()
-            .map_err(|e| format!("flush workload command: {e}"))?;
-        let mut response = String::new();
-        reader
-            .read_line(&mut response)
-            .map_err(|e| format!("read worker response: {e}"))?;
-        match response.trim() {
-            "ok" => {}
-            "full" | "oversized" | "unavailable" => {
-                rejected_events = rejected_events.saturating_add(1);
+    let burst_result = (|| -> Result<(), String> {
+        for event in 0..config.burst {
+            let (name, _) = SOURCES[event % SOURCES.len()];
+            let command = format!("{name}|{}", event / SOURCES.len());
+            let before = Instant::now();
+            writeln!(writer, "{command}").map_err(|e| format!("write workload command: {e}"))?;
+            writer
+                .flush()
+                .map_err(|e| format!("flush workload command: {e}"))?;
+            let mut response = String::new();
+            reader
+                .read_line(&mut response)
+                .map_err(|e| format!("read worker response: {e}"))?;
+            match response.trim() {
+                "ok" => {}
+                "full" | "oversized" | "unavailable" => {
+                    rejected_events = rejected_events.saturating_add(1);
+                }
+                _ => return Err("worker returned an invalid response".into()),
             }
-            _ => return Err("worker returned an invalid response".into()),
+            latencies_us.push(before.elapsed().as_micros());
         }
-        latencies_us.push(before.elapsed().as_micros());
-    }
+        Ok(())
+    })();
     let burst_elapsed = burst_started.elapsed();
-    let burst_peaks = stop_pressure_sampler(burst_sampler)?;
+    let burst_peaks = burst_sampler.stop()?;
+    burst_result?;
     let cpu_after = process_cpu_seconds(child.id())?;
     let burst_cpu_percent = if burst_elapsed.is_zero() {
         0.0
@@ -411,17 +455,19 @@ fn execute_run(
         started,
         network_baseline,
     )?;
-    let drain_sampler = start_pressure_sampler(durable_dir.to_path_buf(), child.id())?;
+    let mut drain_sampler = start_pressure_sampler(durable_dir.to_path_buf(), child.id(), true)?;
     drop(writer);
-    let status = child.wait().map_err(|e| format!("wait for worker: {e}"))?;
-    let drain_peaks = stop_pressure_sampler(drain_sampler)?;
+    let status_result = child.wait().map_err(|e| format!("wait for worker: {e}"));
+    let drain_result = drain_sampler.stop();
+    let status = status_result?;
+    let drain_peaks = drain_result?;
     if !status.success() {
         return Err(format!("worker exited with {status}"));
     }
     let durable_bytes = StorageBudget::allocated_tree_bytes(durable_dir)
         .map_err(|e| format!("measure allocated durable bytes: {e}"))?;
     let durable_events = if enabled {
-        LocalStore::open(&path)
+        LocalStore::open(path)
             .map_err(|e| format!("reopen durable store for reconciliation: {e}"))?
             .observation_count()
             .map_err(|e| format!("count durable observations: {e}"))?
@@ -462,13 +508,31 @@ impl Drop for PressureSampler {
     }
 }
 
-fn start_pressure_sampler(path: PathBuf, pid: u32) -> Result<PressureSampler, String> {
+impl PressureSampler {
+    fn stop(&mut self) -> Result<PressurePeaks, String> {
+        let signal_failed = self.stop.take().is_some_and(|stop| stop.send(()).is_err());
+        let peaks = self
+            .handle
+            .take()
+            .ok_or_else(|| "pressure sampler handle is missing".to_string())?
+            .join()
+            .map_err(|_| "pressure sampler panicked".to_string())??;
+        if signal_failed && !peaks.process_exit_observed {
+            return Err("signal pressure sampler cleanup failed".into());
+        }
+        Ok(peaks)
+    }
+}
+
+fn start_pressure_sampler(
+    path: PathBuf,
+    pid: u32,
+    allow_process_exit: bool,
+) -> Result<PressureSampler, String> {
     let (stop_tx, stop_rx) = mpsc::channel();
     let previous_cpu = process_cpu_seconds(pid)?;
     let previous_at = Instant::now();
-    let initial_rss = ps_value(pid, "rss")
-        .and_then(|value| value.parse().ok())
-        .ok_or("process RSS is unavailable")?;
+    let initial_rss = ps_metric(pid, "rss")?;
     let initial_disk = StorageBudget::allocated_tree_bytes(&path)
         .map_err(|e| format!("measure initial pressure disk: {e}"))?;
     let handle = thread::spawn(move || {
@@ -480,10 +544,15 @@ fn start_pressure_sampler(path: PathBuf, pid: u32) -> Result<PressureSampler, St
         let mut previous_cpu = previous_cpu;
         let mut previous_at = previous_at;
         loop {
-            let current_at = Instant::now();
-            let Ok(current_cpu) = process_cpu_seconds(pid) else {
-                break;
+            let current_cpu = match process_cpu_seconds(pid) {
+                Ok(value) => value,
+                Err(_) if allow_process_exit && !process_exists(pid) => {
+                    peaks.process_exit_observed = true;
+                    break;
+                }
+                Err(error) => return Err(error),
             };
+            let current_at = Instant::now();
             peaks.cpu_percent = peaks.cpu_percent.max(interval_cpu_percent(
                 previous_cpu,
                 current_cpu,
@@ -491,11 +560,7 @@ fn start_pressure_sampler(path: PathBuf, pid: u32) -> Result<PressureSampler, St
             ));
             previous_cpu = current_cpu;
             previous_at = current_at;
-            peaks.rss_kib = peaks.rss_kib.max(
-                ps_value(pid, "rss")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.0),
-            );
+            peaks.rss_kib = peaks.rss_kib.max(ps_metric(pid, "rss")?);
             peaks.disk_bytes = peaks.disk_bytes.max(
                 StorageBudget::allocated_tree_bytes(&path)
                     .map_err(|e| format!("measure pressure disk peak: {e}"))?,
@@ -510,18 +575,6 @@ fn start_pressure_sampler(path: PathBuf, pid: u32) -> Result<PressureSampler, St
         stop: Some(stop_tx),
         handle: Some(handle),
     })
-}
-
-fn stop_pressure_sampler(mut sampler: PressureSampler) -> Result<PressurePeaks, String> {
-    if let Some(stop) = sampler.stop.take() {
-        let _ = stop.send(());
-    }
-    sampler
-        .handle
-        .take()
-        .ok_or_else(|| "pressure sampler handle is missing".to_string())?
-        .join()
-        .map_err(|_| "pressure sampler panicked".to_string())?
 }
 
 fn interval_cpu_percent(previous: f64, current: f64, elapsed: Duration) -> f64 {
@@ -550,7 +603,26 @@ fn process_cpu_seconds(pid: u32) -> Result<f64, String> {
     let seconds = seconds
         .parse::<f64>()
         .map_err(|_| "process CPU seconds are invalid")?;
-    Ok(f64::from(minutes) * 60.0 + seconds)
+    let total = f64::from(minutes) * 60.0 + seconds;
+    if !total.is_finite() || total.is_sign_negative() {
+        return Err("process CPU time is non-finite or negative".into());
+    }
+    Ok(total)
+}
+
+fn ps_metric(pid: u32, field: &str) -> Result<f64, String> {
+    let value = ps_value(pid, field).ok_or_else(|| format!("process {field} is unavailable"))?;
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| format!("process {field} is invalid"))?;
+    if !value.is_finite() || value.is_sign_negative() {
+        return Err(format!("process {field} is non-finite or negative"));
+    }
+    Ok(value)
+}
+
+fn process_exists(pid: u32) -> bool {
+    ps_value(pid, "pid").is_some()
 }
 #[allow(clippy::too_many_arguments)]
 fn sample_phase(
@@ -569,8 +641,8 @@ fn sample_phase(
     let mut previous_at = phase_started;
     while phase_started.elapsed() < duration {
         sleep(next_sample.saturating_duration_since(Instant::now()));
-        let current_at = Instant::now();
         let current_cpu = process_cpu_seconds(pid)?;
+        let current_at = Instant::now();
         samples.push(sample(
             path,
             pid,
@@ -849,7 +921,7 @@ fn sample(
         phase: phase.into(),
         elapsed_ms: elapsed.as_millis(),
         cpu_percent,
-        rss_kib: ps_value(pid, "rss").and_then(|v| v.parse().ok()),
+        rss_kib: Some(ps_metric(pid, "rss")?),
         disk_bytes: Some(
             StorageBudget::allocated_tree_bytes(path)
                 .map_err(|e| format!("measure allocated disk: {e}"))?,
@@ -1078,13 +1150,18 @@ fn power_mode() -> Result<String, String> {
             let path = entry
                 .map_err(|e| format!("inspect power supply entry: {e}"))?
                 .path();
-            let supply_type = fs::read_to_string(path.join("type")).unwrap_or_default();
+            let supply_type = fs::read_to_string(path.join("type"))
+                .map_err(|e| format!("read power supply type: {e}"))?;
             if supply_type.trim() == "Battery" {
                 has_battery = true;
-            } else if fs::read_to_string(path.join("online"))
-                .is_ok_and(|online| online.trim() == "1")
-            {
-                return Ok("ac".into());
+            } else {
+                let online = fs::read_to_string(path.join("online"))
+                    .map_err(|e| format!("read power supply online state: {e}"))?;
+                match online.trim() {
+                    "1" => return Ok("ac".into()),
+                    "0" => {}
+                    _ => return Err("power supply online state is invalid".into()),
+                }
             }
         }
         if has_battery {
@@ -1192,7 +1269,7 @@ fn render_manifest(
     let summary = metric_summary(results);
     let _ = writeln!(
         out,
-        "phase_metrics:\n  idle_average_cpu_delta_percent: {}\n  active_average_cpu_delta_percent: {}\n  active_any_minute_cpu_delta_percent: {}\nmetrics:\n  hook_latency_p95_us: {}\n  hook_latency_p99_us: {}\n  idle_average_cpu_delta_percent: {}\n  active_average_cpu_delta_percent: {}\n  active_any_minute_cpu_delta_percent: {}\n  enabled_rss_p95_kib: {}\n  total_allocated_disk_bytes: {}\n  network_bytes: {}\n  network_static_surface: pass\n  required: [hook_latency_p95_us, hook_latency_p99_us, idle_average_cpu_delta_percent, active_average_cpu_delta_percent, active_any_minute_cpu_delta_percent, enabled_rss_p95_kib, total_allocated_disk_bytes, network_bytes, network_static_surface]\n  network_mode: process-scoped-samples-plus-static-product-surface\n  evidence_scope: subprocess-plus-fixed-capacity-ingress-plus-asynchronous-local-store-drain\nerrors: {:?}",
+        "phase_metrics:\n  idle_average_cpu_delta_percent: {}\n  active_average_cpu_delta_percent: {}\n  active_any_minute_cpu_delta_percent: {}\nmetrics:\n  hook_latency_p95_us: {}\n  hook_latency_p99_us: {}\n  idle_average_cpu_delta_percent: {}\n  active_average_cpu_delta_percent: {}\n  active_any_minute_cpu_delta_percent: {}\n  enabled_rss_p95_kib: {}\n  total_allocated_disk_bytes: {}\n  network_bytes: {}\n  network_static_surface: pass\n  required: [hook_latency_p95_us, hook_latency_p99_us, idle_average_cpu_delta_percent, active_average_cpu_delta_percent, active_any_minute_cpu_delta_percent, enabled_rss_p95_kib, total_allocated_disk_bytes, network_bytes, network_static_surface]\n  network_mode: process-scoped-samples-plus-static-product-surface\n  evidence_scope: subprocess-plus-fixed-capacity-ingress-plus-asynchronous-local-store-drain",
         summary.map_or_else(
             || "null".into(),
             |value| value.idle_cpu_delta_percent.to_string()
@@ -1227,10 +1304,32 @@ fn render_manifest(
             || "null".into(),
             |value| value.total_allocated_disk_bytes.to_string()
         ),
-        summary.map_or_else(|| "null".into(), |value| value.network_bytes.to_string()),
-        errors
+        summary.map_or_else(|| "null".into(), |value| value.network_bytes.to_string())
     );
+    if errors.is_empty() {
+        out.push_str("errors: []\n");
+    } else {
+        out.push_str("errors:\n");
+        for error in errors {
+            let _ = writeln!(out, "  - {}", yaml_single_quoted(error));
+        }
+    }
     out
+}
+
+fn yaml_single_quoted(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .replace('\'', "''");
+    format!("'{sanitized}'")
 }
 
 fn validate_manifest_shape(manifest: &str) -> Result<(), String> {
@@ -1271,6 +1370,35 @@ fn validate_manifest_shape(manifest: &str) -> Result<(), String> {
         .any(|line| line.trim() == "durable_path: run-relative/durable")
     {
         return Err("performance manifest is missing sanitized durable path evidence".into());
+    }
+    let mut lines = manifest.lines();
+    let errors = lines
+        .find(|line| line.starts_with("errors:"))
+        .ok_or("performance manifest is missing errors evidence")?;
+    if errors != "errors: []" {
+        for line in lines {
+            let value = line
+                .strip_prefix("  - ")
+                .ok_or("performance manifest error entry has invalid indentation")?;
+            validate_yaml_single_quoted(value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_yaml_single_quoted(value: &str) -> Result<(), String> {
+    let inner = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .ok_or("performance manifest error entry is not single-quoted")?;
+    let mut characters = inner.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character.is_control() {
+            return Err("performance manifest error entry contains a control character".into());
+        }
+        if character == '\'' && characters.next() != Some('\'') {
+            return Err("performance manifest error entry has an unescaped quote".into());
+        }
     }
     Ok(())
 }
@@ -1417,10 +1545,21 @@ fn validate_results(
         if result.samples.iter().any(|s| {
             s.cpu_percent.is_none()
                 || s.rss_kib.is_none()
+                || s.cpu_percent
+                    .is_some_and(|value| !value.is_finite() || value.is_sign_negative())
+                || s.rss_kib
+                    .is_some_and(|value| !value.is_finite() || value.is_sign_negative())
                 || s.disk_bytes.is_none()
                 || (config.profile == Profile::Release && s.network_bytes.is_none())
         }) {
             return Err("required resource metric is missing".into());
+        }
+        if !result.burst_cpu_percent.is_finite()
+            || result.burst_cpu_percent.is_sign_negative()
+            || !result.peak_rss_kib.is_finite()
+            || result.peak_rss_kib.is_sign_negative()
+        {
+            return Err("required peak metric is non-finite or negative".into());
         }
     }
     if config.profile == Profile::Release {
@@ -1582,6 +1721,11 @@ mod tests {
         );
     }
     #[test]
+    fn non_finite_metric_fails_closed() {
+        assert!(validate_results(c(), &pair(enabled(f64::NAN, 0.1, 1.0, 1, 0)), &[]).is_err());
+        assert!(validate_results(c(), &pair(enabled(0.1, 0.1, f64::INFINITY, 1, 0)), &[]).is_err());
+    }
+    #[test]
     fn idle_threshold() {
         assert!(validate_results(c(), &pair(enabled(0.7, 0.1, 1.0, 1, 0)), &[]).is_err());
     }
@@ -1666,6 +1810,15 @@ mod tests {
             "machine: sanitized-local-host",
         );
         assert!(validate_manifest_shape(&placeholder).is_err());
+
+        let hostile_error = render_manifest(
+            c(),
+            &host(),
+            &pair(enabled(0.1, 0.1, 1.0, 1, 0)),
+            &["failed 'quote'\ncontrol \u{1f}".into()],
+        );
+        assert!(hostile_error.contains("failed ''quote'' control  "));
+        validate_manifest_shape(&hostile_error).unwrap();
     }
 
     #[test]
