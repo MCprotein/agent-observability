@@ -226,8 +226,12 @@ anti-corruption layer다.
 - composition root는 `init -> config-check -> runtime-check` 순서로 private install layout,
   collection policy, singleton lock, SQLite authority와 storage admission을 결합한다.
 - 설치 루트를 받는 ingest command는 같은 strict config와 singleton을 실제 write 전 과정에 적용한다.
-- foreground ingress는 1 MiB raw input, 64 KiB projected message, 64-slot channel과 one worker로
-  고정한다. full/unavailable/oversized는 nonblocking fail-open outcome이다. 현재 이 foreground
+- foreground ingress는 1 MiB raw input, 64 KiB projected message, 64-slot channel과 one normalization
+  writer로 고정한다. full/unavailable/oversized는 nonblocking fail-open outcome이다. `xtask`의
+  drain은 최대 500-record batch 12개를 writer 앞에서 buffering하며, batch당 512 KiB 제한으로 이
+  queue payload를 최대 6 MiB로 제한한다. pump가 송신 대기 중인 batch와 writer가 처리 중인 batch까지
+  포함한 durable handoff payload 상한은 7 MiB이며, 64-slot ingress payload까지 포함한 전체
+  pipeline 상한은 11 MiB다. 현재 이 foreground
   ingress/worker composition은 `xtask` release fixture가 검증하며, CLI handoff ingest는 이미 만들어진
   bounded batch를 singleton 아래 transaction store에 직접 반영한다. Release fixture는 enabled burst의
   fail-open rejection을 1% 이하로 제한하고 graceful shutdown 뒤 enqueued count와 durable observation

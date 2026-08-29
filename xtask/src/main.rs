@@ -23,7 +23,7 @@ use agent_observability_local_store::LocalStore;
 
 const USAGE: &str = "usage: cargo run -p xtask -- perf local --profile <release|smoke> --check";
 const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-performance-v1.yaml");
-const REQUIRED_PROTOCOL_LINES: [&str; 27] = [
+const REQUIRED_PROTOCOL_LINES: [&str; 32] = [
     "schema_version: local_performance.v1",
     "warmup_seconds: 60",
     "idle_seconds: 900",
@@ -45,6 +45,11 @@ const REQUIRED_PROTOCOL_LINES: [&str; 27] = [
     "required_bytes: 0",
     "channel_capacity: 64",
     "normalization_workers: 1",
+    "durable_batch_records: 500",
+    "durable_batch_queue_capacity: 12",
+    "durable_batch_queue_bytes_max: 6291456",
+    "durable_handoff_bytes_max: 7340032",
+    "total_pipeline_payload_bytes_max: 11534336",
     "enqueue_deadline_ms: 10",
     "enabled_rejection_percent_max: 1",
     "required_fields: [machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]",
@@ -58,6 +63,12 @@ const SOURCES: [(&str, AgentSource); 3] = [
     ("cursor", AgentSource::Cursor),
 ];
 const DURABLE_BATCH_COALESCE: Duration = Duration::from_millis(3);
+const DURABLE_BATCH_RECORDS: u16 = 500;
+const DURABLE_BATCH_BYTES: u32 = 524_288;
+const DURABLE_BATCH_QUEUE_CAPACITY: usize = 12;
+const DURABLE_BATCH_QUEUE_BYTES_MAX: u32 = 6_291_456;
+const DURABLE_HANDOFF_BYTES_MAX: u32 = 7_340_032;
+const TOTAL_PIPELINE_PAYLOAD_BYTES_MAX: u32 = 11_534_336;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Profile {
@@ -547,17 +558,57 @@ fn retry_sleep(now: Instant, deadline: Instant) -> Duration {
 }
 
 fn drain(receiver: &std::sync::mpsc::Receiver<IngressMessage>, path: &Path) -> Result<(), String> {
-    let mut store = LocalStore::open(path).map_err(|e| format!("open local durable store: {e}"))?;
-    let config = LocalRuntimeConfigV2::default();
-    let mut control = RuntimeControl::new(&config).map_err(|e| e.to_string())?;
-    let mut previous = BTreeMap::new();
+    let mut config = LocalRuntimeConfigV2::default();
+    config.collection.max_batch_records = DURABLE_BATCH_RECORDS;
+    config.collection.max_batch_bytes = DURABLE_BATCH_BYTES;
+    let max_batch_records = usize::from(config.collection.max_batch_records);
+    let max_batch_bytes = usize::try_from(config.collection.max_batch_bytes).unwrap_or(usize::MAX);
+    let (batch_sender, batch_receiver) = mpsc::sync_channel(DURABLE_BATCH_QUEUE_CAPACITY);
+    let durable_path = path.to_path_buf();
+    let writer = thread::spawn(move || persist_batches(&batch_receiver, &durable_path, &config));
     let mut pending = None;
-    while let Some(messages) = receive_batch(
+    let receive_result = pump_batches(
         receiver,
+        &batch_sender,
         &mut pending,
-        usize::from(config.collection.max_batch_records),
-        usize::try_from(config.collection.max_batch_bytes).unwrap_or(usize::MAX),
-    )? {
+        max_batch_records,
+        max_batch_bytes,
+    );
+    drop(batch_sender);
+    let write_result = writer
+        .join()
+        .map_err(|_| "local durable batch writer panicked".to_string())?;
+    match (receive_result, write_result) {
+        (_, Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn pump_batches(
+    receiver: &std::sync::mpsc::Receiver<IngressMessage>,
+    batch_sender: &std::sync::mpsc::SyncSender<Vec<IngressMessage>>,
+    pending: &mut Option<IngressMessage>,
+    max_batch_records: usize,
+    max_batch_bytes: usize,
+) -> Result<(), String> {
+    while let Some(messages) = receive_batch(receiver, pending, max_batch_records, max_batch_bytes)?
+    {
+        batch_sender
+            .send(messages)
+            .map_err(|_| "local durable batch writer stopped".to_string())?;
+    }
+    Ok(())
+}
+
+fn persist_batches(
+    receiver: &std::sync::mpsc::Receiver<Vec<IngressMessage>>,
+    path: &Path,
+    config: &LocalRuntimeConfigV2,
+) -> Result<(), String> {
+    let mut store = LocalStore::open(path).map_err(|e| format!("open local durable store: {e}"))?;
+    let mut control = RuntimeControl::new(config).map_err(|e| e.to_string())?;
+    let mut previous = BTreeMap::new();
+    while let Ok(messages) = receiver.recv() {
         if control
             .admit(path, u64::from(config.collection.max_batch_bytes))
             .map_err(|e| e.to_string())?
@@ -823,7 +874,7 @@ fn render_manifest(config: Config, results: &[RunResult], errors: &[String]) -> 
         .flat_map(|r| r.latencies_us.iter().copied())
         .collect::<Vec<_>>();
     let mut out = format!(
-        "schema_version: local_performance.v1\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: sanitized-local-host\nos: {}\nfilesystem: local-filesystem\npower_mode: unspecified\ncold_warm_cache: warm\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: local_runtime.v2\n  durable_store: local_state.v4\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  burst_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  channel_capacity: 64\n  normalization_workers: 1\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: asynchronous-local-store-drain\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: removed-after-measurement\nall_run_samples:\n",
+        "schema_version: local_performance.v1\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: sanitized-local-host\nos: {}\nfilesystem: local-filesystem\npower_mode: unspecified\ncold_warm_cache: warm\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: local_runtime.v2\n  durable_store: local_state.v4\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  burst_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  channel_capacity: 64\n  normalization_workers: 1\n  durable_batch_records: {DURABLE_BATCH_RECORDS}\n  durable_batch_queue_capacity: {DURABLE_BATCH_QUEUE_CAPACITY}\n  durable_batch_queue_bytes_max: {DURABLE_BATCH_QUEUE_BYTES_MAX}\n  durable_handoff_bytes_max: {DURABLE_HANDOFF_BYTES_MAX}\n  total_pipeline_payload_bytes_max: {TOTAL_PIPELINE_PAYLOAD_BYTES_MAX}\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: bounded-batch-pump-and-asynchronous-local-store-writer\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: removed-after-measurement\nall_run_samples:\n",
         profile_name(config.profile),
         env::consts::OS,
         thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
@@ -1224,6 +1275,12 @@ mod tests {
     fn release_protocol_is_normative() {
         validate_protocol_contract().unwrap();
         assert_eq!(Config::for_profile(Profile::Release).burst, 10_000);
+        assert_eq!(DURABLE_BATCH_RECORDS, 500);
+        assert_eq!(DURABLE_BATCH_BYTES, 524_288);
+        assert_eq!(DURABLE_BATCH_QUEUE_CAPACITY, 12);
+        assert_eq!(DURABLE_BATCH_QUEUE_BYTES_MAX, 6_291_456);
+        assert_eq!(DURABLE_HANDOFF_BYTES_MAX, 7_340_032);
+        assert_eq!(TOTAL_PIPELINE_PAYLOAD_BYTES_MAX, 11_534_336);
         assert!(PROTOCOL.contains("active_any_minute_percent_max"));
     }
     #[test]
@@ -1309,6 +1366,10 @@ mod tests {
         let manifest = render_manifest(c(), &pair(enabled(0.1, 0.1, 1.0, 1, 0)), &[]);
         assert!(manifest.contains("idle_average_cpu_delta_percent: 0"));
         assert!(manifest.contains("active_any_minute_cpu_delta_percent: 0"));
+        assert!(manifest.contains("durable_batch_queue_capacity: 12"));
+        assert!(manifest.contains("durable_batch_queue_bytes_max: 6291456"));
+        assert!(manifest.contains("durable_handoff_bytes_max: 7340032"));
+        assert!(manifest.contains("total_pipeline_payload_bytes_max: 11534336"));
         assert!(manifest.contains("network_static_surface: pass"));
         assert!(manifest.contains("network_bytes: 0"));
     }
@@ -1369,6 +1430,55 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn durable_batch_handoff_blocks_at_capacity_and_resumes_without_loss() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        for index in 0..DURABLE_BATCH_QUEUE_CAPACITY + 2 {
+            input_sender
+                .send(IngressMessage(vec![u8::try_from(index).unwrap()]))
+                .unwrap();
+        }
+        drop(input_sender);
+        let (batch_sender, batch_receiver) = mpsc::sync_channel(DURABLE_BATCH_QUEUE_CAPACITY);
+        let pump = thread::spawn(move || {
+            pump_batches(&input_receiver, &batch_sender, &mut None, 1, usize::MAX)
+        });
+        thread::sleep(Duration::from_millis(20));
+        assert!(!pump.is_finished());
+        let mut delivered = vec![batch_receiver.recv().unwrap()];
+        thread::sleep(Duration::from_millis(20));
+        assert!(!pump.is_finished());
+        delivered.push(batch_receiver.recv().unwrap());
+        pump.join().unwrap().unwrap();
+        delivered.extend(batch_receiver);
+        assert_eq!(delivered.len(), DURABLE_BATCH_QUEUE_CAPACITY + 2);
+        assert_eq!(
+            delivered
+                .into_iter()
+                .map(|batch| batch[0].0[0])
+                .collect::<Vec<_>>(),
+            (0..u8::try_from(DURABLE_BATCH_QUEUE_CAPACITY + 2).unwrap()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn durable_drain_propagates_writer_startup_failure() {
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        let invalid = std::env::temp_dir().join(format!(
+            "agent-observability-xtask-file-root-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&invalid);
+        fs::write(&invalid, b"not a directory").unwrap();
+        assert!(
+            drain(&receiver, &invalid)
+                .unwrap_err()
+                .contains("open local durable store")
+        );
+        fs::remove_file(invalid).unwrap();
     }
 
     #[test]

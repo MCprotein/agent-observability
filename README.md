@@ -138,7 +138,8 @@ Strict local_runtime.v2 config -> private install layout + singleton lock + stor
 Pressure sampler -> normal / pressured / protected / probe bounded scheduling
 Pricing policy + aggregation -> ReportDtoV1 -> Rust assembler + strict TypeScript static UI
 Rust CLI -> init / checks / bounded product handoff ingest / retention / report
-Rust xtask -> fixed local channel (64 slots, one worker, nonblocking outcomes)
+Rust xtask -> fixed local channel (64 slots, nonblocking outcomes)
+          -> bounded durable handoff (12 queued x 500-record batches; 7 MiB handoff, 11 MiB total) -> one writer
           -> local-only smoke and normative release performance evidence
 No Node.js <-> Rust FFI or subprocess production path
 

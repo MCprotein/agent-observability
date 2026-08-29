@@ -19,10 +19,15 @@ workload:
   fixture_host_scope: this manifest describes the host running xtask; it is not portable hardware evidence
   channel_capacity: 64
   normalization_workers: 1
+  durable_batch_records: 500
+  durable_batch_queue_capacity: 12
+  durable_batch_queue_bytes_max: 6291456
+  durable_handoff_bytes_max: 7340032
+  total_pipeline_payload_bytes_max: 11534336
   enqueue_deadline_ms: 10
   enabled_rejection_percent_max: 1
   foreground_response: bounded enqueue acceptance, never durable commit
-  worker: asynchronous LocalStore drain and final projection rebuild
+  worker: asynchronous bounded batch pump, one LocalStore normalization writer, and final projection rebuild
   command_measurement: subprocess round-trip through bounded local-runtime enqueue; durable commit is asynchronous worker evidence
   daemon_only_measurement: forbidden
   durable_path: required local file-backed path; sanitized relative path in manifest

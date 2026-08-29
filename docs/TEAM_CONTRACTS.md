@@ -116,8 +116,11 @@ silently relax privacy, mutate accepted observations or overwrite queued records
 budgets and load-shedding order in `TEAM_ARCHITECTURE.md`.
 
 Hook ingress reads at most 1 MiB and emits an allowlisted local message of at most 64 KiB. It never persists raw
-overflow bytes. Local channel capacity and normalization worker count are implementation constants recorded in
-the evidence manifest, not unbounded/user-controlled values. Full-channel and receiver-unavailable outcomes return
+overflow bytes. Local channel capacity, normalization writer count, durable batch size, and durable handoff
+capacity are implementation constants recorded in the evidence manifest, not unbounded/user-controlled values.
+The current fixture bounds that handoff to 12 queued batches of at most 500 records and 512 KiB each;
+including the pump's pending send and the active writer batch, the durable handoff is at most 7 MiB,
+and the 64-message ingress raises the total pipeline payload bound to 11 MiB. Full-channel and receiver-unavailable outcomes return
 without waiting for network or drain and expose only bounded counters/reason codes. The v0.13 gate compares a
 deterministic three-source fixture host plus the real bounded ingress and durable drain against a
 collection-disabled fixture-host baseline. A future resident daemon or IPC receiver is team-profile scope;

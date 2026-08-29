@@ -55,7 +55,11 @@ The installed configuration is intentionally small:
 
 - Raw foreground input: at most 1 MiB.
 - Privacy-projected local message: at most 64 KiB.
-- In-process channel: 64 messages, one normalization worker, nonblocking admission.
+- In-process ingress channel: 64 messages, one normalization writer, nonblocking admission. The
+  release fixture places a 12-batch durable handoff before that writer, uses at most 500 records and
+  512 KiB per batch, and therefore bounds queued batch payloads to 6 MiB. Including one batch
+  waiting in the pump and one active writer batch, the durable handoff payload is bounded to 7 MiB;
+  including the 64-message ingress, the total pipeline payload is bounded to 11 MiB.
 - Full, unavailable, and oversized outcomes are bounded counters; they do not wait for drain or
   network.
 - One process owns the private runtime directory through an OS-held file lock and random boot
