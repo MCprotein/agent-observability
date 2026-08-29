@@ -7,10 +7,12 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 release train은 `v1.1.0` report usability 검증을 완료했다. Rust Codex, Claude Code, Cursor
+현재 release train은 `v1.2.0` local retention/archive 검증 단계다. Rust Codex, Claude Code, Cursor
 adapter가 비공개 canonical handoff를 SQLite 권위 저장소에 수집하고, Rust application projector와
 HTML assembler가 strict TypeScript UI asset을 self-contained report로 만든다. report UI는 bounded
-timeline, 저장 보기와 trace/span pagination을 제공한다. 지원 범위는 macOS
+timeline, 저장 보기와 trace/span pagination을 제공한다. bounded age retention은 private archive를
+먼저 export한 뒤 cutoff 이후 관측이 없는 trace의 전체 payload를 trace 단위로 물리 삭제하고 bounded span replay
+guard, source cursor, disposition과 적용 영수증만 남긴다. 지원 범위는 macOS
 standalone과 capability manifest에 고정된 제품 버전 및 handoff import 경계다. Native telemetry
 receiver와 foreground handoff producer는 포함하지 않는다.
 
@@ -28,7 +30,8 @@ Rust workspace는 다음 책임으로 분리된다.
   specific-hook 격리와 content-free diagnostic
 - `crates/application`: pricing policy와 privacy-safe report DTO projection
 - `crates/local-store`: private SQLite authority, atomic cursor/event/current-record/disposition
-  commit, dirty-state 기반 replayable JSONL projection, `local_state.v1/v2` -> `local_state.v3` migration
+  commit, dirty-state 기반 replayable JSONL projection, `local_state.v1/v2/v3` -> `local_state.v4`
+  migration, bounded archive/physical retention
 - `crates/local-runtime`: strict local config, private install layout, singleton lock, bounded
   ingress, storage admission과 load-shedding state machine
 - `crates/static-report`: validated `ReportDtoV1`과 generated TypeScript asset의 private HTML 조립
@@ -88,6 +91,8 @@ cargo run -p agent-observability-cli -- contracts
 cargo run -p agent-observability-cli -- init ~/.agent-observability
 cargo run -p agent-observability-cli -- config-check ~/.agent-observability/config.json
 cargo run -p agent-observability-cli -- runtime-check ~/.agent-observability
+cargo run -p agent-observability-cli -- retention-plan ~/.agent-observability
+cargo run -p agent-observability-cli -- retention-apply ~/.agent-observability PLAN_ID /path/to/private-retention-archive.jsonl
 cargo run -p agent-observability-cli -- codex-ingest ~/.agent-observability /path/to/private-handoff.jsonl
 cargo run -p agent-observability-cli -- claude-code-ingest ~/.agent-observability /path/to/private-handoff.jsonl
 cargo run -p agent-observability-cli -- cursor-ingest ~/.agent-observability /path/to/private-handoff.jsonl
@@ -95,12 +100,14 @@ cargo run -p agent-observability-cli -- report ~/.agent-observability /path/to/p
 cargo run -p xtask -- perf local --profile smoke --check
 ```
 
-`v1.1.0` browser smoke는 세 agent의 canonical handoff fixture를 사용하는 Rust ingest, SQLite snapshot,
+`v1.2.0` 검증은 세 agent의 canonical handoff fixture를 사용하는 Rust ingest, SQLite snapshot,
 비용 projection, Rust HTML
 assembly와 desktop/mobile `file://` 렌더링을 하나의 경로로 검증한다. `v0.13.0` local runtime의
 normative 성능 evidence는 local runtime 경로가 변경되지 않은 1.0 report cutover에만 carry-forward하며,
 실제 agent hook, receiver 또는 producer 성능을 증명하지 않는다.
-1.1에서는 smoke profile을 다시 실행한다. 운영 방법은 [docs/LOCAL_RUNTIME.md](docs/LOCAL_RUNTIME.md)를 따른다.
+v1.2에서는 retention plan/apply subprocess smoke와 local performance smoke에 더해, 변경된 runtime
+config와 durable store를 대상으로 normative five-hour release performance gate를 다시 실행한다. 운영
+방법은 [docs/LOCAL_RUNTIME.md](docs/LOCAL_RUNTIME.md)를 따른다.
 
 ## 아키텍처 요약
 
@@ -117,19 +124,20 @@ Codex / Claude Code
              |-> local JSONL -> JS report projection -> self-contained HTML
              `-> redacted JSON snapshot
 
-CURRENT v1.1 - LOCAL-ONLY STABLE REPORT (Rust + TypeScript static UI)
+CURRENT v1.2 - LOCAL RETENTION RELEASE CANDIDATE (Rust + TypeScript static UI)
 
 Closed schemas + manifest -> deterministic domain reducer + fail-closed projectors
 Private canonical handoff files (upstream receiver/producer not shipped) -> bounded Rust adapters
         -> SourceObservation or fixed-code diagnostic/suppression
         -> CLI bounded batch + singleton + configured storage admission
-        -> private SQLite local_state.v3 authority
+        -> private SQLite local_state.v4 authority
              |-> dirty-state repaired JSONL current-record projection
-             `-> typed snapshot -> pricing/report projection -> private self-contained HTML
-Strict local_runtime.v1 config -> private install layout + singleton lock + storage admission
+             |-> typed snapshot -> pricing/report projection -> private self-contained HTML
+             `-> retention plan/apply -> private JSONL archive + bounded physical reclaim
+Strict local_runtime.v2 config -> private install layout + singleton lock + storage admission
 Pressure sampler -> normal / pressured / protected / probe bounded scheduling
 Pricing policy + aggregation -> ReportDtoV1 -> Rust assembler + strict TypeScript static UI
-Rust CLI -> init / checks / bounded product handoff ingest / report
+Rust CLI -> init / checks / bounded product handoff ingest / retention / report
 Rust xtask -> fixed local channel (64 slots, one worker, nonblocking outcomes)
           -> local-only smoke and normative release performance evidence
 No Node.js <-> Rust FFI or subprocess production path
@@ -473,7 +481,7 @@ rate table 예시:
 
 ```json
 {
-  "schema_version": "local_runtime.v1",
+  "schema_version": "local_runtime.v2",
   "enabled": true,
   "collection": {
     "file_reconcile_interval_ms": 5000,
@@ -483,6 +491,11 @@ rate table 예시:
     "active_heartbeat_interval_ms": 60000,
     "idle_heartbeat_interval_ms": 300000,
     "local_storage_budget_bytes": 1073741824
+  },
+  "retention": {
+    "max_record_age_days": 30,
+    "max_archive_records": 10000,
+    "max_archive_bytes": 16777216
   }
 }
 ```
@@ -523,7 +536,7 @@ writer로 분리한다. 새 Rust adapter는 source payload를 `SourceObservation
 Private canonical handoff import
         |
         v
-SQLite local_state.v3 authority
+SQLite local_state.v4 authority
         |
         | typed snapshot -> Rust report projector and assembler
         v
@@ -543,14 +556,20 @@ Browser file open
 현재 report command:
 
 ```text
-agent-observability report ~/.agent-observability [/path/to/private-rate-table.json]
+agent-observability report ~/.agent-observability
+agent-observability report ~/.agent-observability /path/to/private-rate-table.json
 ```
 
 출력은 `~/.agent-observability/logs/agent-observability-report.html`에 `0600`으로 원자 기록된다.
 HTML은 외부 network 요청 없이 동작한다. 브라우저의 `file://` 제약을 피하기 위해
 JSONL을 따로 fetch하지 않고, 생성 시점에 필요한 데이터를 HTML 안에 주입한다.
 
-현재 v1.1.0 report에서 확인 가능한 화면:
+v1.2 retention은 만료된 record를 이후 local report 집계에서도 제외한다. Correction, retraction,
+reinstate, archive restore와 만료 전후 aggregate 재구성은 아직 지원하지 않는다. 이 동작이 필요한
+Future TODO 단계에서는 raw observation 만료 전에 privacy-safe contribution journal과 versioned
+checkpoint를 먼저 구현해야 한다.
+
+현재 v1.2 train의 report 화면(v1.1에서 도입):
 
 - repo/session/agent/model/text filter와 clear/filter-result state
 - 정제된 repo/session/agent/model 차원 중 allowlisted 안전 scalar만 브라우저 local storage에
