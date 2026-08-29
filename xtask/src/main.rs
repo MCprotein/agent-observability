@@ -455,8 +455,13 @@ fn execute_run_with_child(
     )?;
     let cpu_before = process_cpu_seconds(child.id())?;
     let burst_started = Instant::now();
-    let mut burst_sampler =
-        start_pressure_sampler(durable_dir.to_path_buf(), child.id(), false, None)?;
+    let drain_marker = enabled.then(|| path.join(".drain-active"));
+    let mut burst_sampler = start_pressure_sampler(
+        durable_dir.to_path_buf(),
+        child.id(),
+        false,
+        drain_marker.clone(),
+    )?;
     let mut latencies_us = Vec::with_capacity(config.burst);
     let mut rejected_events = 0_usize;
     let burst_result = (|| -> Result<(), String> {
@@ -510,10 +515,9 @@ fn execute_run_with_child(
         started,
         network_baseline,
     )?;
-    drop(writer);
-    let drain_marker = enabled.then(|| path.join(".drain-active"));
     let mut drain_sampler =
         start_pressure_sampler(durable_dir.to_path_buf(), child.id(), true, drain_marker)?;
+    drop(writer);
     read_worker_marker(&mut reader, "drain-start")?;
     read_worker_marker(&mut reader, "drain-complete")?;
     let status_result = child.wait().map_err(|e| format!("wait for worker: {e}"));
@@ -523,7 +527,7 @@ fn execute_run_with_child(
     if !status.success() {
         return Err(format!("worker exited with {status}"));
     }
-    if enabled && drain_peaks.drain_sample_count == 0 {
+    if enabled && burst_peaks.drain_sample_count + drain_peaks.drain_sample_count == 0 {
         return Err("drain pressure sampler produced no sample inside the drain boundary".into());
     }
     let durable_bytes = StorageBudget::allocated_tree_bytes(durable_dir)
@@ -651,6 +655,12 @@ fn start_pressure_sampler(
         stop: Some(stop_tx),
         handle: Some(handle),
     })
+}
+
+fn write_private_marker(path: &Path, label: &str) -> Result<(), String> {
+    fs::write(path, []).map_err(|e| format!("create {label}: {e}"))?;
+    fs::set_permissions(path, Permissions::from_mode(0o600))
+        .map_err(|e| format!("protect {label}: {e}"))
 }
 
 fn marker_is_active(path: &Path) -> Result<bool, String> {
@@ -806,7 +816,7 @@ fn worker() -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let drain_path = PathBuf::from(&path);
     thread::spawn(move || {
-        let _ = tx.send(drain(&receiver, &drain_path));
+        let _ = tx.send(drain_with_marker(&receiver, &drain_path));
     });
     for line in io::stdin().lock().lines() {
         let command = line.map_err(|e| format!("read worker command: {e}"))?;
@@ -830,22 +840,27 @@ fn worker() -> Result<(), String> {
     output
         .flush()
         .map_err(|e| format!("flush drain marker: {e}"))?;
-    let drain_marker = PathBuf::from(&path).join(".drain-active");
-    fs::write(&drain_marker, []).map_err(|e| format!("create drain boundary: {e}"))?;
-    fs::set_permissions(&drain_marker, Permissions::from_mode(0o600))
-        .map_err(|e| format!("protect drain boundary: {e}"))?;
     let drain_result = rx
         .recv()
         .map_err(|_| "local runtime drain stopped".to_string())?;
-    let marker_cleanup =
-        fs::remove_file(&drain_marker).map_err(|e| format!("remove drain boundary: {e}"));
     drain_result?;
-    marker_cleanup?;
     writeln!(output, "drain-complete").map_err(|e| format!("write drain marker: {e}"))?;
     output
         .flush()
         .map_err(|e| format!("flush drain marker: {e}"))?;
     Ok(())
+}
+
+fn drain_with_marker(
+    receiver: &std::sync::mpsc::Receiver<IngressMessage>,
+    path: &Path,
+) -> Result<(), String> {
+    let marker = path.join(".drain-active");
+    write_private_marker(&marker, "drain boundary")?;
+    let drain_result = drain(receiver, path);
+    let marker_cleanup =
+        fs::remove_file(&marker).map_err(|e| format!("remove drain boundary: {e}"));
+    combine_cleanup(drain_result, marker_cleanup)
 }
 
 fn enqueue_until(deadline: Instant, mut attempt: impl FnMut() -> IngressOutcome) -> IngressOutcome {
