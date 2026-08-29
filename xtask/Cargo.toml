@@ -1,0 +1,16 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+agent-observability-contracts = { path = "../crates/contracts" }
+agent-observability-domain = { path = "../crates/domain" }
+agent-observability-local-runtime = { path = "../crates/local-runtime" }
+agent-observability-local-store = { path = "../crates/local-store" }
+
+[lints]
+workspace = true

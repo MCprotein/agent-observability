@@ -230,7 +230,10 @@ slow/absent/crashed daemon 및 full channel integration fixture를 통과해야 
 normalization, filesystem type, OS/build, CPU/memory, power mode, source versions와 cold/warm cache를 manifest에
 기록한다. Hook command startup, source-side telemetry exporter, local receiver, normalization과 durable commit
 overhead를 포함하며 daemon process만 따로 재서 통과시키지 않는다. Large transcript, offline queue,
-disk-low와 sleep/wake scenario는 별도 run으로 측정한다.
+disk-low와 sleep/wake scenario는 별도 run으로 측정한다. Enabled burst의 attempted/enqueued/rejected/durable
+count를 모두 기록하고, 명시적 fail-open rejection은 1% 이하여야 한다. Graceful fixture shutdown 뒤에는
+enqueued count와 durable observation count가 같아야 하지만 foreground enqueue 자체는 durability를
+보장하지 않는다.
 
 Default total local storage budget은 1 GiB이고 user config range는 256 MiB..20 GiB다. Budget `B`에서 먼저
 `max(32 MiB, floor(B / 8))`를 atomic-write/WAL headroom으로 예약한다. 나머지 `R`은 authoritative

@@ -6,13 +6,14 @@
 
 ## Current and target stack
 
-현재 `v0.11.0`은 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
-보존하면서 experimental Rust Codex, Claude Code와 Cursor adapter를 제공한다. Rust 경로는 closed contract,
+현재 `v0.13.0` release candidate는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
+보존하면서 experimental Rust Codex, Claude Code와 Cursor adapter, TypeScript static report UI,
+strict local config와 bounded runtime policy를 제공한다. Rust 경로는 closed contract,
 deterministic lifecycle reduction, topology validation, pricing/report projection, bounded product handoff와
-private embedded transaction을 구현한다. SQLite `local_state.v2`가 source cursor,
+private embedded transaction을 구현한다. SQLite `local_state.v3`가 source cursor,
 stable observation, current reduced record, adapter disposition과 profile-neutral delivery outcome의
-정본이며 JSONL은 정본에서 재생성하는 projection이다. Team envelope, outbox와 network는 활성
-계약이 아니다.
+정본이며 JSONL은 dirty-state에서만 재생성하는 projection이다. Team envelope, outbox와 network는
+활성 계약이 아니다.
 
 목표 스택은 다음과 같다.
 
@@ -86,9 +87,10 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
-v0.11.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
+v0.13.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
 `crates/adapter-claude-code`, `crates/adapter-cursor`,
-`crates/application`, `crates/local-store`, `crates/cli`로 나뉜다. domain은 외부 형식을
+`crates/application`, `crates/local-store`, `crates/local-runtime`, `crates/cli`와 release
+evidence runner인 `xtask`로 나뉜다. domain은 외부 형식을
 모르고, contracts는 transient
 source와 durable/report DTO 경계를 소유한다. application은 pricing과 report projection을,
 inbound adapters는 제품별 source precedence/correlation/dedupe를, local-store는 SQLite transaction과 JSONL
@@ -214,6 +216,23 @@ anti-corruption layer다.
   기존 v0.6 writer는 parity 대상이 되기 전에 이 조건을 충족해야 한다.
 - 손상된 trailing record와 schema migration 정책을 명시적으로 처리한다.
 
+### Local Runtime
+
+- standalone 설정은 `local_runtime.v1` strict JSON이다. 팀 identity, 이메일, endpoint와 transport
+  설정은 포함하지 않는다.
+- composition root는 `init -> config-check -> runtime-check` 순서로 private install layout,
+  collection policy, singleton lock, SQLite authority와 storage admission을 결합한다.
+- 설치 루트를 받는 ingest command는 같은 strict config와 singleton을 실제 write 전 과정에 적용한다.
+- foreground ingress는 1 MiB raw input, 64 KiB projected message, 64-slot channel과 one worker로
+  고정한다. full/unavailable/oversized는 nonblocking fail-open outcome이다. 현재 이 foreground
+  ingress/worker composition은 `xtask` release fixture가 검증하며, CLI handoff ingest는 이미 만들어진
+  bounded batch를 singleton 아래 transaction store에 직접 반영한다. Release fixture는 enabled burst의
+  fail-open rejection을 1% 이하로 제한하고 graceful shutdown 뒤 enqueued count와 durable observation
+  count를 대조한다. Foreground enqueue 자체는 durability를 보장하지 않는다.
+- 저장소 용량은 allocated block과 worst-case write로 admission하며, age retention은 v1.2 범위다.
+- SQLite authority는 `projection_dirty`를 transaction에 포함하고 clean reopen에서 전체 projection
+  rebuild를 생략한다. 자세한 운영 계약은 [LOCAL_RUNTIME.md](LOCAL_RUNTIME.md)를 따른다.
+
 ### Web UI
 
 Web UI는 TypeScript `strict` mode를 사용한다.
@@ -224,8 +243,8 @@ Web UI는 TypeScript `strict` mode를 사용한다.
 - DTO type은 versioned schema에서 생성하거나 runtime validation으로 확인한다.
 - 브라우저에서 외부 network 요청이나 상시 server 없이 동작한다.
 - agent별 예외 처리는 UI가 아니라 canonical contract나 adapter에서 해결한다.
-- Rust outbound infrastructure가 빌드된 TypeScript UI asset과 `ReportDtoVx`를 하나의
-  self-contained HTML artifact로 조립한다.
+- 목표 Rust outbound infrastructure는 빌드된 TypeScript UI asset과 `ReportDtoVx`를 하나의
+  self-contained HTML artifact로 조립한다. v0.13에는 이 Rust assembler와 `report` subcommand가 없다.
 - team profile의 hosted UI도 같은 `ReportDtoVx` schema와 UI component를 사용한다. transport와
   authentication/authorization만 profile별 composition root에서 달라진다. hosted query는
   server-resolved tenant/workspace scope 밖의 DTO를 생성할 수 없다.

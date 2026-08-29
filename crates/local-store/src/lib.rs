@@ -1,6 +1,6 @@
 //! Private, replayable `SQLite` authority for standalone observations.
 
-use agent_observability_application::reduce_observation_state;
+use agent_observability_application::reduce_span_state;
 use agent_observability_contracts::{
     AdapterDispositionCode, AdapterDispositionKind, DurableRecordV1, ObservationEvent,
     SourceCheckpoint, SourceObservation, canonical_observation_payload_hash,
@@ -10,9 +10,12 @@ use agent_observability_domain::{
     CompactionId, CorrelationIds, DomainSpanState, LifecycleState, OperationId, PermissionId,
     RequestId, SessionId, SpanId, SpanKind, Timing, TokenUsage, TraceId, TurnId,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -22,7 +25,8 @@ use std::time::Duration;
 
 const DB_NAME: &str = "local-store.sqlite3";
 const PROJECTION_NAME: &str = "observations.jsonl";
-pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v2";
+pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v3";
+const MAX_STALE_PROJECTION_TEMPS: usize = 1024;
 const SCHEMA_OBJECTS: &[(&str, &str, &str)] = &[
     (
         "table",
@@ -166,14 +170,14 @@ pub struct LocalStore {
 }
 
 impl LocalStore {
-    /// Opens or creates private transactional state and rebuilds its JSONL projection.
+    /// Opens or creates private transactional state and repairs its JSONL projection when needed.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] for insecure permissions, incompatible state, or I/O failure.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let dir = dir.as_ref().to_path_buf();
-        private_dir(&dir)?;
+        private_dir(dir.as_ref())?;
+        let dir = fs::canonicalize(dir.as_ref())?;
         let db_path = dir.join(DB_NAME);
         match private_create_new(&db_path) {
             Ok(file) => file.sync_all()?,
@@ -182,7 +186,14 @@ impl LocalStore {
             }
             Err(error) => return Err(error),
         }
-        let db = Connection::open(&db_path)?;
+        let db = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         db.busy_timeout(Duration::from_secs(5))?;
         db.pragma_update(None, "journal_mode", "DELETE")?;
         db.pragma_update(None, "foreign_keys", true)?;
@@ -194,14 +205,26 @@ impl LocalStore {
             |row| row.get(0),
         );
         let schema: String = schema.map_err(|_| StoreError::SchemaMismatch)?;
-        if schema == "local_state.v1" {
-            migrate_v1_to_v2(&db)?;
+        if matches!(schema.as_str(), "local_state.v1" | "local_state.v2") {
+            migrate_to_v3(&db)?;
         } else if schema != LOCAL_STORE_SCHEMA_VERSION {
             return Err(StoreError::SchemaMismatch);
         }
         validate_schema(&db)?;
         let store = Self { dir, db };
-        store.rebuild_projection()?;
+        let projection_path = store.projection_path();
+        let projection_missing = match fs::symlink_metadata(&projection_path) {
+            Ok(_) => {
+                private_file(&projection_path)?;
+                false
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error.into()),
+        };
+        let projection_dirty = store.projection_dirty()?;
+        if projection_missing || projection_dirty {
+            store.rebuild_projection()?;
+        }
         Ok(store)
     }
 
@@ -228,6 +251,41 @@ impl LocalStore {
         observation: &SourceObservation,
     ) -> Result<IngestStatus, StoreError> {
         self.ingest_at(observation, None, false)
+    }
+
+    /// Atomically commits an ordered observation batch while deferring projection rebuild.
+    ///
+    /// Every observation shares one transaction. A failure rolls back the entire batch, including
+    /// cursor advancement, so callers can retry the same ordered input without partial progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::ingest`].
+    pub fn ingest_batch_deferred_projection(
+        &mut self,
+        observations: &[SourceObservation],
+    ) -> Result<Vec<IngestStatus>, StoreError> {
+        self.ingest_batch_at(observations, None)
+    }
+
+    fn ingest_batch_at(
+        &mut self,
+        observations: &[SourceObservation],
+        crash: Option<CrashPoint>,
+    ) -> Result<Vec<IngestStatus>, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let mut statuses = Vec::with_capacity(observations.len());
+        for observation in observations {
+            statuses.push(Self::ingest_in_transaction(&tx, observation, None)?);
+        }
+        if crash == Some(CrashPoint::BeforeCommit) {
+            return Err(StoreError::Crash(CrashPoint::BeforeCommit));
+        }
+        tx.commit()?;
+        if crash == Some(CrashPoint::AfterCommit) {
+            return Err(StoreError::Crash(CrashPoint::AfterCommit));
+        }
+        Ok(statuses)
     }
 
     /// Atomically records a content-free adapter diagnostic or suppression and advances its
@@ -325,15 +383,30 @@ impl LocalStore {
         self.ingest_at(observation, Some(crash), true)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the ordered cursor, dedupe, commit, and crash-point transaction stays contiguous"
-    )]
     fn ingest_at(
         &mut self,
         observation: &SourceObservation,
         crash: Option<CrashPoint>,
         rebuild_projection: bool,
+    ) -> Result<IngestStatus, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let status = Self::ingest_in_transaction(&tx, observation, crash)?;
+        tx.commit()?;
+        if crash == Some(CrashPoint::AfterCommit) {
+            return Err(StoreError::Crash(CrashPoint::AfterCommit));
+        }
+        self.rebuild_if_enabled(rebuild_projection, crash)?;
+        Ok(status)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ordered cursor, dedupe, and crash-point transaction stays contiguous"
+    )]
+    fn ingest_in_transaction(
+        tx: &Transaction<'_>,
+        observation: &SourceObservation,
+        crash: Option<CrashPoint>,
     ) -> Result<IngestStatus, StoreError> {
         let source = source_name(observation);
         let generation = private_source_generation(observation);
@@ -344,16 +417,13 @@ impl LocalStore {
         let projected_json = prepared.projected_json;
         let payload_hash = prepared.payload_hash;
         let event_id = prepared.event_id;
-        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         if let Some((disposition, code, existing_hash)) =
-            existing_disposition(&tx, source, &generation, cursor)?
+            existing_disposition(tx, source, &generation, cursor)?
         {
             if disposition == AdapterDispositionKind::Suppressed.as_str()
                 && code == AdapterDispositionCode::DuplicateObservation.as_str()
                 && existing_hash == payload_hash
             {
-                drop(tx);
-                self.rebuild_if_enabled(rebuild_projection, None)?;
                 return Ok(IngestStatus::Suppressed);
             }
             return Err(StoreError::PayloadConflict);
@@ -369,11 +439,9 @@ impl LocalStore {
             if existing_event != event_id || existing_hash != payload_hash {
                 return Err(StoreError::PayloadConflict);
             }
-            drop(tx);
-            self.rebuild_if_enabled(rebuild_projection, None)?;
             return Ok(IngestStatus::Duplicate);
         }
-        if !cursor_matches(&tx, observation)? {
+        if !cursor_matches(tx, observation)? {
             return Err(StoreError::CursorConflict);
         }
         if let Some(existing_state_json) = tx
@@ -384,18 +452,14 @@ impl LocalStore {
             )
             .optional()?
         {
-            ensure_static_record_compatibility(&tx, state.span_id.as_str(), &incoming_record)?;
+            ensure_static_record_compatibility(tx, state.span_id.as_str(), &incoming_record)?;
             let existing_state = state_from_json(&existing_state_json)?;
             if same_canonical_observation(&existing_state, &state) {
-                insert_duplicate_disposition(&tx, observation)?;
+                insert_duplicate_disposition(tx, observation)?;
                 if crash == Some(CrashPoint::BeforeCommit) {
                     return Err(StoreError::Crash(CrashPoint::BeforeCommit));
                 }
-                tx.commit()?;
-                if crash == Some(CrashPoint::AfterCommit) {
-                    return Err(StoreError::Crash(CrashPoint::AfterCommit));
-                }
-                self.rebuild_if_enabled(rebuild_projection, crash)?;
+                mark_projection_dirty(tx)?;
                 return Ok(IngestStatus::Suppressed);
             }
         }
@@ -414,25 +478,18 @@ impl LocalStore {
                 "INSERT INTO source_inputs(source, generation, cursor, event_id, payload_hash) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![source, generation, cursor, event_id, payload_hash],
             )?;
-            advance_cursor(&tx, observation)?;
+            advance_cursor(tx, observation)?;
+            mark_projection_dirty(tx)?;
             if crash == Some(CrashPoint::BeforeCommit) {
                 return Err(StoreError::Crash(CrashPoint::BeforeCommit));
             }
-            tx.commit()?;
-            if crash == Some(CrashPoint::AfterCommit) {
-                return Err(StoreError::Crash(CrashPoint::AfterCommit));
-            }
-            self.rebuild_if_enabled(rebuild_projection, crash)?;
             return Ok(IngestStatus::Duplicate);
         }
-        let mut states = load_states(&tx)?;
-        if states
-            .iter()
-            .any(|existing| existing.span_id == state.span_id)
-        {
-            ensure_static_record_compatibility(&tx, state.span_id.as_str(), &incoming_record)?;
+        let existing = load_state(tx, state.span_id.as_str())?;
+        if existing.is_some() {
+            ensure_static_record_compatibility(tx, state.span_id.as_str(), &incoming_record)?;
         }
-        let reduced = reduce_observation_state(&mut states, state).map_err(map_reduction_error)?;
+        let reduced = reduce_span_state(existing.as_ref(), state).map_err(map_reduction_error)?;
         let projection_observation = projection_observation(observation, &reduced);
         let record = sanitize_durable_record(
             &project_durable_record(
@@ -445,30 +502,29 @@ impl LocalStore {
         let record_json = serde_json::to_string(&record)?;
         let state_json = state_to_json(&reduced)?;
         let parent = reduced.parent_span_id.as_ref().map(SpanId::as_str);
-        let unresolved = i32::from(
-            parent.is_some()
-                && !states
-                    .iter()
-                    .any(|state| Some(state.span_id.as_str()) == parent),
-        );
+        let unresolved = match parent {
+            Some(parent_id) => i32::from(!topology_contains(tx, parent_id)?),
+            None => 0,
+        };
         tx.execute("INSERT INTO observations(event_id, source, generation, observation_id, payload_hash, projected_json) VALUES (?1,?2,?3,?4,?5,?6)", params![event_id, source, generation, hash_opaque_identifier(observation.observation_id.as_str()), payload_hash, projected_json])?;
         tx.execute("INSERT INTO source_inputs(source, generation, cursor, event_id, payload_hash) VALUES (?1,?2,?3,?4,?5)", params![source, generation, cursor, event_id, payload_hash])?;
         tx.execute("INSERT INTO records(span_id, trace_id, parent_span_id, kind, state_json, record_json) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(span_id) DO UPDATE SET state_json=excluded.state_json, record_json=excluded.record_json", params![reduced.span_id.as_str(), reduced.trace_id.as_str(), parent, kind_name(reduced.kind), state_json, record_json])?;
         tx.execute("INSERT INTO topology(span_id, trace_id, parent_span_id, kind, unresolved) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(span_id) DO UPDATE SET unresolved=excluded.unresolved", params![reduced.span_id.as_str(), reduced.trace_id.as_str(), parent, kind_name(reduced.kind), unresolved])?;
-        tx.execute("UPDATE topology SET unresolved = CASE WHEN parent_span_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM topology parent WHERE parent.span_id = topology.parent_span_id) THEN 1 ELSE 0 END", [])?;
+        validate_topology_chain(tx, reduced.span_id.as_str())?;
+        validate_direct_children(tx, reduced.span_id.as_str())?;
+        tx.execute(
+            "UPDATE topology SET unresolved=0 WHERE parent_span_id=?1",
+            [reduced.span_id.as_str()],
+        )?;
         tx.execute(
             "INSERT INTO delivery_outcomes(event_id, outcome) VALUES (?1, 'not_applicable')",
             [event_id.as_str()],
         )?;
-        advance_cursor(&tx, observation)?;
+        advance_cursor(tx, observation)?;
+        mark_projection_dirty(tx)?;
         if crash == Some(CrashPoint::BeforeCommit) {
             return Err(StoreError::Crash(CrashPoint::BeforeCommit));
         }
-        tx.commit()?;
-        if crash == Some(CrashPoint::AfterCommit) {
-            return Err(StoreError::Crash(CrashPoint::AfterCommit));
-        }
-        self.rebuild_if_enabled(rebuild_projection, crash)?;
         Ok(IngestStatus::Committed)
     }
 
@@ -519,8 +575,25 @@ impl LocalStore {
         if crash == Some(CrashPoint::AfterProjectionRename) {
             return Err(StoreError::Crash(CrashPoint::AfterProjectionRename));
         }
+        tx.execute(
+            "UPDATE metadata SET value='0' WHERE key='projection_dirty'",
+            [],
+        )?;
         tx.commit()?;
         Ok(())
+    }
+
+    fn projection_dirty(&self) -> Result<bool, StoreError> {
+        let value = self.db.query_row(
+            "SELECT value FROM metadata WHERE key='projection_dirty'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        match value.as_str() {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            _ => Err(StoreError::SchemaMismatch),
+        }
     }
 
     #[must_use]
@@ -863,14 +936,61 @@ fn disposition_payload_hash(
     ])
 }
 
-fn load_states(tx: &Transaction<'_>) -> Result<Vec<DomainSpanState>, StoreError> {
-    let mut stmt = tx.prepare("SELECT state_json FROM records ORDER BY span_id")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(state_from_json(&row?)?);
+fn load_state(tx: &Transaction<'_>, span_id: &str) -> Result<Option<DomainSpanState>, StoreError> {
+    let state = tx
+        .query_row(
+            "SELECT state_json FROM records WHERE span_id=?1",
+            [span_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    state.map(|json| state_from_json(&json)).transpose()
+}
+
+fn topology_contains(tx: &Transaction<'_>, span_id: &str) -> Result<bool, StoreError> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM topology WHERE span_id=?1)",
+        [span_id],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
+fn validate_topology_chain(tx: &Transaction<'_>, span_id: &str) -> Result<(), StoreError> {
+    const MAX_TOPOLOGY_DEPTH: usize = 4_096;
+    let mut states = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut current = Some(span_id.to_owned());
+    while let Some(id) = current {
+        if states.len() >= MAX_TOPOLOGY_DEPTH || !seen.insert(id.clone()) {
+            return Err(StoreError::InvalidObservation);
+        }
+        let Some(state) = load_state(tx, &id)? else {
+            break;
+        };
+        current = state
+            .parent_span_id
+            .as_ref()
+            .map(|parent| parent.as_str().to_owned());
+        states.push(state);
     }
-    Ok(out)
+    agent_observability_domain::validate_topology(&states).map_err(map_reduction_error)?;
+    Ok(())
+}
+
+fn validate_direct_children(tx: &Transaction<'_>, parent_span_id: &str) -> Result<(), StoreError> {
+    let mut statement = tx.prepare(
+        "SELECT span_id FROM topology WHERE parent_span_id=?1 ORDER BY span_id LIMIT 4097",
+    )?;
+    let rows = statement.query_map([parent_span_id], |row| row.get::<_, String>(0))?;
+    let children = rows.collect::<Result<Vec<_>, _>>()?;
+    if children.len() > 4_096 {
+        return Err(StoreError::InvalidObservation);
+    }
+    drop(statement);
+    for child in children {
+        validate_topology_chain(tx, &child)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1325,6 +1445,7 @@ fn create_projection_temp(dir: &Path) -> Result<(PathBuf, File), StoreError> {
 
 fn remove_stale_projection_temps(dir: &Path) -> Result<(), StoreError> {
     let prefix = format!(".{PROJECTION_NAME}.tmp.");
+    let mut stale = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -1334,12 +1455,26 @@ fn remove_stale_projection_temps(dir: &Path) -> Result<(), StoreError> {
         if !name.starts_with(&prefix) {
             continue;
         }
-        let path = entry.path();
+        stale.push(entry.path());
+        if stale.len() > MAX_STALE_PROJECTION_TEMPS {
+            return Err(StoreError::SchemaMismatch);
+        }
+    }
+    for path in stale {
         private_file(&path)?;
         fs::remove_file(path)?;
     }
     Ok(())
 }
+
+fn mark_projection_dirty(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE metadata SET value='1' WHERE key='projection_dirty'",
+        [],
+    )?;
+    Ok(())
+}
+
 fn count(db: &Connection, table: &str) -> Result<u64, StoreError> {
     Ok(db
         .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
@@ -1374,12 +1509,16 @@ fn initialize_empty_schema(db: &Connection) -> Result<(), StoreError> {
             "INSERT INTO metadata(key, value) VALUES ('schema_version', ?1)",
             [LOCAL_STORE_SCHEMA_VERSION],
         )?;
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES ('projection_dirty', '1')",
+            [],
+        )?;
     }
     tx.commit()?;
     Ok(())
 }
 
-fn migrate_v1_to_v2(db: &Connection) -> Result<(), StoreError> {
+fn migrate_to_v3(db: &Connection) -> Result<(), StoreError> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
     let version: String = tx
         .query_row(
@@ -1388,30 +1527,40 @@ fn migrate_v1_to_v2(db: &Connection) -> Result<(), StoreError> {
             |row| row.get(0),
         )
         .map_err(|_| StoreError::SchemaMismatch)?;
-    if version == "local_state.v2" {
+    if version == LOCAL_STORE_SCHEMA_VERSION {
         tx.commit()?;
         return Ok(());
     }
-    if version != "local_state.v1" {
+    if version == "local_state.v2" {
+        tx.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES ('projection_dirty', '1')",
+            [],
+        )?;
+    } else if version == "local_state.v1" {
+        let object_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'adapter_dispositions')",
+            [],
+            |row| row.get(0),
+        )?;
+        if object_exists {
+            return Err(StoreError::SchemaMismatch);
+        }
+        let disposition_sql = SCHEMA_OBJECTS
+            .iter()
+            .find(|(_, name, _)| *name == "adapter_dispositions")
+            .map(|(_, _, sql)| *sql)
+            .ok_or(StoreError::SchemaMismatch)?;
+        tx.execute_batch(disposition_sql)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES ('projection_dirty', '1')",
+            [],
+        )?;
+    } else {
         return Err(StoreError::SchemaMismatch);
     }
-    let object_exists: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'adapter_dispositions')",
-        [],
-        |row| row.get(0),
-    )?;
-    if object_exists {
-        return Err(StoreError::SchemaMismatch);
-    }
-    let disposition_sql = SCHEMA_OBJECTS
-        .iter()
-        .find(|(_, name, _)| *name == "adapter_dispositions")
-        .map(|(_, _, sql)| *sql)
-        .ok_or(StoreError::SchemaMismatch)?;
-    tx.execute_batch(disposition_sql)?;
     tx.execute(
-        "UPDATE metadata SET value='local_state.v2' WHERE key='schema_version'",
-        [],
+        "UPDATE metadata SET value=?1 WHERE key='schema_version'",
+        [LOCAL_STORE_SCHEMA_VERSION],
     )?;
     tx.commit()?;
     Ok(())
@@ -1589,6 +1738,151 @@ mod tests {
             Some("1")
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_reopen_does_not_rewrite_projection() {
+        let dir = temp_dir("clean-reopen");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        let projection = store.projection_path();
+        let before = fs::metadata(&projection).unwrap().modified().unwrap();
+        drop(store);
+        let reopened = LocalStore::open(&dir).unwrap();
+        assert_eq!(
+            fs::metadata(reopened.projection_path())
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_projection_is_repaired_from_dirty_state_on_reopen() {
+        let dir = temp_dir("deferred-dirty");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store
+            .ingest_deferred_projection(&observation("1", "session", None))
+            .unwrap();
+        let database = store.database_path();
+        assert_eq!(fs::read_to_string(store.projection_path()).unwrap(), "");
+        drop(store);
+        let connection = Connection::open(database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='projection_dirty'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "1"
+        );
+        drop(connection);
+        let reopened = LocalStore::open(&dir).unwrap();
+        assert_eq!(
+            fs::read_to_string(reopened.projection_path())
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let connection = Connection::open(reopened.database_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='projection_dirty'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "0"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_batch_commits_ordered_cursors_atomically() {
+        let dir = temp_dir("deferred-batch");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let batch = [
+            observation("1", "session", None),
+            observation_after("2", Some("1"), "turn", Some("session")),
+        ];
+        assert_eq!(
+            store.ingest_batch_deferred_projection(&batch).unwrap(),
+            [IngestStatus::Committed, IngestStatus::Committed]
+        );
+        assert_eq!(store.observation_count().unwrap(), 2);
+        assert_eq!(
+            store.cursor("codex", "generation").unwrap().as_deref(),
+            Some("2")
+        );
+        assert_eq!(fs::read_to_string(store.projection_path()).unwrap(), "");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_batch_rolls_back_cursor_and_records_on_failure() {
+        let dir = temp_dir("deferred-batch-rollback");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let batch = [
+            observation("1", "session", None),
+            observation_after("2", None, "turn", Some("session")),
+        ];
+        assert!(matches!(
+            store.ingest_batch_deferred_projection(&batch),
+            Err(StoreError::CursorConflict)
+        ));
+        assert_eq!(store.observation_count().unwrap(), 0);
+        assert_eq!(store.source_input_count().unwrap(), 0);
+        assert_eq!(store.cursor("codex", "generation").unwrap(), None);
+        let repaired = [
+            observation("1", "session", None),
+            observation_after("2", Some("1"), "turn", Some("session")),
+        ];
+        assert!(store.ingest_batch_deferred_projection(&repaired).is_ok());
+        assert_eq!(store.observation_count().unwrap(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_batch_crash_boundaries_reopen_without_partial_progress() {
+        for (label, point, expected) in [
+            ("batch-before-commit", CrashPoint::BeforeCommit, 0),
+            ("batch-after-commit", CrashPoint::AfterCommit, 2),
+        ] {
+            let dir = temp_dir(label);
+            let _ = fs::remove_dir_all(&dir);
+            let batch = [
+                observation("1", "session", None),
+                observation_after("2", Some("1"), "turn", Some("session")),
+            ];
+            let mut store = LocalStore::open(&dir).unwrap();
+            assert!(matches!(
+                store.ingest_batch_at(&batch, Some(point)),
+                Err(StoreError::Crash(actual)) if actual == point
+            ));
+            drop(store);
+            let mut reopened = LocalStore::open(&dir).unwrap();
+            assert_eq!(reopened.observation_count().unwrap(), expected);
+            if expected == 0 {
+                assert!(reopened.ingest_batch_deferred_projection(&batch).is_ok());
+            } else {
+                assert_eq!(
+                    reopened.ingest_batch_deferred_projection(&batch).unwrap(),
+                    [IngestStatus::Duplicate, IngestStatus::Duplicate]
+                );
+            }
+            assert_eq!(reopened.observation_count().unwrap(), 2);
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -2202,6 +2496,90 @@ mod tests {
             ),
             Err(StoreError::PayloadConflict)
         ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_store_migrates_to_v3_and_repairs_projection() {
+        let dir = temp_dir("v2-migration");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        let database = store.database_path();
+        let projection = store.projection_path();
+        drop(store);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value='local_state.v2' WHERE key='schema_version'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute("DELETE FROM metadata WHERE key='projection_dirty'", [])
+            .unwrap();
+        drop(connection);
+        fs::remove_file(&projection).unwrap();
+
+        let reopened = LocalStore::open(&dir).unwrap();
+        let connection = Connection::open(reopened.database_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "local_state.v3"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='projection_dirty'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "0"
+        );
+        assert_eq!(fs::read_to_string(&projection).unwrap().lines().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_projection_temp_cleanup_fails_closed_above_bound() {
+        let dir = temp_dir("temp-bound");
+        let _ = fs::remove_dir_all(&dir);
+        let store = LocalStore::open(&dir).unwrap();
+        let database = store.database_path();
+        drop(store);
+        for index in 0..=MAX_STALE_PROJECTION_TEMPS {
+            private_create_new(&dir.join(format!(".{PROJECTION_NAME}.tmp.test.{index}"))).unwrap();
+        }
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value='1' WHERE key='projection_dirty'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            LocalStore::open(&dir),
+            Err(StoreError::SchemaMismatch)
+        ));
+        assert_eq!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!(".{PROJECTION_NAME}.tmp.")))
+                .count(),
+            MAX_STALE_PROJECTION_TEMPS + 1
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

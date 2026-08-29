@@ -35,35 +35,36 @@ reviewed proposal rather than an approved external contract.
 Rust contract types in `crates/contracts/src/` are the single canonical source. JSON schemas, TypeScript types
 and artifact hashes are generated outputs and must have no hand-edited semantic fields.
 
-Planned G1 artifacts:
+Planned G1 artifacts are Future TODO specifications. Verification cells name future test targets, not
+current shell commands. G1 promotion must add a wrapper that fails when a named target matches zero tests.
 
 | Artifact | Path | Verification |
 | --- | --- | --- |
-| ingest request | `crates/contracts/schemas/team-ingest-v1.schema.json` | `cargo test -p contracts team_ingest_v1` |
+| ingest request | `crates/contracts/schemas/team-ingest-v1.schema.json` | Future G1 test target: `team_ingest_v1` |
 | ingest response/error | `crates/contracts/schemas/team-ingest-response-v1.schema.json` | same gate |
-| report | `crates/contracts/schemas/report-dto-v1.schema.json` | `cargo test -p contracts report_dto_v1` |
-| management | `crates/contracts/schemas/management-dto-v1.schema.json` | `cargo test -p contracts management_dto_v1` |
-| local state/outbox | `crates/contracts/schemas/local-state-v1.schema.json` | `cargo test -p contracts local_state_v1` |
-| collection policy | `crates/contracts/schemas/collection-policy-v1.schema.json` | `cargo test -p contracts collection_policy_v1` |
-| queue | `crates/contracts/schemas/team-queue-v1.schema.json` | `cargo test -p contracts team_queue_v1` |
-| credential/enrollment | `crates/contracts/schemas/source-enrollment-v1.schema.json` | `cargo test -p contracts source_enrollment_v1` |
-| identity/binding | `crates/contracts/schemas/identity-binding-v1.schema.json` | `cargo test -p contracts identity_binding_v1` |
-| adapter heartbeat | `crates/contracts/schemas/adapter-heartbeat-v1.schema.json` | `cargo test -p contracts adapter_heartbeat_v1` |
-| adapter capability matrix | `crates/contracts/capabilities/adapter-capability-v1.yaml` | `cargo test -p contracts adapter_capability_v1` |
+| report | `crates/contracts/schemas/report-dto-v1.schema.json` | Future G1 test target: `report_dto_v1` |
+| management | `crates/contracts/schemas/management-dto-v1.schema.json` | Future G1 test target: `management_dto_v1` |
+| local state/outbox | `crates/contracts/schemas/local-state-v1.schema.json` | Future G1 test target: `local_state_v1` |
+| collection policy | `crates/contracts/schemas/collection-policy-v1.schema.json` | Future G1 test target: `collection_policy_v1` |
+| queue | `crates/contracts/schemas/team-queue-v1.schema.json` | Future G1 test target: `team_queue_v1` |
+| credential/enrollment | `crates/contracts/schemas/source-enrollment-v1.schema.json` | Future G1 test target: `source_enrollment_v1` |
+| identity/binding | `crates/contracts/schemas/identity-binding-v1.schema.json` | Future G1 test target: `identity_binding_v1` |
+| adapter heartbeat | `crates/contracts/schemas/adapter-heartbeat-v1.schema.json` | Future G1 test target: `adapter_heartbeat_v1` |
+| adapter capability matrix | `crates/contracts/capabilities/adapter-capability-v1.yaml` | Future G1 test target: `adapter_capability_v1` |
 | local performance protocol | `crates/contracts/performance/local-performance-v1.yaml` | `cargo run -p xtask -- perf local --profile release --check` |
-| observation revision | `crates/contracts/schemas/observation-revision-v1.schema.json` | `cargo test -p contracts observation_revision_v1` |
-| deletion/hold receipt | `crates/contracts/schemas/deletion-v1.schema.json` | `cargo test -p contracts deletion_v1` |
-| quota/reservation ledger | `crates/contracts/schemas/quota-v1.schema.json` | `cargo test -p contracts quota_v1` |
-| audit/export/recovery DTO | `crates/contracts/schemas/operations-v1.schema.json` | `cargo test -p contracts operations_v1` |
-| generated TypeScript | `web/src/generated/contracts/*.ts` | `cargo run -p xtask -- contracts generate --check` |
+| observation revision | `crates/contracts/schemas/observation-revision-v1.schema.json` | Future G1 test target: `observation_revision_v1` |
+| deletion/hold receipt | `crates/contracts/schemas/deletion-v1.schema.json` | Future G1 test target: `deletion_v1` |
+| quota/reservation ledger | `crates/contracts/schemas/quota-v1.schema.json` | Future G1 test target: `quota_v1` |
+| audit/export/recovery DTO | `crates/contracts/schemas/operations-v1.schema.json` | Future G1 test target: `operations_v1` |
+| generated TypeScript | `web/src/generated/contracts/*.ts` | Future G1: `cargo run -p xtask -- contracts generate --check` |
 | generated hash manifest | `crates/contracts/generated-manifest.json` | same command; repository diff must be empty |
-| crypto policy | `crates/contracts/security/team-crypto-v1.yaml` | `cargo test -p contracts team_crypto_v1` |
+| crypto policy | `crates/contracts/security/team-crypto-v1.yaml` | Future G1 test target: `team_crypto_v1` |
 
 Schemas set `additionalProperties: false` at every object, reject duplicate JSON keys before schema
 validation and define required/nullability/string/numeric bounds. Fixture directories contain `valid`,
 `boundary`, `invalid`, `privacy`, `compat` and `canonical-hash` cases.
 
-`cargo run -p xtask -- contracts generate` emits JSON schema, TypeScript and SHA-256 hashes from Rust types.
+After G1 promotion, `cargo run -p xtask -- contracts generate` will emit JSON schema, TypeScript and SHA-256 hashes from Rust types.
 `--check` regenerates in a temporary directory and fails on semantic output or hash drift. G1 evidence is stored
 at `docs/evidence/team/G1/contracts/manifest.yaml` using the evidence manifest fields in section 9 plus generator
 version, every artifact hash, test command and compatibility/privacy suite result.
@@ -116,19 +117,25 @@ budgets and load-shedding order in `TEAM_ARCHITECTURE.md`.
 
 Hook ingress reads at most 1 MiB and emits an allowlisted local message of at most 64 KiB. It never persists raw
 overflow bytes. Local channel capacity and normalization worker count are implementation constants recorded in
-the evidence manifest, not unbounded/user-controlled values. Full-channel and daemon-unavailable outcomes return
-without waiting for network or drain and expose only bounded counters/reason codes. Tests compare the complete
-agent process plus hook/exporter path against a collection-disabled baseline; daemon-only measurements do not
-satisfy the performance gate.
+the evidence manifest, not unbounded/user-controlled values. Full-channel and receiver-unavailable outcomes return
+without waiting for network or drain and expose only bounded counters/reason codes. The v0.13 gate compares a
+deterministic three-source fixture host plus the real bounded ingress and durable drain against a
+collection-disabled fixture-host baseline. A future resident daemon or IPC receiver is team-profile scope;
+resident-daemon-only measurements and hard-coded metrics do not satisfy the
+gate. Product-process compatibility remains a separate adapter capability fixture because external process
+versions and background activity are not a reproducible performance baseline.
 
 The singleton contract uses an OS-held exclusive lock plus boot nonce; a PID or lock file alone is insufficient.
 Observational hooks select host asynchronous mode where supported. A synchronous-only host uses 10 ms enqueue
 and 50 ms total handler deadlines and returns success on timeout/full/unavailable. Capability entries declare
-event mode and fail-open behavior. Process fixtures cover concurrent startup, stale metadata, PID reuse, slow/
-absent/crashed daemon, partial spool record, full channel, interrupted outbox ACK and restart replay.
+event mode and fail-open behavior. A process fixture proves exclusive startup and lock release; deterministic
+fixtures cover stale/corrupt metadata, unavailable/disconnected receivers, oversized messages, full channels,
+crash repair and restart replay. The in-memory v0.13 channel has no partial-record format. Interrupted outbox
+ACK is a Future TODO team fixture and is not a v0.13 standalone release condition.
 
-Storage accounting uses allocated filesystem blocks and covers authoritative state plus WAL/sidecars, team
-queue/ACK, projections/exports, diagnostics/crash/temp files and atomic old/new copies under one hard budget.
+Storage accounting uses allocated filesystem blocks and covers authoritative state plus WAL/sidecars,
+projections/exports, diagnostics/crash/temp files and atomic old/new copies under one hard budget. Standalone
+creates no team queue/ACK artifacts; its disabled team partition is lendable under the rule below.
 For budget `B`, reserve `max(32 MiB, floor(B/8))` as non-borrowable atomic/WAL headroom; split remaining `R`
 40/50/8/2 percent with minimums 80/96/16/4 MiB and assign rounding residual to headroom. Invalid minima fail
 schema validation. A disabled team profile may lend its partition to state/projection but never the headroom.
@@ -140,7 +147,10 @@ deterministic-clock fixture.
 burst, one-second sampler, CPU normalization, machine/OS/filesystem/power metadata, cold/warm cache, three-adapter
 schedule and threshold calculation. The xtask command emits
 `docs/evidence/local/performance/<run>/manifest.yaml` and exits non-zero on any budget breach. No v0.13/v1.0
-release can pass with a missing manifest or a daemon-only sample.
+release can pass with a missing manifest or a resident-daemon-only sample. The enabled burst records attempted,
+enqueued, rejected and durable counts, permits at most 1% explicit fail-open rejection, and requires
+enqueued and durable counts to match after graceful fixture shutdown. Enqueue is not a foreground
+durability guarantee.
 
 ## 3. V1 transport contract
 
@@ -549,7 +559,7 @@ in the backup.
 
 `team-crypto-v1.yaml` defines algorithm identifier, key/nonce/tag length, additional-authenticated-data fields,
 key owner/custodian, tenant and identity-key state transitions, backup inventory rule and restore-denial checks. The verifier
-command is `cargo test -p contracts team_crypto_v1`; evidence covers cross-tenant unlinkability, rotation
+future target is `team_crypto_v1`; evidence covers cross-tenant unlinkability, rotation
 interruption/resume, recovery-only backup restore, retired-key denial and destroyed-key denial.
 
 ## 7. Deletion contract

@@ -7,12 +7,14 @@ members = [
     "crates/cli",
     "crates/contracts",
     "crates/domain",
+    "crates/local-runtime",
     "crates/local-store",
+    "xtask",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 license = "UNLICENSED"
 rust-version = "1.97"

@@ -14,6 +14,7 @@ agent-observability-adapter-claude-code = { path = "../adapter-claude-code" }
 agent-observability-adapter-codex = { path = "../adapter-codex" }
 agent-observability-adapter-cursor = { path = "../adapter-cursor" }
 agent-observability-contracts = { path = "../contracts" }
+agent-observability-local-runtime = { path = "../local-runtime" }
 agent-observability-local-store = { path = "../local-store" }
 
 [lints]

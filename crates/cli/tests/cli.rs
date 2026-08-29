@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[cfg(unix)]
@@ -5,6 +6,10 @@ use std::fs;
 
 fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_agent-observability"))
+}
+
+fn installed_store(root: &Path) -> PathBuf {
+    root.join("state/store")
 }
 
 #[test]
@@ -21,6 +26,137 @@ fn invalid_real_process_command_fails_on_stderr() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown command"));
+}
+
+#[cfg(unix)]
+#[test]
+fn init_and_runtime_check_create_only_private_local_paths() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-install-process-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let init = binary()
+        .args(["init", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    assert!(String::from_utf8_lossy(&init.stdout).contains("config_schema=local_runtime.v1"));
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(root.join("config.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    for directory in ["logs", "queue", "state", "runtime"] {
+        assert_eq!(
+            fs::metadata(root.join(directory))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    let check = binary()
+        .args(["runtime-check", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(stdout.contains("singleton=held"));
+    assert!(stdout.contains("storage_admission=allowed"));
+    assert!(stdout.contains("team_ingest=disabled"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn config_check_rejects_unknown_fields_in_the_real_process() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-config-process-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let config = root.join("config.json");
+    fs::write(
+        &config,
+        br#"{"schema_version":"local_runtime.v1","endpoint":"forbidden"}"#,
+    )
+    .unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = binary()
+        .args(["config-check", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown field"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_runtime_config_disables_ingest_without_creating_a_store() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-disabled-process-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let init = binary()
+        .args(["init", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    let config = root.join("config.json");
+    let body = fs::read_to_string(&config)
+        .unwrap()
+        .replace("\"enabled\": true", "\"enabled\": false");
+    fs::write(&config, body).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let handoff = root.join("codex-handoff.jsonl");
+    fs::write(
+        &handoff,
+        include_str!("../../adapter-codex/tests/fixtures/codex-handoff.jsonl"),
+    )
+    .unwrap();
+    fs::set_permissions(&handoff, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output = binary()
+        .args([
+            "codex-ingest",
+            root.to_str().unwrap(),
+            handoff.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("collection_disabled=1"));
+    assert!(!root.join("state/store/local-store.sqlite3").exists());
+    let _ = fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]
@@ -42,7 +178,7 @@ fn storage_check_rejects_a_broad_directory_in_the_real_process() {
         .unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("permissions are too broad"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not private"));
     let _ = fs::remove_dir_all(directory);
 }
 
@@ -70,16 +206,26 @@ fn concurrent_real_processes_initialize_one_store() {
                 .unwrap()
         })
         .collect::<Vec<_>>();
+    let mut successes = 0;
     for child in children {
         let output = child.wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        if output.status.success() {
+            successes += 1;
+        } else {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("already running"));
+        }
     }
-    assert!(directory.join("local-store.sqlite3").is_file());
-    assert!(directory.join("observations.jsonl").is_file());
+    assert!(successes >= 1);
+    assert!(
+        installed_store(&directory)
+            .join("local-store.sqlite3")
+            .is_file()
+    );
+    assert!(
+        installed_store(&directory)
+            .join("observations.jsonl")
+            .is_file()
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -136,7 +282,8 @@ fn codex_ingest_process_commits_observations_and_bounded_diagnostics() {
         "{}",
         String::from_utf8_lossy(&second.stderr)
     );
-    let projection = fs::read_to_string(store.join("observations.jsonl")).unwrap();
+    let projection =
+        fs::read_to_string(installed_store(&store).join("observations.jsonl")).unwrap();
     assert_eq!(projection.lines().count(), 5);
     for secret in [
         "RAW_PROMPT_SECRET",
@@ -198,7 +345,8 @@ fn claude_code_ingest_process_is_private_and_idempotent() {
         }
     }
 
-    let projection = fs::read_to_string(store.join("observations.jsonl")).unwrap();
+    let projection =
+        fs::read_to_string(installed_store(&store).join("observations.jsonl")).unwrap();
     assert_eq!(projection.lines().count(), 6);
     for secret in [
         "RAW_PROMPT_SECRET",
@@ -276,11 +424,13 @@ fn claude_code_ingest_restarts_from_a_failed_prefix_and_tail() {
     );
 
     assert_eq!(
-        fs::read_to_string(split_store.join("observations.jsonl")).unwrap(),
-        fs::read_to_string(full_store.join("observations.jsonl")).unwrap()
+        fs::read_to_string(installed_store(&split_store).join("observations.jsonl")).unwrap(),
+        fs::read_to_string(installed_store(&full_store).join("observations.jsonl")).unwrap()
     );
-    let split_state = agent_observability_local_store::LocalStore::open(&split_store).unwrap();
-    let full_state = agent_observability_local_store::LocalStore::open(&full_store).unwrap();
+    let split_state =
+        agent_observability_local_store::LocalStore::open(installed_store(&split_store)).unwrap();
+    let full_state =
+        agent_observability_local_store::LocalStore::open(installed_store(&full_store)).unwrap();
     assert_eq!(split_state.observation_count().unwrap(), 7);
     assert_eq!(split_state.disposition_count().unwrap(), 3);
     assert_eq!(
@@ -339,7 +489,8 @@ fn codex_ingest_process_restarts_from_an_appended_tail() {
         );
     }
 
-    let projection = fs::read_to_string(store.join("observations.jsonl")).unwrap();
+    let projection =
+        fs::read_to_string(installed_store(&store).join("observations.jsonl")).unwrap();
     let full_store = root.join("full-store");
     let full_handoff = root.join("full.jsonl");
     fs::write(&full_handoff, fixture).unwrap();
@@ -359,10 +510,12 @@ fn codex_ingest_process_restarts_from_an_appended_tail() {
     );
     assert_eq!(
         projection,
-        fs::read_to_string(full_store.join("observations.jsonl")).unwrap()
+        fs::read_to_string(installed_store(&full_store).join("observations.jsonl")).unwrap()
     );
-    let split_state = agent_observability_local_store::LocalStore::open(&store).unwrap();
-    let full_state = agent_observability_local_store::LocalStore::open(&full_store).unwrap();
+    let split_state =
+        agent_observability_local_store::LocalStore::open(installed_store(&store)).unwrap();
+    let full_state =
+        agent_observability_local_store::LocalStore::open(installed_store(&full_store)).unwrap();
     assert_eq!(split_state.observation_count().unwrap(), 6);
     assert_eq!(split_state.disposition_count().unwrap(), 2);
     assert_eq!(
@@ -378,6 +531,7 @@ fn codex_ingest_process_restarts_from_an_appended_tail() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn cursor_ingest_process_is_private_idempotent_and_restartable() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -449,8 +603,10 @@ fn cursor_ingest_process_is_private_idempotent_and_restartable() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("source=cursor"));
 
-    let split_projection = fs::read_to_string(split_store.join("observations.jsonl")).unwrap();
-    let full_projection = fs::read_to_string(full_store.join("observations.jsonl")).unwrap();
+    let split_projection =
+        fs::read_to_string(installed_store(&split_store).join("observations.jsonl")).unwrap();
+    let full_projection =
+        fs::read_to_string(installed_store(&full_store).join("observations.jsonl")).unwrap();
     assert_eq!(split_projection, full_projection);
     let tool_executions = split_projection
         .lines()
@@ -478,7 +634,8 @@ fn cursor_ingest_process_is_private_idempotent_and_restartable() {
     ] {
         assert!(!split_projection.contains(secret));
     }
-    let split_state = agent_observability_local_store::LocalStore::open(&split_store).unwrap();
+    let split_state =
+        agent_observability_local_store::LocalStore::open(installed_store(&split_store)).unwrap();
     assert_eq!(split_state.observation_count().unwrap(), 7);
     assert_eq!(split_state.disposition_count().unwrap(), 6);
     let _ = fs::remove_dir_all(root);
