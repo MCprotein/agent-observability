@@ -11,6 +11,7 @@ const validatorPath = "ui/report/generated/validate-report-dto-v1.js";
 const bundlePath = "src/report/generated/report-ui.js";
 const shellPath = "src/report/generated/report-shell.html";
 const viewSummaryPath = "ui/report/generated/view-summary.js";
+const viewStatePath = "ui/report/generated/view-state.js";
 const banner = "Generated from contracts/report-dto-v1.schema.json. Do not edit.";
 
 await Promise.all([
@@ -59,6 +60,17 @@ await writeFile(shellPath, reportDocumentTemplate(), "utf8");
 await build({
   entryPoints: ["ui/report/view-summary.ts"],
   outfile: viewSummaryPath,
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: ["node20"],
+  legalComments: "none",
+  banner: { js: `/* ${banner} */` },
+});
+
+await build({
+  entryPoints: ["ui/report/view-state.ts"],
+  outfile: viewStatePath,
   bundle: true,
   format: "esm",
   platform: "node",

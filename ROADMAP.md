@@ -53,7 +53,7 @@ gate를 통과해 추가한다.
 | v0.x | Completed | Local-only PoC를 작은 minor release로 쪼개 검증했다. |
 | v1.x | Active | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
 
-## Active Train: v0.1.0-v1.0.0
+## Active Train: v0.1.0-v1.1.0
 
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
@@ -77,7 +77,7 @@ gate를 통과해 추가한다.
 
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
-| v1.1.0 | Planned | Report usability improvements | richer timelines, saved filters, regression fixture for large local event logs |
+| v1.1.0 | Released | Report usability improvements | bounded timeline, local structured-dimension saved views, 100-trace/200-span pagination, deterministic 4,096-span Node/Chromium regression, reload/delete browser smoke, independent review clear |
 | v1.2.0 | Planned | Local retention and archive policy | disk budget, retention config, archive/export smoke |
 
 ## Branch Strategy

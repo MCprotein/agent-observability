@@ -132,9 +132,21 @@
     .control-actions {
       display: grid;
       grid-column: 1 / -1;
-      grid-template-columns: minmax(120px, 180px) minmax(0, 1fr);
+      grid-template-columns: minmax(120px, 180px) minmax(0, 1fr) minmax(260px, 420px);
       gap: 12px;
       align-items: center;
+    }
+
+    .saved-controls {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 8px;
+    }
+
+    .saved-controls button,
+    .pager button {
+      width: auto;
+      min-width: 38px;
     }
 
     .filter-status { color: var(--muted); font-size: 12px; }
@@ -156,6 +168,67 @@
       gap: 16px;
       align-items: start;
     }
+
+    .timeline-panel {
+      margin-bottom: 16px;
+    }
+
+    .timeline-list {
+      display: grid;
+      max-height: 320px;
+      overflow: auto;
+      padding: 6px 12px 12px;
+    }
+
+    .timeline-row {
+      display: grid;
+      grid-template-columns: minmax(160px, 280px) minmax(240px, 1fr);
+      gap: 12px;
+      align-items: center;
+      min-height: 34px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .timeline-label {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .timeline-label > :first-child {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .timeline-details {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex: 0 0 auto;
+    }
+
+    .timeline-track {
+      position: relative;
+      height: 12px;
+      border-radius: 3px;
+      background: var(--surface-strong);
+      overflow: hidden;
+    }
+
+    .timeline-bar {
+      position: absolute;
+      top: 2px;
+      height: 8px;
+      min-width: 2px;
+      border-radius: 2px;
+      background: var(--muted);
+    }
+
+    .timeline-bar.ok { background: var(--ok); }
+    .timeline-bar.error { background: var(--error); }
+    .timeline-bar.warning { background: var(--warning); }
 
     .panel {
       border: 1px solid var(--line);
@@ -239,6 +312,18 @@
       max-height: 650px;
     }
 
+    .pager {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      min-height: 46px;
+      padding: 6px 10px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
     table {
       width: 100%;
       border-collapse: collapse;
@@ -282,6 +367,8 @@
       .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .layout { grid-template-columns: 1fr; }
+      .control-actions { grid-template-columns: minmax(120px, 180px) minmax(0, 1fr); }
+      .saved-controls { grid-column: 1 / -1; }
     }
 
     @media (max-width: 560px) {
@@ -290,6 +377,9 @@
       .timestamp { white-space: normal; }
       .kpis,
       .controls { grid-template-columns: 1fr; }
+      .control-actions,
+      .saved-controls { grid-template-columns: 1fr; }
+      .timeline-row { grid-template-columns: 1fr; padding: 8px 0; }
       select,
       input,
       button { min-height: 44px; }
@@ -324,8 +414,22 @@
       <div class="control-actions">
         <button id="clear-filters" type="button" disabled>Clear filters</button>
         <span class="filter-status" id="filter-status" aria-live="polite"></span>
+        <div class="saved-controls">
+          <label class="sr-only" for="saved-filter">Saved views</label>
+          <select id="saved-filter" aria-label="Saved views"></select>
+          <button id="save-filter" type="button">Save view</button>
+          <button id="delete-filter" type="button" aria-label="Delete saved view" title="Delete saved view" disabled>&times;</button>
+        </div>
       </div>
     </fieldset>
+
+    <section class="panel timeline-panel" aria-labelledby="timeline-heading">
+      <h2 class="panel-title" id="timeline-heading">
+        <span>Timeline</span>
+        <span class="filter-status" id="timeline-status">0 spans.</span>
+      </h2>
+      <div class="timeline-list" id="timeline-list"></div>
+    </section>
 
     <section class="layout">
       <aside class="panel" aria-labelledby="traces-heading">
@@ -334,6 +438,11 @@
           <span class="badge" id="trace-count">0</span>
         </h2>
         <div class="trace-list" id="trace-list"></div>
+        <div class="pager" aria-label="Trace pages">
+          <button id="trace-previous" type="button" aria-label="Previous trace page" title="Previous trace page">&#8249;</button>
+          <span id="trace-page-status">0 of 0</span>
+          <button id="trace-next" type="button" aria-label="Next trace page" title="Next trace page">&#8250;</button>
+        </div>
       </aside>
       <section class="panel" aria-labelledby="spans-heading">
         <h2 class="panel-title" id="spans-heading">
@@ -358,6 +467,11 @@
             </thead>
             <tbody id="span-table"></tbody>
           </table>
+        </div>
+        <div class="pager" aria-label="Span pages">
+          <button id="span-previous" type="button" aria-label="Previous span page" title="Previous span page">&#8249;</button>
+          <span id="span-page-status">0 of 0</span>
+          <button id="span-next" type="button" aria-label="Next span page" title="Next span page">&#8250;</button>
         </div>
       </section>
     </section>
@@ -2196,6 +2310,135 @@
   }
   validate20.evaluated = { "props": true, "dynamicProps": false, "dynamicItems": false };
 
+  // ui/report/view-state.ts
+  var UNKNOWN = "unknown";
+  function buildFilteredView(spans, traces, state) {
+    const filteredSpans = [];
+    const spansByTrace = /* @__PURE__ */ new Map();
+    for (const span of spans) {
+      if (!matchesFilters(span, state)) continue;
+      filteredSpans.push(span);
+      const traceSpans = spansByTrace.get(span.traceId);
+      if (traceSpans) traceSpans.push(span);
+      else spansByTrace.set(span.traceId, [span]);
+    }
+    return {
+      spans: filteredSpans,
+      traces: traces.filter((trace) => spansByTrace.has(trace.traceId)),
+      spansByTrace
+    };
+  }
+  function paginate(items, requestedIndex, pageSize) {
+    if (!Number.isInteger(pageSize) || pageSize <= 0) throw new Error("pageSize must be positive");
+    const count = Math.max(1, Math.ceil(items.length / pageSize));
+    const index = Math.min(Math.max(0, requestedIndex), count - 1);
+    return {
+      items: items.slice(index * pageSize, (index + 1) * pageSize),
+      index,
+      count,
+      total: items.length
+    };
+  }
+  function buildTimeline(spans, limit) {
+    if (!Number.isInteger(limit) || limit <= 0) throw new Error("limit must be positive");
+    if (spans.length === 0) return [];
+    let start = Number.POSITIVE_INFINITY;
+    let end = Number.NEGATIVE_INFINITY;
+    for (const span of spans) {
+      start = Math.min(start, span.startTimeUnixMs);
+      end = Math.max(end, spanEnd(span));
+    }
+    const range = Math.max(1, end - start);
+    return spans.slice(0, limit).map((span) => {
+      const leftPercent = Math.min(99, (span.startTimeUnixMs - start) / range * 100);
+      const available = Math.max(0, 100 - leftPercent);
+      const durationPercent = (spanEnd(span) - span.startTimeUnixMs) / range * 100;
+      return {
+        span,
+        leftPercent,
+        widthPercent: Math.min(available, Math.max(0.8, durationPercent))
+      };
+    });
+  }
+  function parseSavedFilters(value, limit) {
+    if (!value || value.length > 32768) return [];
+    try {
+      const candidate2 = JSON.parse(value);
+      if (!isSavedFilterEnvelope(candidate2)) return [];
+      const result = [];
+      for (const filters of candidate2.filters) {
+        if (!isPersistableDimensions(filters) || result.some((saved) => sameDimensions(saved, filters))) continue;
+        result.push(filters);
+        if (result.length >= limit) break;
+      }
+      return result;
+    } catch {
+      return [];
+    }
+  }
+  function serializeSavedFilters(filters) {
+    if (filters.some((candidate2) => !isPersistableDimensions(candidate2))) {
+      throw new Error("Saved filters contain a non-persistable value");
+    }
+    const envelope = { version: 1, filters };
+    return JSON.stringify(envelope);
+  }
+  function isPersistableDimensions(filters) {
+    if (!hasDimensions(filters)) return false;
+    const allowed = /* @__PURE__ */ new Set(["repo", "session", "agent", "model"]);
+    if (Object.keys(filters).some((key) => !allowed.has(key))) return false;
+    const safeName = /^[A-Za-z0-9._:-]{1,128}$/;
+    const safeModel = /^[A-Za-z0-9._:-]{1,128}(?:\/[A-Za-z0-9._:-]{1,128}){0,2}$/;
+    const opaqueSession = /^id:sha256:[a-f0-9]{64}$/;
+    return (filters.repo === void 0 || safeName.test(filters.repo)) && (filters.session === void 0 || opaqueSession.test(filters.session)) && (filters.agent === void 0 || safeName.test(filters.agent)) && (filters.model === void 0 || safeModel.test(filters.model));
+  }
+  function sameDimensions(left, right) {
+    return left.repo === right.repo && left.session === right.session && left.agent === right.agent && left.model === right.model;
+  }
+  function matchesFilters(span, state) {
+    if (state.repo !== void 0 && span.repo !== state.repo) return false;
+    if (state.session !== void 0 && span.sessionId !== state.session) return false;
+    if (state.agent !== void 0 && (span.agent.name ?? UNKNOWN) !== state.agent) return false;
+    if (state.model !== void 0 && (span.agent.model ?? UNKNOWN) !== state.model) return false;
+    if (!state.text) return true;
+    return [
+      span.name,
+      span.kind,
+      span.status,
+      span.toolName,
+      span.traceId,
+      span.spanId,
+      span.repo,
+      span.sessionId,
+      span.agent.name,
+      span.agent.model
+    ].join(" ").toLowerCase().includes(state.text);
+  }
+  function spanEnd(span) {
+    const inferredDuration = span.metrics.latencyMs ?? span.metrics.durationMs ?? 0;
+    return Math.max(span.startTimeUnixMs, span.endTimeUnixMs ?? span.startTimeUnixMs + inferredDuration);
+  }
+  function isDimensionFilters(value) {
+    if (!isObject(value)) return false;
+    const allowed = /* @__PURE__ */ new Set(["repo", "session", "agent", "model"]);
+    if (Object.keys(value).some((key) => !allowed.has(key))) return false;
+    return ["repo", "session", "agent", "model"].every((key) => {
+      const candidate2 = value[key];
+      return candidate2 === void 0 || typeof candidate2 === "string" && candidate2.length <= 512;
+    });
+  }
+  function hasDimensions(filters) {
+    return filters.repo !== void 0 || filters.session !== void 0 || filters.agent !== void 0 || filters.model !== void 0;
+  }
+  function isSavedFilterEnvelope(value) {
+    if (!isObject(value) || value.version !== 1 || !Array.isArray(value.filters)) return false;
+    if (Object.keys(value).some((key) => key !== "version" && key !== "filters")) return false;
+    return value.filters.every(isDimensionFilters);
+  }
+  function isObject(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+
   // ui/report/view-summary.ts
   var TOKEN_METRICS = [
     "inputTokens",
@@ -2247,11 +2490,15 @@
 
   // ui/report/main.ts
   var ALL_OPTION = "-1";
-  var UNKNOWN = "unknown";
+  var UNKNOWN2 = "unknown";
+  var TRACE_PAGE_SIZE = 100;
+  var SPAN_PAGE_SIZE = 200;
+  var TIMELINE_LIMIT = 120;
+  var FILTER_OPTION_LIMIT = 500;
+  var SAVED_FILTER_LIMIT = 20;
+  var SAVED_FILTER_KEY = "agent-observability.report.v1.saved-filters";
   var reportData = document.getElementById("report-data");
-  if (!reportData) {
-    throw new Error("Missing report data");
-  }
+  if (!reportData) throw new Error("Missing report data");
   var candidate = parseReportData(reportData.textContent);
   if (candidate === void 0 || !validate_report_dto_v1_default(candidate)) {
     document.body.replaceChildren(errorState("Report data does not match agent_observability.report.v1."));
@@ -2274,6 +2521,9 @@
       text: "",
       trace: void 0
     };
+    let tracePageIndex = 0;
+    let spanPageIndex = 0;
+    let savedFilters = [];
     const selects = {
       repo: element("repo-filter"),
       session: element("session-filter"),
@@ -2282,53 +2532,121 @@
     };
     const textFilter = element("text-filter");
     const clearFilters = element("clear-filters");
+    const savedFilterSelect = element("saved-filter");
+    const saveFilter = element("save-filter");
+    const deleteFilter = element("delete-filter");
     const tracesElement = element("trace-list");
     const tableElement = element("span-table");
+    const timelineElement = element("timeline-list");
     const traceCount = element("trace-count");
     const spanCount = element("span-count");
     const filterStatus = element("filter-status");
-    const filterValues = {
+    const tracePrevious = element("trace-previous");
+    const traceNext = element("trace-next");
+    const spanPrevious = element("span-previous");
+    const spanNext = element("span-next");
+    const allFilterValues = {
       repo: data.filters.repos,
       session: data.filters.sessions,
-      agent: data.filters.agents ?? uniqueSorted(data.spans.map((span) => span.agent.name ?? UNKNOWN)),
-      model: data.filters.models ?? uniqueSorted(data.spans.map((span) => span.agent.model ?? UNKNOWN))
+      agent: data.filters.agents ?? uniqueSorted(data.spans.map((span) => span.agent.name ?? UNKNOWN2)),
+      model: data.filters.models ?? uniqueSorted(data.spans.map((span) => span.agent.model ?? UNKNOWN2))
     };
-    fillSelect(selects.repo, filterValues.repo, "All repos");
-    fillSelect(selects.session, filterValues.session, "All sessions");
-    fillSelect(selects.agent, filterValues.agent, "All agents");
-    fillSelect(selects.model, filterValues.model, "All models");
+    const filterValues = Object.fromEntries(
+      Object.keys(allFilterValues).map((key) => [key, allFilterValues[key].slice(0, FILTER_OPTION_LIMIT)])
+    );
+    savedFilters = currentSavedFilters(loadSavedFilters(), filterValues);
+    fillSelect(selects.repo, filterValues.repo, "All repos", allFilterValues.repo.length);
+    fillSelect(selects.session, filterValues.session, "All sessions", allFilterValues.session.length);
+    fillSelect(selects.agent, filterValues.agent, "All agents", allFilterValues.agent.length);
+    fillSelect(selects.model, filterValues.model, "All models", allFilterValues.model.length);
+    renderSavedFilterOptions();
     for (const key of Object.keys(selects)) {
       selects[key].addEventListener("change", () => {
         const index = Number(selects[key].value);
         state[key] = index >= 0 ? filterValues[key][index] : void 0;
-        state.trace = void 0;
+        resetSelection();
         render();
       });
     }
     textFilter.addEventListener("input", () => {
       state.text = textFilter.value.trim().toLowerCase();
-      state.trace = void 0;
+      resetSelection();
       render();
     });
     clearFilters.addEventListener("click", () => {
-      for (const key of Object.keys(selects)) {
-        state[key] = void 0;
-        selects[key].value = ALL_OPTION;
-      }
+      applyDimensions(emptyDimensions());
       state.text = "";
-      state.trace = void 0;
       textFilter.value = "";
+      resetSelection();
       render();
       selects.repo.focus();
     });
+    saveFilter.addEventListener("click", () => {
+      const dimensions = currentDimensions();
+      if (!isPersistableDimensions(dimensions)) return;
+      const existing = savedFilters.findIndex((saved) => sameDimensions(saved, dimensions));
+      if (existing >= 0) {
+        savedFilterSelect.value = String(existing);
+      } else {
+        const nextFilters = [dimensions, ...savedFilters].slice(0, SAVED_FILTER_LIMIT);
+        if (!persistSavedFilters(nextFilters)) {
+          filterStatus.textContent = "Saved views are unavailable in this browser context.";
+          return;
+        }
+        savedFilters = nextFilters;
+        renderSavedFilterOptions();
+        savedFilterSelect.value = "0";
+      }
+      deleteFilter.disabled = false;
+    });
+    savedFilterSelect.addEventListener("change", () => {
+      const selected = savedFilters[Number(savedFilterSelect.value)];
+      deleteFilter.disabled = selected === void 0;
+      if (!selected) return;
+      applyDimensions(selected);
+      state.text = "";
+      textFilter.value = "";
+      state.trace = void 0;
+      tracePageIndex = 0;
+      spanPageIndex = 0;
+      render();
+    });
+    deleteFilter.addEventListener("click", () => {
+      const index = Number(savedFilterSelect.value);
+      if (!Number.isInteger(index) || index < 0 || index >= savedFilters.length) return;
+      const nextFilters = savedFilters.filter((_, savedIndex) => savedIndex !== index);
+      if (!persistSavedFilters(nextFilters)) {
+        filterStatus.textContent = "The saved view could not be deleted in this browser context.";
+        return;
+      }
+      savedFilters = nextFilters;
+      renderSavedFilterOptions();
+    });
+    tracePrevious.addEventListener("click", () => {
+      tracePageIndex -= 1;
+      render();
+    });
+    traceNext.addEventListener("click", () => {
+      tracePageIndex += 1;
+      render();
+    });
+    spanPrevious.addEventListener("click", () => {
+      spanPageIndex -= 1;
+      render();
+    });
+    spanNext.addEventListener("click", () => {
+      spanPageIndex += 1;
+      render();
+    });
     render();
     function render() {
-      const spans = data.spans.filter(matchesFilters);
-      const traces = data.traces.filter((trace) => spans.some((span) => span.traceId === trace.traceId));
-      if (state.trace !== void 0 && !traces.some((trace) => trace.traceId === state.trace)) {
-        state.trace = void 0;
-      }
-      const visibleSpans = state.trace === void 0 ? spans : spans.filter((span) => span.traceId === state.trace);
+      const view = buildFilteredView(data.spans, data.traces, state);
+      if (state.trace !== void 0 && !view.spansByTrace.has(state.trace)) state.trace = void 0;
+      const visibleSpans = state.trace === void 0 ? view.spans : view.spansByTrace.get(state.trace) ?? [];
+      const tracePage = paginate(view.traces, tracePageIndex, TRACE_PAGE_SIZE);
+      const spanPage = paginate(visibleSpans, spanPageIndex, SPAN_PAGE_SIZE);
+      tracePageIndex = tracePage.index;
+      spanPageIndex = spanPage.index;
       const summary = summarizeVisible(visibleSpans);
       setText("kpi-sessions", summary.sessions);
       setText("kpi-turns", summary.turns);
@@ -2340,37 +2658,24 @@
         currency: data.cost.currency
       }));
       setText("kpi-errors", summary.errors);
-      traceCount.textContent = String(traces.length);
+      traceCount.textContent = String(view.traces.length);
       spanCount.textContent = String(visibleSpans.length);
       clearFilters.disabled = !hasActiveFilters();
+      saveFilter.disabled = !isPersistableDimensions(currentDimensions());
       filterStatus.textContent = hasActiveFilters() ? `${visibleSpans.length} spans match the active filters.` : `${visibleSpans.length} spans in this local report.`;
-      renderTraces(traces, spans);
-      renderSpans(visibleSpans);
+      renderTraces(tracePage, view.spansByTrace);
+      renderTimeline(visibleSpans, state.trace !== void 0);
+      renderSpans(spanPage);
+      renderPager("trace", tracePage, tracePrevious, traceNext, TRACE_PAGE_SIZE);
+      renderPager("span", spanPage, spanPrevious, spanNext, SPAN_PAGE_SIZE);
     }
-    function matchesFilters(span) {
-      if (state.repo !== void 0 && span.repo !== state.repo) return false;
-      if (state.session !== void 0 && span.sessionId !== state.session) return false;
-      if (state.agent !== void 0 && (span.agent.name ?? UNKNOWN) !== state.agent) return false;
-      if (state.model !== void 0 && (span.agent.model ?? UNKNOWN) !== state.model) return false;
-      if (!state.text) return true;
-      return [
-        span.name,
-        span.kind,
-        span.status,
-        span.toolName,
-        span.traceId,
-        span.spanId,
-        span.agent.name,
-        span.agent.model
-      ].join(" ").toLowerCase().includes(state.text);
-    }
-    function renderTraces(traces, filteredSpans) {
-      if (traces.length === 0) {
+    function renderTraces(page, spansByTrace) {
+      if (page.total === 0) {
         tracesElement.innerHTML = '<div class="empty">No traces match the active filters.</div>';
         return;
       }
-      tracesElement.replaceChildren(...traces.map((trace) => {
-        const traceSpans = spansForTrace(trace, filteredSpans);
+      tracesElement.replaceChildren(...page.items.map((trace) => {
+        const traceSpans = spansByTrace.get(trace.traceId) ?? [];
         const traceSummary = summarizeVisible(traceSpans);
         const button = document.createElement("button");
         button.type = "button";
@@ -2378,41 +2683,129 @@
         button.setAttribute("aria-pressed", String(state.trace === trace.traceId));
         button.addEventListener("click", () => {
           state.trace = state.trace === trace.traceId ? void 0 : trace.traceId;
+          spanPageIndex = 0;
           render();
         });
         button.innerHTML = `<div class="trace-main"><span class="mono">${escapeHtml(shortId(trace.traceId))}</span><span class="badge ${traceSummary.errors ? "error" : "ok"}">${traceSummary.errors ? `${traceSummary.errors} error` : "ok"}</span></div><div class="trace-meta"><span>${escapeHtml(trace.repo)}</span><span>${traceSpans.length} spans</span><span>${formatNumber(traceSummary.inputTokens + traceSummary.outputTokens)} tokens</span></div>`;
         return button;
       }));
     }
-    function renderSpans(spans) {
-      if (spans.length === 0) {
+    function renderTimeline(spans, traceSelected) {
+      if (!traceSelected) {
+        timelineElement.innerHTML = '<div class="empty">Select a trace to inspect its timeline.</div>';
+        element("timeline-status").textContent = "No trace selected.";
+        return;
+      }
+      const items = buildTimeline(spans, TIMELINE_LIMIT);
+      if (items.length === 0) {
+        timelineElement.innerHTML = '<div class="empty">No timeline data for the active filters.</div>';
+        element("timeline-status").textContent = "0 spans.";
+        return;
+      }
+      timelineElement.replaceChildren(...items.map((item) => {
+        const row = document.createElement("div");
+        row.className = "timeline-row";
+        row.innerHTML = `<div class="timeline-label"><span>${escapeHtml(item.span.name)}</span><span class="timeline-details"><span class="badge timeline-span-status ${statusClass(item.span.status)}">${escapeHtml(item.span.status)}</span><span class="mono">${escapeHtml(formatDuration(item.span.metrics.latencyMs ?? item.span.metrics.durationMs))}</span></span></div><div class="timeline-track"><span class="timeline-bar ${statusClass(item.span.status)}" style="left:${item.leftPercent.toFixed(3)}%;width:${item.widthPercent.toFixed(3)}%"></span></div>`;
+        return row;
+      }));
+      element("timeline-status").textContent = spans.length > TIMELINE_LIMIT ? `Showing first ${TIMELINE_LIMIT} of ${spans.length} spans.` : `${spans.length} spans.`;
+    }
+    function renderSpans(page) {
+      if (page.total === 0) {
         tableElement.innerHTML = '<tr><td class="empty" colspan="9">No spans match the active filters.</td></tr>';
         return;
       }
-      tableElement.replaceChildren(...spans.map((span) => {
+      tableElement.replaceChildren(...page.items.map((span) => {
         const row = document.createElement("tr");
         row.innerHTML = `<td><span class="badge">${escapeHtml(span.kind)}</span></td><td>${escapeHtml(span.name)}${span.toolName ? `<div class="mono">${escapeHtml(span.toolName)}</div>` : ""}</td><td><span class="badge ${statusClass(span.status)}">${escapeHtml(span.status)}</span></td><td>${escapeHtml(span.repo)}</td><td class="mono">${escapeHtml(span.turnId ?? "")}</td><td>${formatNumber((span.metrics.inputTokens ?? 0) + (span.metrics.outputTokens ?? 0))}</td><td>${escapeHtml(formatCost(span.estimatedCost, span.cost))}</td><td>${formatDuration(span.metrics.latencyMs ?? span.metrics.durationMs)}</td><td class="mono">${escapeHtml(shortId(span.parentSpanId ?? ""))}</td>`;
         return row;
       }));
     }
+    function renderPager(prefix, page, previous, next, pageSize) {
+      previous.disabled = page.index === 0;
+      next.disabled = page.index >= page.count - 1;
+      element(`${prefix}-page-status`).textContent = page.total === 0 ? "0 of 0" : `${page.index * pageSize + 1}-${Math.min(page.total, (page.index + 1) * pageSize)} of ${page.total}`;
+    }
+    function renderSavedFilterOptions() {
+      savedFilterSelect.replaceChildren(
+        option(ALL_OPTION, "Saved views"),
+        ...savedFilters.map((saved, index) => option(String(index), savedFilterLabel(saved)))
+      );
+      deleteFilter.disabled = true;
+    }
+    function applyDimensions(dimensions) {
+      for (const key of Object.keys(selects)) {
+        const value = dimensions[key];
+        const index = value === void 0 ? -1 : filterValues[key].indexOf(value);
+        state[key] = index >= 0 ? value : void 0;
+        selects[key].value = index >= 0 ? String(index) : ALL_OPTION;
+      }
+    }
+    function currentDimensions() {
+      return { repo: state.repo, session: state.session, agent: state.agent, model: state.model };
+    }
+    function resetSelection() {
+      state.trace = void 0;
+      tracePageIndex = 0;
+      spanPageIndex = 0;
+      savedFilterSelect.value = ALL_OPTION;
+      deleteFilter.disabled = true;
+    }
     function hasActiveFilters() {
       return state.text.length > 0 || Object.keys(selects).some((key) => state[key] !== void 0);
     }
   }
-  function spansForTrace(trace, spans) {
-    return spans.filter((span) => span.traceId === trace.traceId);
+  function emptyDimensions() {
+    return { repo: void 0, session: void 0, agent: void 0, model: void 0 };
+  }
+  function loadSavedFilters() {
+    try {
+      return parseSavedFilters(globalThis.localStorage?.getItem(SAVED_FILTER_KEY) ?? null, SAVED_FILTER_LIMIT);
+    } catch {
+      return [];
+    }
+  }
+  function persistSavedFilters(filters) {
+    try {
+      if (!globalThis.localStorage) return false;
+      globalThis.localStorage.setItem(SAVED_FILTER_KEY, serializeSavedFilters(filters));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  function currentSavedFilters(savedFilters, values) {
+    const result = [];
+    for (const saved of savedFilters) {
+      const isCurrent = Object.keys(values).every(
+        (key) => saved[key] === void 0 || values[key].includes(saved[key])
+      );
+      if (isCurrent && hasDimensions2(saved) && !result.some((candidate2) => sameDimensions(candidate2, saved))) {
+        result.push(saved);
+      }
+    }
+    return result;
+  }
+  function hasDimensions2(filters) {
+    return filters.repo !== void 0 || filters.session !== void 0 || filters.agent !== void 0 || filters.model !== void 0;
+  }
+  function savedFilterLabel(filters) {
+    const parts = [filters.repo, filters.session, filters.agent, filters.model].filter((value) => value !== void 0).map(shortId);
+    return parts.length > 0 ? parts.join(" / ") : "All dimensions";
   }
   function element(id) {
     const value = document.getElementById(id);
     if (!value) throw new Error(`Missing report element: ${id}`);
     return value;
   }
-  function fillSelect(select, values, allLabel) {
-    const options = [
+  function fillSelect(select, values, allLabel, total) {
+    const more = option("", `${values.length} shown; use text search for more`);
+    more.disabled = true;
+    select.replaceChildren(
       option(ALL_OPTION, allLabel),
-      ...values.map((value, index) => option(String(index), value === UNKNOWN ? "Unknown" : value))
-    ];
-    select.replaceChildren(...options);
+      ...values.map((value, index) => option(String(index), value === UNKNOWN2 ? "Unknown" : value)),
+      ...total > values.length ? [more] : []
+    );
   }
   function option(value, label) {
     const result = document.createElement("option");
@@ -2456,10 +2849,10 @@
     })[char] ?? char);
   }
   function errorState(message) {
-    const element2 = document.createElement("main");
-    element2.className = "report-error";
-    element2.textContent = message;
-    return element2;
+    const result = document.createElement("main");
+    result.className = "report-error";
+    result.textContent = message;
+    return result;
   }
 })();
 </script>

@@ -7,9 +7,10 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 release train은 `v1.0.0` local-only stable 검증을 완료했다. Rust Codex, Claude Code, Cursor
+현재 release train은 `v1.1.0` report usability 검증을 완료했다. Rust Codex, Claude Code, Cursor
 adapter가 비공개 canonical handoff를 SQLite 권위 저장소에 수집하고, Rust application projector와
-HTML assembler가 strict TypeScript UI asset을 self-contained report로 만든다. 지원 범위는 macOS
+HTML assembler가 strict TypeScript UI asset을 self-contained report로 만든다. report UI는 bounded
+timeline, 저장 보기와 trace/span pagination을 제공한다. 지원 범위는 macOS
 standalone과 capability manifest에 고정된 제품 버전 및 handoff import 경계다. Native telemetry
 receiver와 foreground handoff producer는 포함하지 않는다.
 
@@ -41,8 +42,10 @@ Rust workspace는 다음 책임으로 분리된다.
 목표 기술 스택은 다음과 같다.
 
 현재 JavaScript adapter는 전체 JSONL parsing과 순차 append를 포함하므로 foreground hook 성능
-sign-off 대상이 아니다. Rust release profile은 bounded foreground handoff, queue reconciliation,
-CPU/RSS/disk/network 예산을 포함한 normative 성능 evidence를 통과했다.
+sign-off 대상이 아니다. `v0.13.0` Rust local-runtime 경로는 bounded foreground handoff, queue
+reconciliation, CPU/RSS/disk/network 예산을 포함한 normative 성능 evidence를 통과했고 v1.1에서
+변경되지 않았다. v1.1 report는 4,096-span deterministic regression과 browser smoke를 통과하지만
+별도의 normative render latency/RSS sign-off를 의미하지 않는다.
 
 - web UI: TypeScript
 - domain, application, agent adapters, storage, export, CLI, optional collector/query API: Rust
@@ -92,12 +95,12 @@ cargo run -p agent-observability-cli -- report ~/.agent-observability /path/to/p
 cargo run -p xtask -- perf local --profile smoke --check
 ```
 
-`v1.0.0` browser smoke는 세 agent의 canonical handoff fixture를 사용하는 Rust ingest, SQLite snapshot,
+`v1.1.0` browser smoke는 세 agent의 canonical handoff fixture를 사용하는 Rust ingest, SQLite snapshot,
 비용 projection, Rust HTML
 assembly와 desktop/mobile `file://` 렌더링을 하나의 경로로 검증한다. `v0.13.0` local runtime의
 normative 성능 evidence는 local runtime 경로가 변경되지 않은 1.0 report cutover에만 carry-forward하며,
 실제 agent hook, receiver 또는 producer 성능을 증명하지 않는다.
-1.0에서는 smoke profile을 다시 실행한다. 운영 방법은 [docs/LOCAL_RUNTIME.md](docs/LOCAL_RUNTIME.md)를 따른다.
+1.1에서는 smoke profile을 다시 실행한다. 운영 방법은 [docs/LOCAL_RUNTIME.md](docs/LOCAL_RUNTIME.md)를 따른다.
 
 ## 아키텍처 요약
 
@@ -114,7 +117,7 @@ Codex / Claude Code
              |-> local JSONL -> JS report projection -> self-contained HTML
              `-> redacted JSON snapshot
 
-CURRENT v1.0 - LOCAL-ONLY STABLE (Rust + TypeScript static UI)
+CURRENT v1.1 - LOCAL-ONLY STABLE REPORT (Rust + TypeScript static UI)
 
 Closed schemas + manifest -> deterministic domain reducer + fail-closed projectors
 Private canonical handoff files (upstream receiver/producer not shipped) -> bounded Rust adapters
@@ -547,9 +550,14 @@ agent-observability report ~/.agent-observability [/path/to/private-rate-table.j
 HTML은 외부 network 요청 없이 동작한다. 브라우저의 `file://` 제약을 피하기 위해
 JSONL을 따로 fetch하지 않고, 생성 시점에 필요한 데이터를 HTML 안에 주입한다.
 
-현재 v1.0.0 report에서 확인 가능한 화면:
+현재 v1.1.0 report에서 확인 가능한 화면:
 
 - repo/session/agent/model/text filter와 clear/filter-result state
+- 정제된 repo/session/agent/model 차원 중 allowlisted 안전 scalar만 브라우저 local storage에
+  보관하는 최대 20개 저장 보기
+- 최대 120개 span을 표시하는 status/duration timeline
+- 페이지당 최대 100개 trace와 200개 span을 표시하는 bounded 목록 및 표
+- 차원별 최대 500개 filter value option과 초과 값을 찾는 text search
 - trace 목록과 parent ID를 포함한 평면 span table
 - 현재 filter 결과의 token/cost/error KPI와 span별 latency/duration
 - filter KPI는 Rust가 산출한 sanitized span scalar/status만 축약하며 가격 규칙을 브라우저에서
@@ -559,12 +567,13 @@ JSONL을 따로 fetch하지 않고, 생성 시점에 필요한 데이터를 HTML
 
 `npm test`의 `pretest`는 lockfile에 고정된 `playwright-core`와 맞는 Chromium을
 `npm run setup:browser`로 준비한다. 이어 별도 server 없이 임시 self-contained `file://` report를
-열어 desktop/mobile, keyboard, landmark, filter/trace interaction과 외부 request 부재를 검증한다.
+열어 desktop/mobile, keyboard, landmark, filter/trace/timeline interaction, 저장 보기 reload/delete와
+외부 request 부재를 검증한다. 별도 4,096-span fixture는 전체 KPI/개수는 유지하면서 브라우저 DOM
+행 수가 위 상한을 넘지 않는지 고정한다.
 
-후속 report usability release에서 추가할 화면:
+후속 report release에서 추가할 화면:
 
 - model별 input/output/cached/reasoning token breakdown
-- error, timeout, permission denied, compaction timeline
 - redaction count와 content logging 상태
 
 예상 비용과 cost aggregation은 rate table이 제공될 때 표시하고, 단가표나 모델 단가가
