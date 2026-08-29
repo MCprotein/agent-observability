@@ -12,20 +12,26 @@ pub const CONTRACT_MANIFEST: &str = include_str!("../../../contracts/contract-ma
 pub const DURABLE_RECORD_SCHEMA: &str =
     include_str!("../../../contracts/durable-record-v1.schema.json");
 pub const REPORT_DTO_SCHEMA: &str = include_str!("../../../contracts/report-dto-v1.schema.json");
+pub const RATE_TABLE_SCHEMA: &str = include_str!("../../../contracts/rate-table-v1.schema.json");
 pub const ADAPTER_CAPABILITY_V1: &str = include_str!("../capabilities/adapter-capability-v1.yaml");
 pub const DURABLE_RECORD_VERSION: &str = "agent_observability.v1";
 pub const REPORT_DTO_VERSION: &str = "agent_observability.report.v1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterCapabilityManifestV1 {
     pub schema_version: String,
     pub entries: Vec<AdapterCapabilityEntryV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterCapabilityEntryV1 {
     pub adapter_family: String,
     pub support_status: String,
+    pub platforms: Vec<String>,
+    pub profiles: Vec<String>,
+    pub ingest_boundary: String,
     pub product_versions: ProductVersionRangeV1,
     pub verified_at: String,
     pub official_references: Vec<String>,
@@ -38,12 +44,14 @@ pub struct AdapterCapabilityEntryV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ProductVersionRangeV1 {
     pub oldest: String,
     pub newest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterSurfaceV1 {
     pub id: String,
     pub role: String,
@@ -52,6 +60,7 @@ pub struct AdapterSurfaceV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterPrivacyV1 {
     pub content_fields_accepted: bool,
     pub raw_identifiers_durable: bool,
@@ -80,6 +89,9 @@ impl AdapterCapabilityManifestV1 {
 fn validate_capability_entry(entry: &AdapterCapabilityEntryV1) -> Result<(), ContractError> {
     if entry.adapter_family.is_empty()
         || !matches!(entry.support_status.as_str(), "experimental" | "supported")
+        || entry.platforms != ["macos"]
+        || entry.profiles != ["standalone"]
+        || entry.ingest_boundary != "private_canonical_handoff_v1"
         || entry.product_versions.oldest.is_empty()
         || entry.product_versions.newest.is_empty()
         || entry.verified_at.is_empty()
@@ -1491,8 +1503,10 @@ impl ContractManifest {
     pub fn validate_release_boundary(&self) -> Result<(), ContractError> {
         self.expect("durable_record", DURABLE_RECORD_VERSION)?;
         self.expect("report_dto", REPORT_DTO_VERSION)?;
+        self.expect("rate_table", "agent_observability.rate_table.v1")?;
         self.expect("durable_schema", "contracts/durable-record-v1.schema.json")?;
         self.expect("report_schema", "contracts/report-dto-v1.schema.json")?;
+        self.expect("rate_table_schema", "contracts/rate-table-v1.schema.json")?;
         self.expect("team_ingest", "disabled")?;
         Ok(())
     }
@@ -1582,7 +1596,7 @@ impl Error for ContractError {}
 mod tests {
     use super::{
         ADAPTER_CAPABILITY_V1, AdapterCapabilityManifestV1, CONTRACT_MANIFEST, ContractManifest,
-        DURABLE_RECORD_SCHEMA, REPORT_DTO_SCHEMA, redact_sensitive_text,
+        DURABLE_RECORD_SCHEMA, RATE_TABLE_SCHEMA, REPORT_DTO_SCHEMA, redact_sensitive_text,
     };
 
     #[test]
@@ -1591,7 +1605,7 @@ mod tests {
         manifest
             .validate_release_boundary()
             .expect("release boundary matches");
-        for schema in [DURABLE_RECORD_SCHEMA, REPORT_DTO_SCHEMA] {
+        for schema in [DURABLE_RECORD_SCHEMA, REPORT_DTO_SCHEMA, RATE_TABLE_SCHEMA] {
             assert!(schema.contains("\"additionalProperties\": false"));
         }
     }
@@ -1605,8 +1619,10 @@ mod tests {
             .iter()
             .find(|entry| entry.adapter_family == "codex")
             .expect("Codex capability exists");
-        assert_eq!(codex.support_status, "experimental");
+        assert_eq!(codex.support_status, "supported");
         assert_eq!(codex.product_versions.oldest, "0.150.1");
+        assert_eq!(codex.platforms, ["macos"]);
+        assert_eq!(codex.profiles, ["standalone"]);
         assert!(!codex.privacy.content_fields_accepted);
         assert!(!codex.privacy.raw_identifiers_durable);
         let claude = manifest
@@ -1614,7 +1630,7 @@ mod tests {
             .iter()
             .find(|entry| entry.adapter_family == "claude-code")
             .expect("Claude Code capability exists");
-        assert_eq!(claude.support_status, "experimental");
+        assert_eq!(claude.support_status, "supported");
         assert_eq!(claude.product_versions.oldest, "2.1.248");
         assert_eq!(claude.product_versions.newest, "2.1.248");
         assert!(!claude.privacy.content_fields_accepted);
@@ -1624,7 +1640,7 @@ mod tests {
             .iter()
             .find(|entry| entry.adapter_family == "cursor")
             .expect("Cursor capability exists");
-        assert_eq!(cursor.support_status, "experimental");
+        assert_eq!(cursor.support_status, "supported");
         assert!(!cursor.privacy.content_fields_accepted);
         assert!(!cursor.privacy.raw_identifiers_durable);
     }

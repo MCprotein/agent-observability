@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent_observability.rate_table.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "models"],
+  "properties": {
+    "schema_version": { "const": "agent_observability.rate_table.v1" },
+    "version": { "type": "string" },
+    "currency": { "type": "string" },
+    "unit": { "const": "per_1m_tokens" },
+    "assumption": { "type": "string" },
+    "models": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/model_rates" }
+    }
+  },
+  "$defs": {
+    "model_rates": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": { "type": "number", "minimum": 0 },
+        "output_tokens": { "type": "number", "minimum": 0 },
+        "cached_input_tokens": { "type": "number", "minimum": 0 },
+        "cache_creation_input_tokens": { "type": "number", "minimum": 0 },
+        "reasoning_output_tokens": { "type": "number", "minimum": 0 },
+        "token_semantics": {
+          "type": "object",
+          "additionalProperties": { "enum": ["exclusive", "included_in_total"] }
+        }
+      }
+    }
+  }
+}

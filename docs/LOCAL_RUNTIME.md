@@ -1,6 +1,6 @@
 # Local Runtime v1
 
-v0.13.0 standalone runtime is a local-only Rust boundary. It installs private local state,
+v1.0.0 standalone runtime is a local-only Rust boundary. It installs private local state,
 validates a closed configuration, admits writes against a hard storage budget, and keeps foreground
 handoff bounded. It contains no endpoint, email, team identity, envelope, outbox, or network client.
 It is a library plus one-shot CLI composition boundary, not a resident server or IPC daemon.
@@ -13,6 +13,9 @@ cargo run -p agent-observability-cli -- config-check ~/.agent-observability/conf
 cargo run -p agent-observability-cli -- runtime-check ~/.agent-observability
 cargo run -p agent-observability-cli -- storage-check ~/.agent-observability
 cargo run -p agent-observability-cli -- codex-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+cargo run -p agent-observability-cli -- claude-code-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+cargo run -p agent-observability-cli -- cursor-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+cargo run -p agent-observability-cli -- report ~/.agent-observability [/path/to/private-rate-table.json]
 ~~~
 
 init creates the root, logs, queue, state, and runtime directories with mode 0700 and creates
@@ -57,9 +60,9 @@ nonce. PID metadata alone never proves ownership.
   requires three 10-second windows below 70%.
 - One-shot ingest evaluates disk pressure before writing and rejects protected writes with a bounded
   outcome. The full scheduler state machine and foreground channel are reusable embedding APIs and
-  are exercised by the normative subprocess fixture; v0.13 does not install a resident daemon.
+  are exercised by the normative subprocess fixture; v1.0 does not install a resident daemon.
 
-v0.13.0 enforces capacity and bounded replay artifacts. Age-based deletion, archive, and export
+v1.0.0 enforces capacity and bounded replay artifacts. Age-based deletion, archive, and export
 retention policy remain assigned to v1.2.0.
 
 ## Durable state
@@ -83,3 +86,11 @@ disk, network, or queue-admission evidence. Enabled runs permit at most 1% expli
 rejections and, after graceful fixture shutdown, must reconcile every enqueued event with one durable
 observation. Foreground enqueue does not itself imply durability. Both profiles
 delete measured durable stores after validation; release retains only the sanitized manifest.
+
+## Static report
+
+`report` holds the singleton lock, reads a typed ordered snapshot from SQLite authority, applies the
+Rust privacy/cost projector, and writes `logs/agent-observability-report.html` atomically with mode
+0600. The optional rate table must satisfy `agent_observability.rate_table.v1`, be at most 1 MiB,
+and be a private regular file opened without following symlinks. The generated report is
+self-contained and makes no network request when opened with `file://`.

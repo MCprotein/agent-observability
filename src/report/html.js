@@ -22,6 +22,9 @@ const REPORT_UI_SOURCE = readFileSync(
   new URL("./generated/report-ui.js", import.meta.url),
   "utf8",
 );
+const REPORT_TITLE_TOKEN = "__AGENT_OBSERVABILITY_REPORT_TITLE__";
+const REPORT_GENERATED_AT_TOKEN = "__AGENT_OBSERVABILITY_REPORT_GENERATED_AT__";
+const REPORT_DATA_TOKEN = "__AGENT_OBSERVABILITY_REPORT_DATA__";
 
 export function reportDataFromRecords(records, options = {}) {
   const rateTable = normalizeRateTable(options.rate_table ?? options.rateTable);
@@ -48,12 +51,23 @@ export function reportDataFromRecords(records, options = {}) {
 export function renderStaticHtmlReport(records, options = {}) {
   const data = reportDataFromRecords(records, options);
 
+  return renderReportDtoHtml(data);
+}
+
+export function renderReportDtoHtml(data) {
+  return reportDocumentTemplate()
+    .replaceAll(REPORT_TITLE_TOKEN, escapeHtml(data.title))
+    .replaceAll(REPORT_GENERATED_AT_TOKEN, escapeHtml(data.generatedAt))
+    .replace(REPORT_DATA_TOKEN, jsonForHtml(data));
+}
+
+export function reportDocumentTemplate() {
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeHtml(data.title)}</title>
+  <title>${REPORT_TITLE_TOKEN}</title>
   <style>
     :root {
       color-scheme: light;
@@ -349,8 +363,8 @@ export function renderStaticHtmlReport(records, options = {}) {
 <body>
   <header>
     <div class="wrap topbar">
-      <h1>${escapeHtml(data.title)}</h1>
-      <div class="timestamp">${escapeHtml(data.generatedAt)}</div>
+      <h1>${REPORT_TITLE_TOKEN}</h1>
+      <div class="timestamp">${REPORT_GENERATED_AT_TOKEN}</div>
     </div>
   </header>
   <main class="wrap">
@@ -412,7 +426,7 @@ export function renderStaticHtmlReport(records, options = {}) {
       </section>
     </section>
   </main>
-  <script id="report-data" type="application/json">${jsonForHtml(data)}</script>
+  <script id="report-data" type="application/json">${REPORT_DATA_TOKEN}</script>
   <script>${REPORT_UI_SOURCE}</script>
 </body>
 </html>`;

@@ -9,6 +9,7 @@ const typePath = "ui/report/generated/report-dto-v1.d.ts";
 const browserSchemaPath = "ui/report/generated/report-dto-v1.schema.json";
 const validatorPath = "ui/report/generated/validate-report-dto-v1.js";
 const bundlePath = "src/report/generated/report-ui.js";
+const shellPath = "src/report/generated/report-shell.html";
 const viewSummaryPath = "ui/report/generated/view-summary.js";
 const banner = "Generated from contracts/report-dto-v1.schema.json. Do not edit.";
 
@@ -51,6 +52,9 @@ await build({
   legalComments: "none",
   banner: { js: `/* ${banner} */` },
 });
+
+const { reportDocumentTemplate } = await import("../src/report/html.js");
+await writeFile(shellPath, reportDocumentTemplate(), "utf8");
 
 await build({
   entryPoints: ["ui/report/view-summary.ts"],

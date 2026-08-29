@@ -50,8 +50,8 @@ gate를 통과해 추가한다.
 
 | Major | Status | Scope |
 | --- | --- | --- |
-| v0.x | Active | Local-only PoC를 작은 minor release로 쪼개 검증한다. |
-| v1.x | Planned | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
+| v0.x | Completed | Local-only PoC를 작은 minor release로 쪼개 검증했다. |
+| v1.x | Active | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
 
 ## Active Train: v0.1.0-v1.0.0
 
@@ -70,8 +70,8 @@ gate를 통과해 추가한다.
 | v0.10.0 | Released | Rust Claude Code adapter | official-surface capability entry, telemetry/hook precedence, permission and compaction events, failed lifecycle, explicit interrupt gap, out-of-order fixture parity, independent architecture/code/test review |
 | v0.11.0 | Released | Rust Cursor adapter | official-hook capability entry, generation correlation, generic tool operation capture, specific shell/MCP/file hook diagnostic isolation, raw workspace/path/edit omission, shared contract parity, independent architecture/code/test review |
 | v0.12.0 | Released | TypeScript static report UI | schema-generated and runtime-validated report DTO types, repo/session/agent/model filters, fixed local scope, versioned Rust/TypeScript view-reduction parity, pinned self-contained file-open browser smoke, independent architecture/code/test/dependency review |
-| v0.13.0 | Released | Local-only release candidate | install/config path, bounded collection/flush/storage policy, singleton/crash/full-channel fixtures, adaptive load shedding, capacity/large-log bounds, `cargo run -p xtask -- perf local --profile release --check` evidence for hook latency and CPU/RSS/disk/network budgets, docs and independent review; age retention/archive remain v1.2 |
-| v1.0.0 | Planned | Local-only stable | Codex/Claude Code/Cursor adapters, static report, cost estimate, privacy fixtures, docs and smoke checks all pass; v0.13 normative local performance manifest remains valid or is rerun after performance-sensitive changes |
+| v0.13.0 | Released | Local-only release candidate | install/config path, bounded collection/flush/storage policy, singleton/crash/full-channel fixtures, adaptive load shedding, capacity/large-log bounds, `cargo run -p xtask -- perf local --profile release --check` evidence for foreground local-runtime ingress latency and CPU/RSS/disk/network budgets, docs and independent review; age retention/archive remain v1.2 |
+| v1.0.0 | Released | Local-only stable | Exact-version macOS standalone private handoff imports, Rust static report, cost estimate, privacy fixtures, docs and smoke checks all pass; v0.13 normative evidence is carried forward for the unchanged local runtime path only and does not cover agent hook/receiver/producer performance; independent code and documentation review clear |
 
 ## Later Lines
 
