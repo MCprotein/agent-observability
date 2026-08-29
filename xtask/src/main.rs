@@ -16,7 +16,7 @@ use agent_observability_domain::{
     TokenUsage, TraceId,
 };
 use agent_observability_local_runtime::{
-    Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressMessage, IngressOutcome, LocalRuntimeConfigV1,
+    Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressMessage, IngressOutcome, LocalRuntimeConfigV2,
     PressureSample, RuntimeControl, StorageBudget,
 };
 use agent_observability_local_store::LocalStore;
@@ -57,6 +57,7 @@ const SOURCES: [(&str, AgentSource); 3] = [
     ("claude-code", AgentSource::ClaudeCode),
     ("cursor", AgentSource::Cursor),
 ];
+const DURABLE_BATCH_COALESCE: Duration = Duration::from_millis(3);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Profile {
@@ -547,7 +548,7 @@ fn retry_sleep(now: Instant, deadline: Instant) -> Duration {
 
 fn drain(receiver: &std::sync::mpsc::Receiver<IngressMessage>, path: &Path) -> Result<(), String> {
     let mut store = LocalStore::open(path).map_err(|e| format!("open local durable store: {e}"))?;
-    let config = LocalRuntimeConfigV1::default();
+    let config = LocalRuntimeConfigV2::default();
     let mut control = RuntimeControl::new(&config).map_err(|e| e.to_string())?;
     let mut previous = BTreeMap::new();
     let mut pending = None;
@@ -618,9 +619,9 @@ fn receive_batch(
     let mut batch = Vec::with_capacity(max_records);
     batch.push(first);
     while batch.len() < max_records {
-        let message = match receiver.try_recv() {
+        let message = match receiver.recv_timeout(DURABLE_BATCH_COALESCE) {
             Ok(message) => message,
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if bytes.saturating_add(message.0.len()) > max_bytes {
             *pending = Some(message);
@@ -822,7 +823,7 @@ fn render_manifest(config: Config, results: &[RunResult], errors: &[String]) -> 
         .flat_map(|r| r.latencies_us.iter().copied())
         .collect::<Vec<_>>();
     let mut out = format!(
-        "schema_version: local_performance.v1\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: sanitized-local-host\nos: {}\nfilesystem: local-filesystem\npower_mode: unspecified\ncold_warm_cache: warm\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: local_runtime.v1\n  durable_store: local_state.v3\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  burst_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  channel_capacity: 64\n  normalization_workers: 1\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: asynchronous-local-store-drain\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: removed-after-measurement\nall_run_samples:\n",
+        "schema_version: local_performance.v1\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: sanitized-local-host\nos: {}\nfilesystem: local-filesystem\npower_mode: unspecified\ncold_warm_cache: warm\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: local_runtime.v2\n  durable_store: local_state.v4\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  burst_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  channel_capacity: 64\n  normalization_workers: 1\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: asynchronous-local-store-drain\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: removed-after-measurement\nall_run_samples:\n",
         profile_name(config.profile),
         env::consts::OS,
         thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),

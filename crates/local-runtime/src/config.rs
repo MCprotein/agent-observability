@@ -1,4 +1,4 @@
-use crate::policy::{CollectionPolicyV1, PolicyError};
+use crate::policy::{CollectionPolicyV1, PolicyError, RetentionPolicyV1};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -6,31 +6,51 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v1";
+pub const LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v2";
+const LEGACY_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct LocalRuntimeConfigV1 {
+pub struct LocalRuntimeConfigV2 {
     pub schema_version: String,
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
     #[serde(default)]
     pub collection: CollectionPolicyV1,
+    #[serde(default)]
+    pub retention: RetentionPolicyV1,
 }
 
-impl Default for LocalRuntimeConfigV1 {
+impl Default for LocalRuntimeConfigV2 {
     fn default() -> Self {
         Self {
             schema_version: LOCAL_RUNTIME_CONFIG_VERSION.into(),
             enabled: true,
             collection: CollectionPolicyV1::default(),
+            retention: RetentionPolicyV1::default(),
         }
     }
 }
 
-impl LocalRuntimeConfigV1 {
+impl LocalRuntimeConfigV2 {
     pub fn from_json(input: &str) -> Result<Self, ConfigError> {
-        let config: Self = serde_json::from_str(input).map_err(ConfigError::Json)?;
+        let header: serde_json::Value = serde_json::from_str(input).map_err(ConfigError::Json)?;
+        let version = header
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ConfigError::UnsupportedVersion)?;
+        let config = if version == LEGACY_LOCAL_RUNTIME_CONFIG_VERSION {
+            let legacy: LegacyLocalRuntimeConfigV1 =
+                serde_json::from_str(input).map_err(ConfigError::Json)?;
+            Self {
+                schema_version: LOCAL_RUNTIME_CONFIG_VERSION.into(),
+                enabled: legacy.enabled,
+                collection: legacy.collection,
+                retention: RetentionPolicyV1::default(),
+            }
+        } else {
+            serde_json::from_str(input).map_err(ConfigError::Json)?
+        };
         config.validate()?;
         Ok(config)
     }
@@ -39,8 +59,20 @@ impl LocalRuntimeConfigV1 {
         if self.schema_version != LOCAL_RUNTIME_CONFIG_VERSION {
             return Err(ConfigError::UnsupportedVersion);
         }
-        self.collection.validate().map_err(ConfigError::Policy)
+        self.collection.validate().map_err(ConfigError::Policy)?;
+        self.retention.validate().map_err(ConfigError::Policy)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyLocalRuntimeConfigV1 {
+    #[serde(rename = "schema_version")]
+    _schema_version: String,
+    #[serde(default = "enabled_by_default")]
+    enabled: bool,
+    #[serde(default)]
+    collection: CollectionPolicyV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,8 +147,9 @@ impl From<io::Error> for ConfigError {
 }
 
 pub fn install(root: &Path) -> Result<InstalledLayout, ConfigError> {
-    let layout = InstalledLayout::at(root);
-    private_dir(&layout.root, true)?;
+    private_dir(root, true)?;
+    let root = fs::canonicalize(root)?;
+    let layout = InstalledLayout::at(&root);
     for directory in [&layout.logs, &layout.queue, &layout.state, &layout.runtime] {
         private_dir(directory, true)?;
     }
@@ -128,7 +161,7 @@ pub fn install(root: &Path) -> Result<InstalledLayout, ConfigError> {
 
     reject_symlink(&layout.config)?;
     let body =
-        serde_json::to_vec_pretty(&LocalRuntimeConfigV1::default()).map_err(ConfigError::Json)?;
+        serde_json::to_vec_pretty(&LocalRuntimeConfigV2::default()).map_err(ConfigError::Json)?;
     let temporary = layout
         .root
         .join(format!(".config.json.tmp.{}", std::process::id()));
@@ -155,11 +188,11 @@ pub fn install(root: &Path) -> Result<InstalledLayout, ConfigError> {
     Ok(layout)
 }
 
-pub fn load(path: &Path) -> Result<LocalRuntimeConfigV1, ConfigError> {
+pub fn load(path: &Path) -> Result<LocalRuntimeConfigV2, ConfigError> {
     let mut file = open_private_read(path)?;
     let mut body = String::new();
     file.read_to_string(&mut body)?;
-    LocalRuntimeConfigV1::from_json(&body)
+    LocalRuntimeConfigV2::from_json(&body)
 }
 
 const fn enabled_by_default() -> bool {
@@ -281,17 +314,23 @@ mod tests {
 
     #[test]
     fn config_is_strict_and_versioned() {
-        let config = LocalRuntimeConfigV1::default();
+        let config = LocalRuntimeConfigV2::default();
         config.validate().unwrap();
         assert!(
-            LocalRuntimeConfigV1::from_json(
+            LocalRuntimeConfigV2::from_json(
                 r#"{"schema_version":"local_runtime.v1","unknown":true}"#
             )
             .is_err()
         );
         assert!(
-            LocalRuntimeConfigV1::from_json(r#"{"schema_version":"local_runtime.v2"}"#).is_err()
+            LocalRuntimeConfigV2::from_json(r#"{"schema_version":"local_runtime.v3"}"#).is_err()
         );
+        let legacy = LocalRuntimeConfigV2::from_json(
+            r#"{"schema_version":"local_runtime.v1","enabled":true,"collection":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.schema_version, LOCAL_RUNTIME_CONFIG_VERSION);
+        assert_eq!(legacy.retention, RetentionPolicyV1::default());
     }
 
     #[cfg(unix)]
@@ -316,7 +355,7 @@ mod tests {
         );
         assert_eq!(
             load(&second.config).unwrap(),
-            LocalRuntimeConfigV1::default()
+            LocalRuntimeConfigV2::default()
         );
         let _ = fs::remove_dir_all(root);
     }

@@ -21,6 +21,59 @@ const fn default_idle() -> u32 {
 const fn default_budget() -> u64 {
     1_073_741_824
 }
+const fn default_retention_days() -> u16 {
+    30
+}
+const fn default_archive_records() -> u32 {
+    10_000
+}
+const fn default_archive_bytes() -> u64 {
+    16_777_216
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionPolicyV1 {
+    #[serde(default = "default_retention_days")]
+    pub max_record_age_days: u16,
+    #[serde(default = "default_archive_records")]
+    pub max_archive_records: u32,
+    #[serde(default = "default_archive_bytes")]
+    pub max_archive_bytes: u64,
+}
+
+impl Default for RetentionPolicyV1 {
+    fn default() -> Self {
+        Self {
+            max_record_age_days: default_retention_days(),
+            max_archive_records: default_archive_records(),
+            max_archive_bytes: default_archive_bytes(),
+        }
+    }
+}
+
+impl RetentionPolicyV1 {
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        validate_bounds(
+            "max_record_age_days",
+            u64::from(self.max_record_age_days),
+            1,
+            3_650,
+        )?;
+        validate_bounds(
+            "max_archive_records",
+            u64::from(self.max_archive_records),
+            1,
+            100_000,
+        )?;
+        validate_bounds(
+            "max_archive_bytes",
+            self.max_archive_bytes,
+            65_536,
+            268_435_456,
+        )
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +173,19 @@ impl CollectionPolicyV1 {
     }
 }
 
+fn validate_bounds(field: &'static str, value: u64, min: u64, max: u64) -> Result<(), PolicyError> {
+    if value < min || value > max {
+        Err(PolicyError::OutOfBounds {
+            field,
+            value,
+            min,
+            max,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub enum PolicyError {
     Json(serde_json::Error),
@@ -163,5 +229,66 @@ mod tests {
         assert!(
             CollectionPolicyV1::from_json(r#"{"local_storage_budget_bytes":21474836481}"#).is_err()
         );
+        assert!(RetentionPolicyV1::default().validate().is_ok());
+        for days in [1, 3_650] {
+            assert!(
+                RetentionPolicyV1 {
+                    max_record_age_days: days,
+                    ..RetentionPolicyV1::default()
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+        for days in [0, 3_651] {
+            assert!(
+                RetentionPolicyV1 {
+                    max_record_age_days: days,
+                    ..RetentionPolicyV1::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for records in [1, 100_000] {
+            assert!(
+                RetentionPolicyV1 {
+                    max_archive_records: records,
+                    ..RetentionPolicyV1::default()
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+        for records in [0, 100_001] {
+            assert!(
+                RetentionPolicyV1 {
+                    max_archive_records: records,
+                    ..RetentionPolicyV1::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for bytes in [65_536, 268_435_456] {
+            assert!(
+                RetentionPolicyV1 {
+                    max_archive_bytes: bytes,
+                    ..RetentionPolicyV1::default()
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+        for bytes in [65_535, 268_435_457] {
+            assert!(
+                RetentionPolicyV1 {
+                    max_archive_bytes: bytes,
+                    ..RetentionPolicyV1::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
     }
 }

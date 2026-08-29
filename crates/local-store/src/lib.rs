@@ -3,29 +3,41 @@
 use agent_observability_application::reduce_span_state;
 use agent_observability_contracts::{
     AdapterDispositionCode, AdapterDispositionKind, DurableRecordV1, ObservationEvent,
-    SourceCheckpoint, SourceObservation, canonical_observation_payload_hash,
-    hash_opaque_identifier, project_durable_record, sanitize_durable_record,
+    RETENTION_ARCHIVE_VERSION, SourceCheckpoint, SourceObservation,
+    canonical_observation_payload_hash, hash_opaque_identifier, project_durable_record,
+    sanitize_durable_record,
 };
 use agent_observability_domain::{
     CompactionId, CorrelationIds, DomainSpanState, LifecycleState, OperationId, PermissionId,
     RequestId, SessionId, SpanId, SpanKind, Timing, TokenUsage, TraceId, TurnId,
 };
+use fs2::FileExt;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const DB_NAME: &str = "local-store.sqlite3";
 const PROJECTION_NAME: &str = "observations.jsonl";
-pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v3";
+pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v4";
+const MAX_EXPIRED_SPAN_GUARDS: u64 = 100_000;
+const MAX_RETENTION_RECEIPTS: u64 = 1_024;
+const MAX_ADAPTER_DISPOSITIONS: u64 = 100_000;
+const MIN_ARCHIVE_RECORDS: u32 = 1;
+const MAX_ARCHIVE_RECORDS: u32 = 100_000;
+const MIN_ARCHIVE_BYTES: u64 = 64 * 1024;
+const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_ARCHIVE_TEMP_COLLISIONS: usize = 64;
+const MAX_PRIVATE_DIRECTORY_ENTRIES: usize = 4_096;
 const MAX_STALE_PROJECTION_TEMPS: usize = 1024;
 const SCHEMA_OBJECTS: &[(&str, &str, &str)] = &[
     (
@@ -41,12 +53,22 @@ const SCHEMA_OBJECTS: &[(&str, &str, &str)] = &[
     (
         "table",
         "observations",
-        "CREATE TABLE observations (event_id TEXT PRIMARY KEY, source TEXT NOT NULL, generation TEXT NOT NULL, observation_id TEXT NOT NULL, payload_hash TEXT NOT NULL, projected_json TEXT NOT NULL, UNIQUE(source, generation, observation_id))",
+        "CREATE TABLE observations (event_id TEXT PRIMARY KEY, source TEXT NOT NULL, generation TEXT NOT NULL, observation_id TEXT NOT NULL, trace_id TEXT NOT NULL, observed_at_unix_ms TEXT NOT NULL, payload_hash TEXT NOT NULL, projected_json TEXT NOT NULL, UNIQUE(source, generation, observation_id))",
     ),
     (
         "table",
         "source_inputs",
         "CREATE TABLE source_inputs (source TEXT NOT NULL, generation TEXT NOT NULL, cursor TEXT NOT NULL, event_id TEXT NOT NULL REFERENCES observations(event_id), payload_hash TEXT NOT NULL, PRIMARY KEY(source, generation, cursor))",
+    ),
+    (
+        "table",
+        "expired_span_states",
+        "CREATE TABLE expired_span_states (guard_seq INTEGER PRIMARY KEY AUTOINCREMENT, span_id TEXT NOT NULL UNIQUE, canonical_state_hash TEXT NOT NULL)",
+    ),
+    (
+        "table",
+        "retention_receipts",
+        "CREATE TABLE retention_receipts (plan_id TEXT PRIMARY KEY, cutoff_unix_ms TEXT NOT NULL, traces INTEGER NOT NULL, observations INTEGER NOT NULL, records INTEGER NOT NULL, archive_bytes INTEGER NOT NULL, truncated INTEGER NOT NULL CHECK(truncated IN (0,1)), archive_path_hash TEXT NOT NULL, archive_sha256 TEXT NOT NULL, compacted INTEGER NOT NULL CHECK(compacted IN (0,1)))",
     ),
     (
         "table",
@@ -73,6 +95,21 @@ const SCHEMA_OBJECTS: &[(&str, &str, &str)] = &[
         "topology_parent_idx",
         "CREATE INDEX topology_parent_idx ON topology(parent_span_id)",
     ),
+    (
+        "index",
+        "observations_trace_idx",
+        "CREATE INDEX observations_trace_idx ON observations(trace_id, observed_at_unix_ms, event_id)",
+    ),
+    (
+        "index",
+        "records_trace_idx",
+        "CREATE INDEX records_trace_idx ON records(trace_id, commit_seq)",
+    ),
+    (
+        "index",
+        "topology_trace_idx",
+        "CREATE INDEX topology_trace_idx ON topology(trace_id, unresolved)",
+    ),
 ];
 static PROJECTION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -82,6 +119,8 @@ pub enum CrashPoint {
     AfterCommit,
     BeforeProjectionRename,
     AfterProjectionRename,
+    BeforeRetentionCommit,
+    AfterRetentionCommit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +128,56 @@ pub enum IngestStatus {
     Committed,
     Duplicate,
     Suppressed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetentionPlan {
+    pub plan_id: String,
+    pub cutoff_unix_ms: u64,
+    pub traces: u64,
+    pub observations: u64,
+    pub records: u64,
+    pub archive_bytes: u64,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetentionResult {
+    pub plan: RetentionPlan,
+    pub archive_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "entry_type", rename_all = "snake_case")]
+enum RetentionArchiveEntry {
+    Header {
+        schema_version: String,
+        plan_id: String,
+        cutoff_unix_ms: u64,
+    },
+    Record {
+        record: Box<DurableRecordV1>,
+    },
+    Footer {
+        traces: u64,
+        records: u64,
+        records_sha256: String,
+    },
+}
+
+#[derive(Debug)]
+struct RetentionSelection {
+    plan: RetentionPlan,
+    trace_ids: Vec<String>,
+    span_guards: Vec<(String, String)>,
+}
+
+#[derive(Debug)]
+struct RetentionReceipt {
+    plan: RetentionPlan,
+    archive_path: PathBuf,
+    archive_sha256: String,
+    compacted: bool,
 }
 
 /// Returns the stable identity used for replay deduplication.
@@ -116,6 +205,11 @@ pub enum StoreError {
     InsecurePermissions,
     Symlink,
     InvalidPath,
+    StaleRetentionPlan,
+    RetentionBoundsTooSmall,
+    InvalidRetentionBounds,
+    PendingRetentionRecovery,
+    MigrationAdmissionRequired,
 }
 
 impl Display for StoreError {
@@ -133,6 +227,17 @@ impl Display for StoreError {
             Self::InsecurePermissions => "local store permissions are too broad",
             Self::Symlink => "local store paths must not be symbolic links",
             Self::InvalidPath => "local store path has the wrong filesystem type",
+            Self::StaleRetentionPlan => "retention plan is stale",
+            Self::RetentionBoundsTooSmall => {
+                "retention bounds cannot fit every eligible complete trace in one pass"
+            }
+            Self::InvalidRetentionBounds => "retention bounds are outside the supported range",
+            Self::PendingRetentionRecovery => {
+                "a previous retention pass must be recovered before starting another"
+            }
+            Self::MigrationAdmissionRequired => {
+                "legacy local store migration requires admitted temporary disk headroom"
+            }
         })
     }
 }
@@ -167,6 +272,7 @@ impl From<serde_json::Error> for StoreError {
 pub struct LocalStore {
     dir: PathBuf,
     db: Connection,
+    has_expired_guards: Cell<bool>,
 }
 
 impl LocalStore {
@@ -176,8 +282,28 @@ impl LocalStore {
     ///
     /// Returns [`StoreError`] for insecure permissions, incompatible state, or I/O failure.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
-        private_dir(dir.as_ref())?;
-        let dir = fs::canonicalize(dir.as_ref())?;
+        Self::open_internal(dir.as_ref(), None)
+    }
+
+    /// Opens the store while allowing a legacy schema rewrite within admitted temporary bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::MigrationAdmissionRequired`] before migration when the admitted
+    /// temporary workspace is smaller than the conservative full-rewrite requirement.
+    pub fn open_with_migration_headroom(
+        dir: impl AsRef<Path>,
+        admitted_temporary_bytes: u64,
+    ) -> Result<Self, StoreError> {
+        Self::open_internal(dir.as_ref(), Some(admitted_temporary_bytes))
+    }
+
+    fn open_internal(
+        dir: &Path,
+        admitted_temporary_bytes: Option<u64>,
+    ) -> Result<Self, StoreError> {
+        private_dir(dir)?;
+        let dir = fs::canonicalize(dir)?;
         let db_path = dir.join(DB_NAME);
         match private_create_new(&db_path) {
             Ok(file) => file.sync_all()?,
@@ -198,6 +324,7 @@ impl LocalStore {
         db.pragma_update(None, "journal_mode", "DELETE")?;
         db.pragma_update(None, "foreign_keys", true)?;
         db.pragma_update(None, "synchronous", "FULL")?;
+        db.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         initialize_empty_schema(&db)?;
         let schema = db.query_row(
             "SELECT value FROM metadata WHERE key = 'schema_version'",
@@ -205,13 +332,30 @@ impl LocalStore {
             |row| row.get(0),
         );
         let schema: String = schema.map_err(|_| StoreError::SchemaMismatch)?;
-        if matches!(schema.as_str(), "local_state.v1" | "local_state.v2") {
-            migrate_to_v3(&db)?;
+        if matches!(
+            schema.as_str(),
+            "local_state.v1" | "local_state.v2" | "local_state.v3"
+        ) {
+            let database_bytes = fs::metadata(&db_path)?.len();
+            let required_workspace = database_bytes.saturating_mul(2);
+            if admitted_temporary_bytes.is_none_or(|bytes| bytes < required_workspace) {
+                return Err(StoreError::MigrationAdmissionRequired);
+            }
+            migrate_to_v4(&db)?;
         } else if schema != LOCAL_STORE_SCHEMA_VERSION {
             return Err(StoreError::SchemaMismatch);
         }
         validate_schema(&db)?;
-        let store = Self { dir, db };
+        let has_expired_guards = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM expired_span_states)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let store = Self {
+            dir,
+            db,
+            has_expired_guards: Cell::new(has_expired_guards),
+        };
         let projection_path = store.projection_path();
         let projection_missing = match fs::symlink_metadata(&projection_path) {
             Ok(_) => {
@@ -276,7 +420,12 @@ impl LocalStore {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let mut statuses = Vec::with_capacity(observations.len());
         for observation in observations {
-            statuses.push(Self::ingest_in_transaction(&tx, observation, None)?);
+            statuses.push(Self::ingest_in_transaction(
+                &tx,
+                observation,
+                None,
+                self.has_expired_guards.get(),
+            )?);
         }
         if crash == Some(CrashPoint::BeforeCommit) {
             return Err(StoreError::Crash(CrashPoint::BeforeCommit));
@@ -366,6 +515,7 @@ impl LocalStore {
             params![source, generation, cursor, disposition.as_str(), code.as_str(), payload_hash],
         )?;
         advance_checkpoint_cursor(&tx, checkpoint)?;
+        prune_adapter_dispositions(&tx)?;
         tx.commit()?;
         Ok(IngestStatus::Committed)
     }
@@ -390,7 +540,8 @@ impl LocalStore {
         rebuild_projection: bool,
     ) -> Result<IngestStatus, StoreError> {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-        let status = Self::ingest_in_transaction(&tx, observation, crash)?;
+        let status =
+            Self::ingest_in_transaction(&tx, observation, crash, self.has_expired_guards.get())?;
         tx.commit()?;
         if crash == Some(CrashPoint::AfterCommit) {
             return Err(StoreError::Crash(CrashPoint::AfterCommit));
@@ -407,6 +558,7 @@ impl LocalStore {
         tx: &Transaction<'_>,
         observation: &SourceObservation,
         crash: Option<CrashPoint>,
+        has_expired_guards: bool,
     ) -> Result<IngestStatus, StoreError> {
         let source = source_name(observation);
         let generation = private_source_generation(observation);
@@ -463,6 +615,25 @@ impl LocalStore {
                 return Ok(IngestStatus::Suppressed);
             }
         }
+        if has_expired_guards
+            && let Some(existing_hash) = tx
+                .query_row(
+                    "SELECT canonical_state_hash FROM expired_span_states WHERE span_id=?1",
+                    [state.span_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        {
+            if existing_hash != canonical_state_hash(&state)? {
+                return Err(StoreError::PayloadConflict);
+            }
+            insert_duplicate_disposition(tx, observation)?;
+            if crash == Some(CrashPoint::BeforeCommit) {
+                return Err(StoreError::Crash(CrashPoint::BeforeCommit));
+            }
+            mark_projection_dirty(tx)?;
+            return Ok(IngestStatus::Suppressed);
+        }
         if let Some(existing) = tx
             .query_row(
                 "SELECT payload_hash FROM observations WHERE event_id = ?1",
@@ -506,7 +677,7 @@ impl LocalStore {
             Some(parent_id) => i32::from(!topology_contains(tx, parent_id)?),
             None => 0,
         };
-        tx.execute("INSERT INTO observations(event_id, source, generation, observation_id, payload_hash, projected_json) VALUES (?1,?2,?3,?4,?5,?6)", params![event_id, source, generation, hash_opaque_identifier(observation.observation_id.as_str()), payload_hash, projected_json])?;
+        tx.execute("INSERT INTO observations(event_id, source, generation, observation_id, trace_id, observed_at_unix_ms, payload_hash, projected_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![event_id, source, generation, hash_opaque_identifier(observation.observation_id.as_str()), reduced.trace_id.as_str(), record_observed_at_millis(&incoming_record)?, payload_hash, projected_json])?;
         tx.execute("INSERT INTO source_inputs(source, generation, cursor, event_id, payload_hash) VALUES (?1,?2,?3,?4,?5)", params![source, generation, cursor, event_id, payload_hash])?;
         tx.execute("INSERT INTO records(span_id, trace_id, parent_span_id, kind, state_json, record_json) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(span_id) DO UPDATE SET state_json=excluded.state_json, record_json=excluded.record_json", params![reduced.span_id.as_str(), reduced.trace_id.as_str(), parent, kind_name(reduced.kind), state_json, record_json])?;
         tx.execute("INSERT INTO topology(span_id, trace_id, parent_span_id, kind, unresolved) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(span_id) DO UPDATE SET unresolved=excluded.unresolved", params![reduced.span_id.as_str(), reduced.trace_id.as_str(), parent, kind_name(reduced.kind), unresolved])?;
@@ -701,6 +872,779 @@ impl LocalStore {
         tx.commit()?;
         Ok(records)
     }
+
+    /// Plans a bounded archive-and-prune pass without changing authority or projections.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the authoritative snapshot is invalid or cannot be read.
+    pub fn retention_plan(
+        &self,
+        cutoff_unix_ms: u64,
+        max_archive_records: u32,
+        max_archive_bytes: u64,
+    ) -> Result<RetentionPlan, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let selection =
+            select_retention(&tx, cutoff_unix_ms, max_archive_records, max_archive_bytes)?;
+        tx.commit()?;
+        Ok(selection.plan)
+    }
+
+    /// Writes one private archive and physically expires the exact selected payloads.
+    ///
+    /// Active cursors and bounded canonical span-state replay guards are preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when selection, private archive creation, the transaction, or
+    /// projection repair fails.
+    pub fn apply_retention(
+        &self,
+        cutoff_unix_ms: u64,
+        max_archive_records: u32,
+        max_archive_bytes: u64,
+        expected_plan_id: &str,
+        archive_path: &Path,
+    ) -> Result<RetentionResult, StoreError> {
+        self.apply_retention_at(
+            cutoff_unix_ms,
+            max_archive_records,
+            max_archive_bytes,
+            expected_plan_id,
+            archive_path,
+            None,
+        )
+    }
+
+    fn apply_retention_at(
+        &self,
+        cutoff_unix_ms: u64,
+        max_archive_records: u32,
+        max_archive_bytes: u64,
+        expected_plan_id: &str,
+        archive_path: &Path,
+        crash: Option<CrashPoint>,
+    ) -> Result<RetentionResult, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        if let Some(receipt) = load_retention_receipt(&tx, expected_plan_id, archive_path)? {
+            tx.commit()?;
+            validate_retention_archive(archive_path, &receipt)?;
+            self.finish_retention_receipt(&receipt)?;
+            return Ok(RetentionResult {
+                plan: receipt.plan,
+                archive_path: Some(receipt.archive_path),
+            });
+        }
+        if pending_retention_receipt_exists(&tx)? {
+            return Err(StoreError::PendingRetentionRecovery);
+        }
+        let selection =
+            select_retention(&tx, cutoff_unix_ms, max_archive_records, max_archive_bytes)?;
+        if selection.plan.plan_id != expected_plan_id {
+            return Err(StoreError::StaleRetentionPlan);
+        }
+        if selection.plan.truncated {
+            return Err(StoreError::RetentionBoundsTooSmall);
+        }
+        if selection.plan.traces == 0 {
+            tx.commit()?;
+            return Ok(RetentionResult {
+                plan: selection.plan,
+                archive_path: None,
+            });
+        }
+        tx.execute_batch(
+            "CREATE TEMP TABLE retention_selected_traces(ordinal INTEGER PRIMARY KEY, trace_id TEXT NOT NULL UNIQUE)",
+        )?;
+        for (ordinal, trace_id) in selection.trace_ids.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO retention_selected_traces(ordinal, trace_id) VALUES (?1, ?2)",
+                params![
+                    i64::try_from(ordinal).map_err(|_| StoreError::SchemaMismatch)?,
+                    trace_id
+                ],
+            )?;
+        }
+        let archive_sha256 = write_archive(&tx, archive_path, &selection)?;
+        insert_retention_receipt(&tx, &selection.plan, archive_path, &archive_sha256)?;
+        for (span_id, canonical_state_hash) in &selection.span_guards {
+            tx.execute(
+                "INSERT OR REPLACE INTO expired_span_states(span_id, canonical_state_hash) VALUES (?1, ?2)",
+                params![span_id, canonical_state_hash],
+            )?;
+        }
+        prune_expired_span_guards(&tx)?;
+        tx.execute_batch(
+            "DELETE FROM delivery_outcomes WHERE event_id IN (SELECT event_id FROM observations WHERE trace_id IN (SELECT trace_id FROM retention_selected_traces));
+             DELETE FROM source_inputs WHERE event_id IN (SELECT event_id FROM observations WHERE trace_id IN (SELECT trace_id FROM retention_selected_traces));
+             DELETE FROM observations WHERE trace_id IN (SELECT trace_id FROM retention_selected_traces);
+             DELETE FROM topology WHERE trace_id IN (SELECT trace_id FROM retention_selected_traces);
+             DELETE FROM records WHERE trace_id IN (SELECT trace_id FROM retention_selected_traces);
+             DROP TABLE retention_selected_traces;",
+        )?;
+        mark_projection_dirty(&tx)?;
+        if crash == Some(CrashPoint::BeforeRetentionCommit) {
+            return Err(StoreError::Crash(CrashPoint::BeforeRetentionCommit));
+        }
+        tx.commit()?;
+        self.has_expired_guards.set(true);
+        if crash == Some(CrashPoint::AfterRetentionCommit) {
+            return Err(StoreError::Crash(CrashPoint::AfterRetentionCommit));
+        }
+        let receipt = RetentionReceipt {
+            plan: selection.plan.clone(),
+            archive_path: archive_path.to_path_buf(),
+            archive_sha256,
+            compacted: false,
+        };
+        self.finish_retention_receipt(&receipt)?;
+        Ok(RetentionResult {
+            plan: selection.plan,
+            archive_path: Some(archive_path.to_path_buf()),
+        })
+    }
+
+    fn finish_retention_receipt(&self, receipt: &RetentionReceipt) -> Result<(), StoreError> {
+        if !receipt.compacted {
+            incremental_vacuum(&self.db, receipt.plan.archive_bytes)?;
+            self.rebuild_projection()?;
+        }
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        if !receipt.compacted {
+            tx.execute(
+                "UPDATE retention_receipts SET compacted=1 WHERE plan_id=?1",
+                [&receipt.plan.plan_id],
+            )?;
+        }
+        prune_retention_receipts(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+fn prune_expired_span_guards(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute(
+        "DELETE FROM expired_span_states WHERE guard_seq NOT IN (SELECT guard_seq FROM expired_span_states ORDER BY guard_seq DESC LIMIT ?1)",
+        [i64::try_from(MAX_EXPIRED_SPAN_GUARDS).map_err(|_| StoreError::SchemaMismatch)?],
+    )?;
+    Ok(())
+}
+
+fn prune_retention_receipts(db: &Connection) -> Result<(), StoreError> {
+    db.execute(
+        "DELETE FROM retention_receipts WHERE compacted=1 AND rowid NOT IN (SELECT rowid FROM retention_receipts WHERE compacted=1 ORDER BY rowid DESC LIMIT ?1)",
+        [i64::try_from(MAX_RETENTION_RECEIPTS).map_err(|_| StoreError::SchemaMismatch)?],
+    )?;
+    Ok(())
+}
+
+fn pending_retention_receipt_exists(tx: &Transaction<'_>) -> Result<bool, StoreError> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM retention_receipts WHERE compacted=0)",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(StoreError::from)
+}
+
+fn prune_adapter_dispositions(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute(
+        "DELETE FROM adapter_dispositions WHERE rowid NOT IN (SELECT rowid FROM adapter_dispositions ORDER BY rowid DESC LIMIT ?1)",
+        [i64::try_from(MAX_ADAPTER_DISPOSITIONS).map_err(|_| StoreError::SchemaMismatch)?],
+    )?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "bounded trace-group selection and its byte accounting stay visibly contiguous"
+)]
+fn select_retention(
+    tx: &Transaction<'_>,
+    cutoff_unix_ms: u64,
+    max_archive_records: u32,
+    max_archive_bytes: u64,
+) -> Result<RetentionSelection, StoreError> {
+    validate_retention_bounds(max_archive_records, max_archive_bytes)?;
+    let mut trace_ids = Vec::new();
+    let mut span_guards = Vec::new();
+    let mut plan_inputs = Vec::new();
+    let mut record_bytes = 0_u64;
+    let mut observation_count = 0_u64;
+    let mut record_count = 0_u64;
+    let mut truncated = false;
+    let mut statement = tx.prepare(
+        "SELECT trace_id FROM observations GROUP BY trace_id HAVING MAX(observed_at_unix_ms) < ?1 ORDER BY MAX(observed_at_unix_ms), trace_id",
+    )?;
+    let candidates = statement.query_map([ordered_millis(cutoff_unix_ms)], |row| {
+        row.get::<_, String>(0)
+    })?;
+    'candidates: for trace_id in candidates {
+        let trace_id = trace_id?;
+        if tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM topology WHERE trace_id=?1 AND unresolved=1)",
+            [&trace_id],
+            |row| row.get::<_, bool>(0),
+        )? {
+            continue;
+        }
+        let group_records = tx
+            .query_row(
+                "SELECT COUNT(*) FROM records WHERE trace_id=?1",
+                [&trace_id],
+                |row| row.get::<_, i64>(0),
+            )?
+            .cast_unsigned();
+        let next_records = record_count
+            .checked_add(group_records)
+            .ok_or(StoreError::SchemaMismatch)?;
+        if group_records == 0 {
+            continue;
+        }
+        if next_records > u64::from(max_archive_records) {
+            truncated = true;
+            break;
+        }
+        let header_bytes = encoded_line_len(&RetentionArchiveEntry::Header {
+            schema_version: RETENTION_ARCHIVE_VERSION.into(),
+            plan_id: "0".repeat(64),
+            cutoff_unix_ms,
+        })?;
+        let footer_bytes = encoded_line_len(&RetentionArchiveEntry::Footer {
+            traces: u64::try_from(trace_ids.len() + 1).map_err(|_| StoreError::SchemaMismatch)?,
+            records: next_records,
+            records_sha256: "0".repeat(64),
+        })?;
+        let fixed_bytes = record_bytes
+            .checked_add(header_bytes)
+            .and_then(|bytes| bytes.checked_add(footer_bytes))
+            .ok_or(StoreError::SchemaMismatch)?;
+        let group_byte_limit = max_archive_bytes.saturating_sub(fixed_bytes);
+        if fixed_bytes > max_archive_bytes {
+            truncated = true;
+            break;
+        }
+        let mut group_span_guards = Vec::new();
+        let mut group_bytes = 0_u64;
+        let mut records = tx.prepare(
+            "SELECT span_id, state_json, record_json FROM records WHERE trace_id=?1 ORDER BY commit_seq",
+        )?;
+        let rows = records.query_map([&trace_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (span_id, state_json, record_json) = row?;
+            let state = state_from_json(&state_json)?;
+            let record: DurableRecordV1 = serde_json::from_str(&record_json)?;
+            let entry = RetentionArchiveEntry::Record {
+                record: Box::new(record),
+            };
+            let next_group_bytes = group_bytes
+                .checked_add(encoded_line_len(&entry)?)
+                .ok_or(StoreError::SchemaMismatch)?;
+            if next_group_bytes > group_byte_limit {
+                truncated = true;
+                break 'candidates;
+            }
+            group_bytes = next_group_bytes;
+            group_span_guards.push((span_id, canonical_state_hash(&state)?));
+        }
+        drop(records);
+        if u64::try_from(group_span_guards.len()).map_err(|_| StoreError::SchemaMismatch)?
+            != group_records
+        {
+            return Err(StoreError::SchemaMismatch);
+        }
+        let mut group_observations = 0_u64;
+        let mut observation_hash = Sha256::new();
+        observation_hash.update(b"agent-observability-retention-trace-events-v1");
+        let mut observations = tx.prepare(
+            "SELECT event_id, payload_hash FROM observations WHERE trace_id=?1 ORDER BY observed_at_unix_ms, event_id",
+        )?;
+        let rows = observations.query_map([&trace_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (event_id, payload_hash) = row?;
+            group_observations = group_observations
+                .checked_add(1)
+                .ok_or(StoreError::SchemaMismatch)?;
+            for value in [&event_id, &payload_hash] {
+                observation_hash.update(
+                    u64::try_from(value.len())
+                        .map_err(|_| StoreError::SchemaMismatch)?
+                        .to_be_bytes(),
+                );
+                observation_hash.update(value.as_bytes());
+            }
+        }
+        drop(observations);
+        let group_plan_input = format!("{trace_id}:{}", hex_digest(observation_hash.finalize()));
+        record_bytes = record_bytes
+            .checked_add(group_bytes)
+            .ok_or(StoreError::SchemaMismatch)?;
+        observation_count += group_observations;
+        record_count += group_records;
+        plan_inputs.push(group_plan_input);
+        trace_ids.push(trace_id);
+        span_guards.extend(group_span_guards);
+    }
+    let plan_id = retention_plan_id(cutoff_unix_ms, &plan_inputs);
+    let archive_bytes = if trace_ids.is_empty() {
+        0
+    } else {
+        let header_bytes = encoded_line_len(&RetentionArchiveEntry::Header {
+            schema_version: RETENTION_ARCHIVE_VERSION.into(),
+            plan_id: plan_id.clone(),
+            cutoff_unix_ms,
+        })?;
+        let footer_bytes = encoded_line_len(&RetentionArchiveEntry::Footer {
+            traces: u64::try_from(trace_ids.len()).map_err(|_| StoreError::SchemaMismatch)?,
+            records: record_count,
+            records_sha256: "0".repeat(64),
+        })?;
+        header_bytes
+            .checked_add(record_bytes)
+            .and_then(|bytes| bytes.checked_add(footer_bytes))
+            .ok_or(StoreError::SchemaMismatch)?
+    };
+    if archive_bytes > max_archive_bytes {
+        return Err(StoreError::SchemaMismatch);
+    }
+    Ok(RetentionSelection {
+        plan: RetentionPlan {
+            plan_id,
+            cutoff_unix_ms,
+            traces: u64::try_from(trace_ids.len()).map_err(|_| StoreError::SchemaMismatch)?,
+            observations: observation_count,
+            records: record_count,
+            archive_bytes,
+            truncated,
+        },
+        trace_ids,
+        span_guards,
+    })
+}
+
+fn validate_retention_bounds(
+    max_archive_records: u32,
+    max_archive_bytes: u64,
+) -> Result<(), StoreError> {
+    if !(MIN_ARCHIVE_RECORDS..=MAX_ARCHIVE_RECORDS).contains(&max_archive_records)
+        || !(MIN_ARCHIVE_BYTES..=MAX_ARCHIVE_BYTES).contains(&max_archive_bytes)
+    {
+        return Err(StoreError::InvalidRetentionBounds);
+    }
+    Ok(())
+}
+
+fn retention_plan_id(cutoff_unix_ms: u64, inputs: &[String]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"agent-observability-retention-plan-v1");
+    hash.update(cutoff_unix_ms.to_be_bytes());
+    for input in inputs {
+        hash.update((input.len() as u64).to_be_bytes());
+        hash.update(input.as_bytes());
+    }
+    hex_digest(hash.finalize())
+}
+
+fn canonical_state_hash(state: &DomainSpanState) -> Result<String, StoreError> {
+    let mut hash = Sha256::new();
+    hash.update(b"agent-observability-expired-span-state-v1");
+    hash.update(state_to_json(state)?.as_bytes());
+    Ok(hex_digest(hash.finalize()))
+}
+
+fn archive_path_hash(path: &Path) -> String {
+    digest_components(&[
+        "agent-observability-retention-archive-path-v1",
+        &path.to_string_lossy(),
+    ])
+}
+
+fn insert_retention_receipt(
+    tx: &Transaction<'_>,
+    plan: &RetentionPlan,
+    archive_path: &Path,
+    archive_sha256: &str,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO retention_receipts(plan_id, cutoff_unix_ms, traces, observations, records, archive_bytes, truncated, archive_path_hash, archive_sha256, compacted) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0)",
+        params![
+            plan.plan_id,
+            ordered_millis(plan.cutoff_unix_ms),
+            i64::try_from(plan.traces).map_err(|_| StoreError::SchemaMismatch)?,
+            i64::try_from(plan.observations).map_err(|_| StoreError::SchemaMismatch)?,
+            i64::try_from(plan.records).map_err(|_| StoreError::SchemaMismatch)?,
+            i64::try_from(plan.archive_bytes).map_err(|_| StoreError::SchemaMismatch)?,
+            i64::from(plan.truncated),
+            archive_path_hash(archive_path),
+            archive_sha256,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_retention_receipt(
+    tx: &Transaction<'_>,
+    plan_id: &str,
+    archive_path: &Path,
+) -> Result<Option<RetentionReceipt>, StoreError> {
+    let row = tx
+        .query_row(
+            "SELECT cutoff_unix_ms, traces, observations, records, archive_bytes, truncated, archive_path_hash, archive_sha256, compacted FROM retention_receipts WHERE plan_id=?1",
+            [plan_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, bool>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        cutoff,
+        traces,
+        observations,
+        records,
+        archive_bytes,
+        truncated,
+        stored_path_hash,
+        archive_sha256,
+        compacted,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    if stored_path_hash != archive_path_hash(archive_path) {
+        return Ok(None);
+    }
+    let parse_unsigned = |value: i64| u64::try_from(value).map_err(|_| StoreError::SchemaMismatch);
+    Ok(Some(RetentionReceipt {
+        plan: RetentionPlan {
+            plan_id: plan_id.into(),
+            cutoff_unix_ms: cutoff.parse().map_err(|_| StoreError::SchemaMismatch)?,
+            traces: parse_unsigned(traces)?,
+            observations: parse_unsigned(observations)?,
+            records: parse_unsigned(records)?,
+            archive_bytes: parse_unsigned(archive_bytes)?,
+            truncated,
+        },
+        archive_path: archive_path.into(),
+        archive_sha256,
+        compacted,
+    }))
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    let mut output = String::with_capacity(bytes.as_ref().len() * 2);
+    for byte in bytes.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn encoded_line_len(entry: &RetentionArchiveEntry) -> Result<u64, StoreError> {
+    let length = serde_json::to_vec(entry)?.len();
+    u64::try_from(length)
+        .ok()
+        .and_then(|length| length.checked_add(1))
+        .ok_or(StoreError::SchemaMismatch)
+}
+
+fn ordered_millis(value: u64) -> String {
+    format!("{value:020}")
+}
+
+fn record_observed_at_millis(record: &DurableRecordV1) -> Result<String, StoreError> {
+    let observed_at = record.end_time_unix_ms.unwrap_or(record.start_time_unix_ms);
+    if !observed_at.is_finite()
+        || observed_at < 0.0
+        || observed_at.fract() != 0.0
+        || observed_at > 9_007_199_254_740_991.0
+    {
+        return Err(StoreError::SchemaMismatch);
+    }
+    let millis = format!("{observed_at:.0}")
+        .parse::<u64>()
+        .map_err(|_| StoreError::SchemaMismatch)?;
+    Ok(ordered_millis(millis))
+}
+
+fn incremental_vacuum(db: &Connection, reclaimed_bytes: u64) -> Result<(), StoreError> {
+    let page_size: i64 = db.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let page_size = u64::try_from(page_size).map_err(|_| StoreError::SchemaMismatch)?;
+    if page_size == 0 {
+        return Err(StoreError::SchemaMismatch);
+    }
+    let pages = reclaimed_bytes
+        .saturating_mul(16)
+        .saturating_add(page_size - 1)
+        .checked_div(page_size)
+        .ok_or(StoreError::SchemaMismatch)?;
+    if pages > 0 {
+        let mut statement = db.prepare(&format!("PRAGMA incremental_vacuum({pages})"))?;
+        let mut rows = statement.query([])?;
+        while rows.next()?.is_some() {}
+    }
+    Ok(())
+}
+
+fn write_archive(
+    tx: &Transaction<'_>,
+    path: &Path,
+    selection: &RetentionSelection,
+) -> Result<String, StoreError> {
+    let parent = path.parent().ok_or(StoreError::InvalidPath)?;
+    private_dir(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(StoreError::InvalidPath)?;
+    let _directory_lock = lock_archive_directory(parent)?;
+    cleanup_stale_archive_temps(parent, name)?;
+    let (temporary, mut file) = create_archive_temp(parent, name, &PROJECTION_TEMP_SEQUENCE)?;
+    let result = (|| -> Result<String, StoreError> {
+        let mut archive_hash = Sha256::new();
+        write_archive_entry(
+            &mut file,
+            &mut archive_hash,
+            &RetentionArchiveEntry::Header {
+                schema_version: RETENTION_ARCHIVE_VERSION.into(),
+                plan_id: selection.plan.plan_id.clone(),
+                cutoff_unix_ms: selection.plan.cutoff_unix_ms,
+            },
+        )?;
+        let mut records_hash = Sha256::new();
+        let mut records = 0_u64;
+        let mut statement = tx.prepare(
+            "SELECT records.record_json FROM retention_selected_traces JOIN records ON records.trace_id=retention_selected_traces.trace_id ORDER BY retention_selected_traces.ordinal, records.commit_seq",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let record: DurableRecordV1 = serde_json::from_str(&row?)?;
+            let entry = RetentionArchiveEntry::Record {
+                record: Box::new(record),
+            };
+            let encoded = serde_json::to_vec(&entry)?;
+            file.write_all(&encoded)?;
+            file.write_all(b"\n")?;
+            records_hash.update(&encoded);
+            records_hash.update(b"\n");
+            archive_hash.update(&encoded);
+            archive_hash.update(b"\n");
+            records = records.checked_add(1).ok_or(StoreError::SchemaMismatch)?;
+        }
+        if records != selection.plan.records {
+            return Err(StoreError::SchemaMismatch);
+        }
+        write_archive_entry(
+            &mut file,
+            &mut archive_hash,
+            &RetentionArchiveEntry::Footer {
+                traces: selection.plan.traces,
+                records,
+                records_sha256: hex_digest(records_hash.finalize()),
+            },
+        )?;
+        file.sync_all()?;
+        if file.metadata()?.len() != selection.plan.archive_bytes {
+            return Err(StoreError::SchemaMismatch);
+        }
+        fs::hard_link(&temporary, path)?;
+        fs::remove_file(&temporary)?;
+        private_file(path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(hex_digest(archive_hash.finalize()))
+    })();
+    if result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn lock_archive_directory(parent: &Path) -> Result<File, StoreError> {
+    let path = parent.join(".agent-observability.retention.lock");
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(StoreError::Symlink);
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(no_follow_flag());
+    }
+    let file = options.open(path)?;
+    private_open_file(&file)?;
+    file.try_lock_exclusive()?;
+    Ok(file)
+}
+
+fn write_archive_entry(
+    file: &mut File,
+    archive_hash: &mut Sha256,
+    entry: &RetentionArchiveEntry,
+) -> Result<(), StoreError> {
+    let encoded = serde_json::to_vec(entry)?;
+    file.write_all(&encoded)?;
+    file.write_all(b"\n")?;
+    archive_hash.update(&encoded);
+    archive_hash.update(b"\n");
+    Ok(())
+}
+
+fn create_archive_temp(
+    parent: &Path,
+    archive_name: &str,
+    sequence: &AtomicU64,
+) -> Result<(PathBuf, File), StoreError> {
+    for _ in 0..MAX_ARCHIVE_TEMP_COLLISIONS {
+        let sequence = sequence.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{archive_name}.retention.tmp.{}.{sequence}",
+            std::process::id()
+        ));
+        match private_create_new(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(StoreError::Io(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "archive temporary-file collision limit exceeded",
+    )))
+}
+
+fn cleanup_stale_archive_temps(parent: &Path, archive_name: &str) -> Result<(), StoreError> {
+    let prefix = format!(".{archive_name}.retention.tmp.");
+    for (index, entry) in fs::read_dir(parent)?.enumerate() {
+        if index >= MAX_PRIVATE_DIRECTORY_ENTRIES {
+            return Err(StoreError::InvalidPath);
+        }
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((pid, sequence)) = suffix.split_once('.') else {
+            continue;
+        };
+        if pid.is_empty()
+            || sequence.is_empty()
+            || !pid.bytes().all(|byte| byte.is_ascii_digit())
+            || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        let path = entry.path();
+        match private_file(&path) {
+            Ok(()) => fs::remove_file(path)?,
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn validate_retention_archive(path: &Path, receipt: &RetentionReceipt) -> Result<(), StoreError> {
+    let plan = &receipt.plan;
+    private_file(path)?;
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != plan.archive_bytes {
+        return Err(StoreError::SchemaMismatch);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(StoreError::InsecurePermissions);
+        }
+    }
+    private_file(path)?;
+
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut line_number = 0_u64;
+    let mut record_count = 0_u64;
+    let mut trace_ids = BTreeSet::new();
+    let mut records_hash = Sha256::new();
+    let mut archive_hash = Sha256::new();
+    let mut footer_seen = false;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        line_number = line_number
+            .checked_add(1)
+            .ok_or(StoreError::SchemaMismatch)?;
+        if !line.ends_with('\n') {
+            return Err(StoreError::SchemaMismatch);
+        }
+        archive_hash.update(line.as_bytes());
+        let entry: RetentionArchiveEntry = serde_json::from_str(&line)?;
+        match entry {
+            RetentionArchiveEntry::Header {
+                schema_version,
+                plan_id,
+                cutoff_unix_ms,
+            } if line_number == 1
+                && schema_version == RETENTION_ARCHIVE_VERSION
+                && plan_id == plan.plan_id
+                && cutoff_unix_ms == plan.cutoff_unix_ms => {}
+            RetentionArchiveEntry::Record { record } if line_number > 1 && !footer_seen => {
+                record.validate().map_err(|_| StoreError::SchemaMismatch)?;
+                record_count = record_count
+                    .checked_add(1)
+                    .ok_or(StoreError::SchemaMismatch)?;
+                trace_ids.insert(record.trace_id.clone());
+                records_hash.update(line.as_bytes());
+            }
+            RetentionArchiveEntry::Footer {
+                traces,
+                records,
+                records_sha256,
+            } if line_number > 1
+                && !footer_seen
+                && traces == plan.traces
+                && records == plan.records
+                && records_sha256 == hex_digest(records_hash.finalize_reset()) =>
+            {
+                footer_seen = true;
+            }
+            _ => return Err(StoreError::SchemaMismatch),
+        }
+    }
+    if !footer_seen
+        || record_count != plan.records
+        || u64::try_from(trace_ids.len()).map_err(|_| StoreError::SchemaMismatch)? != plan.traces
+        || hex_digest(archive_hash.finalize()) != receipt.archive_sha256
+    {
+        return Err(StoreError::SchemaMismatch);
+    }
+    Ok(())
 }
 
 fn map_reduction_error(error: agent_observability_domain::DomainError) -> StoreError {
@@ -938,7 +1882,8 @@ fn insert_duplicate_disposition(
         "INSERT INTO adapter_dispositions(source,generation,cursor,disposition,code,payload_hash) VALUES (?1,?2,?3,?4,?5,?6)",
         params![source, generation, cursor, disposition.as_str(), code.as_str(), payload_hash],
     )?;
-    advance_cursor(tx, observation)
+    advance_cursor(tx, observation)?;
+    prune_adapter_dispositions(tx)
 }
 
 fn disposition_payload_hash(
@@ -1431,6 +2376,37 @@ fn private_file(path: &Path) -> Result<(), StoreError> {
     }
     Ok(())
 }
+
+#[cfg(unix)]
+fn private_open_file(file: &File) -> Result<(), StoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(StoreError::InvalidPath);
+    }
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        return Err(StoreError::InsecurePermissions);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn private_open_file(file: &File) -> Result<(), StoreError> {
+    if !file.metadata()?.is_file() {
+        return Err(StoreError::InvalidPath);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const fn no_follow_flag() -> i32 {
+    0x20_000
+}
+
+#[cfg(target_os = "macos")]
+const fn no_follow_flag() -> i32 {
+    0x100
+}
 #[cfg(not(unix))]
 fn set_private_file(path: &Path) -> Result<(), StoreError> {
     let _ = path;
@@ -1468,7 +2444,10 @@ fn create_projection_temp(dir: &Path) -> Result<(PathBuf, File), StoreError> {
 fn remove_stale_projection_temps(dir: &Path) -> Result<(), StoreError> {
     let prefix = format!(".{PROJECTION_NAME}.tmp.");
     let mut stale = Vec::new();
-    for entry in fs::read_dir(dir)? {
+    for (index, entry) in fs::read_dir(dir)?.enumerate() {
+        if index >= MAX_PRIVATE_DIRECTORY_ENTRIES {
+            return Err(StoreError::SchemaMismatch);
+        }
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -1540,7 +2519,41 @@ fn initialize_empty_schema(db: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn migrate_to_v3(db: &Connection) -> Result<(), StoreError> {
+fn migrate_to_v4(db: &Connection) -> Result<(), StoreError> {
+    db.pragma_update(None, "foreign_keys", false)?;
+    let result = prune_legacy_adapter_dispositions(db)
+        .and_then(|()| db.execute_batch("VACUUM").map_err(StoreError::from))
+        .and_then(|()| migrate_to_v4_inner(db));
+    db.pragma_update(None, "foreign_keys", true)?;
+    result
+}
+
+fn prune_legacy_adapter_dispositions(db: &Connection) -> Result<(), StoreError> {
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let version: String = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StoreError::SchemaMismatch)?;
+    if !matches!(version.as_str(), "local_state.v2" | "local_state.v3") {
+        tx.commit()?;
+        return Ok(());
+    }
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='adapter_dispositions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if exists {
+        prune_adapter_dispositions(&tx)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_to_v4_inner(db: &Connection) -> Result<(), StoreError> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
     let version: String = tx
         .query_row(
@@ -1553,7 +2566,7 @@ fn migrate_to_v3(db: &Connection) -> Result<(), StoreError> {
         tx.commit()?;
         return Ok(());
     }
-    if version == "local_state.v2" {
+    if matches!(version.as_str(), "local_state.v2" | "local_state.v3") {
         tx.execute(
             "INSERT OR REPLACE INTO metadata(key, value) VALUES ('projection_dirty', '1')",
             [],
@@ -1580,6 +2593,37 @@ fn migrate_to_v3(db: &Connection) -> Result<(), StoreError> {
     } else {
         return Err(StoreError::SchemaMismatch);
     }
+    prune_adapter_dispositions(&tx)?;
+    tx.execute_batch(
+        "CREATE TABLE observations_v4 (event_id TEXT PRIMARY KEY, source TEXT NOT NULL, generation TEXT NOT NULL, observation_id TEXT NOT NULL, trace_id TEXT NOT NULL, observed_at_unix_ms TEXT NOT NULL, payload_hash TEXT NOT NULL, projected_json TEXT NOT NULL, UNIQUE(source, generation, observation_id))",
+    )?;
+    {
+        let mut statement = tx.prepare(
+            "SELECT event_id, source, generation, observation_id, payload_hash, projected_json FROM observations",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (event_id, source, generation, observation_id, payload_hash, projected_json) = row?;
+            let record: DurableRecordV1 = serde_json::from_str(&projected_json)?;
+            tx.execute(
+                "INSERT INTO observations_v4(event_id, source, generation, observation_id, trace_id, observed_at_unix_ms, payload_hash, projected_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![event_id, source, generation, observation_id, record.trace_id, record_observed_at_millis(&record)?, payload_hash, projected_json],
+            )?;
+        }
+    }
+    tx.execute_batch(
+        "DROP TABLE observations; ALTER TABLE observations_v4 RENAME TO observations",
+    )?;
+    create_v4_retention_objects(&tx)?;
     tx.execute(
         "UPDATE metadata SET value=?1 WHERE key='schema_version'",
         [LOCAL_STORE_SCHEMA_VERSION],
@@ -1588,7 +2632,37 @@ fn migrate_to_v3(db: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn create_v4_retention_objects(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    for name in [
+        "expired_span_states",
+        "retention_receipts",
+        "observations_trace_idx",
+        "records_trace_idx",
+        "topology_trace_idx",
+    ] {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+            [name],
+            |row| row.get(0),
+        )?;
+        if exists {
+            continue;
+        }
+        let sql = SCHEMA_OBJECTS
+            .iter()
+            .find(|(_, object, _)| *object == name)
+            .map(|(_, _, sql)| *sql)
+            .ok_or(StoreError::SchemaMismatch)?;
+        tx.execute_batch(sql)?;
+    }
+    Ok(())
+}
+
 fn validate_schema(db: &Connection) -> Result<(), StoreError> {
+    let auto_vacuum: i64 = db.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+    if auto_vacuum != 2 {
+        return Err(StoreError::SchemaMismatch);
+    }
     let integrity: String = db.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         return Err(StoreError::SchemaMismatch);
@@ -1613,6 +2687,17 @@ fn validate_schema(db: &Connection) -> Result<(), StoreError> {
             return Err(StoreError::SchemaMismatch);
         }
     }
+    validate_table_columns(db)?;
+    let foreign_key_failure = db
+        .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+        .optional()?;
+    if foreign_key_failure.is_some() {
+        return Err(StoreError::SchemaMismatch);
+    }
+    Ok(())
+}
+
+fn validate_table_columns(db: &Connection) -> Result<(), StoreError> {
     for (table, expected) in [
         ("metadata", &["key", "value"][..]),
         ("source_cursors", &["source", "generation", "cursor"]),
@@ -1623,6 +2708,8 @@ fn validate_schema(db: &Connection) -> Result<(), StoreError> {
                 "source",
                 "generation",
                 "observation_id",
+                "trace_id",
+                "observed_at_unix_ms",
                 "payload_hash",
                 "projected_json",
             ],
@@ -1630,6 +2717,25 @@ fn validate_schema(db: &Connection) -> Result<(), StoreError> {
         (
             "source_inputs",
             &["source", "generation", "cursor", "event_id", "payload_hash"],
+        ),
+        (
+            "expired_span_states",
+            &["guard_seq", "span_id", "canonical_state_hash"],
+        ),
+        (
+            "retention_receipts",
+            &[
+                "plan_id",
+                "cutoff_unix_ms",
+                "traces",
+                "observations",
+                "records",
+                "archive_bytes",
+                "truncated",
+                "archive_path_hash",
+                "archive_sha256",
+                "compacted",
+            ],
         ),
         (
             "records",
@@ -1674,18 +2780,12 @@ fn validate_schema(db: &Connection) -> Result<(), StoreError> {
             return Err(StoreError::SchemaMismatch);
         }
     }
-    let foreign_key_failure = db
-        .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
-        .optional()?;
-    if foreign_key_failure.is_some() {
-        return Err(StoreError::SchemaMismatch);
-    }
     Ok(())
 }
 
 fn normalize_schema_sql(sql: &str) -> String {
     sql.chars()
-        .filter(|character| !character.is_ascii_whitespace())
+        .filter(|character| !character.is_ascii_whitespace() && *character != '"')
         .flat_map(char::to_lowercase)
         .collect()
 }
@@ -1738,6 +2838,57 @@ mod tests {
             "agent-observability-local-store-{label}-{}",
             std::process::id()
         ))
+    }
+
+    fn downgrade_to_historical_schema(database: &Path, version: &str) {
+        let connection = Connection::open(database).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX observations_trace_idx;
+                 DROP INDEX records_trace_idx;
+                 DROP INDEX topology_trace_idx;
+                 DROP TABLE expired_span_states;
+                 DROP TABLE retention_receipts;
+                 CREATE TABLE observations_historical (event_id TEXT PRIMARY KEY, source TEXT NOT NULL, generation TEXT NOT NULL, observation_id TEXT NOT NULL, payload_hash TEXT NOT NULL, projected_json TEXT NOT NULL, UNIQUE(source, generation, observation_id));
+                 INSERT INTO observations_historical(event_id, source, generation, observation_id, payload_hash, projected_json) SELECT event_id, source, generation, observation_id, payload_hash, projected_json FROM observations;
+                 DROP TABLE observations;
+                 ALTER TABLE observations_historical RENAME TO observations;",
+            )
+            .unwrap();
+        match version {
+            "local_state.v1" => connection
+                .execute_batch(
+                    "DROP TABLE adapter_dispositions;
+                     DELETE FROM metadata WHERE key='projection_dirty';",
+                )
+                .unwrap(),
+            "local_state.v2" => {
+                connection
+                    .execute("DELETE FROM metadata WHERE key='projection_dirty'", [])
+                    .unwrap();
+            }
+            "local_state.v3" => {}
+            _ => panic!("unsupported historical schema fixture"),
+        }
+        connection
+            .execute(
+                "UPDATE metadata SET value=?1 WHERE key='schema_version'",
+                [version],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "auto_vacuum", "NONE")
+            .unwrap();
+        connection.execute_batch("VACUUM").unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA auto_vacuum", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -2460,17 +3611,19 @@ mod tests {
         let database = store.database_path();
         let projection = store.projection_path();
         drop(store);
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute_batch(
-                "DROP TABLE adapter_dispositions;
-                 UPDATE metadata SET value='local_state.v1' WHERE key='schema_version';",
-            )
-            .unwrap();
-        drop(connection);
+        downgrade_to_historical_schema(&database, "local_state.v1");
         fs::remove_file(&projection).unwrap();
+        let required_workspace = fs::metadata(&database).unwrap().len().saturating_mul(2);
 
-        let mut store = LocalStore::open(&dir).unwrap();
+        assert!(matches!(
+            LocalStore::open(&dir),
+            Err(StoreError::MigrationAdmissionRequired)
+        ));
+        assert!(matches!(
+            LocalStore::open_with_migration_headroom(&dir, required_workspace.saturating_sub(1)),
+            Err(StoreError::MigrationAdmissionRequired)
+        ));
+        let mut store = LocalStore::open_with_migration_headroom(&dir, required_workspace).unwrap();
         assert_eq!(store.observation_count().unwrap(), 1);
         assert_eq!(store.record_count().unwrap(), 1);
         assert_eq!(store.outcome_count().unwrap(), 1);
@@ -2522,7 +3675,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_store_migrates_to_v3_and_repairs_projection() {
+    fn v2_store_migrates_to_v4_and_repairs_projection() {
         let dir = temp_dir("v2-migration");
         let _ = fs::remove_dir_all(&dir);
         let mut store = LocalStore::open(&dir).unwrap();
@@ -2530,20 +3683,51 @@ mod tests {
         let database = store.database_path();
         let projection = store.projection_path();
         drop(store);
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute(
-                "UPDATE metadata SET value='local_state.v2' WHERE key='schema_version'",
+        downgrade_to_historical_schema(&database, "local_state.v2");
+        fs::remove_file(&projection).unwrap();
+
+        let reopened = LocalStore::open_with_migration_headroom(&dir, u64::MAX).unwrap();
+        assert_eq!(reopened.observation_count().unwrap(), 1);
+        assert_eq!(fs::read_to_string(&projection).unwrap().lines().count(), 1);
+        let version: String = reopened
+            .db
+            .query_row(
+                "SELECT value FROM metadata WHERE key='schema_version'",
                 [],
+                |row| row.get(0),
             )
             .unwrap();
-        connection
-            .execute("DELETE FROM metadata WHERE key='projection_dirty'", [])
-            .unwrap();
+        assert_eq!(version, LOCAL_STORE_SCHEMA_VERSION);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v3_store_migrates_to_v4_and_repairs_projection() {
+        let dir = temp_dir("v3-migration");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        let database = store.database_path();
+        let projection = store.projection_path();
+        drop(store);
+        downgrade_to_historical_schema(&database, "local_state.v3");
+        let mut connection = Connection::open(&database).unwrap();
+        let tx = connection.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO adapter_dispositions(source,generation,cursor,disposition,code,payload_hash) VALUES ('codex','generation',?1,'diagnostic','unsupported_event','hash')",
+                )
+                .unwrap();
+            for index in 0..=MAX_ADAPTER_DISPOSITIONS {
+                insert.execute([format!("migration-{index}")]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
         drop(connection);
         fs::remove_file(&projection).unwrap();
 
-        let reopened = LocalStore::open(&dir).unwrap();
+        let reopened = LocalStore::open_with_migration_headroom(&dir, u64::MAX).unwrap();
         let connection = Connection::open(reopened.database_path()).unwrap();
         assert_eq!(
             connection
@@ -2553,7 +3737,7 @@ mod tests {
                     |row| row.get::<_, String>(0)
                 )
                 .unwrap(),
-            "local_state.v3"
+            "local_state.v4"
         );
         assert_eq!(
             connection
@@ -2566,6 +3750,1013 @@ mod tests {
             "0"
         );
         assert_eq!(fs::read_to_string(&projection).unwrap().lines().count(), 1);
+        assert_eq!(
+            count(&reopened.db, "adapter_dispositions").unwrap(),
+            MAX_ADAPTER_DISPOSITIONS
+        );
+        assert!(
+            !reopened
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM adapter_dispositions WHERE cursor='migration-0')",
+                    [],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_v3_data_migration_preserves_authority_and_can_retry() {
+        let dir = temp_dir("v3-migration-retry");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        let database = store.database_path();
+        let valid_record: String = store
+            .db
+            .query_row("SELECT projected_json FROM observations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        drop(store);
+        downgrade_to_historical_schema(&database, "local_state.v3");
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute("UPDATE observations SET projected_json='{'", [])
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            LocalStore::open_with_migration_headroom(&dir, u64::MAX),
+            Err(StoreError::Json(_))
+        ));
+
+        let connection = Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "local_state.v3"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM observations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert!(
+            !connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='retention_receipts')",
+                    [],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        connection
+            .execute("UPDATE observations SET projected_json=?1", [valid_record])
+            .unwrap();
+        drop(connection);
+
+        let reopened = LocalStore::open_with_migration_headroom(&dir, u64::MAX).unwrap();
+        assert_eq!(reopened.observation_count().unwrap(), 1);
+        assert_eq!(reopened.record_count().unwrap(), 1);
+        assert_eq!(
+            reopened
+                .db
+                .query_row("PRAGMA auto_vacuum", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn retention_archives_complete_expired_traces_and_preserves_replay_guards() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("retention-apply");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let session = observation("1", "session", None);
+        let turn = observation_after("2", Some("1"), "turn", Some("session"));
+        store.ingest(&session).unwrap();
+        store.ingest(&turn).unwrap();
+        let before = fs::read(store.projection_path()).unwrap();
+        let plan = store.retention_plan(100, 100, 1_048_576).unwrap();
+        assert_eq!(plan.traces, 1);
+        assert_eq!(plan.observations, 2);
+        assert_eq!(plan.records, 2);
+        assert!(!plan.truncated);
+        assert_eq!(fs::read(store.projection_path()).unwrap(), before);
+
+        let archive = dir.join("archives/expired.jsonl");
+        assert!(matches!(
+            store.apply_retention(100, 100, 1_048_576, "stale", &archive),
+            Err(StoreError::StaleRetentionPlan)
+        ));
+        assert!(!archive.exists());
+        let result = store
+            .apply_retention(100, 100, 1_048_576, &plan.plan_id, &archive)
+            .unwrap();
+        assert_eq!(result.archive_path.as_deref(), Some(archive.as_path()));
+        assert_eq!(
+            fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let archive_body = fs::read_to_string(&archive).unwrap();
+        let archive_lines = archive_body.lines().collect::<Vec<_>>();
+        assert_eq!(archive_lines.len(), 4);
+        assert!(archive_body.contains(RETENTION_ARCHIVE_VERSION));
+        assert!(archive_body.contains("\"entry_type\":\"footer\""));
+        assert!(archive_body.contains("\"records_sha256\""));
+        assert!(!archive_body.contains("\"event_id\""));
+        assert!(!archive_body.contains("\"generation\""));
+        assert!(!archive_body.contains("\"payload_hash\""));
+        let footer: serde_json::Value = serde_json::from_str(archive_lines[3]).unwrap();
+        let mut digest = Sha256::new();
+        for line in &archive_lines[1..3] {
+            digest.update(line.as_bytes());
+            digest.update(b"\n");
+        }
+        assert_eq!(
+            footer["records_sha256"].as_str().unwrap(),
+            hex_digest(digest.finalize())
+        );
+        assert_eq!(store.observation_count().unwrap(), 0);
+        assert_eq!(store.source_input_count().unwrap(), 0);
+        assert_eq!(store.outcome_count().unwrap(), 0);
+        assert_eq!(store.record_count().unwrap(), 0);
+        assert_eq!(
+            store.cursor("codex", "generation").unwrap().as_deref(),
+            Some("2")
+        );
+        assert!(
+            fs::read_to_string(store.projection_path())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            store.ingest(&turn),
+            Err(StoreError::CursorConflict)
+        ));
+        let mut changed = turn.clone();
+        changed.timing = Timing::new(1, Some(3)).unwrap();
+        assert!(matches!(
+            store.ingest(&changed),
+            Err(StoreError::CursorConflict)
+        ));
+        let semantic_duplicate = observation_after("3", Some("2"), "turn", Some("session"));
+        assert_eq!(
+            store.ingest(&semantic_duplicate).unwrap(),
+            IngestStatus::Suppressed
+        );
+        assert_eq!(store.record_count().unwrap(), 0);
+        let mut conflicting_state = observation_after("4", Some("3"), "turn", Some("session"));
+        conflicting_state.timing = Timing::new(1, Some(3)).unwrap();
+        assert!(matches!(
+            store.ingest(&conflicting_state),
+            Err(StoreError::PayloadConflict)
+        ));
+        assert_eq!(
+            store.cursor("codex", "generation").unwrap().as_deref(),
+            Some("3")
+        );
+        let expired_spans: u64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM expired_span_states", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+            .cast_unsigned();
+        assert_eq!(expired_spans, 2);
+        let free_pages: u64 = store
+            .db
+            .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .cast_unsigned();
+        assert_eq!(free_pages, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_keeps_mixed_age_traces_and_reports_bounded_truncation() {
+        let dir = temp_dir("retention-bounds");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let old = observation("1", "session", None);
+        let mut recent = observation_after("2", Some("1"), "turn", Some("session"));
+        recent.timing = Timing::new(200, Some(201)).unwrap();
+        store.ingest(&old).unwrap();
+        store.ingest(&recent).unwrap();
+        assert_eq!(store.retention_plan(100, 100, 1_048_576).unwrap().traces, 0);
+
+        let mut expired = observation_after("3", Some("2"), "other", None);
+        expired.trace_id = TraceId::parse("other-trace").unwrap();
+        store.ingest(&expired).unwrap();
+        assert!(matches!(
+            store.retention_plan(100, 1, 1),
+            Err(StoreError::InvalidRetentionBounds)
+        ));
+        let archive = dir.join("archive/too-small.jsonl");
+        assert!(matches!(
+            store.apply_retention(100, 1, 1, "invalid", &archive),
+            Err(StoreError::InvalidRetentionBounds)
+        ));
+        assert!(!archive.exists());
+        assert_eq!(store.record_count().unwrap(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_bounds_are_inclusive_and_never_split_a_trace() {
+        let dir = temp_dir("retention-exact-bounds");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        store
+            .ingest(&observation_after("2", Some("1"), "turn", Some("session")))
+            .unwrap();
+        let generous = store.retention_plan(100, 100, 1_048_576).unwrap();
+        assert_eq!(generous.records, 2);
+        let exact = store.retention_plan(100, 2, MIN_ARCHIVE_BYTES).unwrap();
+        assert_eq!(exact.traces, 1);
+        assert_eq!(exact.records, 2);
+        assert_eq!(exact.archive_bytes, generous.archive_bytes);
+        assert_eq!(store.retention_plan(100, 1, 1_048_576).unwrap().traces, 0);
+        assert!(matches!(
+            store.retention_plan(100, 2, MIN_ARCHIVE_BYTES - 1),
+            Err(StoreError::InvalidRetentionBounds)
+        ));
+        assert_eq!(store.record_count().unwrap(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_limits_are_enforced_at_the_store_boundary() {
+        let dir = temp_dir("retention-limit-boundary");
+        let _ = fs::remove_dir_all(&dir);
+        let store = LocalStore::open(&dir).unwrap();
+        for (records, bytes) in [
+            (MIN_ARCHIVE_RECORDS, MIN_ARCHIVE_BYTES),
+            (MAX_ARCHIVE_RECORDS, MAX_ARCHIVE_BYTES),
+        ] {
+            assert_eq!(store.retention_plan(0, records, bytes).unwrap().traces, 0);
+        }
+        for (records, bytes) in [
+            (0, MIN_ARCHIVE_BYTES),
+            (MAX_ARCHIVE_RECORDS + 1, MIN_ARCHIVE_BYTES),
+            (MIN_ARCHIVE_RECORDS, MIN_ARCHIVE_BYTES - 1),
+            (MIN_ARCHIVE_RECORDS, MAX_ARCHIVE_BYTES + 1),
+        ] {
+            assert!(matches!(
+                store.retention_plan(u64::MAX, records, bytes),
+                Err(StoreError::InvalidRetentionBounds)
+            ));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_retention_receipt_blocks_a_new_pass_until_recovered() {
+        let dir = temp_dir("retention-pending-receipt");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        let first = store.retention_plan(100, 100, 1_048_576).unwrap();
+        let first_archive = dir.join("archive/first.jsonl");
+        assert!(matches!(
+            store.apply_retention_at(
+                100,
+                100,
+                1_048_576,
+                &first.plan_id,
+                &first_archive,
+                Some(CrashPoint::AfterRetentionCommit)
+            ),
+            Err(StoreError::Crash(CrashPoint::AfterRetentionCommit))
+        ));
+
+        let mut second = observation_after("2", Some("1"), "other", None);
+        second.trace_id = TraceId::parse("other-trace").unwrap();
+        store.ingest(&second).unwrap();
+        let second_plan = store.retention_plan(100, 100, 1_048_576).unwrap();
+        let second_archive = dir.join("archive/second.jsonl");
+        assert!(matches!(
+            store.apply_retention(100, 100, 1_048_576, &second_plan.plan_id, &second_archive),
+            Err(StoreError::PendingRetentionRecovery)
+        ));
+        store
+            .apply_retention(100, 100, 1_048_576, &first.plan_id, &first_archive)
+            .unwrap();
+        store
+            .apply_retention(100, 100, 1_048_576, &second_plan.plan_id, &second_archive)
+            .unwrap();
+        assert_eq!(store.record_count().unwrap(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_retention_callers_publish_one_archive_and_one_receipt() {
+        let dir = temp_dir("retention-concurrent-callers");
+        let _ = fs::remove_dir_all(&dir);
+        let mut planner = LocalStore::open(&dir).unwrap();
+        planner.ingest(&observation("1", "session", None)).unwrap();
+        let plan = planner.retention_plan(100, 100, 1_048_576).unwrap();
+        drop(planner);
+
+        let first = LocalStore::open(&dir).unwrap();
+        let second = LocalStore::open(&dir).unwrap();
+        let archive = dir.join("archive/shared.jsonl");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for store in [first, second] {
+            let plan_id = plan.plan_id.clone();
+            let archive = archive.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.apply_retention(100, 100, 1_048_576, &plan_id, &archive)
+            }));
+        }
+        for handle in handles {
+            let result = handle.join().unwrap().unwrap();
+            assert_eq!(result.plan, plan);
+            assert_eq!(result.archive_path.as_deref(), Some(archive.as_path()));
+        }
+
+        let reopened = LocalStore::open(&dir).unwrap();
+        assert_eq!(reopened.record_count().unwrap(), 0);
+        assert_eq!(count(&reopened.db, "retention_receipts").unwrap(), 1);
+        assert!(archive.is_file());
+        let archive_name = archive.file_name().unwrap().to_str().unwrap();
+        let temp_prefix = format!(".{archive_name}.retention.tmp.");
+        assert_eq!(
+            fs::read_dir(archive.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&temp_prefix))
+                .count(),
+            0
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_stops_before_an_oversized_oldest_trace_without_splitting_it() {
+        let dir = temp_dir("retention-oversized-trace");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        for index in 1..=11_u8 {
+            let cursor = index.to_string();
+            let previous = (index > 1).then(|| (index - 1).to_string());
+            let mut running = observation_after(
+                &cursor,
+                previous.as_deref(),
+                &format!("running-{index}"),
+                None,
+            );
+            running.trace_id = TraceId::parse("a-running").unwrap();
+            running.lifecycle = LifecycleState::Running;
+            store.ingest(&running).unwrap();
+        }
+        let mut terminal = observation_after("12", Some("11"), "terminal", None);
+        terminal.trace_id = TraceId::parse("z-terminal").unwrap();
+        store.ingest(&terminal).unwrap();
+
+        let plan = store.retention_plan(100, 1, 1_048_576).unwrap();
+        assert_eq!(plan.traces, 0);
+        assert_eq!(plan.records, 0);
+        assert!(plan.truncated);
+        assert_eq!(store.record_count().unwrap(), 12);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_rejects_a_truncated_plan_without_applying_its_selected_prefix() {
+        let dir = temp_dir("retention-truncated-prefix");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let mut first = observation("1", "first", None);
+        first.trace_id = TraceId::parse("first-trace").unwrap();
+        first.timing = Timing::new(1, Some(2)).unwrap();
+        store.ingest(&first).unwrap();
+        let mut second = observation_after("2", Some("1"), "second", None);
+        second.trace_id = TraceId::parse("second-trace").unwrap();
+        second.timing = Timing::new(3, Some(4)).unwrap();
+        store.ingest(&second).unwrap();
+
+        let plan = store.retention_plan(100, 1, 1_048_576).unwrap();
+        assert_eq!(plan.traces, 1);
+        assert!(plan.truncated);
+        let archive = dir.join("archive/truncated.jsonl");
+        assert!(matches!(
+            store.apply_retention(100, 1, 1_048_576, &plan.plan_id, &archive),
+            Err(StoreError::RetentionBoundsTooSmall)
+        ));
+        assert_eq!(store.record_count().unwrap(), 2);
+        assert_eq!(store.observation_count().unwrap(), 2);
+        assert!(!archive.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_expires_stale_incomplete_traces_but_keeps_cutoff_equal_traces() {
+        let dir = temp_dir("retention-pins");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let mut incomplete = observation("1", "session", None);
+        incomplete.lifecycle = LifecycleState::Running;
+        incomplete.timing = Timing::new(1, None).unwrap();
+        store.ingest(&incomplete).unwrap();
+        assert_eq!(store.retention_plan(100, 100, 1_048_576).unwrap().traces, 1);
+
+        let mut cutoff_equal = observation_after("2", Some("1"), "equal", None);
+        cutoff_equal.trace_id = TraceId::parse("equal-trace").unwrap();
+        cutoff_equal.timing = Timing::new(100, Some(100)).unwrap();
+        store.ingest(&cutoff_equal).unwrap();
+
+        let mut running_with_end = observation_after("3", Some("2"), "running", None);
+        running_with_end.trace_id = TraceId::parse("running-trace").unwrap();
+        running_with_end.lifecycle = LifecycleState::Running;
+        store.ingest(&running_with_end).unwrap();
+        assert_eq!(store.retention_plan(100, 100, 1_048_576).unwrap().traces, 2);
+        assert_eq!(store.record_count().unwrap(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_archive_publication_fails_closed_without_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("retention-no-overwrite");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        let plan = store.retention_plan(100, 100, 1_048_576).unwrap();
+        let archive_dir = dir.join("archive");
+        fs::create_dir(&archive_dir).unwrap();
+        fs::set_permissions(&archive_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let archive = archive_dir.join("existing.jsonl");
+        fs::write(&archive, b"sentinel\n").unwrap();
+        fs::set_permissions(&archive, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(matches!(
+            store.apply_retention(100, 100, 1_048_576, &plan.plan_id, &archive),
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(fs::read(&archive).unwrap(), b"sentinel\n");
+        assert_eq!(store.observation_count().unwrap(), 1);
+        assert_eq!(store.record_count().unwrap(), 1);
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT COUNT(*) FROM retention_receipts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_stores_cannot_clean_an_active_archive_temporary_file() {
+        use std::sync::mpsc;
+
+        let root = temp_dir("retention-destination-lock");
+        let _ = fs::remove_dir_all(&root);
+        let mut first = LocalStore::open(root.join("first-store")).unwrap();
+        let mut second = LocalStore::open(root.join("second-store")).unwrap();
+        first.ingest(&observation("1", "first", None)).unwrap();
+        second.ingest(&observation("1", "second", None)).unwrap();
+        let first_plan = first.retention_plan(100, 100, 1_048_576).unwrap();
+        let second_plan = second.retention_plan(100, 100, 1_048_576).unwrap();
+        let archive_dir = root.join("archive");
+        private_dir(&archive_dir).unwrap();
+        let archive_name = "shared.jsonl";
+        let archive = archive_dir.join(archive_name);
+        let active_temp = archive_dir.join(format!(
+            ".{archive_name}.retention.tmp.{}.999",
+            std::process::id()
+        ));
+        drop(private_create_new(&active_temp).unwrap());
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let lock_dir = archive_dir.clone();
+        let holder = std::thread::spawn(move || {
+            let _lock = lock_archive_directory(&lock_dir).unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        assert!(matches!(
+            second.apply_retention(
+                100,
+                100,
+                1_048_576,
+                &second_plan.plan_id,
+                &archive
+            ),
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        assert!(active_temp.is_file());
+        assert_eq!(second.record_count().unwrap(), 1);
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        first
+            .apply_retention(100, 100, 1_048_576, &first_plan.plan_id, &archive)
+            .unwrap();
+        assert!(!active_temp.exists());
+        assert_eq!(first.record_count().unwrap(), 0);
+        second
+            .apply_retention(
+                100,
+                100,
+                1_048_576,
+                &second_plan.plan_id,
+                &archive_dir.join("other.jsonl"),
+            )
+            .unwrap();
+        assert_eq!(second.record_count().unwrap(), 0);
+        assert_eq!(
+            fs::read_dir(&archive_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name() == ".agent-observability.retention.lock")
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn retention_archive_paths_permissions_and_stale_temps_fail_closed() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = temp_dir("retention-path-safety");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        let plan = store.retention_plan(100, 100, 1_048_576).unwrap();
+
+        let broad_parent = dir.join("broad");
+        fs::create_dir(&broad_parent).unwrap();
+        fs::set_permissions(&broad_parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            store.apply_retention(
+                100,
+                100,
+                1_048_576,
+                &plan.plan_id,
+                &broad_parent.join("archive.jsonl")
+            ),
+            Err(StoreError::InsecurePermissions)
+        ));
+
+        let private_parent = dir.join("private");
+        fs::create_dir(&private_parent).unwrap();
+        fs::set_permissions(&private_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let sentinel = private_parent.join("sentinel");
+        fs::write(&sentinel, b"sentinel\n").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = private_parent.join("link.jsonl");
+        symlink(&sentinel, &link).unwrap();
+        assert!(matches!(
+            store.apply_retention(100, 100, 1_048_576, &plan.plan_id, &link),
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel\n");
+
+        let directory_target = private_parent.join("directory.jsonl");
+        fs::create_dir(&directory_target).unwrap();
+        assert!(matches!(
+            store.apply_retention(100, 100, 1_048_576, &plan.plan_id, &directory_target),
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+
+        let wrong_parent = private_parent.join("not-a-directory");
+        fs::write(&wrong_parent, b"sentinel\n").unwrap();
+        fs::set_permissions(&wrong_parent, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            store.apply_retention(
+                100,
+                100,
+                1_048_576,
+                &plan.plan_id,
+                &wrong_parent.join("archive.jsonl")
+            ),
+            Err(StoreError::InvalidPath)
+        ));
+
+        assert_eq!(store.observation_count().unwrap(), 1);
+        assert_eq!(store.record_count().unwrap(), 1);
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT COUNT(*) FROM retention_receipts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+
+        let stale_sequence = AtomicU64::new(0);
+        let stale = private_parent.join(format!(
+            ".fresh.jsonl.retention.tmp.{}.0",
+            std::process::id()
+        ));
+        fs::write(&stale, b"stale\n").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
+        let (fresh, file) =
+            create_archive_temp(&private_parent, "fresh.jsonl", &stale_sequence).unwrap();
+        drop(file);
+        assert!(fresh.ends_with(format!(
+            ".fresh.jsonl.retention.tmp.{}.1",
+            std::process::id()
+        )));
+        assert_eq!(fs::read(&stale).unwrap(), b"stale\n");
+        fs::remove_file(fresh).unwrap();
+
+        let exhausted_sequence = AtomicU64::new(0);
+        let mut exhausted = Vec::new();
+        for index in 0..MAX_ARCHIVE_TEMP_COLLISIONS {
+            let path = private_parent.join(format!(
+                ".exhausted.jsonl.retention.tmp.{}.{index}",
+                std::process::id()
+            ));
+            fs::write(&path, b"stale\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            exhausted.push(path);
+        }
+        assert!(matches!(
+            create_archive_temp(
+                &private_parent,
+                "exhausted.jsonl",
+                &exhausted_sequence
+            ),
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        for path in exhausted {
+            assert_eq!(fs::read(&path).unwrap(), b"stale\n");
+            fs::remove_file(path).unwrap();
+        }
+
+        let archive = private_parent.join("fresh.jsonl");
+        store
+            .apply_retention(100, 100, 1_048_576, &plan.plan_id, &archive)
+            .unwrap();
+        assert!(archive.is_file());
+        assert!(!stale.exists());
+        assert_eq!(store.observation_count().unwrap(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_pins_unresolved_topology_until_parent_arrives() {
+        let dir = temp_dir("retention-unresolved");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store
+            .ingest(&observation("1", "turn", Some("session")))
+            .unwrap();
+        assert_eq!(store.unresolved_parent_count().unwrap(), 1);
+        assert_eq!(store.retention_plan(100, 100, 1_048_576).unwrap().traces, 0);
+        store
+            .ingest(&observation_after("2", Some("1"), "session", None))
+            .unwrap();
+        assert_eq!(store.unresolved_parent_count().unwrap(), 0);
+        assert_eq!(store.retention_plan(100, 100, 1_048_576).unwrap().traces, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_rejects_a_real_plan_after_authority_changes() {
+        let dir = temp_dir("retention-stale-authority");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        let plan = store.retention_plan(100, 100, 1_048_576).unwrap();
+        store
+            .ingest(&observation_after("2", Some("1"), "turn", Some("session")))
+            .unwrap();
+        let archive = dir.join("archive/stale.jsonl");
+        assert!(matches!(
+            store.apply_retention(100, 100, 1_048_576, &plan.plan_id, &archive),
+            Err(StoreError::StaleRetentionPlan)
+        ));
+        assert!(!archive.exists());
+        assert_eq!(store.observation_count().unwrap(), 2);
+        assert_eq!(store.record_count().unwrap(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_crash_boundaries_leave_recoverable_authority_and_archive() {
+        for crash in [
+            CrashPoint::BeforeRetentionCommit,
+            CrashPoint::AfterRetentionCommit,
+        ] {
+            let dir = temp_dir(&format!("retention-crash-{crash:?}"));
+            let _ = fs::remove_dir_all(&dir);
+            let mut store = LocalStore::open(&dir).unwrap();
+            store.ingest(&observation("1", "session", None)).unwrap();
+            let plan = store.retention_plan(100, 100, 1_048_576).unwrap();
+            let archive = dir.join("archive/expired.jsonl");
+            assert!(matches!(
+                store.apply_retention_at(
+                    100,
+                    100,
+                    1_048_576,
+                    &plan.plan_id,
+                    &archive,
+                    Some(crash),
+                ),
+                Err(StoreError::Crash(point)) if point == crash
+            ));
+            assert!(archive.is_file());
+            drop(store);
+
+            let reopened = LocalStore::open(&dir).unwrap();
+            let expected = u64::from(crash == CrashPoint::BeforeRetentionCommit);
+            assert_eq!(reopened.observation_count().unwrap(), expected);
+            assert_eq!(reopened.record_count().unwrap(), expected);
+            assert_eq!(
+                fs::read_to_string(reopened.projection_path())
+                    .unwrap()
+                    .lines()
+                    .count(),
+                usize::try_from(expected).unwrap()
+            );
+            let retry_archive = dir.join("archive/retry.jsonl");
+            if crash == CrashPoint::BeforeRetentionCommit {
+                assert!(matches!(
+                    reopened.apply_retention(
+                        100,
+                        100,
+                        1_048_576,
+                        &plan.plan_id,
+                        &archive,
+                    ),
+                    Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+                ));
+                assert_eq!(reopened.record_count().unwrap(), 1);
+                reopened
+                    .apply_retention(100, 100, 1_048_576, &plan.plan_id, &retry_archive)
+                    .unwrap();
+                assert_eq!(reopened.record_count().unwrap(), 0);
+                assert!(retry_archive.is_file());
+            } else {
+                let retried = reopened
+                    .apply_retention(100, 100, 1_048_576, &plan.plan_id, &archive)
+                    .unwrap();
+                assert_eq!(retried.plan, plan);
+                assert_eq!(retried.archive_path.as_deref(), Some(archive.as_path()));
+                assert!(!retry_archive.exists());
+                let compacted: bool = reopened
+                    .db
+                    .query_row(
+                        "SELECT compacted FROM retention_receipts WHERE plan_id=?1",
+                        [&plan.plan_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(compacted);
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_receipt_recovery_rejects_a_corrupted_archive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("retention-corrupt-recovery");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        let plan = store.retention_plan(100, 100, 1_048_576).unwrap();
+        let archive = dir.join("archive/expired.jsonl");
+        assert!(matches!(
+            store.apply_retention_at(
+                100,
+                100,
+                1_048_576,
+                &plan.plan_id,
+                &archive,
+                Some(CrashPoint::AfterRetentionCommit),
+            ),
+            Err(StoreError::Crash(CrashPoint::AfterRetentionCommit))
+        ));
+        let original = fs::read_to_string(&archive).unwrap();
+        let mut lines = original.lines().map(str::to_owned).collect::<Vec<String>>();
+        let mut record: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        record["record"]["name"] = serde_json::Value::String("xession".into());
+        lines[1] = serde_json::to_string(&record).unwrap();
+        let mut record_hash = Sha256::new();
+        record_hash.update(lines[1].as_bytes());
+        record_hash.update(b"\n");
+        let mut footer: serde_json::Value = serde_json::from_str(&lines[2]).unwrap();
+        footer["records_sha256"] = serde_json::Value::String(hex_digest(record_hash.finalize()));
+        lines[2] = serde_json::to_string(&footer).unwrap();
+        let substituted = format!("{}\n", lines.join("\n"));
+        assert_eq!(substituted.len(), original.len());
+        fs::write(&archive, substituted).unwrap();
+        fs::set_permissions(&archive, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(store);
+
+        let reopened = LocalStore::open(&dir).unwrap();
+        assert!(matches!(
+            reopened.apply_retention(100, 100, 1_048_576, &plan.plan_id, &archive),
+            Err(StoreError::SchemaMismatch)
+        ));
+        assert_eq!(reopened.record_count().unwrap(), 0);
+        assert!(
+            !reopened
+                .db
+                .query_row(
+                    "SELECT compacted FROM retention_receipts WHERE plan_id=?1",
+                    [&plan.plan_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_vacuum_reclaims_database_bytes() {
+        let dir = temp_dir("retention-reclaims-bytes");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        for index in 0..256_u16 {
+            let cursor = (u32::from(index) + 1).to_string();
+            let previous = (index > 0).then(|| u32::from(index).to_string());
+            let mut item =
+                observation_after(&cursor, previous.as_deref(), &format!("span-{index}"), None);
+            item.trace_id = TraceId::parse(format!("trace-{index}")).unwrap();
+            store.ingest_deferred_projection(&item).unwrap();
+        }
+        store.rebuild_projection().unwrap();
+        let before = fs::metadata(store.database_path()).unwrap().len();
+        let plan = store.retention_plan(100, 1_000, 10_485_760).unwrap();
+        assert_eq!(plan.traces, 256);
+        let archive = dir.join("archive/all.jsonl");
+        store
+            .apply_retention(100, 1_000, 10_485_760, &plan.plan_id, &archive)
+            .unwrap();
+        let after = fs::metadata(store.database_path()).unwrap().len();
+        assert!(after < before, "before={before}, after={after}");
+        assert_eq!(store.record_count().unwrap(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expired_span_replay_guards_keep_only_the_newest_bounded_horizon() {
+        let dir = temp_dir("retention-guard-bound");
+        let _ = fs::remove_dir_all(&dir);
+        let store = LocalStore::open(&dir).unwrap();
+        let tx = Transaction::new_unchecked(&store.db, TransactionBehavior::Immediate).unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO expired_span_states(span_id, canonical_state_hash) VALUES (?1, ?2)",
+                )
+                .unwrap();
+            for index in 0..=MAX_EXPIRED_SPAN_GUARDS {
+                insert
+                    .execute(params![format!("span-{index}"), format!("hash-{index}")])
+                    .unwrap();
+            }
+        }
+        prune_expired_span_guards(&tx).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            count(&store.db, "expired_span_states").unwrap(),
+            MAX_EXPIRED_SPAN_GUARDS
+        );
+        assert!(
+            store
+                .db
+                .query_row(
+                    "SELECT 1 FROM expired_span_states WHERE span_id='span-0'",
+                    [],
+                    |_| Ok(())
+                )
+                .optional()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .db
+                .query_row(
+                    "SELECT 1 FROM expired_span_states WHERE span_id=?1",
+                    [format!("span-{MAX_EXPIRED_SPAN_GUARDS}")],
+                    |_| Ok(())
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disposition_and_completed_receipt_ledgers_keep_only_the_newest_bounds() {
+        let dir = temp_dir("bounded-ledgers");
+        let _ = fs::remove_dir_all(&dir);
+        let store = LocalStore::open(&dir).unwrap();
+        let tx = Transaction::new_unchecked(&store.db, TransactionBehavior::Immediate).unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO adapter_dispositions(source,generation,cursor,disposition,code,payload_hash) VALUES ('codex','generation',?1,'diagnostic','unsupported_event','hash')",
+                )
+                .unwrap();
+            for index in 0..=MAX_ADAPTER_DISPOSITIONS {
+                insert.execute([format!("cursor-{index}")]).unwrap();
+            }
+        }
+        prune_adapter_dispositions(&tx).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            count(&store.db, "adapter_dispositions").unwrap(),
+            MAX_ADAPTER_DISPOSITIONS
+        );
+        assert!(
+            !store
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM adapter_dispositions WHERE cursor='cursor-0')",
+                    [],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+
+        let tx = Transaction::new_unchecked(&store.db, TransactionBehavior::Immediate).unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO retention_receipts(plan_id,cutoff_unix_ms,traces,observations,records,archive_bytes,truncated,archive_path_hash,archive_sha256,compacted) VALUES (?1,'00000000000000000000',1,1,1,1,0,'path','archive',1)",
+                )
+                .unwrap();
+            for index in 0..=MAX_RETENTION_RECEIPTS {
+                insert.execute([format!("plan-{index}")]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        store
+            .finish_retention_receipt(&RetentionReceipt {
+                plan: RetentionPlan {
+                    plan_id: format!("plan-{MAX_RETENTION_RECEIPTS}"),
+                    cutoff_unix_ms: 0,
+                    traces: 1,
+                    observations: 1,
+                    records: 1,
+                    archive_bytes: 1,
+                    truncated: false,
+                },
+                archive_path: PathBuf::from("unused"),
+                archive_sha256: "unused".into(),
+                compacted: true,
+            })
+            .unwrap();
+        assert_eq!(
+            count(&store.db, "retention_receipts").unwrap(),
+            MAX_RETENTION_RECEIPTS
+        );
+        assert!(
+            !store
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM retention_receipts WHERE plan_id='plan-0')",
+                    [],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2602,6 +4793,23 @@ mod tests {
                 .count(),
             MAX_STALE_PROJECTION_TEMPS + 1
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_projection_temp_cleanup_bounds_total_directory_traversal() {
+        let dir = temp_dir("temp-directory-bound");
+        let _ = fs::remove_dir_all(&dir);
+        let store = LocalStore::open(&dir).unwrap();
+        drop(store);
+        for index in 0..MAX_PRIVATE_DIRECTORY_ENTRIES {
+            drop(private_create_new(&dir.join(format!("unrelated-{index}"))).unwrap());
+        }
+        assert!(matches!(
+            remove_stale_projection_temps(&dir),
+            Err(StoreError::SchemaMismatch)
+        ));
+        assert!(dir.join("unrelated-0").is_file());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2644,7 +4852,7 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let mut reopened = LocalStore::open(&dir).unwrap();
+        let mut reopened = LocalStore::open_with_migration_headroom(&dir, u64::MAX).unwrap();
         let mut update = observation_after("2", Some("1"), "compaction", None);
         update.event = ObservationEvent::Compaction {
             trigger: Some("auto".into()),
