@@ -266,6 +266,13 @@ export function reportDocumentTemplate() {
       white-space: nowrap;
     }
 
+    .timeline-details {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex: 0 0 auto;
+    }
+
     .timeline-track {
       position: relative;
       height: 12px;

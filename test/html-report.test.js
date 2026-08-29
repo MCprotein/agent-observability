@@ -256,6 +256,7 @@ test("bounds rendered rows for a 4096-span local report", () => {
   dom.element("trace-list").children[0].listeners.click();
   assert.equal(dom.element("timeline-list").children.length, 120);
   assert.equal(dom.element("timeline-status").textContent, "Showing first 120 of 200 spans.");
+  assert.equal(dom.element("timeline-list").innerHTML.includes("timeline-span-status error\">error"), true);
 });
 
 test("renders legacy v1 report data without additive agent and model filters", () => {

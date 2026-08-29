@@ -252,7 +252,9 @@ function mount(data: AgentObservabilityReportV1): void {
       row.className = "timeline-row";
       row.innerHTML =
         `<div class="timeline-label"><span>${escapeHtml(item.span.name)}</span>` +
-        `<span class="mono">${escapeHtml(formatDuration(item.span.metrics.latencyMs ?? item.span.metrics.durationMs))}</span></div>` +
+        `<span class="timeline-details"><span class="badge timeline-span-status ${statusClass(item.span.status)}">` +
+        `${escapeHtml(item.span.status)}</span><span class="mono">` +
+        `${escapeHtml(formatDuration(item.span.metrics.latencyMs ?? item.span.metrics.durationMs))}</span></span></div>` +
         `<div class="timeline-track"><span class="timeline-bar ${statusClass(item.span.status)}" ` +
         `style="left:${item.leftPercent.toFixed(3)}%;width:${item.widthPercent.toFixed(3)}%"></span></div>`;
       return row;
