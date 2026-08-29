@@ -84,15 +84,27 @@ gate를 통과해 추가한다.
 
 - `main` is the stable line. It should only receive verified version work.
 - Each planned version starts from current `main` on `release/vX.Y.Z`.
+- Push the release branch to `origin`, then open a draft pull request early and
+  keep its scope, completed evidence, and remaining gates current while the
+  version is in progress.
 - Use focused `feat/vX.Y.Z/<topic>` branches only when a version is too large to
   keep reviewable on one release branch.
 - Do not skip the active train. Finish or explicitly mark the current version
   `Blocked` / `Superseded` before starting the next one.
 - Merge a release branch to `main` only after the version scope, tests, docs,
-  privacy checks, and review evidence are complete.
+  privacy checks, performance gates, and role-separated independent review evidence
+  are complete. A role-separated subagent review can provide that independent evidence.
+  Review evidence records the reviewer role, reviewed commit SHA, verdict, and resolved
+  blocking findings. An incomplete gate keeps the PR in draft.
+- Confirm the resulting commit on `main`, switch to and update local `main`, then
+  delete the merged release branch locally and remotely. Start the next version
+  on a new branch from the updated `main`; preserve a merged branch only when its
+  PR records a concrete reason and removal condition.
 - Tagging/publishing rules can be added when the project has an actual package
-  distribution path; until then, the merge commit plus roadmap status is the
-  release record.
+  distribution path; until then, the merged PR, its resulting commit SHA, and
+  roadmap status are the release record.
+
+The contributor-facing procedure is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Future TODO
 
@@ -121,7 +133,11 @@ Team 항목은 collector endpoint 하나로 완료되지 않는다. `docs/TEAM_A
 5. README와 ROADMAP의 상태를 같이 갱신한다.
 6. 독립 리뷰 또는 동등한 검증을 받고 blocking finding을 해결한다.
 7. 커밋 전에 금지된 외부 backend/vendor 참조가 들어오지 않았는지 검색한다.
-8. 완료 evidence가 모이면 상태를 `Released`로 바꾼다.
+8. 완료 evidence가 모이고 PR이 mergeable이면 병합 직전에 상태를 `Released`로 바꾼다.
+   병합이 완료되지 않으면 상태를 되돌린다.
+9. release PR을 `main`에 병합하고 resulting commit SHA와 PR 상태를 확인한다.
+10. local `main`을 갱신한 뒤 병합된 branch를 local/remote에서 삭제한다.
+11. 다음 버전은 갱신된 `main`에서 새 release branch로 시작한다.
 
 ## Non-Skippable Gates
 
