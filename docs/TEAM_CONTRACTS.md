@@ -117,10 +117,11 @@ budgets and load-shedding order in `TEAM_ARCHITECTURE.md`.
 
 Hook ingress reads at most 1 MiB and emits an allowlisted local message of at most 64 KiB. It never persists raw
 overflow bytes. Local channel capacity and normalization worker count are implementation constants recorded in
-the evidence manifest, not unbounded/user-controlled values. Full-channel and daemon-unavailable outcomes return
+the evidence manifest, not unbounded/user-controlled values. Full-channel and receiver-unavailable outcomes return
 without waiting for network or drain and expose only bounded counters/reason codes. The v0.13 gate compares a
 deterministic three-source fixture host plus the real bounded ingress and durable drain against a
-collection-disabled fixture-host baseline. Daemon-only measurements and hard-coded metrics do not satisfy the
+collection-disabled fixture-host baseline. A future resident daemon or IPC receiver is team-profile scope;
+resident-daemon-only measurements and hard-coded metrics do not satisfy the
 gate. Product-process compatibility remains a separate adapter capability fixture because external process
 versions and background activity are not a reproducible performance baseline.
 
@@ -146,7 +147,7 @@ deterministic-clock fixture.
 burst, one-second sampler, CPU normalization, machine/OS/filesystem/power metadata, cold/warm cache, three-adapter
 schedule and threshold calculation. The xtask command emits
 `docs/evidence/local/performance/<run>/manifest.yaml` and exits non-zero on any budget breach. No v0.13/v1.0
-release can pass with a missing manifest or a daemon-only sample. The enabled burst records attempted,
+release can pass with a missing manifest or a resident-daemon-only sample. The enabled burst records attempted,
 enqueued, rejected and durable counts, permits at most 1% explicit fail-open rejection, and requires
 enqueued and durable counts to match after graceful fixture shutdown. Enqueue is not a foreground
 durability guarantee.

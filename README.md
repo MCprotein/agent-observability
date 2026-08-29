@@ -7,7 +7,7 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 release train은 `v0.13.0` local-only release candidate다. JavaScript migration baseline 위에
+현재 release train은 `v0.13.0` local-only release candidate까지 검증을 완료했다. JavaScript migration baseline 위에
 experimental Rust Codex, Claude Code, Cursor adapter, strict TypeScript static report UI, private
 install/config 경계, bounded local runtime policy와 성능 검증 harness를 제공한다. Rust 경로는 bounded
 canonical handoff JSONL을 private local state에 저장한다. Native OTel endpoint와 Rust HTML artifact
@@ -40,8 +40,8 @@ Rust workspace는 다음 책임으로 분리된다.
 목표 기술 스택은 다음과 같다.
 
 현재 JavaScript adapter는 전체 JSONL parsing과 순차 append를 포함하므로 foreground hook 성능
-sign-off 대상이 아니다. Rust release profile의 normative 성능 evidence가 통과하기 전에는 사용자
-기기 성능 보호가 release 완료되었다고 표시하지 않는다.
+sign-off 대상이 아니다. Rust release profile은 bounded foreground handoff, queue reconciliation,
+CPU/RSS/disk/network 예산을 포함한 normative 성능 evidence를 통과했다.
 
 - web UI: TypeScript
 - domain, application, agent adapters, storage, export, CLI, optional collector/query API: Rust
@@ -91,8 +91,9 @@ cargo run -p xtask -- perf local --profile smoke --check
 ```
 
 `v0.12.0` TypeScript static report UI는 schema/type generation, fail-closed validation, fixed local
-scope, filter reduction parity, pinned browser smoke와 독립 review gate를 완료했다. v0.13 runtime
-계약과 운영 방법은 [docs/LOCAL_RUNTIME.md](docs/LOCAL_RUNTIME.md)를 따른다.
+scope, filter reduction parity, pinned browser smoke와 독립 review gate를 완료했다. `v0.13.0`
+local runtime도 normative 성능 evidence와 독립 review gate를 완료했다. runtime 계약과 운영 방법은
+[docs/LOCAL_RUNTIME.md](docs/LOCAL_RUNTIME.md)를 따른다.
 
 ## 아키텍처 요약
 
@@ -109,7 +110,7 @@ Codex / Claude Code
              |-> local JSONL -> JS report projection -> self-contained HTML
              `-> redacted JSON snapshot
 
-CURRENT v0.13 - RELEASE CANDIDATE (Rust local runtime + TypeScript static UI)
+CURRENT v0.13 - VERIFIED RELEASE CANDIDATE (Rust local runtime + TypeScript static UI)
 
 Closed schemas + manifest -> deterministic domain reducer + fail-closed projectors
 Codex OTel/notify, Claude Code OTel/hook, or Cursor Hook v1 canonical handoff -> bounded Rust adapters
@@ -140,9 +141,10 @@ Agent logs/hooks for Codex, Claude Code, and Cursor
              `-> fail-closed diagnostic contract -> diagnostics
 ```
 
-TypeScript UI는 원본 agent payload나 JSONL을 직접 읽지 않는다. Rust가 생성한 versioned
-`ReportDtoVx`와 빌드된 UI asset을 Rust outbound infrastructure가 하나의 HTML artifact로
-조립한다. export나 선택적 collector도 각 sink 전용 fail-closed contract 뒤에만 추가한다.
+TypeScript UI는 원본 agent payload나 JSONL을 직접 읽지 않는다. 현재 static report는 JavaScript
+migration baseline이 self-contained HTML을 조립한다. 목표 Rust outbound infrastructure는 Rust가
+생성한 versioned `ReportDtoVx`와 빌드된 UI asset을 하나의 HTML artifact로 조립한다. export나
+선택적 collector도 각 sink 전용 fail-closed contract 뒤에만 추가한다.
 
 ### 사용 프로필
 
@@ -762,9 +764,10 @@ redaction 단계:
 4. 길이 제한
 5. hash/size metadata만 남기는 fallback
 
-현재 v0.6.1은 content omission, 민감 key/path, secret pattern 치환과 unknown metadata 거부까지
-구현한다. 길이 제한, hash/size fallback, project opt-out, collector 인증은 이후 local release 또는
-Future TODO의 검증 대상이다.
+v0.6.1은 content omission, 민감 key/path, secret pattern 치환과 unknown metadata 거부를 구현했다.
+v0.13.0 Rust runtime은 handoff file, line, raw/projected message, batch와 storage capacity 길이 제한을
+추가했다. Content hash/size fallback과 project opt-out은 이후 local release, collector 인증은 Future
+TODO의 검증 대상이다.
 
 ## 저장과 조회
 
