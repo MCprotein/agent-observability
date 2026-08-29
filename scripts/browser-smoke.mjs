@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { chromium } from "playwright-core";
+import { createSpanRecord, renderStaticHtmlReport } from "../src/index.js";
 
 const execute = promisify(execFile);
 
@@ -61,16 +62,19 @@ try {
     const page = await browser.newPage({ viewport: testCase.viewport });
     const consoleErrors = [];
     const externalRequests = [];
+    const failedRequests = [];
     page.on("console", (message) => {
       if (message.type() === "error") consoleErrors.push(message.text());
     });
     page.on("request", (request) => {
       if (!request.url().startsWith("file://")) externalRequests.push(request.url());
     });
+    page.on("requestfailed", (request) => failedRequests.push(request.url()));
     await page.goto(pathToFileURL(reportPath).href);
 
     assert.equal(await page.locator("h1").textContent(), "Agent Observability Report");
-    assert.equal(await page.locator("h2").count(), 2);
+    assert.equal(await page.locator("h2").count(), 3);
+    assert.equal(await page.locator('[aria-labelledby="timeline-heading"]').count(), 1);
     assert.equal(await page.locator('[aria-labelledby="traces-heading"]').count(), 1);
     assert.equal(await page.locator('[aria-labelledby="spans-heading"]').count(), 1);
     assert.equal(
@@ -82,8 +86,25 @@ try {
     assert.equal(await page.evaluate(() => document.activeElement?.id), "repo-filter");
     await page.locator("#model-filter").selectOption({ label: "gpt-test" });
     assert.match(await page.locator("#filter-status").textContent(), /^[1-9]\d* spans match the active filters\.$/);
+    assert.equal(await page.locator("#span-table tr").count() <= 200, true);
+    await page.locator("#save-filter").click();
+    assert.equal(await page.locator("#saved-filter option").count(), 2);
+    const storedView = await page.evaluate(() =>
+      localStorage.getItem("agent-observability.report.v1.saved-filters"),
+    );
+    assert.deepEqual(JSON.parse(storedView), {
+      version: 1,
+      filters: [{ model: "gpt-test" }],
+    });
+    await page.reload();
+    assert.equal(await page.locator("#saved-filter option").count(), 2);
+    await page.locator("#saved-filter").selectOption("0");
+    assert.equal(await page.locator("#model-filter option:checked").textContent(), "gpt-test");
+    await page.locator("#delete-filter").click();
+    assert.equal(await page.locator("#saved-filter option").count(), 1);
     await page.locator(".trace-row:visible").first().click();
     assert.equal(await page.locator(".trace-row:visible").first().getAttribute("aria-pressed"), "true");
+    assert.equal(await page.locator(".timeline-row").count() > 0, true);
 
     if (testCase.name === "mobile") {
       const heights = await page.locator("select, input, button").evaluateAll((elements) =>
@@ -97,9 +118,37 @@ try {
     assert.equal((await stat(screenshotPath)).size > 0, true);
     assert.deepEqual(consoleErrors, []);
     assert.deepEqual(externalRequests, []);
+    assert.deepEqual(failedRequests, []);
     results.push({ name: testCase.name, overflow: false, consoleErrors: 0, externalRequests: 0 });
     await page.close();
   }
+  const largeReportPath = join(directory, "large-report.html");
+  await writeFile(largeReportPath, renderStaticHtmlReport(largeReportFixture(), {
+    generated_at: "2026-07-10T00:00:00.000Z",
+  }), { mode: 0o600 });
+  const largePage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const largeConsoleErrors = [];
+  const largeExternalRequests = [];
+  const largeFailedRequests = [];
+  largePage.on("console", (message) => {
+    if (message.type() === "error") largeConsoleErrors.push(message.text());
+  });
+  largePage.on("request", (request) => {
+    if (!request.url().startsWith("file://")) largeExternalRequests.push(request.url());
+  });
+  largePage.on("requestfailed", (request) => largeFailedRequests.push(request.url()));
+  await largePage.goto(pathToFileURL(largeReportPath).href);
+  assert.equal(await largePage.locator("#span-count").textContent(), "4096");
+  assert.equal(await largePage.locator("#span-table tr").count(), 200);
+  assert.equal(await largePage.locator("#trace-list .trace-row").count(), 100);
+  assert.equal(await largePage.locator("#session-filter option").count(), 502);
+  await largePage.locator("#trace-list .trace-row").first().click();
+  assert.equal(await largePage.locator(".timeline-row").count(), 120);
+  assert.deepEqual(largeConsoleErrors, []);
+  assert.deepEqual(largeExternalRequests, []);
+  assert.deepEqual(largeFailedRequests, []);
+  results.push({ name: "large", spans: 4_096, traceRows: 100, spanRows: 200, timelineRows: 120 });
+  await largePage.close();
   console.log(JSON.stringify({ executablePath, results }));
 } finally {
   await browser.close();
@@ -124,4 +173,20 @@ function rateTable() {
       "cursor-test": { input_tokens: 2, output_tokens: 8 },
     },
   };
+}
+
+function largeReportFixture() {
+  return Array.from({ length: 4_096 }, (_, index) => createSpanRecord({
+    trace_id: index < 200 ? "trace-large-0" : `trace-large-${1 + (index % 255)}`,
+    span_id: `span-large-${index}`,
+    span_kind: "tool.execution",
+    name: `operation-${index}`,
+    status: index % 31 === 0 ? "error" : "ok",
+    start_time_unix_ms: 1_000 + index * 10,
+    end_time_unix_ms: 1_005 + index * 10,
+    agent: { name: "codex", model: index % 2 === 0 ? "gpt-test" : "other-model" },
+    project: { name: "agent-observability" },
+    attributes: { session_id: `session-${index}`, tool_name: "exec_command" },
+    metrics: { duration_ms: 5 },
+  }));
 }

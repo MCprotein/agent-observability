@@ -215,6 +215,49 @@ test("writes an HTML report file and executes the inline renderer", async () => 
   assert.equal(dom.element("clear-filters").disabled, true);
 });
 
+test("bounds rendered rows for a 4096-span local report", () => {
+  const records = Array.from({ length: 4_096 }, (_, index) => createSpanRecord({
+    trace_id: index < 200 ? "trace-large-0" : `trace-large-${1 + (index % 255)}`,
+    span_id: `span-large-${index}`,
+    span_kind: "tool.execution",
+    name: `operation-${index}`,
+    status: index % 31 === 0 ? "error" : "ok",
+    start_time_unix_ms: 1_000 + index * 10,
+    end_time_unix_ms: 1_005 + index * 10,
+    agent: { name: "codex", model: index % 2 === 0 ? "gpt-test" : "other-model" },
+    project: { name: "agent-observability" },
+    attributes: { session_id: `session-${index}`, tool_name: "exec_command" },
+    metrics: { duration_ms: 5 },
+  }));
+  const html = renderStaticHtmlReport(records, {
+    generated_at: "2026-07-10T00:00:00.000Z",
+    rate_table: reportRateTable(),
+  });
+  const dom = createReportDom(extractReportDataJson(html));
+
+  new Script(extractRendererScript(html)).runInContext(createContext({ document: dom.document }));
+
+  assert.equal(dom.element("span-count").textContent, "4096");
+  assert.equal(dom.element("kpi-sessions").textContent, "4,096");
+  assert.equal(dom.element("kpi-tools").textContent, "4,096");
+  assert.equal(dom.element("kpi-errors").textContent, "133");
+  assert.equal(dom.element("span-table").children.length, 200);
+  assert.equal(dom.element("span-page-status").textContent, "1-200 of 4096");
+  assert.equal(dom.element("trace-list").children.length, 100);
+  assert.equal(dom.element("trace-page-status").textContent, "1-100 of 256");
+  assert.equal(dom.element("session-filter").children.length, 502);
+  assert.equal(dom.element("session-filter").children.at(-1).disabled, true);
+  dom.element("span-next").listeners.click();
+  assert.equal(dom.element("span-page-status").textContent, "201-400 of 4096");
+  assert.equal(dom.element("span-table").children.length, 200);
+  dom.element("trace-next").listeners.click();
+  assert.equal(dom.element("trace-page-status").textContent, "101-200 of 256");
+  dom.element("trace-previous").listeners.click();
+  dom.element("trace-list").children[0].listeners.click();
+  assert.equal(dom.element("timeline-list").children.length, 120);
+  assert.equal(dom.element("timeline-status").textContent, "Showing first 120 of 200 spans.");
+});
+
 test("renders legacy v1 report data without additive agent and model filters", () => {
   const html = renderStaticHtmlReport(reportFixture(), {
     generated_at: "2026-07-10T00:00:00.000Z",
@@ -381,12 +424,23 @@ function createReportDom(reportDataJson) {
     "agent-filter",
     "model-filter",
     "text-filter",
+    "saved-filter",
+    "save-filter",
+    "delete-filter",
     "clear-filters",
     "filter-status",
     "trace-list",
     "span-table",
     "trace-count",
     "span-count",
+    "timeline-list",
+    "timeline-status",
+    "trace-previous",
+    "trace-next",
+    "trace-page-status",
+    "span-previous",
+    "span-next",
+    "span-page-status",
     "kpi-sessions",
     "kpi-turns",
     "kpi-llm",
@@ -429,7 +483,8 @@ function tagNameForId(id) {
   if (id === "text-filter") {
     return "input";
   }
-  if (id === "clear-filters") {
+  if (id === "clear-filters" || id === "save-filter" || id === "delete-filter"
+    || id.endsWith("-previous") || id.endsWith("-next")) {
     return "button";
   }
   if (id === "span-table") {

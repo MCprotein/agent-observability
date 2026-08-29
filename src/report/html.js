@@ -196,9 +196,21 @@ export function reportDocumentTemplate() {
     .control-actions {
       display: grid;
       grid-column: 1 / -1;
-      grid-template-columns: minmax(120px, 180px) minmax(0, 1fr);
+      grid-template-columns: minmax(120px, 180px) minmax(0, 1fr) minmax(260px, 420px);
       gap: 12px;
       align-items: center;
+    }
+
+    .saved-controls {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 8px;
+    }
+
+    .saved-controls button,
+    .pager button {
+      width: auto;
+      min-width: 38px;
     }
 
     .filter-status { color: var(--muted); font-size: 12px; }
@@ -220,6 +232,60 @@ export function reportDocumentTemplate() {
       gap: 16px;
       align-items: start;
     }
+
+    .timeline-panel {
+      margin-bottom: 16px;
+    }
+
+    .timeline-list {
+      display: grid;
+      max-height: 320px;
+      overflow: auto;
+      padding: 6px 12px 12px;
+    }
+
+    .timeline-row {
+      display: grid;
+      grid-template-columns: minmax(160px, 280px) minmax(240px, 1fr);
+      gap: 12px;
+      align-items: center;
+      min-height: 34px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .timeline-label {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .timeline-label > :first-child {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .timeline-track {
+      position: relative;
+      height: 12px;
+      border-radius: 3px;
+      background: var(--surface-strong);
+      overflow: hidden;
+    }
+
+    .timeline-bar {
+      position: absolute;
+      top: 2px;
+      height: 8px;
+      min-width: 2px;
+      border-radius: 2px;
+      background: var(--muted);
+    }
+
+    .timeline-bar.ok { background: var(--ok); }
+    .timeline-bar.error { background: var(--error); }
+    .timeline-bar.warning { background: var(--warning); }
 
     .panel {
       border: 1px solid var(--line);
@@ -303,6 +369,18 @@ export function reportDocumentTemplate() {
       max-height: 650px;
     }
 
+    .pager {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      min-height: 46px;
+      padding: 6px 10px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
     table {
       width: 100%;
       border-collapse: collapse;
@@ -346,6 +424,8 @@ export function reportDocumentTemplate() {
       .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .layout { grid-template-columns: 1fr; }
+      .control-actions { grid-template-columns: minmax(120px, 180px) minmax(0, 1fr); }
+      .saved-controls { grid-column: 1 / -1; }
     }
 
     @media (max-width: 560px) {
@@ -354,6 +434,9 @@ export function reportDocumentTemplate() {
       .timestamp { white-space: normal; }
       .kpis,
       .controls { grid-template-columns: 1fr; }
+      .control-actions,
+      .saved-controls { grid-template-columns: 1fr; }
+      .timeline-row { grid-template-columns: 1fr; padding: 8px 0; }
       select,
       input,
       button { min-height: 44px; }
@@ -388,8 +471,22 @@ export function reportDocumentTemplate() {
       <div class="control-actions">
         <button id="clear-filters" type="button" disabled>Clear filters</button>
         <span class="filter-status" id="filter-status" aria-live="polite"></span>
+        <div class="saved-controls">
+          <label class="sr-only" for="saved-filter">Saved views</label>
+          <select id="saved-filter" aria-label="Saved views"></select>
+          <button id="save-filter" type="button">Save view</button>
+          <button id="delete-filter" type="button" aria-label="Delete saved view" title="Delete saved view" disabled>&times;</button>
+        </div>
       </div>
     </fieldset>
+
+    <section class="panel timeline-panel" aria-labelledby="timeline-heading">
+      <h2 class="panel-title" id="timeline-heading">
+        <span>Timeline</span>
+        <span class="filter-status" id="timeline-status">0 spans.</span>
+      </h2>
+      <div class="timeline-list" id="timeline-list"></div>
+    </section>
 
     <section class="layout">
       <aside class="panel" aria-labelledby="traces-heading">
@@ -398,6 +495,11 @@ export function reportDocumentTemplate() {
           <span class="badge" id="trace-count">0</span>
         </h2>
         <div class="trace-list" id="trace-list"></div>
+        <div class="pager" aria-label="Trace pages">
+          <button id="trace-previous" type="button" aria-label="Previous trace page" title="Previous trace page">&#8249;</button>
+          <span id="trace-page-status">0 of 0</span>
+          <button id="trace-next" type="button" aria-label="Next trace page" title="Next trace page">&#8250;</button>
+        </div>
       </aside>
       <section class="panel" aria-labelledby="spans-heading">
         <h2 class="panel-title" id="spans-heading">
@@ -422,6 +524,11 @@ export function reportDocumentTemplate() {
             </thead>
             <tbody id="span-table"></tbody>
           </table>
+        </div>
+        <div class="pager" aria-label="Span pages">
+          <button id="span-previous" type="button" aria-label="Previous span page" title="Previous span page">&#8249;</button>
+          <span id="span-page-status">0 of 0</span>
+          <button id="span-next" type="button" aria-label="Next span page" title="Next span page">&#8250;</button>
         </div>
       </section>
     </section>
