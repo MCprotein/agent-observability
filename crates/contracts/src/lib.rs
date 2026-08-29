@@ -12,6 +12,7 @@ pub const CONTRACT_MANIFEST: &str = include_str!("../../../contracts/contract-ma
 pub const DURABLE_RECORD_SCHEMA: &str =
     include_str!("../../../contracts/durable-record-v1.schema.json");
 pub const REPORT_DTO_SCHEMA: &str = include_str!("../../../contracts/report-dto-v1.schema.json");
+pub const RATE_TABLE_SCHEMA: &str = include_str!("../../../contracts/rate-table-v1.schema.json");
 pub const ADAPTER_CAPABILITY_V1: &str = include_str!("../capabilities/adapter-capability-v1.yaml");
 pub const DURABLE_RECORD_VERSION: &str = "agent_observability.v1";
 pub const REPORT_DTO_VERSION: &str = "agent_observability.report.v1";
@@ -1491,8 +1492,10 @@ impl ContractManifest {
     pub fn validate_release_boundary(&self) -> Result<(), ContractError> {
         self.expect("durable_record", DURABLE_RECORD_VERSION)?;
         self.expect("report_dto", REPORT_DTO_VERSION)?;
+        self.expect("rate_table", "agent_observability.rate_table.v1")?;
         self.expect("durable_schema", "contracts/durable-record-v1.schema.json")?;
         self.expect("report_schema", "contracts/report-dto-v1.schema.json")?;
+        self.expect("rate_table_schema", "contracts/rate-table-v1.schema.json")?;
         self.expect("team_ingest", "disabled")?;
         Ok(())
     }
@@ -1582,7 +1585,7 @@ impl Error for ContractError {}
 mod tests {
     use super::{
         ADAPTER_CAPABILITY_V1, AdapterCapabilityManifestV1, CONTRACT_MANIFEST, ContractManifest,
-        DURABLE_RECORD_SCHEMA, REPORT_DTO_SCHEMA, redact_sensitive_text,
+        DURABLE_RECORD_SCHEMA, RATE_TABLE_SCHEMA, REPORT_DTO_SCHEMA, redact_sensitive_text,
     };
 
     #[test]
@@ -1591,7 +1594,7 @@ mod tests {
         manifest
             .validate_release_boundary()
             .expect("release boundary matches");
-        for schema in [DURABLE_RECORD_SCHEMA, REPORT_DTO_SCHEMA] {
+        for schema in [DURABLE_RECORD_SCHEMA, REPORT_DTO_SCHEMA, RATE_TABLE_SCHEMA] {
             assert!(schema.contains("\"additionalProperties\": false"));
         }
     }

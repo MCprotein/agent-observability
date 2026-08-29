@@ -384,6 +384,38 @@ fn parity_rejects_unsupported_units_and_rates() {
 }
 
 #[test]
+fn rate_table_document_is_versioned_closed_and_normalized() {
+    let rates = parse_rate_table_json(
+        r#"{
+          "schema_version":"agent_observability.rate_table.v1",
+          "version":"stable-test",
+          "currency":"USD",
+          "unit":"per_1m_tokens",
+          "assumption":"Fixture rates only.",
+          "models":{"gpt-test":{"input_tokens":2,"output_tokens":8}}
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(rates.version, "stable-test");
+    assert_eq!(rates.models["gpt-test"].input_tokens, Some(2.0));
+
+    assert_eq!(
+        parse_rate_table_json(
+            r#"{"schema_version":"agent_observability.rate_table.v2","models":{}}"#
+        )
+        .unwrap_err(),
+        PricingError::UnsupportedVersion
+    );
+    assert_eq!(
+        parse_rate_table_json(
+            r#"{"schema_version":"agent_observability.rate_table.v1","models":{},"extra":true}"#
+        )
+        .unwrap_err(),
+        PricingError::InvalidDocument
+    );
+}
+
+#[test]
 fn absent_overlap_semantics_are_incomplete() {
     let mut rates = table();
     rates

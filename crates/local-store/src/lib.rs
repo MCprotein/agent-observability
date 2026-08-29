@@ -679,6 +679,28 @@ impl LocalStore {
             count(&self.db, "delivery_outcomes")?,
         ))
     }
+
+    /// Reads one consistent, ordered snapshot of current reduced durable records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the authoritative transaction cannot be read or a stored record
+    /// no longer satisfies its typed JSON contract.
+    pub fn current_records(&self) -> Result<Vec<DurableRecordV1>, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)?;
+        let records = {
+            let mut statement =
+                tx.prepare("SELECT record_json FROM records ORDER BY commit_seq")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.map(|row| {
+                let json = row?;
+                serde_json::from_str(&json).map_err(StoreError::Json)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        tx.commit()?;
+        Ok(records)
+    }
 }
 
 fn map_reduction_error(error: agent_observability_domain::DomainError) -> StoreError {
@@ -2779,6 +2801,27 @@ mod tests {
                 "projection leaked {sentinel}"
             );
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_records_reads_an_ordered_typed_snapshot_from_authority() {
+        let dir = temp_dir("current-records");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        store
+            .ingest(&observation_after("2", Some("1"), "turn", Some("session")))
+            .unwrap();
+
+        let records = store.current_records().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].span_kind, SpanKind::AgentSession);
+        assert_eq!(records[1].span_kind, SpanKind::Turn);
+        assert_eq!(
+            records[1].parent_span_id.as_deref(),
+            Some(records[0].span_id.as_str())
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

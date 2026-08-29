@@ -9,6 +9,7 @@ members = [
     "crates/domain",
     "crates/local-runtime",
     "crates/local-store",
+    "crates/static-report",
     "xtask",
 ]
 resolver = "2"

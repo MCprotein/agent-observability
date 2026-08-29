@@ -44,6 +44,7 @@ version = "0.13.0"
 dependencies = [
  "agent-observability-contracts",
  "agent-observability-domain",
+ "serde",
  "serde_json",
 ]
 
@@ -54,9 +55,11 @@ dependencies = [
  "agent-observability-adapter-claude-code",
  "agent-observability-adapter-codex",
  "agent-observability-adapter-cursor",
+ "agent-observability-application",
  "agent-observability-contracts",
  "agent-observability-local-runtime",
  "agent-observability-local-store",
+ "agent-observability-static-report",
 ]
 
 [[package]]
@@ -94,6 +97,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "agent-observability-static-report"
+version = "0.13.0"
+dependencies = [
+ "agent-observability-contracts",
+ "serde_json",
 ]
 
 [[package]]

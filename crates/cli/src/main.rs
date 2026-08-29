@@ -7,8 +7,10 @@ use agent_observability_adapter_codex::{
 use agent_observability_adapter_cursor::{
     AdapterItem as CursorAdapterItem, read_handoff_file as read_cursor_handoff_file,
 };
+use agent_observability_application::{parse_rate_table_json, project_report};
 use agent_observability_contracts::{
-    AdapterDispositionCode, AdapterDispositionKind, SourceCheckpoint, SourceObservation,
+    AdapterDispositionCode, AdapterDispositionKind, REPORT_DTO_VERSION, SourceCheckpoint,
+    SourceObservation,
 };
 use agent_observability_contracts::{CONTRACT_MANIFEST, ContractManifest};
 use agent_observability_local_runtime::{
@@ -16,11 +18,17 @@ use agent_observability_local_runtime::{
     Singleton, StorageBudget, install, load,
 };
 use agent_observability_local_store::{IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore};
+use agent_observability_static_report::write_private;
 use std::env;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "usage: agent-observability [init <root>|config-check <config-json>|runtime-check <root>|contracts|storage-check <runtime-root>|codex-ingest <runtime-root> <handoff-jsonl>|claude-code-ingest <runtime-root> <handoff-jsonl>|cursor-ingest <runtime-root> <handoff-jsonl>|version|help]";
+const USAGE: &str = "usage: agent-observability [init <root>|config-check <config-json>|runtime-check <root>|contracts|storage-check <runtime-root>|codex-ingest <runtime-root> <handoff-jsonl>|claude-code-ingest <runtime-root> <handoff-jsonl>|cursor-ingest <runtime-root> <handoff-jsonl>|report <runtime-root> [rate-table-json]|version|help]";
+const REPORT_FILE_NAME: &str = "agent-observability-report.html";
+const MAX_RATE_TABLE_BYTES: u64 = 1_048_576;
 
 enum IngestItem<'a> {
     Observation(&'a SourceObservation),
@@ -138,6 +146,10 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
                 }),
             )
         }
+        [command, root] if command == "report" => report(Path::new(root), None),
+        [command, root, rate_table] if command == "report" => {
+            report(Path::new(root), Some(Path::new(rate_table)))
+        }
         [command] if matches!(command.as_str(), "version" | "--version" | "-V") => {
             Ok(env!("CARGO_PKG_VERSION").into())
         }
@@ -146,6 +158,117 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
         [command] => Err(format!("unknown command {command}")),
         _ => Err(USAGE.into()),
     }
+}
+
+fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String> {
+    let layout = install(root).map_err(|error| error.to_string())?;
+    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let store = LocalStore::open(layout.state.join("store")).map_err(|error| error.to_string())?;
+    let records = store.current_records().map_err(|error| error.to_string())?;
+    let rate_table = rate_table_path
+        .map(read_private_rate_table)
+        .transpose()?
+        .map(|body| parse_rate_table_json(&body).map_err(|error| error.to_string()))
+        .transpose()?;
+    let report = project_report(
+        &records,
+        current_timestamp()?,
+        "Agent Observability Report",
+        rate_table.as_ref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let output_path = layout.logs.join(REPORT_FILE_NAME);
+    let bytes = write_private(&output_path, &report).map_err(|error| error.to_string())?;
+    Ok(format!(
+        "report_schema={REPORT_DTO_VERSION}\nrecords={}\ncost_status={}\nreport={}\nbytes={bytes}\nteam_ingest=disabled",
+        records.len(),
+        report.cost.status,
+        output_path.display()
+    ))
+}
+
+fn read_private_rate_table(path: &Path) -> Result<String, String> {
+    let file = open_private_read(path)?;
+    let metadata = file.metadata().map_err(|_| "rate table metadata failed")?;
+    if metadata.len() > MAX_RATE_TABLE_BYTES {
+        return Err("rate table exceeds 1 MiB".into());
+    }
+    let mut body = String::new();
+    file.take(MAX_RATE_TABLE_BYTES + 1)
+        .read_to_string(&mut body)
+        .map_err(|_| "rate table read failed")?;
+    if body.len() as u64 > MAX_RATE_TABLE_BYTES {
+        return Err("rate table exceeds 1 MiB".into());
+    }
+    Ok(body)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn open_private_read(path: &Path) -> Result<File, String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(no_follow_flag());
+    let file = options.open(path).map_err(|_| "rate table open failed")?;
+    let metadata = file.metadata().map_err(|_| "rate table metadata failed")?;
+    if !metadata.is_file() {
+        return Err("rate table must be a regular file".into());
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err("rate table permissions must be private".into());
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn open_private_read(_path: &Path) -> Result<File, String> {
+    Err("private rate tables are unsupported on this platform".into())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const fn no_follow_flag() -> i32 {
+    0x20_000
+}
+
+#[cfg(target_os = "macos")]
+const fn no_follow_flag() -> i32 {
+    0x100
+}
+
+fn current_timestamp() -> Result<String, String> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch")?;
+    timestamp_from_duration(duration)
+}
+
+fn timestamp_from_duration(duration: Duration) -> Result<String, String> {
+    let seconds = i64::try_from(duration.as_secs()).map_err(|_| "system clock is out of range")?;
+    let days = seconds / 86_400;
+    let seconds_in_day = seconds % 86_400;
+    let (year, month, day) = civil_date_from_days(days);
+    let hour = seconds_in_day / 3_600;
+    let minute = (seconds_in_day % 3_600) / 60;
+    let second = seconds_in_day % 60;
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{:03}Z",
+        duration.subsec_millis()
+    ))
+}
+
+fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let days = days_since_epoch + 719_468;
+    let era = days / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }
 
 fn runtime_check(root: &Path) -> Result<String, String> {
@@ -305,8 +428,9 @@ fn ingest_paths(path: &Path) -> Result<IngestPaths, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LOCAL_STORE_SCHEMA_VERSION, run};
+    use super::{LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME, run, timestamp_from_duration};
     use std::fs;
+    use std::time::Duration;
 
     #[test]
     fn contracts_command_exposes_disabled_team_boundary() {
@@ -372,5 +496,42 @@ mod tests {
         assert!(output.contains("observations=0"));
         assert!(output.contains("team_ingest=disabled"));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn utc_timestamp_is_stable_at_known_boundaries() {
+        assert_eq!(
+            timestamp_from_duration(Duration::from_millis(0)).unwrap(),
+            "1970-01-01T00:00:00.000Z"
+        );
+        assert_eq!(
+            timestamp_from_duration(Duration::from_millis(946_684_800_123)).unwrap(),
+            "2000-01-01T00:00:00.123Z"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_writes_a_private_self_contained_artifact() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-report-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let output = run(["report".into(), root.to_string_lossy().into_owned()].into_iter())
+            .expect("report command succeeds");
+        assert!(output.contains("report_schema=agent_observability.report.v1"));
+        assert!(output.contains("records=0"));
+        assert!(output.contains("cost_status=unknown"));
+        let report = root.join("logs").join(REPORT_FILE_NAME);
+        let metadata = fs::metadata(&report).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let html = fs::read_to_string(report).unwrap();
+        assert!(html.contains("Agent Observability Report"));
+        assert!(!html.contains("http://"));
+        assert!(!html.contains("https://"));
+        let _ = fs::remove_dir_all(root);
     }
 }

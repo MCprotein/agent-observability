@@ -11,6 +11,7 @@ use agent_observability_domain::StatusCode;
 use agent_observability_domain::{
     DomainError, DomainSpanState, LifecycleReducer, validate_topology,
 };
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -30,6 +31,7 @@ const OVERLAP_KEYS: [&str; 3] = [
 const DEFAULT_ASSUMPTION: &str =
     "Estimated from a local static rate table; not a billing statement.";
 const NO_TABLE_ASSUMPTION: &str = "No local rate table was supplied.";
+pub const RATE_TABLE_VERSION: &str = "agent_observability.rate_table.v1";
 
 /// Reduces one canonical observation into current application state and validates topology.
 ///
@@ -119,7 +121,8 @@ pub struct RateTableInput {
     pub models: BTreeMap<String, ModelRatesInput>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
 pub struct ModelRatesInput {
     pub input_tokens: Option<f64>,
     pub output_tokens: Option<f64>,
@@ -127,6 +130,21 @@ pub struct ModelRatesInput {
     pub cache_creation_input_tokens: Option<f64>,
     pub reasoning_output_tokens: Option<f64>,
     pub token_semantics: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RateTableDocumentV1 {
+    schema_version: String,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
+    unit: Option<String>,
+    #[serde(default)]
+    assumption: Option<String>,
+    models: BTreeMap<String, ModelRatesInput>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -474,6 +492,8 @@ fn max_nullable(left: Option<f64>, right: Option<f64>) -> Option<f64> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PricingError {
+    InvalidDocument,
+    UnsupportedVersion,
     UnsupportedUnit,
     InvalidRate(String),
     UnsupportedSemantic(String),
@@ -482,6 +502,8 @@ pub enum PricingError {
 impl Display for PricingError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidDocument => formatter.write_str("invalid rate table document"),
+            Self::UnsupportedVersion => formatter.write_str("unsupported rate table version"),
             Self::UnsupportedUnit => formatter.write_str("rate table unit must be per_1m_tokens"),
             Self::InvalidRate(label) => write!(
                 formatter,
@@ -496,6 +518,27 @@ impl Display for PricingError {
 }
 
 impl Error for PricingError {}
+
+/// Parses the closed local rate-table document and normalizes its pricing rules.
+///
+/// # Errors
+///
+/// Returns [`PricingError`] for malformed JSON, unknown fields, unsupported versions, or invalid
+/// pricing values.
+pub fn parse_rate_table_json(input: &str) -> Result<RateTable, PricingError> {
+    let document: RateTableDocumentV1 =
+        serde_json::from_str(input).map_err(|_| PricingError::InvalidDocument)?;
+    if document.schema_version != RATE_TABLE_VERSION {
+        return Err(PricingError::UnsupportedVersion);
+    }
+    normalize_rate_table(RateTableInput {
+        version: document.version,
+        currency: document.currency,
+        unit: document.unit,
+        assumption: document.assumption,
+        models: document.models,
+    })
+}
 
 /// Validates and normalizes a local rate table. Rates are always per million tokens.
 ///
