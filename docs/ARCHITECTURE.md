@@ -6,7 +6,7 @@
 
 ## Current and target stack
 
-현재 `v1.0.0` stable release는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
+현재 `v1.1.0` stable release는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
 보존하면서 macOS standalone private handoff import 범위의 Rust Codex, Claude Code와 Cursor adapter,
 TypeScript static report UI, strict local config와 bounded runtime policy를 제공한다. Rust 경로는 closed contract,
 deterministic lifecycle reduction, topology validation, pricing/report projection, bounded product handoff와
@@ -87,7 +87,7 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
-v1.0.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
+v1.1.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
 `crates/adapter-claude-code`, `crates/adapter-cursor`,
 `crates/application`, `crates/local-store`, `crates/local-runtime`, `crates/static-report`, `crates/cli`와 release
 evidence runner인 `xtask`로 나뉜다. domain은 외부 형식을
@@ -254,7 +254,7 @@ Web UI는 TypeScript `strict` mode를 사용한다.
 - standalone report는 team/workspace를 client-side field에서 추론하거나 filter로 제공하지 않는다.
   local scope는 고정이며, hosted team scope는 Future TODO promotion 뒤 서버가 결정해 scope bar로
   제공한다. v0.12 filter dimension은 sanitized repo, session, agent와 model이다.
-- v1.0 build는 canonical report schema에서 TypeScript declaration과 standalone validator를
+- v1.1 build는 canonical report schema에서 TypeScript declaration과 standalone validator를
   생성하고 strict TypeScript UI를 하나의 browser IIFE로 bundle한다. HTML은 DTO와 bundle을 직접
   삽입하며 runtime network request를 만들지 않는다.
 - v0.12 producer는 `filters.agents`와 `filters.models`를 출력한다. 두 필드는 additive optional v1
@@ -264,6 +264,16 @@ Web UI는 TypeScript `strict` mode를 사용한다.
   `estimatedCost`만 축약한다. cost completeness는 span별 `cost.status`를
   `contracts/report-view-reduction-v1.fixture.json` 규칙으로 합치며 Rust와 generated TypeScript reducer가
   같은 fixture를 검증한다. rate lookup, token overlap 또는 가격 계산은 브라우저에 존재하지 않는다.
+- v1.1 view-state는 span을 한 번 순회해 filter와 trace group을 함께 만들고, DOM projection은 페이지당
+  trace 100개, span 200개, timeline 120개로 제한한다. 이 제한은 화면 렌더링 상한이며 Rust DTO의
+  전체 aggregate나 span 집합을 잘라내지 않는다. 각 filter select도 500개 value option으로 제한하고
+  초과한 sanitized repo/session/agent/model 값은 text search에서 찾는다.
+- 저장 보기는 최대 20개이며 sanitized repo/session/agent/model 차원 중 key별 allowlisted scalar
+  grammar를 통과한 값만 versioned envelope로 browser local storage에 기록한다. session은 opaque
+  `id:sha256:` 형식만 허용하고 repo/agent는 bounded name, model은 최대 3개 bounded name segment만
+  허용한다. text search, trace 선택, email, 원문 content와 local path 형식은 저장하지 않으며
+  sentinel fixture로 거부를 검증한다.
+  file-origin storage가 허용되지 않는 환경에서도 report 조회와 filtering은 계속 동작한다.
 - additive optional field는 새 consumer가 이전 v1 report를 읽는 방향만 보장한다. closed v1 schema를
   가진 N-1 consumer는 새 field를 거부할 수 있으므로 hosted/team transport를 도입하기 전에 contract
   version negotiation 또는 새 DTO version이 필요하다. standalone artifact는 DTO와 동버전 bundle을
@@ -271,7 +281,8 @@ Web UI는 TypeScript `strict` mode를 사용한다.
 - `npm test`의 `pretest`는 lockfile에 고정된 `playwright-core`가 요구하는 Chromium revision을
   `playwright-core install chromium --no-shell`로 준비한다. smoke는 해당 pinned executable만 사용해
   self-contained `file://` artifact의 desktop/mobile overflow, mobile 44px target, heading/landmark,
-  keyboard focus, filter/trace interaction, console error와 외부 request 부재를 검증한다. 별도 web
+  keyboard focus, filter/trace/timeline interaction, 저장 보기 reload/delete, console error와 외부
+  request 부재를 검증한다. 4,096-span deterministic fixture는 전체 집계와 bounded DOM을 함께 검증한다. 별도 web
   server나 system browser 탐색은 사용하지 않는다.
 
 Framework는 필요성이 확인될 때 선택한다. TypeScript 자체가 목표이며 특정 UI framework는

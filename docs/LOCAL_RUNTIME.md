@@ -1,6 +1,7 @@
 # Local Runtime v1
 
-v1.0.0 standalone runtime is a local-only Rust boundary. It installs private local state,
+v1.0.0 introduced the standalone local-only Rust runtime boundary, which remains unchanged in v1.1.0.
+It installs private local state,
 validates a closed configuration, admits writes against a hard storage budget, and keeps foreground
 handoff bounded. It contains no endpoint, email, team identity, envelope, outbox, or network client.
 It is a library plus one-shot CLI composition boundary, not a resident server or IPC daemon.
@@ -93,4 +94,6 @@ delete measured durable stores after validation; release retains only the saniti
 Rust privacy/cost projector, and writes `logs/agent-observability-report.html` atomically with mode
 0600. The optional rate table must satisfy `agent_observability.rate_table.v1`, be at most 1 MiB,
 and be a private regular file opened without following symlinks. The generated report is
-self-contained and makes no network request when opened with `file://`.
+self-contained and makes no network request when opened with `file://`. The v1.1 UI preserves full
+DTO summaries while bounding visible trace, span, and timeline DOM work; saved views persist only
+sanitized repo, session, agent, and model dimensions when file-origin storage is available.

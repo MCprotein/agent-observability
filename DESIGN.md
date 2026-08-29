@@ -12,7 +12,7 @@ Evidence reviewed:
 - `docs/ARCHITECTURE.md`: Rust/TypeScript boundary and shared `ReportDtoVx`
 - `docs/TEAM_ARCHITECTURE.md`: tenancy, role, ingest, retention, quota and audit contracts
 - `docs/ADAPTER_COMPATIBILITY.md`: official adapter surfaces, precedence and support evidence
-- v0.12 strict TypeScript static report renderer and desktop/mobile screenshot baseline
+- v1.1 strict TypeScript static report renderer, bounded timeline/pagination, saved views and desktop/mobile baseline
 
 This file is the product and UI source of truth. Backend and security decisions remain owned by the two
 architecture documents. Team screens described here are planned, not implemented.
@@ -192,6 +192,11 @@ application/projector code owns those decisions. The static UI may perform prese
 over sanitized spans and Rust-priced scalar/status fields; its completeness rule is locked to
 `contracts/report-view-reduction-v1.fixture.json` in Rust and TypeScript tests. Profile adapters own
 file-embedded DTO versus authenticated paginated query.
+
+The standalone v1.1 report renders at most 100 traces, 200 span rows, 120 timeline rows, and 500 values per
+filter dimension while retaining full DTO counts and aggregates. Saved views retain at most 20 sanitized
+repo/session/agent/model combinations whose values pass the key-specific safe scalar grammar in browser-local
+storage; free-text searches, trace selections, email-like values, and path-like values are never persisted.
 
 ## Accessibility
 
