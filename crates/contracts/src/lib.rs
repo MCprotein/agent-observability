@@ -18,15 +18,20 @@ pub const DURABLE_RECORD_VERSION: &str = "agent_observability.v1";
 pub const REPORT_DTO_VERSION: &str = "agent_observability.report.v1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterCapabilityManifestV1 {
     pub schema_version: String,
     pub entries: Vec<AdapterCapabilityEntryV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterCapabilityEntryV1 {
     pub adapter_family: String,
     pub support_status: String,
+    pub platforms: Vec<String>,
+    pub profiles: Vec<String>,
+    pub ingest_boundary: String,
     pub product_versions: ProductVersionRangeV1,
     pub verified_at: String,
     pub official_references: Vec<String>,
@@ -39,12 +44,14 @@ pub struct AdapterCapabilityEntryV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ProductVersionRangeV1 {
     pub oldest: String,
     pub newest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterSurfaceV1 {
     pub id: String,
     pub role: String,
@@ -53,6 +60,7 @@ pub struct AdapterSurfaceV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterPrivacyV1 {
     pub content_fields_accepted: bool,
     pub raw_identifiers_durable: bool,
@@ -81,6 +89,9 @@ impl AdapterCapabilityManifestV1 {
 fn validate_capability_entry(entry: &AdapterCapabilityEntryV1) -> Result<(), ContractError> {
     if entry.adapter_family.is_empty()
         || !matches!(entry.support_status.as_str(), "experimental" | "supported")
+        || entry.platforms != ["macos"]
+        || entry.profiles != ["standalone"]
+        || entry.ingest_boundary != "private_canonical_handoff_v1"
         || entry.product_versions.oldest.is_empty()
         || entry.product_versions.newest.is_empty()
         || entry.verified_at.is_empty()
@@ -1608,8 +1619,10 @@ mod tests {
             .iter()
             .find(|entry| entry.adapter_family == "codex")
             .expect("Codex capability exists");
-        assert_eq!(codex.support_status, "experimental");
+        assert_eq!(codex.support_status, "supported");
         assert_eq!(codex.product_versions.oldest, "0.150.1");
+        assert_eq!(codex.platforms, ["macos"]);
+        assert_eq!(codex.profiles, ["standalone"]);
         assert!(!codex.privacy.content_fields_accepted);
         assert!(!codex.privacy.raw_identifiers_durable);
         let claude = manifest
@@ -1617,7 +1630,7 @@ mod tests {
             .iter()
             .find(|entry| entry.adapter_family == "claude-code")
             .expect("Claude Code capability exists");
-        assert_eq!(claude.support_status, "experimental");
+        assert_eq!(claude.support_status, "supported");
         assert_eq!(claude.product_versions.oldest, "2.1.248");
         assert_eq!(claude.product_versions.newest, "2.1.248");
         assert!(!claude.privacy.content_fields_accepted);
@@ -1627,7 +1640,7 @@ mod tests {
             .iter()
             .find(|entry| entry.adapter_family == "cursor")
             .expect("Cursor capability exists");
-        assert_eq!(cursor.support_status, "experimental");
+        assert_eq!(cursor.support_status, "supported");
         assert!(!cursor.privacy.content_fields_accepted);
         assert!(!cursor.privacy.raw_identifiers_durable);
     }

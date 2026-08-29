@@ -72,14 +72,7 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
             ))
         }
         [command, root] if command == "runtime-check" => runtime_check(Path::new(root)),
-        [command] if command == "contracts" => {
-            let manifest =
-                ContractManifest::parse(CONTRACT_MANIFEST).map_err(|error| error.to_string())?;
-            manifest
-                .validate_release_boundary()
-                .map_err(|error| error.to_string())?;
-            Ok(CONTRACT_MANIFEST.trim_end().into())
-        }
+        [command] if command == "contracts" => contracts(),
         [command, root] if command == "storage-check" => {
             let layout = install(Path::new(root)).map_err(|error| error.to_string())?;
             let _singleton =
@@ -146,16 +139,29 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
                 }),
             )
         }
-        [command, root] if command == "report" => report(Path::new(root), None),
-        [command, root, rate_table] if command == "report" => {
-            report(Path::new(root), Some(Path::new(rate_table)))
-        }
+        [command, report_arguments @ ..] if command == "report" => report_command(report_arguments),
         [command] if matches!(command.as_str(), "version" | "--version" | "-V") => {
             Ok(env!("CARGO_PKG_VERSION").into())
         }
         [] => Ok(USAGE.into()),
         [command] if matches!(command.as_str(), "help" | "--help" | "-h") => Ok(USAGE.into()),
         [command] => Err(format!("unknown command {command}")),
+        _ => Err(USAGE.into()),
+    }
+}
+
+fn contracts() -> Result<String, String> {
+    let manifest = ContractManifest::parse(CONTRACT_MANIFEST).map_err(|error| error.to_string())?;
+    manifest
+        .validate_release_boundary()
+        .map_err(|error| error.to_string())?;
+    Ok(CONTRACT_MANIFEST.trim_end().into())
+}
+
+fn report_command(arguments: &[String]) -> Result<String, String> {
+    match arguments {
+        [root] => report(Path::new(root), None),
+        [root, rate_table] => report(Path::new(root), Some(Path::new(rate_table))),
         _ => Err(USAGE.into()),
     }
 }
@@ -430,6 +436,7 @@ fn ingest_paths(path: &Path) -> Result<IngestPaths, String> {
 mod tests {
     use super::{LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME, run, timestamp_from_duration};
     use std::fs;
+    use std::path::Path;
     use std::time::Duration;
 
     #[test]
@@ -532,6 +539,71 @@ mod tests {
         assert!(html.contains("Agent Observability Report"));
         assert!(!html.contains("http://"));
         assert!(!html.contains("https://"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_accepts_only_private_versioned_rate_tables() {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-rate-table-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = root.join("runtime");
+        let handoff = root.join("claude-handoff.jsonl");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../adapter-claude-code/tests/fixtures/claude-handoff.jsonl"),
+            &handoff,
+        )
+        .unwrap();
+        fs::set_permissions(&handoff, fs::Permissions::from_mode(0o600)).unwrap();
+        run([
+            "claude-code-ingest".into(),
+            runtime.to_string_lossy().into_owned(),
+            handoff.to_string_lossy().into_owned(),
+        ]
+        .into_iter())
+        .expect("Claude Code fixture ingests");
+        let rate_table = root.join("rates.json");
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&rate_table)
+            .unwrap();
+        file.write_all(
+            br#"{"schema_version":"agent_observability.rate_table.v1","version":"cli-test","models":{"claude-sonnet-5":{"input_tokens":3,"output_tokens":15,"cached_input_tokens":0.3,"cache_creation_input_tokens":3.75}}}"#,
+        )
+        .unwrap();
+        drop(file);
+
+        let output = run([
+            "report".into(),
+            runtime.to_string_lossy().into_owned(),
+            rate_table.to_string_lossy().into_owned(),
+        ]
+        .into_iter())
+        .expect("private rate table succeeds");
+        assert!(!output.contains("cost_status=unknown"));
+
+        fs::set_permissions(&rate_table, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            run([
+                "report".into(),
+                runtime.to_string_lossy().into_owned(),
+                rate_table.to_string_lossy().into_owned(),
+            ]
+            .into_iter(),)
+            .unwrap_err()
+            .contains("permissions must be private")
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

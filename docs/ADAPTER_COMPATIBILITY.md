@@ -1,7 +1,7 @@
 # Adapter Compatibility Contract
 
-Status: Codex, Claude Code and Cursor experimental entries implemented
-Last verified: 2026-08-28
+Status: exact-version macOS standalone private handoff imports supported
+Last verified: 2026-08-29
 
 이 문서는 Codex, Claude Code, Cursor adapter가 어떤 공식 surface를 어떤 우선순위로 사용하고,
 어떤 evidence가 있어야 특정 제품/version을 지원한다고 표시할 수 있는지 정의한다. 제품 업데이트로
@@ -30,15 +30,15 @@ diagnostics or team ingest.
 
 ## Runtime rules
 
-- Hook handlers perform bounded validation and a constant-size local IPC/spool handoff only. They do not call
+- A future foreground producer must perform bounded validation and a constant-size local IPC/spool handoff only. It must not call
   team REST endpoints, render reports, scan transcripts or wait for background flush completion.
-- Observational command hooks use host asynchronous mode where supported and never opt into fail-closed behavior
+- A future observational command hook must use host asynchronous mode where supported and never opt into fail-closed behavior
   for capture. A synchronous-only host handler has a 10 ms enqueue deadline and 50 ms total deadline, then exits
   successfully on timeout, unavailable daemon or full channel. Exact event/mode support is versioned evidence,
   not a cross-product assumption.
-- Native telemetry is received by a local endpoint and normalized asynchronously. Exporter batch/flush behavior
+- A future native telemetry receiver must normalize asynchronously. Exporter batch/flush behavior
   is not treated as proof that the observation reached this product; only the local durable transaction is.
-- File/transcript fallback uses a persisted generation fingerprint and cursor, filesystem notification where
+- A future file fallback must use a persisted generation fingerprint and cursor, filesystem notification where
   reliable, and adaptive reconciliation. It never rescans an unchanged file from byte zero.
 - Undocumented credential stores, browser sessions and private account APIs are never scraped. An undocumented
   file format may be used only as an explicitly experimental, local-only parser with fixture evidence and a
@@ -54,15 +54,16 @@ Support requires all mandatory scenarios below.
 
 Each entry in `crates/contracts/capabilities/adapter-capability-v1.yaml` contains:
 
-- adapter family, support status, oldest/newest checked product version and verification date
+- adapter family, support status, platform/profile/import boundary, oldest/newest checked product version and verification date
 - official reference URL, source surface ID/role, event names and uniquely owned canonical fields
 - correlation keys, closed privacy flags, known gaps, fixture IDs and input/projection fixture hashes
 
 `cargo test -p agent-observability-contracts adapter_capability_v1` validates schema, field ownership and
 privacy closure. The Codex, Claude Code and Cursor adapter suites verify declared input/projection fixture hashes,
 exact replay output, bounded input, restart/idempotency and privacy behavior. Claude Code additionally locks permission,
-compaction, failed lifecycle, interrupt-gap and out-of-order timestamp fixtures. Cross-version/OS/profile execution,
-foreground deadline and load evidence remain future support gates; all three entries therefore remain `experimental`.
+compaction, failed lifecycle, interrupt-gap and out-of-order timestamp fixtures. The supported boundary is restricted
+to macOS, standalone, `private_canonical_handoff_v1`, and the exact declared versions. Cross-version/OS/profile
+execution, native receiver and foreground producer evidence remain future promotion gates.
 
 | Scenario | Required evidence |
 | --- | --- |
@@ -86,5 +87,6 @@ fixture hash validation and CLI-to-private-store replay. Claude Code uses docume
 hooks only for lifecycle. Cursor uses generic tool hooks as primary and lifecycle hooks as supplement; specific
 shell/MCP/file hooks remain diagnostic-only, and raw transcript/content fields are not parsed. No adapter includes
 an OTLP HTTP/gRPC receiver or foreground spool writer. Cross-version execution and full performance evidence
-remain roadmap work. The current private file handoff reader is supported only on Unix;
-other platforms fail closed until equivalent no-follow, identity and permission evidence exists.
+remain roadmap work. These receiver/producer capabilities are not part of the stable import boundary. The current
+release claim is macOS only; other platforms fail closed or remain unsupported until equivalent no-follow,
+identity, permission and execution evidence exists.

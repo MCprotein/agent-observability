@@ -6,11 +6,11 @@
 
 ## Current and target stack
 
-현재 `v0.13.0` release candidate는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
-보존하면서 experimental Rust Codex, Claude Code와 Cursor adapter, TypeScript static report UI,
-strict local config와 bounded runtime policy를 제공한다. Rust 경로는 closed contract,
+현재 `v1.0.0` stable candidate는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
+보존하면서 macOS standalone private handoff import 범위의 Rust Codex, Claude Code와 Cursor adapter,
+TypeScript static report UI, strict local config와 bounded runtime policy를 제공한다. Rust 경로는 closed contract,
 deterministic lifecycle reduction, topology validation, pricing/report projection, bounded product handoff와
-private embedded transaction을 구현한다. SQLite `local_state.v3`가 source cursor,
+private embedded transaction, static HTML assembly와 CLI `report`를 구현한다. SQLite `local_state.v3`가 source cursor,
 stable observation, current reduced record, adapter disposition과 profile-neutral delivery outcome의
 정본이며 JSONL은 dirty-state에서만 재생성하는 projection이다. Team envelope, outbox와 network는
 활성 계약이 아니다.
@@ -87,14 +87,15 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
-v0.13.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
+v1.0.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
 `crates/adapter-claude-code`, `crates/adapter-cursor`,
-`crates/application`, `crates/local-store`, `crates/local-runtime`, `crates/cli`와 release
+`crates/application`, `crates/local-store`, `crates/local-runtime`, `crates/static-report`, `crates/cli`와 release
 evidence runner인 `xtask`로 나뉜다. domain은 외부 형식을
 모르고, contracts는 transient
 source와 durable/report DTO 경계를 소유한다. application은 pricing과 report projection을,
 inbound adapters는 제품별 source precedence/correlation/dedupe를, local-store는 SQLite transaction과 JSONL
-projection을, CLI는 composition root를 소유한다.
+projection을, static-report는 generated UI asset의 self-contained artifact 조립과 private atomic write를,
+CLI는 composition root를 소유한다.
 `contracts/*.schema.json`은 closed wire contract이고 `contracts/contract-manifest.v1`은 현재
 활성 schema path/version과 `team_ingest=disabled` 경계를 runtime 중립적으로 고정한다.
 
@@ -243,15 +244,16 @@ Web UI는 TypeScript `strict` mode를 사용한다.
 - DTO type은 versioned schema에서 생성하거나 runtime validation으로 확인한다.
 - 브라우저에서 외부 network 요청이나 상시 server 없이 동작한다.
 - agent별 예외 처리는 UI가 아니라 canonical contract나 adapter에서 해결한다.
-- 목표 Rust outbound infrastructure는 빌드된 TypeScript UI asset과 `ReportDtoVx`를 하나의
-  self-contained HTML artifact로 조립한다. v0.13에는 이 Rust assembler와 `report` subcommand가 없다.
+- Rust outbound infrastructure는 빌드된 TypeScript UI asset과 `ReportDtoV1`을 하나의
+  self-contained HTML artifact로 조립한다. `report <runtime-root> [rate-table-json]`은 SQLite의 typed
+  snapshot을 읽고 고정된 private logs 경로에 원자 기록한다. Node.js는 build/test에서만 사용된다.
 - team profile의 hosted UI도 같은 `ReportDtoVx` schema와 UI component를 사용한다. transport와
   authentication/authorization만 profile별 composition root에서 달라진다. hosted query는
   server-resolved tenant/workspace scope 밖의 DTO를 생성할 수 없다.
 - standalone report는 team/workspace를 client-side field에서 추론하거나 filter로 제공하지 않는다.
   local scope는 고정이며, hosted team scope는 Future TODO promotion 뒤 서버가 결정해 scope bar로
   제공한다. v0.12 filter dimension은 sanitized repo, session, agent와 model이다.
-- v0.12 build는 canonical report schema에서 TypeScript declaration과 standalone validator를
+- v1.0 build는 canonical report schema에서 TypeScript declaration과 standalone validator를
   생성하고 strict TypeScript UI를 하나의 browser IIFE로 bundle한다. HTML은 DTO와 bundle을 직접
   삽입하며 runtime network request를 만들지 않는다.
 - v0.12 producer는 `filters.agents`와 `filters.models`를 출력한다. 두 필드는 additive optional v1
