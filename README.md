@@ -7,7 +7,7 @@ handoff, approval, sandbox 상태를 관측하기 위한 내부 설계 정리.
 
 ## 현재 구현 상태
 
-현재 release train은 `v1.0.0` local-only stable 검증 단계다. Rust Codex, Claude Code, Cursor
+현재 release train은 `v1.0.0` local-only stable 검증을 완료했다. Rust Codex, Claude Code, Cursor
 adapter가 비공개 canonical handoff를 SQLite 권위 저장소에 수집하고, Rust application projector와
 HTML assembler가 strict TypeScript UI asset을 self-contained report로 만든다. 지원 범위는 macOS
 standalone과 capability manifest에 고정된 제품 버전 및 handoff import 경계다. Native telemetry
@@ -92,9 +92,11 @@ cargo run -p agent-observability-cli -- report ~/.agent-observability /path/to/p
 cargo run -p xtask -- perf local --profile smoke --check
 ```
 
-`v1.0.0` browser smoke는 세 agent의 실제 Rust ingest, SQLite snapshot, 비용 projection, Rust HTML
+`v1.0.0` browser smoke는 세 agent의 canonical handoff fixture를 사용하는 Rust ingest, SQLite snapshot,
+비용 projection, Rust HTML
 assembly와 desktop/mobile `file://` 렌더링을 하나의 경로로 검증한다. `v0.13.0` local runtime의
-normative 성능 evidence는 foreground/runtime 변경이 없는 1.0 report cutover에 carry-forward하며,
+normative 성능 evidence는 local runtime 경로가 변경되지 않은 1.0 report cutover에만 carry-forward하며,
+실제 agent hook, receiver 또는 producer 성능을 증명하지 않는다.
 1.0에서는 smoke profile을 다시 실행한다. 운영 방법은 [docs/LOCAL_RUNTIME.md](docs/LOCAL_RUNTIME.md)를 따른다.
 
 ## 아키텍처 요약
@@ -112,10 +114,10 @@ Codex / Claude Code
              |-> local JSONL -> JS report projection -> self-contained HTML
              `-> redacted JSON snapshot
 
-CURRENT v1.0 - LOCAL-ONLY STABLE CANDIDATE (Rust + TypeScript static UI)
+CURRENT v1.0 - LOCAL-ONLY STABLE (Rust + TypeScript static UI)
 
 Closed schemas + manifest -> deterministic domain reducer + fail-closed projectors
-Codex OTel/notify, Claude Code OTel/hook, or Cursor Hook v1 canonical handoff -> bounded Rust adapters
+Private canonical handoff files (upstream receiver/producer not shipped) -> bounded Rust adapters
         -> SourceObservation or fixed-code diagnostic/suppression
         -> CLI bounded batch + singleton + configured storage admission
         -> private SQLite local_state.v3 authority
@@ -310,7 +312,8 @@ offline recovery canonical fixture를 통과해야 하며 필수 signal이 없�
 Agent A adapter ─┐
 Agent B adapter ─┼─> domain/application state
 Agent C adapter ─┘              `-> atomic local state + outbox
-                                     |-> DurableRecordVx -> local events.jsonl -> static HTML report
+                                     |-> SQLite authority -> typed snapshot -> static HTML report
+                                     |                    `-> JSONL projection
                                      `-> TeamIngestEnvelopeV1 -> retry queue -> optional collector
 ```
 
@@ -509,19 +512,19 @@ writer로 분리한다. 새 Rust adapter는 source payload를 `SourceObservation
 
 ## Static HTML Report
 
-1차 PoC의 조회 화면은 상시 실행형 웹 UI가 아니라 정적 HTML report로 시작한다. 미리 만든
+조회 화면은 상시 실행형 웹 UI가 아니라 정적 HTML report다. 미리 만든
 템플릿에 수집 데이터를 주입해 self-contained `report.html`을 만들고, 사용자는 브라우저로
 그 파일을 열어본다.
 
 ```text
-Local adapter
+Private canonical handoff import
         |
         v
-~/.agent-observability/events.jsonl
+SQLite local_state.v3 authority
         |
-        | report renderer
+        | typed snapshot -> Rust report projector and assembler
         v
-agent-observability-report.html
+~/.agent-observability/logs/agent-observability-report.html
         |
         v
 Browser file open
@@ -544,7 +547,7 @@ agent-observability report ~/.agent-observability [/path/to/private-rate-table.j
 HTML은 외부 network 요청 없이 동작한다. 브라우저의 `file://` 제약을 피하기 위해
 JSONL을 따로 fetch하지 않고, 생성 시점에 필요한 데이터를 HTML 안에 주입한다.
 
-현재 v0.12.0 report에서 확인 가능한 화면:
+현재 v1.0.0 report에서 확인 가능한 화면:
 
 - repo/session/agent/model/text filter와 clear/filter-result state
 - trace 목록과 parent ID를 포함한 평면 span table

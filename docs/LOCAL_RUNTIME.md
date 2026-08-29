@@ -13,6 +13,8 @@ cargo run -p agent-observability-cli -- config-check ~/.agent-observability/conf
 cargo run -p agent-observability-cli -- runtime-check ~/.agent-observability
 cargo run -p agent-observability-cli -- storage-check ~/.agent-observability
 cargo run -p agent-observability-cli -- codex-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+cargo run -p agent-observability-cli -- claude-code-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+cargo run -p agent-observability-cli -- cursor-ingest ~/.agent-observability /path/to/private-handoff.jsonl
 cargo run -p agent-observability-cli -- report ~/.agent-observability [/path/to/private-rate-table.json]
 ~~~
 
@@ -58,7 +60,7 @@ nonce. PID metadata alone never proves ownership.
   requires three 10-second windows below 70%.
 - One-shot ingest evaluates disk pressure before writing and rejects protected writes with a bounded
   outcome. The full scheduler state machine and foreground channel are reusable embedding APIs and
-  are exercised by the normative subprocess fixture; v0.13 does not install a resident daemon.
+  are exercised by the normative subprocess fixture; v1.0 does not install a resident daemon.
 
 v1.0.0 enforces capacity and bounded replay artifacts. Age-based deletion, archive, and export
 retention policy remain assigned to v1.2.0.

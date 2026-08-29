@@ -14,6 +14,9 @@ surface가 바뀌면 이 문서와 versioned capability manifest를 함께 갱�
 adapter family, source generation, 공식 session/conversation/generation identifier와 source cursor로
 동일 observation을 합친다.
 
+아래 표는 canonical handoff producer가 따라야 할 source 의미와 field ownership을 정의한다.
+현재 release가 해당 native receiver나 foreground producer를 구현했다는 뜻은 아니다.
+
 | Adapter | Primary source | Supplement / fallback | Verified official reference |
 | --- | --- | --- | --- |
 | Codex | native telemetry for model/API/token/tool signals | `agent-turn-complete` notify for turn lifecycle; local session output is not used by the Rust adapter | [Advanced configuration](https://developers.openai.com/codex/config-advanced), [Configuration reference](https://developers.openai.com/codex/config-reference) |
