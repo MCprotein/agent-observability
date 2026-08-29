@@ -139,13 +139,54 @@ struct RunResult {
     peak_disk_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct PressurePeaks {
     cpu_percent: f64,
     rss_kib: f64,
     disk_bytes: u64,
     sample_count: usize,
+    sample_times: Vec<Instant>,
     process_exit_observed: bool,
+}
+
+struct DirectoryCleanup {
+    path: PathBuf,
+    label: &'static str,
+    complete: bool,
+}
+
+impl DirectoryCleanup {
+    fn new(path: PathBuf, label: &'static str) -> Self {
+        Self {
+            path,
+            label,
+            complete: false,
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        match fs::remove_dir_all(&self.path) {
+            Ok(()) => {
+                self.complete = true;
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.complete = true;
+                Ok(())
+            }
+            Err(error) => Err(format!("remove {}: {error}", self.label)),
+        }
+    }
+}
+
+impl Drop for DirectoryCleanup {
+    fn drop(&mut self) {
+        if !self.complete
+            && let Err(error) = self.cleanup()
+        {
+            eprintln!("fallback directory cleanup failed: {error}");
+        }
+    }
 }
 
 struct ChildGuard(Child);
@@ -271,6 +312,8 @@ fn run(config: Config) -> Result<(), String> {
         .as_nanos();
     let root = PathBuf::from("docs/evidence/local/performance").join(stamp.to_string());
     fs::create_dir_all(&root).map_err(|e| format!("create manifest directory: {e}"))?;
+    let mut smoke_root_cleanup = (config.profile == Profile::Smoke)
+        .then(|| DirectoryCleanup::new(root.clone(), "smoke manifest path"));
     fs::set_permissions(&root, Permissions::from_mode(0o700))
         .map_err(|e| format!("protect manifest directory: {e}"))?;
     let durable_root = if config.profile == Profile::Smoke {
@@ -278,6 +321,7 @@ fn run(config: Config) -> Result<(), String> {
     } else {
         root.join("durable")
     };
+    let mut durable_cleanup = DirectoryCleanup::new(durable_root.clone(), "durable evidence path");
     fs::create_dir_all(&durable_root).map_err(|e| format!("create evidence directory: {e}"))?;
     fs::set_permissions(&durable_root, Permissions::from_mode(0o700))
         .map_err(|e| format!("protect durable evidence directory: {e}"))?;
@@ -317,13 +361,10 @@ fn run(config: Config) -> Result<(), String> {
         let finalized = pending_manifest.replace("status: pending-validation", "status: pass");
         fs::write(&manifest_path, finalized).map_err(|e| format!("finalize manifest: {e}"))
     })();
-    let durable_cleanup =
-        fs::remove_dir_all(&durable_root).map_err(|e| format!("remove durable evidence path: {e}"));
-    let smoke_cleanup = if config.profile == Profile::Smoke {
-        fs::remove_dir_all(&root).map_err(|e| format!("remove smoke manifest: {e}"))
-    } else {
-        Ok(())
-    };
+    let durable_cleanup = durable_cleanup.cleanup();
+    let smoke_cleanup = smoke_root_cleanup
+        .as_mut()
+        .map_or(Ok(()), DirectoryCleanup::cleanup);
     combine_cleanup(combine_cleanup(completion, durable_cleanup), smoke_cleanup)?;
     println!(
         "manifest={}\nprofile={}\nstatus=pass",
@@ -471,6 +512,10 @@ fn execute_run_with_child(
     )?;
     drop(writer);
     let mut drain_sampler = start_pressure_sampler(durable_dir.to_path_buf(), child.id(), true)?;
+    read_worker_marker(&mut reader, "drain-start")?;
+    let drain_started = Instant::now();
+    read_worker_marker(&mut reader, "drain-complete")?;
+    let drain_completed = Instant::now();
     let status_result = child.wait().map_err(|e| format!("wait for worker: {e}"));
     let drain_result = drain_sampler.stop();
     let status = status_result?;
@@ -478,8 +523,13 @@ fn execute_run_with_child(
     if !status.success() {
         return Err(format!("worker exited with {status}"));
     }
-    if drain_peaks.sample_count == 0 {
-        return Err("drain pressure sampler produced no complete samples".into());
+    if enabled
+        && !drain_peaks
+            .sample_times
+            .iter()
+            .any(|sampled| *sampled >= drain_started && *sampled <= drain_completed)
+    {
+        return Err("drain pressure sampler produced no sample inside the drain boundary".into());
     }
     let durable_bytes = StorageBudget::allocated_tree_bytes(durable_dir)
         .map_err(|e| format!("measure allocated durable bytes: {e}"))?;
@@ -582,6 +632,7 @@ fn start_pressure_sampler(
                     .map_err(|e| format!("measure pressure disk peak: {e}"))?,
             );
             peaks.sample_count = peaks.sample_count.saturating_add(1);
+            peaks.sample_times.push(Instant::now());
             if stop_rx.recv_timeout(Duration::from_millis(10)).is_ok() {
                 break;
             }
@@ -652,11 +703,10 @@ fn sample_phase(
     started: Instant,
     network_baseline: Option<u64>,
 ) -> Result<(), String> {
-    let previous_cpu = process_cpu_seconds(pid)?;
     let phase_started = Instant::now();
-    let mut next_sample = phase_started + interval;
-    let mut previous_cpu = previous_cpu;
-    let mut previous_at = phase_started;
+    let mut previous_cpu = process_cpu_seconds(pid)?;
+    let mut previous_at = Instant::now();
+    let mut next_sample = previous_at + interval;
     while phase_started.elapsed() < duration {
         sleep(next_sample.saturating_duration_since(Instant::now()));
         let current_cpu = process_cpu_seconds(pid)?;
@@ -704,6 +754,17 @@ fn spawn_worker(path: &Path, enabled: bool) -> Result<Child, String> {
         .map_err(|e| format!("spawn local workload worker: {e}"))
 }
 
+fn read_worker_marker(reader: &mut impl BufRead, expected: &str) -> Result<(), String> {
+    let mut marker = String::new();
+    reader
+        .read_line(&mut marker)
+        .map_err(|e| format!("read worker {expected} marker: {e}"))?;
+    if marker.trim() != expected {
+        return Err(format!("worker omitted {expected} marker"));
+    }
+    Ok(())
+}
+
 fn worker() -> Result<(), String> {
     let mut args = env::args().skip(2);
     let path = args.next().ok_or("worker durable path missing")?;
@@ -717,7 +778,11 @@ fn worker() -> Result<(), String> {
                 .flush()
                 .map_err(|e| format!("flush worker response: {e}"))?;
         }
-        thread::sleep(Duration::from_millis(100));
+        writeln!(output, "drain-start").map_err(|e| format!("write drain marker: {e}"))?;
+        writeln!(output, "drain-complete").map_err(|e| format!("write drain marker: {e}"))?;
+        output
+            .flush()
+            .map_err(|e| format!("flush drain marker: {e}"))?;
         return Ok(());
     }
     let (ingress, receiver) = Ingress::new();
@@ -744,9 +809,16 @@ fn worker() -> Result<(), String> {
             .map_err(|e| format!("flush worker response: {e}"))?;
     }
     drop(ingress);
+    writeln!(output, "drain-start").map_err(|e| format!("write drain marker: {e}"))?;
+    output
+        .flush()
+        .map_err(|e| format!("flush drain marker: {e}"))?;
     rx.recv()
         .map_err(|_| "local runtime drain stopped".to_string())??;
-    thread::sleep(Duration::from_millis(100));
+    writeln!(output, "drain-complete").map_err(|e| format!("write drain marker: {e}"))?;
+    output
+        .flush()
+        .map_err(|e| format!("flush drain marker: {e}"))?;
     Ok(())
 }
 
