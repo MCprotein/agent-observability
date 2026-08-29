@@ -3,6 +3,7 @@ use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, Permissions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -23,7 +24,7 @@ use agent_observability_local_store::LocalStore;
 
 const USAGE: &str = "usage: cargo run -p xtask -- perf local --profile <release|smoke> --check";
 const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-performance-v1.yaml");
-const REQUIRED_PROTOCOL_LINES: [&str; 32] = [
+const REQUIRED_PROTOCOL_LINES: [&str; 36] = [
     "schema_version: local_performance.v1",
     "warmup_seconds: 60",
     "idle_seconds: 900",
@@ -37,10 +38,12 @@ const REQUIRED_PROTOCOL_LINES: [&str; 32] = [
     "idle_average_percent_max: 0.5",
     "active_average_percent_max: 2",
     "active_any_minute_percent_max: 5",
+    "sampling: process CPU time delta divided by sample wall-time delta; lifetime-average percent is forbidden",
     "burst_integrated_and_sampled_percent_max: 100",
     "p95_mib_max: 96",
     "burst_and_drain_peak_required: true",
     "total_bytes_max: 1073741824",
+    "accounting: allocated filesystem blocks for the full release durable root across all retained run directories, including durable state, final state, projections, crash and sampled temp artifacts",
     "ingest_requests_in_flight_max: 0",
     "required_bytes: 0",
     "channel_capacity: 64",
@@ -54,6 +57,8 @@ const REQUIRED_PROTOCOL_LINES: [&str; 32] = [
     "enabled_rejection_percent_max: 1",
     "required_fields: [machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]",
     "fail_closed: missing or breached required metrics produce non-zero exit",
+    "host_metadata: sanitized factual architecture/core, filesystem type, power source and cache/warmup state; placeholder values are forbidden",
+    "failure_behavior: stop after the first failed run, terminate and join worker/sampler resources, remove durable payloads, and retain the release failure manifest for diagnosis",
     "event_reconciliation: after graceful fixture shutdown enabled enqueued events must equal durable observations; every rejection remains explicit",
     "output: docs/evidence/local/performance/<run>/manifest.yaml",
 ];
@@ -141,6 +146,31 @@ struct PressurePeaks {
     disk_bytes: u64,
 }
 
+struct ChildGuard(Child);
+
+impl Deref for ChildGuard {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MetricSummary {
     idle_cpu_delta_percent: f64,
@@ -149,6 +179,27 @@ struct MetricSummary {
     enabled_rss_p95_kib: f64,
     total_allocated_disk_bytes: u64,
     network_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct HostEvidence {
+    machine: String,
+    filesystem: String,
+    power_mode: String,
+}
+
+impl HostEvidence {
+    fn collect(path: &Path) -> Result<Self, String> {
+        let logical_cores = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        Ok(Self {
+            machine: format!(
+                "sanitized-{}-{logical_cores}-logical-core",
+                env::consts::ARCH
+            ),
+            filesystem: filesystem_type(path)?,
+            power_mode: power_mode()?,
+        })
+    }
 }
 
 fn main() {
@@ -205,28 +256,36 @@ fn run(config: Config) -> Result<(), String> {
     fs::create_dir_all(&durable_root).map_err(|e| format!("create evidence directory: {e}"))?;
     fs::set_permissions(&durable_root, Permissions::from_mode(0o700))
         .map_err(|e| format!("protect durable evidence directory: {e}"))?;
+    let host = HostEvidence::collect(&root)?;
     let mut results = Vec::new();
     let mut errors = Vec::new();
-    for enabled in [false, true] {
+    'workload: for enabled in [false, true] {
         for run_number in 1..=config.runs {
             match execute_run(config, enabled, run_number, &durable_root) {
                 Ok(result) => results.push(result),
-                Err(error) => errors.push(format!(
-                    "{} run {run_number}: {error}",
-                    if enabled { "enabled" } else { "baseline" }
-                )),
+                Err(error) => {
+                    errors.push(format!(
+                        "{} run {run_number}: {error}",
+                        if enabled { "enabled" } else { "baseline" }
+                    ));
+                    break 'workload;
+                }
             }
         }
     }
     let manifest_path = root.join("manifest.yaml");
-    fs::write(&manifest_path, render_manifest(config, &results, &errors))
-        .map_err(|e| format!("write manifest: {e}"))?;
+    fs::write(
+        &manifest_path,
+        render_manifest(config, &host, &results, &errors),
+    )
+    .map_err(|e| format!("write manifest: {e}"))?;
     let pending_manifest =
         fs::read_to_string(&manifest_path).map_err(|e| format!("read pending manifest: {e}"))?;
     validate_manifest_shape(&pending_manifest)?;
-    if let Err(error) = validate_results(config, &results, &errors) {
+    let validation = validate_results(config, &results, &errors);
+    fs::remove_dir_all(&durable_root).map_err(|e| format!("remove durable evidence path: {e}"))?;
+    if let Err(error) = validation {
         if config.profile == Profile::Smoke {
-            let _ = fs::remove_dir_all(&durable_root);
             let _ = fs::remove_dir_all(&root);
         }
         return Err(format!(
@@ -238,7 +297,6 @@ fn run(config: Config) -> Result<(), String> {
         .map_err(|e| format!("read manifest: {e}"))?
         .replace("status: pending-validation", "status: pass");
     fs::write(&manifest_path, finalized).map_err(|e| format!("finalize manifest: {e}"))?;
-    fs::remove_dir_all(&durable_root).map_err(|e| format!("remove durable evidence path: {e}"))?;
     if config.profile == Profile::Smoke {
         fs::remove_dir_all(&root).map_err(|e| format!("remove smoke manifest: {e}"))?;
     }
@@ -274,7 +332,7 @@ fn execute_run(
     fs::create_dir_all(&path).map_err(|e| format!("create run artifact directory: {e}"))?;
     fs::set_permissions(&path, Permissions::from_mode(0o700))
         .map_err(|e| format!("protect run artifact directory: {e}"))?;
-    let mut child = spawn_worker(&path, enabled)?;
+    let mut child = ChildGuard(spawn_worker(&path, enabled)?);
     let network_baseline = network_bytes(child.id()).ok();
     let mut writer = BufWriter::new(child.stdin.take().ok_or("worker stdin unavailable")?);
     let stdout = child.stdout.take().ok_or("worker stdout unavailable")?;
@@ -286,7 +344,7 @@ fn execute_run(
         "warmup",
         config.warmup,
         config.sample,
-        &path,
+        durable_dir,
         child.id(),
         started,
         network_baseline,
@@ -296,14 +354,14 @@ fn execute_run(
         "idle",
         config.idle,
         config.sample,
-        &path,
+        durable_dir,
         child.id(),
         started,
         network_baseline,
     )?;
     let cpu_before = process_cpu_seconds(child.id())?;
     let burst_started = Instant::now();
-    let burst_sampler = start_pressure_sampler(path.clone(), child.id());
+    let burst_sampler = start_pressure_sampler(durable_dir.to_path_buf(), child.id())?;
     let mut latencies_us = Vec::with_capacity(config.burst);
     let mut rejected_events = 0_usize;
     for event in 0..config.burst {
@@ -336,10 +394,11 @@ fn execute_run(
         (cpu_after - cpu_before).max(0.0) / burst_elapsed.as_secs_f64() * 100.0
     };
     samples.push(sample(
-        &path,
+        durable_dir,
         child.id(),
         "active",
         started.elapsed(),
+        Some(burst_cpu_percent),
         network_baseline,
     )?);
     sample_phase(
@@ -347,19 +406,19 @@ fn execute_run(
         "active",
         config.active,
         config.sample,
-        &path,
+        durable_dir,
         child.id(),
         started,
         network_baseline,
     )?;
-    let drain_sampler = start_pressure_sampler(path.clone(), child.id());
+    let drain_sampler = start_pressure_sampler(durable_dir.to_path_buf(), child.id())?;
     drop(writer);
     let status = child.wait().map_err(|e| format!("wait for worker: {e}"))?;
     let drain_peaks = stop_pressure_sampler(drain_sampler)?;
     if !status.success() {
         return Err(format!("worker exited with {status}"));
     }
-    let durable_bytes = StorageBudget::allocated_tree_bytes(&path)
+    let durable_bytes = StorageBudget::allocated_tree_bytes(durable_dir)
         .map_err(|e| format!("measure allocated durable bytes: {e}"))?;
     let durable_events = if enabled {
         LocalStore::open(&path)
@@ -387,21 +446,51 @@ fn execute_run(
     })
 }
 
-type PressureSampler = (
-    mpsc::Sender<()>,
-    thread::JoinHandle<Result<PressurePeaks, String>>,
-);
+struct PressureSampler {
+    stop: Option<mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<Result<PressurePeaks, String>>>,
+}
 
-fn start_pressure_sampler(path: PathBuf, pid: u32) -> PressureSampler {
+impl Drop for PressureSampler {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn start_pressure_sampler(path: PathBuf, pid: u32) -> Result<PressureSampler, String> {
     let (stop_tx, stop_rx) = mpsc::channel();
+    let previous_cpu = process_cpu_seconds(pid)?;
+    let previous_at = Instant::now();
+    let initial_rss = ps_value(pid, "rss")
+        .and_then(|value| value.parse().ok())
+        .ok_or("process RSS is unavailable")?;
+    let initial_disk = StorageBudget::allocated_tree_bytes(&path)
+        .map_err(|e| format!("measure initial pressure disk: {e}"))?;
     let handle = thread::spawn(move || {
-        let mut peaks = PressurePeaks::default();
+        let mut peaks = PressurePeaks {
+            rss_kib: initial_rss,
+            disk_bytes: initial_disk,
+            ..PressurePeaks::default()
+        };
+        let mut previous_cpu = previous_cpu;
+        let mut previous_at = previous_at;
         loop {
-            peaks.cpu_percent = peaks.cpu_percent.max(
-                ps_value(pid, "%cpu")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.0),
-            );
+            let current_at = Instant::now();
+            let Ok(current_cpu) = process_cpu_seconds(pid) else {
+                break;
+            };
+            peaks.cpu_percent = peaks.cpu_percent.max(interval_cpu_percent(
+                previous_cpu,
+                current_cpu,
+                current_at.duration_since(previous_at),
+            ));
+            previous_cpu = current_cpu;
+            previous_at = current_at;
             peaks.rss_kib = peaks.rss_kib.max(
                 ps_value(pid, "rss")
                     .and_then(|v| v.parse().ok())
@@ -417,19 +506,41 @@ fn start_pressure_sampler(path: PathBuf, pid: u32) -> PressureSampler {
         }
         Ok(peaks)
     });
-    (stop_tx, handle)
+    Ok(PressureSampler {
+        stop: Some(stop_tx),
+        handle: Some(handle),
+    })
 }
 
-fn stop_pressure_sampler(sampler: PressureSampler) -> Result<PressurePeaks, String> {
-    let (stop, handle) = sampler;
-    let _ = stop.send(());
-    handle
+fn stop_pressure_sampler(mut sampler: PressureSampler) -> Result<PressurePeaks, String> {
+    if let Some(stop) = sampler.stop.take() {
+        let _ = stop.send(());
+    }
+    sampler
+        .handle
+        .take()
+        .ok_or_else(|| "pressure sampler handle is missing".to_string())?
         .join()
         .map_err(|_| "pressure sampler panicked".to_string())?
 }
 
+fn interval_cpu_percent(previous: f64, current: f64, elapsed: Duration) -> f64 {
+    if elapsed.is_zero() {
+        return 0.0;
+    }
+    (current - previous).max(0.0) / elapsed.as_secs_f64() * 100.0
+}
+
 fn process_cpu_seconds(pid: u32) -> Result<f64, String> {
-    let value = ps_value(pid, "time").ok_or("process CPU time is unavailable")?;
+    let mut value = None;
+    for _ in 0..5 {
+        value = ps_value(pid, "time");
+        if value.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let value = value.ok_or("process CPU time is unavailable")?;
     let (minutes, seconds) = value
         .rsplit_once(':')
         .ok_or("process CPU time has an invalid format")?;
@@ -454,15 +565,26 @@ fn sample_phase(
 ) -> Result<(), String> {
     let phase_started = Instant::now();
     let mut next_sample = phase_started + interval;
+    let mut previous_cpu = process_cpu_seconds(pid)?;
+    let mut previous_at = phase_started;
     while phase_started.elapsed() < duration {
         sleep(next_sample.saturating_duration_since(Instant::now()));
+        let current_at = Instant::now();
+        let current_cpu = process_cpu_seconds(pid)?;
         samples.push(sample(
             path,
             pid,
             phase,
             started.elapsed(),
+            Some(interval_cpu_percent(
+                previous_cpu,
+                current_cpu,
+                current_at.duration_since(previous_at),
+            )),
             network_baseline,
         )?);
+        previous_cpu = current_cpu;
+        previous_at = current_at;
         next_sample += interval;
     }
     if !samples.iter().any(|s| s.phase == phase) {
@@ -471,6 +593,7 @@ fn sample_phase(
             pid,
             phase,
             started.elapsed(),
+            Some(0.0),
             network_baseline,
         )?);
     }
@@ -719,12 +842,13 @@ fn sample(
     pid: u32,
     phase: &str,
     elapsed: Duration,
+    cpu_percent: Option<f64>,
     network_baseline: Option<u64>,
 ) -> Result<Sample, String> {
     Ok(Sample {
         phase: phase.into(),
         elapsed_ms: elapsed.as_millis(),
-        cpu_percent: ps_value(pid, "%cpu").and_then(|v| v.parse().ok()),
+        cpu_percent,
         rss_kib: ps_value(pid, "rss").and_then(|v| v.parse().ok()),
         disk_bytes: Some(
             StorageBudget::allocated_tree_bytes(path)
@@ -852,31 +976,162 @@ fn validate_network_surface() -> Result<(), String> {
     }
     Ok(())
 }
+
+fn filesystem_type(path: &Path) -> Result<String, String> {
+    filesystem_type_platform(path)
+}
+
+#[cfg(target_os = "macos")]
+fn filesystem_type_platform(path: &Path) -> Result<String, String> {
+    let df = Command::new("df")
+        .arg("-P")
+        .arg(path)
+        .output()
+        .map_err(|e| format!("locate evidence filesystem device: {e}"))?;
+    if !df.status.success() {
+        return Err("filesystem device command failed".into());
+    }
+    let body = String::from_utf8(df.stdout)
+        .map_err(|_| "filesystem device evidence is not UTF-8".to_string())?;
+    let device = body
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().next())
+        .ok_or("filesystem device evidence is missing")?;
+    let info = Command::new("diskutil")
+        .args(["info", device])
+        .output()
+        .map_err(|e| format!("inspect evidence filesystem: {e}"))?;
+    if !info.status.success() {
+        return Err("filesystem evidence command failed".into());
+    }
+    let body = String::from_utf8(info.stdout)
+        .map_err(|_| "filesystem evidence is not UTF-8".to_string())?;
+    let value = body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Type (Bundle):"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("filesystem type evidence is missing")?;
+    validated_evidence_token(value, "filesystem")
+}
+
+#[cfg(target_os = "linux")]
+fn filesystem_type_platform(path: &Path) -> Result<String, String> {
+    let output = Command::new("stat")
+        .args(["-f", "-c", "%T"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("inspect evidence filesystem: {e}"))?;
+    if !output.status.success() {
+        return Err("filesystem evidence command failed".into());
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|_| "filesystem evidence is not UTF-8".to_string())?;
+    validated_evidence_token(value.trim(), "filesystem")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn filesystem_type_platform(_path: &Path) -> Result<String, String> {
+    Err("filesystem evidence is unsupported on this host".into())
+}
+
+fn validated_evidence_token(value: &str, field: &str) -> Result<String, String> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(format!("{field} evidence is empty or unsafe"));
+    }
+    Ok(value.to_owned())
+}
+
+fn power_mode() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("pmset")
+            .args(["-g", "batt"])
+            .output()
+            .map_err(|e| format!("inspect power mode: {e}"))?;
+        if !output.status.success() {
+            return Err("power mode command failed".into());
+        }
+        let value = String::from_utf8(output.stdout)
+            .map_err(|_| "power mode evidence is not UTF-8".to_string())?;
+        if value.contains("AC Power") {
+            return Ok("ac".into());
+        }
+        if value.contains("Battery Power") {
+            return Ok("battery".into());
+        }
+        Err("power mode evidence is unavailable".into())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let root = Path::new("/sys/class/power_supply");
+        if !root.is_dir() {
+            return Ok("not-applicable-no-power-supply-interface".into());
+        }
+        let mut has_battery = false;
+        for entry in fs::read_dir(root).map_err(|e| format!("inspect power supplies: {e}"))? {
+            let path = entry
+                .map_err(|e| format!("inspect power supply entry: {e}"))?
+                .path();
+            let supply_type = fs::read_to_string(path.join("type")).unwrap_or_default();
+            if supply_type.trim() == "Battery" {
+                has_battery = true;
+            } else if fs::read_to_string(path.join("online"))
+                .is_ok_and(|online| online.trim() == "1")
+            {
+                return Ok("ac".into());
+            }
+        }
+        if has_battery {
+            Ok("battery".into())
+        } else {
+            Ok("not-applicable-no-power-supply".into())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    Err("power mode evidence is unsupported on this host".into())
+}
+
 fn ps_value(pid: u32, field: &str) -> Option<String> {
     let output = Command::new("ps")
-        .args(["-o", field, "-p", &pid.to_string()])
+        .arg("-o")
+        .arg(format!("{field}="))
+        .args(["-p", &pid.to_string()])
         .output()
         .ok()?;
     let value = String::from_utf8(output.stdout)
         .ok()?
         .lines()
-        .nth(1)?
+        .find(|line| !line.trim().is_empty())?
         .trim()
         .to_owned();
     (!value.is_empty()).then_some(value)
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_manifest(config: Config, results: &[RunResult], errors: &[String]) -> String {
+fn render_manifest(
+    config: Config,
+    host: &HostEvidence,
+    results: &[RunResult],
+    errors: &[String],
+) -> String {
     let all = results
         .iter()
         .filter(|result| result.enabled)
         .flat_map(|r| r.latencies_us.iter().copied())
         .collect::<Vec<_>>();
     let mut out = format!(
-        "schema_version: local_performance.v1\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: sanitized-local-host\nos: {}\nfilesystem: local-filesystem\npower_mode: unspecified\ncold_warm_cache: warm\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: local_runtime.v2\n  durable_store: local_state.v4\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  burst_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  channel_capacity: 64\n  normalization_workers: 1\n  durable_batch_records: {DURABLE_BATCH_RECORDS}\n  durable_batch_queue_capacity: {DURABLE_BATCH_QUEUE_CAPACITY}\n  durable_batch_queue_bytes_max: {DURABLE_BATCH_QUEUE_BYTES_MAX}\n  durable_handoff_bytes_max: {DURABLE_HANDOFF_BYTES_MAX}\n  total_pipeline_payload_bytes_max: {TOTAL_PIPELINE_PAYLOAD_BYTES_MAX}\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: bounded-batch-pump-and-asynchronous-local-store-writer\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: removed-after-measurement\nall_run_samples:\n",
+        "schema_version: local_performance.v1\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: {}\nos: {}\nfilesystem: {}\npower_mode: {}\ncold_warm_cache: warm-after-build-and-per-run-warmup\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: local_runtime.v2\n  durable_store: local_state.v4\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  burst_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  channel_capacity: 64\n  normalization_workers: 1\n  durable_batch_records: {DURABLE_BATCH_RECORDS}\n  durable_batch_queue_capacity: {DURABLE_BATCH_QUEUE_CAPACITY}\n  durable_batch_queue_bytes_max: {DURABLE_BATCH_QUEUE_BYTES_MAX}\n  durable_handoff_bytes_max: {DURABLE_HANDOFF_BYTES_MAX}\n  total_pipeline_payload_bytes_max: {TOTAL_PIPELINE_PAYLOAD_BYTES_MAX}\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: bounded-batch-pump-and-asynchronous-local-store-writer\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: run-relative/durable\n  durable_path_lifecycle: removed-after-measurement\nall_run_samples:\n",
         profile_name(config.profile),
+        host.machine,
         env::consts::OS,
+        host.filesystem,
+        host.power_mode,
         thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
         env!("CARGO_PKG_VERSION"),
         config.runs,
@@ -999,6 +1254,24 @@ fn validate_manifest_shape(manifest: &str) -> Result<(), String> {
             ));
         }
     }
+    for invalid in [
+        "machine: sanitized-local-host",
+        "filesystem: local-filesystem",
+        "power_mode: unspecified",
+        "durable_path: removed-after-measurement",
+    ] {
+        if manifest.lines().any(|line| line.trim() == invalid) {
+            return Err(format!(
+                "performance manifest contains placeholder evidence {invalid}"
+            ));
+        }
+    }
+    if !manifest
+        .lines()
+        .any(|line| line.trim() == "durable_path: run-relative/durable")
+    {
+        return Err("performance manifest is missing sanitized durable path evidence".into());
+    }
     Ok(())
 }
 fn optional_f64(value: Option<f64>) -> String {
@@ -1113,7 +1386,10 @@ fn validate_results(
     results: &[RunResult],
     errors: &[String],
 ) -> Result<(), String> {
-    if !errors.is_empty() || results.len() != config.runs * 2 {
+    if !errors.is_empty() {
+        return Err(format!("workload errors: {}", errors.join("; ")));
+    }
+    if results.len() != config.runs * 2 {
         return Err("incomplete baseline/enabled evidence".into());
     }
     if results
@@ -1264,6 +1540,13 @@ mod tests {
             r(true, enabled),
         ]
     }
+    fn host() -> HostEvidence {
+        HostEvidence {
+            machine: "sanitized-test-4-logical-core".into(),
+            filesystem: "testfs".into(),
+            power_mode: "ac".into(),
+        }
+    }
     fn enabled(idle_cpu: f64, active_cpu: f64, rss: f64, disk: u64, net: u64) -> Vec<Sample> {
         vec![
             s("warmup", Some(0.1), Some(rss), Some(disk), Some(net)),
@@ -1363,7 +1646,11 @@ mod tests {
 
     #[test]
     fn manifest_contains_computed_phase_and_network_evidence() {
-        let manifest = render_manifest(c(), &pair(enabled(0.1, 0.1, 1.0, 1, 0)), &[]);
+        let manifest = render_manifest(c(), &host(), &pair(enabled(0.1, 0.1, 1.0, 1, 0)), &[]);
+        assert!(manifest.contains("machine: sanitized-test-4-logical-core"));
+        assert!(manifest.contains("filesystem: testfs"));
+        assert!(manifest.contains("power_mode: ac"));
+        assert!(manifest.contains("durable_path: run-relative/durable"));
         assert!(manifest.contains("idle_average_cpu_delta_percent: 0"));
         assert!(manifest.contains("active_any_minute_cpu_delta_percent: 0"));
         assert!(manifest.contains("durable_batch_queue_capacity: 12"));
@@ -1372,6 +1659,22 @@ mod tests {
         assert!(manifest.contains("total_pipeline_payload_bytes_max: 11534336"));
         assert!(manifest.contains("network_static_surface: pass"));
         assert!(manifest.contains("network_bytes: 0"));
+        validate_manifest_shape(&manifest).unwrap();
+
+        let placeholder = manifest.replace(
+            "machine: sanitized-test-4-logical-core",
+            "machine: sanitized-local-host",
+        );
+        assert!(validate_manifest_shape(&placeholder).is_err());
+    }
+
+    #[test]
+    fn interval_cpu_uses_process_delta_over_wall_time() {
+        assert!(
+            (interval_cpu_percent(1.0, 1.25, Duration::from_secs(1)) - 25.0).abs() < f64::EPSILON
+        );
+        assert!(interval_cpu_percent(2.0, 1.0, Duration::from_secs(1)).abs() < f64::EPSILON);
+        assert!(interval_cpu_percent(1.0, 2.0, Duration::ZERO).abs() < f64::EPSILON);
     }
 
     #[test]

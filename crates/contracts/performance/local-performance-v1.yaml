@@ -38,6 +38,7 @@ metrics:
     foreground_hook_p99_ms_max: 50
   cpu:
     normalization: percent of one logical core
+    sampling: process CPU time delta divided by sample wall-time delta; lifetime-average percent is forbidden
     idle_average_percent_max: 0.5
     active_average_percent_max: 2
     active_any_minute_percent_max: 5
@@ -47,7 +48,7 @@ metrics:
     burst_and_drain_peak_required: true
   disk:
     total_bytes_max: 1073741824
-    accounting: allocated filesystem blocks including directories, durable state, final state, projections, crash and sampled temp artifacts
+    accounting: allocated filesystem blocks for the full release durable root across all retained run directories, including durable state, final state, projections, crash and sampled temp artifacts
   network:
     mode: process-scoped samples plus bounded static product-surface scan
     linux_evidence: worker has no socket descriptors at every sample
@@ -58,5 +59,7 @@ metrics:
 evidence:
   output: docs/evidence/local/performance/<run>/manifest.yaml
   required_fields: [machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]
+  host_metadata: sanitized factual architecture/core, filesystem type, power source and cache/warmup state; placeholder values are forbidden
   fail_closed: missing or breached required metrics produce non-zero exit
+  failure_behavior: stop after the first failed run, terminate and join worker/sampler resources, remove durable payloads, and retain the release failure manifest for diagnosis
   event_reconciliation: after graceful fixture shutdown enabled enqueued events must equal durable observations; every rejection remains explicit
