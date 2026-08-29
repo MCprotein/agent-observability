@@ -904,6 +904,12 @@ Future TODO (버전 미확정):
 - 첫 hosted data region, legal deletion wording과 enterprise identity 후속 우선순위
 - 민감 프로젝트 opt-out 정책
 
+## 기여와 운영
+
+버전 scope와 완료 조건은 [ROADMAP.md](ROADMAP.md), branch/PR/review/merge 절차는
+[CONTRIBUTING.md](CONTRIBUTING.md)를 따른다. 버그, 제안, 운영 정책 결정은
+[GitHub Issues](https://github.com/MCprotein/agent-observability/issues)에 기록한다.
+
 ## 요약
 
 AI coding agent observability는 network interception보다 agent-native surface를
