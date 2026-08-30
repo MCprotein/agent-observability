@@ -7,7 +7,8 @@ use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -521,6 +522,9 @@ fn execute_run_with_child(
     read_worker_marker(&mut reader, "drain-start")?;
     read_worker_marker(&mut reader, "drain-complete")?;
     let status_result = child.wait().map_err(|e| format!("wait for worker: {e}"));
+    if status_result.is_ok() {
+        drain_sampler.confirm_process_exit();
+    }
     let drain_result = drain_sampler.stop();
     let status = status_result?;
     let drain_peaks = drain_result?;
@@ -561,6 +565,7 @@ fn execute_run_with_child(
 struct PressureSampler {
     stop: Option<mpsc::Sender<()>>,
     handle: Option<thread::JoinHandle<Result<PressurePeaks, String>>>,
+    process_exit_confirmed: Arc<AtomicBool>,
 }
 
 impl Drop for PressureSampler {
@@ -574,6 +579,10 @@ impl Drop for PressureSampler {
 }
 
 impl PressureSampler {
+    fn confirm_process_exit(&self) {
+        self.process_exit_confirmed.store(true, Ordering::Release);
+    }
+
     fn stop(&mut self) -> Result<PressurePeaks, String> {
         let signal_failed = self.stop.take().is_some_and(|stop| stop.send(()).is_err());
         let peaks = self
@@ -601,6 +610,8 @@ fn start_pressure_sampler(
     let initial_rss = ps_metric(pid, "rss")?;
     let initial_disk = StorageBudget::allocated_tree_bytes(&path)
         .map_err(|e| format!("measure initial pressure disk: {e}"))?;
+    let process_exit_confirmed = Arc::new(AtomicBool::new(false));
+    let sampler_exit_confirmed = Arc::clone(&process_exit_confirmed);
     let handle = thread::spawn(move || {
         let mut peaks = PressurePeaks {
             rss_kib: initial_rss,
@@ -615,13 +626,14 @@ fn start_pressure_sampler(
                 .map(marker_is_active)
                 .transpose()?
                 .unwrap_or(false);
-            let current_cpu = match process_cpu_seconds(pid) {
-                Ok(value) => value,
-                Err(_) if allow_process_exit && !process_exists(pid) => {
-                    peaks.process_exit_observed = true;
-                    break;
-                }
-                Err(error) => return Err(error),
+            let Some(current_cpu) = metric_or_confirmed_exit(
+                process_cpu_seconds(pid),
+                allow_process_exit,
+                &sampler_exit_confirmed,
+            )?
+            else {
+                peaks.process_exit_observed = true;
+                break;
             };
             let current_at = Instant::now();
             peaks.cpu_percent = peaks.cpu_percent.max(interval_cpu_percent(
@@ -631,7 +643,16 @@ fn start_pressure_sampler(
             ));
             previous_cpu = current_cpu;
             previous_at = current_at;
-            peaks.rss_kib = peaks.rss_kib.max(ps_metric(pid, "rss")?);
+            let Some(current_rss) = metric_or_confirmed_exit(
+                ps_metric(pid, "rss"),
+                allow_process_exit,
+                &sampler_exit_confirmed,
+            )?
+            else {
+                peaks.process_exit_observed = true;
+                break;
+            };
+            peaks.rss_kib = peaks.rss_kib.max(current_rss);
             peaks.disk_bytes = peaks.disk_bytes.max(
                 StorageBudget::allocated_tree_bytes(&path)
                     .map_err(|e| format!("measure pressure disk peak: {e}"))?,
@@ -654,6 +675,7 @@ fn start_pressure_sampler(
     Ok(PressureSampler {
         stop: Some(stop_tx),
         handle: Some(handle),
+        process_exit_confirmed,
     })
 }
 
@@ -716,8 +738,24 @@ fn ps_metric(pid: u32, field: &str) -> Result<f64, String> {
     Ok(value)
 }
 
-fn process_exists(pid: u32) -> bool {
-    ps_value(pid, "pid").is_some()
+fn metric_or_confirmed_exit(
+    metric: Result<f64, String>,
+    allow_process_exit: bool,
+    process_exit_confirmed: &AtomicBool,
+) -> Result<Option<f64>, String> {
+    match metric {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if allow_process_exit => {
+            for _ in 0..20 {
+                if process_exit_confirmed.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
 }
 #[allow(clippy::too_many_arguments)]
 fn sample_phase(
@@ -1967,6 +2005,65 @@ mod tests {
         );
         assert!(interval_cpu_percent(2.0, 1.0, Duration::from_secs(1)).abs() < f64::EPSILON);
         assert!(interval_cpu_percent(1.0, 2.0, Duration::ZERO).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn drain_metric_allows_only_a_parent_confirmed_process_exit() {
+        let process_exit_confirmed = AtomicBool::new(false);
+        assert!(
+            metric_or_confirmed_exit(
+                Err("process rss is unavailable".into()),
+                true,
+                &process_exit_confirmed,
+            )
+            .is_err()
+        );
+        process_exit_confirmed.store(true, Ordering::Release);
+        assert_eq!(
+            metric_or_confirmed_exit(
+                Err("process rss is unavailable".into()),
+                true,
+                &process_exit_confirmed,
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            metric_or_confirmed_exit(
+                Err("process rss is unavailable".into()),
+                false,
+                &process_exit_confirmed,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn drain_sampler_accepts_exit_only_after_child_wait_confirms_it() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-xtask-sampler-exit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = Command::new("sleep")
+            .arg("0.2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut sampler = start_pressure_sampler(root.clone(), child.id(), true, None).unwrap();
+        assert!(child.wait().unwrap().success());
+        sampler.confirm_process_exit();
+        thread::sleep(Duration::from_millis(30));
+        let peaks = sampler.stop().unwrap();
+        assert!(peaks.process_exit_observed);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
