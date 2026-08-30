@@ -711,16 +711,51 @@ fn process_cpu_seconds(pid: u32) -> Result<f64, String> {
         thread::sleep(Duration::from_millis(5));
     }
     let value = value.ok_or("process CPU time is unavailable")?;
-    let (minutes, seconds) = value
-        .rsplit_once(':')
-        .ok_or("process CPU time has an invalid format")?;
-    let minutes = minutes
-        .parse::<u32>()
-        .map_err(|_| "process CPU minutes are invalid")?;
-    let seconds = seconds
+    parse_process_cpu_seconds(&value)
+}
+
+fn parse_process_cpu_seconds(value: &str) -> Result<f64, String> {
+    let mut parts = value.rsplit(':');
+    let seconds = parts
+        .next()
+        .ok_or("process CPU time has an invalid format")?
         .parse::<f64>()
         .map_err(|_| "process CPU seconds are invalid")?;
-    let total = f64::from(minutes) * 60.0 + seconds;
+    let minutes = parts
+        .next()
+        .ok_or("process CPU time has an invalid format")?
+        .parse::<u32>()
+        .map_err(|_| "process CPU minutes are invalid")?;
+    let hours_and_days = parts.next();
+    let has_hours = hours_and_days.is_some();
+    if parts.next().is_some() {
+        return Err("process CPU time has an invalid format".into());
+    }
+    let (days, hours) = match hours_and_days {
+        None => (0, 0),
+        Some(value) => match value.split_once('-') {
+            Some((days, hours)) => (
+                days.parse::<u32>()
+                    .map_err(|_| "process CPU days are invalid")?,
+                hours
+                    .parse::<u32>()
+                    .map_err(|_| "process CPU hours are invalid")?,
+            ),
+            None => (
+                0,
+                value
+                    .parse::<u32>()
+                    .map_err(|_| "process CPU hours are invalid")?,
+            ),
+        },
+    };
+    if (has_hours && minutes >= 60) || hours >= 24 || !(0.0..60.0).contains(&seconds) {
+        return Err("process CPU time components are out of range".into());
+    }
+    let total = f64::from(days) * 86_400.0
+        + f64::from(hours) * 3_600.0
+        + f64::from(minutes) * 60.0
+        + seconds;
     if !total.is_finite() || total.is_sign_negative() {
         return Err("process CPU time is non-finite or negative".into());
     }
@@ -2005,6 +2040,22 @@ mod tests {
         );
         assert!(interval_cpu_percent(2.0, 1.0, Duration::from_secs(1)).abs() < f64::EPSILON);
         assert!(interval_cpu_percent(1.0, 2.0, Duration::ZERO).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn process_cpu_time_accepts_macos_and_linux_formats() {
+        assert!((parse_process_cpu_seconds("2:03.50").unwrap() - 123.5).abs() < f64::EPSILON);
+        assert!((parse_process_cpu_seconds("61:00.00").unwrap() - 3_660.0).abs() < f64::EPSILON);
+        assert!((parse_process_cpu_seconds("01:02:03").unwrap() - 3_723.0).abs() < f64::EPSILON);
+        assert!(
+            (parse_process_cpu_seconds("2-01:02:03").unwrap() - 176_523.0).abs() < f64::EPSILON
+        );
+        assert!(parse_process_cpu_seconds("01:60:00").is_err());
+        assert!(parse_process_cpu_seconds("-1:00").is_err());
+        assert!(parse_process_cpu_seconds("1:NaN").is_err());
+        assert!(parse_process_cpu_seconds("1:inf").is_err());
+        assert!(parse_process_cpu_seconds("4294967296:00").is_err());
+        assert!(parse_process_cpu_seconds("not-a-time").is_err());
     }
 
     #[test]
