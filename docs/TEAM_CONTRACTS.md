@@ -118,12 +118,18 @@ budgets and load-shedding order in `TEAM_ARCHITECTURE.md`.
 Hook ingress reads at most 1 MiB and emits an allowlisted local message of at most 64 KiB. It never persists raw
 overflow bytes. Local channel capacity, normalization writer count, durable batch size, and durable handoff
 capacity are implementation constants recorded in the evidence manifest, not unbounded/user-controlled values.
-The current fixture bounds that handoff to 12 queued batches of at most 500 records and 512 KiB each;
-including the pump's pending send and the active writer batch, the durable handoff is at most 7 MiB,
-and the 64-message ingress raises the total pipeline payload bound to 11 MiB. Full-channel and receiver-unavailable outcomes return
-without waiting for network or drain and expose only bounded counters/reason codes. The v0.13 gate compares a
+The current fixture uses one CPU execution token with batches of at most 32 records or 512 KiB.
+Including one pending 64 KiB message, the durable handoff is at most 576 KiB, and the 64-message
+ingress raises the total pipeline payload bound to about 4.6 MiB. Full-channel and receiver-unavailable outcomes return
+without waiting for network or drain and expose only bounded counters/reason codes. The v1.2 gate supersedes
+the v0.13 unpaced-burst protocol and compares a
 deterministic three-source fixture host plus the real bounded ingress and durable drain against a
-collection-disabled fixture-host baseline. A future resident daemon or IPC receiver is team-profile scope;
+collection-disabled fixture-host baseline. Baseline and enabled supported-rate passes use the same
+3 ms driver inter-arrival schedule; a separate enabled-only unpaced saturation pass verifies bounded
+rejection, latency, memory, and durable reconciliation. A durability barrier isolates supported-rate
+CPU and backlog before saturation starts; supported CPU includes the accepted durable commit tail
+through barrier completion. This workload schedule is not product-side
+pacing or a device-wide CPU guarantee. Peak CPU sampling uses the profile-declared interval. A future resident daemon or IPC receiver is team-profile scope;
 resident-daemon-only measurements and hard-coded metrics do not satisfy the
 gate. Product-process compatibility remains a separate adapter capability fixture because external process
 versions and background activity are not a reproducible performance baseline.
@@ -146,13 +152,14 @@ Worst-case block reservation is checked before write. Startup removes orphan tem
 the `normal/pressured/protected/probe` load-shedding transitions are normative in `TEAM_ARCHITECTURE.md` and use a
 deterministic-clock fixture.
 
-`local-performance-v1.yaml` fixes workload size, 60-second warm-up, 15-minute idle/active runs, 10,000-event
-burst, one-second sampler, CPU normalization, machine/OS/filesystem/power metadata, cold/warm cache, three-adapter
-schedule and threshold calculation. The xtask command emits
-`docs/evidence/local/performance/<run>/manifest.yaml` and exits non-zero on any budget breach. No v0.13/v1.0
-release can pass with a missing manifest or a resident-daemon-only sample. The enabled burst records attempted,
-enqueued, rejected and durable counts, permits at most 1% explicit fail-open rejection, and requires
-enqueued and durable counts to match after graceful fixture shutdown. Enqueue is not a foreground
+`local-performance-v1.yaml` fixes 60-second warm-up, 15-minute idle/active runs, a symmetric 10,000-event
+supported-rate pass, an enabled-only 10,000-event unpaced saturation pass, one-second sampler, CPU normalization,
+machine/OS/filesystem/power metadata, cold/warm cache, three-adapter schedule and threshold calculation. A durability
+barrier commits supported accepted events before saturation. The xtask command emits
+`docs/evidence/local/performance/<run>/manifest.yaml` and exits non-zero on any budget breach. No release can pass
+with a missing manifest or a resident-daemon-only sample. Each enabled pass records attempted,
+enqueued and rejected counts, permits at most 1% explicit fail-open rejection, and requires their combined
+enqueued count to match durable observations after graceful fixture shutdown. Enqueue is not a foreground
 durability guarantee.
 
 ## 3. V1 transport contract

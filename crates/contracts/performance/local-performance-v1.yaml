@@ -1,12 +1,15 @@
 schema_version: local_performance.v1
-version: v0.13.0
+version: v1.2.0
+protocol_revision: v1.2.0-supported-rate-and-saturation
 purpose: normative local-only performance evidence protocol
 profiles:
   release:
     warmup_seconds: 60
     idle_seconds: 900
     active_seconds: 900
-    burst_events: 10000
+    supported_rate_events: 10000
+    supported_inter_event_ms: 3
+    saturation_events: 10000
     sample_interval_seconds: 1
     baseline_runs: 5
     enabled_runs: 5
@@ -16,18 +19,19 @@ profiles:
 workload:
   adapters: [codex, claude-code, cursor]
   schedule: deterministic round-robin codex, claude-code, cursor SourceObservation ingress
+  supported_rate_schedule: symmetric driver pacing for baseline and enabled
+  saturation_schedule: enabled-only unpaced arrival after supported-rate measurement
   fixture_host_scope: this manifest describes the host running xtask; it is not portable hardware evidence
   channel_capacity: 64
   normalization_workers: 1
-  durable_batch_records: 500
-  durable_batch_queue_capacity: 12
-  durable_batch_queue_bytes_max: 6291456
-  durable_handoff_bytes_max: 7340032
-  total_pipeline_payload_bytes_max: 11534336
+  durable_batch_records: 32
+  durable_handoff_bytes_max: 589824
+  total_pipeline_payload_bytes_max: 4784128
   enqueue_deadline_ms: 10
   enabled_rejection_percent_max: 1
+  rejection_budget_applies_to: each enabled supported-rate and saturation pass
   foreground_response: bounded enqueue acceptance, never durable commit
-  worker: asynchronous bounded batch pump, one LocalStore normalization writer, and final projection rebuild
+  worker: one bounded batch LocalStore drain actor and final projection rebuild
   command_measurement: subprocess round-trip through bounded local-runtime enqueue; durable commit is asynchronous worker evidence
   daemon_only_measurement: forbidden
   durable_path: required local file-backed path; sanitized relative path in manifest
@@ -39,13 +43,17 @@ metrics:
   cpu:
     normalization: percent of one logical core
     sampling: process CPU time delta divided by sample wall-time delta; lifetime-average percent is forbidden
+    peak_sampling_interval: profile sample_interval_seconds
     idle_average_percent_max: 0.5
     active_average_percent_max: 2
     active_any_minute_percent_max: 5
-    burst_integrated_and_sampled_percent_max: 100
+    supported_rate_integrated_and_sampled_percent_max: 100
+    saturation_cpu: recorded for diagnosis and never used to dilute supported-rate CPU
+    supported_rate_durability_barrier: required before saturation
+    supported_rate_measurement_boundary: first command through durability barrier completion; accepted commit tail is included
   rss:
     p95_mib_max: 96
-    burst_and_drain_peak_required: true
+    supported_rate_saturation_and_drain_peak_required: true
   disk:
     total_bytes_max: 1073741824
     accounting: allocated filesystem blocks for the full release durable root across all retained run directories, including durable state, final state, projections, crash and sampled temp artifacts
@@ -58,8 +66,8 @@ metrics:
     required_bytes: 0
 evidence:
   output: docs/evidence/local/performance/<run>/manifest.yaml
-  required_fields: [machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]
+  required_fields: [protocol_revision, machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]
   host_metadata: sanitized factual architecture/core, filesystem type, power source and cache/warmup state; placeholder values are forbidden
   fail_closed: missing or breached required metrics produce non-zero exit
   failure_behavior: stop after the first failed run, terminate and join worker/sampler resources, remove durable payloads, and retain the release failure manifest for diagnosis
-  event_reconciliation: after graceful fixture shutdown enabled enqueued events must equal durable observations; every rejection remains explicit
+  event_reconciliation: after graceful fixture shutdown enabled supported-rate plus saturation enqueued events must equal durable observations; every rejection remains explicit per pass

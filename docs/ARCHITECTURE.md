@@ -228,12 +228,16 @@ anti-corruption layer다.
 - 설치 루트를 받는 ingest command는 같은 strict config와 singleton을 실제 write 전 과정에 적용한다.
 - foreground ingress는 1 MiB raw input, 64 KiB projected message, 64-slot channel과 one normalization
   writer로 고정한다. full/unavailable/oversized는 nonblocking fail-open outcome이다. `xtask`의
-  drain은 최대 500-record batch 12개를 writer 앞에서 buffering하며, batch당 512 KiB 제한으로 이
-  queue payload를 최대 6 MiB로 제한한다. pump가 송신 대기 중인 batch와 writer가 처리 중인 batch까지
-  포함한 durable handoff payload 상한은 7 MiB이며, 64-slot ingress payload까지 포함한 전체
-  pipeline 상한은 11 MiB다. 현재 이 foreground
-  ingress/worker composition은 `xtask` release fixture가 검증하며, CLI handoff ingest는 이미 만들어진
-  bounded batch를 singleton 아래 transaction store에 직접 반영한다. Release fixture는 enabled burst의
+  drain은 단일 CPU execution token 아래 최대 32-record, 512 KiB batch를 처리한다. active batch와
+  64 KiB pending message를 포함한 durable handoff payload 상한은 576 KiB이며, 64-slot ingress까지
+  포함한 전체 pipeline 상한은 약 4.6 MiB다. release fixture는 baseline과 enabled에 동일한 3 ms driver inter-arrival
+  schedule을 적용해 지원 처리율의 합산 CPU를 비교하고, 이어지는 enabled-only unpaced saturation pass로
+  rejection, latency, bounded memory, durable reconciliation을 별도 검증한다. 두 pass 사이 durability
+  barrier가 supported accepted event의 commit 완료를 보장해 CPU와 backlog 귀속을 분리한다. supported CPU는
+  첫 command부터 barrier 완료까지 측정해 accepted commit tail을 포함한다. 이 schedule은 제품 내부
+  pacing이나 device-wide CPU 보장으로 해석하지 않는다. 현재 이 foreground
+  ingress/drain composition은 `xtask` release fixture가 검증하며, CLI handoff ingest는 이미 만들어진
+  bounded batch를 singleton 아래 transaction store에 직접 반영한다. Release fixture는 enabled saturation의
   fail-open rejection을 1% 이하로 제한하고 graceful shutdown 뒤 enqueued count와 durable observation
   count를 대조한다. Foreground enqueue 자체는 durability를 보장하지 않는다.
 - 저장소 용량은 allocated block과 worst-case write로 admission한다. age retention은 strict 설정의

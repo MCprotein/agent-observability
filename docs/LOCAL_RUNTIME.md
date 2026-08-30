@@ -56,10 +56,18 @@ The installed configuration is intentionally small:
 - Raw foreground input: at most 1 MiB.
 - Privacy-projected local message: at most 64 KiB.
 - In-process ingress channel: 64 messages, one normalization writer, nonblocking admission. The
-  release fixture places a 12-batch durable handoff before that writer, uses at most 500 records and
-  512 KiB per batch, and therefore bounds queued batch payloads to 6 MiB. Including one batch
-  waiting in the pump and one active writer batch, the durable handoff payload is bounded to 7 MiB;
-  including the 64-message ingress, the total pipeline payload is bounded to 11 MiB.
+  release fixture uses one CPU execution token and batches at most 32 records or 512 KiB. Including
+  one pending 64 KiB message, the durable handoff is bounded to 576 KiB; including the ingress
+  channel, the total pipeline payload is bounded to about 4.6 MiB.
+- The release fixture applies the same 3 ms driver inter-arrival schedule to baseline and enabled
+  supported-rate passes. A separate enabled-only unpaced saturation pass verifies rejection,
+  latency, bounded memory, and durable reconciliation. A durability barrier commits every accepted
+  supported-rate event before saturation begins. This is workload evidence, not product-side
+  pacing or a device-wide CPU guarantee.
+- Supported-rate CPU is measured from the first command through barrier completion, including the
+  durable commit tail for every accepted event.
+- Peak process CPU uses the profile's declared sample interval: one second for normative release
+  evidence. This keeps process CPU-time resolution and wall-time normalization aligned.
 - Full, unavailable, and oversized outcomes are bounded counters; they do not wait for drain or
   network.
 - One process owns the private runtime directory through an OS-held file lock and random boot

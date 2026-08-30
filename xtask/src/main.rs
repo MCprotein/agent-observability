@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,12 +25,15 @@ use agent_observability_local_store::LocalStore;
 
 const USAGE: &str = "usage: cargo run -p xtask -- perf local --profile <release|smoke> --check";
 const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-performance-v1.yaml");
-const REQUIRED_PROTOCOL_LINES: [&str; 36] = [
+const REQUIRED_PROTOCOL_LINES: [&str; 42] = [
     "schema_version: local_performance.v1",
+    "protocol_revision: v1.2.0-supported-rate-and-saturation",
     "warmup_seconds: 60",
     "idle_seconds: 900",
     "active_seconds: 900",
-    "burst_events: 10000",
+    "supported_rate_events: 10000",
+    "supported_inter_event_ms: 3",
+    "saturation_events: 10000",
     "sample_interval_seconds: 1",
     "baseline_runs: 5",
     "enabled_runs: 5",
@@ -40,27 +43,30 @@ const REQUIRED_PROTOCOL_LINES: [&str; 36] = [
     "active_average_percent_max: 2",
     "active_any_minute_percent_max: 5",
     "sampling: process CPU time delta divided by sample wall-time delta; lifetime-average percent is forbidden",
-    "burst_integrated_and_sampled_percent_max: 100",
+    "peak_sampling_interval: profile sample_interval_seconds",
+    "supported_rate_integrated_and_sampled_percent_max: 100",
+    "saturation_cpu: recorded for diagnosis and never used to dilute supported-rate CPU",
+    "supported_rate_durability_barrier: required before saturation",
+    "supported_rate_measurement_boundary: first command through durability barrier completion; accepted commit tail is included",
     "p95_mib_max: 96",
-    "burst_and_drain_peak_required: true",
+    "supported_rate_saturation_and_drain_peak_required: true",
     "total_bytes_max: 1073741824",
     "accounting: allocated filesystem blocks for the full release durable root across all retained run directories, including durable state, final state, projections, crash and sampled temp artifacts",
     "ingest_requests_in_flight_max: 0",
     "required_bytes: 0",
     "channel_capacity: 64",
     "normalization_workers: 1",
-    "durable_batch_records: 500",
-    "durable_batch_queue_capacity: 12",
-    "durable_batch_queue_bytes_max: 6291456",
-    "durable_handoff_bytes_max: 7340032",
-    "total_pipeline_payload_bytes_max: 11534336",
+    "durable_batch_records: 32",
+    "durable_handoff_bytes_max: 589824",
+    "total_pipeline_payload_bytes_max: 4784128",
     "enqueue_deadline_ms: 10",
     "enabled_rejection_percent_max: 1",
-    "required_fields: [machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]",
+    "rejection_budget_applies_to: each enabled supported-rate and saturation pass",
+    "required_fields: [protocol_revision, machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]",
     "fail_closed: missing or breached required metrics produce non-zero exit",
     "host_metadata: sanitized factual architecture/core, filesystem type, power source and cache/warmup state; placeholder values are forbidden",
     "failure_behavior: stop after the first failed run, terminate and join worker/sampler resources, remove durable payloads, and retain the release failure manifest for diagnosis",
-    "event_reconciliation: after graceful fixture shutdown enabled enqueued events must equal durable observations; every rejection remains explicit",
+    "event_reconciliation: after graceful fixture shutdown enabled supported-rate plus saturation enqueued events must equal durable observations; every rejection remains explicit per pass",
     "output: docs/evidence/local/performance/<run>/manifest.yaml",
 ];
 const SOURCES: [(&str, AgentSource); 3] = [
@@ -69,12 +75,11 @@ const SOURCES: [(&str, AgentSource); 3] = [
     ("cursor", AgentSource::Cursor),
 ];
 const DURABLE_BATCH_COALESCE: Duration = Duration::from_millis(3);
-const DURABLE_BATCH_RECORDS: u16 = 500;
+const SUPPORTED_INTER_EVENT_PERIOD: Duration = Duration::from_millis(3);
+const DURABLE_BATCH_RECORDS: u16 = 32;
 const DURABLE_BATCH_BYTES: u32 = 524_288;
-const DURABLE_BATCH_QUEUE_CAPACITY: usize = 12;
-const DURABLE_BATCH_QUEUE_BYTES_MAX: u32 = 6_291_456;
-const DURABLE_HANDOFF_BYTES_MAX: u32 = 7_340_032;
-const TOTAL_PIPELINE_PAYLOAD_BYTES_MAX: u32 = 11_534_336;
+const DURABLE_HANDOFF_BYTES_MAX: u32 = 589_824;
+const TOTAL_PIPELINE_PAYLOAD_BYTES_MAX: u32 = 4_784_128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Profile {
@@ -87,7 +92,8 @@ struct Config {
     warmup: Duration,
     idle: Duration,
     active: Duration,
-    burst: usize,
+    supported_events: usize,
+    saturation_events: usize,
     runs: usize,
     sample: Duration,
 }
@@ -99,7 +105,8 @@ impl Config {
                 warmup: Duration::from_mins(1),
                 idle: Duration::from_mins(15),
                 active: Duration::from_mins(15),
-                burst: 10_000,
+                supported_events: 10_000,
+                saturation_events: 10_000,
                 runs: 5,
                 sample: Duration::from_secs(1),
             },
@@ -108,7 +115,8 @@ impl Config {
                 warmup: Duration::from_millis(100),
                 idle: Duration::from_millis(250),
                 active: Duration::from_millis(500),
-                burst: 100,
+                supported_events: 100,
+                saturation_events: 100,
                 runs: 1,
                 sample: Duration::from_millis(100),
             },
@@ -131,11 +139,15 @@ struct RunResult {
     run: usize,
     events: usize,
     rejected_events: usize,
+    saturation_events: usize,
+    saturation_rejected_events: usize,
     durable_events: u64,
     latencies_us: Vec<u128>,
+    saturation_latencies_us: Vec<u128>,
     samples: Vec<Sample>,
     durable_bytes: u64,
-    burst_cpu_percent: f64,
+    supported_rate_cpu_percent: f64,
+    saturation_cpu_percent: f64,
     peak_rss_kib: f64,
     peak_disk_bytes: u64,
 }
@@ -147,6 +159,11 @@ struct PressurePeaks {
     disk_bytes: u64,
     drain_sample_count: usize,
     process_exit_observed: bool,
+}
+
+struct WorkloadPass {
+    latencies_us: Vec<u128>,
+    rejected_events: usize,
 }
 
 struct DirectoryCleanup {
@@ -343,21 +360,30 @@ fn run(config: Config) -> Result<(), String> {
         }
     }
     let manifest_path = root.join("manifest.yaml");
+    let validation = validate_results(config, &results, &errors);
+    let mut manifest_errors = errors.clone();
+    if let Err(error) = &validation {
+        manifest_errors.push(format!("validation: {error}"));
+    }
     let completion = (|| -> Result<(), String> {
         fs::write(
             &manifest_path,
-            render_manifest(config, &host, &results, &errors),
+            render_manifest(config, &host, &results, &manifest_errors),
         )
         .map_err(|e| format!("write manifest: {e}"))?;
         let pending_manifest = fs::read_to_string(&manifest_path)
             .map_err(|e| format!("read pending manifest: {e}"))?;
         validate_manifest_shape(&pending_manifest)?;
-        validate_results(config, &results, &errors).map_err(|error| {
-            format!(
+        if let Err(error) = validation {
+            let failed_manifest =
+                pending_manifest.replace("status: pending-validation", "status: failed");
+            fs::write(&manifest_path, failed_manifest)
+                .map_err(|e| format!("finalize failed manifest: {e}"))?;
+            return Err(format!(
                 "performance check failed; manifest: {}: {error}",
                 manifest_path.display()
-            )
-        })?;
+            ));
+        }
         let finalized = pending_manifest.replace("status: pending-validation", "status: pass");
         fs::write(&manifest_path, finalized).map_err(|e| format!("finalize manifest: {e}"))
     })();
@@ -454,56 +480,76 @@ fn execute_run_with_child(
         started,
         network_baseline,
     )?;
-    let cpu_before = process_cpu_seconds(child.id())?;
-    let burst_started = Instant::now();
     let drain_marker = enabled.then(|| path.join(".drain-active"));
-    let mut burst_sampler = start_pressure_sampler(
+    let supported_cpu_before = process_cpu_seconds(child.id())?;
+    let supported_started = Instant::now();
+    let mut supported_sampler = start_pressure_sampler(
         durable_dir.to_path_buf(),
         child.id(),
         false,
         drain_marker.clone(),
+        config.sample,
     )?;
-    let mut latencies_us = Vec::with_capacity(config.burst);
-    let mut rejected_events = 0_usize;
-    let burst_result = (|| -> Result<(), String> {
-        for event in 0..config.burst {
-            let (name, _) = SOURCES[event % SOURCES.len()];
-            let command = format!("{name}|{}", event / SOURCES.len());
-            let before = Instant::now();
-            writeln!(writer, "{command}").map_err(|e| format!("write workload command: {e}"))?;
-            writer
-                .flush()
-                .map_err(|e| format!("flush workload command: {e}"))?;
-            let mut response = String::new();
-            reader
-                .read_line(&mut response)
-                .map_err(|e| format!("read worker response: {e}"))?;
-            match response.trim() {
-                "ok" => {}
-                "full" | "oversized" | "unavailable" => {
-                    rejected_events = rejected_events.saturating_add(1);
-                }
-                _ => return Err("worker returned an invalid response".into()),
-            }
-            latencies_us.push(before.elapsed().as_micros());
-        }
-        Ok(())
-    })();
-    let burst_elapsed = burst_started.elapsed();
-    let burst_peaks = burst_sampler.stop()?;
-    burst_result?;
-    let cpu_after = process_cpu_seconds(child.id())?;
-    let burst_cpu_percent = if burst_elapsed.is_zero() {
+    let supported = execute_commands(
+        &mut writer,
+        &mut reader,
+        0,
+        config.supported_events,
+        SUPPORTED_INTER_EVENT_PERIOD,
+    )?;
+    durability_barrier(&mut writer, &mut reader)?;
+    let supported_elapsed = supported_started.elapsed();
+    let supported_peaks = supported_sampler.stop()?;
+    let supported_cpu_after = process_cpu_seconds(child.id())?;
+    let supported_rate_cpu_percent = if supported_elapsed.is_zero() {
         0.0
     } else {
-        (cpu_after - cpu_before).max(0.0) / burst_elapsed.as_secs_f64() * 100.0
+        (supported_cpu_after - supported_cpu_before).max(0.0) / supported_elapsed.as_secs_f64()
+            * 100.0
+    };
+    let (saturation, saturation_cpu_percent, saturation_peaks) = if enabled {
+        let cpu_before = process_cpu_seconds(child.id())?;
+        let saturation_started = Instant::now();
+        let mut saturation_sampler = start_pressure_sampler(
+            durable_dir.to_path_buf(),
+            child.id(),
+            false,
+            drain_marker.clone(),
+            config.sample,
+        )?;
+        let saturation = execute_commands(
+            &mut writer,
+            &mut reader,
+            config.supported_events,
+            config.saturation_events,
+            Duration::ZERO,
+        );
+        let elapsed = saturation_started.elapsed();
+        let peaks = saturation_sampler.stop()?;
+        let saturation = saturation?;
+        let cpu_after = process_cpu_seconds(child.id())?;
+        let cpu_percent = if elapsed.is_zero() {
+            0.0
+        } else {
+            (cpu_after - cpu_before).max(0.0) / elapsed.as_secs_f64() * 100.0
+        };
+        (saturation, cpu_percent, peaks)
+    } else {
+        (
+            WorkloadPass {
+                latencies_us: Vec::new(),
+                rejected_events: 0,
+            },
+            0.0,
+            PressurePeaks::default(),
+        )
     };
     samples.push(sample(
         durable_dir,
         child.id(),
         "active",
         started.elapsed(),
-        Some(burst_cpu_percent),
+        Some(supported_rate_cpu_percent),
         network_baseline,
     )?);
     sample_phase(
@@ -516,8 +562,13 @@ fn execute_run_with_child(
         started,
         network_baseline,
     )?;
-    let mut drain_sampler =
-        start_pressure_sampler(durable_dir.to_path_buf(), child.id(), true, drain_marker)?;
+    let mut drain_sampler = start_pressure_sampler(
+        durable_dir.to_path_buf(),
+        child.id(),
+        true,
+        drain_marker,
+        config.sample,
+    )?;
     drop(writer);
     read_worker_marker(&mut reader, "drain-start")?;
     read_worker_marker(&mut reader, "drain-complete")?;
@@ -531,7 +582,12 @@ fn execute_run_with_child(
     if !status.success() {
         return Err(format!("worker exited with {status}"));
     }
-    if enabled && burst_peaks.drain_sample_count + drain_peaks.drain_sample_count == 0 {
+    if enabled
+        && supported_peaks.drain_sample_count
+            + saturation_peaks.drain_sample_count
+            + drain_peaks.drain_sample_count
+            == 0
+    {
         return Err("drain pressure sampler produced no sample inside the drain boundary".into());
     }
     let durable_bytes = StorageBudget::allocated_tree_bytes(durable_dir)
@@ -544,22 +600,90 @@ fn execute_run_with_child(
     } else {
         0
     };
-    if latencies_us.len() != config.burst || samples.is_empty() {
+    if supported.latencies_us.len() != config.supported_events
+        || (enabled && saturation.latencies_us.len() != config.saturation_events)
+        || samples.is_empty()
+    {
         return Err("required subprocess latency or resource samples are missing".into());
     }
     Ok(RunResult {
         enabled,
         run,
-        events: latencies_us.len(),
-        rejected_events,
+        events: supported.latencies_us.len(),
+        rejected_events: supported.rejected_events,
+        saturation_events: saturation.latencies_us.len(),
+        saturation_rejected_events: saturation.rejected_events,
         durable_events,
-        latencies_us,
+        latencies_us: supported.latencies_us,
+        saturation_latencies_us: saturation.latencies_us,
         samples,
         durable_bytes,
-        burst_cpu_percent: burst_cpu_percent.max(burst_peaks.cpu_percent),
-        peak_rss_kib: burst_peaks.rss_kib.max(drain_peaks.rss_kib),
-        peak_disk_bytes: burst_peaks.disk_bytes.max(drain_peaks.disk_bytes),
+        supported_rate_cpu_percent: supported_rate_cpu_percent.max(supported_peaks.cpu_percent),
+        saturation_cpu_percent: saturation_cpu_percent.max(saturation_peaks.cpu_percent),
+        peak_rss_kib: supported_peaks
+            .rss_kib
+            .max(saturation_peaks.rss_kib)
+            .max(drain_peaks.rss_kib),
+        peak_disk_bytes: supported_peaks
+            .disk_bytes
+            .max(saturation_peaks.disk_bytes)
+            .max(drain_peaks.disk_bytes),
     })
+}
+
+fn execute_commands(
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+    event_offset: usize,
+    event_count: usize,
+    inter_event_period: Duration,
+) -> Result<WorkloadPass, String> {
+    let mut latencies_us = Vec::with_capacity(event_count);
+    let mut rejected_events = 0_usize;
+    let mut next_event_at = Instant::now();
+    for event in event_offset..event_offset.saturating_add(event_count) {
+        sleep(next_event_at.saturating_duration_since(Instant::now()));
+        next_event_at += inter_event_period;
+        let (name, _) = SOURCES[event % SOURCES.len()];
+        let command = format!("{name}|{}", event / SOURCES.len());
+        let before = Instant::now();
+        writeln!(writer, "{command}").map_err(|e| format!("write workload command: {e}"))?;
+        writer
+            .flush()
+            .map_err(|e| format!("flush workload command: {e}"))?;
+        let mut response = String::new();
+        reader
+            .read_line(&mut response)
+            .map_err(|e| format!("read worker response: {e}"))?;
+        match response.trim() {
+            "ok" => {}
+            "full" | "oversized" | "unavailable" => {
+                rejected_events = rejected_events.saturating_add(1);
+            }
+            _ => return Err("worker returned an invalid response".into()),
+        }
+        latencies_us.push(before.elapsed().as_micros());
+    }
+    Ok(WorkloadPass {
+        latencies_us,
+        rejected_events,
+    })
+}
+
+fn durability_barrier(writer: &mut impl Write, reader: &mut impl BufRead) -> Result<(), String> {
+    writeln!(writer, "__durability_barrier__")
+        .map_err(|e| format!("write durability barrier: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("flush durability barrier: {e}"))?;
+    let mut response = String::new();
+    reader
+        .read_line(&mut response)
+        .map_err(|e| format!("read durability barrier: {e}"))?;
+    if response.trim() != "barrier-complete" {
+        return Err("worker omitted durability barrier completion".into());
+    }
+    Ok(())
 }
 
 struct PressureSampler {
@@ -603,6 +727,7 @@ fn start_pressure_sampler(
     pid: u32,
     allow_process_exit: bool,
     drain_marker: Option<PathBuf>,
+    interval: Duration,
 ) -> Result<PressureSampler, String> {
     let (stop_tx, stop_rx) = mpsc::channel();
     let previous_cpu = process_cpu_seconds(pid)?;
@@ -666,7 +791,7 @@ fn start_pressure_sampler(
             {
                 peaks.drain_sample_count = peaks.drain_sample_count.saturating_add(1);
             }
-            if stop_rx.recv_timeout(Duration::from_millis(10)).is_ok() {
+            if stop_rx.recv_timeout(interval).is_ok() {
                 break;
             }
         }
@@ -872,8 +997,13 @@ fn worker() -> Result<(), String> {
     let mut output = BufWriter::new(io::stdout().lock());
     if !enabled {
         for line in io::stdin().lock().lines() {
-            line.map_err(|e| format!("read worker command: {e}"))?;
-            writeln!(output, "ok").map_err(|e| format!("write worker response: {e}"))?;
+            let command = line.map_err(|e| format!("read worker command: {e}"))?;
+            let response = if command == "__durability_barrier__" {
+                "barrier-complete"
+            } else {
+                "ok"
+            };
+            writeln!(output, "{response}").map_err(|e| format!("write worker response: {e}"))?;
             output
                 .flush()
                 .map_err(|e| format!("flush worker response: {e}"))?;
@@ -887,12 +1017,35 @@ fn worker() -> Result<(), String> {
     }
     let (ingress, receiver) = Ingress::new();
     let (tx, rx) = mpsc::channel();
+    let (progress_tx, progress_rx) = mpsc::channel();
     let drain_path = PathBuf::from(&path);
+    let cpu_token = Arc::new(Mutex::new(()));
+    let drain_cpu_token = Arc::clone(&cpu_token);
     thread::spawn(move || {
-        let _ = tx.send(drain_with_marker(&receiver, &drain_path));
+        let _ = tx.send(drain_with_marker(
+            &receiver,
+            &drain_path,
+            &drain_cpu_token,
+            &progress_tx,
+        ));
     });
+    let mut durable_events = 0_usize;
     for line in io::stdin().lock().lines() {
         let command = line.map_err(|e| format!("read worker command: {e}"))?;
+        if command == "__durability_barrier__" {
+            let accepted = usize::try_from(ingress.counters.snapshot().0)
+                .map_err(|_| "accepted ingress count overflow")?;
+            await_durable_count(&progress_rx, &mut durable_events, accepted)?;
+            writeln!(output, "barrier-complete")
+                .map_err(|e| format!("write durability barrier response: {e}"))?;
+            output
+                .flush()
+                .map_err(|e| format!("flush durability barrier response: {e}"))?;
+            continue;
+        }
+        let _cpu_guard = cpu_token
+            .lock()
+            .map_err(|_| "local CPU execution token poisoned")?;
         let deadline = Instant::now() + Duration::from_millis(ENQUEUE_DEADLINE_MS);
         let outcome = enqueue_until(deadline, || {
             ingress.try_send_projected(command.len(), command.as_bytes())
@@ -927,10 +1080,12 @@ fn worker() -> Result<(), String> {
 fn drain_with_marker(
     receiver: &std::sync::mpsc::Receiver<IngressMessage>,
     path: &Path,
+    cpu_token: &Mutex<()>,
+    progress: &mpsc::Sender<usize>,
 ) -> Result<(), String> {
     let marker = path.join(".drain-active");
     write_private_marker(&marker, "drain boundary")?;
-    let drain_result = drain(receiver, path);
+    let drain_result = drain_with_cpu_token(receiver, path, Some(cpu_token), Some(progress));
     let marker_cleanup =
         fs::remove_file(&marker).map_err(|e| format!("remove drain boundary: {e}"));
     combine_cleanup(drain_result, marker_cleanup)
@@ -958,58 +1113,37 @@ fn retry_sleep(now: Instant, deadline: Instant) -> Duration {
         .min(Duration::from_micros(100))
 }
 
+#[cfg(test)]
 fn drain(receiver: &std::sync::mpsc::Receiver<IngressMessage>, path: &Path) -> Result<(), String> {
+    drain_with_cpu_token(receiver, path, None, None)
+}
+
+fn drain_with_cpu_token(
+    receiver: &std::sync::mpsc::Receiver<IngressMessage>,
+    path: &Path,
+    cpu_token: Option<&Mutex<()>>,
+    progress: Option<&mpsc::Sender<usize>>,
+) -> Result<(), String> {
+    let mut store = LocalStore::open(path).map_err(|e| format!("open local durable store: {e}"))?;
     let mut config = LocalRuntimeConfigV2::default();
     config.collection.max_batch_records = DURABLE_BATCH_RECORDS;
     config.collection.max_batch_bytes = DURABLE_BATCH_BYTES;
-    let max_batch_records = usize::from(config.collection.max_batch_records);
-    let max_batch_bytes = usize::try_from(config.collection.max_batch_bytes).unwrap_or(usize::MAX);
-    let (batch_sender, batch_receiver) = mpsc::sync_channel(DURABLE_BATCH_QUEUE_CAPACITY);
-    let durable_path = path.to_path_buf();
-    let writer = thread::spawn(move || persist_batches(&batch_receiver, &durable_path, &config));
-    let mut pending = None;
-    let receive_result = pump_batches(
-        receiver,
-        &batch_sender,
-        &mut pending,
-        max_batch_records,
-        max_batch_bytes,
-    );
-    drop(batch_sender);
-    let write_result = writer
-        .join()
-        .map_err(|_| "local durable batch writer panicked".to_string())?;
-    match (receive_result, write_result) {
-        (_, Err(error)) | (Err(error), Ok(())) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
-    }
-}
-
-fn pump_batches(
-    receiver: &std::sync::mpsc::Receiver<IngressMessage>,
-    batch_sender: &std::sync::mpsc::SyncSender<Vec<IngressMessage>>,
-    pending: &mut Option<IngressMessage>,
-    max_batch_records: usize,
-    max_batch_bytes: usize,
-) -> Result<(), String> {
-    while let Some(messages) = receive_batch(receiver, pending, max_batch_records, max_batch_bytes)?
-    {
-        batch_sender
-            .send(messages)
-            .map_err(|_| "local durable batch writer stopped".to_string())?;
-    }
-    Ok(())
-}
-
-fn persist_batches(
-    receiver: &std::sync::mpsc::Receiver<Vec<IngressMessage>>,
-    path: &Path,
-    config: &LocalRuntimeConfigV2,
-) -> Result<(), String> {
-    let mut store = LocalStore::open(path).map_err(|e| format!("open local durable store: {e}"))?;
-    let mut control = RuntimeControl::new(config).map_err(|e| e.to_string())?;
+    let mut control = RuntimeControl::new(&config).map_err(|e| e.to_string())?;
     let mut previous = BTreeMap::new();
-    while let Ok(messages) = receiver.recv() {
+    let mut pending = None;
+    while let Some(messages) = receive_batch(
+        receiver,
+        &mut pending,
+        usize::from(config.collection.max_batch_records),
+        usize::try_from(config.collection.max_batch_bytes).unwrap_or(usize::MAX),
+    )? {
+        let _cpu_guard = cpu_token
+            .map(|token| {
+                token
+                    .lock()
+                    .map_err(|_| "local CPU execution token poisoned")
+            })
+            .transpose()?;
         if control
             .admit(path, u64::from(config.collection.max_batch_bytes))
             .map_err(|e| e.to_string())?
@@ -1032,6 +1166,11 @@ fn persist_batches(
         store
             .ingest_batch_deferred_projection(&observations)
             .map_err(|e| format!("local durable batch commit: {e}"))?;
+        if let Some(progress) = progress {
+            progress
+                .send(observations.len())
+                .map_err(|_| "durability progress receiver stopped".to_string())?;
+        }
     }
     let allocated = StorageBudget::allocated_tree_bytes(path)
         .map_err(|e| format!("measure local state: {e}"))?;
@@ -1047,6 +1186,21 @@ fn persist_batches(
         store
             .rebuild_projection()
             .map_err(|e| format!("rebuild local projection: {e}"))?;
+    }
+    Ok(())
+}
+
+fn await_durable_count(
+    progress: &mpsc::Receiver<usize>,
+    durable_events: &mut usize,
+    target: usize,
+) -> Result<(), String> {
+    while *durable_events < target {
+        *durable_events = durable_events.saturating_add(
+            progress
+                .recv()
+                .map_err(|_| "local runtime drain stopped before durability barrier")?,
+        );
     }
     Ok(())
 }
@@ -1411,10 +1565,16 @@ fn render_manifest(
     let all = results
         .iter()
         .filter(|result| result.enabled)
-        .flat_map(|r| r.latencies_us.iter().copied())
+        .flat_map(|result| {
+            result
+                .latencies_us
+                .iter()
+                .chain(&result.saturation_latencies_us)
+                .copied()
+        })
         .collect::<Vec<_>>();
     let mut out = format!(
-        "schema_version: local_performance.v1\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: {}\nos: {}\nfilesystem: {}\npower_mode: {}\ncold_warm_cache: warm-after-build-and-per-run-warmup\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: local_runtime.v2\n  durable_store: local_state.v4\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  burst_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  channel_capacity: 64\n  normalization_workers: 1\n  durable_batch_records: {DURABLE_BATCH_RECORDS}\n  durable_batch_queue_capacity: {DURABLE_BATCH_QUEUE_CAPACITY}\n  durable_batch_queue_bytes_max: {DURABLE_BATCH_QUEUE_BYTES_MAX}\n  durable_handoff_bytes_max: {DURABLE_HANDOFF_BYTES_MAX}\n  total_pipeline_payload_bytes_max: {TOTAL_PIPELINE_PAYLOAD_BYTES_MAX}\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: bounded-batch-pump-and-asynchronous-local-store-writer\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: run-relative/durable\n  durable_path_lifecycle: removed-after-measurement\nall_run_samples:\n",
+        "schema_version: local_performance.v1\nprotocol_revision: v1.2.0-supported-rate-and-saturation\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: {}\nos: {}\nfilesystem: {}\npower_mode: {}\ncold_warm_cache: warm-after-build-and-per-run-warmup\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: local_runtime.v2\n  durable_store: local_state.v4\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  supported_rate_events: {}\n  supported_inter_event_ms: {}\n  saturation_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  supported_rate_schedule: symmetric-driver-paced\n  supported_rate_durability_barrier: required-before-saturation\n  supported_rate_measurement_boundary: first-command-through-barrier-completion\n  saturation_schedule: enabled-unpaced\n  channel_capacity: 64\n  normalization_workers: 1\n  durable_batch_records: {DURABLE_BATCH_RECORDS}\n  durable_handoff_bytes_max: {DURABLE_HANDOFF_BYTES_MAX}\n  total_pipeline_payload_bytes_max: {TOTAL_PIPELINE_PAYLOAD_BYTES_MAX}\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: one-bounded-batch-local-store-drain-actor\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: run-relative/durable\n  durable_path_lifecycle: removed-after-measurement\nall_run_samples:\n",
         profile_name(config.profile),
         host.machine,
         env::consts::OS,
@@ -1427,13 +1587,15 @@ fn render_manifest(
         config.warmup.as_secs_f64(),
         config.idle.as_secs_f64(),
         config.active.as_secs_f64(),
-        config.burst,
-        config.sample.as_secs_f64()
+        config.supported_events,
+        SUPPORTED_INTER_EVENT_PERIOD.as_millis(),
+        config.saturation_events,
+        config.sample.as_secs_f64(),
     );
     for result in results {
         let _ = writeln!(
             out,
-            "  - mode: {}\n    run: {}\n    attempted_events: {}\n    enqueued_events: {}\n    rejected_events: {}\n    durable_events: {}\n    durable_bytes: {}\n    burst_cpu_percent: {}\n    peak_rss_kib: {}\n    peak_disk_bytes: {}\n    hook_latency_us: {:?}\n    samples:",
+            "  - mode: {}\n    run: {}\n    supported_rate_attempted_events: {}\n    supported_rate_enqueued_events: {}\n    supported_rate_rejected_events: {}\n    saturation_attempted_events: {}\n    saturation_enqueued_events: {}\n    saturation_rejected_events: {}\n    durable_events: {}\n    durable_bytes: {}\n    supported_rate_cpu_percent: {}\n    saturation_cpu_percent: {}\n    peak_rss_kib: {}\n    peak_disk_bytes: {}\n    hook_latency_us: {:?}\n    saturation_hook_latency_us: {:?}\n    samples:",
             if result.enabled {
                 "enabled"
             } else {
@@ -1443,12 +1605,19 @@ fn render_manifest(
             result.events,
             result.events.saturating_sub(result.rejected_events),
             result.rejected_events,
+            result.saturation_events,
+            result
+                .saturation_events
+                .saturating_sub(result.saturation_rejected_events),
+            result.saturation_rejected_events,
             result.durable_events,
             result.durable_bytes,
-            result.burst_cpu_percent,
+            result.supported_rate_cpu_percent,
+            result.saturation_cpu_percent,
             result.peak_rss_kib,
             result.peak_disk_bytes,
-            result.latencies_us
+            result.latencies_us,
+            result.saturation_latencies_us
         );
         for sample in &result.samples {
             let _ = writeln!(
@@ -1478,9 +1647,19 @@ fn render_manifest(
         Some(percentile(&values, 99))
     };
     let summary = metric_summary(results);
+    let supported_rate_cpu_percent_max = results
+        .iter()
+        .filter(|result| result.enabled)
+        .map(|result| result.supported_rate_cpu_percent)
+        .max_by(f64::total_cmp);
+    let saturation_cpu_percent_max = results
+        .iter()
+        .filter(|result| result.enabled)
+        .map(|result| result.saturation_cpu_percent)
+        .max_by(f64::total_cmp);
     let _ = writeln!(
         out,
-        "phase_metrics:\n  idle_average_cpu_delta_percent: {}\n  active_average_cpu_delta_percent: {}\n  active_any_minute_cpu_delta_percent: {}\nmetrics:\n  hook_latency_p95_us: {}\n  hook_latency_p99_us: {}\n  idle_average_cpu_delta_percent: {}\n  active_average_cpu_delta_percent: {}\n  active_any_minute_cpu_delta_percent: {}\n  enabled_rss_p95_kib: {}\n  total_allocated_disk_bytes: {}\n  network_bytes: {}\n  network_static_surface: pass\n  required: [hook_latency_p95_us, hook_latency_p99_us, idle_average_cpu_delta_percent, active_average_cpu_delta_percent, active_any_minute_cpu_delta_percent, enabled_rss_p95_kib, total_allocated_disk_bytes, network_bytes, network_static_surface]\n  network_mode: process-scoped-samples-plus-static-product-surface\n  evidence_scope: subprocess-plus-fixed-capacity-ingress-plus-asynchronous-local-store-drain",
+        "phase_metrics:\n  idle_average_cpu_delta_percent: {}\n  active_average_cpu_delta_percent: {}\n  active_any_minute_cpu_delta_percent: {}\nmetrics:\n  hook_latency_p95_us: {}\n  hook_latency_p99_us: {}\n  supported_rate_cpu_percent_max: {}\n  saturation_cpu_percent_max: {}\n  idle_average_cpu_delta_percent: {}\n  active_average_cpu_delta_percent: {}\n  active_any_minute_cpu_delta_percent: {}\n  enabled_rss_p95_kib: {}\n  total_allocated_disk_bytes: {}\n  network_bytes: {}\n  network_static_surface: pass\n  required: [hook_latency_p95_us, hook_latency_p99_us, supported_rate_cpu_percent_max, saturation_cpu_percent_max, idle_average_cpu_delta_percent, active_average_cpu_delta_percent, active_any_minute_cpu_delta_percent, enabled_rss_p95_kib, total_allocated_disk_bytes, network_bytes, network_static_surface]\n  network_mode: process-scoped-samples-plus-static-product-surface\n  evidence_scope: subprocess-plus-fixed-capacity-ingress-plus-one-token-local-store-drain",
         summary.map_or_else(
             || "null".into(),
             |value| value.idle_cpu_delta_percent.to_string()
@@ -1495,6 +1674,8 @@ fn render_manifest(
         ),
         optional_u128(p95),
         optional_u128(p99),
+        optional_f64(supported_rate_cpu_percent_max),
+        optional_f64(saturation_cpu_percent_max),
         summary.map_or_else(
             || "null".into(),
             |value| value.idle_cpu_delta_percent.to_string()
@@ -1545,6 +1726,7 @@ fn yaml_single_quoted(value: &str) -> String {
 
 fn validate_manifest_shape(manifest: &str) -> Result<(), String> {
     for field in [
+        "protocol_revision:",
         "machine:",
         "os:",
         "filesystem:",
@@ -1720,6 +1902,7 @@ fn max_minute_cpu(result: &RunResult, phase: &str) -> Option<f64> {
         .max_by(f64::total_cmp)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_results(
     config: Config,
     results: &[RunResult],
@@ -1731,21 +1914,35 @@ fn validate_results(
     if results.len() != config.runs * 2 {
         return Err("incomplete baseline/enabled evidence".into());
     }
-    if results
-        .iter()
-        .any(|r| r.events != config.burst || r.latencies_us.is_empty() || r.samples.is_empty())
-    {
+    if results.iter().any(|result| {
+        result.events != config.supported_events
+            || result.latencies_us.is_empty()
+            || result.samples.is_empty()
+            || (result.enabled
+                && (result.saturation_events != config.saturation_events
+                    || result.saturation_latencies_us.is_empty()))
+            || (!result.enabled
+                && (result.saturation_events != 0 || !result.saturation_latencies_us.is_empty()))
+    }) {
         return Err("incomplete event, latency, or sample evidence".into());
     }
     for result in results {
         if result.enabled {
-            let enqueued = result.events.saturating_sub(result.rejected_events);
+            let supported_enqueued = result.events.saturating_sub(result.rejected_events);
+            let saturation_enqueued = result
+                .saturation_events
+                .saturating_sub(result.saturation_rejected_events);
+            let enqueued = supported_enqueued.saturating_add(saturation_enqueued);
             if result.durable_events != u64::try_from(enqueued).unwrap_or(u64::MAX)
                 || result.rejected_events.saturating_mul(100) > result.events
+                || result.saturation_rejected_events.saturating_mul(100) > result.saturation_events
             {
                 return Err("enabled event reconciliation or rejection budget failed".into());
             }
-        } else if result.rejected_events != 0 || result.durable_events != 0 {
+        } else if result.rejected_events != 0
+            || result.saturation_rejected_events != 0
+            || result.durable_events != 0
+        {
             return Err("baseline event accounting is invalid".into());
         }
         for phase in ["warmup", "idle", "active"] {
@@ -1765,8 +1962,10 @@ fn validate_results(
         }) {
             return Err("required resource metric is missing".into());
         }
-        if !result.burst_cpu_percent.is_finite()
-            || result.burst_cpu_percent.is_sign_negative()
+        if !result.supported_rate_cpu_percent.is_finite()
+            || result.supported_rate_cpu_percent.is_sign_negative()
+            || !result.saturation_cpu_percent.is_finite()
+            || result.saturation_cpu_percent.is_sign_negative()
             || !result.peak_rss_kib.is_finite()
             || result.peak_rss_kib.is_sign_negative()
         {
@@ -1788,9 +1987,9 @@ fn validate_results(
         if results
             .iter()
             .filter(|result| result.enabled)
-            .any(|result| result.burst_cpu_percent > 100.0)
+            .any(|result| result.supported_rate_cpu_percent > 100.0)
         {
-            return Err("burst CPU exceeded one logical core".into());
+            return Err("supported-rate CPU exceeded one logical core".into());
         }
         if summary.enabled_rss_p95_kib > 96.0 * 1024.0 {
             return Err("enabled RSS p95 budget exceeded".into());
@@ -1801,7 +2000,13 @@ fn validate_results(
         let latencies = results
             .iter()
             .filter(|result| result.enabled)
-            .flat_map(|result| result.latencies_us.iter().copied())
+            .flat_map(|result| {
+                result
+                    .latencies_us
+                    .iter()
+                    .chain(&result.saturation_latencies_us)
+                    .copied()
+            })
             .collect::<Vec<_>>();
         if percentile(&latencies, 95) > 20_000 || percentile(&latencies, 99) > 50_000 {
             return Err("foreground latency budget exceeded".into());
@@ -1857,11 +2062,15 @@ mod tests {
             run: 1,
             events: 1,
             rejected_events: 0,
-            durable_events: u64::from(enabled),
+            saturation_events: usize::from(enabled),
+            saturation_rejected_events: 0,
+            durable_events: u64::from(enabled) * 2,
             latencies_us: vec![1],
+            saturation_latencies_us: enabled.then_some(1).into_iter().collect(),
             samples,
             durable_bytes: 1,
-            burst_cpu_percent: 0.1,
+            supported_rate_cpu_percent: 0.1,
+            saturation_cpu_percent: 0.1,
             peak_rss_kib: 1.0,
             peak_disk_bytes: 1,
         }
@@ -1872,7 +2081,8 @@ mod tests {
             warmup: Duration::ZERO,
             idle: Duration::ZERO,
             active: Duration::ZERO,
-            burst: 1,
+            supported_events: 1,
+            saturation_events: 1,
             runs: 1,
             sample: Duration::ZERO,
         }
@@ -1908,13 +2118,19 @@ mod tests {
     #[test]
     fn release_protocol_is_normative() {
         validate_protocol_contract().unwrap();
-        assert_eq!(Config::for_profile(Profile::Release).burst, 10_000);
-        assert_eq!(DURABLE_BATCH_RECORDS, 500);
+        assert_eq!(
+            Config::for_profile(Profile::Release).supported_events,
+            10_000
+        );
+        assert_eq!(
+            Config::for_profile(Profile::Release).saturation_events,
+            10_000
+        );
+        assert_eq!(DURABLE_BATCH_RECORDS, 32);
         assert_eq!(DURABLE_BATCH_BYTES, 524_288);
-        assert_eq!(DURABLE_BATCH_QUEUE_CAPACITY, 12);
-        assert_eq!(DURABLE_BATCH_QUEUE_BYTES_MAX, 6_291_456);
-        assert_eq!(DURABLE_HANDOFF_BYTES_MAX, 7_340_032);
-        assert_eq!(TOTAL_PIPELINE_PAYLOAD_BYTES_MAX, 11_534_336);
+        assert_eq!(SUPPORTED_INTER_EVENT_PERIOD, Duration::from_millis(3));
+        assert_eq!(DURABLE_HANDOFF_BYTES_MAX, 589_824);
+        assert_eq!(TOTAL_PIPELINE_PAYLOAD_BYTES_MAX, 4_784_128);
         assert!(PROTOCOL.contains("active_any_minute_percent_max"));
     }
     #[test]
@@ -1984,19 +2200,23 @@ mod tests {
     #[test]
     fn enabled_rejections_are_bounded_and_reconciled_with_durable_events() {
         let mut config = c();
-        config.burst = 100;
+        config.supported_events = 100;
+        config.saturation_events = 100;
         let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
         for result in &mut results {
             result.events = 100;
             result.latencies_us = vec![1; 100];
         }
+        results[1].saturation_events = 100;
+        results[1].saturation_latencies_us = vec![1; 100];
         results[1].rejected_events = 1;
-        results[1].durable_events = 99;
+        results[1].saturation_rejected_events = 1;
+        results[1].durable_events = 198;
         assert!(validate_results(config, &results, &[]).is_ok());
-        results[1].rejected_events = 2;
-        results[1].durable_events = 98;
+        results[1].saturation_rejected_events = 2;
+        results[1].durable_events = 197;
         assert!(validate_results(config, &results, &[]).is_err());
-        results[1].rejected_events = 1;
+        results[1].saturation_rejected_events = 1;
         assert!(validate_results(config, &results, &[]).is_err());
     }
 
@@ -2006,13 +2226,19 @@ mod tests {
         assert!(manifest.contains("machine: sanitized-test-4-logical-core"));
         assert!(manifest.contains("filesystem: testfs"));
         assert!(manifest.contains("power_mode: ac"));
+        assert!(manifest.contains("protocol_revision: v1.2.0-supported-rate-and-saturation"));
+        assert!(manifest.contains("supported_inter_event_ms: 3"));
+        assert!(manifest.contains(
+            "supported_rate_measurement_boundary: first-command-through-barrier-completion"
+        ));
+        assert!(manifest.contains("saturation_schedule: enabled-unpaced"));
+        assert!(manifest.contains("supported_rate_attempted_events: 1"));
+        assert!(manifest.contains("saturation_attempted_events: 1"));
         assert!(manifest.contains("durable_path: run-relative/durable"));
         assert!(manifest.contains("idle_average_cpu_delta_percent: 0"));
         assert!(manifest.contains("active_any_minute_cpu_delta_percent: 0"));
-        assert!(manifest.contains("durable_batch_queue_capacity: 12"));
-        assert!(manifest.contains("durable_batch_queue_bytes_max: 6291456"));
-        assert!(manifest.contains("durable_handoff_bytes_max: 7340032"));
-        assert!(manifest.contains("total_pipeline_payload_bytes_max: 11534336"));
+        assert!(manifest.contains("durable_handoff_bytes_max: 589824"));
+        assert!(manifest.contains("total_pipeline_payload_bytes_max: 4784128"));
         assert!(manifest.contains("network_static_surface: pass"));
         assert!(manifest.contains("network_bytes: 0"));
         validate_manifest_shape(&manifest).unwrap();
@@ -2108,7 +2334,14 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let mut sampler = start_pressure_sampler(root.clone(), child.id(), true, None).unwrap();
+        let mut sampler = start_pressure_sampler(
+            root.clone(),
+            child.id(),
+            true,
+            None,
+            Duration::from_millis(10),
+        )
+        .unwrap();
         assert!(child.wait().unwrap().success());
         sampler.confirm_process_exit();
         thread::sleep(Duration::from_millis(30));
@@ -2176,34 +2409,43 @@ mod tests {
     }
 
     #[test]
-    fn durable_batch_handoff_blocks_at_capacity_and_resumes_without_loss() {
-        let (input_sender, input_receiver) = mpsc::channel();
-        for index in 0..DURABLE_BATCH_QUEUE_CAPACITY + 2 {
-            input_sender
-                .send(IngressMessage(vec![u8::try_from(index).unwrap()]))
-                .unwrap();
-        }
-        drop(input_sender);
-        let (batch_sender, batch_receiver) = mpsc::sync_channel(DURABLE_BATCH_QUEUE_CAPACITY);
-        let pump = thread::spawn(move || {
-            pump_batches(&input_receiver, &batch_sender, &mut None, 1, usize::MAX)
+    fn durability_barrier_accumulates_committed_batches_to_target() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(2).unwrap();
+        sender.send(3).unwrap();
+        let mut durable_events = 0;
+        await_durable_count(&receiver, &mut durable_events, 5).unwrap();
+        assert_eq!(durable_events, 5);
+    }
+
+    #[test]
+    fn durability_progress_is_emitted_only_after_store_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-xtask-barrier-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        let drain_root = root.clone();
+        let drain = thread::spawn(move || {
+            drain_with_cpu_token(&receiver, &drain_root, None, Some(&progress_sender))
         });
-        thread::sleep(Duration::from_millis(20));
-        assert!(!pump.is_finished());
-        let mut delivered = vec![batch_receiver.recv().unwrap()];
-        thread::sleep(Duration::from_millis(20));
-        assert!(!pump.is_finished());
-        delivered.push(batch_receiver.recv().unwrap());
-        pump.join().unwrap().unwrap();
-        delivered.extend(batch_receiver);
-        assert_eq!(delivered.len(), DURABLE_BATCH_QUEUE_CAPACITY + 2);
+        sender.send(IngressMessage(b"codex|0".to_vec())).unwrap();
+        let mut durable_events = 0;
+        await_durable_count(&progress_receiver, &mut durable_events, 1).unwrap();
         assert_eq!(
-            delivered
-                .into_iter()
-                .map(|batch| batch[0].0[0])
-                .collect::<Vec<_>>(),
-            (0..u8::try_from(DURABLE_BATCH_QUEUE_CAPACITY + 2).unwrap()).collect::<Vec<_>>()
+            LocalStore::open(&root)
+                .unwrap()
+                .observation_count()
+                .unwrap(),
+            1
         );
+        drop(sender);
+        drain.join().unwrap().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
