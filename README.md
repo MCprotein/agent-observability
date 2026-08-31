@@ -23,10 +23,11 @@ mkdir -p ~/.local/bin
 install -m 0755 \
   agent-observability-1.3.0-darwin-universal2/agent-observability \
   ~/.local/bin/agent-observability
+export PATH="$HOME/.local/bin:$PATH"
 agent-observability --version
 ```
 
-`~/.local/bin`이 `PATH`에 있어야 한다. Release에는 arm64/x64 개별 archive,
+새 shell에서도 쓰려면 위 `export`를 shell profile에 추가한다. Release에는 arm64/x64 개별 archive,
 `SHA256SUMS`, build provenance도 함께 게시된다.
 
 ### GitHub Packages
