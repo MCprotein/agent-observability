@@ -6,7 +6,7 @@
 
 ## Current and target stack
 
-현재 `v1.2.0` release candidate는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
+현재 `v1.2.0` Rust 경로는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
 보존하면서 macOS standalone private handoff import 범위의 Rust Codex, Claude Code와 Cursor adapter,
 TypeScript static report UI, strict local config와 bounded runtime policy를 제공한다. Rust 경로는 closed contract,
 deterministic lifecycle reduction, topology validation, pricing/report projection, bounded product handoff와
