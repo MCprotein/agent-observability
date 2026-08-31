@@ -19,6 +19,7 @@ gh release download v1.3.0 \
   --repo MCprotein/agent-observability \
   --pattern 'agent-observability-1.3.0-darwin-universal2.tar.gz'
 tar -xzf agent-observability-1.3.0-darwin-universal2.tar.gz
+mkdir -p ~/.local/bin
 install -m 0755 \
   agent-observability-1.3.0-darwin-universal2/agent-observability \
   ~/.local/bin/agent-observability
@@ -67,6 +68,30 @@ agent-observability storage-check ~/.agent-observability
 현재 ingest 입력은 별도 producer가 만든 **private canonical handoff JSONL**이어야 한다.
 각 agent의 원본 transcript나 hook payload를 직접 넘기는 인터페이스가 아니다.
 
+설치와 report 경로를 끝까지 확인하려면 release에 포함된 content-free Codex example을
+사용할 수 있다. 실제 관측값이 아니며 producer 연동을 대신하지 않는다.
+
+```bash
+cp /path/to/extracted-release/examples/codex-handoff.v1.jsonl /tmp/codex-handoff.v1.jsonl
+chmod 0600 /tmp/codex-handoff.v1.jsonl
+agent-observability codex-ingest \
+  ~/.agent-observability /tmp/codex-handoff.v1.jsonl
+agent-observability report ~/.agent-observability
+open ~/.agent-observability/logs/agent-observability-report.html
+```
+
+GitHub Package로 설치했다면 example은 tag에서 받을 수 있다.
+
+```bash
+curl -fsSLo /tmp/codex-handoff.v1.jsonl \
+  https://raw.githubusercontent.com/MCprotein/agent-observability/v1.3.0/examples/codex-handoff.v1.jsonl
+chmod 0600 /tmp/codex-handoff.v1.jsonl
+```
+
+실제 private canonical handoff는 agent별 `*.v1` schema와
+[Adapter Compatibility](docs/ADAPTER_COMPATIBILITY.md)의 verified surface에 맞춰 별도 producer가
+생성해야 한다.
+
 ```bash
 agent-observability codex-ingest \
   ~/.agent-observability /path/to/private-codex-handoff.jsonl
@@ -76,7 +101,7 @@ agent-observability cursor-ingest \
   ~/.agent-observability /path/to/private-cursor-handoff.jsonl
 ```
 
-report를 만들고 브라우저에서 연다.
+실제 handoff를 가져온 뒤 report를 만들고 브라우저에서 연다.
 
 ```bash
 agent-observability report ~/.agent-observability

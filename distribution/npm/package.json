@@ -21,6 +21,7 @@
   },
   "files": [
     "bin/agent-observability",
+    "examples/codex-handoff.v1.jsonl",
     "README.md",
     "LICENSE"
   ],

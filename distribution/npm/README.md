@@ -6,3 +6,4 @@ it does not install a JavaScript runtime wrapper, daemon, or network collector.
 
 See the [repository README](https://github.com/MCprotein/agent-observability#readme)
 for authentication, installation, input requirements, and commands.
+The package also includes a content-free example handoff for installation smoke tests.
