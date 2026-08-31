@@ -1,7 +1,7 @@
 # Local Runtime
 
 v1.0.0 introduced the standalone local-only Rust runtime boundary. v1.2.0 added bounded local
-retention and private archive export; v1.3.0 packages the same one-shot CLI without adding a
+retention and private archive export; v1.3.1 packages the same one-shot CLI without adding a
 server, daemon, identity, or network path.
 It installs private local state,
 validates a closed configuration, admits writes against a hard storage budget, and keeps foreground

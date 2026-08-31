@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-observability-adapter-claude-code"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "agent-observability-contracts",
  "agent-observability-domain",
@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "agent-observability-adapter-codex"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "agent-observability-contracts",
  "agent-observability-domain",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "agent-observability-adapter-cursor"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "agent-observability-contracts",
  "agent-observability-domain",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "agent-observability-application"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "agent-observability-contracts",
  "agent-observability-domain",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "agent-observability-cli"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "agent-observability-adapter-claude-code",
  "agent-observability-adapter-codex",
@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "agent-observability-contracts"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "agent-observability-domain",
  "serde",
@@ -74,11 +74,11 @@ dependencies = [
 
 [[package]]
 name = "agent-observability-domain"
-version = "1.3.0"
+version = "1.3.1"
 
 [[package]]
 name = "agent-observability-local-runtime"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "fs2",
  "getrandom",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "agent-observability-local-store"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "agent-observability-application",
  "agent-observability-contracts",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "agent-observability-static-report"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "agent-observability-contracts",
  "serde_json",
@@ -590,7 +590,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "agent-observability-contracts",
  "agent-observability-domain",
