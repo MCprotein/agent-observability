@@ -14,8 +14,8 @@ function failure(result, context) {
   return new Error(`${context} failed with exit ${result.status}: ${detail}`);
 }
 
-function run(command, args, context = command) {
-  const result = commandResult(command, args);
+function run(execute, command, args, context = command) {
+  const result = execute(command, args);
   if (result.status !== 0) {
     throw failure(result, context);
   }
@@ -47,8 +47,8 @@ export function classifyPackageView(result, version) {
   return /\bE404\b|404 Not Found/i.test(detail) ? "missing" : "error";
 }
 
-function releaseView(tag) {
-  return commandResult("gh", [
+function releaseView(execute, tag) {
+  return execute("gh", [
     "release",
     "view",
     tag,
@@ -66,22 +66,29 @@ function distributionFiles() {
     .sort();
 }
 
-function ensureDraft(tag) {
-  const view = releaseView(tag);
+export function ensureDraft(
+  tag,
+  {
+    execute = commandResult,
+    files = distributionFiles(),
+    write = (message) => process.stdout.write(message),
+  } = {},
+) {
+  const view = releaseView(execute, tag);
   const state = classifyReleaseView(view);
   if (state === "error" || state === "invalid") {
     throw failure(view, "release lookup");
   }
   if (state === "published") {
-    process.stdout.write("release=already-published\n");
+    write("release=already-published\n");
     return;
   }
 
-  const files = distributionFiles();
   if (state === "draft") {
-    run("gh", ["release", "upload", tag, ...files, "--clobber"], "release upload");
+    run(execute, "gh", ["release", "upload", tag, ...files, "--clobber"], "release upload");
   } else {
     run(
+      execute,
       "gh",
       [
         "release",
@@ -97,13 +104,19 @@ function ensureDraft(tag) {
       "release creation",
     );
   }
-  process.stdout.write("release=draft\n");
+  write("release=draft\n");
 }
 
-function publishPackage(version) {
+export function publishPackage(
+  version,
+  {
+    execute = commandResult,
+    write = (message) => process.stdout.write(message),
+  } = {},
+) {
   const packageName = "@mcprotein/agent-observability";
   const registry = "https://npm.pkg.github.com";
-  const view = commandResult("npm", [
+  const view = execute("npm", [
     "view",
     `${packageName}@${version}`,
     "version",
@@ -116,30 +129,42 @@ function publishPackage(version) {
     throw failure(view, "package lookup");
   }
   if (state === "published") {
-    process.stdout.write("package=already-published\n");
+    write("package=already-published\n");
     return;
   }
 
   run(
+    execute,
     "npm",
     ["publish", `dist/mcprotein-agent-observability-${version}.tgz`],
     "package publication",
   );
-  process.stdout.write("package=published\n");
+  write("package=published\n");
 }
 
-function finalizeRelease(tag) {
-  const view = releaseView(tag);
+export function finalizeRelease(
+  tag,
+  {
+    execute = commandResult,
+    write = (message) => process.stdout.write(message),
+  } = {},
+) {
+  const view = releaseView(execute, tag);
   const state = classifyReleaseView(view);
   if (state === "published") {
-    process.stdout.write("release=already-published\n");
+    write("release=already-published\n");
     return;
   }
   if (state !== "draft") {
     throw failure(view, "release finalization lookup");
   }
-  run("gh", ["release", "edit", tag, "--draft=false", "--latest"], "release finalization");
-  process.stdout.write("release=published\n");
+  run(
+    execute,
+    "gh",
+    ["release", "edit", tag, "--draft=false", "--latest"],
+    "release finalization",
+  );
+  write("release=published\n");
 }
 
 function main() {

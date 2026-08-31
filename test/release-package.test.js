@@ -6,6 +6,9 @@ import test from "node:test";
 import {
   classifyPackageView,
   classifyReleaseView,
+  ensureDraft,
+  finalizeRelease,
+  publishPackage,
 } from "../scripts/publish-release.mjs";
 
 const rootPackage = JSON.parse(readFileSync("package.json", "utf8"));
@@ -73,4 +76,100 @@ test("release workflow pins actions and uses the tested publication state machin
   assert.match(releaseWorkflow, /publish-release\.mjs draft/);
   assert.match(releaseWorkflow, /publish-release\.mjs package/);
   assert.match(releaseWorkflow, /publish-release\.mjs finalize/);
+});
+
+function scriptedExecutor(results) {
+  const calls = [];
+  return {
+    calls,
+    execute(command, args) {
+      calls.push([command, args]);
+      const result = results.shift();
+      assert.ok(result, `unexpected command: ${command} ${args.join(" ")}`);
+      return result;
+    },
+  };
+}
+
+const success = (stdout = "") => ({ status: 0, stdout, stderr: "" });
+const failure = (stderr) => ({ status: 1, stdout: "", stderr });
+
+test("draft transition creates, refreshes, and skips the expected release states", () => {
+  const missing = scriptedExecutor([failure("release not found"), success()]);
+  ensureDraft("v1.3.0", {
+    execute: missing.execute,
+    files: ["dist/a.tgz"],
+    write() {},
+  });
+  assert.deepEqual(missing.calls[1], [
+    "gh",
+    [
+      "release",
+      "create",
+      "v1.3.0",
+      "dist/a.tgz",
+      "--draft",
+      "--verify-tag",
+      "--generate-notes",
+      "--title",
+      "v1.3.0",
+    ],
+  ]);
+
+  const draft = scriptedExecutor([success("true\n"), success()]);
+  ensureDraft("v1.3.0", {
+    execute: draft.execute,
+    files: ["dist/a.tgz"],
+    write() {},
+  });
+  assert.deepEqual(draft.calls[1], [
+    "gh",
+    ["release", "upload", "v1.3.0", "dist/a.tgz", "--clobber"],
+  ]);
+
+  const published = scriptedExecutor([success("false\n")]);
+  ensureDraft("v1.3.0", {
+    execute: published.execute,
+    files: ["dist/a.tgz"],
+    write() {},
+  });
+  assert.equal(published.calls.length, 1);
+});
+
+test("package transition publishes only a missing version and skips an existing one", () => {
+  const missing = scriptedExecutor([failure("npm error code E404"), success()]);
+  publishPackage("1.3.0", { execute: missing.execute, write() {} });
+  assert.deepEqual(missing.calls[1], [
+    "npm",
+    ["publish", "dist/mcprotein-agent-observability-1.3.0.tgz"],
+  ]);
+
+  const published = scriptedExecutor([success('"1.3.0"\n')]);
+  publishPackage("1.3.0", { execute: published.execute, write() {} });
+  assert.equal(published.calls.length, 1);
+
+  const unauthorized = scriptedExecutor([failure("npm error code E401")]);
+  assert.throws(
+    () => publishPackage("1.3.0", { execute: unauthorized.execute, write() {} }),
+    /package lookup failed/,
+  );
+});
+
+test("finalize transition publishes a draft and treats publication as idempotent", () => {
+  const draft = scriptedExecutor([success("true\n"), success()]);
+  finalizeRelease("v1.3.0", { execute: draft.execute, write() {} });
+  assert.deepEqual(draft.calls[1], [
+    "gh",
+    ["release", "edit", "v1.3.0", "--draft=false", "--latest"],
+  ]);
+
+  const published = scriptedExecutor([success("false\n")]);
+  finalizeRelease("v1.3.0", { execute: published.execute, write() {} });
+  assert.equal(published.calls.length, 1);
+
+  const missing = scriptedExecutor([failure("release not found")]);
+  assert.throws(
+    () => finalizeRelease("v1.3.0", { execute: missing.execute, write() {} }),
+    /release finalization lookup failed/,
+  );
 });
