@@ -121,7 +121,7 @@ jobs:
             artifacts/agent-observability-x64 \
             -output stage/agent-observability
           chmod 0755 stage/agent-observability
-          lipo -verify_arch arm64 x86_64 stage/agent-observability
+          lipo stage/agent-observability -verify_arch arm64 x86_64
           test "$(stage/agent-observability --version)" = "$version"
 
           install -m 0755 stage/agent-observability \

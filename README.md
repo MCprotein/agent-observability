@@ -4,7 +4,7 @@ Coding agent의 token, latency, tool lifecycle, error, permission, compaction을
 privacy-safe trace 모델로 정규화하고, 로컬 SQLite와 self-contained HTML report로 확인하는
 local-first CLI다.
 
-> **v1.3.0 범위:** macOS standalone과 private canonical handoff import를 지원한다.
+> **v1.3.1 범위:** macOS standalone과 private canonical handoff import를 지원한다.
 > Codex, Claude Code, Cursor의 hook/log를 자동 감시하는 producer와 receiver, daemon, team
 > collector는 아직 포함하지 않는다.
 
@@ -15,13 +15,13 @@ local-first CLI다.
 Apple Silicon과 Intel Mac에서 모두 동작하는 universal binary를 설치한다.
 
 ```bash
-gh release download v1.3.0 \
+gh release download v1.3.1 \
   --repo MCprotein/agent-observability \
-  --pattern 'agent-observability-1.3.0-darwin-universal2.tar.gz'
-tar -xzf agent-observability-1.3.0-darwin-universal2.tar.gz
+  --pattern 'agent-observability-1.3.1-darwin-universal2.tar.gz'
+tar -xzf agent-observability-1.3.1-darwin-universal2.tar.gz
 mkdir -p ~/.local/bin
 install -m 0755 \
-  agent-observability-1.3.0-darwin-universal2/agent-observability \
+  agent-observability-1.3.1-darwin-universal2/agent-observability \
   ~/.local/bin/agent-observability
 export PATH="$HOME/.local/bin:$PATH"
 agent-observability --version
@@ -85,7 +85,7 @@ GitHub Package로 설치했다면 example은 tag에서 받을 수 있다.
 
 ```bash
 curl -fsSLo /tmp/codex-handoff.v1.jsonl \
-  https://raw.githubusercontent.com/MCprotein/agent-observability/v1.3.0/examples/codex-handoff.v1.jsonl
+  https://raw.githubusercontent.com/MCprotein/agent-observability/v1.3.1/examples/codex-handoff.v1.jsonl
 chmod 0600 /tmp/codex-handoff.v1.jsonl
 ```
 
