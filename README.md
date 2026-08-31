@@ -4,7 +4,8 @@ Coding agent의 token, latency, tool lifecycle, error, permission, compaction을
 privacy-safe trace 모델로 정규화하고 로컬 SQLite와 self-contained HTML report로 확인하는
 local-first observability project다.
 
-> **Release status:** `v1.2.0` planned local retention/archive release candidate. 현재 지원 범위는 macOS
+> **Release status:** `v1.2.0` released with bounded local retention and private archive export.
+> 현재 지원 범위는 macOS
 > standalone private canonical handoff import다. Native receiver, foreground producer,
 > team collector와 hosted UI는 아직 Future TODO다.
 
