@@ -47,7 +47,7 @@ fn init_and_runtime_check_create_only_private_local_paths() {
         "{}",
         String::from_utf8_lossy(&init.stderr)
     );
-    assert!(String::from_utf8_lossy(&init.stdout).contains("config_schema=local_runtime.v1"));
+    assert!(String::from_utf8_lossy(&init.stdout).contains("config_schema=local_runtime.v2"));
     assert_eq!(
         fs::metadata(&root).unwrap().permissions().mode() & 0o777,
         0o700
@@ -84,6 +84,112 @@ fn init_and_runtime_check_create_only_private_local_paths() {
     assert!(stdout.contains("singleton=held"));
     assert!(stdout.contains("storage_admission=allowed"));
     assert!(stdout.contains("team_ingest=disabled"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn retention_plan_is_read_only_and_apply_writes_one_private_archive() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-retention-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let handoff = root.join("old-cursor-handoff.jsonl");
+    let old = include_str!("../../adapter-cursor/tests/fixtures/cursor-handoff.jsonl")
+        .replace("178787520", "100000000");
+    fs::write(&handoff, old).unwrap();
+    fs::set_permissions(&handoff, fs::Permissions::from_mode(0o600)).unwrap();
+    let runtime = root.join("runtime-root");
+    let ingest = binary()
+        .args([
+            "cursor-ingest",
+            runtime.to_str().unwrap(),
+            handoff.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        ingest.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+    let projection = installed_store(&runtime).join("observations.jsonl");
+    let before = fs::read(&projection).unwrap();
+
+    let plan = binary()
+        .args(["retention-plan", runtime.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        plan.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let plan_output = String::from_utf8_lossy(&plan.stdout);
+    assert!(plan_output.contains("applied=0"));
+    assert!(!plan_output.contains("traces=0"));
+    let plan_id = plan_output
+        .lines()
+        .find_map(|line| line.strip_prefix("plan_id="))
+        .unwrap();
+    assert_eq!(fs::read(&projection).unwrap(), before);
+    let archive = root.join("expired.jsonl");
+    assert!(!archive.exists());
+
+    let inside_archive = runtime.join("inside.jsonl");
+    let rejected = binary()
+        .current_dir(&root)
+        .args([
+            "retention-apply",
+            "runtime-root",
+            plan_id,
+            inside_archive.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("retention archive must be outside the managed runtime root")
+    );
+    assert!(!inside_archive.exists());
+
+    let apply = binary()
+        .args([
+            "retention-apply",
+            runtime.to_str().unwrap(),
+            plan_id,
+            archive.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    assert!(String::from_utf8_lossy(&apply.stdout).contains("applied=1"));
+    assert_eq!(
+        fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(fs::read_to_string(&projection).unwrap().is_empty());
+
+    let stale_replay = binary()
+        .args([
+            "cursor-ingest",
+            runtime.to_str().unwrap(),
+            handoff.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!stale_replay.status.success());
+    assert!(String::from_utf8_lossy(&stale_replay.stderr).contains("source cursor conflict"));
     let _ = fs::remove_dir_all(root);
 }
 

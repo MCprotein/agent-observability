@@ -6,11 +6,11 @@
 
 ## Current and target stack
 
-현재 `v1.1.0` stable release는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
+현재 `v1.2.0` Rust 경로는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
 보존하면서 macOS standalone private handoff import 범위의 Rust Codex, Claude Code와 Cursor adapter,
 TypeScript static report UI, strict local config와 bounded runtime policy를 제공한다. Rust 경로는 closed contract,
 deterministic lifecycle reduction, topology validation, pricing/report projection, bounded product handoff와
-private embedded transaction, static HTML assembly와 CLI `report`를 구현한다. SQLite `local_state.v3`가 source cursor,
+private embedded transaction, static HTML assembly와 CLI `report`를 구현한다. SQLite `local_state.v4`가 source cursor,
 stable observation, current reduced record, adapter disposition과 profile-neutral delivery outcome의
 정본이며 JSONL은 dirty-state에서만 재생성하는 projection이다. Team envelope, outbox와 network는
 활성 계약이 아니다.
@@ -87,7 +87,7 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
-v1.1.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
+v1.2.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
 `crates/adapter-claude-code`, `crates/adapter-cursor`,
 `crates/application`, `crates/local-store`, `crates/local-runtime`, `crates/static-report`, `crates/cli`와 release
 evidence runner인 `xtask`로 나뉜다. domain은 외부 형식을
@@ -220,18 +220,69 @@ anti-corruption layer다.
 
 ### Local Runtime
 
-- standalone 설정은 `local_runtime.v1` strict JSON이다. 팀 identity, 이메일, endpoint와 transport
+- standalone 설정은 `local_runtime.v2` strict JSON이다. 기존 v1은 retention 기본값으로 호환
+  로드한다. 팀 identity, 이메일, endpoint와 transport
   설정은 포함하지 않는다.
 - composition root는 `init -> config-check -> runtime-check` 순서로 private install layout,
   collection policy, singleton lock, SQLite authority와 storage admission을 결합한다.
 - 설치 루트를 받는 ingest command는 같은 strict config와 singleton을 실제 write 전 과정에 적용한다.
-- foreground ingress는 1 MiB raw input, 64 KiB projected message, 64-slot channel과 one worker로
-  고정한다. full/unavailable/oversized는 nonblocking fail-open outcome이다. 현재 이 foreground
-  ingress/worker composition은 `xtask` release fixture가 검증하며, CLI handoff ingest는 이미 만들어진
-  bounded batch를 singleton 아래 transaction store에 직접 반영한다. Release fixture는 enabled burst의
+- foreground ingress는 1 MiB raw input, 64 KiB projected message, 64-slot channel과 one normalization
+  writer로 고정한다. full/unavailable/oversized는 nonblocking fail-open outcome이다. `xtask`의
+  drain은 단일 CPU execution token 아래 최대 32-record, 512 KiB batch를 처리한다. active batch와
+  64 KiB pending message를 포함한 durable handoff payload 상한은 576 KiB이며, 64-slot ingress까지
+  포함한 전체 pipeline 상한은 약 4.6 MiB다. release fixture는 baseline과 enabled에 동일한 3 ms driver inter-arrival
+  schedule을 적용해 지원 처리율의 합산 CPU를 비교하고, 이어지는 enabled-only unpaced saturation pass로
+  rejection, latency, bounded memory, durable reconciliation을 별도 검증한다. 두 pass 사이 durability
+  barrier가 supported accepted event의 commit 완료를 보장해 CPU와 backlog 귀속을 분리한다. supported CPU는
+  첫 command부터 barrier 완료까지 측정해 accepted commit tail을 포함한다. 이 schedule은 제품 내부
+  pacing이나 device-wide CPU 보장으로 해석하지 않는다. 현재 이 foreground
+  ingress/drain composition은 `xtask` release fixture가 검증하며, CLI handoff ingest는 이미 만들어진
+  bounded batch를 singleton 아래 transaction store에 직접 반영한다. Release fixture는 enabled saturation의
   fail-open rejection을 1% 이하로 제한하고 graceful shutdown 뒤 enqueued count와 durable observation
-  count를 대조한다. Foreground enqueue 자체는 durability를 보장하지 않는다.
-- 저장소 용량은 allocated block과 worst-case write로 admission하며, age retention은 v1.2 범위다.
+  count를 대조한다. macOS network evidence는 run마다 하나의 PTY-backed `nettop` monitor를 worker 전체
+  생명주기 동안 유지하며, 다음 header가 닫은 완전한 cycle만 evidence로 승인한다. resource sample은
+  3초보다 오래되지 않은 최신 완료 누적값을 읽고, 닫힌 socket 뒤에도 이전 traffic이 사라지지 않도록
+  run 최대값을 보존한다. durable drain 완료 뒤 시작된 cycle 하나가 완전히 닫힌 것을 확인한 다음 worker를
+  release한다. Linux는 각 resource sample과 drain 뒤에 worker socket descriptor를 point-in-time으로
+  검사하며 continuous byte monitor로 간주하지 않는다. drain evidence marker는 worker가 drain command를
+  받은 뒤에만 만들고, drain 완료와 parent-confirmed final resource sample까지 유지한 다음
+  `drain-complete` 전에 제거한다. sampler result, worker protocol/exit, local process query와 monitor shutdown
+  wait는 bounded이며 완료된 sampler/output-reader thread를 join한다. Foreground enqueue 자체는 durability를
+  보장하지 않는다.
+- 저장소 용량은 allocated block과 worst-case write로 admission한다. age retention은 strict 설정의
+  1..3650일, archive pass당 1..100,000 record와 64 KiB..256 MiB bounds를 사용한다.
+- retention은 cutoff와 같거나 더 새로운 observation이 있는 trace와 unresolved topology를 보존한다.
+  cutoff 이후 관측이 없는 trace는 lifecycle 상태와 관계없이 complete trace 단위의 deterministic order로
+  private JSONL archive에 먼저 streaming 내구화하고, 같은 immediate transaction에서
+  observation/source-input/delivery/current-record/topology rows를 물리 삭제한다. source cursor와 compact
+  canonical span-state hash를 별도 table에 보존해 bounded semantic replay idempotency를 유지한다.
+  typed observation retention columns와 persistent indexes가 selection을 full JSON scan과 trace별 반복 scan에서
+  분리한다. commit 뒤 archive 크기의 최대 16배 page까지만 incremental vacuum으로 회수한다.
+  v1/v2/v3 migration은 legacy disposition을 먼저 bounded horizon으로 줄이고, schema version 변경 전에
+  incremental auto-vacuum 활성화를 위한 atomic full rewrite를 한 번 수행한다. 일반 store open은 legacy
+  migration을 거부한다. 제품 CLI는 configured budget의 남은
+  용량과 실제 filesystem available space 중 작은 값을 migration workspace로 명시 전달하며, DB 크기의
+  두 배보다 작으면 rewrite나 schema-version 변경 전에 fail closed한다.
+- `retention-plan`의 selection은 retention authority를 변경하지 않고 deterministic plan ID를 반환한다.
+  하나라도 bounds를 넘는 eligible trace가 있어 `truncated=true`이면 apply는 selected prefix까지 전부
+  거부하며, 더 큰 bounded limit으로 새 plan을 만들어야 한다.
+  단, CLI store open은 최초 schema 초기화/migration과 dirty projection repair를 수행할 수 있다.
+  `retention-apply`는 같은 UTC-day cutoff와 현재 authority에서 plan ID를 재검증한다. archive 경로는 managed
+  runtime root 밖이어야 하며 parent/file은 각각 0700/0600이어야 한다. archive file sync가 SQLite
+  mutation보다 먼저다. archive는 temporary sync 후 no-overwrite link로 publish하고 header/footer 및
+  record digest를 포함한다. commit 전 실패로 archive만 남으면 그 파일은 valid duplicate export로 취급하고
+  새 경로로 재시도한다. commit transaction의 applied-plan receipt는 authority 재선택보다 먼저 확인하며,
+  이후 incremental compaction 실패를 같은 plan ID와 archive path로 재개하고 원래 archive 경로를 반환한다.
+  pending receipt가 있으면 해당 receipt 복구 외의 새 pass를 차단한다. expired span guard와 content-free
+  disposition은 각각 최신 100,000개, 완료 receipt는 최신 1,024개로 제한된다. receipt 완료와 completed
+  ledger pruning은 한 transaction으로 commit한다. archive write 전에는 archive parent당 하나의 stable
+  exclusive lock을 잡고 해당
+  archive 이름으로 crash-left private temp를 bounded total directory scan으로 정리한다. guard horizon 밖의 과거 cursor
+  replay는 source cursor 계약에서 fail-closed conflict가 되며, 새 cursor semantic replay 보호는 horizon 안에서만
+  suppression/conflict를 보장한다.
+- v1.2에서 expired record는 이후 local report aggregate에서도 제외된다. Correction, retraction,
+  reinstate, restore와 retention 전후 deterministic aggregate rebuild는 미지원이다. 해당 Future TODO를
+  승격하기 전 privacy-safe contribution journal과 versioned checkpoint를 raw expiry보다 먼저 구현한다.
 - SQLite authority는 `projection_dirty`를 transaction에 포함하고 clean reopen에서 전체 projection
   rebuild를 생략한다. 자세한 운영 계약은 [LOCAL_RUNTIME.md](LOCAL_RUNTIME.md)를 따른다.
 

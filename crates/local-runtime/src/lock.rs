@@ -142,7 +142,9 @@ fn decode_nonce(value: &str) -> Result<[u8; 32], SingletonError> {
         return Err(SingletonError::CorruptMetadata);
     }
     let mut nonce = [0_u8; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    let (chunks, remainder) = value.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for (index, chunk) in chunks.iter().enumerate() {
         let text = std::str::from_utf8(chunk).map_err(|_| SingletonError::CorruptMetadata)?;
         nonce[index] = u8::from_str_radix(text, 16).map_err(|_| SingletonError::CorruptMetadata)?;
     }

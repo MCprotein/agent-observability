@@ -1,12 +1,15 @@
 schema_version: local_performance.v1
-version: v0.13.0
+version: v1.2.0
+protocol_revision: v1.2.0-supported-rate-saturation-continuous-network
 purpose: normative local-only performance evidence protocol
 profiles:
   release:
     warmup_seconds: 60
     idle_seconds: 900
     active_seconds: 900
-    burst_events: 10000
+    supported_rate_events: 10000
+    supported_inter_event_ms: 3
+    saturation_events: 10000
     sample_interval_seconds: 1
     baseline_runs: 5
     enabled_runs: 5
@@ -16,14 +19,22 @@ profiles:
 workload:
   adapters: [codex, claude-code, cursor]
   schedule: deterministic round-robin codex, claude-code, cursor SourceObservation ingress
+  supported_rate_schedule: symmetric driver pacing for baseline and enabled
+  saturation_schedule: enabled-only unpaced arrival after supported-rate measurement
   fixture_host_scope: this manifest describes the host running xtask; it is not portable hardware evidence
   channel_capacity: 64
   normalization_workers: 1
+  durable_batch_records: 32
+  durable_handoff_bytes_max: 589824
+  total_pipeline_payload_bytes_max: 4784128
   enqueue_deadline_ms: 10
   enabled_rejection_percent_max: 1
+  rejection_budget_applies_to: each enabled supported-rate and saturation pass
   foreground_response: bounded enqueue acceptance, never durable commit
-  worker: asynchronous LocalStore drain and final projection rebuild
+  worker: one bounded batch LocalStore drain actor and final projection rebuild
   command_measurement: subprocess round-trip through bounded local-runtime enqueue; durable commit is asynchronous worker evidence
+  drain_evidence_boundary: worker creates the marker only after the drain command, retains it through drain completion and the parent-confirmed final resource sample, then removes it before drain-complete
+  resource_sampler_shutdown: stop and result waits are bounded; sampler and worker output readers are joined after completion
   daemon_only_measurement: forbidden
   durable_path: required local file-backed path; sanitized relative path in manifest
 metrics:
@@ -33,25 +44,35 @@ metrics:
     foreground_hook_p99_ms_max: 50
   cpu:
     normalization: percent of one logical core
+    sampling: process CPU time delta divided by sample wall-time delta; lifetime-average percent is forbidden
+    peak_sampling_interval: profile sample_interval_seconds
     idle_average_percent_max: 0.5
     active_average_percent_max: 2
     active_any_minute_percent_max: 5
-    burst_integrated_and_sampled_percent_max: 100
+    supported_rate_integrated_and_sampled_percent_max: 100
+    saturation_cpu: recorded for diagnosis and never used to dilute supported-rate CPU
+    supported_rate_durability_barrier: required before saturation
+    supported_rate_measurement_boundary: first command through durability barrier completion; accepted commit tail is included
   rss:
     p95_mib_max: 96
-    burst_and_drain_peak_required: true
+    supported_rate_saturation_and_drain_peak_required: true
   disk:
     total_bytes_max: 1073741824
-    accounting: allocated filesystem blocks including directories, durable state, final state, projections, crash and sampled temp artifacts
+    accounting: allocated filesystem blocks for the full release durable root across all retained run directories, including durable state, final state, projections, crash and sampled temp artifacts
   network:
-    mode: process-scoped samples plus bounded static product-surface scan
-    linux_evidence: worker has no socket descriptors at every sample
-    macos_evidence: nettop per-process cumulative bytes at every sample
+    mode: platform-specific process-scoped evidence plus bounded static product-surface scan
+    linux_evidence: point-in-time worker socket-descriptor scan at every resource sample and after drain
+    macos_evidence: one bounded long-lived nettop monitor per run; only a cycle closed by the next header becomes evidence, latest cumulative bytes attach to each resource sample, and the process-lifetime maximum is retained
+    freshness: every macOS resource sample requires a completed monitor cycle no older than 3 seconds
+    sampler_failure: monitor startup has a bounded retry budget; missing samples, parse errors, or unexpected exit fail the run immediately
+    final_sample: worker remains alive after durable drain until a complete monitor cycle that started after drain completion is observed; Linux performs a final descriptor scan
     static_evidence: product Rust crates contain no socket API or network dependency token
     ingest_requests_in_flight_max: 0
     required_bytes: 0
 evidence:
   output: docs/evidence/local/performance/<run>/manifest.yaml
-  required_fields: [machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]
+  required_fields: [protocol_revision, source_revision, machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]
+  host_metadata: sanitized factual architecture/core, filesystem type, power source and cache/warmup state; placeholder values are forbidden
   fail_closed: missing or breached required metrics produce non-zero exit
-  event_reconciliation: after graceful fixture shutdown enabled enqueued events must equal durable observations; every rejection remains explicit
+  failure_behavior: stop after the first failed run, bound worker/sampler termination and join waits, join resources whose completion is confirmed, remove durable payloads, and retain the release failure manifest for diagnosis
+  event_reconciliation: after graceful fixture shutdown enabled supported-rate plus saturation enqueued events must equal durable observations; every rejection remains explicit per pass

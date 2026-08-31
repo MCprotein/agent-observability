@@ -2,11 +2,13 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, Permissions};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,19 +18,22 @@ use agent_observability_domain::{
     TokenUsage, TraceId,
 };
 use agent_observability_local_runtime::{
-    Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressMessage, IngressOutcome, LocalRuntimeConfigV1,
+    Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressMessage, IngressOutcome, LocalRuntimeConfigV2,
     PressureSample, RuntimeControl, StorageBudget,
 };
 use agent_observability_local_store::LocalStore;
 
 const USAGE: &str = "usage: cargo run -p xtask -- perf local --profile <release|smoke> --check";
 const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-performance-v1.yaml");
-const REQUIRED_PROTOCOL_LINES: [&str; 27] = [
+const REQUIRED_PROTOCOL_LINES: [&str; 50] = [
     "schema_version: local_performance.v1",
+    "protocol_revision: v1.2.0-supported-rate-saturation-continuous-network",
     "warmup_seconds: 60",
     "idle_seconds: 900",
     "active_seconds: 900",
-    "burst_events: 10000",
+    "supported_rate_events: 10000",
+    "supported_inter_event_ms: 3",
+    "saturation_events: 10000",
     "sample_interval_seconds: 1",
     "baseline_runs: 5",
     "enabled_runs: 5",
@@ -37,19 +42,39 @@ const REQUIRED_PROTOCOL_LINES: [&str; 27] = [
     "idle_average_percent_max: 0.5",
     "active_average_percent_max: 2",
     "active_any_minute_percent_max: 5",
-    "burst_integrated_and_sampled_percent_max: 100",
+    "sampling: process CPU time delta divided by sample wall-time delta; lifetime-average percent is forbidden",
+    "peak_sampling_interval: profile sample_interval_seconds",
+    "supported_rate_integrated_and_sampled_percent_max: 100",
+    "saturation_cpu: recorded for diagnosis and never used to dilute supported-rate CPU",
+    "supported_rate_durability_barrier: required before saturation",
+    "supported_rate_measurement_boundary: first command through durability barrier completion; accepted commit tail is included",
     "p95_mib_max: 96",
-    "burst_and_drain_peak_required: true",
+    "supported_rate_saturation_and_drain_peak_required: true",
     "total_bytes_max: 1073741824",
+    "accounting: allocated filesystem blocks for the full release durable root across all retained run directories, including durable state, final state, projections, crash and sampled temp artifacts",
     "ingest_requests_in_flight_max: 0",
     "required_bytes: 0",
+    "mode: platform-specific process-scoped evidence plus bounded static product-surface scan",
+    "linux_evidence: point-in-time worker socket-descriptor scan at every resource sample and after drain",
+    "macos_evidence: one bounded long-lived nettop monitor per run; only a cycle closed by the next header becomes evidence, latest cumulative bytes attach to each resource sample, and the process-lifetime maximum is retained",
+    "freshness: every macOS resource sample requires a completed monitor cycle no older than 3 seconds",
+    "sampler_failure: monitor startup has a bounded retry budget; missing samples, parse errors, or unexpected exit fail the run immediately",
+    "final_sample: worker remains alive after durable drain until a complete monitor cycle that started after drain completion is observed; Linux performs a final descriptor scan",
     "channel_capacity: 64",
     "normalization_workers: 1",
+    "durable_batch_records: 32",
+    "durable_handoff_bytes_max: 589824",
+    "total_pipeline_payload_bytes_max: 4784128",
     "enqueue_deadline_ms: 10",
     "enabled_rejection_percent_max: 1",
-    "required_fields: [machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]",
+    "rejection_budget_applies_to: each enabled supported-rate and saturation pass",
+    "drain_evidence_boundary: worker creates the marker only after the drain command, retains it through drain completion and the parent-confirmed final resource sample, then removes it before drain-complete",
+    "resource_sampler_shutdown: stop and result waits are bounded; sampler and worker output readers are joined after completion",
+    "required_fields: [protocol_revision, source_revision, machine, os, filesystem, power_mode, cold_warm_cache, logical_cores, source_versions, workload, phase_metrics, all_run_samples, baseline, enabled]",
     "fail_closed: missing or breached required metrics produce non-zero exit",
-    "event_reconciliation: after graceful fixture shutdown enabled enqueued events must equal durable observations; every rejection remains explicit",
+    "host_metadata: sanitized factual architecture/core, filesystem type, power source and cache/warmup state; placeholder values are forbidden",
+    "failure_behavior: stop after the first failed run, bound worker/sampler termination and join waits, join resources whose completion is confirmed, remove durable payloads, and retain the release failure manifest for diagnosis",
+    "event_reconciliation: after graceful fixture shutdown enabled supported-rate plus saturation enqueued events must equal durable observations; every rejection remains explicit per pass",
     "output: docs/evidence/local/performance/<run>/manifest.yaml",
 ];
 const SOURCES: [(&str, AgentSource); 3] = [
@@ -57,6 +82,29 @@ const SOURCES: [(&str, AgentSource); 3] = [
     ("claude-code", AgentSource::ClaudeCode),
     ("cursor", AgentSource::Cursor),
 ];
+const DURABLE_BATCH_COALESCE: Duration = Duration::from_millis(3);
+const SUPPORTED_INTER_EVENT_PERIOD: Duration = Duration::from_millis(3);
+const DURABLE_BATCH_RECORDS: u16 = 32;
+const DURABLE_BATCH_BYTES: u32 = 524_288;
+const DURABLE_HANDOFF_BYTES_MAX: u32 = 589_824;
+const TOTAL_PIPELINE_PAYLOAD_BYTES_MAX: u32 = 4_784_128;
+const WORKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKER_PROTOCOL_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const SAMPLER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "macos")]
+const NETWORK_MONITOR_START_ATTEMPTS: usize = 3;
+#[cfg(target_os = "macos")]
+const NETWORK_MONITOR_START_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(target_os = "macos")]
+const NETWORK_MONITOR_FINAL_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(target_os = "macos")]
+const NETWORK_MONITOR_STALE_AFTER: Duration = Duration::from_secs(3);
+#[cfg(target_os = "macos")]
+const NETWORK_MONITOR_RETRY_DELAY: Duration = Duration::from_millis(50);
+#[cfg(target_os = "macos")]
+const NETWORK_MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Profile {
@@ -69,7 +117,8 @@ struct Config {
     warmup: Duration,
     idle: Duration,
     active: Duration,
-    burst: usize,
+    supported_events: usize,
+    saturation_events: usize,
     runs: usize,
     sample: Duration,
 }
@@ -81,7 +130,8 @@ impl Config {
                 warmup: Duration::from_mins(1),
                 idle: Duration::from_mins(15),
                 active: Duration::from_mins(15),
-                burst: 10_000,
+                supported_events: 10_000,
+                saturation_events: 10_000,
                 runs: 5,
                 sample: Duration::from_secs(1),
             },
@@ -90,7 +140,8 @@ impl Config {
                 warmup: Duration::from_millis(100),
                 idle: Duration::from_millis(250),
                 active: Duration::from_millis(500),
-                burst: 100,
+                supported_events: 100,
+                saturation_events: 100,
                 runs: 1,
                 sample: Duration::from_millis(100),
             },
@@ -113,20 +164,580 @@ struct RunResult {
     run: usize,
     events: usize,
     rejected_events: usize,
+    saturation_events: usize,
+    saturation_rejected_events: usize,
     durable_events: u64,
     latencies_us: Vec<u128>,
+    saturation_latencies_us: Vec<u128>,
     samples: Vec<Sample>,
     durable_bytes: u64,
-    burst_cpu_percent: f64,
+    supported_rate_cpu_percent: f64,
+    saturation_cpu_percent: f64,
     peak_rss_kib: f64,
     peak_disk_bytes: u64,
+    network_bytes: u64,
+    network_monitor_samples: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct PressurePeaks {
     cpu_percent: f64,
     rss_kib: f64,
     disk_bytes: u64,
+    drain_sample_count: usize,
+    process_exit_observed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NetworkEvidence {
+    latest_bytes: u64,
+    max_bytes: u64,
+    samples: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct MacNetworkMonitorState {
+    evidence: NetworkEvidence,
+    pending_bytes: Option<u64>,
+    pending_started_at: Option<Instant>,
+    last_completed_at: Option<Instant>,
+    last_completed_started_at: Option<Instant>,
+    error: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+struct NetworkMonitor {
+    process: Option<Child>,
+    reader: Option<thread::JoinHandle<()>>,
+    reader_done: mpsc::Receiver<()>,
+    state: Arc<Mutex<MacNetworkMonitorState>>,
+    stopping: Arc<AtomicBool>,
+}
+
+#[cfg(target_os = "macos")]
+impl NetworkMonitor {
+    fn start(pid: u32) -> Result<Self, String> {
+        let mut errors = Vec::with_capacity(NETWORK_MONITOR_START_ATTEMPTS);
+        for attempt in 1..=NETWORK_MONITOR_START_ATTEMPTS {
+            match Self::start_once(pid) {
+                Ok(monitor) => return Ok(monitor),
+                Err(error) => errors.push(format!("attempt {attempt}: {error}")),
+            }
+            if attempt < NETWORK_MONITOR_START_ATTEMPTS {
+                sleep(NETWORK_MONITOR_RETRY_DELAY);
+            }
+        }
+        Err(format!(
+            "process-scoped network monitor exhausted its startup retry budget: {}",
+            errors.join("; ")
+        ))
+    }
+
+    fn start_once(pid: u32) -> Result<Self, String> {
+        let mut process = Command::new("/usr/bin/script")
+            .args([
+                "-q",
+                "/dev/null",
+                "/usr/bin/nettop",
+                "-P",
+                "-n",
+                "-x",
+                "-l",
+                "0",
+                "-s",
+                "1",
+                "-J",
+                "bytes_in,bytes_out",
+                "-p",
+                &pid.to_string(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("start process-scoped network monitor: {error}"))?;
+        let stdout = process
+            .stdout
+            .take()
+            .ok_or("process-scoped network monitor stdout is unavailable")?;
+        let state = Arc::new(Mutex::new(MacNetworkMonitorState::default()));
+        let reader_state = Arc::clone(&state);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let reader_stopping = Arc::clone(&stopping);
+        let (reader_done_tx, reader_done) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let result = read_macos_network_monitor(BufReader::new(stdout), &reader_state);
+            if let Err(error) = result
+                && let Ok(mut state) = reader_state.lock()
+            {
+                state.error = Some(error);
+            }
+            if !reader_stopping.load(Ordering::Acquire)
+                && let Ok(mut state) = reader_state.lock()
+                && state.error.is_none()
+            {
+                state.error = Some("process-scoped network monitor ended unexpectedly".into());
+            }
+            let _ = reader_done_tx.send(());
+        });
+        let mut monitor = Self {
+            process: Some(process),
+            reader: Some(reader),
+            reader_done,
+            state,
+            stopping,
+        };
+        if let Err(error) = monitor.wait_until_started() {
+            let _ = monitor.shutdown();
+            return Err(error);
+        }
+        Ok(monitor)
+    }
+
+    fn wait_until_started(&mut self) -> Result<(), String> {
+        let started = Instant::now();
+        loop {
+            let state = self.state()?;
+            if let Some(error) = state.error {
+                return Err(error);
+            }
+            if state.evidence.samples > 0 {
+                return Ok(());
+            }
+            if self
+                .process
+                .as_mut()
+                .ok_or("process-scoped network monitor process is missing")?
+                .try_wait()
+                .map_err(|error| format!("poll process-scoped network monitor: {error}"))?
+                .is_some()
+            {
+                return Err("process-scoped network monitor exited during startup".into());
+            }
+            if started.elapsed() >= NETWORK_MONITOR_START_TIMEOUT {
+                return Err(format!(
+                    "process-scoped network monitor startup timed out after {} ms",
+                    NETWORK_MONITOR_START_TIMEOUT.as_millis()
+                ));
+            }
+            sleep(NETWORK_MONITOR_POLL_INTERVAL);
+        }
+    }
+
+    fn sample(&mut self) -> Result<u64, String> {
+        if self
+            .process
+            .as_mut()
+            .ok_or("process-scoped network monitor process is missing")?
+            .try_wait()
+            .map_err(|error| format!("poll process-scoped network monitor: {error}"))?
+            .is_some()
+        {
+            return Err("process-scoped network monitor exited unexpectedly".into());
+        }
+        macos_network_sample(&self.state()?, Instant::now())
+    }
+
+    fn final_sample(&mut self) -> Result<u64, String> {
+        let drain_completed_at = Instant::now();
+        let started = drain_completed_at;
+        loop {
+            let latest = self.sample()?;
+            if macos_cycle_started_after(&self.state()?, drain_completed_at) {
+                return Ok(latest);
+            }
+            if started.elapsed() >= NETWORK_MONITOR_FINAL_TIMEOUT {
+                return Err(format!(
+                    "post-drain network monitor sample timed out after {} ms",
+                    NETWORK_MONITOR_FINAL_TIMEOUT.as_millis()
+                ));
+            }
+            sleep(NETWORK_MONITOR_POLL_INTERVAL);
+        }
+    }
+
+    fn finish(mut self) -> Result<NetworkEvidence, String> {
+        let shutdown = self.shutdown();
+        let evidence = self.state().and_then(finalize_macos_network_evidence);
+        match (evidence, shutdown) {
+            (Ok(evidence), Ok(())) => Ok(evidence),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(evidence_error), Err(shutdown_error)) => {
+                Err(format!("{evidence_error}; {shutdown_error}"))
+            }
+        }
+    }
+
+    fn state(&self) -> Result<MacNetworkMonitorState, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "process-scoped network monitor state is poisoned")?;
+        Ok(MacNetworkMonitorState {
+            evidence: state.evidence,
+            pending_bytes: state.pending_bytes,
+            pending_started_at: state.pending_started_at,
+            last_completed_at: state.last_completed_at,
+            last_completed_started_at: state.last_completed_started_at,
+            error: state.error.clone(),
+        })
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        if self.process.is_none() && self.reader.is_none() {
+            return Ok(());
+        }
+        self.stopping.store(true, Ordering::Release);
+        let process_cleanup = if let Some(mut process) = self.process.take() {
+            let mut cleanup_errors = Vec::new();
+            let running = match process.try_wait() {
+                Ok(status) => status.is_none(),
+                Err(error) => {
+                    cleanup_errors.push(format!("inspect process-scoped network monitor: {error}"));
+                    true
+                }
+            };
+            if running {
+                if let Err(error) = terminate_monitor_descendants(process.id()) {
+                    cleanup_errors.push(error);
+                }
+                if let Err(error) = process.kill() {
+                    cleanup_errors.push(format!("stop process-scoped network monitor: {error}"));
+                }
+            }
+            if let Err(error) = wait_for_child(&mut process, WORKER_EXIT_TIMEOUT) {
+                cleanup_errors.push(format!("join process-scoped network monitor: {error}"));
+            }
+            errors_result(&cleanup_errors)
+        } else {
+            Ok(())
+        };
+        let (reader_finished, reader_cleanup) =
+            match self.reader_done.recv_timeout(WORKER_EXIT_TIMEOUT) {
+                Ok(()) => (true, Ok(())),
+                Err(mpsc::RecvTimeoutError::Timeout) => (
+                    false,
+                    Err(format!(
+                        "process-scoped network monitor reader timed out after {} ms",
+                        WORKER_EXIT_TIMEOUT.as_millis()
+                    )),
+                ),
+                Err(mpsc::RecvTimeoutError::Disconnected) => (
+                    true,
+                    Err("process-scoped network monitor reader ended without completion".into()),
+                ),
+            };
+        let reader_join = if reader_finished {
+            self.reader.take().map_or(Ok(()), |reader| {
+                reader
+                    .join()
+                    .map_err(|_| "process-scoped network monitor reader panicked".into())
+            })
+        } else {
+            Ok(())
+        };
+        combine_cleanup(
+            combine_cleanup(process_cleanup, reader_cleanup),
+            reader_join,
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn finalize_macos_network_evidence(
+    state: MacNetworkMonitorState,
+) -> Result<NetworkEvidence, String> {
+    if let Some(error) = state.error {
+        return Err(error);
+    }
+    if state.evidence.samples == 0 {
+        return Err("process-scoped network monitor produced no samples".into());
+    }
+    Ok(state.evidence)
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_monitor_descendants(pid: u32) -> Result<(), String> {
+    let mut process = Command::new("/usr/bin/pkill")
+        .args(["-KILL", "-P", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("start monitor descendant cleanup: {error}"))?;
+    let status = wait_for_child(&mut process, LOCAL_COMMAND_TIMEOUT).inspect_err(|_| {
+        let _ = process.kill();
+        let _ = wait_for_child(&mut process, LOCAL_COMMAND_TIMEOUT);
+    })?;
+    if status.success() || status.code() == Some(1) {
+        Ok(())
+    } else {
+        Err(format!(
+            "stop process-scoped network monitor child: {status}"
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn errors_result(errors: &[String]) -> Result<(), String> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_network_sample(
+    state: &MacNetworkMonitorState,
+    observed_at: Instant,
+) -> Result<u64, String> {
+    if let Some(error) = &state.error {
+        return Err(error.clone());
+    }
+    if state.evidence.samples == 0 {
+        return Err("process-scoped network monitor produced no samples".into());
+    }
+    let completed_at = state
+        .last_completed_at
+        .ok_or("process-scoped network monitor completion time is missing")?;
+    if observed_at.saturating_duration_since(completed_at) > NETWORK_MONITOR_STALE_AFTER {
+        return Err("process-scoped network monitor evidence is stale".into());
+    }
+    Ok(state.evidence.latest_bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cycle_started_after(state: &MacNetworkMonitorState, boundary: Instant) -> bool {
+    state
+        .last_completed_started_at
+        .is_some_and(|cycle_started_at| cycle_started_at >= boundary)
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for NetworkMonitor {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown() {
+            eprintln!("fallback network monitor cleanup failed: {error}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct NetworkMonitor {
+    pid: u32,
+    evidence: NetworkEvidence,
+}
+
+#[cfg(target_os = "linux")]
+impl NetworkMonitor {
+    fn start(pid: u32) -> Result<Self, String> {
+        let mut monitor = Self {
+            pid,
+            evidence: NetworkEvidence::default(),
+        };
+        monitor.sample()?;
+        Ok(monitor)
+    }
+
+    fn sample(&mut self) -> Result<u64, String> {
+        let bytes = linux_network_bytes(self.pid)?;
+        self.evidence.latest_bytes = bytes;
+        self.evidence.max_bytes = self.evidence.max_bytes.max(bytes);
+        self.evidence.samples = self.evidence.samples.saturating_add(1);
+        Ok(bytes)
+    }
+
+    fn final_sample(&mut self) -> Result<u64, String> {
+        self.sample()
+    }
+
+    fn finish(self) -> Result<NetworkEvidence, String> {
+        if self.evidence.samples == 0 {
+            return Err("process-scoped network monitor produced no samples".into());
+        }
+        Ok(self.evidence)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+struct NetworkMonitor;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl NetworkMonitor {
+    fn start(_pid: u32) -> Result<Self, String> {
+        Err("process-scoped network evidence is unsupported on this host".into())
+    }
+
+    fn sample(&mut self) -> Result<u64, String> {
+        Err("process-scoped network evidence is unsupported on this host".into())
+    }
+
+    fn final_sample(&mut self) -> Result<u64, String> {
+        Err("process-scoped network evidence is unsupported on this host".into())
+    }
+
+    fn finish(self) -> Result<NetworkEvidence, String> {
+        Err("process-scoped network evidence is unsupported on this host".into())
+    }
+}
+
+struct WorkloadPass {
+    latencies_us: Vec<u128>,
+    rejected_events: usize,
+}
+
+struct WorkerOutput {
+    receiver: mpsc::Receiver<Result<String, String>>,
+    reader_done: mpsc::Receiver<()>,
+    reader: Option<thread::JoinHandle<()>>,
+}
+
+impl WorkerOutput {
+    fn new(stdout: ChildStdout) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let (reader_done_tx, reader_done) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let line = line.map_err(|error| format!("read worker output: {error}"));
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+            let _ = reader_done_tx.send(());
+        });
+        Self {
+            receiver,
+            reader_done,
+            reader: Some(reader),
+        }
+    }
+
+    fn read(&self, timeout: Duration, label: &str) -> Result<String, String> {
+        read_worker_output(&self.receiver, timeout, label)
+    }
+
+    fn join(&mut self) -> Result<(), String> {
+        self.join_with_timeout(WORKER_EXIT_TIMEOUT)
+    }
+
+    fn join_with_timeout(&mut self, timeout: Duration) -> Result<(), String> {
+        let finished = match self.reader_done.recv_timeout(timeout) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+        };
+        if !finished {
+            return Err(format!(
+                "worker output reader timed out after {} ms",
+                timeout.as_millis()
+            ));
+        }
+        if let Some(reader) = self.reader.take() {
+            reader.join().map_err(|_| "worker output reader panicked")?;
+        }
+        Ok(())
+    }
+}
+
+fn read_worker_output(
+    receiver: &mpsc::Receiver<Result<String, String>>,
+    timeout: Duration,
+    label: &str,
+) -> Result<String, String> {
+    match receiver.recv_timeout(timeout) {
+        Ok(line) => line,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "worker {label} timed out after {} ms",
+            timeout.as_millis()
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(format!("worker output ended before {label}"))
+        }
+    }
+}
+
+struct DirectoryCleanup {
+    path: PathBuf,
+    label: &'static str,
+    complete: bool,
+}
+
+impl DirectoryCleanup {
+    fn new(path: PathBuf, label: &'static str) -> Self {
+        Self {
+            path,
+            label,
+            complete: false,
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        match fs::remove_dir_all(&self.path) {
+            Ok(()) => {
+                self.complete = true;
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.complete = true;
+                Ok(())
+            }
+            Err(error) => Err(format!("remove {}: {error}", self.label)),
+        }
+    }
+}
+
+impl Drop for DirectoryCleanup {
+    fn drop(&mut self) {
+        if !self.complete
+            && let Err(error) = self.cleanup()
+        {
+            eprintln!("fallback directory cleanup failed: {error}");
+        }
+    }
+}
+
+struct ChildGuard(Child);
+
+impl ChildGuard {
+    fn terminate(&mut self) -> Result<(), String> {
+        if self
+            .0
+            .try_wait()
+            .map_err(|e| format!("inspect worker during cleanup: {e}"))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.0
+            .kill()
+            .map_err(|e| format!("terminate worker during cleanup: {e}"))?;
+        wait_for_child(&mut self.0, WORKER_EXIT_TIMEOUT)
+            .map_err(|e| format!("join worker during cleanup: {e}"))?;
+        Ok(())
+    }
+}
+
+impl Deref for ChildGuard {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.terminate() {
+            eprintln!("fallback worker cleanup failed: {error}");
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -137,6 +748,33 @@ struct MetricSummary {
     enabled_rss_p95_kib: f64,
     total_allocated_disk_bytes: u64,
     network_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct HostEvidence {
+    source_revision: String,
+    machine: String,
+    logical_cores: usize,
+    filesystem: String,
+    power_mode: String,
+}
+
+impl HostEvidence {
+    fn collect(path: &Path) -> Result<Self, String> {
+        let logical_cores = thread::available_parallelism()
+            .map_err(|e| format!("inspect logical core count: {e}"))?
+            .get();
+        Ok(Self {
+            source_revision: source_revision()?,
+            machine: format!(
+                "sanitized-{}-{logical_cores}-logical-core",
+                env::consts::ARCH
+            ),
+            logical_cores,
+            filesystem: filesystem_type(path)?,
+            power_mode: power_mode()?,
+        })
+    }
 }
 
 fn main() {
@@ -177,12 +815,17 @@ fn command(args: &[String]) -> Result<(), String> {
 fn run(config: Config) -> Result<(), String> {
     validate_protocol_contract()?;
     validate_network_surface()?;
+    if config.profile == Profile::Release {
+        require_clean_worktree()?;
+    }
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "clock before epoch")?
         .as_nanos();
     let root = PathBuf::from("docs/evidence/local/performance").join(stamp.to_string());
     fs::create_dir_all(&root).map_err(|e| format!("create manifest directory: {e}"))?;
+    let mut smoke_root_cleanup = (config.profile == Profile::Smoke)
+        .then(|| DirectoryCleanup::new(root.clone(), "smoke manifest path"));
     fs::set_permissions(&root, Permissions::from_mode(0o700))
         .map_err(|e| format!("protect manifest directory: {e}"))?;
     let durable_root = if config.profile == Profile::Smoke {
@@ -190,52 +833,237 @@ fn run(config: Config) -> Result<(), String> {
     } else {
         root.join("durable")
     };
+    let mut durable_cleanup = DirectoryCleanup::new(durable_root.clone(), "durable evidence path");
     fs::create_dir_all(&durable_root).map_err(|e| format!("create evidence directory: {e}"))?;
     fs::set_permissions(&durable_root, Permissions::from_mode(0o700))
         .map_err(|e| format!("protect durable evidence directory: {e}"))?;
+    let host = HostEvidence::collect(&root)?;
     let mut results = Vec::new();
     let mut errors = Vec::new();
-    for enabled in [false, true] {
+    'workload: for enabled in [false, true] {
         for run_number in 1..=config.runs {
             match execute_run(config, enabled, run_number, &durable_root) {
                 Ok(result) => results.push(result),
-                Err(error) => errors.push(format!(
-                    "{} run {run_number}: {error}",
-                    if enabled { "enabled" } else { "baseline" }
-                )),
+                Err(error) => {
+                    errors.push(format!(
+                        "{} run {run_number}: {error}",
+                        if enabled { "enabled" } else { "baseline" }
+                    ));
+                    break 'workload;
+                }
             }
         }
     }
     let manifest_path = root.join("manifest.yaml");
-    fs::write(&manifest_path, render_manifest(config, &results, &errors))
-        .map_err(|e| format!("write manifest: {e}"))?;
-    let pending_manifest =
-        fs::read_to_string(&manifest_path).map_err(|e| format!("read pending manifest: {e}"))?;
-    validate_manifest_shape(&pending_manifest)?;
-    if let Err(error) = validate_results(config, &results, &errors) {
-        if config.profile == Profile::Smoke {
-            let _ = fs::remove_dir_all(&durable_root);
-            let _ = fs::remove_dir_all(&root);
-        }
-        return Err(format!(
-            "performance check failed; manifest: {}: {error}",
-            manifest_path.display()
-        ));
+    let validation = validate_results(config, &results, &errors);
+    let mut manifest_errors = errors.clone();
+    if let Err(error) = &validation {
+        manifest_errors.push(format!("validation: {error}"));
     }
-    let finalized = fs::read_to_string(&manifest_path)
-        .map_err(|e| format!("read manifest: {e}"))?
-        .replace("status: pending-validation", "status: pass");
-    fs::write(&manifest_path, finalized).map_err(|e| format!("finalize manifest: {e}"))?;
-    fs::remove_dir_all(&durable_root).map_err(|e| format!("remove durable evidence path: {e}"))?;
-    if config.profile == Profile::Smoke {
-        fs::remove_dir_all(&root).map_err(|e| format!("remove smoke manifest: {e}"))?;
-    }
+    let preparation = prepare_manifest(
+        &manifest_path,
+        config,
+        &host,
+        &results,
+        &manifest_errors,
+        validation,
+    );
+    let durable_cleanup = durable_cleanup.cleanup();
+    let smoke_cleanup = smoke_root_cleanup
+        .as_mut()
+        .map_or(Ok(()), DirectoryCleanup::cleanup);
+    let cleanup = combine_cleanup(durable_cleanup, smoke_cleanup);
+    complete_manifest_lifecycle(
+        &manifest_path,
+        config,
+        &host,
+        &results,
+        &manifest_errors,
+        preparation,
+        cleanup,
+    )?;
     println!(
         "manifest={}\nprofile={}\nstatus=pass",
         manifest_path.display(),
         profile_name(config.profile)
     );
     Ok(())
+}
+
+fn prepare_manifest(
+    manifest_path: &Path,
+    config: Config,
+    host: &HostEvidence,
+    results: &[RunResult],
+    manifest_errors: &[String],
+    validation: Result<(), String>,
+) -> Result<String, String> {
+    let pending_manifest = render_manifest(config, host, results, manifest_errors);
+    fs::write(manifest_path, &pending_manifest)
+        .map_err(|error| format!("write manifest: {error}"))?;
+    if let Err(shape_error) = validate_manifest_shape(&pending_manifest) {
+        let failed_manifest = render_failed_manifest(
+            config,
+            host,
+            results,
+            manifest_errors,
+            &format!("manifest shape: {shape_error}"),
+        );
+        fs::write(manifest_path, failed_manifest)
+            .map_err(|error| format!("finalize malformed manifest: {error}"))?;
+        return Err(format!(
+            "performance manifest validation failed; manifest: {}: {shape_error}",
+            manifest_path.display()
+        ));
+    }
+    if let Err(error) = validation {
+        let failed_manifest =
+            pending_manifest.replace("status: pending-validation", "status: failed");
+        fs::write(manifest_path, failed_manifest)
+            .map_err(|write_error| format!("finalize failed manifest: {write_error}"))?;
+        return Err(format!(
+            "performance check failed; manifest: {}: {error}",
+            manifest_path.display()
+        ));
+    }
+    Ok(pending_manifest)
+}
+
+fn complete_manifest_lifecycle(
+    manifest_path: &Path,
+    config: Config,
+    host: &HostEvidence,
+    results: &[RunResult],
+    manifest_errors: &[String],
+    preparation: Result<String, String>,
+    cleanup: Result<(), String>,
+) -> Result<(), String> {
+    match preparation {
+        Ok(pending_manifest) => {
+            let cleanup_failed_manifest = cleanup.as_ref().err().map(|error| {
+                render_failed_manifest(
+                    config,
+                    host,
+                    results,
+                    manifest_errors,
+                    &format!("cleanup: {error}"),
+                )
+            });
+            finalize_manifest_after_cleanup(
+                config.profile,
+                manifest_path,
+                &pending_manifest,
+                cleanup,
+                cleanup_failed_manifest.as_deref(),
+            )
+        }
+        Err(preparation_error) => match cleanup {
+            Ok(()) => Err(preparation_error),
+            Err(cleanup_error) => {
+                let failed_manifest = render_failed_manifest(
+                    config,
+                    host,
+                    results,
+                    manifest_errors,
+                    &format!("preparation: {preparation_error}; cleanup: {cleanup_error}"),
+                );
+                let manifest_write = if manifest_path.exists() {
+                    fs::write(manifest_path, failed_manifest)
+                        .map_err(|error| format!("finalize combined failure manifest: {error}"))
+                } else {
+                    Ok(())
+                };
+                combine_cleanup(
+                    combine_cleanup(Err(preparation_error), Err(cleanup_error)),
+                    manifest_write,
+                )
+            }
+        },
+    }
+}
+
+fn finalize_manifest_after_cleanup(
+    profile: Profile,
+    manifest_path: &Path,
+    pending_manifest: &str,
+    cleanup: Result<(), String>,
+    cleanup_failed_manifest: Option<&str>,
+) -> Result<(), String> {
+    if let Err(error) = cleanup {
+        let manifest_write = if manifest_path.exists() {
+            let failed_manifest =
+                cleanup_failed_manifest.ok_or("cleanup failure manifest is unavailable")?;
+            fs::write(manifest_path, failed_manifest)
+                .map_err(|write_error| format!("finalize cleanup failure manifest: {write_error}"))
+        } else {
+            Ok(())
+        };
+        return combine_cleanup(
+            Err(format!("performance cleanup failed: {error}")),
+            manifest_write,
+        );
+    }
+    if profile == Profile::Release {
+        let finalized = pending_manifest.replace("status: pending-validation", "status: pass");
+        fs::write(manifest_path, finalized)
+            .map_err(|error| format!("finalize manifest: {error}"))?;
+    }
+    Ok(())
+}
+
+fn render_failed_manifest(
+    config: Config,
+    host: &HostEvidence,
+    results: &[RunResult],
+    errors: &[String],
+    final_error: &str,
+) -> String {
+    let mut all_errors = errors.to_vec();
+    all_errors.push(final_error.into());
+    render_manifest(config, host, results, &all_errors)
+        .replace("status: pending-validation", "status: failed")
+}
+
+fn source_revision() -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|error| format!("read source revision: {error}"))?;
+    if !output.status.success() {
+        return Err("source revision command failed".into());
+    }
+    let revision = String::from_utf8(output.stdout)
+        .map_err(|_| "source revision is not UTF-8".to_string())?
+        .trim()
+        .to_owned();
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("source revision is not a full commit SHA".into());
+    }
+    Ok(revision)
+}
+
+fn require_clean_worktree() -> Result<(), String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .map_err(|error| format!("inspect release worktree: {error}"))?;
+    if !output.status.success() {
+        return Err("release worktree inspection failed".into());
+    }
+    if !output.stdout.is_empty() {
+        return Err("release performance evidence requires a clean worktree".into());
+    }
+    Ok(())
+}
+
+fn combine_cleanup(primary: Result<(), String>, cleanup: Result<(), String>) -> Result<(), String> {
+    match (primary, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            Err(format!("{error}; cleanup failed: {cleanup_error}"))
+        }
+    }
 }
 
 fn validate_protocol_contract() -> Result<(), String> {
@@ -262,11 +1090,49 @@ fn execute_run(
     fs::create_dir_all(&path).map_err(|e| format!("create run artifact directory: {e}"))?;
     fs::set_permissions(&path, Permissions::from_mode(0o700))
         .map_err(|e| format!("protect run artifact directory: {e}"))?;
-    let mut child = spawn_worker(&path, enabled)?;
-    let network_baseline = network_bytes(child.id()).ok();
-    let mut writer = BufWriter::new(child.stdin.take().ok_or("worker stdin unavailable")?);
+    let mut child = ChildGuard(spawn_worker(&path, enabled)?);
     let stdout = child.stdout.take().ok_or("worker stdout unavailable")?;
-    let mut reader = BufReader::new(stdout);
+    let mut output = WorkerOutput::new(stdout);
+    let result = execute_run_with_child(
+        config,
+        enabled,
+        run,
+        durable_dir,
+        &path,
+        &mut child,
+        &mut output,
+    );
+    if let Err(error) = result {
+        let worker_cleanup = child
+            .terminate()
+            .map_err(|cleanup| format!("worker cleanup failed: {cleanup}"));
+        let output_cleanup = output.join();
+        return Err(
+            combine_cleanup(combine_cleanup(Err(error), worker_cleanup), output_cleanup)
+                .unwrap_err(),
+        );
+    }
+    result
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_run_with_child(
+    config: Config,
+    enabled: bool,
+    run: usize,
+    durable_dir: &Path,
+    path: &Path,
+    child: &mut ChildGuard,
+    output: &mut WorkerOutput,
+) -> Result<RunResult, String> {
+    let mut network_monitor = NetworkMonitor::start(child.id())?;
+    let mut writer = BufWriter::new(child.stdin.take().ok_or("worker stdin unavailable")?);
+    writeln!(writer, "__network_monitor_start__")
+        .map_err(|e| format!("start network-monitored worker: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("flush network monitor start: {e}"))?;
+    read_worker_marker(output, "worker-ready", WORKER_PROTOCOL_TIMEOUT)?;
     let started = Instant::now();
     let mut samples = Vec::new();
     sample_phase(
@@ -274,27 +1140,208 @@ fn execute_run(
         "warmup",
         config.warmup,
         config.sample,
-        &path,
+        durable_dir,
         child.id(),
         started,
-        network_baseline,
+        &mut network_monitor,
     )?;
     sample_phase(
         &mut samples,
         "idle",
         config.idle,
         config.sample,
-        &path,
+        durable_dir,
         child.id(),
         started,
-        network_baseline,
+        &mut network_monitor,
     )?;
-    let cpu_before = process_cpu_seconds(child.id())?;
-    let burst_started = Instant::now();
-    let burst_sampler = start_pressure_sampler(path.clone(), child.id());
-    let mut latencies_us = Vec::with_capacity(config.burst);
+    let drain_marker = enabled.then(|| path.join(".drain-active"));
+    let supported_cpu_before = process_cpu_seconds(child.id())?;
+    let supported_started = Instant::now();
+    let mut supported_sampler = start_pressure_sampler(
+        durable_dir.to_path_buf(),
+        child.id(),
+        false,
+        drain_marker.clone(),
+        config.sample,
+    )?;
+    let supported = execute_commands(
+        &mut writer,
+        output,
+        0,
+        config.supported_events,
+        SUPPORTED_INTER_EVENT_PERIOD,
+    )?;
+    durability_barrier(&mut writer, output)?;
+    let supported_elapsed = supported_started.elapsed();
+    let supported_peaks = supported_sampler.stop()?;
+    let supported_cpu_after = process_cpu_seconds(child.id())?;
+    let supported_rate_cpu_percent = if supported_elapsed.is_zero() {
+        0.0
+    } else {
+        (supported_cpu_after - supported_cpu_before).max(0.0) / supported_elapsed.as_secs_f64()
+            * 100.0
+    };
+    let (saturation, saturation_cpu_percent, saturation_peaks) = if enabled {
+        let cpu_before = process_cpu_seconds(child.id())?;
+        let saturation_started = Instant::now();
+        let mut saturation_sampler = start_pressure_sampler(
+            durable_dir.to_path_buf(),
+            child.id(),
+            false,
+            drain_marker.clone(),
+            config.sample,
+        )?;
+        let saturation = execute_commands(
+            &mut writer,
+            output,
+            config.supported_events,
+            config.saturation_events,
+            Duration::ZERO,
+        );
+        let elapsed = saturation_started.elapsed();
+        let peaks = saturation_sampler.stop()?;
+        let saturation = saturation?;
+        let cpu_after = process_cpu_seconds(child.id())?;
+        let cpu_percent = if elapsed.is_zero() {
+            0.0
+        } else {
+            (cpu_after - cpu_before).max(0.0) / elapsed.as_secs_f64() * 100.0
+        };
+        (saturation, cpu_percent, peaks)
+    } else {
+        (
+            WorkloadPass {
+                latencies_us: Vec::new(),
+                rejected_events: 0,
+            },
+            0.0,
+            PressurePeaks::default(),
+        )
+    };
+    samples.push(sample(
+        durable_dir,
+        child.id(),
+        "active",
+        started.elapsed(),
+        Some(supported_rate_cpu_percent),
+        &mut network_monitor,
+    )?);
+    sample_phase(
+        &mut samples,
+        "active",
+        config.active,
+        config.sample,
+        durable_dir,
+        child.id(),
+        started,
+        &mut network_monitor,
+    )?;
+    let mut drain_sampler = start_pressure_sampler(
+        durable_dir.to_path_buf(),
+        child.id(),
+        true,
+        drain_marker,
+        config.sample,
+    )?;
+    writeln!(writer, "__drain__").map_err(|e| format!("request worker drain: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("flush worker drain request: {e}"))?;
+    read_worker_marker(output, "drain-start", WORKER_PROTOCOL_TIMEOUT)?;
+    read_worker_marker(output, "drain-finished", WORKER_PROTOCOL_TIMEOUT)?;
+    if enabled {
+        drain_sampler.wait_for_drain_sample(WORKER_PROTOCOL_TIMEOUT)?;
+    }
+    writeln!(writer, "__drain_sampled__")
+        .map_err(|e| format!("acknowledge worker drain sample: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("flush worker drain sample acknowledgement: {e}"))?;
+    read_worker_marker(output, "drain-complete", WORKER_PROTOCOL_TIMEOUT)?;
+    network_monitor.final_sample()?;
+    writeln!(writer, "__network_monitor_release__")
+        .map_err(|e| format!("release network-monitored worker: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("flush network monitor release: {e}"))?;
+    drop(writer);
+    let status_result = wait_for_child(child, WORKER_EXIT_TIMEOUT);
+    if status_result.is_ok() {
+        drain_sampler.confirm_process_exit();
+    }
+    let drain_result = drain_sampler.stop();
+    let status = status_result?;
+    output.join()?;
+    let drain_peaks = drain_result?;
+    if !status.success() {
+        return Err(format!("worker exited with {status}"));
+    }
+    let network_evidence = network_monitor.finish()?;
+    if enabled
+        && supported_peaks.drain_sample_count
+            + saturation_peaks.drain_sample_count
+            + drain_peaks.drain_sample_count
+            == 0
+    {
+        return Err("drain pressure sampler produced no sample inside the drain boundary".into());
+    }
+    let durable_bytes = StorageBudget::allocated_tree_bytes(durable_dir)
+        .map_err(|e| format!("measure allocated durable bytes: {e}"))?;
+    let durable_events = if enabled {
+        LocalStore::open(path)
+            .map_err(|e| format!("reopen durable store for reconciliation: {e}"))?
+            .observation_count()
+            .map_err(|e| format!("count durable observations: {e}"))?
+    } else {
+        0
+    };
+    if supported.latencies_us.len() != config.supported_events
+        || (enabled && saturation.latencies_us.len() != config.saturation_events)
+        || samples.is_empty()
+    {
+        return Err("required subprocess latency or resource samples are missing".into());
+    }
+    Ok(RunResult {
+        enabled,
+        run,
+        events: supported.latencies_us.len(),
+        rejected_events: supported.rejected_events,
+        saturation_events: saturation.latencies_us.len(),
+        saturation_rejected_events: saturation.rejected_events,
+        durable_events,
+        latencies_us: supported.latencies_us,
+        saturation_latencies_us: saturation.latencies_us,
+        samples,
+        durable_bytes,
+        supported_rate_cpu_percent: supported_rate_cpu_percent.max(supported_peaks.cpu_percent),
+        saturation_cpu_percent: saturation_cpu_percent.max(saturation_peaks.cpu_percent),
+        peak_rss_kib: supported_peaks
+            .rss_kib
+            .max(saturation_peaks.rss_kib)
+            .max(drain_peaks.rss_kib),
+        peak_disk_bytes: supported_peaks
+            .disk_bytes
+            .max(saturation_peaks.disk_bytes)
+            .max(drain_peaks.disk_bytes),
+        network_bytes: network_evidence.max_bytes,
+        network_monitor_samples: network_evidence.samples,
+    })
+}
+
+fn execute_commands(
+    writer: &mut impl Write,
+    output: &WorkerOutput,
+    event_offset: usize,
+    event_count: usize,
+    inter_event_period: Duration,
+) -> Result<WorkloadPass, String> {
+    let mut latencies_us = Vec::with_capacity(event_count);
     let mut rejected_events = 0_usize;
-    for event in 0..config.burst {
+    let mut next_event_at = Instant::now();
+    for event in event_offset..event_offset.saturating_add(event_count) {
+        sleep(next_event_at.saturating_duration_since(Instant::now()));
+        next_event_at += inter_event_period;
         let (name, _) = SOURCES[event % SOURCES.len()];
         let command = format!("{name}|{}", event / SOURCES.len());
         let before = Instant::now();
@@ -302,10 +1349,7 @@ fn execute_run(
         writer
             .flush()
             .map_err(|e| format!("flush workload command: {e}"))?;
-        let mut response = String::new();
-        reader
-            .read_line(&mut response)
-            .map_err(|e| format!("read worker response: {e}"))?;
+        let response = output.read(WORKER_COMMAND_TIMEOUT, "command response")?;
         match response.trim() {
             "ok" => {}
             "full" | "oversized" | "unavailable" => {
@@ -315,119 +1359,313 @@ fn execute_run(
         }
         latencies_us.push(before.elapsed().as_micros());
     }
-    let burst_elapsed = burst_started.elapsed();
-    let burst_peaks = stop_pressure_sampler(burst_sampler)?;
-    let cpu_after = process_cpu_seconds(child.id())?;
-    let burst_cpu_percent = if burst_elapsed.is_zero() {
-        0.0
-    } else {
-        (cpu_after - cpu_before).max(0.0) / burst_elapsed.as_secs_f64() * 100.0
-    };
-    samples.push(sample(
-        &path,
-        child.id(),
-        "active",
-        started.elapsed(),
-        network_baseline,
-    )?);
-    sample_phase(
-        &mut samples,
-        "active",
-        config.active,
-        config.sample,
-        &path,
-        child.id(),
-        started,
-        network_baseline,
-    )?;
-    let drain_sampler = start_pressure_sampler(path.clone(), child.id());
-    drop(writer);
-    let status = child.wait().map_err(|e| format!("wait for worker: {e}"))?;
-    let drain_peaks = stop_pressure_sampler(drain_sampler)?;
-    if !status.success() {
-        return Err(format!("worker exited with {status}"));
-    }
-    let durable_bytes = StorageBudget::allocated_tree_bytes(&path)
-        .map_err(|e| format!("measure allocated durable bytes: {e}"))?;
-    let durable_events = if enabled {
-        LocalStore::open(&path)
-            .map_err(|e| format!("reopen durable store for reconciliation: {e}"))?
-            .observation_count()
-            .map_err(|e| format!("count durable observations: {e}"))?
-    } else {
-        0
-    };
-    if latencies_us.len() != config.burst || samples.is_empty() {
-        return Err("required subprocess latency or resource samples are missing".into());
-    }
-    Ok(RunResult {
-        enabled,
-        run,
-        events: latencies_us.len(),
-        rejected_events,
-        durable_events,
+    Ok(WorkloadPass {
         latencies_us,
-        samples,
-        durable_bytes,
-        burst_cpu_percent: burst_cpu_percent.max(burst_peaks.cpu_percent),
-        peak_rss_kib: burst_peaks.rss_kib.max(drain_peaks.rss_kib),
-        peak_disk_bytes: burst_peaks.disk_bytes.max(drain_peaks.disk_bytes),
+        rejected_events,
     })
 }
 
-type PressureSampler = (
-    mpsc::Sender<()>,
-    thread::JoinHandle<Result<PressurePeaks, String>>,
-);
-
-fn start_pressure_sampler(path: PathBuf, pid: u32) -> PressureSampler {
-    let (stop_tx, stop_rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let mut peaks = PressurePeaks::default();
-        loop {
-            peaks.cpu_percent = peaks.cpu_percent.max(
-                ps_value(pid, "%cpu")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.0),
-            );
-            peaks.rss_kib = peaks.rss_kib.max(
-                ps_value(pid, "rss")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.0),
-            );
-            peaks.disk_bytes = peaks.disk_bytes.max(
-                StorageBudget::allocated_tree_bytes(&path)
-                    .map_err(|e| format!("measure pressure disk peak: {e}"))?,
-            );
-            if stop_rx.recv_timeout(Duration::from_millis(10)).is_ok() {
-                break;
-            }
-        }
-        Ok(peaks)
-    });
-    (stop_tx, handle)
+fn durability_barrier(writer: &mut impl Write, output: &WorkerOutput) -> Result<(), String> {
+    writeln!(writer, "__durability_barrier__")
+        .map_err(|e| format!("write durability barrier: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("flush durability barrier: {e}"))?;
+    let response = output.read(WORKER_PROTOCOL_TIMEOUT, "durability barrier")?;
+    if response.trim() != "barrier-complete" {
+        return Err("worker omitted durability barrier completion".into());
+    }
+    Ok(())
 }
 
-fn stop_pressure_sampler(sampler: PressureSampler) -> Result<PressurePeaks, String> {
-    let (stop, handle) = sampler;
-    let _ = stop.send(());
-    handle
-        .join()
-        .map_err(|_| "pressure sampler panicked".to_string())?
+struct PressureSampler {
+    stop: Option<mpsc::Sender<()>>,
+    result: mpsc::Receiver<Result<PressurePeaks, String>>,
+    handle: Option<thread::JoinHandle<()>>,
+    process_exit_confirmed: Arc<AtomicBool>,
+    drain_sample_count: Arc<AtomicU64>,
+}
+
+impl Drop for PressureSampler {
+    fn drop(&mut self) {
+        if self.handle.is_some()
+            && let Err(error) = self.stop()
+        {
+            eprintln!("fallback pressure sampler cleanup failed: {error}");
+        }
+    }
+}
+
+impl PressureSampler {
+    fn confirm_process_exit(&self) {
+        self.process_exit_confirmed.store(true, Ordering::Release);
+    }
+
+    fn wait_for_drain_sample(&mut self, timeout: Duration) -> Result<(), String> {
+        let started = Instant::now();
+        loop {
+            if self.drain_sample_count.load(Ordering::Acquire) > 0 {
+                return Ok(());
+            }
+            match self.result.try_recv() {
+                Ok(result) => {
+                    self.join_completed()?;
+                    return match result {
+                        Ok(_) => Err("pressure sampler ended before a drain sample".into()),
+                        Err(error) => Err(error),
+                    };
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.join_completed()?;
+                    return Err("pressure sampler ended without a result".into());
+                }
+            }
+            if started.elapsed() >= timeout {
+                return Err(format!(
+                    "drain pressure sample timed out after {} ms",
+                    timeout.as_millis()
+                ));
+            }
+            sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn stop(&mut self) -> Result<PressurePeaks, String> {
+        let signal_failed = self.stop.take().is_some_and(|stop| stop.send(()).is_err());
+        let result = match self.result.recv_timeout(SAMPLER_STOP_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "pressure sampler stop timed out after {} ms",
+                    SAMPLER_STOP_TIMEOUT.as_millis()
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.join_completed()?;
+                return Err("pressure sampler ended without a result".into());
+            }
+        };
+        self.join_completed()?;
+        let peaks = result?;
+        if signal_failed && !peaks.process_exit_observed {
+            return Err("signal pressure sampler cleanup failed".into());
+        }
+        Ok(peaks)
+    }
+
+    fn join_completed(&mut self) -> Result<(), String> {
+        self.handle
+            .take()
+            .ok_or_else(|| "pressure sampler handle is missing".to_string())?
+            .join()
+            .map_err(|_| "pressure sampler panicked".to_string())
+    }
+}
+
+fn start_pressure_sampler(
+    path: PathBuf,
+    pid: u32,
+    allow_process_exit: bool,
+    drain_marker: Option<PathBuf>,
+    interval: Duration,
+) -> Result<PressureSampler, String> {
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let previous_cpu = process_cpu_seconds(pid)?;
+    let previous_at = Instant::now();
+    let initial_rss = ps_metric(pid, "rss")?;
+    let initial_disk = StorageBudget::allocated_tree_bytes(&path)
+        .map_err(|e| format!("measure initial pressure disk: {e}"))?;
+    let process_exit_confirmed = Arc::new(AtomicBool::new(false));
+    let sampler_exit_confirmed = Arc::clone(&process_exit_confirmed);
+    let drain_sample_count = Arc::new(AtomicU64::new(0));
+    let sampler_drain_sample_count = Arc::clone(&drain_sample_count);
+    let (result_tx, result_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let result = (|| {
+            let mut peaks = PressurePeaks {
+                rss_kib: initial_rss,
+                disk_bytes: initial_disk,
+                ..PressurePeaks::default()
+            };
+            let mut previous_cpu = previous_cpu;
+            let mut previous_at = previous_at;
+            loop {
+                let drain_active_before = drain_marker
+                    .as_deref()
+                    .map(marker_is_active)
+                    .transpose()?
+                    .unwrap_or(false);
+                let Some(current_cpu) = metric_or_confirmed_exit(
+                    process_cpu_seconds(pid),
+                    allow_process_exit,
+                    &sampler_exit_confirmed,
+                )?
+                else {
+                    peaks.process_exit_observed = true;
+                    break;
+                };
+                let current_at = Instant::now();
+                peaks.cpu_percent = peaks.cpu_percent.max(interval_cpu_percent(
+                    previous_cpu,
+                    current_cpu,
+                    current_at.duration_since(previous_at),
+                ));
+                previous_cpu = current_cpu;
+                previous_at = current_at;
+                let Some(current_rss) = metric_or_confirmed_exit(
+                    ps_metric(pid, "rss"),
+                    allow_process_exit,
+                    &sampler_exit_confirmed,
+                )?
+                else {
+                    peaks.process_exit_observed = true;
+                    break;
+                };
+                peaks.rss_kib = peaks.rss_kib.max(current_rss);
+                peaks.disk_bytes = peaks.disk_bytes.max(
+                    StorageBudget::allocated_tree_bytes(&path)
+                        .map_err(|e| format!("measure pressure disk peak: {e}"))?,
+                );
+                if drain_active_before
+                    && drain_marker
+                        .as_deref()
+                        .map(marker_is_active)
+                        .transpose()?
+                        .unwrap_or(false)
+                {
+                    peaks.drain_sample_count = peaks.drain_sample_count.saturating_add(1);
+                    sampler_drain_sample_count.fetch_add(1, Ordering::Release);
+                }
+                if stop_rx.recv_timeout(interval).is_ok() {
+                    break;
+                }
+            }
+            Ok(peaks)
+        })();
+        let _ = result_tx.send(result);
+    });
+    Ok(PressureSampler {
+        stop: Some(stop_tx),
+        result: result_rx,
+        handle: Some(handle),
+        process_exit_confirmed,
+        drain_sample_count,
+    })
+}
+
+fn write_private_marker(path: &Path, label: &str) -> Result<(), String> {
+    fs::write(path, []).map_err(|e| format!("create {label}: {e}"))?;
+    fs::set_permissions(path, Permissions::from_mode(0o600))
+        .map_err(|e| format!("protect {label}: {e}"))
+}
+
+fn marker_is_active(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err("drain marker is not a regular file".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("inspect drain marker: {error}")),
+    }
+}
+
+fn interval_cpu_percent(previous: f64, current: f64, elapsed: Duration) -> f64 {
+    if elapsed.is_zero() {
+        return 0.0;
+    }
+    (current - previous).max(0.0) / elapsed.as_secs_f64() * 100.0
 }
 
 fn process_cpu_seconds(pid: u32) -> Result<f64, String> {
-    let value = ps_value(pid, "time").ok_or("process CPU time is unavailable")?;
-    let (minutes, seconds) = value
-        .rsplit_once(':')
-        .ok_or("process CPU time has an invalid format")?;
-    let minutes = minutes
-        .parse::<u32>()
-        .map_err(|_| "process CPU minutes are invalid")?;
-    let seconds = seconds
+    let mut value = None;
+    for _ in 0..5 {
+        value = ps_value(pid, "time");
+        if value.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let value = value.ok_or("process CPU time is unavailable")?;
+    parse_process_cpu_seconds(&value)
+}
+
+fn parse_process_cpu_seconds(value: &str) -> Result<f64, String> {
+    let mut parts = value.rsplit(':');
+    let seconds = parts
+        .next()
+        .ok_or("process CPU time has an invalid format")?
         .parse::<f64>()
         .map_err(|_| "process CPU seconds are invalid")?;
-    Ok(f64::from(minutes) * 60.0 + seconds)
+    let minutes = parts
+        .next()
+        .ok_or("process CPU time has an invalid format")?
+        .parse::<u32>()
+        .map_err(|_| "process CPU minutes are invalid")?;
+    let hours_and_days = parts.next();
+    let has_hours = hours_and_days.is_some();
+    if parts.next().is_some() {
+        return Err("process CPU time has an invalid format".into());
+    }
+    let (days, hours) = match hours_and_days {
+        None => (0, 0),
+        Some(value) => match value.split_once('-') {
+            Some((days, hours)) => (
+                days.parse::<u32>()
+                    .map_err(|_| "process CPU days are invalid")?,
+                hours
+                    .parse::<u32>()
+                    .map_err(|_| "process CPU hours are invalid")?,
+            ),
+            None => (
+                0,
+                value
+                    .parse::<u32>()
+                    .map_err(|_| "process CPU hours are invalid")?,
+            ),
+        },
+    };
+    if (has_hours && minutes >= 60) || hours >= 24 || !(0.0..60.0).contains(&seconds) {
+        return Err("process CPU time components are out of range".into());
+    }
+    let total = f64::from(days) * 86_400.0
+        + f64::from(hours) * 3_600.0
+        + f64::from(minutes) * 60.0
+        + seconds;
+    if !total.is_finite() || total.is_sign_negative() {
+        return Err("process CPU time is non-finite or negative".into());
+    }
+    Ok(total)
+}
+
+fn ps_metric(pid: u32, field: &str) -> Result<f64, String> {
+    let value = ps_value(pid, field).ok_or_else(|| format!("process {field} is unavailable"))?;
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| format!("process {field} is invalid"))?;
+    if !value.is_finite() || value.is_sign_negative() {
+        return Err(format!("process {field} is non-finite or negative"));
+    }
+    Ok(value)
+}
+
+fn metric_or_confirmed_exit(
+    metric: Result<f64, String>,
+    allow_process_exit: bool,
+    process_exit_confirmed: &AtomicBool,
+) -> Result<Option<f64>, String> {
+    match metric {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if allow_process_exit => {
+            for _ in 0..20 {
+                if process_exit_confirmed.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
 }
 #[allow(clippy::too_many_arguments)]
 fn sample_phase(
@@ -438,19 +1676,30 @@ fn sample_phase(
     path: &Path,
     pid: u32,
     started: Instant,
-    network_baseline: Option<u64>,
+    network_monitor: &mut NetworkMonitor,
 ) -> Result<(), String> {
     let phase_started = Instant::now();
-    let mut next_sample = phase_started + interval;
+    let mut previous_cpu = process_cpu_seconds(pid)?;
+    let mut previous_at = Instant::now();
+    let mut next_sample = previous_at + interval;
     while phase_started.elapsed() < duration {
         sleep(next_sample.saturating_duration_since(Instant::now()));
+        let current_cpu = process_cpu_seconds(pid)?;
+        let current_at = Instant::now();
         samples.push(sample(
             path,
             pid,
             phase,
             started.elapsed(),
-            network_baseline,
+            Some(interval_cpu_percent(
+                previous_cpu,
+                current_cpu,
+                current_at.duration_since(previous_at),
+            )),
+            network_monitor,
         )?);
+        previous_cpu = current_cpu;
+        previous_at = current_at;
         next_sample += interval;
     }
     if !samples.iter().any(|s| s.phase == phase) {
@@ -459,7 +1708,8 @@ fn sample_phase(
             pid,
             phase,
             started.elapsed(),
-            network_baseline,
+            Some(0.0),
+            network_monitor,
         )?);
     }
     Ok(())
@@ -479,29 +1729,87 @@ fn spawn_worker(path: &Path, enabled: bool) -> Result<Child, String> {
         .map_err(|e| format!("spawn local workload worker: {e}"))
 }
 
+fn read_worker_marker(
+    output: &WorkerOutput,
+    expected: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let marker = output.read(timeout, expected)?;
+    if marker.trim() != expected {
+        return Err(format!("worker omitted {expected} marker"));
+    }
+    Ok(())
+}
+
+fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus, String> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("inspect worker exit: {error}"))?
+        {
+            return Ok(status);
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "worker exit timed out after {} ms",
+                timeout.as_millis()
+            ));
+        }
+        sleep(Duration::from_millis(5));
+    }
+}
+
 fn worker() -> Result<(), String> {
     let mut args = env::args().skip(2);
     let path = args.next().ok_or("worker durable path missing")?;
     let enabled = args.next().is_some_and(|mode| mode == "enabled");
     let mut output = BufWriter::new(io::stdout().lock());
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+    read_network_monitor_start(&mut lines)?;
     if !enabled {
-        for line in io::stdin().lock().lines() {
-            line.map_err(|e| format!("read worker command: {e}"))?;
-            writeln!(output, "ok").map_err(|e| format!("write worker response: {e}"))?;
-            output
-                .flush()
-                .map_err(|e| format!("flush worker response: {e}"))?;
-        }
-        return Ok(());
+        return baseline_worker(&mut lines, &mut output);
     }
     let (ingress, receiver) = Ingress::new();
     let (tx, rx) = mpsc::channel();
-    let drain_path = PathBuf::from(path);
+    let (progress_tx, progress_rx) = mpsc::channel();
+    let drain_path = PathBuf::from(&path);
+    let drain_marker = drain_path.join(".drain-active");
+    let cpu_token = Arc::new(Mutex::new(()));
+    let drain_cpu_token = Arc::clone(&cpu_token);
     thread::spawn(move || {
-        let _ = tx.send(drain(&receiver, &drain_path));
+        let _ = tx.send(drain_with_cpu_token(
+            &receiver,
+            &drain_path,
+            Some(&drain_cpu_token),
+            Some(&progress_tx),
+        ));
     });
-    for line in io::stdin().lock().lines() {
+    writeln!(output, "worker-ready").map_err(|e| format!("write worker ready: {e}"))?;
+    output
+        .flush()
+        .map_err(|e| format!("flush worker ready: {e}"))?;
+    let mut durable_events = 0_usize;
+    for line in &mut lines {
         let command = line.map_err(|e| format!("read worker command: {e}"))?;
+        if begin_drain_boundary(&command, &drain_marker)? {
+            break;
+        }
+        if command == "__durability_barrier__" {
+            let accepted = usize::try_from(ingress.counters.snapshot().0)
+                .map_err(|_| "accepted ingress count overflow")?;
+            await_durable_count(&progress_rx, &mut durable_events, accepted)?;
+            writeln!(output, "barrier-complete")
+                .map_err(|e| format!("write durability barrier response: {e}"))?;
+            output
+                .flush()
+                .map_err(|e| format!("flush durability barrier response: {e}"))?;
+            continue;
+        }
+        let _cpu_guard = cpu_token
+            .lock()
+            .map_err(|_| "local CPU execution token poisoned")?;
         let deadline = Instant::now() + Duration::from_millis(ENQUEUE_DEADLINE_MS);
         let outcome = enqueue_until(deadline, || {
             ingress.try_send_projected(command.len(), command.as_bytes())
@@ -518,8 +1826,112 @@ fn worker() -> Result<(), String> {
             .map_err(|e| format!("flush worker response: {e}"))?;
     }
     drop(ingress);
-    rx.recv()
-        .map_err(|_| "local runtime drain stopped".to_string())??;
+    writeln!(output, "drain-start").map_err(|e| format!("write drain marker: {e}"))?;
+    output
+        .flush()
+        .map_err(|e| format!("flush drain marker: {e}"))?;
+    let drain_result = rx
+        .recv()
+        .map_err(|_| "local runtime drain stopped".to_string())?;
+    drain_result?;
+    writeln!(output, "drain-finished").map_err(|e| format!("write drain marker: {e}"))?;
+    output
+        .flush()
+        .map_err(|e| format!("flush drain marker: {e}"))?;
+    read_drain_sample_ack(&mut lines)?;
+    finish_drain_boundary(&drain_marker)?;
+    writeln!(output, "drain-complete").map_err(|e| format!("write drain marker: {e}"))?;
+    output
+        .flush()
+        .map_err(|e| format!("flush drain marker: {e}"))?;
+    read_network_monitor_release(&mut lines)?;
+    Ok(())
+}
+
+fn baseline_worker(
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+    output: &mut impl Write,
+) -> Result<(), String> {
+    writeln!(output, "worker-ready").map_err(|e| format!("write worker ready: {e}"))?;
+    output
+        .flush()
+        .map_err(|e| format!("flush worker ready: {e}"))?;
+    for line in &mut *lines {
+        let command = line.map_err(|e| format!("read worker command: {e}"))?;
+        if command == "__drain__" {
+            break;
+        }
+        let response = if command == "__durability_barrier__" {
+            "barrier-complete"
+        } else {
+            "ok"
+        };
+        writeln!(output, "{response}").map_err(|e| format!("write worker response: {e}"))?;
+        output
+            .flush()
+            .map_err(|e| format!("flush worker response: {e}"))?;
+    }
+    writeln!(output, "drain-start").map_err(|e| format!("write drain marker: {e}"))?;
+    writeln!(output, "drain-finished").map_err(|e| format!("write drain marker: {e}"))?;
+    output
+        .flush()
+        .map_err(|e| format!("flush drain marker: {e}"))?;
+    read_drain_sample_ack(lines)?;
+    writeln!(output, "drain-complete").map_err(|e| format!("write drain marker: {e}"))?;
+    output
+        .flush()
+        .map_err(|e| format!("flush drain marker: {e}"))?;
+    read_network_monitor_release(lines)
+}
+
+fn read_drain_sample_ack(
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+) -> Result<(), String> {
+    let acknowledgement = lines
+        .next()
+        .ok_or("drain sample acknowledgement is missing")?
+        .map_err(|error| format!("read drain sample acknowledgement: {error}"))?;
+    if acknowledgement != "__drain_sampled__" {
+        return Err("drain sample acknowledgement is invalid".into());
+    }
+    Ok(())
+}
+
+fn begin_drain_boundary(command: &str, marker: &Path) -> Result<bool, String> {
+    if command != "__drain__" {
+        return Ok(false);
+    }
+    write_private_marker(marker, "drain boundary")?;
+    Ok(true)
+}
+
+fn finish_drain_boundary(marker: &Path) -> Result<(), String> {
+    fs::remove_file(marker).map_err(|e| format!("remove drain boundary: {e}"))
+}
+
+fn read_network_monitor_start(
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+) -> Result<(), String> {
+    let start = lines
+        .next()
+        .ok_or("network monitor start is missing")?
+        .map_err(|error| format!("read network monitor start: {error}"))?;
+    if start != "__network_monitor_start__" {
+        return Err("network monitor start is invalid".into());
+    }
+    Ok(())
+}
+
+fn read_network_monitor_release(
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+) -> Result<(), String> {
+    let release = lines
+        .next()
+        .ok_or("network monitor release is missing")?
+        .map_err(|error| format!("read network monitor release: {error}"))?;
+    if release != "__network_monitor_release__" {
+        return Err("network monitor release is invalid".into());
+    }
     Ok(())
 }
 
@@ -545,9 +1957,21 @@ fn retry_sleep(now: Instant, deadline: Instant) -> Duration {
         .min(Duration::from_micros(100))
 }
 
+#[cfg(test)]
 fn drain(receiver: &std::sync::mpsc::Receiver<IngressMessage>, path: &Path) -> Result<(), String> {
+    drain_with_cpu_token(receiver, path, None, None)
+}
+
+fn drain_with_cpu_token(
+    receiver: &std::sync::mpsc::Receiver<IngressMessage>,
+    path: &Path,
+    cpu_token: Option<&Mutex<()>>,
+    progress: Option<&mpsc::Sender<usize>>,
+) -> Result<(), String> {
     let mut store = LocalStore::open(path).map_err(|e| format!("open local durable store: {e}"))?;
-    let config = LocalRuntimeConfigV1::default();
+    let mut config = LocalRuntimeConfigV2::default();
+    config.collection.max_batch_records = DURABLE_BATCH_RECORDS;
+    config.collection.max_batch_bytes = DURABLE_BATCH_BYTES;
     let mut control = RuntimeControl::new(&config).map_err(|e| e.to_string())?;
     let mut previous = BTreeMap::new();
     let mut pending = None;
@@ -557,6 +1981,13 @@ fn drain(receiver: &std::sync::mpsc::Receiver<IngressMessage>, path: &Path) -> R
         usize::from(config.collection.max_batch_records),
         usize::try_from(config.collection.max_batch_bytes).unwrap_or(usize::MAX),
     )? {
+        let _cpu_guard = cpu_token
+            .map(|token| {
+                token
+                    .lock()
+                    .map_err(|_| "local CPU execution token poisoned")
+            })
+            .transpose()?;
         if control
             .admit(path, u64::from(config.collection.max_batch_bytes))
             .map_err(|e| e.to_string())?
@@ -579,6 +2010,11 @@ fn drain(receiver: &std::sync::mpsc::Receiver<IngressMessage>, path: &Path) -> R
         store
             .ingest_batch_deferred_projection(&observations)
             .map_err(|e| format!("local durable batch commit: {e}"))?;
+        if let Some(progress) = progress {
+            progress
+                .send(observations.len())
+                .map_err(|_| "durability progress receiver stopped".to_string())?;
+        }
     }
     let allocated = StorageBudget::allocated_tree_bytes(path)
         .map_err(|e| format!("measure local state: {e}"))?;
@@ -594,6 +2030,21 @@ fn drain(receiver: &std::sync::mpsc::Receiver<IngressMessage>, path: &Path) -> R
         store
             .rebuild_projection()
             .map_err(|e| format!("rebuild local projection: {e}"))?;
+    }
+    Ok(())
+}
+
+fn await_durable_count(
+    progress: &mpsc::Receiver<usize>,
+    durable_events: &mut usize,
+    target: usize,
+) -> Result<(), String> {
+    while *durable_events < target {
+        *durable_events = durable_events.saturating_add(
+            progress
+                .recv()
+                .map_err(|_| "local runtime drain stopped before durability barrier")?,
+        );
     }
     Ok(())
 }
@@ -618,9 +2069,9 @@ fn receive_batch(
     let mut batch = Vec::with_capacity(max_records);
     batch.push(first);
     while batch.len() < max_records {
-        let message = match receiver.try_recv() {
+        let message = match receiver.recv_timeout(DURABLE_BATCH_COALESCE) {
             Ok(message) => message,
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if bytes.saturating_add(message.0.len()) > max_bytes {
             *pending = Some(message);
@@ -667,87 +2118,101 @@ fn sample(
     pid: u32,
     phase: &str,
     elapsed: Duration,
-    network_baseline: Option<u64>,
+    cpu_percent: Option<f64>,
+    network_monitor: &mut NetworkMonitor,
 ) -> Result<Sample, String> {
     Ok(Sample {
         phase: phase.into(),
         elapsed_ms: elapsed.as_millis(),
-        cpu_percent: ps_value(pid, "%cpu").and_then(|v| v.parse().ok()),
-        rss_kib: ps_value(pid, "rss").and_then(|v| v.parse().ok()),
+        cpu_percent,
+        rss_kib: Some(ps_metric(pid, "rss")?),
         disk_bytes: Some(
             StorageBudget::allocated_tree_bytes(path)
                 .map_err(|e| format!("measure allocated disk: {e}"))?,
         ),
-        network_bytes: network_bytes(pid)
-            .ok()
-            .zip(network_baseline)
-            .map(|(current, baseline)| current.saturating_sub(baseline)),
+        network_bytes: Some(network_monitor.sample()?),
     })
 }
-fn network_bytes(pid: u32) -> Result<u64, String> {
-    #[cfg(target_os = "linux")]
-    {
-        let descriptors = fs::read_dir(format!("/proc/{pid}/fd"))
-            .map_err(|e| format!("inspect process descriptors: {e}"))?;
-        for descriptor in descriptors {
-            let target = fs::read_link(
-                descriptor
-                    .map_err(|e| format!("inspect process descriptor: {e}"))?
-                    .path(),
-            )
-            .map_err(|e| format!("inspect process descriptor target: {e}"))?;
-            if target.to_string_lossy().starts_with("socket:[") {
-                return Err(
-                    "worker owns a network socket; zero-byte evidence cannot be established".into(),
-                );
-            }
+
+#[cfg(target_os = "linux")]
+fn linux_network_bytes(pid: u32) -> Result<u64, String> {
+    let descriptors = fs::read_dir(format!("/proc/{pid}/fd"))
+        .map_err(|e| format!("inspect process descriptors: {e}"))?;
+    for descriptor in descriptors {
+        let target = fs::read_link(
+            descriptor
+                .map_err(|e| format!("inspect process descriptor: {e}"))?
+                .path(),
+        )
+        .map_err(|e| format!("inspect process descriptor target: {e}"))?;
+        if target.to_string_lossy().starts_with("socket:[") {
+            return Err(
+                "worker owns a network socket; zero-byte evidence cannot be established".into(),
+            );
         }
-        return Ok(0);
     }
-    #[cfg(target_os = "macos")]
+    Ok(0)
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_network_monitor(
+    reader: impl BufRead,
+    state: &Mutex<MacNetworkMonitorState>,
+) -> Result<(), String> {
+    for line in reader.lines() {
+        let line = line.map_err(|error| format!("read process-scoped network monitor: {error}"))?;
+        let mut state = state
+            .lock()
+            .map_err(|_| "process-scoped network monitor state is poisoned")?;
+        record_macos_network_line(&mut state, &line, Instant::now())?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn record_macos_network_line(
+    state: &mut MacNetworkMonitorState,
+    line: &str,
+    observed_at: Instant,
+) -> Result<(), String> {
+    let sanitized = line
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>();
+    let fields = sanitized.split_whitespace().collect::<Vec<_>>();
+    if fields.len() >= 2
+        && fields[fields.len() - 2] == "bytes_in"
+        && fields[fields.len() - 1] == "bytes_out"
     {
-        let output = Command::new("nettop")
-            .args([
-                "-P",
-                "-x",
-                "-J",
-                "bytes_in,bytes_out",
-                "-p",
-                &pid.to_string(),
-                "-l",
-                "1",
-            ])
-            .output()
-            .map_err(|e| format!("run process-scoped network sampler: {e}"))?;
-        if !output.status.success() {
-            return Err("process-scoped network sampler failed".into());
+        if let Some(completed_bytes) = state.pending_bytes.take() {
+            state.evidence.latest_bytes = completed_bytes;
+            state.evidence.max_bytes = state.evidence.max_bytes.max(completed_bytes);
+            state.evidence.samples = state.evidence.samples.saturating_add(1);
+            state.last_completed_at = Some(observed_at);
+            state.last_completed_started_at = state.pending_started_at.take();
         }
-        let body = String::from_utf8(output.stdout)
-            .map_err(|_| "process-scoped network sampler returned non-UTF8".to_string())?;
-        let mut total = 0_u64;
-        for line in body.lines().skip(1).filter(|line| !line.trim().is_empty()) {
-            let columns = line.split_whitespace().collect::<Vec<_>>();
-            if columns.len() < 3 {
-                return Err("process-scoped network sampler returned an invalid row".into());
-            }
-            let bytes_in = columns[columns.len() - 2]
-                .parse::<u64>()
-                .map_err(|_| "process-scoped network bytes_in is invalid")?;
-            let bytes_out = columns[columns.len() - 1]
-                .parse::<u64>()
-                .map_err(|_| "process-scoped network bytes_out is invalid")?;
-            total = total
-                .checked_add(bytes_in)
-                .and_then(|value| value.checked_add(bytes_out))
-                .ok_or("process-scoped network byte counter overflow")?;
-        }
-        Ok(total)
+        state.pending_bytes = Some(0);
+        state.pending_started_at = Some(observed_at);
+        return Ok(());
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid;
-        Err("process-scoped network evidence is unsupported on this host".into())
+    if fields.len() < 3 {
+        return Err("process-scoped network monitor returned an invalid row".into());
     }
+    let bytes_in = fields[fields.len() - 2]
+        .parse::<u64>()
+        .map_err(|_| "process-scoped network bytes_in is invalid")?;
+    let bytes_out = fields[fields.len() - 1]
+        .parse::<u64>()
+        .map_err(|_| "process-scoped network bytes_out is invalid")?;
+    let pending_bytes = state
+        .pending_bytes
+        .as_mut()
+        .ok_or("process-scoped network monitor row arrived before its header")?;
+    *pending_bytes = pending_bytes
+        .checked_add(bytes_in)
+        .and_then(|value| value.checked_add(bytes_out))
+        .ok_or("process-scoped network byte counter overflow")?;
+    Ok(())
 }
 
 fn validate_network_surface() -> Result<(), String> {
@@ -800,45 +2265,206 @@ fn validate_network_surface() -> Result<(), String> {
     }
     Ok(())
 }
-fn ps_value(pid: u32, field: &str) -> Option<String> {
-    let output = Command::new("ps")
-        .args(["-o", field, "-p", &pid.to_string()])
+
+fn filesystem_type(path: &Path) -> Result<String, String> {
+    filesystem_type_platform(path)
+}
+
+#[cfg(target_os = "macos")]
+fn filesystem_type_platform(path: &Path) -> Result<String, String> {
+    let df = Command::new("df")
+        .arg("-P")
+        .arg(path)
         .output()
-        .ok()?;
-    let value = String::from_utf8(output.stdout)
-        .ok()?
+        .map_err(|e| format!("locate evidence filesystem device: {e}"))?;
+    if !df.status.success() {
+        return Err("filesystem device command failed".into());
+    }
+    let body = String::from_utf8(df.stdout)
+        .map_err(|_| "filesystem device evidence is not UTF-8".to_string())?;
+    let device = body
         .lines()
-        .nth(1)?
+        .nth(1)
+        .and_then(|line| line.split_whitespace().next())
+        .ok_or("filesystem device evidence is missing")?;
+    let info = Command::new("diskutil")
+        .args(["info", device])
+        .output()
+        .map_err(|e| format!("inspect evidence filesystem: {e}"))?;
+    if !info.status.success() {
+        return Err("filesystem evidence command failed".into());
+    }
+    let body = String::from_utf8(info.stdout)
+        .map_err(|_| "filesystem evidence is not UTF-8".to_string())?;
+    let value = body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Type (Bundle):"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("filesystem type evidence is missing")?;
+    validated_evidence_token(value, "filesystem")
+}
+
+#[cfg(target_os = "linux")]
+fn filesystem_type_platform(path: &Path) -> Result<String, String> {
+    let output = Command::new("stat")
+        .args(["-f", "-c", "%T"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("inspect evidence filesystem: {e}"))?;
+    if !output.status.success() {
+        return Err("filesystem evidence command failed".into());
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|_| "filesystem evidence is not UTF-8".to_string())?;
+    validated_evidence_token(value.trim(), "filesystem")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn filesystem_type_platform(_path: &Path) -> Result<String, String> {
+    Err("filesystem evidence is unsupported on this host".into())
+}
+
+fn validated_evidence_token(value: &str, field: &str) -> Result<String, String> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(format!("{field} evidence is empty or unsafe"));
+    }
+    Ok(value.to_owned())
+}
+
+fn power_mode() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("pmset")
+            .args(["-g", "batt"])
+            .output()
+            .map_err(|e| format!("inspect power mode: {e}"))?;
+        if !output.status.success() {
+            return Err("power mode command failed".into());
+        }
+        let value = String::from_utf8(output.stdout)
+            .map_err(|_| "power mode evidence is not UTF-8".to_string())?;
+        if value.contains("AC Power") {
+            return Ok("ac".into());
+        }
+        if value.contains("Battery Power") {
+            return Ok("battery".into());
+        }
+        Err("power mode evidence is unavailable".into())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let root = Path::new("/sys/class/power_supply");
+        match fs::metadata(root) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err("power supply interface is not a directory".into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok("not-applicable-no-power-supply-interface".into());
+            }
+            Err(error) => return Err(format!("inspect power supply interface: {error}")),
+        }
+        let mut has_battery = false;
+        for entry in fs::read_dir(root).map_err(|e| format!("inspect power supplies: {e}"))? {
+            let path = entry
+                .map_err(|e| format!("inspect power supply entry: {e}"))?
+                .path();
+            let supply_type = fs::read_to_string(path.join("type"))
+                .map_err(|e| format!("read power supply type: {e}"))?;
+            if supply_type.trim() == "Battery" {
+                has_battery = true;
+            } else {
+                let online = fs::read_to_string(path.join("online"))
+                    .map_err(|e| format!("read power supply online state: {e}"))?;
+                match online.trim() {
+                    "1" => return Ok("ac".into()),
+                    "0" => {}
+                    _ => return Err("power supply online state is invalid".into()),
+                }
+            }
+        }
+        if has_battery {
+            Ok("battery".into())
+        } else {
+            Ok("not-applicable-no-power-supply".into())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    Err("power mode evidence is unsupported on this host".into())
+}
+
+fn ps_value(pid: u32, field: &str) -> Option<String> {
+    let mut process = Command::new("ps")
+        .arg("-o")
+        .arg(format!("{field}="))
+        .args(["-p", &pid.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let Ok(status) = wait_for_child(&mut process, LOCAL_COMMAND_TIMEOUT) else {
+        let _ = process.kill();
+        let _ = wait_for_child(&mut process, LOCAL_COMMAND_TIMEOUT);
+        return None;
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut stdout = String::new();
+    process.stdout.take()?.read_to_string(&mut stdout).ok()?;
+    let value = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())?
         .trim()
         .to_owned();
     (!value.is_empty()).then_some(value)
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_manifest(config: Config, results: &[RunResult], errors: &[String]) -> String {
+fn render_manifest(
+    config: Config,
+    host: &HostEvidence,
+    results: &[RunResult],
+    errors: &[String],
+) -> String {
     let all = results
         .iter()
         .filter(|result| result.enabled)
-        .flat_map(|r| r.latencies_us.iter().copied())
+        .flat_map(|result| {
+            result
+                .latencies_us
+                .iter()
+                .chain(&result.saturation_latencies_us)
+                .copied()
+        })
         .collect::<Vec<_>>();
     let mut out = format!(
-        "schema_version: local_performance.v1\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: sanitized-local-host\nos: {}\nfilesystem: local-filesystem\npower_mode: unspecified\ncold_warm_cache: warm\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: local_runtime.v1\n  durable_store: local_state.v3\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  burst_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  channel_capacity: 64\n  normalization_workers: 1\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: asynchronous-local-store-drain\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: removed-after-measurement\nall_run_samples:\n",
+        "schema_version: local_performance.v1\nprotocol_revision: v1.2.0-supported-rate-saturation-continuous-network\nsource_revision: {}\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: {}\nos: {}\nfilesystem: {}\npower_mode: {}\ncold_warm_cache: warm-after-build-and-per-run-warmup\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: local_runtime.v2\n  durable_store: local_state.v4\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  supported_rate_events: {}\n  supported_inter_event_ms: {}\n  saturation_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  supported_rate_schedule: symmetric-driver-paced\n  supported_rate_durability_barrier: required-before-saturation\n  supported_rate_measurement_boundary: first-command-through-barrier-completion\n  saturation_schedule: enabled-unpaced\n  channel_capacity: 64\n  normalization_workers: 1\n  durable_batch_records: {DURABLE_BATCH_RECORDS}\n  durable_handoff_bytes_max: {DURABLE_HANDOFF_BYTES_MAX}\n  total_pipeline_payload_bytes_max: {TOTAL_PIPELINE_PAYLOAD_BYTES_MAX}\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: one-bounded-batch-local-store-drain-actor\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: run-relative/durable\n  durable_path_lifecycle: removed-after-measurement\nall_run_samples:\n",
+        host.source_revision,
         profile_name(config.profile),
+        host.machine,
         env::consts::OS,
-        thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        host.filesystem,
+        host.power_mode,
+        host.logical_cores,
         env!("CARGO_PKG_VERSION"),
         config.runs,
         config.runs,
         config.warmup.as_secs_f64(),
         config.idle.as_secs_f64(),
         config.active.as_secs_f64(),
-        config.burst,
-        config.sample.as_secs_f64()
+        config.supported_events,
+        SUPPORTED_INTER_EVENT_PERIOD.as_millis(),
+        config.saturation_events,
+        config.sample.as_secs_f64(),
     );
     for result in results {
         let _ = writeln!(
             out,
-            "  - mode: {}\n    run: {}\n    attempted_events: {}\n    enqueued_events: {}\n    rejected_events: {}\n    durable_events: {}\n    durable_bytes: {}\n    burst_cpu_percent: {}\n    peak_rss_kib: {}\n    peak_disk_bytes: {}\n    hook_latency_us: {:?}\n    samples:",
+            "  - mode: {}\n    run: {}\n    supported_rate_attempted_events: {}\n    supported_rate_enqueued_events: {}\n    supported_rate_rejected_events: {}\n    saturation_attempted_events: {}\n    saturation_enqueued_events: {}\n    saturation_rejected_events: {}\n    durable_events: {}\n    durable_bytes: {}\n    supported_rate_cpu_percent: {}\n    saturation_cpu_percent: {}\n    peak_rss_kib: {}\n    peak_disk_bytes: {}\n    network_bytes: {}\n    network_monitor_samples: {}\n    hook_latency_us: {:?}\n    saturation_hook_latency_us: {:?}\n    samples:",
             if result.enabled {
                 "enabled"
             } else {
@@ -848,12 +2474,21 @@ fn render_manifest(config: Config, results: &[RunResult], errors: &[String]) -> 
             result.events,
             result.events.saturating_sub(result.rejected_events),
             result.rejected_events,
+            result.saturation_events,
+            result
+                .saturation_events
+                .saturating_sub(result.saturation_rejected_events),
+            result.saturation_rejected_events,
             result.durable_events,
             result.durable_bytes,
-            result.burst_cpu_percent,
+            result.supported_rate_cpu_percent,
+            result.saturation_cpu_percent,
             result.peak_rss_kib,
             result.peak_disk_bytes,
-            result.latencies_us
+            result.network_bytes,
+            result.network_monitor_samples,
+            result.latencies_us,
+            result.saturation_latencies_us
         );
         for sample in &result.samples {
             let _ = writeln!(
@@ -882,10 +2517,24 @@ fn render_manifest(config: Config, results: &[RunResult], errors: &[String]) -> 
         values.sort_unstable();
         Some(percentile(&values, 99))
     };
-    let summary = metric_summary(results);
+    let summary = if errors.is_empty() {
+        metric_summary(results)
+    } else {
+        None
+    };
+    let supported_rate_cpu_percent_max = results
+        .iter()
+        .filter(|result| result.enabled)
+        .map(|result| result.supported_rate_cpu_percent)
+        .max_by(f64::total_cmp);
+    let saturation_cpu_percent_max = results
+        .iter()
+        .filter(|result| result.enabled)
+        .map(|result| result.saturation_cpu_percent)
+        .max_by(f64::total_cmp);
     let _ = writeln!(
         out,
-        "phase_metrics:\n  idle_average_cpu_delta_percent: {}\n  active_average_cpu_delta_percent: {}\n  active_any_minute_cpu_delta_percent: {}\nmetrics:\n  hook_latency_p95_us: {}\n  hook_latency_p99_us: {}\n  idle_average_cpu_delta_percent: {}\n  active_average_cpu_delta_percent: {}\n  active_any_minute_cpu_delta_percent: {}\n  enabled_rss_p95_kib: {}\n  total_allocated_disk_bytes: {}\n  network_bytes: {}\n  network_static_surface: pass\n  required: [hook_latency_p95_us, hook_latency_p99_us, idle_average_cpu_delta_percent, active_average_cpu_delta_percent, active_any_minute_cpu_delta_percent, enabled_rss_p95_kib, total_allocated_disk_bytes, network_bytes, network_static_surface]\n  network_mode: process-scoped-samples-plus-static-product-surface\n  evidence_scope: subprocess-plus-fixed-capacity-ingress-plus-asynchronous-local-store-drain\nerrors: {:?}",
+        "phase_metrics:\n  idle_average_cpu_delta_percent: {}\n  active_average_cpu_delta_percent: {}\n  active_any_minute_cpu_delta_percent: {}\nmetrics:\n  hook_latency_p95_us: {}\n  hook_latency_p99_us: {}\n  supported_rate_cpu_percent_max: {}\n  saturation_cpu_percent_max: {}\n  idle_average_cpu_delta_percent: {}\n  active_average_cpu_delta_percent: {}\n  active_any_minute_cpu_delta_percent: {}\n  enabled_rss_p95_kib: {}\n  total_allocated_disk_bytes: {}\n  network_bytes: {}\n  network_static_surface: pass\n  required: [hook_latency_p95_us, hook_latency_p99_us, supported_rate_cpu_percent_max, saturation_cpu_percent_max, idle_average_cpu_delta_percent, active_average_cpu_delta_percent, active_any_minute_cpu_delta_percent, enabled_rss_p95_kib, total_allocated_disk_bytes, network_bytes, network_static_surface]\n  network_mode: {}\n  evidence_scope: subprocess-plus-fixed-capacity-ingress-plus-one-token-local-store-drain",
         summary.map_or_else(
             || "null".into(),
             |value| value.idle_cpu_delta_percent.to_string()
@@ -900,6 +2549,8 @@ fn render_manifest(config: Config, results: &[RunResult], errors: &[String]) -> 
         ),
         optional_u128(p95),
         optional_u128(p99),
+        optional_f64(supported_rate_cpu_percent_max),
+        optional_f64(saturation_cpu_percent_max),
         summary.map_or_else(
             || "null".into(),
             |value| value.idle_cpu_delta_percent.to_string()
@@ -921,13 +2572,46 @@ fn render_manifest(config: Config, results: &[RunResult], errors: &[String]) -> 
             |value| value.total_allocated_disk_bytes.to_string()
         ),
         summary.map_or_else(|| "null".into(), |value| value.network_bytes.to_string()),
-        errors
+        network_evidence_mode(env::consts::OS)
     );
+    if errors.is_empty() {
+        out.push_str("errors: []\n");
+    } else {
+        out.push_str("errors:\n");
+        for error in errors {
+            let _ = writeln!(out, "  - {}", yaml_single_quoted(error));
+        }
+    }
     out
+}
+
+fn network_evidence_mode(os: &str) -> &'static str {
+    match os {
+        "macos" => "continuous-process-lifetime-monitor-plus-static-product-surface",
+        "linux" => "point-in-time-socket-descriptor-scan-plus-static-product-surface",
+        _ => "unsupported-process-scoped-evidence-plus-static-product-surface",
+    }
+}
+
+fn yaml_single_quoted(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .replace('\'', "''");
+    format!("'{sanitized}'")
 }
 
 fn validate_manifest_shape(manifest: &str) -> Result<(), String> {
     for field in [
+        "protocol_revision:",
+        "source_revision:",
         "machine:",
         "os:",
         "filesystem:",
@@ -945,6 +2629,61 @@ fn validate_manifest_shape(manifest: &str) -> Result<(), String> {
             return Err(format!(
                 "performance manifest is missing required field {field}"
             ));
+        }
+    }
+    let source_revision = manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("source_revision: "))
+        .ok_or("performance manifest is missing source revision")?;
+    if source_revision.len() != 40 || !source_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("performance manifest source revision is invalid".into());
+    }
+    for invalid in [
+        "machine: sanitized-local-host",
+        "filesystem: local-filesystem",
+        "power_mode: unspecified",
+        "durable_path: removed-after-measurement",
+    ] {
+        if manifest.lines().any(|line| line.trim() == invalid) {
+            return Err(format!(
+                "performance manifest contains placeholder evidence {invalid}"
+            ));
+        }
+    }
+    if !manifest
+        .lines()
+        .any(|line| line.trim() == "durable_path: run-relative/durable")
+    {
+        return Err("performance manifest is missing sanitized durable path evidence".into());
+    }
+    let mut lines = manifest.lines();
+    let errors = lines
+        .find(|line| line.starts_with("errors:"))
+        .ok_or("performance manifest is missing errors evidence")?;
+    if errors != "errors: []" {
+        for line in lines {
+            let value = line
+                .strip_prefix("  - ")
+                .ok_or("performance manifest error entry has invalid indentation")?;
+            validate_yaml_single_quoted(value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_yaml_single_quoted(value: &str) -> Result<(), String> {
+    let inner = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .ok_or("performance manifest error entry is not single-quoted")?;
+    let mut characters = inner.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character.is_control() {
+            return Err("performance manifest error entry contains a control character".into());
+        }
+        if character == '\'' && characters.next() != Some('\'') {
+            return Err("performance manifest error entry has an unescaped quote".into());
         }
     }
     Ok(())
@@ -993,15 +2732,7 @@ fn metric_summary(results: &[RunResult]) -> Option<MetricSummary> {
         .map(|result| result.durable_bytes.max(result.peak_disk_bytes))
         .max()?;
     let total_allocated_disk_bytes = sampled_disk_bytes.max(final_or_peak_disk_bytes);
-    let network_bytes = results
-        .iter()
-        .flat_map(|result| {
-            result
-                .samples
-                .iter()
-                .filter_map(|sample| sample.network_bytes)
-        })
-        .max()?;
+    let network_bytes = results.iter().map(|result| result.network_bytes).max()?;
     Some(MetricSummary {
         idle_cpu_delta_percent: enabled_idle - baseline_idle,
         active_cpu_delta_percent: enabled_active - baseline_active,
@@ -1056,29 +2787,47 @@ fn max_minute_cpu(result: &RunResult, phase: &str) -> Option<f64> {
         .max_by(f64::total_cmp)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_results(
     config: Config,
     results: &[RunResult],
     errors: &[String],
 ) -> Result<(), String> {
-    if !errors.is_empty() || results.len() != config.runs * 2 {
+    if !errors.is_empty() {
+        return Err(format!("workload errors: {}", errors.join("; ")));
+    }
+    if results.len() != config.runs * 2 {
         return Err("incomplete baseline/enabled evidence".into());
     }
-    if results
-        .iter()
-        .any(|r| r.events != config.burst || r.latencies_us.is_empty() || r.samples.is_empty())
-    {
+    if results.iter().any(|result| {
+        result.events != config.supported_events
+            || result.latencies_us.is_empty()
+            || result.samples.is_empty()
+            || (result.enabled
+                && (result.saturation_events != config.saturation_events
+                    || result.saturation_latencies_us.is_empty()))
+            || (!result.enabled
+                && (result.saturation_events != 0 || !result.saturation_latencies_us.is_empty()))
+    }) {
         return Err("incomplete event, latency, or sample evidence".into());
     }
     for result in results {
         if result.enabled {
-            let enqueued = result.events.saturating_sub(result.rejected_events);
+            let supported_enqueued = result.events.saturating_sub(result.rejected_events);
+            let saturation_enqueued = result
+                .saturation_events
+                .saturating_sub(result.saturation_rejected_events);
+            let enqueued = supported_enqueued.saturating_add(saturation_enqueued);
             if result.durable_events != u64::try_from(enqueued).unwrap_or(u64::MAX)
                 || result.rejected_events.saturating_mul(100) > result.events
+                || result.saturation_rejected_events.saturating_mul(100) > result.saturation_events
             {
                 return Err("enabled event reconciliation or rejection budget failed".into());
             }
-        } else if result.rejected_events != 0 || result.durable_events != 0 {
+        } else if result.rejected_events != 0
+            || result.saturation_rejected_events != 0
+            || result.durable_events != 0
+        {
             return Err("baseline event accounting is invalid".into());
         }
         for phase in ["warmup", "idle", "active"] {
@@ -1086,13 +2835,28 @@ fn validate_results(
                 return Err(format!("missing {phase} samples"));
             }
         }
-        if result.samples.iter().any(|s| {
-            s.cpu_percent.is_none()
-                || s.rss_kib.is_none()
-                || s.disk_bytes.is_none()
-                || (config.profile == Profile::Release && s.network_bytes.is_none())
-        }) {
+        if result.network_monitor_samples == 0
+            || result.samples.iter().any(|s| {
+                s.cpu_percent.is_none()
+                    || s.rss_kib.is_none()
+                    || s.cpu_percent
+                        .is_some_and(|value| !value.is_finite() || value.is_sign_negative())
+                    || s.rss_kib
+                        .is_some_and(|value| !value.is_finite() || value.is_sign_negative())
+                    || s.disk_bytes.is_none()
+                    || (config.profile == Profile::Release && s.network_bytes.is_none())
+            })
+        {
             return Err("required resource metric is missing".into());
+        }
+        if !result.supported_rate_cpu_percent.is_finite()
+            || result.supported_rate_cpu_percent.is_sign_negative()
+            || !result.saturation_cpu_percent.is_finite()
+            || result.saturation_cpu_percent.is_sign_negative()
+            || !result.peak_rss_kib.is_finite()
+            || result.peak_rss_kib.is_sign_negative()
+        {
+            return Err("required peak metric is non-finite or negative".into());
         }
     }
     if config.profile == Profile::Release {
@@ -1110,9 +2874,9 @@ fn validate_results(
         if results
             .iter()
             .filter(|result| result.enabled)
-            .any(|result| result.burst_cpu_percent > 100.0)
+            .any(|result| result.supported_rate_cpu_percent > 100.0)
         {
-            return Err("burst CPU exceeded one logical core".into());
+            return Err("supported-rate CPU exceeded one logical core".into());
         }
         if summary.enabled_rss_p95_kib > 96.0 * 1024.0 {
             return Err("enabled RSS p95 budget exceeded".into());
@@ -1123,7 +2887,13 @@ fn validate_results(
         let latencies = results
             .iter()
             .filter(|result| result.enabled)
-            .flat_map(|result| result.latencies_us.iter().copied())
+            .flat_map(|result| {
+                result
+                    .latencies_us
+                    .iter()
+                    .chain(&result.saturation_latencies_us)
+                    .copied()
+            })
             .collect::<Vec<_>>();
         if percentile(&latencies, 95) > 20_000 || percentile(&latencies, 99) > 50_000 {
             return Err("foreground latency budget exceeded".into());
@@ -1174,18 +2944,29 @@ mod tests {
         }
     }
     fn r(enabled: bool, samples: Vec<Sample>) -> RunResult {
+        let network_bytes = samples
+            .iter()
+            .filter_map(|sample| sample.network_bytes)
+            .max()
+            .unwrap_or_default();
         RunResult {
             enabled,
             run: 1,
             events: 1,
             rejected_events: 0,
-            durable_events: u64::from(enabled),
+            saturation_events: usize::from(enabled),
+            saturation_rejected_events: 0,
+            durable_events: u64::from(enabled) * 2,
             latencies_us: vec![1],
+            saturation_latencies_us: enabled.then_some(1).into_iter().collect(),
             samples,
             durable_bytes: 1,
-            burst_cpu_percent: 0.1,
+            supported_rate_cpu_percent: 0.1,
+            saturation_cpu_percent: 0.1,
             peak_rss_kib: 1.0,
             peak_disk_bytes: 1,
+            network_bytes,
+            network_monitor_samples: 1,
         }
     }
     fn c() -> Config {
@@ -1194,7 +2975,8 @@ mod tests {
             warmup: Duration::ZERO,
             idle: Duration::ZERO,
             active: Duration::ZERO,
-            burst: 1,
+            supported_events: 1,
+            saturation_events: 1,
             runs: 1,
             sample: Duration::ZERO,
         }
@@ -1212,6 +2994,15 @@ mod tests {
             r(true, enabled),
         ]
     }
+    fn host() -> HostEvidence {
+        HostEvidence {
+            source_revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            machine: "sanitized-test-4-logical-core".into(),
+            logical_cores: 4,
+            filesystem: "testfs".into(),
+            power_mode: "ac".into(),
+        }
+    }
     fn enabled(idle_cpu: f64, active_cpu: f64, rss: f64, disk: u64, net: u64) -> Vec<Sample> {
         vec![
             s("warmup", Some(0.1), Some(rss), Some(disk), Some(net)),
@@ -1222,7 +3013,19 @@ mod tests {
     #[test]
     fn release_protocol_is_normative() {
         validate_protocol_contract().unwrap();
-        assert_eq!(Config::for_profile(Profile::Release).burst, 10_000);
+        assert_eq!(
+            Config::for_profile(Profile::Release).supported_events,
+            10_000
+        );
+        assert_eq!(
+            Config::for_profile(Profile::Release).saturation_events,
+            10_000
+        );
+        assert_eq!(DURABLE_BATCH_RECORDS, 32);
+        assert_eq!(DURABLE_BATCH_BYTES, 524_288);
+        assert_eq!(SUPPORTED_INTER_EVENT_PERIOD, Duration::from_millis(3));
+        assert_eq!(DURABLE_HANDOFF_BYTES_MAX, 589_824);
+        assert_eq!(TOTAL_PIPELINE_PAYLOAD_BYTES_MAX, 4_784_128);
         assert!(PROTOCOL.contains("active_any_minute_percent_max"));
     }
     #[test]
@@ -1239,6 +3042,18 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn missing_network_monitor_samples_fail_closed() {
+        let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
+        results[1].network_monitor_samples = 0;
+        assert!(validate_results(c(), &results, &[]).is_err());
+    }
+    #[test]
+    fn non_finite_metric_fails_closed() {
+        assert!(validate_results(c(), &pair(enabled(f64::NAN, 0.1, 1.0, 1, 0)), &[]).is_err());
+        assert!(validate_results(c(), &pair(enabled(0.1, 0.1, f64::INFINITY, 1, 0)), &[]).is_err());
     }
     #[test]
     fn idle_threshold() {
@@ -1287,29 +3102,471 @@ mod tests {
     #[test]
     fn enabled_rejections_are_bounded_and_reconciled_with_durable_events() {
         let mut config = c();
-        config.burst = 100;
+        config.supported_events = 100;
+        config.saturation_events = 100;
         let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
         for result in &mut results {
             result.events = 100;
             result.latencies_us = vec![1; 100];
         }
+        results[1].saturation_events = 100;
+        results[1].saturation_latencies_us = vec![1; 100];
         results[1].rejected_events = 1;
-        results[1].durable_events = 99;
+        results[1].saturation_rejected_events = 1;
+        results[1].durable_events = 198;
         assert!(validate_results(config, &results, &[]).is_ok());
-        results[1].rejected_events = 2;
-        results[1].durable_events = 98;
+        results[1].saturation_rejected_events = 2;
+        results[1].durable_events = 197;
         assert!(validate_results(config, &results, &[]).is_err());
-        results[1].rejected_events = 1;
+        results[1].saturation_rejected_events = 1;
         assert!(validate_results(config, &results, &[]).is_err());
     }
 
     #[test]
     fn manifest_contains_computed_phase_and_network_evidence() {
-        let manifest = render_manifest(c(), &pair(enabled(0.1, 0.1, 1.0, 1, 0)), &[]);
+        let manifest = render_manifest(c(), &host(), &pair(enabled(0.1, 0.1, 1.0, 1, 0)), &[]);
+        assert!(manifest.contains("machine: sanitized-test-4-logical-core"));
+        assert!(manifest.contains("filesystem: testfs"));
+        assert!(manifest.contains("power_mode: ac"));
+        assert!(
+            manifest
+                .contains("protocol_revision: v1.2.0-supported-rate-saturation-continuous-network")
+        );
+        assert!(manifest.contains("source_revision: 0123456789abcdef0123456789abcdef01234567"));
+        assert!(manifest.contains("supported_inter_event_ms: 3"));
+        assert!(manifest.contains(
+            "supported_rate_measurement_boundary: first-command-through-barrier-completion"
+        ));
+        assert!(manifest.contains("saturation_schedule: enabled-unpaced"));
+        assert!(manifest.contains("supported_rate_attempted_events: 1"));
+        assert!(manifest.contains("saturation_attempted_events: 1"));
+        assert!(manifest.contains("durable_path: run-relative/durable"));
         assert!(manifest.contains("idle_average_cpu_delta_percent: 0"));
         assert!(manifest.contains("active_any_minute_cpu_delta_percent: 0"));
+        assert!(manifest.contains("durable_handoff_bytes_max: 589824"));
+        assert!(manifest.contains("total_pipeline_payload_bytes_max: 4784128"));
         assert!(manifest.contains("network_static_surface: pass"));
+        assert!(manifest.contains("network_monitor_samples: 1"));
         assert!(manifest.contains("network_bytes: 0"));
+        validate_manifest_shape(&manifest).unwrap();
+
+        let placeholder = manifest.replace(
+            "machine: sanitized-test-4-logical-core",
+            "machine: sanitized-local-host",
+        );
+        assert!(validate_manifest_shape(&placeholder).is_err());
+
+        let hostile_error = render_manifest(
+            c(),
+            &host(),
+            &pair(enabled(0.1, 0.1, 1.0, 1, 0)),
+            &["failed 'quote'\ncontrol \u{1f}".into()],
+        );
+        assert!(hostile_error.contains("failed ''quote'' control  "));
+        assert!(hostile_error.contains(
+            "metrics:\n  hook_latency_p95_us: 1\n  hook_latency_p99_us: 1\n  supported_rate_cpu_percent_max: 0.1\n  saturation_cpu_percent_max: 0.1\n  idle_average_cpu_delta_percent: null"
+        ));
+        assert!(hostile_error.contains("  network_bytes: null\n  network_static_surface: pass"));
+        validate_manifest_shape(&hostile_error).unwrap();
+
+        let malformed = render_failed_manifest(
+            c(),
+            &host(),
+            &pair(enabled(0.1, 0.1, 1.0, 1, 0)),
+            &[],
+            "manifest shape: required field missing",
+        );
+        assert!(malformed.contains("status: failed"));
+        assert!(malformed.contains("manifest shape: required field missing"));
+    }
+
+    #[test]
+    fn cleanup_failure_finalizes_release_manifest_as_failed() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-xtask-cleanup-manifest-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("manifest.yaml");
+        let pending = "status: pending-validation\nerrors: []\n";
+        let failed = "status: failed\nerrors:\n  - cleanup: injected failure\n";
+        fs::write(&manifest_path, pending).unwrap();
+
+        let error = finalize_manifest_after_cleanup(
+            Profile::Release,
+            &manifest_path,
+            pending,
+            Err("injected failure".into()),
+            Some(failed),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("performance cleanup failed: injected failure"));
+        assert_eq!(fs::read_to_string(&manifest_path).unwrap(), failed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validation_failure_finalizes_written_manifest_as_failed() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-xtask-validation-manifest-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("manifest.yaml");
+
+        let error = prepare_manifest(
+            &manifest_path,
+            c(),
+            &host(),
+            &pair(enabled(0.1, 0.1, 1.0, 1, 0)),
+            &[],
+            Err("injected validation failure".into()),
+        )
+        .unwrap_err();
+        let manifest = fs::read_to_string(&manifest_path).unwrap();
+
+        assert!(error.contains("injected validation failure"));
+        assert!(manifest.contains("status: failed"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preparation_and_cleanup_failures_are_both_persisted() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-xtask-combined-manifest-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("manifest.yaml");
+        fs::write(&manifest_path, "status: pending-validation\n").unwrap();
+
+        let error = complete_manifest_lifecycle(
+            &manifest_path,
+            c(),
+            &host(),
+            &pair(enabled(0.1, 0.1, 1.0, 1, 0)),
+            &[],
+            Err("injected preparation failure".into()),
+            Err("injected cleanup failure".into()),
+        )
+        .unwrap_err();
+        let manifest = fs::read_to_string(&manifest_path).unwrap();
+
+        assert!(error.contains("injected preparation failure"));
+        assert!(error.contains("injected cleanup failure"));
+        assert!(manifest.contains("status: failed"));
+        assert!(manifest.contains("preparation: injected preparation failure"));
+        assert!(manifest.contains("cleanup: injected cleanup failure"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn network_manifest_mode_is_platform_specific() {
+        assert_eq!(
+            network_evidence_mode("macos"),
+            "continuous-process-lifetime-monitor-plus-static-product-surface"
+        );
+        assert_eq!(
+            network_evidence_mode("linux"),
+            "point-in-time-socket-descriptor-scan-plus-static-product-surface"
+        );
+        assert_eq!(
+            network_evidence_mode("other"),
+            "unsupported-process-scoped-evidence-plus-static-product-surface"
+        );
+    }
+
+    #[test]
+    fn worker_output_timeout_is_bounded() {
+        let (_sender, receiver) = mpsc::channel::<Result<String, String>>();
+        let timeout = Duration::from_millis(20);
+        let started = Instant::now();
+        let error = read_worker_output(&receiver, timeout, "test marker").unwrap_err();
+        assert!(error.contains("timed out after 20 ms"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn worker_output_reader_join_timeout_is_bounded() {
+        let (_line_sender, receiver) = mpsc::channel::<Result<String, String>>();
+        let (reader_done_sender, reader_done) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let _ = reader_done_sender.send(());
+        });
+        let mut output = WorkerOutput {
+            receiver,
+            reader_done,
+            reader: Some(reader),
+        };
+        let started = Instant::now();
+        let error = output
+            .join_with_timeout(Duration::from_millis(5))
+            .unwrap_err();
+        assert!(error.contains("timed out after 5 ms"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        output.join_with_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn pressure_sampler_result_timeout_is_bounded() {
+        let (_sender, receiver) = mpsc::channel::<Result<PressurePeaks, String>>();
+        let timeout = Duration::from_millis(20);
+        let started = Instant::now();
+        let error = receiver.recv_timeout(timeout).unwrap_err();
+        assert_eq!(error, mpsc::RecvTimeoutError::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn pressure_sampler_joins_after_result_channel_disconnects() {
+        let (stop, _stop_receiver) = mpsc::channel();
+        let (result_sender, result) = mpsc::channel::<Result<PressurePeaks, String>>();
+        drop(result_sender);
+        let mut sampler = PressureSampler {
+            stop: Some(stop),
+            result,
+            handle: Some(thread::spawn(|| {})),
+            process_exit_confirmed: Arc::new(AtomicBool::new(false)),
+            drain_sample_count: Arc::new(AtomicU64::new(0)),
+        };
+
+        let error = sampler.stop().unwrap_err();
+
+        assert!(error.contains("pressure sampler ended without a result"));
+        assert!(sampler.handle.is_none());
+    }
+
+    #[test]
+    fn worker_drain_marker_starts_on_request_and_ends_after_sample_ack() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-xtask-drain-protocol-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = root.join(".drain-active");
+        assert!(!begin_drain_boundary("codex|0", &marker).unwrap());
+        assert!(!marker.exists());
+        assert!(begin_drain_boundary("__drain__", &marker).unwrap());
+        assert!(marker.exists());
+        let mut valid_ack = [Ok("__drain_sampled__".into())].into_iter();
+        read_drain_sample_ack(&mut valid_ack).unwrap();
+        assert!(marker.exists());
+        finish_drain_boundary(&marker).unwrap();
+        assert!(!marker.exists());
+        let mut invalid_ack = [Ok("wrong".into())].into_iter();
+        assert!(read_drain_sample_ack(&mut invalid_ack).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_exit_timeout_is_bounded() {
+        let mut child = Command::new("sleep")
+            .arg("1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let timeout = Duration::from_millis(20);
+        let started = Instant::now();
+        let error = wait_for_child(&mut child, timeout).unwrap_err();
+        assert!(error.contains("worker exit timed out after 20 ms"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn interval_cpu_uses_process_delta_over_wall_time() {
+        assert!(
+            (interval_cpu_percent(1.0, 1.25, Duration::from_secs(1)) - 25.0).abs() < f64::EPSILON
+        );
+        assert!(interval_cpu_percent(2.0, 1.0, Duration::from_secs(1)).abs() < f64::EPSILON);
+        assert!(interval_cpu_percent(1.0, 2.0, Duration::ZERO).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn process_cpu_time_accepts_macos_and_linux_formats() {
+        assert!((parse_process_cpu_seconds("2:03.50").unwrap() - 123.5).abs() < f64::EPSILON);
+        assert!((parse_process_cpu_seconds("61:00.00").unwrap() - 3_660.0).abs() < f64::EPSILON);
+        assert!((parse_process_cpu_seconds("01:02:03").unwrap() - 3_723.0).abs() < f64::EPSILON);
+        assert!(
+            (parse_process_cpu_seconds("2-01:02:03").unwrap() - 176_523.0).abs() < f64::EPSILON
+        );
+        assert!(parse_process_cpu_seconds("01:60:00").is_err());
+        assert!(parse_process_cpu_seconds("-1:00").is_err());
+        assert!(parse_process_cpu_seconds("1:NaN").is_err());
+        assert!(parse_process_cpu_seconds("1:inf").is_err());
+        assert!(parse_process_cpu_seconds("4294967296:00").is_err());
+        assert!(parse_process_cpu_seconds("not-a-time").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_network_monitor_preserves_peak_across_closed_socket_samples() {
+        let mut state = MacNetworkMonitorState::default();
+        let started = Instant::now();
+        record_macos_network_line(&mut state, "^D\u{8}\u{8} bytes_in bytes_out\r", started)
+            .unwrap();
+        assert_eq!(state.evidence.samples, 0);
+        record_macos_network_line(&mut state, "worker.1 10 20", started).unwrap();
+        record_macos_network_line(&mut state, "worker.1 3 4", started).unwrap();
+        assert_eq!(state.evidence.samples, 0);
+
+        let first_completed = started + Duration::from_secs(1);
+        record_macos_network_line(&mut state, "bytes_in bytes_out", first_completed).unwrap();
+        assert_eq!(state.evidence.latest_bytes, 37);
+        assert_eq!(state.evidence.max_bytes, 37);
+        assert_eq!(state.evidence.samples, 1);
+
+        record_macos_network_line(
+            &mut state,
+            "bytes_in bytes_out",
+            first_completed + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(state.evidence.latest_bytes, 0);
+        assert_eq!(state.evidence.max_bytes, 37);
+        assert_eq!(state.evidence.samples, 2);
+        assert!(record_macos_network_line(&mut state, "invalid", started).is_err());
+        assert!(record_macos_network_line(&mut state, "worker nope 1", started).is_err());
+
+        assert_eq!(
+            macos_network_sample(&state, first_completed + Duration::from_secs(2)).unwrap(),
+            0
+        );
+        assert!(
+            macos_network_sample(&state, first_completed + Duration::from_secs(5))
+                .unwrap_err()
+                .contains("stale")
+        );
+        let post_drain_boundary = first_completed + Duration::from_millis(500);
+        assert!(!macos_cycle_started_after(&state, post_drain_boundary));
+        state.last_completed_started_at = Some(post_drain_boundary);
+        assert!(macos_cycle_started_after(&state, post_drain_boundary));
+        state.error = Some("monitor parse failed".into());
+        assert_eq!(
+            macos_network_sample(&state, first_completed + Duration::from_secs(2)).unwrap_err(),
+            "monitor parse failed"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_network_finish_includes_terminal_buffered_cycle() {
+        let state = Mutex::new(MacNetworkMonitorState::default());
+        let buffered = b"bytes_in bytes_out\nworker.1 40 2\nbytes_in bytes_out\n";
+
+        read_macos_network_monitor(std::io::Cursor::new(buffered), &state).unwrap();
+        let state = state.into_inner().unwrap();
+        let evidence = finalize_macos_network_evidence(state).unwrap();
+
+        assert_eq!(evidence.latest_bytes, 42);
+        assert_eq!(evidence.max_bytes, 42);
+        assert_eq!(evidence.samples, 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_network_finish_propagates_terminal_reader_error() {
+        let state = MacNetworkMonitorState {
+            evidence: NetworkEvidence {
+                latest_bytes: 42,
+                max_bytes: 42,
+                samples: 1,
+            },
+            error: Some("terminal parse failure".into()),
+            ..MacNetworkMonitorState::default()
+        };
+
+        let error = finalize_macos_network_evidence(state).unwrap_err();
+
+        assert_eq!(error, "terminal parse failure");
+    }
+
+    #[test]
+    fn drain_metric_allows_only_a_parent_confirmed_process_exit() {
+        let process_exit_confirmed = AtomicBool::new(false);
+        assert!(
+            metric_or_confirmed_exit(
+                Err("process rss is unavailable".into()),
+                true,
+                &process_exit_confirmed,
+            )
+            .is_err()
+        );
+        process_exit_confirmed.store(true, Ordering::Release);
+        assert_eq!(
+            metric_or_confirmed_exit(
+                Err("process rss is unavailable".into()),
+                true,
+                &process_exit_confirmed,
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            metric_or_confirmed_exit(
+                Err("process rss is unavailable".into()),
+                false,
+                &process_exit_confirmed,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn drain_sampler_accepts_exit_only_after_child_wait_confirms_it() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-xtask-sampler-exit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = Command::new("sleep")
+            .arg("0.2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut sampler = start_pressure_sampler(
+            root.clone(),
+            child.id(),
+            true,
+            None,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+        sampler.confirm_process_exit();
+        thread::sleep(Duration::from_millis(30));
+        let peaks = sampler.stop().unwrap();
+        assert!(peaks.process_exit_observed);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1368,6 +3625,64 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn durability_barrier_accumulates_committed_batches_to_target() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(2).unwrap();
+        sender.send(3).unwrap();
+        let mut durable_events = 0;
+        await_durable_count(&receiver, &mut durable_events, 5).unwrap();
+        assert_eq!(durable_events, 5);
+    }
+
+    #[test]
+    fn durability_progress_is_emitted_only_after_store_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-xtask-barrier-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        let drain_root = root.clone();
+        let drain = thread::spawn(move || {
+            drain_with_cpu_token(&receiver, &drain_root, None, Some(&progress_sender))
+        });
+        sender.send(IngressMessage(b"codex|0".to_vec())).unwrap();
+        let mut durable_events = 0;
+        await_durable_count(&progress_receiver, &mut durable_events, 1).unwrap();
+        assert_eq!(
+            LocalStore::open(&root)
+                .unwrap()
+                .observation_count()
+                .unwrap(),
+            1
+        );
+        drop(sender);
+        drain.join().unwrap().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn durable_drain_propagates_writer_startup_failure() {
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        let invalid = std::env::temp_dir().join(format!(
+            "agent-observability-xtask-file-root-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&invalid);
+        fs::write(&invalid, b"not a directory").unwrap();
+        assert!(
+            drain(&receiver, &invalid)
+                .unwrap_err()
+                .contains("open local durable store")
+        );
+        fs::remove_file(invalid).unwrap();
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::{
-    Admission, CollectionPolicyV1, LocalRuntimeConfigV1, PressureSample, Schedule, Scheduler,
+    Admission, CollectionPolicyV1, LocalRuntimeConfigV2, PressureSample, Schedule, Scheduler,
     StorageAccountingError, StorageBudget, StorageError,
 };
 use std::path::Path;
@@ -12,7 +12,7 @@ pub struct RuntimeControl {
 }
 
 impl RuntimeControl {
-    pub fn new(config: &LocalRuntimeConfigV1) -> Result<Self, ControlError> {
+    pub fn new(config: &LocalRuntimeConfigV2) -> Result<Self, ControlError> {
         config.validate().map_err(ControlError::Config)?;
         let storage = StorageBudget::calculate(config.collection.local_storage_budget_bytes, false)
             .map_err(ControlError::Storage)?;
@@ -27,6 +27,16 @@ impl RuntimeControl {
         let allocated =
             StorageBudget::allocated_tree_bytes(root).map_err(ControlError::Accounting)?;
         Ok(self.storage.admit(allocated, worst_case_write))
+    }
+
+    pub fn migration_headroom(&self, root: &Path) -> Result<u64, ControlError> {
+        let allocated =
+            StorageBudget::allocated_tree_bytes(root).map_err(ControlError::Accounting)?;
+        let budget_remaining = self.storage.total.saturating_sub(allocated);
+        let filesystem_remaining = fs2::available_space(root)
+            .map_err(StorageAccountingError::Io)
+            .map_err(ControlError::Accounting)?;
+        Ok(budget_remaining.min(filesystem_remaining))
     }
 
     pub fn evaluate(&mut self, now_ms: u64, sample: PressureSample) -> Schedule {
@@ -86,7 +96,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("runtime-control-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let mut control = RuntimeControl::new(&LocalRuntimeConfigV1::default()).unwrap();
+        let mut control = RuntimeControl::new(&LocalRuntimeConfigV2::default()).unwrap();
         assert!(matches!(
             control.admit(&root, 1).unwrap(),
             Admission::Allowed { .. }
@@ -113,13 +123,25 @@ mod tests {
             std::env::temp_dir().join(format!("runtime-control-denied-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let control = RuntimeControl::new(&LocalRuntimeConfigV1::default()).unwrap();
+        let control = RuntimeControl::new(&LocalRuntimeConfigV2::default()).unwrap();
         assert_eq!(
             control
                 .admit(&root, control.storage_budget().total + 1)
                 .unwrap(),
             Admission::Denied
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migration_headroom_is_bounded_by_the_configured_budget() {
+        let root =
+            std::env::temp_dir().join(format!("runtime-migration-headroom-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let control = RuntimeControl::new(&LocalRuntimeConfigV2::default()).unwrap();
+        let headroom = control.migration_headroom(&root).unwrap();
+        assert!(headroom <= control.storage_budget().total);
         let _ = fs::remove_dir_all(root);
     }
 }

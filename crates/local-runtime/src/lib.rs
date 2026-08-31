@@ -17,7 +17,7 @@ pub mod storage;
 pub use control::{ControlError, RuntimeControl};
 pub use ingress::{Ingress, IngressCounters, IngressMessage, IngressOutcome};
 pub use lock::{Singleton, SingletonError};
-pub use policy::CollectionPolicyV1;
+pub use policy::{CollectionPolicyV1, RetentionPolicyV1};
 pub use scheduler::{PressureSample, Schedule, Scheduler, State};
 pub use storage::{Admission, Partition, StorageAccountingError, StorageBudget, StorageError};
 
@@ -28,5 +28,5 @@ pub const HANDLER_DEADLINE_MS: u64 = 50;
 pub const CHANNEL_CAPACITY: usize = 64;
 pub const NORMALIZATION_WORKERS: usize = 1;
 pub use config::{
-    ConfigError, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION, LocalRuntimeConfigV1, install, load,
+    ConfigError, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION, LocalRuntimeConfigV2, install, load,
 };

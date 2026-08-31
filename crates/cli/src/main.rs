@@ -14,10 +14,12 @@ use agent_observability_contracts::{
 };
 use agent_observability_contracts::{CONTRACT_MANIFEST, ContractManifest};
 use agent_observability_local_runtime::{
-    Admission, LOCAL_RUNTIME_CONFIG_VERSION, LocalRuntimeConfigV1, PressureSample, RuntimeControl,
-    Singleton, StorageBudget, install, load,
+    Admission, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION, LocalRuntimeConfigV2, PressureSample,
+    RuntimeControl, Singleton, StorageBudget, install, load,
 };
-use agent_observability_local_store::{IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore};
+use agent_observability_local_store::{
+    IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore, RetentionPlan,
+};
 use agent_observability_static_report::write_private;
 use std::env;
 use std::fs::{File, OpenOptions};
@@ -26,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "usage: agent-observability [init <root>|config-check <config-json>|runtime-check <root>|contracts|storage-check <runtime-root>|codex-ingest <runtime-root> <handoff-jsonl>|claude-code-ingest <runtime-root> <handoff-jsonl>|cursor-ingest <runtime-root> <handoff-jsonl>|report <runtime-root> [rate-table-json]|version|help]";
+const USAGE: &str = "usage: agent-observability [init <root>|config-check <config-json>|runtime-check <root>|contracts|storage-check <runtime-root>|retention-plan <runtime-root>|retention-apply <runtime-root> <plan-id> <private-archive-jsonl>|codex-ingest <runtime-root> <handoff-jsonl>|claude-code-ingest <runtime-root> <handoff-jsonl>|cursor-ingest <runtime-root> <handoff-jsonl>|report <runtime-root> [rate-table-json]|version|help]";
 const REPORT_FILE_NAME: &str = "agent-observability-report.html";
 const MAX_RATE_TABLE_BYTES: u64 = 1_048_576;
 
@@ -67,24 +69,22 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
         [command, config] if command == "config-check" => {
             let config = load(Path::new(config)).map_err(|error| error.to_string())?;
             Ok(format!(
-                "config_schema={LOCAL_RUNTIME_CONFIG_VERSION}\nenabled={}\nlocal_storage_budget_bytes={}\nteam_ingest=disabled",
-                config.enabled, config.collection.local_storage_budget_bytes
+                "config_schema={LOCAL_RUNTIME_CONFIG_VERSION}\nenabled={}\nlocal_storage_budget_bytes={}\nmax_record_age_days={}\nmax_archive_records={}\nmax_archive_bytes={}\nteam_ingest=disabled",
+                config.enabled,
+                config.collection.local_storage_budget_bytes,
+                config.retention.max_record_age_days,
+                config.retention.max_archive_records,
+                config.retention.max_archive_bytes
             ))
         }
         [command, root] if command == "runtime-check" => runtime_check(Path::new(root)),
         [command] if command == "contracts" => contracts(),
-        [command, root] if command == "storage-check" => {
-            let layout = install(Path::new(root)).map_err(|error| error.to_string())?;
-            let _singleton =
-                Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-            let store =
-                LocalStore::open(layout.state.join("store")).map_err(|error| error.to_string())?;
-            let (observations, records, outcomes) =
-                store.counts().map_err(|error| error.to_string())?;
-            Ok(format!(
-                "store_schema={LOCAL_STORE_SCHEMA_VERSION}\nobservations={observations}\nrecords={records}\ndelivery_outcomes={outcomes}\nteam_ingest=disabled"
-            ))
-        }
+        [command, root] if command == "storage-check" => storage_check(Path::new(root)),
+        [command, root] if command == "retention-plan" => retention(Path::new(root), None),
+        [command, root, plan_id, archive] if command == "retention-apply" => retention(
+            Path::new(root),
+            Some((plan_id.as_str(), Path::new(archive))),
+        ),
         [command, directory, handoff] if command == "codex-ingest" => {
             let batch = read_codex_handoff_file(handoff).map_err(|error| error.to_string())?;
             ingest_items(
@@ -150,6 +150,105 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
     }
 }
 
+fn storage_check(root: &Path) -> Result<String, String> {
+    let layout = install(root).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let store = open_store(&layout, &config)?;
+    let (observations, records, outcomes) = store.counts().map_err(|error| error.to_string())?;
+    Ok(format!(
+        "store_schema={LOCAL_STORE_SCHEMA_VERSION}\nobservations={observations}\nrecords={records}\ndelivery_outcomes={outcomes}\nteam_ingest=disabled"
+    ))
+}
+
+fn open_store(
+    layout: &InstalledLayout,
+    config: &LocalRuntimeConfigV2,
+) -> Result<LocalStore, String> {
+    let control = RuntimeControl::new(config).map_err(|error| error.to_string())?;
+    let migration_headroom = control
+        .migration_headroom(&layout.root)
+        .map_err(|error| error.to_string())?;
+    LocalStore::open_with_migration_headroom(layout.state.join("store"), migration_headroom)
+        .map_err(|error| error.to_string())
+}
+
+fn retention(root: &Path, apply: Option<(&str, &Path)>) -> Result<String, String> {
+    let layout = install(root).map_err(|error| error.to_string())?;
+    let apply = apply
+        .map(|(plan_id, path)| normalize_archive_path(&layout.root, plan_id, path))
+        .transpose()?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let store = open_store(&layout, &config)?;
+    let now_unix_ms = current_unix_ms()?;
+    let retention_ms = u64::from(config.retention.max_record_age_days)
+        .checked_mul(86_400_000)
+        .ok_or_else(|| "retention cutoff overflow".to_string())?;
+    let cutoff_unix_ms = (now_unix_ms / 86_400_000)
+        .saturating_mul(86_400_000)
+        .saturating_sub(retention_ms);
+    if let Some((expected_plan_id, archive_path)) = apply.as_ref() {
+        let result = store
+            .apply_retention(
+                cutoff_unix_ms,
+                config.retention.max_archive_records,
+                config.retention.max_archive_bytes,
+                expected_plan_id,
+                archive_path,
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(retention_output(
+            &result.plan,
+            result.archive_path.as_deref(),
+            true,
+        ));
+    }
+    let plan = store
+        .retention_plan(
+            cutoff_unix_ms,
+            config.retention.max_archive_records,
+            config.retention.max_archive_bytes,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(retention_output(&plan, None, false))
+}
+
+fn normalize_archive_path(
+    runtime_root: &Path,
+    plan_id: &str,
+    archive_path: &Path,
+) -> Result<(String, PathBuf), String> {
+    let name = archive_path
+        .file_name()
+        .ok_or_else(|| "retention archive path must name a file".to_string())?;
+    let parent = archive_path
+        .parent()
+        .ok_or_else(|| "retention archive path must have a parent".to_string())?
+        .canonicalize()
+        .map_err(|error| format!("retention archive parent is unavailable: {error}"))?;
+    let normalized = parent.join(name);
+    if normalized.starts_with(runtime_root) {
+        return Err("retention archive must be outside the managed runtime root".into());
+    }
+    Ok((plan_id.into(), normalized))
+}
+
+fn retention_output(plan: &RetentionPlan, archive: Option<&Path>, applied: bool) -> String {
+    format!(
+        "plan_id={}\ncutoff_unix_ms={}\ntraces={}\nobservations={}\nrecords={}\narchive_bytes={}\ntruncated={}\napplied={}\narchive={}\nteam_ingest=disabled",
+        plan.plan_id,
+        plan.cutoff_unix_ms,
+        plan.traces,
+        plan.observations,
+        plan.records,
+        plan.archive_bytes,
+        plan.truncated,
+        u8::from(applied && plan.traces > 0),
+        archive.map_or_else(|| "none".into(), |path| path.display().to_string())
+    )
+}
+
 fn contracts() -> Result<String, String> {
     let manifest = ContractManifest::parse(CONTRACT_MANIFEST).map_err(|error| error.to_string())?;
     manifest
@@ -168,8 +267,9 @@ fn report_command(arguments: &[String]) -> Result<String, String> {
 
 fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let store = LocalStore::open(layout.state.join("store")).map_err(|error| error.to_string())?;
+    let store = open_store(&layout, &config)?;
     let records = store.current_records().map_err(|error| error.to_string())?;
     let rate_table = rate_table_path
         .map(read_private_rate_table)
@@ -242,10 +342,19 @@ const fn no_follow_flag() -> i32 {
 }
 
 fn current_timestamp() -> Result<String, String> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| "system clock is before the Unix epoch")?;
+    let duration = current_duration()?;
     timestamp_from_duration(duration)
+}
+
+fn current_unix_ms() -> Result<u64, String> {
+    let duration = current_duration()?;
+    u64::try_from(duration.as_millis()).map_err(|_| "system clock is out of range".into())
+}
+
+fn current_duration() -> Result<Duration, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".into())
 }
 
 fn timestamp_from_duration(duration: Duration) -> Result<String, String> {
@@ -281,8 +390,7 @@ fn runtime_check(root: &Path) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
     let config = load(&layout.config).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let store_directory = layout.state.join("store");
-    let store = LocalStore::open(&store_directory).map_err(|error| error.to_string())?;
+    let store = open_store(&layout, &config)?;
     drop(store);
     let allocated =
         StorageBudget::allocated_tree_bytes(&layout.root).map_err(|error| error.to_string())?;
@@ -358,7 +466,12 @@ fn ingest_items<'a>(
             "source={source}\nobservations=0\ndiagnostics=0\nduplicates=0\nsuppressed=0\ncollection_disabled=0\nstorage_blocked=1\nteam_ingest=disabled"
         ));
     }
-    let mut store = LocalStore::open(&paths.store_directory).map_err(|error| error.to_string())?;
+    let migration_headroom = control
+        .migration_headroom(&paths.accounting_root)
+        .map_err(|error| error.to_string())?;
+    let mut store =
+        LocalStore::open_with_migration_headroom(&paths.store_directory, migration_headroom)
+            .map_err(|error| error.to_string())?;
     let mut observations = 0_u64;
     let mut diagnostics = 0_u64;
     let mut duplicates = 0_u64;
@@ -415,7 +528,7 @@ fn ingest_reservation_bytes(store_directory: &Path, batch_bytes: u64) -> Result<
 }
 
 struct IngestPaths {
-    config: LocalRuntimeConfigV1,
+    config: LocalRuntimeConfigV2,
     accounting_root: PathBuf,
     runtime_directory: PathBuf,
     store_directory: PathBuf,
@@ -461,7 +574,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         let init = run(["init".into(), root.to_string_lossy().into_owned()].into_iter()).unwrap();
-        assert!(init.contains("config_schema=local_runtime.v1"));
+        assert!(init.contains("config_schema=local_runtime.v2"));
         let config = root.join("config.json");
         let check = run(["config-check".into(), config.to_string_lossy().into_owned()].into_iter())
             .unwrap();

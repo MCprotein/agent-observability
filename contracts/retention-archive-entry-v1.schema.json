@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent_observability.retention_archive.v1",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry_type", "schema_version", "plan_id", "cutoff_unix_ms"],
+      "properties": {
+        "entry_type": { "const": "header" },
+        "schema_version": { "const": "agent_observability.retention_archive.v1" },
+        "plan_id": { "$ref": "#/$defs/digest" },
+        "cutoff_unix_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry_type", "record"],
+      "properties": {
+        "entry_type": { "const": "record" },
+        "record": { "$ref": "agent_observability.v1" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry_type", "traces", "records", "records_sha256"],
+      "properties": {
+        "entry_type": { "const": "footer" },
+        "traces": { "type": "integer", "minimum": 1 },
+        "records": { "type": "integer", "minimum": 1 },
+        "records_sha256": { "$ref": "#/$defs/digest" }
+      }
+    }
+  ],
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}
