@@ -80,7 +80,7 @@ gate를 통과해 추가한다.
 | v1.1.0 | Released | Report usability improvements | bounded timeline, local structured-dimension saved views, 100-trace/200-span pagination, deterministic 4,096-span Node/Chromium regression, reload/delete browser smoke, independent review clear |
 | v1.2.0 | Released | Local retention and archive policy | strict retention config and migration, whole-trace plan/apply, private archive contract, replay/crash/path-safety fixtures, physical reclaim, archive CLI smoke, passing normative manifest `1788152070592764000` bound to source `fe8da2e9b2bb9cbc088c4df7f551ca423ad9d097`, independent review clear |
 | v1.3.0 | Superseded | Installable open-source distribution implementation | Source, license, package metadata, documentation, tests, and native arm64/x64 builds passed, but tag workflow run `33412746641` stopped before publication because its universal-binary verification used invalid `lipo` argument order; no Release or Package was published |
-| v1.3.1 | Planned | Distribution publication correction | Correct and regression-lock universal `lipo` verification, keep the immutable failed v1.3.0 tag as history, rerun exact-head review/CI, then publish and verify Release assets, checksums, provenance, package, and installed CLI |
+| v1.3.1 | Released | Distribution publication correction | Correct and regression-lock universal `lipo` verification, preserve the immutable failed v1.3.0 tag, exact-head CI and independent review clear, real failed-run artifacts assembled successfully; release review in `docs/reviews/v1.3.1.md` |
 
 ## Branch Strategy
 
