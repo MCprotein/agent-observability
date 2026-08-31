@@ -79,7 +79,7 @@ gate를 통과해 추가한다.
 | --- | --- | --- | --- |
 | v1.1.0 | Released | Report usability improvements | bounded timeline, local structured-dimension saved views, 100-trace/200-span pagination, deterministic 4,096-span Node/Chromium regression, reload/delete browser smoke, independent review clear |
 | v1.2.0 | Released | Local retention and archive policy | strict retention config and migration, whole-trace plan/apply, private archive contract, replay/crash/path-safety fixtures, physical reclaim, archive CLI smoke, passing normative manifest `1788152070592764000` bound to source `fe8da2e9b2bb9cbc088c4df7f551ca423ad9d097`, independent review clear |
-| v1.3.0 | Planned | Installable open-source distribution | Apache-2.0 license, macOS arm64/x64/universal2 GitHub Release artifacts, checksums and build provenance, native-binary GitHub Package, synchronized version gate, install-first README, renderer-independent architecture diagrams, independent review clear |
+| v1.3.0 | Released | Installable open-source distribution | Apache-2.0 license, macOS arm64/x64/universal2 GitHub Release artifacts, checksums and build provenance, native-binary GitHub Package, synchronized version gate, install-first README, renderer-independent architecture diagrams, independent review clear; publication evidence in `docs/reviews/v1.3.0.md` |
 
 ## Branch Strategy
 
