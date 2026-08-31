@@ -998,6 +998,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn dashboard_invokes_opener_with_the_generated_report_path() {
+        use std::cell::RefCell;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-dashboard-open-success-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let opened = RefCell::new(None);
+        let dashboard = prepare_dashboard_with(&root, true, |path| {
+            assert!(path.ends_with(Path::new("logs").join(REPORT_FILE_NAME)));
+            *opened.borrow_mut() = Some(path.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(opened.into_inner().as_deref(), Some(dashboard.as_path()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn config_set_updates_every_supported_option_and_rejects_invalid_values() {
         let root = std::env::temp_dir().join(format!(
             "agent-observability-cli-config-set-{}",

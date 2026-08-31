@@ -11,6 +11,14 @@ pub const LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v2";
 const LEGACY_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v1";
 static UPDATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveStage {
+    Write,
+    FileSync,
+    Rename,
+    ParentSync,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LocalRuntimeConfigV2 {
@@ -198,6 +206,14 @@ pub fn load(path: &Path) -> Result<LocalRuntimeConfigV2, ConfigError> {
 }
 
 pub fn save(path: &Path, config: &LocalRuntimeConfigV2) -> Result<(), ConfigError> {
+    save_with_hook(path, config, |_| Ok(()))
+}
+
+fn save_with_hook(
+    path: &Path,
+    config: &LocalRuntimeConfigV2,
+    mut before: impl FnMut(SaveStage) -> io::Result<()>,
+) -> Result<(), ConfigError> {
     config.validate()?;
     reject_symlink(path)?;
     let parent = path.parent().ok_or(ConfigError::InvalidPath)?;
@@ -207,11 +223,15 @@ pub fn save(path: &Path, config: &LocalRuntimeConfigV2) -> Result<(), ConfigErro
     let body = serde_json::to_vec_pretty(config).map_err(ConfigError::Json)?;
     let (temporary, mut file) = private_update_file(parent)?;
     let result = (|| {
+        before(SaveStage::Write)?;
         file.write_all(&body)?;
         file.write_all(b"\n")?;
+        before(SaveStage::FileSync)?;
         file.sync_all()?;
         private_open_file(&file)?;
+        before(SaveStage::Rename)?;
         fs::rename(&temporary, path)?;
+        before(SaveStage::ParentSync)?;
         File::open(parent)?.sync_all()?;
         Ok(())
     })();
@@ -551,6 +571,65 @@ mod tests {
         save(&layout.config, &config).unwrap();
         assert_eq!(load(&layout.config).unwrap(), config);
         assert!(stale.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_rename_io_failures_preserve_config_and_clean_temporary_files() {
+        let root = root("save-pre-rename-failures");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        let mut config = LocalRuntimeConfigV2::default();
+        config.retention.max_record_age_days = 90;
+
+        for failed_stage in [SaveStage::Write, SaveStage::FileSync, SaveStage::Rename] {
+            let result = save_with_hook(&layout.config, &config, |stage| {
+                if stage == failed_stage {
+                    Err(io::Error::other("injected save failure"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(result, Err(ConfigError::Io(_))));
+            assert_eq!(fs::read(&layout.config).unwrap(), original);
+            assert!(fs::read_dir(&layout.root).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".update.")
+            }));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_sync_failure_reports_error_after_complete_replace() {
+        let root = root("save-parent-sync-failure");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mut config = LocalRuntimeConfigV2::default();
+        config.retention.max_record_age_days = 90;
+
+        let result = save_with_hook(&layout.config, &config, |stage| {
+            if stage == SaveStage::ParentSync {
+                Err(io::Error::other("injected parent sync failure"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(ConfigError::Io(_))));
+        assert_eq!(load(&layout.config).unwrap(), config);
+        assert!(fs::read_dir(&layout.root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".update.")
+        }));
         let _ = fs::remove_dir_all(root);
     }
 }
