@@ -81,7 +81,7 @@ gate를 통과해 추가한다.
 | v1.2.0 | Released | Local retention and archive policy | strict retention config and migration, whole-trace plan/apply, private archive contract, replay/crash/path-safety fixtures, physical reclaim, archive CLI smoke, passing normative manifest `1788152070592764000` bound to source `fe8da2e9b2bb9cbc088c4df7f551ca423ad9d097`, independent review clear |
 | v1.3.0 | Superseded | Installable open-source distribution implementation | Source, license, package metadata, documentation, tests, and native arm64/x64 builds passed, but tag workflow run `33412746641` stopped before publication because its universal-binary verification used invalid `lipo` argument order; no Release or Package was published |
 | v1.3.1 | Superseded | Distribution publication correction | Universal assembly, attestation, and draft Release succeeded, but run `33414142455` stopped before Package/public Release because npm interpreted `dist/*.tgz` as a repository shorthand; immutable tag and draft remain as failure evidence |
-| v1.3.2 | Ready | Package publication path correction | Explicit local `./dist/*.tgz` publication and regression lock, synchronized metadata, exact-head CI, real-package dry-run, and independent review passed; Package and public Release remain tag-workflow gates |
+| v1.3.2 | Released | Package publication path correction | Run `33416302530` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
 
 ## Branch Strategy
 
