@@ -1,0 +1,30 @@
+{
+  "name": "@mcprotein/agent-observability",
+  "version": "1.3.0",
+  "description": "Native macOS CLI for local-first coding-agent observability.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MCprotein/agent-observability.git"
+  },
+  "homepage": "https://github.com/MCprotein/agent-observability#readme",
+  "bugs": "https://github.com/MCprotein/agent-observability/issues",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "bin": {
+    "agent-observability": "bin/agent-observability"
+  },
+  "files": [
+    "bin/agent-observability",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  }
+}

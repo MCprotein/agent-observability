@@ -1,0 +1,181 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Validate tag, source, and versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git fetch origin main --no-tags
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+          cargo_version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "agent-observability-cli") | .version')"
+          root_version="$(jq -r .version package.json)"
+          package_version="$(jq -r .version distribution/npm/package.json)"
+          test "$version" = "$cargo_version"
+          test "$version" = "$root_version"
+          test "$version" = "$package_version"
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            label: arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            label: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Install supported Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --target "${{ matrix.target }}"
+      - name: Build native CLI
+        run: cargo +1.97.0 build --release --locked -p agent-observability-cli --target "${{ matrix.target }}"
+      - name: Verify native CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          binary="target/${{ matrix.target }}/release/agent-observability"
+          test "$("$binary" --version)" = "$version"
+
+          mkdir -p "stage/agent-observability-$version-darwin-${{ matrix.label }}" dist
+          install -m 0755 "$binary" "stage/agent-observability-$version-darwin-${{ matrix.label }}/agent-observability"
+          cp README.md LICENSE "stage/agent-observability-$version-darwin-${{ matrix.label }}/"
+          cp "$binary" "dist/agent-observability-${{ matrix.label }}"
+          chmod 0755 "dist/agent-observability-${{ matrix.label }}"
+          tar -C stage -czf "dist/agent-observability-$version-darwin-${{ matrix.label }}.tar.gz" \
+            "agent-observability-$version-darwin-${{ matrix.label }}"
+      - name: Upload native artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release and package
+    needs: build
+    runs-on: macos-15
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Download native artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: native-*
+          path: artifacts
+          merge-multiple: true
+      - name: Assemble universal release and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p "stage/agent-observability-$version-darwin-universal2" dist npm-stage/bin
+
+          chmod 0755 artifacts/agent-observability-arm64 artifacts/agent-observability-x64
+          lipo -create \
+            artifacts/agent-observability-arm64 \
+            artifacts/agent-observability-x64 \
+            -output stage/agent-observability
+          chmod 0755 stage/agent-observability
+          lipo -verify_arch arm64 x86_64 stage/agent-observability
+          test "$(stage/agent-observability --version)" = "$version"
+
+          install -m 0755 stage/agent-observability \
+            "stage/agent-observability-$version-darwin-universal2/agent-observability"
+          cp README.md LICENSE "stage/agent-observability-$version-darwin-universal2/"
+          tar -C stage -czf "dist/agent-observability-$version-darwin-universal2.tar.gz" \
+            "agent-observability-$version-darwin-universal2"
+          cp artifacts/*.tar.gz dist/
+
+          cp distribution/npm/package.json distribution/npm/README.md LICENSE npm-stage/
+          install -m 0755 stage/agent-observability npm-stage/bin/agent-observability
+          npm pack ./npm-stage --pack-destination dist
+
+          tar -xzf dist/mcprotein-agent-observability-"$version".tgz -C stage
+          test -x stage/package/bin/agent-observability
+          test "$(stage/package/bin/agent-observability --version)" = "$version"
+          rm -rf stage/package
+
+          (
+            cd dist
+            shasum -a 256 -- *.tar.gz *.tgz > SHA256SUMS
+          )
+      - name: Attest release artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.tgz
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = "true"
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --draft \
+              --verify-tag \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME"
+          fi
+      - name: Configure GitHub Packages
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          registry-url: https://npm.pkg.github.com
+          scope: "@mcprotein"
+      - name: Publish GitHub package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if test "$(npm view "@mcprotein/agent-observability@$version" version --registry https://npm.pkg.github.com 2>/dev/null || true)" != "$version"; then
+            npm publish "dist/mcprotein-agent-observability-$version.tgz"
+          fi
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
