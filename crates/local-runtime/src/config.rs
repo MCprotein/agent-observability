@@ -195,6 +195,32 @@ pub fn load(path: &Path) -> Result<LocalRuntimeConfigV2, ConfigError> {
     LocalRuntimeConfigV2::from_json(&body)
 }
 
+pub fn save(path: &Path, config: &LocalRuntimeConfigV2) -> Result<(), ConfigError> {
+    config.validate()?;
+    reject_symlink(path)?;
+    let parent = path.parent().ok_or(ConfigError::InvalidPath)?;
+    private_dir(parent, false)?;
+    let _ = open_private_read(path)?;
+
+    let body = serde_json::to_vec_pretty(config).map_err(ConfigError::Json)?;
+    let temporary = parent.join(format!(".config.json.update.{}", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    let result = (|| {
+        let mut file = private_create_new(&temporary)?;
+        file.write_all(&body)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        private_open_file(&file)?;
+        fs::rename(&temporary, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 const fn enabled_by_default() -> bool {
     true
 }
@@ -373,6 +399,48 @@ mod tests {
             install(&root),
             Err(ConfigError::InsecurePermissions)
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_atomically_updates_a_private_valid_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root("save");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.retention.max_record_age_days = 90;
+        save(&layout.config, &config).unwrap();
+
+        assert_eq!(load(&layout.config).unwrap(), config);
+        assert_eq!(
+            fs::metadata(&layout.config).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(fs::read_dir(&layout.root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".update.")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_invalid_values_without_changing_the_file() {
+        let root = root("save-invalid");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.retention.max_record_age_days = 0;
+
+        assert!(save(&layout.config, &config).is_err());
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
         let _ = fs::remove_dir_all(root);
     }
 }

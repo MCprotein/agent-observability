@@ -28,5 +28,6 @@ pub const HANDLER_DEADLINE_MS: u64 = 50;
 pub const CHANNEL_CAPACITY: usize = 64;
 pub const NORMALIZATION_WORKERS: usize = 1;
 pub use config::{
-    ConfigError, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION, LocalRuntimeConfigV2, install, load,
+    ConfigError, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION, LocalRuntimeConfigV2, install,
+    load, save,
 };
