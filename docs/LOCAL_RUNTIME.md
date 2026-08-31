@@ -1,8 +1,9 @@
 # Local Runtime
 
 v1.0.0 introduced the standalone local-only Rust runtime boundary. v1.2.0 added bounded local
-retention and private archive export; v1.3.2 packages the same one-shot CLI without adding a
-server, daemon, identity, or network path.
+retention and private archive export; v1.4.0 adds one-command setup, an isolated built-in demo,
+dashboard open, and atomic CLI configuration updates without adding a server, daemon, identity,
+automatic producer, or network path.
 It installs private local state,
 validates a closed configuration, admits writes against a hard storage budget, and keeps foreground
 handoff bounded. It contains no endpoint, email, team identity, envelope, outbox, or network client.
@@ -14,21 +15,24 @@ Install a universal macOS binary from GitHub Releases or the authenticated GitHu
 documented in the repository README. The package is only a transport for the Rust executable.
 
 ~~~bash
-agent-observability init ~/.agent-observability
-agent-observability config-check ~/.agent-observability/config.json
-agent-observability runtime-check ~/.agent-observability
-agent-observability storage-check ~/.agent-observability
+agent-observability demo
+agent-observability setup
+agent-observability config show
+agent-observability config set retention-days 90
+agent-observability dashboard
 agent-observability retention-plan ~/.agent-observability
 agent-observability retention-apply ~/.agent-observability PLAN_ID /path/to/private-retention-archive.jsonl
 agent-observability codex-ingest ~/.agent-observability /path/to/private-handoff.jsonl
 agent-observability claude-code-ingest ~/.agent-observability /path/to/private-handoff.jsonl
 agent-observability cursor-ingest ~/.agent-observability /path/to/private-handoff.jsonl
-agent-observability report ~/.agent-observability
 agent-observability report ~/.agent-observability /path/to/private-rate-table.json
 ~~~
 
-init creates the root, logs, queue, state, and runtime directories with mode 0700 and creates
-config.json with mode 0600. Existing configuration is validated and preserved. Broad permissions,
+`setup` composes private install, store initialization, report generation, and macOS browser open.
+`demo` uses an isolated default root and embedded content-free fixture; it never reads an agent log.
+The lower-level `init` command remains available for automation. Install creates the root, logs,
+queue, state, and runtime directories with mode 0700 and creates config.json with mode 0600.
+Existing configuration is validated and preserved. Broad permissions,
 symlinks, wrong file types, unsupported schema versions, unknown fields, and values outside policy
 bounds fail closed.
 
@@ -54,6 +58,11 @@ The installed configuration is intentionally small:
   }
 }
 ~~~
+
+`config set [root] <option> <value>` acquires the runtime singleton, validates the complete updated
+configuration, writes a private temporary file, syncs it, and atomically replaces `config.json`.
+Invalid updates leave the previous bytes unchanged. User-facing names, defaults, and bounds are in
+[Configuration](CONFIGURATION.md).
 
 ## Runtime bounds
 
