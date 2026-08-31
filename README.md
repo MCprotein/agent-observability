@@ -121,7 +121,8 @@ agent-observability config set storage-bytes 2147483648
 
 ```mermaid
 flowchart LR
-    A["Coding agents"] --> B["Private canonical handoff"]
+    A["Coding agents"] -.-> P["Separate producer<br/>TODO in this repository"]
+    P -.-> B["Private canonical handoff"]
     B --> C["Rust adapters"]
     C --> D["Shared trace and span model"]
     D --> E["Local SQLite"]
@@ -130,6 +131,8 @@ flowchart LR
     G --> H["Local browser"]
 ```
 
+- 점선은 현재 release가 제공하지 않는 agent별 producer 경계다.
+- 실선은 `v1.4.0` CLI가 구현하고 검증하는 local-only 경로다.
 - agent별 차이는 adapter에서 끝나고 이후 저장·비용·UI contract는 하나다.
 - SQLite가 로컬 권위 저장소이며 JSONL archive와 HTML은 다시 만들 수 있는 projection이다.
 - TypeScript UI는 원본 agent payload가 아니라 Rust가 검증한 report DTO만 받는다.
@@ -214,7 +217,7 @@ cargo run -p agent-observability-cli -- demo
 | --- | --- |
 | `demo [root] [--no-open]` | 격리된 sample 대시보드 생성 |
 | `setup [root] [--no-open]` | 실제 private runtime 초기화 |
-| `dashboard [root]` | 최신 report를 만들고 브라우저에서 열기 |
+| `dashboard [root] [--no-open]` | 최신 report를 만들고 필요하면 브라우저에서 열기 |
 | `config show [root]` | 현재 설정 확인 |
 | `config set [root] <option> <value>` | 검증 후 설정 원자 교체 |
 | `<agent>-ingest <root> <handoff>` | private canonical handoff import |

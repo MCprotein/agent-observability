@@ -159,6 +159,22 @@ fn setup_and_config_set_work_end_to_end_in_the_real_process() {
             & 0o777,
         0o600
     );
+
+    fs::remove_file(&dashboard).unwrap();
+    let dashboard_command = binary()
+        .args(["dashboard", root.to_str().unwrap(), "--no-open"])
+        .output()
+        .unwrap();
+    assert!(
+        dashboard_command.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dashboard_command.stderr)
+    );
+    assert!(String::from_utf8_lossy(&dashboard_command.stdout).contains("opened=false"));
+    assert_eq!(
+        fs::metadata(&dashboard).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -186,6 +202,38 @@ fn demo_produces_first_observable_value_without_an_external_file() {
     let dashboard = fs::read_to_string(root.join("logs/agent-observability-report.html")).unwrap();
     assert!(dashboard.contains(r#""generatedSpans":1"#));
     assert!(!dashboard.contains("example-conversation"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn demo_fails_when_collection_policy_blocks_first_value() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-demo-blocked-process-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let setup = binary()
+        .args(["setup", root.to_str().unwrap(), "--no-open"])
+        .output()
+        .unwrap();
+    assert!(setup.status.success());
+    let disable = binary()
+        .args(["config", "set", root.to_str().unwrap(), "enabled", "false"])
+        .output()
+        .unwrap();
+    assert!(disable.status.success());
+
+    let demo = binary()
+        .args(["demo", root.to_str().unwrap(), "--no-open"])
+        .output()
+        .unwrap();
+    assert!(!demo.status.success());
+    assert!(demo.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&demo.stderr);
+    assert!(stderr.contains("demo could not create observable data"));
+    assert!(stderr.contains("collection_disabled=1"));
+    assert!(!stderr.contains("status=demo_ready"));
     let _ = fs::remove_dir_all(root);
 }
 

@@ -36,7 +36,7 @@ const USAGE: &str = "Agent Observability
 Quick start:
   agent-observability demo [root] [--no-open]
   agent-observability setup [root] [--no-open]
-  agent-observability dashboard [root]
+  agent-observability dashboard [root] [--no-open]
 
 Configuration:
   agent-observability config show [root]
@@ -66,6 +66,52 @@ enum IngestItem<'a> {
         code: AdapterDispositionCode,
         payload_hash: Option<&'a str>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IngestBlock {
+    CollectionDisabled,
+    Policy,
+    Pressure,
+    Storage,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IngestResult {
+    source: String,
+    observations: u64,
+    diagnostics: u64,
+    duplicates: u64,
+    suppressed: u64,
+    blocked: Option<IngestBlock>,
+}
+
+impl IngestResult {
+    fn blocked(source: &str, blocked: IngestBlock) -> Self {
+        Self {
+            source: source.into(),
+            observations: 0,
+            diagnostics: 0,
+            duplicates: 0,
+            suppressed: 0,
+            blocked: Some(blocked),
+        }
+    }
+
+    fn output(&self) -> String {
+        format!(
+            "source={}\nobservations={}\ndiagnostics={}\nduplicates={}\nsuppressed={}\ncollection_disabled={}\npolicy_blocked={}\npressure_blocked={}\nstorage_blocked={}\nteam_ingest=disabled",
+            self.source,
+            self.observations,
+            self.diagnostics,
+            self.duplicates,
+            self.suppressed,
+            u8::from(self.blocked == Some(IngestBlock::CollectionDisabled)),
+            u8::from(self.blocked == Some(IngestBlock::Policy)),
+            u8::from(self.blocked == Some(IngestBlock::Pressure)),
+            u8::from(self.blocked == Some(IngestBlock::Storage)),
+        )
+    }
 }
 
 fn main() -> ExitCode {
@@ -131,6 +177,7 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
                     },
                 }),
             )
+            .map(|result| result.output())
         }
         [command, directory, handoff] if command == "claude-code-ingest" => {
             let batch = read_claude_handoff_file(handoff).map_err(|error| error.to_string())?;
@@ -149,6 +196,7 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
                     },
                 }),
             )
+            .map(|result| result.output())
         }
         [command, directory, handoff] if command == "cursor-ingest" => {
             let batch = read_cursor_handoff_file(handoff).map_err(|error| error.to_string())?;
@@ -167,6 +215,7 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
                     },
                 }),
             )
+            .map(|result| result.output())
         }
         [command, report_arguments @ ..] if command == "report" => report_command(report_arguments),
         [command] if matches!(command.as_str(), "version" | "--version" | "-V") => {
@@ -197,8 +246,16 @@ fn run_onboarding(arguments: &[String]) -> Option<Result<String, String>> {
         [command, root, flag] if command == "setup" && flag == "--no-open" => {
             setup(Path::new(root), false)
         }
-        [command] if command == "dashboard" => default_root().and_then(|root| dashboard(&root)),
-        [command, root] if command == "dashboard" => dashboard(Path::new(root)),
+        [command] if command == "dashboard" => {
+            default_root().and_then(|root| dashboard(&root, true))
+        }
+        [command, flag] if command == "dashboard" && flag == "--no-open" => {
+            default_root().and_then(|root| dashboard(&root, false))
+        }
+        [command, root] if command == "dashboard" => dashboard(Path::new(root), true),
+        [command, root, flag] if command == "dashboard" && flag == "--no-open" => {
+            dashboard(Path::new(root), false)
+        }
         [command] if command == "config" => default_root().and_then(|root| show_config(&root)),
         [command, action] if command == "config" && action == "show" => {
             default_root().and_then(|root| show_config(&root))
@@ -251,12 +308,28 @@ fn demo(root: &Path, open: bool) -> Result<String, String> {
             },
         }),
     )?;
+    require_demo_ingest(&ingest)?;
     let dashboard = prepare_dashboard(root, open)?;
+    if current_record_count(root)? == 0 {
+        return Err("demo completed ingest but the dashboard has no observable data".into());
+    }
     Ok(format!(
-        "status=demo_ready\nroot={}\n{ingest}\ndashboard={}\nopened={open}",
+        "status=demo_ready\nroot={}\n{}\ndashboard={}\nopened={open}",
         root.display(),
+        ingest.output(),
         dashboard.display()
     ))
+}
+
+fn require_demo_ingest(ingest: &IngestResult) -> Result<(), String> {
+    if ingest.blocked.is_some() {
+        Err(format!(
+            "demo could not create observable data\n{}",
+            ingest.output()
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn setup(root: &Path, open: bool) -> Result<String, String> {
@@ -269,19 +342,38 @@ fn setup(root: &Path, open: bool) -> Result<String, String> {
     ))
 }
 
-fn dashboard(root: &Path) -> Result<String, String> {
-    let dashboard = prepare_dashboard(root, true)?;
-    Ok(format!("dashboard={}\nopened=true", dashboard.display()))
+fn dashboard(root: &Path, open: bool) -> Result<String, String> {
+    let dashboard = prepare_dashboard(root, open)?;
+    Ok(format!("dashboard={}\nopened={open}", dashboard.display()))
 }
 
 fn prepare_dashboard(root: &Path, open: bool) -> Result<PathBuf, String> {
+    prepare_dashboard_with(root, open, open_dashboard)
+}
+
+fn prepare_dashboard_with(
+    root: &Path,
+    open: bool,
+    opener: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<PathBuf, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
     let _ = report(&layout.root, None)?;
     let dashboard = layout.logs.join(REPORT_FILE_NAME);
     if open {
-        open_dashboard(&dashboard)?;
+        opener(&dashboard)?;
     }
     Ok(dashboard)
+}
+
+fn current_record_count(root: &Path) -> Result<usize, String> {
+    let layout = install(root).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let store = open_store(&layout, &config)?;
+    store
+        .current_records()
+        .map(|records| records.len())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -642,21 +734,20 @@ fn ingest_items<'a>(
     directory: &str,
     source: &str,
     items: impl Iterator<Item = IngestItem<'a>>,
-) -> Result<String, String> {
+) -> Result<IngestResult, String> {
     let paths = ingest_paths(Path::new(directory))?;
     let _singleton =
         Singleton::acquire(&paths.runtime_directory).map_err(|error| error.to_string())?;
     let mut control = RuntimeControl::new(&paths.config).map_err(|error| error.to_string())?;
     let items = items.collect::<Vec<_>>();
     if !paths.config.enabled {
-        return Ok(format!(
-            "source={source}\nobservations=0\ndiagnostics=0\nduplicates=0\nsuppressed=0\ncollection_disabled=1\nstorage_blocked=0\nteam_ingest=disabled"
+        return Ok(IngestResult::blocked(
+            source,
+            IngestBlock::CollectionDisabled,
         ));
     }
     if items.len() > usize::from(paths.config.collection.max_batch_records) {
-        return Ok(format!(
-            "source={source}\nobservations=0\ndiagnostics=0\nduplicates=0\nsuppressed=0\ncollection_disabled=0\npolicy_blocked=1\nstorage_blocked=0\nteam_ingest=disabled"
-        ));
+        return Ok(IngestResult::blocked(source, IngestBlock::Policy));
     }
     let allocated = StorageBudget::allocated_tree_bytes(&paths.accounting_root)
         .map_err(|error| error.to_string())?;
@@ -669,9 +760,7 @@ fn ingest_items<'a>(
         },
     );
     if schedule.flush_paused {
-        return Ok(format!(
-            "source={source}\nobservations=0\ndiagnostics=0\nduplicates=0\nsuppressed=0\ncollection_disabled=0\npressure_blocked=1\nstorage_blocked=0\nteam_ingest=disabled"
-        ));
+        return Ok(IngestResult::blocked(source, IngestBlock::Pressure));
     }
     if control
         .admit(
@@ -684,9 +773,7 @@ fn ingest_items<'a>(
         .map_err(|error| error.to_string())?
         == Admission::Denied
     {
-        return Ok(format!(
-            "source={source}\nobservations=0\ndiagnostics=0\nduplicates=0\nsuppressed=0\ncollection_disabled=0\nstorage_blocked=1\nteam_ingest=disabled"
-        ));
+        return Ok(IngestResult::blocked(source, IngestBlock::Storage));
     }
     let migration_headroom = control
         .migration_headroom(&paths.accounting_root)
@@ -733,9 +820,14 @@ fn ingest_items<'a>(
     store
         .rebuild_projection()
         .map_err(|error| error.to_string())?;
-    Ok(format!(
-        "source={source}\nobservations={observations}\ndiagnostics={diagnostics}\nduplicates={duplicates}\nsuppressed={suppressed}\ncollection_disabled=0\nstorage_blocked=0\nteam_ingest=disabled"
-    ))
+    Ok(IngestResult {
+        source: source.into(),
+        observations,
+        diagnostics,
+        duplicates,
+        suppressed,
+        blocked: None,
+    })
 }
 
 fn ingest_reservation_bytes(store_directory: &Path, batch_bytes: u64) -> Result<u64, String> {
@@ -769,7 +861,10 @@ fn ingest_paths(path: &Path) -> Result<IngestPaths, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME, run, timestamp_from_duration};
+    use super::{
+        IngestBlock, IngestResult, LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME,
+        prepare_dashboard_with, require_demo_ingest, run, timestamp_from_duration,
+    };
     use std::fs;
     use std::path::Path;
     use std::time::Duration;
@@ -859,6 +954,45 @@ mod tests {
         assert!(dashboard.contains(r#""generatedSpans":1"#));
         assert!(!dashboard.contains("example-conversation"));
         assert!(!dashboard.contains("prompt"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn demo_rejects_every_blocked_ingest_outcome() {
+        for blocked in [
+            IngestBlock::CollectionDisabled,
+            IngestBlock::Policy,
+            IngestBlock::Pressure,
+            IngestBlock::Storage,
+        ] {
+            let result = IngestResult::blocked("codex", blocked);
+            let error = require_demo_ingest(&result).unwrap_err();
+            assert!(error.contains("demo could not create observable data"));
+            assert!(error.contains("=1"));
+        }
+        let result = IngestResult {
+            source: "codex".into(),
+            observations: 1,
+            diagnostics: 2,
+            duplicates: 0,
+            suppressed: 0,
+            blocked: None,
+        };
+        require_demo_ingest(&result).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_propagates_opener_failure_after_writing_report() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-dashboard-open-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let error =
+            prepare_dashboard_with(&root, true, |_| Err("opener failed".into())).unwrap_err();
+        assert_eq!(error, "opener failed");
+        assert!(root.join("logs").join(REPORT_FILE_NAME).is_file());
         let _ = fs::remove_dir_all(root);
     }
 

@@ -4,10 +4,12 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub const LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v2";
 const LEGACY_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v1";
+static UPDATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -203,10 +205,8 @@ pub fn save(path: &Path, config: &LocalRuntimeConfigV2) -> Result<(), ConfigErro
     let _ = open_private_read(path)?;
 
     let body = serde_json::to_vec_pretty(config).map_err(ConfigError::Json)?;
-    let temporary = parent.join(format!(".config.json.update.{}", std::process::id()));
-    let _ = fs::remove_file(&temporary);
+    let (temporary, mut file) = private_update_file(parent)?;
     let result = (|| {
-        let mut file = private_create_new(&temporary)?;
         file.write_all(&body)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
@@ -219,6 +219,27 @@ pub fn save(path: &Path, config: &LocalRuntimeConfigV2) -> Result<(), ConfigErro
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn private_update_file(parent: &Path) -> Result<(PathBuf, File), ConfigError> {
+    for _ in 0..1_024 {
+        let sequence = UPDATE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".config.json.update.{}.{}",
+            std::process::id(),
+            sequence
+        ));
+        match private_create_new(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(ConfigError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique config update file",
+    )
+    .into())
 }
 
 const fn enabled_by_default() -> bool {
@@ -441,6 +462,95 @@ mod tests {
 
         assert!(save(&layout.config, &config).is_err());
         assert_eq!(fs::read(&layout.config).unwrap(), original);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_symlinks_and_broad_parent_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = root("save-boundaries");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let backup = layout.root.join("config.backup");
+        fs::rename(&layout.config, &backup).unwrap();
+        symlink(&backup, &layout.config).unwrap();
+        assert!(matches!(
+            save(&layout.config, &LocalRuntimeConfigV2::default()),
+            Err(ConfigError::Symlink)
+        ));
+
+        fs::remove_file(&layout.config).unwrap();
+        fs::rename(&backup, &layout.config).unwrap();
+        fs::set_permissions(&layout.root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            save(&layout.config, &LocalRuntimeConfigV2::default()),
+            Err(ConfigError::InsecurePermissions)
+        ));
+        fs::set_permissions(&layout.root, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_saves_publish_one_complete_valid_config() {
+        use std::sync::{Arc, Barrier};
+
+        let root = root("save-concurrent");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let path = Arc::new(layout.config.clone());
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = [30, 90].map(|days| {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let mut config = LocalRuntimeConfigV2::default();
+                config.retention.max_record_age_days = days;
+                barrier.wait();
+                save(&path, &config)
+            })
+        });
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let stored = load(&layout.config).unwrap();
+        assert!(matches!(stored.retention.max_record_age_days, 30 | 90));
+        assert!(fs::read_dir(&layout.root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".update.")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_update_file_does_not_block_a_save() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let root = root("save-stale");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let stale = layout
+            .root
+            .join(format!(".config.json.update.{}.0", std::process::id()));
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&stale)
+            .unwrap();
+        let mut config = LocalRuntimeConfigV2::default();
+        config.retention.max_record_age_days = 90;
+        save(&layout.config, &config).unwrap();
+        assert_eq!(load(&layout.config).unwrap(), config);
+        assert!(stale.exists());
         let _ = fs::remove_dir_all(root);
     }
 }
