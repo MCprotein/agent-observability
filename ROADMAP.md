@@ -53,7 +53,7 @@ gate를 통과해 추가한다.
 | v0.x | Completed | Local-only PoC를 작은 minor release로 쪼개 검증했다. |
 | v1.x | Active | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
 
-## Active Train: v0.1.0-v1.2.0
+## Active Train: v0.1.0-v1.3.0
 
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
@@ -79,6 +79,7 @@ gate를 통과해 추가한다.
 | --- | --- | --- | --- |
 | v1.1.0 | Released | Report usability improvements | bounded timeline, local structured-dimension saved views, 100-trace/200-span pagination, deterministic 4,096-span Node/Chromium regression, reload/delete browser smoke, independent review clear |
 | v1.2.0 | Released | Local retention and archive policy | strict retention config and migration, whole-trace plan/apply, private archive contract, replay/crash/path-safety fixtures, physical reclaim, archive CLI smoke, passing normative manifest `1788152070592764000` bound to source `fe8da2e9b2bb9cbc088c4df7f551ca423ad9d097`, independent review clear |
+| v1.3.0 | Released | Installable open-source distribution | Apache-2.0 license, macOS arm64/x64/universal2 GitHub Release artifacts, checksums and build provenance, native-binary GitHub Package, synchronized version gate, install-first README, renderer-independent architecture diagrams, independent review clear; release review in `docs/reviews/v1.3.0.md` |
 
 ## Branch Strategy
 
@@ -100,9 +101,14 @@ gate를 통과해 추가한다.
   delete the merged release branch locally and remotely. Start the next version
   on a new branch from the updated `main`; preserve a merged branch only when its
   PR records a concrete reason and removal condition.
-- Tagging/publishing rules can be added when the project has an actual package
-  distribution path; until then, the merged PR, its resulting commit SHA, and
-  roadmap status are the release record.
+- After the release PR is merged, create one immutable annotated `vX.Y.Z` tag on
+  the resulting `main` commit. The tag-triggered workflow must reject a tag that
+  is not contained in `main` or does not match Cargo, root npm, and distribution
+  package versions.
+- The release workflow publishes checksum-bound, attested native archives to a
+  GitHub Release and the same universal Rust executable through GitHub Packages.
+  A failed publication keeps the GitHub Release in draft; never move or reuse a
+  published version tag.
 
 The contributor-facing procedure is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -136,8 +142,10 @@ Team 항목은 collector endpoint 하나로 완료되지 않는다. `docs/TEAM_A
 8. 완료 evidence가 모이고 PR이 mergeable이면 병합 직전에 상태를 `Released`로 바꾼다.
    병합이 완료되지 않으면 상태를 되돌린다.
 9. release PR을 `main`에 병합하고 resulting commit SHA와 PR 상태를 확인한다.
-10. local `main`을 갱신한 뒤 병합된 branch를 local/remote에서 삭제한다.
-11. 다음 버전은 갱신된 `main`에서 새 release branch로 시작한다.
+10. 병합 SHA에 annotated `vX.Y.Z` tag를 생성하고 Release, Package, checksum과
+    provenance 게시 결과를 확인한다.
+11. local `main`을 갱신한 뒤 병합된 branch를 local/remote에서 삭제한다.
+12. 다음 버전은 갱신된 `main`에서 새 release branch로 시작한다.
 
 ## Non-Skippable Gates
 

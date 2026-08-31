@@ -8,6 +8,19 @@ fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_agent-observability"))
 }
 
+#[test]
+fn version_flags_report_the_package_version() {
+    for flag in ["version", "--version", "-V"] {
+        let output = binary().arg(flag).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(output.stderr.is_empty());
+    }
+}
+
 fn installed_store(root: &Path) -> PathBuf {
     root.join("state/store")
 }

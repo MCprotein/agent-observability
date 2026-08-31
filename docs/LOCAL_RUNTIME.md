@@ -1,7 +1,8 @@
 # Local Runtime
 
-v1.0.0 introduced the standalone local-only Rust runtime boundary. v1.2.0 adds bounded local
-retention and private archive export without adding a server, daemon, identity, or network path.
+v1.0.0 introduced the standalone local-only Rust runtime boundary. v1.2.0 added bounded local
+retention and private archive export; v1.3.0 packages the same one-shot CLI without adding a
+server, daemon, identity, or network path.
 It installs private local state,
 validates a closed configuration, admits writes against a hard storage budget, and keeps foreground
 handoff bounded. It contains no endpoint, email, team identity, envelope, outbox, or network client.
@@ -9,18 +10,21 @@ It is a library plus one-shot CLI composition boundary, not a resident server or
 
 ## Install and validate
 
+Install a universal macOS binary from GitHub Releases or the authenticated GitHub Package as
+documented in the repository README. The package is only a transport for the Rust executable.
+
 ~~~bash
-cargo run -p agent-observability-cli -- init ~/.agent-observability
-cargo run -p agent-observability-cli -- config-check ~/.agent-observability/config.json
-cargo run -p agent-observability-cli -- runtime-check ~/.agent-observability
-cargo run -p agent-observability-cli -- storage-check ~/.agent-observability
-cargo run -p agent-observability-cli -- retention-plan ~/.agent-observability
-cargo run -p agent-observability-cli -- retention-apply ~/.agent-observability PLAN_ID /path/to/private-retention-archive.jsonl
-cargo run -p agent-observability-cli -- codex-ingest ~/.agent-observability /path/to/private-handoff.jsonl
-cargo run -p agent-observability-cli -- claude-code-ingest ~/.agent-observability /path/to/private-handoff.jsonl
-cargo run -p agent-observability-cli -- cursor-ingest ~/.agent-observability /path/to/private-handoff.jsonl
-cargo run -p agent-observability-cli -- report ~/.agent-observability
-cargo run -p agent-observability-cli -- report ~/.agent-observability /path/to/private-rate-table.json
+agent-observability init ~/.agent-observability
+agent-observability config-check ~/.agent-observability/config.json
+agent-observability runtime-check ~/.agent-observability
+agent-observability storage-check ~/.agent-observability
+agent-observability retention-plan ~/.agent-observability
+agent-observability retention-apply ~/.agent-observability PLAN_ID /path/to/private-retention-archive.jsonl
+agent-observability codex-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+agent-observability claude-code-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+agent-observability cursor-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+agent-observability report ~/.agent-observability
+agent-observability report ~/.agent-observability /path/to/private-rate-table.json
 ~~~
 
 init creates the root, logs, queue, state, and runtime directories with mode 0700 and creates

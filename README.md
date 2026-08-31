@@ -1,48 +1,129 @@
 # Agent Observability
 
 Coding agent의 token, latency, tool lifecycle, error, permission, compaction을 하나의
-privacy-safe trace 모델로 정규화하고 로컬 SQLite와 self-contained HTML report로 확인하는
-local-first observability project다.
+privacy-safe trace 모델로 정규화하고, 로컬 SQLite와 self-contained HTML report로 확인하는
+local-first CLI다.
 
-> **Release status:** `v1.2.0` released with bounded local retention and private archive export.
-> 현재 지원 범위는 macOS
-> standalone private canonical handoff import다. Native receiver, foreground producer,
-> team collector와 hosted UI는 아직 Future TODO다.
+> **v1.3.0 범위:** macOS standalone과 private canonical handoff import를 지원한다.
+> Codex, Claude Code, Cursor의 hook/log를 자동 감시하는 producer와 receiver, daemon, team
+> collector는 아직 포함하지 않는다.
 
-## 문서 바로가기
+## 설치
 
-| 목적 | 문서 |
-| --- | --- |
-| 전체 수집·저장·report·retention 흐름 | [Collection Flow](docs/COLLECTION_FLOW.md) |
-| 기술 스택, 책임 경계, SOLID/OOP/FP와 패턴 | [Architecture](docs/ARCHITECTURE.md) |
-| 설치, runtime bounds, retention과 성능 검증 | [Local Runtime](docs/LOCAL_RUNTIME.md) |
-| agent별 공식 surface와 지원 범위 | [Adapter Compatibility](docs/ADAPTER_COMPATIBILITY.md) |
-| token 기반 예상 비용 계산 | [Cost Estimation](docs/COST_ESTIMATION.md) |
-| static report UI 원칙 | [Design](DESIGN.md) |
-| 버전별 범위와 release gate | [Roadmap](ROADMAP.md) |
-| branch, PR, review와 merge 절차 | [Contributing](CONTRIBUTING.md) |
-| Future TODO team profile | [Team Architecture](docs/TEAM_ARCHITECTURE.md) / [Team Contracts](docs/TEAM_CONTRACTS.md) |
+### GitHub Release (권장)
 
-## 현재 제공하는 것
+Apple Silicon과 Intel Mac에서 모두 동작하는 universal binary를 설치한다.
 
-- Codex, Claude Code, Cursor용 bounded canonical handoff adapter
-- agent별 payload를 공통 `SourceObservation`과 trace/span 의미로 정규화
-- observation 경로와 disposition 경로를 각각 cursor와 함께 원자적으로 기록하는 private SQLite authority
-- strict `local_runtime.v2` 설정, singleton lock, storage admission과 load shedding
-- whole-trace retention plan/apply, private JSONL archive와 bounded physical reclaim
-- versioned rate table을 사용하는 token 기반 예상 비용
-- Rust projector와 TypeScript UI를 조립한 network-free self-contained HTML report
-- schema, privacy, crash recovery, browser, performance regression suite
+```bash
+gh release download v1.3.0 \
+  --repo MCprotein/agent-observability \
+  --pattern 'agent-observability-1.3.0-darwin-universal2.tar.gz'
+tar -xzf agent-observability-1.3.0-darwin-universal2.tar.gz
+mkdir -p ~/.local/bin
+install -m 0755 \
+  agent-observability-1.3.0-darwin-universal2/agent-observability \
+  ~/.local/bin/agent-observability
+export PATH="$HOME/.local/bin:$PATH"
+agent-observability --version
+```
 
-현재 제공하지 않는 것:
+새 shell에서도 쓰려면 위 `export`를 shell profile에 추가한다. Release에는 arm64/x64 개별 archive,
+`SHA256SUMS`, build provenance도 함께 게시된다.
 
-- agent log/hook에서 canonical handoff를 만드는 foreground producer
-- OTLP HTTP/gRPC receiver나 상시 실행 daemon
-- 중앙 collector, login, raw email ingest, hosted team dashboard
-- archive restore, correction, retraction, reinstatement와 aggregate rebuild
-- macOS 및 capability manifest의 exact-version 범위를 넘어선 지원 보장
+### GitHub Packages
 
-현재 검증된 adapter boundary:
+GitHub Packages는 인증이 필요하다. `read:packages` 권한이 있는 personal access token
+(classic)을 npm password로 사용한다.
+
+```bash
+npm login \
+  --scope=@mcprotein \
+  --auth-type=legacy \
+  --registry=https://npm.pkg.github.com
+npm install --global @mcprotein/agent-observability \
+  --registry=https://npm.pkg.github.com
+agent-observability --version
+```
+
+이 npm package는 JavaScript launcher가 아니라 macOS universal Rust binary를 직접 설치한다.
+
+### 소스에서 실행
+
+개발에는 Rust `1.97`, Node.js `20+`가 필요하다.
+
+```bash
+cargo run -p agent-observability-cli -- --version
+```
+
+## 5분 시작
+
+먼저 private runtime을 만든다.
+
+```bash
+agent-observability init ~/.agent-observability
+agent-observability config-check ~/.agent-observability/config.json
+agent-observability runtime-check ~/.agent-observability
+agent-observability storage-check ~/.agent-observability
+```
+
+현재 ingest 입력은 별도 producer가 만든 **private canonical handoff JSONL**이어야 한다.
+각 agent의 원본 transcript나 hook payload를 직접 넘기는 인터페이스가 아니다.
+
+설치와 report 경로를 끝까지 확인하려면 release에 포함된 content-free Codex example을
+사용할 수 있다. 실제 관측값이 아니며 producer 연동을 대신하지 않는다.
+
+```bash
+cp /path/to/extracted-release/examples/codex-handoff.v1.jsonl /tmp/codex-handoff.v1.jsonl
+chmod 0600 /tmp/codex-handoff.v1.jsonl
+agent-observability codex-ingest \
+  ~/.agent-observability /tmp/codex-handoff.v1.jsonl
+agent-observability report ~/.agent-observability
+open ~/.agent-observability/logs/agent-observability-report.html
+```
+
+GitHub Package로 설치했다면 example은 tag에서 받을 수 있다.
+
+```bash
+curl -fsSLo /tmp/codex-handoff.v1.jsonl \
+  https://raw.githubusercontent.com/MCprotein/agent-observability/v1.3.0/examples/codex-handoff.v1.jsonl
+chmod 0600 /tmp/codex-handoff.v1.jsonl
+```
+
+실제 private canonical handoff는 agent별 `*.v1` schema와
+[Adapter Compatibility](docs/ADAPTER_COMPATIBILITY.md)의 verified surface에 맞춰 별도 producer가
+생성해야 한다.
+
+```bash
+agent-observability codex-ingest \
+  ~/.agent-observability /path/to/private-codex-handoff.jsonl
+agent-observability claude-code-ingest \
+  ~/.agent-observability /path/to/private-claude-handoff.jsonl
+agent-observability cursor-ingest \
+  ~/.agent-observability /path/to/private-cursor-handoff.jsonl
+```
+
+실제 handoff를 가져온 뒤 report를 만들고 브라우저에서 연다.
+
+```bash
+agent-observability report ~/.agent-observability
+open ~/.agent-observability/logs/agent-observability-report.html
+```
+
+HTML은 mode `0600`으로 원자 기록된다. 별도 web server 없이 `file://`로 열리며 외부
+network request를 만들지 않는다.
+
+## 무엇을 볼 수 있나
+
+- repo/session/agent/model filter와 saved view
+- bounded timeline, trace pagination, token/cost/error KPI
+- versioned rate table 기반 예상 비용과 incomplete/unknown 상태
+- Codex, Claude Code, Cursor canonical adapter parity
+- bounded retention plan/apply와 private JSONL archive
+
+예상 비용은 실제 청구액이 아니다. 단가표가 없거나 불완전하면 `unknown` 또는
+`incomplete`로 표시한다. 자세한 계산 계약은 [Cost Estimation](docs/COST_ESTIMATION.md)에 있다.
+
+현재 검증된 adapter 경계:
 
 | Agent | Verified version | Boundary | Known gap |
 | --- | --- | --- | --- |
@@ -50,160 +131,110 @@ local-first observability project다.
 | Claude Code | `2.1.248` | macOS standalone private handoff | user interrupt signal 미확인 |
 | Cursor | `3.17.21` | macOS standalone private handoff | specific shell/MCP/file hook은 diagnostic-only |
 
-## 아키텍처
+정확한 source surface는 [Adapter Compatibility](docs/ADAPTER_COMPATIBILITY.md)를 따른다.
 
-```mermaid
-flowchart LR
-    H["Private canonical handoff JSONL<br/>producer / receiver not shipped"]
-    A["Bounded Rust adapter"]
-    D["Domain + application"]
-    S[("SQLite local_state.v4<br/>authority")]
-    J["Rebuildable JSONL projection"]
-    P["Privacy + cost projector"]
-    DTO["Validated ReportDtoV1"]
-    UI["Built TypeScript UI asset"]
-    HTML["Private self-contained HTML"]
-    B["Browser file://<br/>no network"]
-    R["Explicit retention plan / apply"]
-    X["Private archive<br/>outside runtime root"]
+## 동작 구조
 
-    H --> A
-    A -->|"transient SourceObservation"| D
-    A -->|"fixed-code disposition"| S
-    D -->|"per-item atomic commit"| S
-    S --> J
-    S --> P --> DTO --> HTML --> B
-    UI --> HTML
-    S --> R --> X
-```
-
-핵심 경계는 다음과 같다.
-
-1. Adapter는 agent별 입력을 번역하며 durable storage나 UI를 직접 다루지 않는다.
-2. Domain과 application은 agent payload, filesystem, SQLite, CLI와 UI에 의존하지 않는다.
-3. SQLite가 권위 저장소이며 JSONL, snapshot과 HTML은 재생성 가능한 projection이다.
-4. TypeScript UI는 원본 agent payload를 읽지 않고 Rust가 검증한 `ReportDtoV1`만 사용한다.
-5. 현재 제품 경로에는 network 전송이 없다.
-
-상세한 sequence와 retention/report 흐름은 [Collection Flow](docs/COLLECTION_FLOW.md)를 참고한다.
-
-## 빠른 시작
-
-> 이 흐름은 이미 생성된 private canonical handoff file이 있어야 실행할 수 있다. Agent hook/log에서
-> handoff를 만드는 producer는 아직 이 repository에 포함되지 않는다.
-
-필수 환경:
-
-- Rust `1.97`
-- Node.js `20+`
-- macOS standalone environment
-
-로컬 runtime을 초기화하고 검증한다.
-
-```bash
-cargo run -p agent-observability-cli -- init ~/.agent-observability
-cargo run -p agent-observability-cli -- config-check ~/.agent-observability/config.json
-cargo run -p agent-observability-cli -- runtime-check ~/.agent-observability
-cargo run -p agent-observability-cli -- storage-check ~/.agent-observability
-```
-
-별도 producer가 만든 private canonical handoff를 agent별 adapter로 가져온다.
-
-```bash
-cargo run -p agent-observability-cli -- codex-ingest \
-  ~/.agent-observability /path/to/private-codex-handoff.jsonl
-
-cargo run -p agent-observability-cli -- claude-code-ingest \
-  ~/.agent-observability /path/to/private-claude-handoff.jsonl
-
-cargo run -p agent-observability-cli -- cursor-ingest \
-  ~/.agent-observability /path/to/private-cursor-handoff.jsonl
-```
-
-정적 report를 생성한다.
-
-```bash
-cargo run -p agent-observability-cli -- report ~/.agent-observability
-
-# Optional private rate table
-cargo run -p agent-observability-cli -- report \
-  ~/.agent-observability /path/to/private-rate-table.json
-```
-
-출력은 다음 경로에 mode `0600`으로 원자 기록된다.
+GitHub의 rich display 지원 여부와 관계없이 보이도록 plain-text diagram을 사용한다.
 
 ```text
-~/.agent-observability/logs/agent-observability-report.html
+Private canonical handoff JSONL
+             |
+             v
+  bounded Rust agent adapter
+             |
+             v
+  domain + application rules
+             |
+        +----+--------------------+
+        |                         |
+        v                         v
+SQLite local_state.v4      privacy + cost projector
+(local authority)                  |
+        |                           v
+        v                    validated ReportDtoV1
+rebuildable JSONL                   |
+        |                           v
+        +--> retention       TypeScript UI asset
+             plan/apply             |
+                                    v
+                         self-contained private HTML
+                                    |
+                                    v
+                           browser file://, no network
 ```
 
-별도 server 없이 브라우저에서 `file://`로 열 수 있으며 외부 network request를 만들지 않는다.
+핵심 경계:
+
+1. Adapter는 agent별 입력만 번역하고 storage나 UI를 직접 다루지 않는다.
+2. Domain과 application은 agent payload, filesystem, SQLite, CLI, UI에 의존하지 않는다.
+3. SQLite가 권위 저장소이며 JSONL과 HTML은 재생성 가능한 projection이다.
+4. TypeScript UI는 원본 payload가 아니라 Rust가 검증한 `ReportDtoV1`만 받는다.
+5. 현재 standalone 제품 경로에는 network 전송, login, collector가 없다.
+
+상세 흐름은 [Collection Flow](docs/COLLECTION_FLOW.md), 설계 원칙은
+[Architecture](docs/ARCHITECTURE.md)를 참고한다.
 
 ## Retention
 
-Retention은 ingest 중 암묵적으로 데이터를 지우지 않는다. 먼저 read-only plan을 만들고, 새 private
-archive 경로를 지정해 명시적으로 적용한다.
+Retention은 ingest 중 암묵적으로 데이터를 지우지 않는다. read-only plan을 먼저 만들고,
+managed runtime 밖의 새 private archive 경로를 지정해 적용한다.
 
 ```bash
-cargo run -p agent-observability-cli -- retention-plan ~/.agent-observability
-
-cargo run -p agent-observability-cli -- retention-apply \
+agent-observability retention-plan ~/.agent-observability
+agent-observability retention-apply \
   ~/.agent-observability PLAN_ID /path/to/private-retention-archive.jsonl
 ```
 
 - cutoff와 같거나 이후인 관측이 하나라도 있는 trace는 전체가 유지된다.
 - 만료 대상은 trace 전체 단위로 archive한 뒤 제거한다.
 - bounded plan이 `truncated=true`이면 apply 전체를 거부한다.
-- archive는 managed runtime 밖의 private directory에만 생성한다.
 - source cursor와 bounded replay guard는 남아 오래된 재전송을 거부한다.
 
-정확한 crash/retry와 reclaim 계약은 [Local Runtime](docs/LOCAL_RUNTIME.md#retention-and-private-archive)에
+Crash/retry/reclaim 계약은 [Local Runtime](docs/LOCAL_RUNTIME.md#retention-and-private-archive)에
 정리되어 있다.
 
-## Report UI
+## Privacy
 
-```mermaid
-flowchart LR
-    S[("SQLite authority")]
-    P["Rust privacy + cost projector"]
-    DTO["ReportDtoV1"]
-    UI["Built TypeScript assets"]
-    HTML["Private self-contained HTML"]
-    B["Browser file://"]
+- prompt, assistant/tool output, cwd, command, path, raw email은 durable contract에 넣지 않는다.
+- secret과 민감 field는 durable write 전에 allowlist와 redaction을 통과해야 한다.
+- runtime directory는 `0700`, managed files는 `0600`을 요구한다.
+- symlink, broad permission, unknown field, unsupported schema version은 fail closed한다.
+- transient `SourceObservation` 전체를 SQLite, JSONL, HTML, export에 저장하지 않는다.
+- standalone은 login, endpoint, outbox, network client 없이 동작한다.
 
-    S --> P --> DTO --> HTML --> B
-    UI --> HTML
-```
+## 명령
 
-현재 report는 repo/session/agent/model filter, saved view, bounded timeline, trace pagination,
-token/cost/error KPI와 malformed DTO fail-closed state를 제공한다. 예상 비용은 실제 청구액이 아니며
-rate table이 없거나 불완전하면 `unknown` 또는 `incomplete`로 표시한다.
+| Command | Purpose |
+| --- | --- |
+| `init <root>` | private local runtime 생성 |
+| `config-check <config-json>` | strict config 검증 |
+| `runtime-check <root>` | singleton/resource boundary 확인 |
+| `storage-check <root>` | local authority 상태 확인 |
+| `<agent>-ingest <root> <handoff>` | canonical handoff ingest |
+| `report <root> [rate-table]` | self-contained HTML 생성 |
+| `retention-plan <root>` | read-only expiry plan 생성 |
+| `retention-apply <root> <plan-id> <archive>` | private archive 후 expiry 적용 |
+| `contracts` | active schema/profile boundary 출력 |
+| `version` | CLI version 출력 |
 
-## Privacy Invariants
-
-- prompt, assistant output, tool output, cwd, command, path와 raw email은 Rust durable contract에 넣지 않는다.
-- secret과 민감 field는 durable write 전에 allowlist와 redaction policy를 통과해야 한다.
-- private runtime directory는 `0700`, managed files는 `0600`을 요구한다.
-- symlink, broad permission, unknown schema field와 unsupported version은 fail closed한다.
-- `SourceObservation`은 transient이며 SQLite, JSONL, HTML 또는 Future team envelope에 그대로 저장하지 않는다.
-- 현재 standalone profile은 login, endpoint, outbox와 network client를 포함하지 않는다.
-
-## Repository Map
+## 저장소 안내
 
 | Path | Responsibility |
 | --- | --- |
-| `crates/domain` | opaque identifiers, lifecycle, topology와 token 의미 |
-| `crates/contracts` | transient/durable/report contract와 capability manifest |
-| `crates/adapter-*` | Codex, Claude Code, Cursor handoff translation |
-| `crates/application` | pricing policy와 privacy-safe report projection |
-| `crates/local-store` | SQLite authority, projection recovery와 retention |
+| `crates/domain` | identifier, lifecycle, topology, token 의미 |
+| `crates/contracts` | transient/durable/report contract와 manifest |
+| `crates/adapter-*` | agent별 canonical handoff translation |
+| `crates/application` | pricing과 privacy-safe report projection |
+| `crates/local-store` | SQLite authority, recovery, retention |
 | `crates/local-runtime` | config, lock, admission, resource policy |
-| `crates/static-report` | validated DTO와 browser asset의 HTML assembly |
-| `crates/cli` | one-shot product composition root |
-| `ui/report` | strict TypeScript report UI source |
+| `crates/static-report` | DTO와 TypeScript asset의 HTML assembly |
+| `crates/cli` | one-shot composition root |
+| `ui/report` | strict TypeScript report UI |
 | `contracts` | shared closed JSON Schema |
-| `xtask` | local performance protocol과 evidence validation |
+| `distribution/npm` | GitHub Packages용 native binary metadata |
 
-## 검증
+## 개발 검증
 
 ```bash
 cargo fmt --all -- --check
@@ -214,15 +245,25 @@ npm test
 cargo run -p xtask -- perf local --profile smoke --check
 ```
 
-`smoke`는 개발용 비규범 검사다. Release 판정에는 별도의 uninterrupted release profile과
-sanitized manifest review가 필요하다.
+Release 판정에는 별도의 uninterrupted release profile과 sanitized manifest review가 필요하다.
 
-## Release와 기여
+## 문서
 
-버전 하나는 하나의 release branch와 draft PR로 관리한다. CI, 독립 review와 release gate가 모두
-통과한 뒤 문서를 `Released`로 바꾸고 merge하며, 결과 SHA를 확인한 다음 merged branch를 제거한다.
-세부 절차는 [CONTRIBUTING.md](CONTRIBUTING.md), 버전별 상태는 [ROADMAP.md](ROADMAP.md)를 따른다.
+| 목적 | 문서 |
+| --- | --- |
+| 수집·저장·report·retention 흐름 | [Collection Flow](docs/COLLECTION_FLOW.md) |
+| 기술 스택과 책임 경계 | [Architecture](docs/ARCHITECTURE.md) |
+| runtime bounds와 성능 | [Local Runtime](docs/LOCAL_RUNTIME.md) |
+| agent별 지원 범위 | [Adapter Compatibility](docs/ADAPTER_COMPATIBILITY.md) |
+| UI 원칙 | [Design](DESIGN.md) |
+| 버전과 release gate | [Roadmap](ROADMAP.md) |
+| branch, PR, review | [Contributing](CONTRIBUTING.md) |
+| Future TODO team profile | [Team Architecture](docs/TEAM_ARCHITECTURE.md) / [Team Contracts](docs/TEAM_CONTRACTS.md) |
 
-현재 Future TODO team profile은 standalone core를 재사용하되 별도 collector composition root,
-tenant isolation, RBAC, identity binding, deletion, quota, audit와 SLO/DR gate를 모두 통과하기 전에는
-상용 기능으로 간주하지 않는다.
+## 기여와 라이선스
+
+버전 하나는 하나의 release branch와 draft PR로 관리한다. 독립 review와 CI를 통과한 뒤
+`main`에 병합하고, 병합 SHA에 immutable version tag를 붙여 Release와 Package를 게시한다.
+[CONTRIBUTING.md](CONTRIBUTING.md)에 전체 절차가 있다.
+
+Apache License 2.0. 자세한 내용은 [LICENSE](LICENSE)를 확인한다.

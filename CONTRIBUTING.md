@@ -20,9 +20,11 @@ agent-observability는 버전 단위의 작은 pull request로 변경을 검토�
    최종 release 상태 변경은 병합 직전에 수행하고, 병합이 완료되지 않으면 상태를
    되돌려 `main`에 없는 버전을 `Released`로 방치하지 않는다.
 8. PR을 `main`에 병합한 뒤 resulting commit SHA와 PR 상태를 확인한다.
-9. `main`으로 전환해 remote와 동기화한 다음 병합된 release branch를 GitHub와 로컬에서
+9. 병합 SHA에 annotated `vX.Y.Z` tag를 만들고 push한다. Release workflow가 GitHub
+   Release와 GitHub Package를 모두 게시할 때까지 결과를 확인한다.
+10. `main`으로 전환해 remote와 동기화한 다음 병합된 release branch를 GitHub와 로컬에서
    삭제한다. 보존해야 할 예외가 있으면 PR에 이유와 제거 조건을 기록한다.
-10. 다음 버전은 병합 결과를 포함한 최신 `main`에서 새 release branch로 시작한다.
+11. 다음 버전은 병합 결과를 포함한 최신 `main`에서 새 release branch로 시작한다.
 
 버전 브랜치 하나에는 한 버전만 포함한다. 현재 버전을 `Released`, `Blocked`, 또는
 `Superseded`로 정리하기 전에는 다음 버전 구현을 섞지 않는다. 큰 버전을 여러 사람이
@@ -60,6 +62,21 @@ CI 성공은 merge gate의 일부이며, 로컬에서만 실행할 수 있는 �
 사용자 동작이나 성능 계약이 바뀌면 ROADMAP에 선언된 fixture, smoke, browser, performance
 검증도 추가한다. 생성된 evidence는 실제 실행 결과와 호환되는 protocol/manifest만
 보존하며, 실패하거나 오래된 결과로 현재 gate를 충족했다고 주장하지 않는다.
+
+## Release Publication
+
+- tag 형식은 `vX.Y.Z`이며 Cargo workspace, root npm package와
+  `distribution/npm/package.json`의 버전이 모두 `X.Y.Z`와 같아야 한다.
+- tag는 merge된 `main` commit에만 붙인다. 게시한 tag는 이동, 삭제 후 재사용하거나 같은
+  package version으로 다시 만들지 않는다.
+- GitHub Release에는 macOS arm64, x64, universal2 archive, npm package tarball,
+  `SHA256SUMS`를 게시하고 artifact attestation을 생성한다.
+- GitHub Package는 `@mcprotein/agent-observability`이며 universal Rust binary를 직접
+  `bin`으로 노출한다. JavaScript launcher나 runtime dependency를 추가하지 않는다.
+- workflow는 Release를 draft로 먼저 만들고 Package 게시가 성공한 뒤 공개한다. 일부 단계가
+  실패하면 draft와 workflow log를 근거로 복구하며 version이나 tag를 바꾸지 않는다.
+- 게시 후 universal archive를 새 directory에 받아 checksum, attestation,
+  `agent-observability --version`을 검증하고 PR 또는 review evidence에 결과를 남긴다.
 
 ## Pull Request Review
 

@@ -6,7 +6,7 @@
 
 ## Current and target stack
 
-현재 `v1.2.0` Rust 경로는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
+현재 `v1.3.0` Rust 경로는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
 보존하면서 macOS standalone private handoff import 범위의 Rust Codex, Claude Code와 Cursor adapter,
 TypeScript static report UI, strict local config와 bounded runtime policy를 제공한다. Rust 경로는 closed contract,
 deterministic lifecycle reduction, topology validation, pricing/report projection, bounded product handoff와
@@ -28,6 +28,11 @@ contract fixture로 고정한 뒤 Rust CLI를 별도 실행 경로로 병렬 구
 모듈 단위 FFI나 subprocess 호출로 섞지 않는다. 동일한 입력 fixture에서 durable record와
 report DTO parity가 확인되면 완성된 수직 기능 단위를 release boundary에서 Rust CLI로
 전환하고 대응하는 JavaScript 경로를 제거한다.
+
+배포 경계도 같은 원칙을 따른다. GitHub Release archive와 GitHub Packages npm package는
+동일한 universal Rust executable을 운반한다. npm metadata의 `bin`은 실행 파일을 직접
+가리키며 JavaScript launcher, daemon, collector 또는 runtime dependency를 추가하지 않는다.
+배포 형식은 transport일 뿐 domain/application/runtime 책임을 소유하지 않는다.
 
 TypeScript UI는 브라우저에서 직접 원본 event log를 읽지 않고 Rust가 만든 sanitized report
 DTO만 사용한다. report는 self-contained static HTML이며 runtime web server를 요구하지 않는다.
@@ -87,7 +92,7 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
-v1.2.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
+v1.3.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
 `crates/adapter-claude-code`, `crates/adapter-cursor`,
 `crates/application`, `crates/local-store`, `crates/local-runtime`, `crates/static-report`, `crates/cli`와 release
 evidence runner인 `xtask`로 나뉜다. domain은 외부 형식을
