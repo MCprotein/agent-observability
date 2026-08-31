@@ -1,4 +1,6 @@
 schema_version: local_performance.v1
+protocol_revision: v0.13.0-legacy-burst
+source_revision: 84acc418c87740293084abccf8a48d7e48ff2a4d
 profile: release
 protocol: crates/contracts/performance/local-performance-v1.yaml
 status: pass

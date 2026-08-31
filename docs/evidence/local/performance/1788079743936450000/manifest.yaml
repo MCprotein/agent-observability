@@ -1,7 +1,9 @@
 schema_version: local_performance.v1
+protocol_revision: legacy-v1.2.0-pre-revision-drain-sampler
+source_revision: e93aa19b72ac1385d71491b40d198dc648d53b0d
 profile: release
 protocol: crates/contracts/performance/local-performance-v1.yaml
-status: pending-validation
+status: failed
 machine: sanitized-aarch64-18-logical-core
 os: macos
 filesystem: apfs

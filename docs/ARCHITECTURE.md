@@ -239,7 +239,16 @@ anti-corruption layer다.
   ingress/drain composition은 `xtask` release fixture가 검증하며, CLI handoff ingest는 이미 만들어진
   bounded batch를 singleton 아래 transaction store에 직접 반영한다. Release fixture는 enabled saturation의
   fail-open rejection을 1% 이하로 제한하고 graceful shutdown 뒤 enqueued count와 durable observation
-  count를 대조한다. Foreground enqueue 자체는 durability를 보장하지 않는다.
+  count를 대조한다. macOS network evidence는 run마다 하나의 PTY-backed `nettop` monitor를 worker 전체
+  생명주기 동안 유지하며, 다음 header가 닫은 완전한 cycle만 evidence로 승인한다. resource sample은
+  3초보다 오래되지 않은 최신 완료 누적값을 읽고, 닫힌 socket 뒤에도 이전 traffic이 사라지지 않도록
+  run 최대값을 보존한다. durable drain 완료 뒤 시작된 cycle 하나가 완전히 닫힌 것을 확인한 다음 worker를
+  release한다. Linux는 각 resource sample과 drain 뒤에 worker socket descriptor를 point-in-time으로
+  검사하며 continuous byte monitor로 간주하지 않는다. drain evidence marker는 worker가 drain command를
+  받은 뒤에만 만들고, drain 완료와 parent-confirmed final resource sample까지 유지한 다음
+  `drain-complete` 전에 제거한다. sampler result, worker protocol/exit, local process query와 monitor shutdown
+  wait는 bounded이며 완료된 sampler/output-reader thread를 join한다. Foreground enqueue 자체는 durability를
+  보장하지 않는다.
 - 저장소 용량은 allocated block과 worst-case write로 admission한다. age retention은 strict 설정의
   1..3650일, archive pass당 1..100,000 record와 64 KiB..256 MiB bounds를 사용한다.
 - retention은 cutoff와 같거나 더 새로운 observation이 있는 trace와 unresolved topology를 보존한다.

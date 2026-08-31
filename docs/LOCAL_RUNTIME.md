@@ -68,6 +68,18 @@ The installed configuration is intentionally small:
   durable commit tail for every accepted event.
 - Peak process CPU uses the profile's declared sample interval: one second for normative release
   evidence. This keeps process CPU-time resolution and wall-time normalization aligned.
+- The worker creates its drain-evidence marker only after receiving the drain command. It retains the
+  marker through drain completion and a parent-confirmed final resource sample, then removes it before
+  `drain-complete`. Worker protocol, process exit, local `ps`, sampler result, and monitor shutdown
+  waits are bounded; completed sampler and output-reader threads are joined.
+- On macOS, each run owns one PTY-backed `nettop` monitor for the worker's full lifetime. Resource
+  samples read its latest completed cumulative byte count without spawning another process, while
+  the run retains the maximum observed count so traffic remains visible after a socket closes. A
+  cycle becomes evidence only when the next header closes it, and each resource read rejects evidence
+  older than three seconds. Startup, parsing, unexpected exit, stale evidence, and missing-sample
+  failures stop the run. The worker remains alive until a complete cycle that started after durable
+  drain completion is observed. Linux instead scans the worker's socket descriptors at each resource
+  sample and once after drain; it is point-in-time evidence rather than a continuous byte monitor.
 - Full, unavailable, and oversized outcomes are bounded counters; they do not wait for drain or
   network.
 - One process owns the private runtime directory through an OS-held file lock and random boot
@@ -178,7 +190,10 @@ docs/evidence/local/performance/, and exits nonzero for missing or breached late
 disk, network, or queue-admission evidence. Enabled runs permit at most 1% explicit fail-open
 rejections and, after graceful fixture shutdown, must reconcile every enqueued event with one durable
 observation. Foreground enqueue does not itself imply durability. Both profiles
-delete measured durable stores after validation; release retains only the sanitized manifest.
+delete measured durable stores after validation; release retains only the sanitized manifest. A
+release run also requires a clean worktree and records the full source commit SHA. A retained failed
+release manifest therefore has to be reviewed and committed before another release-profile attempt;
+smoke remains available while the diagnostic commit is being prepared.
 
 ## Static report
 
