@@ -102,6 +102,143 @@ fn init_and_runtime_check_create_only_private_local_paths() {
 
 #[cfg(unix)]
 #[test]
+fn setup_and_config_set_work_end_to_end_in_the_real_process() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-onboarding-process-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let setup = binary()
+        .args(["setup", root.to_str().unwrap(), "--no-open"])
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let setup_output = String::from_utf8_lossy(&setup.stdout);
+    assert!(setup_output.contains("status=ready"));
+    assert!(setup_output.contains("collection=manual_import"));
+    assert!(setup_output.contains("opened=false"));
+    let dashboard = root.join("logs/agent-observability-report.html");
+    assert_eq!(
+        fs::metadata(&dashboard).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let update = binary()
+        .args([
+            "config",
+            "set",
+            root.to_str().unwrap(),
+            "retention-days",
+            "90",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    assert!(String::from_utf8_lossy(&update.stdout).contains("retention-days=90"));
+    let show = binary()
+        .args(["config", "show", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(show.status.success());
+    assert!(String::from_utf8_lossy(&show.stdout).contains("retention-days=90"));
+    assert_eq!(
+        fs::metadata(root.join("config.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    fs::remove_file(&dashboard).unwrap();
+    let dashboard_command = binary()
+        .args(["dashboard", root.to_str().unwrap(), "--no-open"])
+        .output()
+        .unwrap();
+    assert!(
+        dashboard_command.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dashboard_command.stderr)
+    );
+    assert!(String::from_utf8_lossy(&dashboard_command.stdout).contains("opened=false"));
+    assert_eq!(
+        fs::metadata(&dashboard).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn demo_produces_first_observable_value_without_an_external_file() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-demo-process-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let output = binary()
+        .args(["demo", root.to_str().unwrap(), "--no-open"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status=demo_ready"));
+    assert!(stdout.contains("observations=1"));
+    assert!(stdout.contains("diagnostics=2"));
+    let dashboard = fs::read_to_string(root.join("logs/agent-observability-report.html")).unwrap();
+    assert!(dashboard.contains(r#""generatedSpans":1"#));
+    assert!(!dashboard.contains("example-conversation"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn demo_fails_when_collection_policy_blocks_first_value() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-demo-blocked-process-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let setup = binary()
+        .args(["setup", root.to_str().unwrap(), "--no-open"])
+        .output()
+        .unwrap();
+    assert!(setup.status.success());
+    let disable = binary()
+        .args(["config", "set", root.to_str().unwrap(), "enabled", "false"])
+        .output()
+        .unwrap();
+    assert!(disable.status.success());
+
+    let demo = binary()
+        .args(["demo", root.to_str().unwrap(), "--no-open"])
+        .output()
+        .unwrap();
+    assert!(!demo.status.success());
+    assert!(demo.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&demo.stderr);
+    assert!(stderr.contains("demo could not create observable data"));
+    assert!(stderr.contains("collection_disabled=1"));
+    assert!(!stderr.contains("status=demo_ready"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
 fn retention_plan_is_read_only_and_apply_writes_one_private_archive() {
     use std::os::unix::fs::PermissionsExt;
 

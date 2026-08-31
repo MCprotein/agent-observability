@@ -4,10 +4,20 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub const LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v2";
 const LEGACY_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v1";
+static UPDATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveStage {
+    Write,
+    FileSync,
+    Rename,
+    ParentSync,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -195,6 +205,63 @@ pub fn load(path: &Path) -> Result<LocalRuntimeConfigV2, ConfigError> {
     LocalRuntimeConfigV2::from_json(&body)
 }
 
+pub fn save(path: &Path, config: &LocalRuntimeConfigV2) -> Result<(), ConfigError> {
+    save_with_hook(path, config, |_| Ok(()))
+}
+
+fn save_with_hook(
+    path: &Path,
+    config: &LocalRuntimeConfigV2,
+    mut before: impl FnMut(SaveStage) -> io::Result<()>,
+) -> Result<(), ConfigError> {
+    config.validate()?;
+    reject_symlink(path)?;
+    let parent = path.parent().ok_or(ConfigError::InvalidPath)?;
+    private_dir(parent, false)?;
+    let _ = open_private_read(path)?;
+
+    let body = serde_json::to_vec_pretty(config).map_err(ConfigError::Json)?;
+    let (temporary, mut file) = private_update_file(parent)?;
+    let result = (|| {
+        before(SaveStage::Write)?;
+        file.write_all(&body)?;
+        file.write_all(b"\n")?;
+        before(SaveStage::FileSync)?;
+        file.sync_all()?;
+        private_open_file(&file)?;
+        before(SaveStage::Rename)?;
+        fs::rename(&temporary, path)?;
+        before(SaveStage::ParentSync)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn private_update_file(parent: &Path) -> Result<(PathBuf, File), ConfigError> {
+    for _ in 0..1_024 {
+        let sequence = UPDATE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".config.json.update.{}.{}",
+            std::process::id(),
+            sequence
+        ));
+        match private_create_new(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(ConfigError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique config update file",
+    )
+    .into())
+}
+
 const fn enabled_by_default() -> bool {
     true
 }
@@ -373,6 +440,196 @@ mod tests {
             install(&root),
             Err(ConfigError::InsecurePermissions)
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_atomically_updates_a_private_valid_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root("save");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.retention.max_record_age_days = 90;
+        save(&layout.config, &config).unwrap();
+
+        assert_eq!(load(&layout.config).unwrap(), config);
+        assert_eq!(
+            fs::metadata(&layout.config).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(fs::read_dir(&layout.root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".update.")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_invalid_values_without_changing_the_file() {
+        let root = root("save-invalid");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.retention.max_record_age_days = 0;
+
+        assert!(save(&layout.config, &config).is_err());
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_symlinks_and_broad_parent_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = root("save-boundaries");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let backup = layout.root.join("config.backup");
+        fs::rename(&layout.config, &backup).unwrap();
+        symlink(&backup, &layout.config).unwrap();
+        assert!(matches!(
+            save(&layout.config, &LocalRuntimeConfigV2::default()),
+            Err(ConfigError::Symlink)
+        ));
+
+        fs::remove_file(&layout.config).unwrap();
+        fs::rename(&backup, &layout.config).unwrap();
+        fs::set_permissions(&layout.root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            save(&layout.config, &LocalRuntimeConfigV2::default()),
+            Err(ConfigError::InsecurePermissions)
+        ));
+        fs::set_permissions(&layout.root, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_saves_publish_one_complete_valid_config() {
+        use std::sync::{Arc, Barrier};
+
+        let root = root("save-concurrent");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let path = Arc::new(layout.config.clone());
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = [30, 90].map(|days| {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let mut config = LocalRuntimeConfigV2::default();
+                config.retention.max_record_age_days = days;
+                barrier.wait();
+                save(&path, &config)
+            })
+        });
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let stored = load(&layout.config).unwrap();
+        assert!(matches!(stored.retention.max_record_age_days, 30 | 90));
+        assert!(fs::read_dir(&layout.root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".update.")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_update_file_does_not_block_a_save() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let root = root("save-stale");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let stale = layout
+            .root
+            .join(format!(".config.json.update.{}.0", std::process::id()));
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&stale)
+            .unwrap();
+        let mut config = LocalRuntimeConfigV2::default();
+        config.retention.max_record_age_days = 90;
+        save(&layout.config, &config).unwrap();
+        assert_eq!(load(&layout.config).unwrap(), config);
+        assert!(stale.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_rename_io_failures_preserve_config_and_clean_temporary_files() {
+        let root = root("save-pre-rename-failures");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        let mut config = LocalRuntimeConfigV2::default();
+        config.retention.max_record_age_days = 90;
+
+        for failed_stage in [SaveStage::Write, SaveStage::FileSync, SaveStage::Rename] {
+            let result = save_with_hook(&layout.config, &config, |stage| {
+                if stage == failed_stage {
+                    Err(io::Error::other("injected save failure"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(result, Err(ConfigError::Io(_))));
+            assert_eq!(fs::read(&layout.config).unwrap(), original);
+            assert!(fs::read_dir(&layout.root).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".update.")
+            }));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_sync_failure_reports_error_after_complete_replace() {
+        let root = root("save-parent-sync-failure");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mut config = LocalRuntimeConfigV2::default();
+        config.retention.max_record_age_days = 90;
+
+        let result = save_with_hook(&layout.config, &config, |stage| {
+            if stage == SaveStage::ParentSync {
+                Err(io::Error::other("injected parent sync failure"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(ConfigError::Io(_))));
+        assert_eq!(load(&layout.config).unwrap(), config);
+        assert!(fs::read_dir(&layout.root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".update.")
+        }));
         let _ = fs::remove_dir_all(root);
     }
 }

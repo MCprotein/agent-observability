@@ -6,7 +6,7 @@
 
 ## Current and target stack
 
-현재 `v1.3.2` Rust 경로는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
+현재 `v1.4.0` Rust 경로는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
 보존하면서 macOS standalone private handoff import 범위의 Rust Codex, Claude Code와 Cursor adapter,
 TypeScript static report UI, strict local config와 bounded runtime policy를 제공한다. Rust 경로는 closed contract,
 deterministic lifecycle reduction, topology validation, pricing/report projection, bounded product handoff와
@@ -92,7 +92,7 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
-v1.3.2의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
+v1.4.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
 `crates/adapter-claude-code`, `crates/adapter-cursor`,
 `crates/application`, `crates/local-store`, `crates/local-runtime`, `crates/static-report`, `crates/cli`와 release
 evidence runner인 `xtask`로 나뉜다. domain은 외부 형식을
@@ -228,8 +228,10 @@ anti-corruption layer다.
 - standalone 설정은 `local_runtime.v2` strict JSON이다. 기존 v1은 retention 기본값으로 호환
   로드한다. 팀 identity, 이메일, endpoint와 transport
   설정은 포함하지 않는다.
-- composition root는 `init -> config-check -> runtime-check` 순서로 private install layout,
-  collection policy, singleton lock, SQLite authority와 storage admission을 결합한다.
+- composition root는 `setup`에서 private install layout, collection policy, singleton lock,
+  SQLite authority, storage admission, first report와 local browser open을 결합한다. `demo`는
+  별도 runtime과 embedded content-free fixture만 사용한다. `config set`은 local-runtime의
+  validated atomic save boundary를 통해 다음 one-shot command에 적용한다.
 - 설치 루트를 받는 ingest command는 같은 strict config와 singleton을 실제 write 전 과정에 적용한다.
 - foreground ingress는 1 MiB raw input, 64 KiB projected message, 64-slot channel과 one normalization
   writer로 고정한다. full/unavailable/oversized는 nonblocking fail-open outcome이다. `xtask`의

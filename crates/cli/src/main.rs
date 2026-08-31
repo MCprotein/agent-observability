@@ -2,7 +2,8 @@ use agent_observability_adapter_claude_code::{
     AdapterItem as ClaudeAdapterItem, read_handoff_file as read_claude_handoff_file,
 };
 use agent_observability_adapter_codex::{
-    AdapterItem as CodexAdapterItem, read_handoff_file as read_codex_handoff_file,
+    AdapterItem as CodexAdapterItem, parse_handoff_jsonl as parse_codex_handoff_jsonl,
+    read_handoff_file as read_codex_handoff_file,
 };
 use agent_observability_adapter_cursor::{
     AdapterItem as CursorAdapterItem, read_handoff_file as read_cursor_handoff_file,
@@ -15,7 +16,7 @@ use agent_observability_contracts::{
 use agent_observability_contracts::{CONTRACT_MANIFEST, ContractManifest};
 use agent_observability_local_runtime::{
     Admission, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION, LocalRuntimeConfigV2, PressureSample,
-    RuntimeControl, Singleton, StorageBudget, install, load,
+    RuntimeControl, Singleton, StorageBudget, install, load, save,
 };
 use agent_observability_local_store::{
     IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore, RetentionPlan,
@@ -25,12 +26,37 @@ use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "usage: agent-observability [init <root>|config-check <config-json>|runtime-check <root>|contracts|storage-check <runtime-root>|retention-plan <runtime-root>|retention-apply <runtime-root> <plan-id> <private-archive-jsonl>|codex-ingest <runtime-root> <handoff-jsonl>|claude-code-ingest <runtime-root> <handoff-jsonl>|cursor-ingest <runtime-root> <handoff-jsonl>|report <runtime-root> [rate-table-json]|version|help]";
+const USAGE: &str = "Agent Observability
+
+Quick start:
+  agent-observability demo [root] [--no-open]
+  agent-observability setup [root] [--no-open]
+  agent-observability dashboard [root] [--no-open]
+
+Configuration:
+  agent-observability config show [root]
+  agent-observability config set [root] <option> <value>
+
+Import and report:
+  agent-observability <codex|claude-code|cursor>-ingest <root> <handoff-jsonl>
+  agent-observability report <root> [rate-table-json]
+
+Maintenance:
+  agent-observability retention-plan <root>
+  agent-observability retention-apply <root> <plan-id> <private-archive-jsonl>
+  agent-observability init|runtime-check|storage-check <root>
+  agent-observability config-check <config-json>
+  agent-observability contracts|version|help";
 const REPORT_FILE_NAME: &str = "agent-observability-report.html";
 const MAX_RATE_TABLE_BYTES: u64 = 1_048_576;
+const DEFAULT_ROOT_NAME: &str = ".agent-observability";
+const DEFAULT_DEMO_ROOT_NAME: &str = ".agent-observability-demo";
+const CODEX_DEMO_HANDOFF: &str = include_str!("../../../examples/codex-handoff.v1.jsonl");
 
 enum IngestItem<'a> {
     Observation(&'a SourceObservation),
@@ -40,6 +66,52 @@ enum IngestItem<'a> {
         code: AdapterDispositionCode,
         payload_hash: Option<&'a str>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IngestBlock {
+    CollectionDisabled,
+    Policy,
+    Pressure,
+    Storage,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IngestResult {
+    source: String,
+    observations: u64,
+    diagnostics: u64,
+    duplicates: u64,
+    suppressed: u64,
+    blocked: Option<IngestBlock>,
+}
+
+impl IngestResult {
+    fn blocked(source: &str, blocked: IngestBlock) -> Self {
+        Self {
+            source: source.into(),
+            observations: 0,
+            diagnostics: 0,
+            duplicates: 0,
+            suppressed: 0,
+            blocked: Some(blocked),
+        }
+    }
+
+    fn output(&self) -> String {
+        format!(
+            "source={}\nobservations={}\ndiagnostics={}\nduplicates={}\nsuppressed={}\ncollection_disabled={}\npolicy_blocked={}\npressure_blocked={}\nstorage_blocked={}\nteam_ingest=disabled",
+            self.source,
+            self.observations,
+            self.diagnostics,
+            self.duplicates,
+            self.suppressed,
+            u8::from(self.blocked == Some(IngestBlock::CollectionDisabled)),
+            u8::from(self.blocked == Some(IngestBlock::Policy)),
+            u8::from(self.blocked == Some(IngestBlock::Pressure)),
+            u8::from(self.blocked == Some(IngestBlock::Storage)),
+        )
+    }
 }
 
 fn main() -> ExitCode {
@@ -57,6 +129,9 @@ fn main() -> ExitCode {
 
 fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
     let arguments: Vec<String> = arguments.collect();
+    if let Some(result) = run_onboarding(&arguments) {
+        return result;
+    }
     match arguments.as_slice() {
         [command, root] if command == "init" => {
             let layout = install(Path::new(root)).map_err(|error| error.to_string())?;
@@ -102,6 +177,7 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
                     },
                 }),
             )
+            .map(|result| result.output())
         }
         [command, directory, handoff] if command == "claude-code-ingest" => {
             let batch = read_claude_handoff_file(handoff).map_err(|error| error.to_string())?;
@@ -120,6 +196,7 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
                     },
                 }),
             )
+            .map(|result| result.output())
         }
         [command, directory, handoff] if command == "cursor-ingest" => {
             let batch = read_cursor_handoff_file(handoff).map_err(|error| error.to_string())?;
@@ -138,6 +215,7 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
                     },
                 }),
             )
+            .map(|result| result.output())
         }
         [command, report_arguments @ ..] if command == "report" => report_command(report_arguments),
         [command] if matches!(command.as_str(), "version" | "--version" | "-V") => {
@@ -148,6 +226,242 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
         [command] => Err(format!("unknown command {command}")),
         _ => Err(USAGE.into()),
     }
+}
+
+fn run_onboarding(arguments: &[String]) -> Option<Result<String, String>> {
+    let result = match arguments {
+        [command] if command == "demo" => default_demo_root().and_then(|root| demo(&root, true)),
+        [command, flag] if command == "demo" && flag == "--no-open" => {
+            default_demo_root().and_then(|root| demo(&root, false))
+        }
+        [command, root] if command == "demo" => demo(Path::new(root), true),
+        [command, root, flag] if command == "demo" && flag == "--no-open" => {
+            demo(Path::new(root), false)
+        }
+        [command] if command == "setup" => default_root().and_then(|root| setup(&root, true)),
+        [command, flag] if command == "setup" && flag == "--no-open" => {
+            default_root().and_then(|root| setup(&root, false))
+        }
+        [command, root] if command == "setup" => setup(Path::new(root), true),
+        [command, root, flag] if command == "setup" && flag == "--no-open" => {
+            setup(Path::new(root), false)
+        }
+        [command] if command == "dashboard" => {
+            default_root().and_then(|root| dashboard(&root, true))
+        }
+        [command, flag] if command == "dashboard" && flag == "--no-open" => {
+            default_root().and_then(|root| dashboard(&root, false))
+        }
+        [command, root] if command == "dashboard" => dashboard(Path::new(root), true),
+        [command, root, flag] if command == "dashboard" && flag == "--no-open" => {
+            dashboard(Path::new(root), false)
+        }
+        [command] if command == "config" => default_root().and_then(|root| show_config(&root)),
+        [command, action] if command == "config" && action == "show" => {
+            default_root().and_then(|root| show_config(&root))
+        }
+        [command, action, root] if command == "config" && action == "show" => {
+            show_config(Path::new(root))
+        }
+        [command, action, key, value] if command == "config" && action == "set" => {
+            default_root().and_then(|root| update_config(&root, key, value))
+        }
+        [command, action, root, key, value] if command == "config" && action == "set" => {
+            update_config(Path::new(root), key, value)
+        }
+        _ => return None,
+    };
+    Some(result)
+}
+
+fn default_root() -> Result<PathBuf, String> {
+    default_home_root(DEFAULT_ROOT_NAME)
+}
+
+fn default_demo_root() -> Result<PathBuf, String> {
+    default_home_root(DEFAULT_DEMO_ROOT_NAME)
+}
+
+fn default_home_root(name: &str) -> Result<PathBuf, String> {
+    env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(name))
+        .ok_or_else(|| "HOME is not set; pass an explicit runtime root".into())
+}
+
+fn demo(root: &Path, open: bool) -> Result<String, String> {
+    let root_text = root
+        .to_str()
+        .ok_or_else(|| "demo runtime root must be valid UTF-8".to_string())?;
+    let batch = parse_codex_handoff_jsonl(CODEX_DEMO_HANDOFF).map_err(|error| error.to_string())?;
+    let ingest = ingest_items(
+        root_text,
+        "codex",
+        batch.items.iter().map(|item| match item {
+            CodexAdapterItem::Observation(observation) => IngestItem::Observation(observation),
+            CodexAdapterItem::Disposition(diagnostic) => IngestItem::Disposition {
+                checkpoint: &diagnostic.checkpoint,
+                disposition: diagnostic.disposition,
+                code: diagnostic.code,
+                payload_hash: diagnostic.payload_hash.as_deref(),
+            },
+        }),
+    )?;
+    require_demo_ingest(&ingest)?;
+    let dashboard = prepare_dashboard(root, open)?;
+    if current_record_count(root)? == 0 {
+        return Err("demo completed ingest but the dashboard has no observable data".into());
+    }
+    Ok(format!(
+        "status=demo_ready\nroot={}\n{}\ndashboard={}\nopened={open}",
+        root.display(),
+        ingest.output(),
+        dashboard.display()
+    ))
+}
+
+fn require_demo_ingest(ingest: &IngestResult) -> Result<(), String> {
+    if ingest.blocked.is_some() {
+        Err(format!(
+            "demo could not create observable data\n{}",
+            ingest.output()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn setup(root: &Path, open: bool) -> Result<String, String> {
+    let layout = install(root).map_err(|error| error.to_string())?;
+    let dashboard = prepare_dashboard(&layout.root, open)?;
+    Ok(format!(
+        "status=ready\nroot={}\ndashboard={}\ncollection=manual_import\nopened={open}",
+        layout.root.display(),
+        dashboard.display()
+    ))
+}
+
+fn dashboard(root: &Path, open: bool) -> Result<String, String> {
+    let dashboard = prepare_dashboard(root, open)?;
+    Ok(format!("dashboard={}\nopened={open}", dashboard.display()))
+}
+
+fn prepare_dashboard(root: &Path, open: bool) -> Result<PathBuf, String> {
+    prepare_dashboard_with(root, open, open_dashboard)
+}
+
+fn prepare_dashboard_with(
+    root: &Path,
+    open: bool,
+    opener: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<PathBuf, String> {
+    let layout = install(root).map_err(|error| error.to_string())?;
+    let _ = report(&layout.root, None)?;
+    let dashboard = layout.logs.join(REPORT_FILE_NAME);
+    if open {
+        opener(&dashboard)?;
+    }
+    Ok(dashboard)
+}
+
+fn current_record_count(root: &Path) -> Result<usize, String> {
+    let layout = install(root).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let store = open_store(&layout, &config)?;
+    store
+        .current_records()
+        .map(|records| records.len())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn open_dashboard(path: &Path) -> Result<(), String> {
+    let status = Command::new("open")
+        .arg(path)
+        .status()
+        .map_err(|error| format!("dashboard open failed: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("dashboard open failed with status {status}"))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_dashboard(_path: &Path) -> Result<(), String> {
+    Err(
+        "dashboard open is supported on macOS; use setup --no-open and open the reported file"
+            .into(),
+    )
+}
+
+fn show_config(root: &Path) -> Result<String, String> {
+    let layout = install(root).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    Ok(config_output(&layout, &config))
+}
+
+fn update_config(root: &Path, key: &str, value: &str) -> Result<String, String> {
+    let layout = install(root).map_err(|error| error.to_string())?;
+    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let mut config = load(&layout.config).map_err(|error| error.to_string())?;
+    set_config_value(&mut config, key, value)?;
+    save(&layout.config, &config).map_err(|error| error.to_string())?;
+    Ok(format!(
+        "updated={key}\n{}",
+        config_output(&layout, &config)
+    ))
+}
+
+fn set_config_value(
+    config: &mut LocalRuntimeConfigV2,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    macro_rules! parse {
+        ($type:ty) => {
+            value
+                .parse::<$type>()
+                .map_err(|_| format!("invalid value for {key}: {value}"))?
+        };
+    }
+
+    match key {
+        "enabled" => config.enabled = parse!(bool),
+        "file-reconcile-ms" => config.collection.file_reconcile_interval_ms = parse!(u32),
+        "flush-ms" => config.collection.flush_interval_ms = parse!(u32),
+        "batch-records" => config.collection.max_batch_records = parse!(u16),
+        "batch-bytes" => config.collection.max_batch_bytes = parse!(u32),
+        "active-heartbeat-ms" => config.collection.active_heartbeat_interval_ms = parse!(u32),
+        "idle-heartbeat-ms" => config.collection.idle_heartbeat_interval_ms = parse!(u32),
+        "storage-bytes" => config.collection.local_storage_budget_bytes = parse!(u64),
+        "retention-days" => config.retention.max_record_age_days = parse!(u16),
+        "archive-records" => config.retention.max_archive_records = parse!(u32),
+        "archive-bytes" => config.retention.max_archive_bytes = parse!(u64),
+        _ => return Err(format!("unknown config option {key}")),
+    }
+    config.validate().map_err(|error| error.to_string())
+}
+
+fn config_output(layout: &InstalledLayout, config: &LocalRuntimeConfigV2) -> String {
+    format!(
+        "root={}\nconfig={}\nenabled={}\nfile-reconcile-ms={}\nflush-ms={}\nbatch-records={}\nbatch-bytes={}\nactive-heartbeat-ms={}\nidle-heartbeat-ms={}\nstorage-bytes={}\nretention-days={}\narchive-records={}\narchive-bytes={}",
+        layout.root.display(),
+        layout.config.display(),
+        config.enabled,
+        config.collection.file_reconcile_interval_ms,
+        config.collection.flush_interval_ms,
+        config.collection.max_batch_records,
+        config.collection.max_batch_bytes,
+        config.collection.active_heartbeat_interval_ms,
+        config.collection.idle_heartbeat_interval_ms,
+        config.collection.local_storage_budget_bytes,
+        config.retention.max_record_age_days,
+        config.retention.max_archive_records,
+        config.retention.max_archive_bytes
+    )
 }
 
 fn storage_check(root: &Path) -> Result<String, String> {
@@ -420,21 +734,20 @@ fn ingest_items<'a>(
     directory: &str,
     source: &str,
     items: impl Iterator<Item = IngestItem<'a>>,
-) -> Result<String, String> {
+) -> Result<IngestResult, String> {
     let paths = ingest_paths(Path::new(directory))?;
     let _singleton =
         Singleton::acquire(&paths.runtime_directory).map_err(|error| error.to_string())?;
     let mut control = RuntimeControl::new(&paths.config).map_err(|error| error.to_string())?;
     let items = items.collect::<Vec<_>>();
     if !paths.config.enabled {
-        return Ok(format!(
-            "source={source}\nobservations=0\ndiagnostics=0\nduplicates=0\nsuppressed=0\ncollection_disabled=1\nstorage_blocked=0\nteam_ingest=disabled"
+        return Ok(IngestResult::blocked(
+            source,
+            IngestBlock::CollectionDisabled,
         ));
     }
     if items.len() > usize::from(paths.config.collection.max_batch_records) {
-        return Ok(format!(
-            "source={source}\nobservations=0\ndiagnostics=0\nduplicates=0\nsuppressed=0\ncollection_disabled=0\npolicy_blocked=1\nstorage_blocked=0\nteam_ingest=disabled"
-        ));
+        return Ok(IngestResult::blocked(source, IngestBlock::Policy));
     }
     let allocated = StorageBudget::allocated_tree_bytes(&paths.accounting_root)
         .map_err(|error| error.to_string())?;
@@ -447,9 +760,7 @@ fn ingest_items<'a>(
         },
     );
     if schedule.flush_paused {
-        return Ok(format!(
-            "source={source}\nobservations=0\ndiagnostics=0\nduplicates=0\nsuppressed=0\ncollection_disabled=0\npressure_blocked=1\nstorage_blocked=0\nteam_ingest=disabled"
-        ));
+        return Ok(IngestResult::blocked(source, IngestBlock::Pressure));
     }
     if control
         .admit(
@@ -462,9 +773,7 @@ fn ingest_items<'a>(
         .map_err(|error| error.to_string())?
         == Admission::Denied
     {
-        return Ok(format!(
-            "source={source}\nobservations=0\ndiagnostics=0\nduplicates=0\nsuppressed=0\ncollection_disabled=0\nstorage_blocked=1\nteam_ingest=disabled"
-        ));
+        return Ok(IngestResult::blocked(source, IngestBlock::Storage));
     }
     let migration_headroom = control
         .migration_headroom(&paths.accounting_root)
@@ -511,9 +820,14 @@ fn ingest_items<'a>(
     store
         .rebuild_projection()
         .map_err(|error| error.to_string())?;
-    Ok(format!(
-        "source={source}\nobservations={observations}\ndiagnostics={diagnostics}\nduplicates={duplicates}\nsuppressed={suppressed}\ncollection_disabled=0\nstorage_blocked=0\nteam_ingest=disabled"
-    ))
+    Ok(IngestResult {
+        source: source.into(),
+        observations,
+        diagnostics,
+        duplicates,
+        suppressed,
+        blocked: None,
+    })
 }
 
 fn ingest_reservation_bytes(store_directory: &Path, batch_bytes: u64) -> Result<u64, String> {
@@ -547,7 +861,10 @@ fn ingest_paths(path: &Path) -> Result<IngestPaths, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME, run, timestamp_from_duration};
+    use super::{
+        IngestBlock, IngestResult, LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME,
+        prepare_dashboard_with, require_demo_ingest, run, timestamp_from_duration,
+    };
     use std::fs;
     use std::path::Path;
     use std::time::Duration;
@@ -580,6 +897,187 @@ mod tests {
             .unwrap();
         assert!(check.contains("enabled=true"));
         assert!(check.contains("local_storage_budget_bytes=1073741824"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_creates_a_ready_private_dashboard_in_one_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-setup-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let output = run([
+            "setup".into(),
+            root.to_string_lossy().into_owned(),
+            "--no-open".into(),
+        ]
+        .into_iter())
+        .unwrap();
+
+        assert!(output.contains("status=ready"));
+        assert!(output.contains("collection=manual_import"));
+        assert!(output.contains("opened=false"));
+        let dashboard = root.join("logs").join(REPORT_FILE_NAME);
+        assert!(dashboard.is_file());
+        assert_eq!(
+            fs::metadata(dashboard).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn demo_is_idempotent_and_opens_a_populated_isolated_runtime() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-demo-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        for _ in 0..2 {
+            let output = run([
+                "demo".into(),
+                root.to_string_lossy().into_owned(),
+                "--no-open".into(),
+            ]
+            .into_iter())
+            .unwrap();
+            assert!(output.contains("status=demo_ready"));
+            assert!(output.contains("source=codex"));
+            assert!(output.contains("opened=false"));
+        }
+        let dashboard = fs::read_to_string(root.join("logs").join(REPORT_FILE_NAME)).unwrap();
+        assert!(dashboard.contains(r#""generatedSpans":1"#));
+        assert!(!dashboard.contains("example-conversation"));
+        assert!(!dashboard.contains("prompt"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn demo_rejects_every_blocked_ingest_outcome() {
+        for blocked in [
+            IngestBlock::CollectionDisabled,
+            IngestBlock::Policy,
+            IngestBlock::Pressure,
+            IngestBlock::Storage,
+        ] {
+            let result = IngestResult::blocked("codex", blocked);
+            let error = require_demo_ingest(&result).unwrap_err();
+            assert!(error.contains("demo could not create observable data"));
+            assert!(error.contains("=1"));
+        }
+        let result = IngestResult {
+            source: "codex".into(),
+            observations: 1,
+            diagnostics: 2,
+            duplicates: 0,
+            suppressed: 0,
+            blocked: None,
+        };
+        require_demo_ingest(&result).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_propagates_opener_failure_after_writing_report() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-dashboard-open-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let error =
+            prepare_dashboard_with(&root, true, |_| Err("opener failed".into())).unwrap_err();
+        assert_eq!(error, "opener failed");
+        assert!(root.join("logs").join(REPORT_FILE_NAME).is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_invokes_opener_with_the_generated_report_path() {
+        use std::cell::RefCell;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-dashboard-open-success-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let opened = RefCell::new(None);
+        let dashboard = prepare_dashboard_with(&root, true, |path| {
+            assert!(path.ends_with(Path::new("logs").join(REPORT_FILE_NAME)));
+            *opened.borrow_mut() = Some(path.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(opened.into_inner().as_deref(), Some(dashboard.as_path()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_set_updates_every_supported_option_and_rejects_invalid_values() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-config-set-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let root_arg = root.to_string_lossy().into_owned();
+        let options = [
+            ("enabled", "false"),
+            ("file-reconcile-ms", "1000"),
+            ("flush-ms", "2000"),
+            ("batch-records", "50"),
+            ("batch-bytes", "65536"),
+            ("active-heartbeat-ms", "30000"),
+            ("idle-heartbeat-ms", "120000"),
+            ("storage-bytes", "536870912"),
+            ("retention-days", "90"),
+            ("archive-records", "5000"),
+            ("archive-bytes", "8388608"),
+        ];
+        for (key, value) in options {
+            let output = run([
+                "config".into(),
+                "set".into(),
+                root_arg.clone(),
+                key.into(),
+                value.into(),
+            ]
+            .into_iter())
+            .unwrap();
+            assert!(output.contains(&format!("updated={key}")));
+        }
+
+        let output = run(["config".into(), "show".into(), root_arg.clone()].into_iter()).unwrap();
+        for (key, value) in options {
+            assert!(output.contains(&format!("{key}={value}")));
+        }
+        assert!(
+            run([
+                "config".into(),
+                "set".into(),
+                root_arg.clone(),
+                "retention-days".into(),
+                "0".into(),
+            ]
+            .into_iter())
+            .is_err()
+        );
+        assert!(
+            run([
+                "config".into(),
+                "set".into(),
+                root_arg,
+                "unknown".into(),
+                "1".into(),
+            ]
+            .into_iter())
+            .is_err()
+        );
         let _ = fs::remove_dir_all(root);
     }
 
