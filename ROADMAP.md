@@ -53,7 +53,7 @@ gate를 통과해 추가한다.
 | v0.x | Completed | Local-only PoC를 작은 minor release로 쪼개 검증했다. |
 | v1.x | Active | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
 
-## Active Train: v0.1.0-v1.3.2
+## Active Train: v0.1.0-v1.4.0
 
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
@@ -82,6 +82,7 @@ gate를 통과해 추가한다.
 | v1.3.0 | Superseded | Installable open-source distribution implementation | Source, license, package metadata, documentation, tests, and native arm64/x64 builds passed, but tag workflow run `33412746641` stopped before publication because its universal-binary verification used invalid `lipo` argument order; no Release or Package was published |
 | v1.3.1 | Superseded | Distribution publication correction | Universal assembly, attestation, and draft Release succeeded, but run `33414142455` stopped before Package/public Release because npm interpreted `dist/*.tgz` as a repository shorthand; immutable tag and draft remain as failure evidence |
 | v1.3.2 | Released | Package publication path correction | Run `33416302530` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
+| v1.4.0 | In Progress | Local onboarding and documentation usability | One-command private runtime setup opens the first self-contained dashboard, all supported runtime options can be changed atomically through the CLI, setup/config/dashboard process tests pass, README follows run-to-first-value progressive disclosure with renderable Mermaid flows and concise capability/support tables, automatic collection gaps remain explicit, independent code and documentation review clear |
 
 ## Branch Strategy
 
