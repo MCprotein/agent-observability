@@ -136,7 +136,7 @@ export function publishPackage(
   run(
     execute,
     "npm",
-    ["publish", `dist/mcprotein-agent-observability-${version}.tgz`],
+    ["publish", `./dist/mcprotein-agent-observability-${version}.tgz`],
     "package publication",
   );
   write("package=published\n");

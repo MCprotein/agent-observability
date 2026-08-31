@@ -53,7 +53,7 @@ gate를 통과해 추가한다.
 | v0.x | Completed | Local-only PoC를 작은 minor release로 쪼개 검증했다. |
 | v1.x | Active | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
 
-## Active Train: v0.1.0-v1.3.1
+## Active Train: v0.1.0-v1.3.2
 
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
@@ -80,7 +80,8 @@ gate를 통과해 추가한다.
 | v1.1.0 | Released | Report usability improvements | bounded timeline, local structured-dimension saved views, 100-trace/200-span pagination, deterministic 4,096-span Node/Chromium regression, reload/delete browser smoke, independent review clear |
 | v1.2.0 | Released | Local retention and archive policy | strict retention config and migration, whole-trace plan/apply, private archive contract, replay/crash/path-safety fixtures, physical reclaim, archive CLI smoke, passing normative manifest `1788152070592764000` bound to source `fe8da2e9b2bb9cbc088c4df7f551ca423ad9d097`, independent review clear |
 | v1.3.0 | Superseded | Installable open-source distribution implementation | Source, license, package metadata, documentation, tests, and native arm64/x64 builds passed, but tag workflow run `33412746641` stopped before publication because its universal-binary verification used invalid `lipo` argument order; no Release or Package was published |
-| v1.3.1 | Released | Distribution publication correction | Correct and regression-lock universal `lipo` verification, preserve the immutable failed v1.3.0 tag, exact-head CI and independent review clear, real failed-run artifacts assembled successfully; release review in `docs/reviews/v1.3.1.md` |
+| v1.3.1 | Superseded | Distribution publication correction | Universal assembly, attestation, and draft Release succeeded, but run `33414142455` stopped before Package/public Release because npm interpreted `dist/*.tgz` as a repository shorthand; immutable tag and draft remain as failure evidence |
+| v1.3.2 | Planned | Package publication path correction | Publish the local tarball with an explicit `./dist/*.tgz` path, regression-lock command arguments, preserve prior immutable tags, rerun exact-head CI/review, then verify Package and public Release end to end |
 
 ## Branch Strategy
 
