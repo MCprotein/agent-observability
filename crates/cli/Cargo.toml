@@ -17,7 +17,9 @@ agent-observability-application = { path = "../application" }
 agent-observability-contracts = { path = "../contracts" }
 agent-observability-local-runtime = { path = "../local-runtime" }
 agent-observability-local-store = { path = "../local-store" }
+agent-observability-local-ui = { path = "../local-ui" }
 agent-observability-static-report = { path = "../static-report" }
+tokio = { version = "1.53.1", features = ["rt"] }
 
 [lints]
 workspace = true

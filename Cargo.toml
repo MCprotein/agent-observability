@@ -9,6 +9,7 @@ members = [
     "crates/domain",
     "crates/local-runtime",
     "crates/local-store",
+    "crates/local-ui",
     "crates/static-report",
     "xtask",
 ]

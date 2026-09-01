@@ -21,10 +21,11 @@ use agent_observability_local_runtime::{
 use agent_observability_local_store::{
     IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore, RetentionPlan,
 };
+use agent_observability_local_ui::PreparedUi;
 use agent_observability_static_report::write_private;
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
@@ -37,6 +38,7 @@ Quick start:
   agent-observability demo [root] [--no-open]
   agent-observability setup [root] [--no-open]
   agent-observability dashboard [root] [--no-open]
+  agent-observability ui [root] [--no-open]
 
 Configuration:
   agent-observability config show [root]
@@ -115,7 +117,17 @@ impl IngestResult {
 }
 
 fn main() -> ExitCode {
-    match run(env::args().skip(1)) {
+    let arguments: Vec<String> = env::args().skip(1).collect();
+    if let Some(result) = run_ui_command(&arguments) {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("{message}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    match run(arguments.into_iter()) {
         Ok(output) => {
             println!("{output}");
             ExitCode::SUCCESS
@@ -125,6 +137,67 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_ui_command(arguments: &[String]) -> Option<Result<(), String>> {
+    let result = match arguments {
+        [command] if command == "ui" => default_root().and_then(|root| settings_ui(&root, true)),
+        [command, flag] if command == "ui" && flag == "--no-open" => {
+            default_root().and_then(|root| settings_ui(&root, false))
+        }
+        [command, root] if command == "ui" => settings_ui(Path::new(root), true),
+        [command, root, flag] if command == "ui" && flag == "--no-open" => {
+            settings_ui(Path::new(root), false)
+        }
+        _ => return None,
+    };
+    Some(result)
+}
+
+fn settings_ui(root: &Path, open: bool) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("settings runtime failed: {error}"))?;
+    runtime.block_on(async {
+        let ui = agent_observability_local_ui::prepare(root)
+            .await
+            .map_err(|error| error.to_string())?;
+        announce_settings_ui(&ui, open)?;
+        ui.serve().await.map_err(|error| error.to_string())
+    })
+}
+
+fn announce_settings_ui(ui: &PreparedUi, open: bool) -> Result<(), String> {
+    println!(
+        "status=settings_ready\nurl={}\nopened={open}\ncollection=manual_import",
+        ui.url()
+    );
+    std::io::stdout()
+        .flush()
+        .map_err(|error| format!("settings output failed: {error}"))?;
+    if open {
+        open_settings_url(ui.url())?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_settings_url(url: &str) -> Result<(), String> {
+    let status = Command::new("open")
+        .arg(url)
+        .status()
+        .map_err(|error| format!("settings UI open failed: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("settings UI open failed with status {status}"))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_settings_url(_url: &str) -> Result<(), String> {
+    Err("automatic settings UI open is supported on macOS; use ui --no-open and open the reported URL".into())
 }
 
 fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
