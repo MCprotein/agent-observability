@@ -500,9 +500,19 @@ fn require_demo_ingest(ingest: &IngestResult) -> Result<(), String> {
 }
 
 fn setup(root: &Path, open: bool, automatic: bool) -> Result<String, String> {
+    setup_with(root, open, automatic, prepare_dashboard, connect_codex)
+}
+
+fn setup_with(
+    root: &Path,
+    open: bool,
+    automatic: bool,
+    prepare: impl FnOnce(&Path, bool) -> Result<PathBuf, String>,
+    connect: impl FnOnce(&Path) -> Result<String, String>,
+) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let connection = automatic.then(|| connect_codex(&layout.root)).transpose()?;
-    let dashboard = prepare_dashboard(&layout.root, open)?;
+    let dashboard = prepare(&layout.root, open)?;
+    let connection = automatic.then(|| connect(&layout.root)).transpose()?;
     Ok(format!(
         "status=ready\nroot={}\ndashboard={}\ncollection={}\nopened={open}{}",
         layout.root.display(),
@@ -825,6 +835,7 @@ fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String>
     let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
     let config = load(&layout.config).map_err(|error| error.to_string())?;
     let store = open_store(&mutation, &layout, &config)?;
+    drop(mutation);
     let rate_table = rate_table_path
         .map(read_private_rate_table)
         .transpose()?
@@ -1120,7 +1131,7 @@ fn ingest_paths(path: &Path) -> Result<IngestPaths, String> {
 mod tests {
     use super::{
         IngestBlock, IngestResult, LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME,
-        format_codex_status, prepare_dashboard_with, require_demo_ingest, run,
+        format_codex_status, prepare_dashboard_with, require_demo_ingest, run, setup_with,
         timestamp_from_duration,
     };
     use agent_observability_codex_integration::{
@@ -1204,6 +1215,53 @@ mod tests {
             fs::metadata(dashboard).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn automatic_setup_connects_only_after_dashboard_preparation_succeeds() {
+        use std::cell::RefCell;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-setup-order-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let events = RefCell::new(Vec::new());
+        let error = setup_with(
+            &root,
+            false,
+            true,
+            |_, _| {
+                events.borrow_mut().push("dashboard");
+                Err("dashboard failed".into())
+            },
+            |_| {
+                events.borrow_mut().push("connect");
+                Ok("connected".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "dashboard failed");
+        assert_eq!(*events.borrow(), ["dashboard"]);
+
+        let dashboard = root.join("logs").join(REPORT_FILE_NAME);
+        let output = setup_with(
+            &root,
+            false,
+            true,
+            |_, _| {
+                events.borrow_mut().push("dashboard");
+                Ok(dashboard.clone())
+            },
+            |_| {
+                events.borrow_mut().push("connect");
+                Ok("connected".into())
+            },
+        )
+        .unwrap();
+        assert!(output.contains("collection=automatic_codex"));
+        assert_eq!(*events.borrow(), ["dashboard", "dashboard", "connect"]);
         let _ = fs::remove_dir_all(root);
     }
 

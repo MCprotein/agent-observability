@@ -206,7 +206,7 @@ fn validate_codex_automatic_local_capability(
         || capability.privacy.content_fields_durable
         || capability.privacy.raw_identifiers_durable
         || capability.privacy.raw_request_bodies_durable
-        || capability.privacy.unknown_fields != "rejected_before_durable_boundary"
+        || capability.privacy.unknown_fields != "discarded_by_allowlist_before_durable_boundary"
     {
         return Err(ContractError::InvalidCapabilityManifest);
     }
@@ -1792,7 +1792,7 @@ mod tests {
         assert!(!automatic.privacy.raw_request_bodies_durable);
         assert_eq!(
             automatic.privacy.unknown_fields,
-            "rejected_before_durable_boundary"
+            "discarded_by_allowlist_before_durable_boundary"
         );
         assert!(
             automatic

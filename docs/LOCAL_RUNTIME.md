@@ -236,10 +236,12 @@ auto-vacuum with one atomic full-database rewrite before changing the schema ver
 open refuses a legacy rewrite. Product commands
 explicitly admit migration workspace against both the configured storage budget and actual
 filesystem availability; less than twice the database file size fails closed before the rewrite.
-Collector startup, report refresh, report generation, storage checks, retention, runtime checks, and
-dashboard store reads hold the same runtime `mutation.lock` from config load through migration-headroom
-accounting, store open or projection repair, and any resulting authority mutation. Callers pass explicit
-guard ownership into store-open helpers, preventing nested or reentrant lock acquisition.
+Authority-changing commands hold the runtime `mutation.lock` through config load, migration-headroom
+accounting, store open, and the resulting mutation. Collector startup uses the lock only while opening or
+migrating authoritative SQLite state, defers non-authoritative JSONL repair, and releases it before binding.
+Automatic report refresh uses a separate `report-render.lock`, a current-schema SQLite connection, and
+generation compare-and-set acknowledgement; it neither acquires `mutation.lock` nor repairs JSONL. Manual
+report generation releases `mutation.lock` after store preparation and before snapshot/render/publication.
 The supported bounds are 1..3650 days, 1..100,000 archive entries, and 64 KiB..256 MiB per pass.
 The default is 30 days, 10,000 entries, and 16 MiB.
 
@@ -302,9 +304,10 @@ a privacy-safe aggregate contribution journal and versioned checkpoints ahead of
 
 SQLite local_state.v4 is authoritative. Projection-affecting transactions set
 projection_dirty=1; a successful atomic JSONL replacement clears it. A clean reopen does not
-rebuild the full projection. Missing or dirty projections are repaired, and stale projection-temp
-cleanup is bounded. Opening v1/v2/v3 authority migrates privacy-projected observation rows to the
-v4 trace/span/time index before validation.
+rebuild the full projection. Explicit repairing store opens restore missing or dirty JSONL and bound
+stale projection-temp cleanup. Automatic collector startup and HTML refresh defer JSONL repair so a
+non-authoritative file cannot delay receiver availability or foreground ingest. Opening v1/v2/v3
+authority migrates privacy-projected observation rows to the v4 trace/span/time index before validation.
 
 ## Performance evidence
 

@@ -91,6 +91,19 @@ test("release workflow pins actions and uses the tested publication state machin
   assert.match(releaseWorkflow, /dist\/install\.sh/);
   assert.match(releaseWorkflow, /Smoke test release installer/);
   assert.match(releaseWorkflow, /AGENT_OBSERVABILITY_RELEASE_BASE_URL=/);
+  assert.match(
+    releaseWorkflow,
+    /revision="\$GITHUB_SHA"[\s\S]*git rev-parse "\$GITHUB_SHA\^2"[\s\S]*revision="\$second_parent"/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /artifact="automatic-release-evidence-\$SOURCE_REVISION"/,
+  );
+  assert.match(releaseWorkflow, /source_revision: \$SOURCE_REVISION/);
+  assert.match(
+    releaseWorkflow,
+    /publish:[\s\S]*needs:[\s\S]*- build[\s\S]*- automatic-release-evidence/,
+  );
 });
 
 interface CommandResult {

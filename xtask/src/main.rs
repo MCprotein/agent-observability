@@ -127,7 +127,8 @@ const AUTOMATIC_ALLOCATED_DISK_BYTES_MAX: u64 = 1_073_741_824;
 const AUTOMATIC_CONNECT_OUTPUT_MAX_BYTES: u64 = 4_096;
 const AUTOMATIC_LIFECYCLE_SEED_MODE: u32 = 0o600;
 const AUTOMATIC_CODEX_E2E_PROMPT: &str =
-    "AUTOMATIC_CODEX_E2E_RAW_PROMPT_SENTINEL Reply with OK only.";
+    "AUTOMATIC_CODEX_E2E_RAW_PROMPT_SENTINEL Reply with the requested test value only.";
+const AUTOMATIC_CODEX_E2E_RESPONSE: &str = "AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL";
 #[cfg(target_os = "macos")]
 const NETWORK_MONITOR_START_ATTEMPTS: usize = 3;
 #[cfg(target_os = "macos")]
@@ -365,6 +366,7 @@ struct AutomaticRunResult {
     accepted_primary_requests: usize,
     rejected_primary_requests: usize,
     notify_supplement_accepted: bool,
+    report_converged: bool,
 }
 impl Config {
     fn for_profile(profile: Profile) -> Self {
@@ -1218,12 +1220,12 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
             lifecycle_cleanup: "best-effort bounded disconnect, bootout, exact seed restoration, plist removal, and isolated directory removal on success or error".into(),
             codex_config_load_boundary: "installed @openai/codex 0.151.0 exact version, strict diagnostic loading, and actual codex exec proving exporter construction and native OTLP delivery without an external model request".into(),
             observed_compatibility_correction: "Codex 0.151.0 on macOS fails exporter construction when client certificate and client private-key identity fields are present; corrected product config uses private-CA HTTPS plus the exact x-agent-observability-token private random request header and no client identity fields".into(),
-            real_codex_e2e_release_gate: "the same exact-revision evidence runs actual Codex 0.151.0 macOS codex exec against a content-free loopback Responses fixture and requires exporter construction, native OTLP acceptance, a private session record, exact 10 input and 2 output token records, and no raw prompt persistence".into(),
+            real_codex_e2e_release_gate: "the same exact-revision evidence runs actual Codex 0.151.0 macOS codex exec against a content-free loopback Responses fixture and requires exporter construction, native OTLP acceptance, a private session record, exact 10 input and 2 output token records, and no raw prompt or response persistence".into(),
             synthetic_benchmark_boundary: "after the real Codex gate passes, sustained synthetic Codex-shaped OTLP/HTTP JSON /v1/logs requests measure the private-CA HTTPS exact-header collector path and durable report authority".into(),
             notify_boundary: "separately verified built agent-observability codex-notify supplement through private-CA HTTPS with the exact private random request header".into(),
             collector_boundary: "built agent-observability collector-serve subprocess".into(),
             payload: "bounded synthetic Codex-shaped OTLP log pairs with opaque identifiers; one bounded notify supplement per measured run whose raw sentinels must be absent from the durable tree".into(),
-            readiness: "successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline".into(),
+            readiness: "successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, acknowledged report generation, and HTML generatedSpans parity with authoritative SQLite must converge before collector shutdown".into(),
             collector_shutdown: "bounded child termination and wait".into(),
         },
         metrics: AutomaticProtocolMetrics {
@@ -1256,7 +1258,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
             build_timeout_seconds: AUTOMATIC_BUILD_TIMEOUT.as_secs(),
             startup_timeout_seconds: AUTOMATIC_START_TIMEOUT.as_secs(),
             cleanup_timeout_seconds: AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT.as_secs(),
-            fail_closed: "missing or invalid benchmark metrics, real Codex execution or native OTLP failure, rejected synthetic OTLP requests, Codex version or strict config-load incompatibility, missing notify evidence, durable raw sentinels, non-loopback endpoints, timeout, or threshold breach produce non-zero exit".into(),
+            fail_closed: "missing or invalid benchmark metrics, real Codex execution or native OTLP failure, rejected synthetic OTLP requests, Codex version or strict config-load incompatibility, missing notify or report convergence evidence, durable raw sentinels, non-loopback endpoints, timeout, or threshold breach produce non-zero exit".into(),
         },
         evidence: AutomaticProtocolEvidence {
             output: "docs/evidence/local/performance/automatic-<run>/manifest.yaml".into(),
@@ -1632,11 +1634,11 @@ fn local_codex_sse_response() -> String {
         r#"{"type":"response.created","response":{"id":"resp_agentobs","object":"response","created_at":0,"status":"in_progress","output":[]}}"#,
         r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_agentobs","type":"message","role":"assistant","status":"in_progress","content":[]}}"#,
         r#"{"type":"response.content_part.added","item_id":"msg_agentobs","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}"#,
-        r#"{"type":"response.output_text.delta","item_id":"msg_agentobs","output_index":0,"content_index":0,"delta":"OK"}"#,
-        r#"{"type":"response.output_text.done","item_id":"msg_agentobs","output_index":0,"content_index":0,"text":"OK"}"#,
-        r#"{"type":"response.content_part.done","item_id":"msg_agentobs","output_index":0,"content_index":0,"part":{"type":"output_text","text":"OK","annotations":[]}}"#,
-        r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_agentobs","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK","annotations":[]}]}}"#,
-        r#"{"type":"response.completed","response":{"id":"resp_agentobs","object":"response","created_at":0,"status":"completed","output":[{"id":"msg_agentobs","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK","annotations":[]}]}],"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":12}}}"#,
+        r#"{"type":"response.output_text.delta","item_id":"msg_agentobs","output_index":0,"content_index":0,"delta":"AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL"}"#,
+        r#"{"type":"response.output_text.done","item_id":"msg_agentobs","output_index":0,"content_index":0,"text":"AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL"}"#,
+        r#"{"type":"response.content_part.done","item_id":"msg_agentobs","output_index":0,"content_index":0,"part":{"type":"output_text","text":"AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL","annotations":[]}}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_agentobs","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL","annotations":[]}]}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_agentobs","object":"response","created_at":0,"status":"completed","output":[{"id":"msg_agentobs","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL","annotations":[]}]}],"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":12}}}"#,
     ];
     EVENTS
         .into_iter()
@@ -1896,7 +1898,13 @@ fn verify_real_codex_e2e(
                 .into(),
         );
     }
-    assert_tree_excludes_bytes(root, &[AUTOMATIC_CODEX_E2E_PROMPT.as_bytes()])?;
+    assert_tree_excludes_bytes(
+        root,
+        &[
+            AUTOMATIC_CODEX_E2E_PROMPT.as_bytes(),
+            AUTOMATIC_CODEX_E2E_RESPONSE.as_bytes(),
+        ],
+    )?;
     Ok(records)
 }
 
@@ -2899,7 +2907,7 @@ fn execute_automatic_run(
             notify.trim()
         ));
     }
-    sleep(Duration::from_millis(250));
+    wait_for_automatic_report_convergence(&root, &mut collector)?;
     assert_automatic_notify_sentinels_absent(&root)?;
     assert_automatic_network_local(collector.id())?;
     network_monitor.final_sample()?;
@@ -2923,6 +2931,7 @@ fn execute_automatic_run(
         accepted_primary_requests,
         rejected_primary_requests: 0,
         notify_supplement_accepted,
+        report_converged: true,
     })
 }
 
@@ -3126,6 +3135,38 @@ fn wait_for_automatic_ready(root: &Path, collector: &mut ChildGuard) -> Result<(
         }
         if started.elapsed() >= AUTOMATIC_START_TIMEOUT {
             return Err("built automatic collector readiness timed out".into());
+        }
+        sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_automatic_report_convergence(
+    root: &Path,
+    collector: &mut ChildGuard,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        if collector
+            .try_wait()
+            .map_err(|error| format!("inspect automatic collector convergence: {error}"))?
+            .is_some()
+        {
+            return Err("built automatic collector exited before report convergence".into());
+        }
+        if check_health(root) == HealthOutcome::Ready
+            && let Ok(store) = LocalStore::open_current(root.join("state/store"))
+            && let Ok(status) = store.report_status()
+            && !status.pending()
+            && let Ok(record_count) = store.record_count()
+            && record_count > 0
+            && let Ok(report) =
+                fs::read_to_string(root.join("logs/agent-observability-report.html"))
+            && report.contains(&format!(r#""generatedSpans":{record_count}"#))
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= AUTOMATIC_START_TIMEOUT {
+            return Err("automatic durable report convergence timed out".into());
         }
         sleep(Duration::from_millis(20));
     }
@@ -4778,6 +4819,9 @@ fn validate_automatic_results(
         if !result.notify_supplement_accepted {
             return Err("automatic notify supplement evidence is missing".into());
         }
+        if !result.report_converged {
+            return Err("automatic durable report convergence evidence is missing".into());
+        }
         if !result.idle_cpu_percent.is_finite()
             || result.idle_cpu_percent.is_sign_negative()
             || !result.active_cpu_percent.is_finite()
@@ -4911,11 +4955,12 @@ fn render_automatic_manifest(
         run_latencies.sort_unstable();
         let _ = writeln!(
             manifest,
-            "  - run: {}\n    accepted_synthetic_otlp_requests: {}\n    rejected_synthetic_otlp_requests: {}\n    notify_supplement_accepted: {}\n    raw_notify_sentinels_absent: true\n    synthetic_collector_otlp_p95_us: {}\n    synthetic_collector_otlp_p99_us: {}\n    idle_cpu_percent: {}\n    active_cpu_percent: {}\n    peak_rss_kib: {}\n    allocated_disk_bytes: {}\n    collector_network_bytes: {}\n    network_monitor_samples: {}\n    all_observed_endpoints_loopback: true",
+            "  - run: {}\n    accepted_synthetic_otlp_requests: {}\n    rejected_synthetic_otlp_requests: {}\n    notify_supplement_accepted: {}\n    durable_report_converged: {}\n    raw_notify_sentinels_absent: true\n    synthetic_collector_otlp_p95_us: {}\n    synthetic_collector_otlp_p99_us: {}\n    idle_cpu_percent: {}\n    active_cpu_percent: {}\n    peak_rss_kib: {}\n    allocated_disk_bytes: {}\n    collector_network_bytes: {}\n    network_monitor_samples: {}\n    all_observed_endpoints_loopback: true",
             result.run,
             result.accepted_primary_requests,
             result.rejected_primary_requests,
             result.notify_supplement_accepted,
+            result.report_converged,
             percentile(&run_latencies, 95),
             percentile(&run_latencies, 99),
             result.idle_cpu_percent,
@@ -5655,6 +5700,7 @@ mod tests {
             network_monitor_samples: 2,
             rejected_primary_requests: 0,
             notify_supplement_accepted: true,
+            report_converged: true,
         }
     }
     fn validate_single_automatic(result: AutomaticRunResult) -> Result<(), String> {
@@ -5709,6 +5755,7 @@ mod tests {
         assert!(AUTOMATIC_PROTOCOL.contains("exact 10 input and 2 output token records"));
         assert!(AUTOMATIC_PROTOCOL.contains("sustained synthetic Codex-shaped OTLP/HTTP JSON"));
         assert!(AUTOMATIC_PROTOCOL.contains("after the real Codex gate passes"));
+        assert!(AUTOMATIC_PROTOCOL.contains("HTML generatedSpans parity"));
         assert!(AUTOMATIC_PROTOCOL.contains("not mTLS"));
         assert!(!AUTOMATIC_PROTOCOL.contains("launchd kickstart recovery"));
         assert!(
@@ -5920,6 +5967,17 @@ mod tests {
             validate_single_automatic(result)
                 .unwrap_err()
                 .contains("incomplete")
+        );
+    }
+
+    #[test]
+    fn automatic_report_convergence_is_fail_closed() {
+        let mut result = automatic_result(1, vec![1; 100]);
+        result.report_converged = false;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("report convergence")
         );
     }
 

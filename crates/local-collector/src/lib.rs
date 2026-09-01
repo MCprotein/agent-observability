@@ -1246,6 +1246,15 @@ struct CollectorState {
     report_dirty: bool,
     report_degraded: bool,
     report_refresh_failures: u32,
+    report_failure: Option<ReportFailure>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportFailure {
+    Task,
+    Refresh,
+    Status,
 }
 
 #[derive(Clone, Debug)]
@@ -1267,6 +1276,7 @@ struct Health {
     last_ingest_unix_ms: Option<u64>,
     report_dirty: bool,
     report_refresh_failures: u32,
+    report_failure: Option<ReportFailure>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1328,6 +1338,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         report_dirty,
         report_degraded: report_dirty,
         report_refresh_failures: 0,
+        report_failure: None,
     }));
     let state = AppState {
         collector,
@@ -1657,10 +1668,12 @@ async fn ingest_notify(State(state): State<AppState>, body: Bytes) -> impl IntoR
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let mut collector = state.collector.lock().await;
-    let report_pending = collector
-        .store
-        .report_status()
-        .map_or(true, agent_observability_local_store::ReportStatus::pending);
+    let report_pending = if let Ok(status) = collector.store.report_status() {
+        status.pending()
+    } else {
+        collector.report_failure = Some(ReportFailure::Status);
+        true
+    };
     collector.report_dirty = report_pending;
     axum::Json(Health {
         status: if collector.report_degraded || report_pending {
@@ -1674,6 +1687,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         last_ingest_unix_ms: collector.last_ingest_unix_ms,
         report_dirty: collector.report_dirty,
         report_refresh_failures: collector.report_refresh_failures,
+        report_failure: collector.report_failure,
     })
     .into_response()
 }
@@ -1972,6 +1986,7 @@ async fn watch_report_authority(state: AppState, mut observed_generation: u64, i
         let Ok(status) = collector.store.report_status() else {
             collector.report_dirty = true;
             collector.report_degraded = true;
+            collector.report_failure = Some(ReportFailure::Status);
             continue;
         };
         collector.report_dirty = status.pending();
@@ -1980,6 +1995,7 @@ async fn watch_report_authority(state: AppState, mut observed_generation: u64, i
         if !status.pending() {
             collector.report_degraded = false;
             collector.report_refresh_failures = 0;
+            collector.report_failure = None;
             let _ = clear_report_dirty(&collector.layout);
             continue;
         }
@@ -2029,20 +2045,25 @@ fn schedule_report_refresh_with_timing(state: &AppState, timing: ReportRefreshTi
             state
                 .report_refresh_attempts
                 .fetch_add(1, Ordering::Release);
-            let refresh = tokio::task::spawn_blocking(move || refresh_report_from_root(&root))
-                .await
-                .ok()
-                .and_then(Result::ok);
+            let (refresh, mut failure) =
+                match tokio::task::spawn_blocking(move || refresh_report_from_root(&root)).await {
+                    Ok(Ok(refreshed)) => (Some(refreshed), None),
+                    Ok(Err(_)) => (None, Some(ReportFailure::Refresh)),
+                    Err(_) => (None, Some(ReportFailure::Task)),
+                };
             let mut collector = state.collector.lock().await;
-            let pending = collector
-                .store
-                .report_status()
-                .map_or(true, agent_observability_local_store::ReportStatus::pending);
+            let pending = if let Ok(status) = collector.store.report_status() {
+                status.pending()
+            } else {
+                failure = Some(ReportFailure::Status);
+                true
+            };
             collector.report_dirty = pending;
             let completed = refresh.is_some() && !pending;
             if completed {
                 collector.report_degraded = false;
                 collector.report_refresh_failures = 0;
+                collector.report_failure = None;
                 state
                     .report_refresh_scheduled
                     .store(false, Ordering::Release);
@@ -2064,11 +2085,13 @@ fn schedule_report_refresh_with_timing(state: &AppState, timing: ReportRefreshTi
             }
             if refresh.is_some() {
                 collector.report_refresh_failures = 0;
+                collector.report_failure = failure;
                 failure_attempts = 0;
                 retry_delay = timing.retry_initial;
             } else {
                 collector.report_refresh_failures =
                     collector.report_refresh_failures.saturating_add(1);
+                collector.report_failure = failure;
                 failure_attempts += 1;
             }
             if failure_attempts == REPORT_RETRY_LIMIT {
@@ -2171,7 +2194,6 @@ fn clear_report_dirty(layout: &InstalledLayout) -> Result<(), CollectorError> {
 fn refresh_report_from_root(root: &Path) -> Result<bool, CollectorError> {
     let layout = install(root).map_err(runtime_error)?;
     let store = LocalStore::open_current(layout.state.join("store")).map_err(runtime_error)?;
-    store.repair_projection_if_needed().map_err(runtime_error)?;
     refresh_report(&layout, &store, current_unix_ms()?)
 }
 
@@ -2479,8 +2501,11 @@ fn open_store(
     let headroom = control
         .migration_headroom(&layout.root)
         .map_err(runtime_error)?;
-    LocalStore::open_with_migration_headroom(layout.state.join("store"), headroom)
-        .map_err(runtime_error)
+    LocalStore::open_with_migration_headroom_deferred_projection(
+        layout.state.join("store"),
+        headroom,
+    )
+    .map_err(runtime_error)
 }
 
 fn validate_options(options: &CollectorOptions) -> Result<(), CollectorError> {
@@ -2675,6 +2700,7 @@ mod tests {
             report_dirty: false,
             report_degraded: false,
             report_refresh_failures: 0,
+            report_failure: None,
         }
     }
 
@@ -4479,6 +4505,7 @@ mod tests {
             report_dirty: false,
             report_degraded: false,
             report_refresh_failures: 0,
+            report_failure: None,
         };
         let body = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
           {"timeUnixNano":"1787875200000000000","attributes":[
@@ -4960,15 +4987,16 @@ mod tests {
         let render_guard = blocker.acquire_report_render_guard().unwrap();
         let mutation = MutationGuard::acquire(&collector.layout.runtime).unwrap();
         let projection = collector.layout.state.join("store/observations.jsonl");
-        fs::remove_file(&projection).unwrap();
+        assert!(!projection.exists());
         let refresh_root = root.clone();
         let refresh = thread::spawn(move || refresh_report_from_root(&refresh_root));
 
         thread::sleep(Duration::from_millis(50));
-        assert!(projection.is_file());
+        assert!(!projection.exists());
         drop(render_guard);
         assert!(refresh.join().unwrap().unwrap());
         drop(mutation);
+        assert!(!projection.exists());
         assert_eq!(collector.store.record_count().unwrap(), 1);
         assert!(!collector.store.report_status().unwrap().pending());
         assert!(
@@ -5190,6 +5218,7 @@ mod tests {
             report_dirty: false,
             report_degraded: false,
             report_refresh_failures: 0,
+            report_failure: None,
         };
         let guard = ConfigMutationGuard::acquire(&layout).unwrap();
         let mut disabled = initial;

@@ -27,12 +27,12 @@ workload:
   lifecycle_cleanup: best-effort bounded disconnect, bootout, exact seed restoration, plist removal, and isolated directory removal on success or error
   codex_config_load_boundary: installed @openai/codex 0.151.0 exact version, strict diagnostic loading, and actual codex exec proving exporter construction and native OTLP delivery without an external model request
   observed_compatibility_correction: Codex 0.151.0 on macOS fails exporter construction when client certificate and client private-key identity fields are present; corrected product config uses private-CA HTTPS plus the exact x-agent-observability-token private random request header and no client identity fields
-  real_codex_e2e_release_gate: the same exact-revision evidence runs actual Codex 0.151.0 macOS codex exec against a content-free loopback Responses fixture and requires exporter construction, native OTLP acceptance, a private session record, exact 10 input and 2 output token records, and no raw prompt persistence
+  real_codex_e2e_release_gate: the same exact-revision evidence runs actual Codex 0.151.0 macOS codex exec against a content-free loopback Responses fixture and requires exporter construction, native OTLP acceptance, a private session record, exact 10 input and 2 output token records, and no raw prompt or response persistence
   synthetic_benchmark_boundary: after the real Codex gate passes, sustained synthetic Codex-shaped OTLP/HTTP JSON /v1/logs requests measure the private-CA HTTPS exact-header collector path and durable report authority
   notify_boundary: separately verified built agent-observability codex-notify supplement through private-CA HTTPS with the exact private random request header
   collector_boundary: built agent-observability collector-serve subprocess
   payload: bounded synthetic Codex-shaped OTLP log pairs with opaque identifiers; one bounded notify supplement per measured run whose raw sentinels must be absent from the durable tree
-  readiness: successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline
+  readiness: successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, acknowledged report generation, and HTML generatedSpans parity with authoritative SQLite must converge before collector shutdown
   collector_shutdown: bounded child termination and wait
 metrics:
   synthetic_collector_otlp:
@@ -58,7 +58,7 @@ execution:
   build_timeout_seconds: 600
   startup_timeout_seconds: 10
   cleanup_timeout_seconds: 5
-  fail_closed: missing or invalid benchmark metrics, real Codex execution or native OTLP failure, rejected synthetic OTLP requests, Codex version or strict config-load incompatibility, missing notify evidence, durable raw sentinels, non-loopback endpoints, timeout, or threshold breach produce non-zero exit
+  fail_closed: missing or invalid benchmark metrics, real Codex execution or native OTLP failure, rejected synthetic OTLP requests, Codex version or strict config-load incompatibility, missing notify or report convergence evidence, durable raw sentinels, non-loopback endpoints, timeout, or threshold breach produce non-zero exit
 evidence:
   output: docs/evidence/local/performance/automatic-<run>/manifest.yaml
   exact_source: full git commit, Rust 1.97.0 locked build command, tested binary, package version, profile, and protocol revision

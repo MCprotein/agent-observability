@@ -347,6 +347,9 @@ anti-corruption layer다.
   하나라도 bounds를 넘는 eligible trace가 있어 `truncated=true`이면 apply는 selected prefix까지 전부
   거부하며, 더 큰 bounded limit으로 새 plan을 만들어야 한다.
   단, CLI store open은 최초 schema 초기화/migration과 dirty projection repair를 수행할 수 있다.
+  automatic collector startup과 HTML refresh는 non-authoritative JSONL repair를 수행하지 않으며,
+  current-schema report connection은 전체 `integrity_check` 대신 필요한 version/generation metadata와
+  실제 report query 실패로 fail closed한다.
   `retention-apply`는 같은 UTC-day cutoff와 현재 authority에서 plan ID를 재검증한다. archive 경로는 managed
   runtime root 밖이어야 하며 parent/file은 각각 0700/0600이어야 한다. archive file sync가 SQLite
   mutation보다 먼저다. archive는 temporary sync 후 no-overwrite link로 publish하고 header/footer 및

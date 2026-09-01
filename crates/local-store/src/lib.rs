@@ -356,7 +356,7 @@ impl LocalStore {
     ///
     /// Returns [`StoreError`] for insecure permissions, incompatible state, or I/O failure.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
-        Self::open_internal(dir.as_ref(), None)
+        Self::open_internal(dir.as_ref(), None, true)
     }
 
     /// Opens the store while allowing a legacy schema rewrite within admitted temporary bytes.
@@ -369,7 +369,23 @@ impl LocalStore {
         dir: impl AsRef<Path>,
         admitted_temporary_bytes: u64,
     ) -> Result<Self, StoreError> {
-        Self::open_internal(dir.as_ref(), Some(admitted_temporary_bytes))
+        Self::open_internal(dir.as_ref(), Some(admitted_temporary_bytes), true)
+    }
+
+    /// Opens the store while allowing migration but defers non-authoritative JSONL repair.
+    ///
+    /// This keeps collector availability independent from projection filesystem work. Callers that
+    /// require the JSONL artifact can repair it later through [`Self::repair_projection_if_needed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for insecure permissions, incompatible state, migration admission,
+    /// or authoritative `SQLite` failure.
+    pub fn open_with_migration_headroom_deferred_projection(
+        dir: impl AsRef<Path>,
+        admitted_temporary_bytes: u64,
+    ) -> Result<Self, StoreError> {
+        Self::open_internal(dir.as_ref(), Some(admitted_temporary_bytes), false)
     }
 
     /// Opens an already initialized current-schema store without creating, migrating, or repairing
@@ -405,7 +421,6 @@ impl LocalStore {
         if schema != LOCAL_STORE_SCHEMA_VERSION {
             return Err(StoreError::SchemaMismatch);
         }
-        validate_schema(&db)?;
         metadata_generation(&db, REPORT_GENERATION_KEY)?;
         metadata_generation(&db, REPORT_ACKNOWLEDGED_GENERATION_KEY)?;
         Ok(Self { dir, db })
@@ -414,6 +429,7 @@ impl LocalStore {
     fn open_internal(
         dir: &Path,
         admitted_temporary_bytes: Option<u64>,
+        repair_projection: bool,
     ) -> Result<Self, StoreError> {
         private_dir(dir)?;
         let dir = fs::canonicalize(dir)?;
@@ -461,7 +477,9 @@ impl LocalStore {
         validate_schema(&db)?;
         ensure_report_metadata(&db)?;
         let store = Self { dir, db };
-        store.repair_projection_if_needed()?;
+        if repair_projection {
+            store.repair_projection_if_needed()?;
+        }
         Ok(store)
     }
 
@@ -3470,6 +3488,32 @@ mod tests {
             "local_state.v3"
         );
         let _ = fs::remove_dir_all(&legacy);
+    }
+
+    #[test]
+    fn admitted_open_can_defer_non_authoritative_projection_repair() {
+        let dir = temp_dir("admitted-open-deferred-projection");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store
+            .ingest_ordered_batch_deferred_projection(&[StoreBatchItem::Observation(&observation(
+                "1", "session", None,
+            ))])
+            .unwrap();
+        let projection = store.projection_path();
+        fs::remove_file(&projection).unwrap();
+        let database_bytes = fs::metadata(store.database_path()).unwrap().len();
+        drop(store);
+
+        let reopened = LocalStore::open_with_migration_headroom_deferred_projection(
+            &dir,
+            database_bytes.saturating_mul(2),
+        )
+        .unwrap();
+        assert_eq!(reopened.record_count().unwrap(), 1);
+        assert!(reopened.report_status().unwrap().pending());
+        assert!(!projection.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
