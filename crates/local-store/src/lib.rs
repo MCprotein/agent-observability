@@ -461,7 +461,17 @@ impl LocalStore {
         validate_schema(&db)?;
         ensure_report_metadata(&db)?;
         let store = Self { dir, db };
-        let projection_path = store.projection_path();
+        store.repair_projection_if_needed()?;
+        Ok(store)
+    }
+
+    /// Repairs the JSONL projection only when it is missing or marked dirty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when projection state cannot be validated or rebuilt.
+    pub fn repair_projection_if_needed(&self) -> Result<bool, StoreError> {
+        let projection_path = self.projection_path();
         let projection_missing = match fs::symlink_metadata(&projection_path) {
             Ok(_) => {
                 private_file(&projection_path)?;
@@ -470,11 +480,12 @@ impl LocalStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => true,
             Err(error) => return Err(error.into()),
         };
-        let projection_dirty = store.projection_dirty()?;
+        let projection_dirty = self.projection_dirty()?;
         if projection_missing || projection_dirty {
-            store.rebuild_projection()?;
+            self.rebuild_projection()?;
+            return Ok(true);
         }
-        Ok(store)
+        Ok(false)
     }
 
     /// Atomically accepts one source observation.
@@ -3399,6 +3410,7 @@ mod tests {
         store.ingest(&observation("1", "session", None)).unwrap();
         let projection = store.projection_path();
         let before = fs::metadata(&projection).unwrap().modified().unwrap();
+        assert!(!store.repair_projection_if_needed().unwrap());
         drop(store);
         let reopened = LocalStore::open(&dir).unwrap();
         assert_eq!(
@@ -3432,6 +3444,8 @@ mod tests {
         let reopened = LocalStore::open_current(&dir).unwrap();
         assert!(reopened.report_status().unwrap().pending());
         assert!(!projection.exists());
+        assert!(reopened.repair_projection_if_needed().unwrap());
+        assert!(projection.is_file());
         let _ = fs::remove_dir_all(&dir);
 
         let legacy = temp_dir("current-open-legacy");

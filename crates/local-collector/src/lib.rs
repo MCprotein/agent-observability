@@ -2171,7 +2171,7 @@ fn clear_report_dirty(layout: &InstalledLayout) -> Result<(), CollectorError> {
 fn refresh_report_from_root(root: &Path) -> Result<bool, CollectorError> {
     let layout = install(root).map_err(runtime_error)?;
     let store = LocalStore::open_current(layout.state.join("store")).map_err(runtime_error)?;
-    store.rebuild_projection().map_err(runtime_error)?;
+    store.repair_projection_if_needed().map_err(runtime_error)?;
     refresh_report(&layout, &store, current_unix_ms()?)
 }
 
