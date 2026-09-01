@@ -41,9 +41,11 @@ Direct config file editing is unsupported.
 The fragment capability is retained only in same-tab session storage for reload recovery and is removed
 after explicit close, an invalid session, or a bootstrap/heartbeat network failure; it is never placed in a
 cookie or local storage.
-The process stops after 10 minutes without an active browser heartbeat and has an absolute one-hour lifetime.
+The server requests shutdown after 10 minutes without an active browser heartbeat and enforces a one-hour
+settings-session deadline while its local executor and filesystem remain responsive.
 HTTP/1 header reads are limited to five seconds, and graceful connection draining is limited to one second,
-so a partial request cannot keep the foreground settings process alive indefinitely.
+with at most 64 concurrent connections, so partial or repeated requests cannot grow foreground connection
+tasks without a fixed bound. Config filesystem work runs on the blocking executor instead of the server loop.
 The lower-level `init` command remains available for automation. Install creates the root, logs,
 queue, state, and runtime directories with mode 0700 and creates config.json with mode 0600.
 Existing configuration is validated and preserved. Broad permissions,

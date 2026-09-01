@@ -878,6 +878,7 @@
     </dialog>
     <dialog id="close-dialog" aria-labelledby="close-title">
       <div class="dialog-heading"><i data-lucide="x-circle"></i><div><h2 id="close-title">\uC800\uC7A5\uD558\uC9C0 \uC54A\uC740 \uBCC0\uACBD \uB2EB\uAE30</h2><p>\uD604\uC7AC \uD3B8\uC9D1\uAC12\uC740 \uC800\uC7A5\uB418\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4. \uC124\uC815 \uC138\uC158\uC744 \uC885\uB8CC\uD558\uBA74 \uBCC0\uACBD\uC744 \uC783\uC2B5\uB2C8\uB2E4.</p></div></div>
+      <p class="dialog-error" id="close-error" role="alert"></p>
       <div class="dialog-actions"><button class="button ghost" id="cancel-close" type="button">\uACC4\uC18D \uD3B8\uC9D1</button><button class="button danger" id="confirm-close" type="button">\uBCC0\uACBD \uBC84\uB9AC\uACE0 \uB2EB\uAE30</button></div>
     </dialog>
   </div>`;
@@ -1166,17 +1167,17 @@
           showToast("\uCD5C\uC2E0 \uC124\uC815\uC744 \uBD88\uB7EC\uC640 \uB0B4 \uBCC0\uACBD\uB9CC \uB2E4\uC2DC \uC801\uC6A9\uD588\uC2B5\uB2C8\uB2E4. \uAC80\uD1A0 \uD6C4 \uC800\uC7A5\uD558\uC138\uC694.", "error");
         } catch (rebaseError) {
           const rebaseApiError = rebaseError;
-          if (rebaseApiError.code === "invalid_session") {
+          if (rebaseApiError.code === "invalid_session" || rebaseApiError.code === "network_failure") {
             expireSession();
             return;
           }
           showToast("\uCD5C\uC2E0 \uC124\uC815\uC744 \uBD88\uB7EC\uC624\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. \uD3B8\uC9D1\uAC12\uC740 \uC720\uC9C0\uB429\uB2C8\uB2E4. \uB2E4\uC2DC \uC800\uC7A5\uD574 \uC7AC\uC2DC\uB3C4\uD558\uC138\uC694.", "error");
         }
-      } else if (apiError.code === "invalid_session") {
+      } else if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
         expireSession();
         return;
       } else {
-        showToast(messageOf(error), "error");
+        showToast("\uC124\uC815\uC744 \uC800\uC7A5\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. reason=" + (apiError.code ?? "request_failed"), "error");
       }
     } finally {
       busy = false;
@@ -1220,12 +1221,35 @@
     showToast("\uAE30\uBCF8\uAC12\uC744 \uD3B8\uC9D1\uAC12\uC5D0 \uC801\uC6A9\uD588\uC2B5\uB2C8\uB2E4. \uC800\uC7A5\uD574\uC57C \uBC18\uC601\uB429\uB2C8\uB2E4.", "neutral");
   }
   async function closeSession() {
-    window.clearInterval(heartbeatTimer);
+    if (busy) return;
+    busy = true;
+    setBusy(true);
+    setText("close-error", "");
     try {
       await api("/api/shutdown", { method: "POST" });
-    } catch {
+      if (persisted) draft = structuredClone(persisted);
+      conflicted = false;
+      expireSession();
+    } catch (error) {
+      const apiError = error;
+      if (apiError.code === "invalid_session") {
+        if (persisted) draft = structuredClone(persisted);
+        conflicted = false;
+        expireSession();
+        return;
+      }
+      setText(
+        "close-error",
+        "\uC138\uC158\uC744 \uB2EB\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. \uB85C\uCEEC process \uC5F0\uACB0\uC744 \uD655\uC778\uD558\uACE0 \uB2E4\uC2DC \uC2DC\uB3C4\uD558\uC138\uC694."
+      );
+      document.querySelector("#confirm-close")?.focus();
+    } finally {
+      busy = false;
+      if (token) {
+        setBusy(false);
+        updateDirtyState();
+      }
     }
-    expireSession();
   }
   function requestCloseSession() {
     if (isDirty()) {
@@ -1342,7 +1366,9 @@
     toast.textContent = message;
     toast.dataset.kind = kind;
     toast.classList.add("visible");
-    window.setTimeout(() => toast.classList.remove("visible"), 4e3);
+    if (kind !== "error") {
+      window.setTimeout(() => toast.classList.remove("visible"), 4e3);
+    }
   }
   function mountIcons() {
     createIcons({

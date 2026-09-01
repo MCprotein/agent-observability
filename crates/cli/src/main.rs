@@ -195,15 +195,14 @@ fn announce_settings_ui(ui: &PreparedUi, open: bool) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn open_settings_url(url: &str) -> Result<(), String> {
-    let status = Command::new("open")
+    let mut child = Command::new("open")
         .arg(url)
-        .status()
+        .spawn()
         .map_err(|error| format!("settings UI open failed: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("settings UI open failed with status {status}"))
-    }
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]

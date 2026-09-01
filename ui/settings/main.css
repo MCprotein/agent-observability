@@ -447,6 +447,14 @@ h3 { margin-bottom: 4px; font-size: 14px; line-height: 20px; }
 .toast[data-kind="success"] { border-color: #afdac8; background: var(--success-soft); color: var(--success); }
 .toast[data-kind="error"] { border-color: #efb8b3; background: var(--error-soft); color: var(--error); }
 
+.dialog-error {
+  min-height: 20px;
+  margin: 0;
+  color: var(--error);
+  font-size: 13px;
+  font-weight: 650;
+}
+
 dialog {
   width: min(480px, calc(100% - 32px));
   padding: 24px;

@@ -94,13 +94,15 @@ Standalone settings use an ephemeral loopback route opened by `agent-observabili
 - `/api/config` reads and atomically replaces the Rust-validated local configuration
 - the browser receives a one-time session capability through the URL fragment, removes it from the visible URL,
   keeps it only in same-tab session storage for reload recovery, sends it only in a private request header and
-  removes it after explicit close or an invalid-session/network failure
+  removes it after a confirmed explicit close or an invalid-session/network failure during bootstrap,
+  heartbeat, or config mutation. A failed shutdown request retains it only so the user can retry closing.
 
 The settings process binds an operating-system-selected port on `127.0.0.1`, rejects non-loopback host and
 origin values, sends no CORS permission, makes no external request and expires after inactivity. Closing it
 does not affect the static report or collection runtime. Rust remains authoritative for defaults, validation,
 atomic persistence and file permissions. The browser stops heartbeat after one minute without real user
-activity; the process expires after ten minutes without heartbeat and always stops within one hour. Keeping
+activity. The server requests shutdown after ten minutes without heartbeat and applies a one-hour session
+deadline while its local executor and filesystem remain responsive. Keeping
 the settings screen open holds only its own instance lock. Config mutation acquires the shared runtime lock
 briefly and uses optimistic revision control so ingest/report commands remain available. Every supported CLI
 and UI writer uses the same mutation guard, so revision conflicts between supported writers are never silently

@@ -47,8 +47,9 @@ agent-observability ui
 바꿀 수 있다. 설정할 때만 임의의 `127.0.0.1` port를 사용하며 browser tab의 session token,
 Host와 Origin을 모두 확인한다. token은 같은 tab의 새로고침에서만 복구되며 세션 종료 시 삭제된다.
 사용자가 1분 이상 화면을 조작하지 않으면 heartbeat를 멈추고,
-연결이 10분 동안 끊기거나 실행 후 1시간이 지나면 process가 종료된다. 불완전한 HTTP header는
-5초 안에 닫고, 종료 시 연결 정리는 최대 1초로 제한한다.
+연결이 10분 동안 끊기거나 설정 server가 시작된 후 1시간이 지나면 종료를 요청한다. 이 deadline은
+로컬 executor와 filesystem이 응답하는 동안 적용된다. 불완전한 HTTP header는
+5초 안에 닫고, 동시 연결은 64개로 제한하며, 종료 시 연결 정리는 최대 1초로 제한한다.
 
 ### 4. 실제 runtime 준비
 

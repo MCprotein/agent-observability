@@ -48,6 +48,18 @@ try {
   assert.deepEqual(bootstrapPageErrors, []);
   await bootstrapFailurePage.close();
 
+  const mutationFailurePage = await browser.newPage({ viewport: { width: 800, height: 600 } });
+  await mutationFailurePage.route(`${origin}/api/config`, (route) => {
+    if (route.request().method() === "PUT") return route.abort("connectionfailed");
+    return route.continue();
+  });
+  await mutationFailurePage.goto(url, { waitUntil: "networkidle" });
+  await mutationFailurePage.locator("#collection-max_batch_records").fill("124");
+  await mutationFailurePage.locator("#save").click();
+  await mutationFailurePage.locator("text=설정 세션이 종료되었습니다").waitFor();
+  assert.equal(await mutationFailurePage.evaluate(() => sessionStorage.length), 0);
+  await mutationFailurePage.close();
+
   for (const testCase of [
     { name: "desktop", viewport: { width: 1440, height: 900 } },
     { name: "mobile", viewport: { width: 390, height: 844 } },
@@ -272,10 +284,29 @@ try {
       assert.equal(await page.evaluate(() => document.activeElement?.id), "cancel-close");
       await page.locator("#cancel-close").click();
       assert.equal(await page.evaluate(() => document.activeElement?.id), "close-session");
-      await page.locator("#discard").click();
       await page.locator("#close-session").click();
+      let failNextShutdown = true;
+      await page.route(`${origin}/api/shutdown`, async (route) => {
+        if (failNextShutdown) {
+          failNextShutdown = false;
+          await route.abort("connectionfailed");
+        } else {
+          await route.continue();
+        }
+      });
+      await page.locator("#confirm-close").click();
+      await page.locator("#close-error").filter({ hasText: "다시 시도" }).waitFor();
+      assert.equal(await page.evaluate(() => sessionStorage.length), 1);
+      assert.equal(await page.locator("#overview-title").count(), 1);
+      assert.equal(await page.locator("#confirm-close").isEnabled(), true);
+      await page.locator("#confirm-close").click();
       await page.locator("text=설정 세션이 종료되었습니다").waitFor();
       assert.equal(await page.evaluate(() => sessionStorage.length), 0);
+      assert.equal(await page.evaluate(() => {
+        const event = new Event("beforeunload", { cancelable: true });
+        window.dispatchEvent(event);
+        return event.defaultPrevented;
+      }), false);
     }
     await page.close();
   }

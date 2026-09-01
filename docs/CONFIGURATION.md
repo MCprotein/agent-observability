@@ -17,12 +17,14 @@ agent-observability ui /private/runtime --no-open
 ```
 
 UI는 `127.0.0.1`의 임의 port에만 bind하고 URL fragment의 session capability를 private header로
-옮긴다. 같은 tab의 새로고침을 위해서만 session storage에 보존하며 명시적 종료, invalid session,
-bootstrap/heartbeat network failure 확인 시 삭제한다.
+옮긴다. 같은 tab의 새로고침을 위해서만 session storage에 보존하며 확인된 명시적 종료, invalid session,
+bootstrap/heartbeat/config mutation network failure 확인 시 삭제한다. 종료 요청 자체가 실패하면 다시
+시도할 수 있도록 현재 tab의 capability를 유지한다.
 cookie, local storage, 외부 전송에는 저장하지 않는다. API는 정확한 Host, Origin과 session을
 확인하며 CORS를 허용하지 않는다. 설정 화면은 외부 request를 만들지 않는다. 사용자가 1분 이상
 화면을 조작하지 않으면 browser heartbeat를
-멈추며, 화면 연결이 10분 동안 끊기거나 process 실행 후 1시간이 지나면 종료된다. 정적 report에는
+멈추며, 화면 연결이 10분 동안 끊기거나 설정 server 시작 후 1시간이 지나면 종료를 요청한다. 이
+deadline은 로컬 executor와 filesystem이 응답하는 동안 적용된다. 정적 report에는
 영향을 주지 않는다.
 
 자동화와 headless 환경에서는 CLI를 사용한다.

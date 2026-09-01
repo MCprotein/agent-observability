@@ -2,8 +2,8 @@
 #![allow(clippy::missing_errors_doc)]
 
 use agent_observability_local_runtime::{
-    ConfigError, ConfigMutationGuard, InstalledLayout, LocalRuntimeConfigV2, Singleton,
-    SingletonError, load, revision as runtime_revision, save_if_revision,
+    ConfigServiceError, InstalledLayout, LocalConfigService, LocalRuntimeConfigV2, Singleton,
+    VersionedLocalConfig,
 };
 use axum::{
     Json, Router,
@@ -18,13 +18,12 @@ use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
 use std::{
-    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::{
     net::TcpListener,
-    sync::{Notify, watch},
+    sync::{Notify, Semaphore, watch},
     task::JoinSet,
 };
 use tower::ServiceExt;
@@ -36,6 +35,7 @@ const MAX_SESSION_LIFETIME: Duration = Duration::from_hours(1);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_CONNECTIONS: usize = 64;
 const SETTINGS_SHELL: &str = include_str!("generated/settings-shell.html");
 const SETTINGS_SCRIPT: &str = include_str!("generated/settings-ui.js");
 const SETTINGS_STYLE: &str = include_str!("generated/settings-ui.css");
@@ -82,7 +82,7 @@ impl PreparedUi {
     }
 
     pub async fn serve(self) -> Result<(), UiError> {
-        self.serve_with_limits(HEADER_READ_TIMEOUT, GRACEFUL_DRAIN_TIMEOUT)
+        self.serve_with_limits(HEADER_READ_TIMEOUT, GRACEFUL_DRAIN_TIMEOUT, MAX_CONNECTIONS)
             .await
     }
 
@@ -90,6 +90,7 @@ impl PreparedUi {
         self,
         header_read_timeout: Duration,
         drain_timeout: Duration,
+        max_connections: usize,
     ) -> Result<(), UiError> {
         let Self {
             listener,
@@ -101,18 +102,26 @@ impl PreparedUi {
         } = self;
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut connections = JoinSet::new();
+        let connection_slots = Arc::new(Semaphore::new(max_connections));
         let shutdown = shutdown_signal(shutdown, last_seen);
         tokio::pin!(shutdown);
 
         loop {
             tokio::select! {
-                biased;
                 () = &mut shutdown => break,
+                joined = connections.join_next(), if !connections.is_empty() => {
+                    let _ = joined;
+                }
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
+                    let Ok(connection_slot) = Arc::clone(&connection_slots).try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
                     let router = router.clone();
                     let mut stop_rx = stop_rx.clone();
                     connections.spawn(async move {
+                        let _connection_slot = connection_slot;
                         let service = service_fn(move |request: Request<Incoming>| {
                             router.clone().oneshot(request.map(Body::new))
                         });
@@ -132,9 +141,6 @@ impl PreparedUi {
                             }
                         }
                     });
-                }
-                joined = connections.join_next(), if !connections.is_empty() => {
-                    let _ = joined;
                 }
             }
         }
@@ -156,7 +162,7 @@ impl PreparedUi {
 
 #[derive(Clone, Debug)]
 struct AppState {
-    layout: InstalledLayout,
+    config: LocalConfigService,
     host: String,
     origin: String,
     token: String,
@@ -234,7 +240,7 @@ pub async fn prepare(layout: &InstalledLayout) -> Result<PreparedUi, UiError> {
     let shutdown = Arc::new(Notify::new());
     let last_seen = Arc::new(Mutex::new(Instant::now()));
     let state = AppState {
-        layout: layout.clone(),
+        config: LocalConfigService::new(layout),
         host,
         origin: origin.clone(),
         token: token.clone(),
@@ -300,7 +306,7 @@ async fn get_config(
 ) -> Result<Json<ConfigEnvelope>, ApiError> {
     authorize(&state, &headers, false)?;
     touch(&state)?;
-    envelope(&state.layout.config).map(Json)
+    read_envelope(state.config).await.map(Json)
 }
 
 async fn put_config(
@@ -313,41 +319,12 @@ async fn put_config(
     let Json(update) = Json::<UpdateRequest>::from_request(request, &state)
         .await
         .map_err(|error| map_json_rejection(&error))?;
-    update.config.validate().map_err(|error| {
-        ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_config",
-            error.to_string(),
-        )
-    })?;
-    let mutation = ConfigMutationGuard::acquire(&state.layout).map_err(|error| match error {
-        SingletonError::AlreadyRunning => ApiError::new(
-            StatusCode::CONFLICT,
-            "runtime_busy",
-            "다른 로컬 작업이 실행 중입니다. 잠시 후 다시 저장하세요.",
-        ),
-        _ => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "runtime_lock_failed",
-            error.to_string(),
-        ),
-    })?;
-    save_if_revision(&mutation, &update.revision, &update.config).map_err(|error| {
-        if matches!(error, ConfigError::Conflict) {
-            ApiError::new(
-                StatusCode::CONFLICT,
-                "config_conflict",
-                "설정 파일이 다른 프로세스에서 변경되었습니다. 최신 값을 다시 불러오세요.",
-            )
-        } else {
-            ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "save_failed",
-                error.to_string(),
-            )
-        }
-    })?;
-    envelope(&state.layout.config).map(Json)
+    let config = state.config;
+    let saved = tokio::task::spawn_blocking(move || config.save(&update.revision, &update.config))
+        .await
+        .map_err(|_| config_error(ConfigServiceError::Unavailable))?
+        .map_err(config_error)?;
+    Ok(Json(envelope(saved)))
 }
 
 async fn heartbeat(
@@ -446,35 +423,46 @@ fn authorize(state: &AppState, headers: &HeaderMap, mutation: bool) -> Result<()
     Ok(())
 }
 
-fn envelope(path: &Path) -> Result<ConfigEnvelope, ApiError> {
-    let config = load_config(path)?;
-    let revision = config_revision(&config)?;
-    Ok(ConfigEnvelope {
-        config,
+async fn read_envelope(config: LocalConfigService) -> Result<ConfigEnvelope, ApiError> {
+    let versioned = tokio::task::spawn_blocking(move || config.read())
+        .await
+        .map_err(|_| config_error(ConfigServiceError::Unavailable))?
+        .map_err(config_error)?;
+    Ok(envelope(versioned))
+}
+
+fn envelope(versioned: VersionedLocalConfig) -> ConfigEnvelope {
+    ConfigEnvelope {
+        config: versioned.config,
         defaults: LocalRuntimeConfigV2::default(),
-        revision,
+        revision: versioned.revision,
         collection_mode: "manual_import",
-    })
+    }
 }
 
-fn config_revision(config: &LocalRuntimeConfigV2) -> Result<String, ApiError> {
-    runtime_revision(config).map_err(|error| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "revision_failed",
-            error.to_string(),
-        )
-    })
-}
-
-fn load_config(path: &Path) -> Result<LocalRuntimeConfigV2, ApiError> {
-    load(path).map_err(|error| {
-        ApiError::new(
+fn config_error(error: ConfigServiceError) -> ApiError {
+    match error {
+        ConfigServiceError::Busy => ApiError::new(
+            StatusCode::CONFLICT,
+            "runtime_busy",
+            "다른 로컬 작업이 실행 중입니다. 잠시 후 다시 저장하세요.",
+        ),
+        ConfigServiceError::Conflict => ApiError::new(
+            StatusCode::CONFLICT,
+            "config_conflict",
+            "설정 파일이 변경되었습니다. 최신 값을 다시 불러오세요.",
+        ),
+        ConfigServiceError::Invalid => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_config",
+            "설정값이 허용된 범위를 벗어났습니다.",
+        ),
+        ConfigServiceError::Unavailable => ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "config_unavailable",
-            error.to_string(),
-        )
-    })
+            "로컬 설정을 읽거나 저장할 수 없습니다.",
+        ),
+    }
 }
 
 fn session_token() -> Result<String, UiError> {
@@ -548,7 +536,9 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, constant_time_equal, prepare, router, session_token};
+    use super::{
+        AppState, LocalConfigService, constant_time_equal, prepare, router, session_token,
+    };
     use agent_observability_local_runtime::{LocalRuntimeConfigV2, install, revision};
     use axum::{
         body::{Body, to_bytes},
@@ -604,10 +594,11 @@ mod tests {
                 let prepared = prepare(&layout).await.unwrap();
                 let address = prepared.listener.local_addr().unwrap();
                 let shutdown = Arc::clone(&prepared.shutdown);
-                let server = tokio::spawn(
-                    prepared
-                        .serve_with_limits(Duration::from_millis(50), Duration::from_millis(50)),
-                );
+                let server = tokio::spawn(prepared.serve_with_limits(
+                    Duration::from_millis(200),
+                    Duration::from_millis(50),
+                    1,
+                ));
 
                 let mut timed_out_header = TcpStream::connect(address).await.unwrap();
                 timed_out_header
@@ -630,6 +621,26 @@ mod tests {
                     .await
                     .unwrap();
                 tokio::time::sleep(Duration::from_millis(10)).await;
+                let mut overflow_connection = TcpStream::connect(address).await.unwrap();
+                overflow_connection
+                    .write_all(b"GET / HTTP/1.1\r\nHost:")
+                    .await
+                    .unwrap();
+                let overflow_result = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    overflow_connection.read(&mut byte),
+                )
+                .await
+                .expect("connection above the fixed limit must close");
+                match overflow_result {
+                    Ok(0) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                        ) => {}
+                    other => panic!("unexpected overflow connection result: {other:?}"),
+                }
                 shutdown.notify_one();
                 tokio::time::timeout(Duration::from_millis(500), server)
                     .await
@@ -655,7 +666,7 @@ mod tests {
                 let _ = fs::remove_dir_all(&root);
                 let layout = install(&root).unwrap();
                 let state = AppState {
-                    layout,
+                    config: LocalConfigService::new(&layout),
                     host: "127.0.0.1:43191".into(),
                     origin: "http://127.0.0.1:43191".into(),
                     token: "test-session".into(),
@@ -749,6 +760,7 @@ mod tests {
                 assert_ne!(saved_envelope["revision"], stale_revision);
 
                 let conflict_response = app
+                    .clone()
                     .oneshot(api_request(
                         "PUT",
                         "/api/config",
@@ -759,6 +771,31 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(conflict_response.status(), StatusCode::CONFLICT);
+                fs::remove_file(&layout.config).unwrap();
+                let unavailable_response = app
+                    .oneshot(api_request(
+                        "GET",
+                        "/api/config",
+                        "127.0.0.1:43191",
+                        Some("http://127.0.0.1:43191"),
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    unavailable_response.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR
+                );
+                let unavailable_body = to_bytes(unavailable_response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                let unavailable: Value = serde_json::from_slice(&unavailable_body).unwrap();
+                assert_eq!(unavailable["code"], "config_unavailable");
+                assert_eq!(
+                    unavailable["message"],
+                    "로컬 설정을 읽거나 저장할 수 없습니다."
+                );
+                assert!(!unavailable_body.windows(5).any(|window| window == b"/tmp/"));
                 let _ = fs::remove_dir_all(root);
             });
     }

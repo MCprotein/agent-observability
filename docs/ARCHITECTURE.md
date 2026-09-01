@@ -110,8 +110,9 @@ evidence runner인 `xtask`로 나뉜다. domain은 외부 형식을
 source와 durable/report DTO 경계를 소유한다. application은 pricing과 report projection을,
 inbound adapters는 제품별 source precedence/correlation/dedupe를, local-store는 SQLite transaction과 JSONL
 projection을, static-report는 generated UI asset의 self-contained artifact 조립과 private atomic write를,
-local-ui는 authenticated loopback 설정 inbound adapter와 embedded generated asset을, CLI는 composition
-root를 소유한다.
+local-ui는 authenticated loopback 설정 inbound adapter와 embedded generated asset을, local-runtime은
+blocking config I/O를 캡슐화한 standalone config use-case를, CLI는 composition root를 소유한다.
+local-ui handler는 이 use-case를 blocking executor에서 호출하고 HTTP 연결 task는 최대 64개로 제한한다.
 `contracts/*.schema.json`은 closed wire contract이고 versioned config fixture와 전체 bounds parity
 corpus가 strict Rust wire DTO와 생성된 TypeScript validator의 required/default/min/max/unknown-field
 일치를 잠근다. `contracts/contract-manifest.v1`은 현재

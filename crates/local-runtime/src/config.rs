@@ -152,6 +152,57 @@ pub struct InstalledLayout {
     pub runtime: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub struct LocalConfigService {
+    layout: InstalledLayout,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionedLocalConfig {
+    pub config: LocalRuntimeConfigV2,
+    pub revision: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigServiceError {
+    Busy,
+    Conflict,
+    Invalid,
+    Unavailable,
+}
+
+impl LocalConfigService {
+    pub fn new(layout: &InstalledLayout) -> Self {
+        Self {
+            layout: InstalledLayout::at(&layout.root),
+        }
+    }
+
+    pub fn read(&self) -> Result<VersionedLocalConfig, ConfigServiceError> {
+        let config = load(&self.layout.config).map_err(|_| ConfigServiceError::Unavailable)?;
+        let revision = revision(&config).map_err(|_| ConfigServiceError::Unavailable)?;
+        Ok(VersionedLocalConfig { config, revision })
+    }
+
+    pub fn save(
+        &self,
+        expected_revision: &str,
+        config: &LocalRuntimeConfigV2,
+    ) -> Result<VersionedLocalConfig, ConfigServiceError> {
+        config.validate().map_err(|_| ConfigServiceError::Invalid)?;
+        let mutation = ConfigMutationGuard::acquire(&self.layout).map_err(|error| match error {
+            SingletonError::AlreadyRunning => ConfigServiceError::Busy,
+            _ => ConfigServiceError::Unavailable,
+        })?;
+        save_if_revision(&mutation, expected_revision, config).map_err(|error| match error {
+            ConfigError::Conflict => ConfigServiceError::Conflict,
+            ConfigError::Policy(_) | ConfigError::UnsupportedVersion => ConfigServiceError::Invalid,
+            _ => ConfigServiceError::Unavailable,
+        })?;
+        self.read()
+    }
+}
+
 #[derive(Debug)]
 pub struct ConfigMutationGuard {
     _singleton: Singleton,

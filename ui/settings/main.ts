@@ -280,6 +280,7 @@ function renderSettings(focusTarget?: string): void {
     </dialog>
     <dialog id="close-dialog" aria-labelledby="close-title">
       <div class="dialog-heading"><i data-lucide="x-circle"></i><div><h2 id="close-title">저장하지 않은 변경 닫기</h2><p>현재 편집값은 저장되지 않았습니다. 설정 세션을 종료하면 변경을 잃습니다.</p></div></div>
+      <p class="dialog-error" id="close-error" role="alert"></p>
       <div class="dialog-actions"><button class="button ghost" id="cancel-close" type="button">계속 편집</button><button class="button danger" id="confirm-close" type="button">변경 버리고 닫기</button></div>
     </dialog>
   </div>`;
@@ -589,17 +590,20 @@ async function saveDraft(): Promise<void> {
         showToast("최신 설정을 불러와 내 변경만 다시 적용했습니다. 검토 후 저장하세요.", "error");
       } catch (rebaseError) {
         const rebaseApiError = rebaseError as Error & { code?: string };
-        if (rebaseApiError.code === "invalid_session") {
+        if (
+          rebaseApiError.code === "invalid_session" ||
+          rebaseApiError.code === "network_failure"
+        ) {
           expireSession();
           return;
         }
         showToast("최신 설정을 불러오지 못했습니다. 편집값은 유지됩니다. 다시 저장해 재시도하세요.", "error");
       }
-    } else if (apiError.code === "invalid_session") {
+    } else if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
       expireSession();
       return;
     } else {
-      showToast(messageOf(error), "error");
+      showToast("설정을 저장하지 못했습니다. reason=" + (apiError.code ?? "request_failed"), "error");
     }
   } finally {
     busy = false;
@@ -649,13 +653,35 @@ function resetDefaults(): void {
 }
 
 async function closeSession(): Promise<void> {
-  window.clearInterval(heartbeatTimer);
+  if (busy) return;
+  busy = true;
+  setBusy(true);
+  setText("close-error", "");
   try {
     await api<void>("/api/shutdown", { method: "POST" });
-  } catch {
-    // The process may close before the empty response reaches the browser.
+    if (persisted) draft = structuredClone(persisted);
+    conflicted = false;
+    expireSession();
+  } catch (error) {
+    const apiError = error as Error & { code?: string };
+    if (apiError.code === "invalid_session") {
+      if (persisted) draft = structuredClone(persisted);
+      conflicted = false;
+      expireSession();
+      return;
+    }
+    setText(
+      "close-error",
+      "세션을 닫지 못했습니다. 로컬 process 연결을 확인하고 다시 시도하세요.",
+    );
+    document.querySelector<HTMLButtonElement>("#confirm-close")?.focus();
+  } finally {
+    busy = false;
+    if (token) {
+      setBusy(false);
+      updateDirtyState();
+    }
   }
-  expireSession();
 }
 
 function requestCloseSession(): void {
@@ -794,7 +820,9 @@ function showToast(message: string, kind: "success" | "error" | "neutral"): void
   toast.textContent = message;
   toast.dataset.kind = kind;
   toast.classList.add("visible");
-  window.setTimeout(() => toast.classList.remove("visible"), 4_000);
+  if (kind !== "error") {
+    window.setTimeout(() => toast.classList.remove("visible"), 4_000);
+  }
 }
 
 function mountIcons(): void {
