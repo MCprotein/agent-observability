@@ -780,6 +780,7 @@ fn reconcile_collector_service(
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)] // Keep the cross-platform lifecycle contract uniform.
 fn reconcile_collector_service(
     _root: &Path,
     _config: ConfigConnectionStatus,
@@ -814,6 +815,7 @@ fn commit_collector_service_install(service: &CollectorService) -> Result<(), In
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)] // Keep the cross-platform lifecycle contract uniform.
 fn commit_collector_service_install(_service: &CollectorService) -> Result<(), IntegrationError> {
     Ok(())
 }
@@ -847,6 +849,7 @@ fn commit_collector_service_uninstall(service: &CollectorService) -> Result<(), 
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)] // Keep the cross-platform lifecycle contract uniform.
 fn commit_collector_service_uninstall(_service: &CollectorService) -> Result<(), IntegrationError> {
     Ok(())
 }
