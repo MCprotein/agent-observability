@@ -33,6 +33,21 @@ try {
   const results = [];
   const screenshotDirectory = process.env.SETTINGS_SCREENSHOT_DIR ?? directory;
 
+  const bootstrapFailurePage = await browser.newPage({ viewport: { width: 800, height: 600 } });
+  const bootstrapFailures = [];
+  const bootstrapPageErrors = [];
+  bootstrapFailurePage.on("requestfailed", (request) => bootstrapFailures.push(request));
+  bootstrapFailurePage.on("pageerror", (error) => bootstrapPageErrors.push(error.message));
+  await bootstrapFailurePage.route(`${origin}/api/config`, (route) => route.abort("connectionfailed"));
+  await bootstrapFailurePage.goto(url);
+  await bootstrapFailurePage.locator("text=설정 세션이 종료되었습니다").waitFor();
+  assert.equal(await bootstrapFailurePage.evaluate(() => sessionStorage.length), 0);
+  assert.equal(bootstrapFailures.length, 1);
+  assert.equal(bootstrapFailures[0].url(), `${origin}/api/config`);
+  assert.equal(bootstrapFailures[0].method(), "GET");
+  assert.deepEqual(bootstrapPageErrors, []);
+  await bootstrapFailurePage.close();
+
   for (const testCase of [
     { name: "desktop", viewport: { width: 1440, height: 900 } },
     { name: "mobile", viewport: { width: 390, height: 844 } },

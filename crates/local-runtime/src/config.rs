@@ -160,9 +160,10 @@ pub struct ConfigMutationGuard {
 
 impl ConfigMutationGuard {
     pub fn acquire(layout: &InstalledLayout) -> Result<Self, SingletonError> {
-        Singleton::acquire(&layout.runtime).map(|singleton| Self {
+        let canonical = InstalledLayout::at(&layout.root);
+        Singleton::acquire(&canonical.runtime).map(|singleton| Self {
             _singleton: singleton,
-            config_path: layout.config.clone(),
+            config_path: canonical.config,
         })
     }
 }
@@ -657,7 +658,10 @@ mod tests {
         let _ = fs::remove_dir_all(&second_root);
         let first_layout = install(&first_root).unwrap();
         let second_layout = install(&second_root).unwrap();
-        let guard = ConfigMutationGuard::acquire(&first_layout).unwrap();
+        let mut mismatched_layout = first_layout.clone();
+        mismatched_layout.config = second_layout.config.clone();
+        mismatched_layout.runtime = second_layout.runtime.clone();
+        let guard = ConfigMutationGuard::acquire(&mismatched_layout).unwrap();
         let mut update = LocalRuntimeConfigV2::default();
         update.retention.max_record_age_days = 90;
 

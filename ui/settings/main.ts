@@ -198,7 +198,7 @@ async function bootstrap(): Promise<void> {
     heartbeatTimer = window.setInterval(() => void heartbeat(), 20_000);
   } catch (error) {
     const apiError = error as Error & { code?: string };
-    if (apiError.code === "invalid_session") {
+    if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
       expireSession();
     } else {
       renderUnavailable(messageOf(error));
@@ -705,7 +705,14 @@ function isDirty(): boolean {
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("x-agent-observability-session", token);
-  const response = await fetch(path, { ...init, headers, cache: "no-store" });
+  let response: Response;
+  try {
+    response = await fetch(path, { ...init, headers, cache: "no-store" });
+  } catch {
+    const error = new Error("로컬 설정 process에 연결할 수 없습니다.") as Error & { code?: string };
+    error.code = "network_failure";
+    throw error;
+  }
   if (!response.ok) {
     const body = (await response.json().catch(() => ({}))) as ApiError;
     const error = new Error(body.message ?? `요청이 실패했습니다 (${response.status}).`) as Error & {

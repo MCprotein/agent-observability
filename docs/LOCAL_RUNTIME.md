@@ -39,7 +39,8 @@ typed mutation guard. The CLI reads and writes while holding that guard; the UI 
 browser revision immediately before the atomic replace. Both release the guard before the next operation.
 Direct config file editing is unsupported.
 The fragment capability is retained only in same-tab session storage for reload recovery and is removed
-after explicit close or an invalid-session/network failure; it is never placed in a cookie or local storage.
+after explicit close, an invalid session, or a bootstrap/heartbeat network failure; it is never placed in a
+cookie or local storage.
 The process stops after 10 minutes without an active browser heartbeat and has an absolute one-hour lifetime.
 The lower-level `init` command remains available for automation. Install creates the root, logs,
 queue, state, and runtime directories with mode 0700 and creates config.json with mode 0600.

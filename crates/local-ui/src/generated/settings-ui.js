@@ -800,7 +800,7 @@
       heartbeatTimer = window.setInterval(() => void heartbeat(), 2e4);
     } catch (error) {
       const apiError = error;
-      if (apiError.code === "invalid_session") {
+      if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
         expireSession();
       } else {
         renderUnavailable(messageOf(error));
@@ -1263,7 +1263,14 @@
   async function api(path, init = {}) {
     const headers = new Headers(init.headers);
     headers.set("x-agent-observability-session", token);
-    const response = await fetch(path, { ...init, headers, cache: "no-store" });
+    let response;
+    try {
+      response = await fetch(path, { ...init, headers, cache: "no-store" });
+    } catch {
+      const error = new Error("\uB85C\uCEEC \uC124\uC815 process\uC5D0 \uC5F0\uACB0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4.");
+      error.code = "network_failure";
+      throw error;
+    }
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       const error = new Error(body.message ?? `\uC694\uCCAD\uC774 \uC2E4\uD328\uD588\uC2B5\uB2C8\uB2E4 (${response.status}).`);
