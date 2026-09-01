@@ -1,3 +1,4 @@
+use agent_observability_local_store::LocalStore;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -276,6 +277,7 @@ fn demo_fails_when_collection_policy_blocks_first_value() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn retention_plan_is_read_only_and_apply_writes_one_private_archive() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -305,6 +307,20 @@ fn retention_plan_is_read_only_and_apply_writes_one_private_archive() {
         "{}",
         String::from_utf8_lossy(&ingest.stderr)
     );
+    let initial_report = binary()
+        .args(["report", runtime.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(initial_report.status.success());
+    let dashboard = runtime.join("logs/agent-observability-report.html");
+    assert!(
+        !fs::read_to_string(&dashboard)
+            .unwrap()
+            .contains(r#""generatedSpans":0"#)
+    );
+    let store = LocalStore::open(installed_store(&runtime)).unwrap();
+    assert!(!store.report_status().unwrap().pending());
+    drop(store);
     let projection = installed_store(&runtime).join("observations.jsonl");
     let before = fs::read(&projection).unwrap();
 
@@ -366,6 +382,32 @@ fn retention_plan_is_read_only_and_apply_writes_one_private_archive() {
         0o600
     );
     assert!(fs::read_to_string(&projection).unwrap().is_empty());
+    let store = LocalStore::open(installed_store(&runtime)).unwrap();
+    assert!(store.report_status().unwrap().pending());
+    drop(store);
+    assert!(
+        !fs::read_to_string(&dashboard)
+            .unwrap()
+            .contains(r#""generatedSpans":0"#)
+    );
+
+    let refresh = binary()
+        .args(["dashboard", runtime.to_str().unwrap(), "--no-open"])
+        .output()
+        .unwrap();
+    assert!(
+        refresh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refresh.stderr)
+    );
+    assert!(
+        fs::read_to_string(&dashboard)
+            .unwrap()
+            .contains(r#""generatedSpans":0"#)
+    );
+    let store = LocalStore::open(installed_store(&runtime)).unwrap();
+    assert!(!store.report_status().unwrap().pending());
+    drop(store);
 
     let stale_replay = binary()
         .args([

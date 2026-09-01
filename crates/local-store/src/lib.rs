@@ -17,7 +17,6 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -28,7 +27,10 @@ use std::time::Duration;
 
 const DB_NAME: &str = "local-store.sqlite3";
 const PROJECTION_NAME: &str = "observations.jsonl";
+const REPORT_RENDER_LOCK_NAME: &str = ".report-render.lock";
 pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v4";
+const REPORT_GENERATION_KEY: &str = "report_generation";
+const REPORT_ACKNOWLEDGED_GENERATION_KEY: &str = "report_acknowledged_generation";
 const MAX_EXPIRED_SPAN_GUARDS: u64 = 100_000;
 const MAX_RETENTION_RECEIPTS: u64 = 1_024;
 const MAX_ADAPTER_DISPOSITIONS: u64 = 100_000;
@@ -128,6 +130,30 @@ pub enum IngestStatus {
     Committed,
     Duplicate,
     Suppressed,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReportSnapshot {
+    pub generation: u64,
+    pub records: Vec<DurableRecordV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReportStatus {
+    pub generation: u64,
+    pub acknowledged_generation: u64,
+}
+
+#[derive(Debug)]
+pub struct ReportRenderGuard {
+    _file: File,
+}
+
+impl ReportStatus {
+    #[must_use]
+    pub const fn pending(self) -> bool {
+        self.generation != self.acknowledged_generation
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -283,7 +309,6 @@ impl From<serde_json::Error> for StoreError {
 pub struct LocalStore {
     dir: PathBuf,
     db: Connection,
-    has_expired_guards: Cell<bool>,
 }
 
 impl LocalStore {
@@ -357,16 +382,8 @@ impl LocalStore {
             return Err(StoreError::SchemaMismatch);
         }
         validate_schema(&db)?;
-        let has_expired_guards = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM expired_span_states)",
-            [],
-            |row| row.get::<_, bool>(0),
-        )?;
-        let store = Self {
-            dir,
-            db,
-            has_expired_guards: Cell::new(has_expired_guards),
-        };
+        ensure_report_metadata(&db)?;
+        let store = Self { dir, db };
         let projection_path = store.projection_path();
         let projection_missing = match fs::symlink_metadata(&projection_path) {
             Ok(_) => {
@@ -449,12 +466,9 @@ impl LocalStore {
         let mut statuses = Vec::with_capacity(items.len());
         for item in items {
             statuses.push(match item {
-                StoreBatchItem::Observation(observation) => Self::ingest_in_transaction(
-                    &tx,
-                    observation,
-                    None,
-                    self.has_expired_guards.get(),
-                )?,
+                StoreBatchItem::Observation(observation) => {
+                    Self::ingest_in_transaction(&tx, observation, None)?
+                }
                 StoreBatchItem::Disposition {
                     checkpoint,
                     disposition,
@@ -599,8 +613,7 @@ impl LocalStore {
         rebuild_projection: bool,
     ) -> Result<IngestStatus, StoreError> {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-        let status =
-            Self::ingest_in_transaction(&tx, observation, crash, self.has_expired_guards.get())?;
+        let status = Self::ingest_in_transaction(&tx, observation, crash)?;
         tx.commit()?;
         if crash == Some(CrashPoint::AfterCommit) {
             return Err(StoreError::Crash(CrashPoint::AfterCommit));
@@ -617,7 +630,6 @@ impl LocalStore {
         tx: &Transaction<'_>,
         observation: &SourceObservation,
         crash: Option<CrashPoint>,
-        has_expired_guards: bool,
     ) -> Result<IngestStatus, StoreError> {
         let source = source_name(observation);
         let generation = private_source_generation(observation);
@@ -674,14 +686,13 @@ impl LocalStore {
                 return Ok(IngestStatus::Suppressed);
             }
         }
-        if has_expired_guards
-            && let Some(existing_hash) = tx
-                .query_row(
-                    "SELECT canonical_state_hash FROM expired_span_states WHERE span_id=?1",
-                    [state.span_id.as_str()],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
+        if let Some(existing_hash) = tx
+            .query_row(
+                "SELECT canonical_state_hash FROM expired_span_states WHERE span_id=?1",
+                [state.span_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
         {
             if existing_hash != canonical_state_hash(&state)? {
                 return Err(StoreError::PayloadConflict);
@@ -752,6 +763,7 @@ impl LocalStore {
         )?;
         advance_cursor(tx, observation)?;
         mark_projection_dirty(tx)?;
+        advance_report_generation(tx)?;
         if crash == Some(CrashPoint::BeforeCommit) {
             return Err(StoreError::Crash(CrashPoint::BeforeCommit));
         }
@@ -932,6 +944,94 @@ impl LocalStore {
         Ok(records)
     }
 
+    /// Reads current records and their report generation from one consistent snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the snapshot or stored record contract cannot be read.
+    pub fn report_snapshot(&self) -> Result<ReportSnapshot, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)?;
+        let generation = metadata_generation(&tx, REPORT_GENERATION_KEY)?;
+        let records = {
+            let mut statement =
+                tx.prepare("SELECT record_json FROM records ORDER BY commit_seq")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.map(|row| {
+                let json = row?;
+                serde_json::from_str(&json).map_err(StoreError::Json)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        tx.commit()?;
+        Ok(ReportSnapshot {
+            generation,
+            records,
+        })
+    }
+
+    /// Returns the durable report generation state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when generation metadata is missing, invalid, or cannot be read.
+    pub fn report_status(&self) -> Result<ReportStatus, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)?;
+        let status = ReportStatus {
+            generation: metadata_generation(&tx, REPORT_GENERATION_KEY)?,
+            acknowledged_generation: metadata_generation(&tx, REPORT_ACKNOWLEDGED_GENERATION_KEY)?,
+        };
+        tx.commit()?;
+        if status.acknowledged_generation > status.generation {
+            return Err(StoreError::SchemaMismatch);
+        }
+        Ok(status)
+    }
+
+    /// Serializes report artifact publication across local processes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the private render lock cannot be safely acquired.
+    pub fn acquire_report_render_guard(&self) -> Result<ReportRenderGuard, StoreError> {
+        let path = self.dir.join(REPORT_RENDER_LOCK_NAME);
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(StoreError::Symlink);
+        }
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(no_follow_flag());
+        }
+        let file = options.open(path)?;
+        private_open_file(&file)?;
+        file.lock_exclusive()?;
+        Ok(ReportRenderGuard { _file: file })
+    }
+
+    /// Acknowledges a report only when authority is still at the rendered generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when durable generation metadata cannot be updated transactionally.
+    pub fn acknowledge_report_generation(&self, generation: u64) -> Result<bool, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let current = metadata_generation(&tx, REPORT_GENERATION_KEY)?;
+        if current != generation {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE metadata SET value=?1 WHERE key=?2",
+            params![generation.to_string(), REPORT_ACKNOWLEDGED_GENERATION_KEY],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Plans a bounded archive-and-prune pass without changing authority or projections.
     ///
     /// # Errors
@@ -1043,11 +1143,11 @@ impl LocalStore {
              DROP TABLE retention_selected_traces;",
         )?;
         mark_projection_dirty(&tx)?;
+        advance_report_generation(&tx)?;
         if crash == Some(CrashPoint::BeforeRetentionCommit) {
             return Err(StoreError::Crash(CrashPoint::BeforeRetentionCommit));
         }
         tx.commit()?;
-        self.has_expired_guards.set(true);
         if crash == Some(CrashPoint::AfterRetentionCommit) {
             return Err(StoreError::Crash(CrashPoint::AfterRetentionCommit));
         }
@@ -2535,6 +2635,26 @@ fn mark_projection_dirty(tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn metadata_generation(db: &Connection, key: &str) -> Result<u64, StoreError> {
+    let value: String = db
+        .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StoreError::SchemaMismatch)?;
+    value.parse().map_err(|_| StoreError::SchemaMismatch)
+}
+
+fn advance_report_generation(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let generation = metadata_generation(tx, REPORT_GENERATION_KEY)?
+        .checked_add(1)
+        .ok_or(StoreError::SchemaMismatch)?;
+    tx.execute(
+        "UPDATE metadata SET value=?1 WHERE key=?2",
+        params![generation.to_string(), REPORT_GENERATION_KEY],
+    )?;
+    Ok(())
+}
+
 fn count(db: &Connection, table: &str) -> Result<u64, StoreError> {
     Ok(db
         .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
@@ -2573,6 +2693,58 @@ fn initialize_empty_schema(db: &Connection) -> Result<(), StoreError> {
             "INSERT INTO metadata(key, value) VALUES ('projection_dirty', '1')",
             [],
         )?;
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, '0')",
+            [REPORT_GENERATION_KEY],
+        )?;
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, '0')",
+            [REPORT_ACKNOWLEDGED_GENERATION_KEY],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn ensure_report_metadata(db: &Connection) -> Result<(), StoreError> {
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let generation = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [REPORT_GENERATION_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let acknowledged = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [REPORT_ACKNOWLEDGED_GENERATION_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    match (generation, acknowledged) {
+        (None, None) => {
+            tx.execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, '1')",
+                [REPORT_GENERATION_KEY],
+            )?;
+            tx.execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, '0')",
+                [REPORT_ACKNOWLEDGED_GENERATION_KEY],
+            )?;
+        }
+        (Some(generation), Some(acknowledged)) => {
+            let generation = generation
+                .parse::<u64>()
+                .map_err(|_| StoreError::SchemaMismatch)?;
+            let acknowledged = acknowledged
+                .parse::<u64>()
+                .map_err(|_| StoreError::SchemaMismatch)?;
+            if acknowledged > generation {
+                return Err(StoreError::SchemaMismatch);
+            }
+        }
+        _ => return Err(StoreError::SchemaMismatch),
     }
     tx.commit()?;
     Ok(())
@@ -4096,6 +4268,117 @@ mod tests {
             .unwrap()
             .cast_unsigned();
         assert_eq!(free_pages, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connection_opened_before_retention_cannot_resurrect_expired_span() {
+        let dir = temp_dir("retention-two-connections");
+        let _ = fs::remove_dir_all(&dir);
+        let mut collector = LocalStore::open(&dir).unwrap();
+        let mut retention = LocalStore::open(&dir).unwrap();
+        retention
+            .ingest(&observation("1", "session", None))
+            .unwrap();
+        retention
+            .ingest(&observation_after("2", Some("1"), "turn", Some("session")))
+            .unwrap();
+        let plan = retention.retention_plan(100, 100, 1_048_576).unwrap();
+        retention
+            .apply_retention(
+                100,
+                100,
+                1_048_576,
+                &plan.plan_id,
+                &dir.join("archive/expired.jsonl"),
+            )
+            .unwrap();
+
+        let replay = observation_after("3", Some("2"), "turn", Some("session"));
+        assert_eq!(collector.ingest(&replay).unwrap(), IngestStatus::Suppressed);
+        assert_eq!(collector.record_count().unwrap(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_generation_tracks_record_mutations_and_exact_acknowledgement() {
+        let dir = temp_dir("report-generation");
+        let _ = fs::remove_dir_all(&dir);
+        let mut writer = LocalStore::open(&dir).unwrap();
+        assert_eq!(
+            writer.report_status().unwrap(),
+            ReportStatus {
+                generation: 0,
+                acknowledged_generation: 0,
+            }
+        );
+        writer.ingest(&observation("1", "session", None)).unwrap();
+        let snapshot = writer.report_snapshot().unwrap();
+        assert_eq!(snapshot.generation, 1);
+        assert_eq!(snapshot.records.len(), 1);
+
+        let mut concurrent_writer = LocalStore::open(&dir).unwrap();
+        concurrent_writer
+            .ingest(&observation_after("2", Some("1"), "turn", Some("session")))
+            .unwrap();
+        assert!(
+            !writer
+                .acknowledge_report_generation(snapshot.generation)
+                .unwrap()
+        );
+        assert!(writer.report_status().unwrap().pending());
+
+        let latest = writer.report_snapshot().unwrap();
+        assert_eq!(latest.generation, 2);
+        assert_eq!(latest.records.len(), 2);
+        assert!(
+            writer
+                .acknowledge_report_generation(latest.generation)
+                .unwrap()
+        );
+        assert!(!writer.report_status().unwrap().pending());
+
+        let plan = writer.retention_plan(100, 100, 1_048_576).unwrap();
+        writer
+            .apply_retention(
+                100,
+                100,
+                1_048_576,
+                &plan.plan_id,
+                &dir.join("archive/expired.jsonl"),
+            )
+            .unwrap();
+        let status = writer.report_status().unwrap();
+        assert_eq!(status.generation, 3);
+        assert_eq!(status.acknowledged_generation, 2);
+        assert!(status.pending());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_v4_store_without_report_metadata_reopens_pending() {
+        let dir = temp_dir("report-generation-v4-backfill");
+        let _ = fs::remove_dir_all(&dir);
+        let store = LocalStore::open(&dir).unwrap();
+        let database = store.database_path();
+        drop(store);
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute(
+                "DELETE FROM metadata WHERE key IN (?1, ?2)",
+                params![REPORT_GENERATION_KEY, REPORT_ACKNOWLEDGED_GENERATION_KEY],
+            )
+            .unwrap();
+        drop(connection);
+
+        let reopened = LocalStore::open(&dir).unwrap();
+        assert_eq!(
+            reopened.report_status().unwrap(),
+            ReportStatus {
+                generation: 1,
+                acknowledged_generation: 0,
+            }
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -235,7 +235,6 @@ struct CollectorState {
     rejected_requests: u64,
     suppressed_requests: u64,
     last_ingest_unix_ms: Option<u64>,
-    report_generation: u64,
     report_dirty: bool,
     report_degraded: bool,
     report_refresh_failures: u32,
@@ -265,7 +264,10 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let config = load(&layout.config).map_err(runtime_error)?;
     let singleton = Singleton::acquire(&layout.runtime.join("collector")).map_err(runtime_error)?;
     let store = open_store(&layout, &config)?;
-    let report_dirty = reconcile_report_state(&layout)?;
+    let report_status = store.report_status().map_err(runtime_error)?;
+    let report_missing = !layout.logs.join(REPORT_FILE_NAME).is_file();
+    let report_wakeup = reconcile_report_state(&layout, report_status.pending() || report_missing);
+    let report_dirty = report_status.pending() || report_missing;
     let last_cursor = store
         .cursor("codex", &options.source_generation)
         .map_err(runtime_error)?;
@@ -284,7 +286,6 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         rejected_requests: 0,
         suppressed_requests: 0,
         last_ingest_unix_ms: None,
-        report_generation: 0,
         report_dirty,
         report_degraded: report_dirty,
         report_refresh_failures: 0,
@@ -294,7 +295,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
     };
     let app = router(state.clone());
-    if report_dirty {
+    if report_wakeup {
         schedule_report_refresh(&state);
     }
     let result = axum::serve(listener, app).await;
@@ -598,21 +599,31 @@ fn commit_batch(
             },
         })
         .collect::<Vec<_>>();
-    let was_dirty = state.report_dirty;
-    mark_report_dirty(&state.layout)?;
-    state.report_dirty = true;
+    let _ = mark_report_dirty(&state.layout);
     match state.store.ingest_ordered_batch_deferred_projection(&items) {
         Ok(_) => {}
         Err(error) => {
-            if !was_dirty && clear_report_dirty(&state.layout).is_ok() {
-                state.report_dirty = false;
+            state.report_dirty = state
+                .store
+                .report_status()
+                .map_err(runtime_error)?
+                .pending();
+            if !state.report_dirty {
+                let _ = clear_report_dirty(&state.layout);
             }
             return Err(runtime_error(error));
         }
     }
     state.last_cursor = last_cursor;
     state.last_ingest_unix_ms = Some(now);
-    state.report_generation = state.report_generation.saturating_add(1);
+    state.report_dirty = state
+        .store
+        .report_status()
+        .map_err(runtime_error)?
+        .pending();
+    if !state.report_dirty {
+        let _ = clear_report_dirty(&state.layout);
+    }
     Ok(())
 }
 
@@ -629,19 +640,23 @@ fn schedule_report_refresh(state: &AppState) {
         let mut delay = REPORT_RETRY_INITIAL_DELAY;
         for attempt in 1..=REPORT_RETRY_LIMIT {
             tokio::time::sleep(delay).await;
-            let (root, generation) = {
+            let root = {
                 let collector = state.collector.lock().await;
-                (collector.layout.root.clone(), collector.report_generation)
+                collector.layout.root.clone()
             };
-            let refreshed = tokio::task::spawn_blocking(move || refresh_report_from_root(&root))
+            let refresh = tokio::task::spawn_blocking(move || refresh_report_from_root(&root))
                 .await
-                .is_ok_and(|result| result.is_ok());
+                .ok()
+                .and_then(Result::ok);
             let mut collector = state.collector.lock().await;
-            let generation_changed = collector.report_generation != generation;
-            let completed =
-                refreshed && !generation_changed && clear_report_dirty(&collector.layout).is_ok();
+            let pending = collector
+                .store
+                .report_status()
+                .map_or(true, agent_observability_local_store::ReportStatus::pending);
+            collector.report_dirty = pending;
+            let completed = refresh.is_some() && !pending;
             if completed {
-                collector.report_dirty = false;
+                let _ = clear_report_dirty(&collector.layout);
                 collector.report_degraded = false;
                 collector.report_refresh_failures = 0;
                 state
@@ -649,7 +664,7 @@ fn schedule_report_refresh(state: &AppState) {
                     .store(false, Ordering::Release);
                 return;
             }
-            if refreshed && generation_changed {
+            if refresh.is_some() {
                 delay = REPORT_RETRY_INITIAL_DELAY;
             } else {
                 collector.report_refresh_failures =
@@ -661,8 +676,9 @@ fn schedule_report_refresh(state: &AppState) {
                 state
                     .report_refresh_scheduled
                     .store(false, Ordering::Release);
+                let retry_latest = refresh.is_some() && pending;
                 drop(collector);
-                if generation_changed && refreshed {
+                if retry_latest {
                     schedule_report_refresh(&state);
                 }
                 return;
@@ -676,13 +692,13 @@ fn report_dirty_path(layout: &InstalledLayout) -> PathBuf {
     layout.runtime.join(REPORT_DIRTY_FILE_NAME)
 }
 
-fn reconcile_report_state(layout: &InstalledLayout) -> Result<bool, CollectorError> {
-    let dirty = report_dirty_path(layout);
-    if dirty.exists() || !layout.logs.join(REPORT_FILE_NAME).is_file() {
-        mark_report_dirty(layout)?;
-        return Ok(true);
+fn reconcile_report_state(layout: &InstalledLayout, durable_pending_or_missing: bool) -> bool {
+    let marker_exists = report_dirty_path(layout).exists();
+    if durable_pending_or_missing || marker_exists {
+        let _ = mark_report_dirty(layout);
+        return true;
     }
-    Ok(false)
+    false
 }
 
 fn mark_report_dirty(layout: &InstalledLayout) -> Result<(), CollectorError> {
@@ -731,7 +747,7 @@ fn clear_report_dirty(layout: &InstalledLayout) -> Result<(), CollectorError> {
     }
 }
 
-fn refresh_report_from_root(root: &Path) -> Result<(), CollectorError> {
+fn refresh_report_from_root(root: &Path) -> Result<bool, CollectorError> {
     let layout = install(root).map_err(runtime_error)?;
     let config = load(&layout.config).map_err(runtime_error)?;
     let store = open_store(&layout, &config)?;
@@ -819,17 +835,20 @@ fn refresh_report(
     layout: &InstalledLayout,
     store: &LocalStore,
     now_unix_ms: u64,
-) -> Result<(), CollectorError> {
-    let records = store.current_records().map_err(runtime_error)?;
+) -> Result<bool, CollectorError> {
+    let _render_guard = store.acquire_report_render_guard().map_err(runtime_error)?;
+    let snapshot = store.report_snapshot().map_err(runtime_error)?;
     let report = project_report(
-        &records,
+        &snapshot.records,
         timestamp_from_unix_ms(now_unix_ms)?,
         "Agent Observability Report",
         None,
     )
     .map_err(runtime_error)?;
     write_private(&layout.logs.join(REPORT_FILE_NAME), &report).map_err(runtime_error)?;
-    Ok(())
+    store
+        .acknowledge_report_generation(snapshot.generation)
+        .map_err(runtime_error)
 }
 
 fn open_store(
@@ -904,10 +923,10 @@ mod tests {
     use super::{
         AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome, REPORT_FILE_NAME,
         TOKEN_HEADER, admit_request, constant_time_equal, enforce_batch_policy, ingest_locked,
-        ingest_notify_locked, install_settings, is_json, load_settings, open_store,
+        ingest_notify_locked, install_settings, is_json, load_settings, open_store, project_report,
         reconcile_report_state, refresh_report_from_root, report_dirty_path, router,
         schedule_report_refresh, settings_path, submit_notify, timestamp_from_unix_ms,
-        write_private_json,
+        write_private, write_private_json,
     };
     use agent_observability_adapter_codex::{MAX_HANDOFF_BYTES, parse_otlp_http_json};
     use agent_observability_local_runtime::{ConfigMutationGuard, install, load, save};
@@ -951,7 +970,6 @@ mod tests {
             rejected_requests: 0,
             suppressed_requests: 0,
             last_ingest_unix_ms: None,
-            report_generation: 0,
             report_dirty: false,
             report_degraded: false,
             report_refresh_failures: 0,
@@ -1406,7 +1424,6 @@ mod tests {
             rejected_requests: 0,
             suppressed_requests: 0,
             last_ingest_unix_ms: None,
-            report_generation: 0,
             report_dirty: false,
             report_degraded: false,
             report_refresh_failures: 0,
@@ -1493,6 +1510,24 @@ mod tests {
     }
 
     #[test]
+    fn report_wakeup_marker_failure_does_not_block_durable_ingest() {
+        let root = test_root("report-marker-optional");
+        let _ = fs::remove_dir_all(&root);
+        let mut state = collector_state(&root);
+        fs::create_dir(report_dirty_path(&state.layout)).unwrap();
+
+        ingest_notify_locked(
+            &mut state,
+            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(state.store.record_count().unwrap(), 1);
+        assert!(state.store.report_status().unwrap().pending());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn report_refresh_retries_transient_failure_and_converges_to_latest_generation() {
         let root = test_root("report-retry");
         let _ = fs::remove_dir_all(&root);
@@ -1545,6 +1580,70 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_ingest_during_render_cannot_acknowledge_a_stale_report() {
+        let root = test_root("report-concurrent-ingest");
+        let _ = fs::remove_dir_all(&root);
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(
+            &mut collector,
+            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+        )
+        .unwrap();
+
+        let config = load(&collector.layout.config).unwrap();
+        let renderer = open_store(&collector.layout, &config).unwrap();
+        let report_path = collector.layout.logs.join(REPORT_FILE_NAME);
+        let snapshot_ready = Arc::new(std::sync::Barrier::new(2));
+        let ingest_finished = Arc::new(std::sync::Barrier::new(2));
+        let render_handle = {
+            let snapshot_ready = Arc::clone(&snapshot_ready);
+            let ingest_finished = Arc::clone(&ingest_finished);
+            let report_path = report_path.clone();
+            thread::spawn(move || {
+                let _render_guard = renderer.acquire_report_render_guard().unwrap();
+                let snapshot = renderer.report_snapshot().unwrap();
+                snapshot_ready.wait();
+                ingest_finished.wait();
+                let report = project_report(
+                    &snapshot.records,
+                    "2026-09-02T00:00:00.000Z",
+                    "Agent Observability Report",
+                    None,
+                )
+                .unwrap();
+                write_private(&report_path, &report).unwrap();
+                renderer
+                    .acknowledge_report_generation(snapshot.generation)
+                    .unwrap()
+            })
+        };
+
+        snapshot_ready.wait();
+        ingest_notify_locked(
+            &mut collector,
+            br#"{"type":"agent-turn-complete","thread-id":"thread-2","turn-id":"turn-2"}"#,
+        )
+        .unwrap();
+        ingest_finished.wait();
+        assert!(!render_handle.join().unwrap());
+        assert!(collector.store.report_status().unwrap().pending());
+        assert!(
+            fs::read_to_string(&report_path)
+                .unwrap()
+                .contains(r#""generatedSpans":1"#)
+        );
+
+        assert!(refresh_report_from_root(&root).unwrap());
+        assert!(!collector.store.report_status().unwrap().pending());
+        assert!(
+            fs::read_to_string(&report_path)
+                .unwrap()
+                .contains(r#""generatedSpans":2"#)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn startup_reconciles_durable_dirty_marker_after_ingest_crash_window() {
         let root = test_root("report-startup-reconcile");
         let _ = fs::remove_dir_all(&root);
@@ -1559,7 +1658,7 @@ mod tests {
         }
 
         let mut restarted = collector_state(&root);
-        assert!(reconcile_report_state(&restarted.layout).unwrap());
+        assert!(reconcile_report_state(&restarted.layout, true));
         restarted.report_dirty = true;
         restarted.report_degraded = true;
         let state = AppState {
@@ -1699,7 +1798,6 @@ mod tests {
             rejected_requests: 0,
             suppressed_requests: 0,
             last_ingest_unix_ms: None,
-            report_generation: 0,
             report_dirty: false,
             report_degraded: false,
             report_refresh_failures: 0,

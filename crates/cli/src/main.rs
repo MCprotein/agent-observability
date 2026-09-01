@@ -66,6 +66,7 @@ Maintenance:
   agentobs config-check <config-json>
   agentobs contracts|version|help";
 const REPORT_FILE_NAME: &str = "agent-observability-report.html";
+const REPORT_RENDER_RETRY_LIMIT: u32 = 4;
 const MAX_RATE_TABLE_BYTES: u64 = 1_048_576;
 const DEFAULT_ROOT_NAME: &str = ".agent-observability";
 const DEFAULT_DEMO_ROOT_NAME: &str = ".agent-observability-demo";
@@ -518,8 +519,9 @@ fn connect_codex(root: &Path) -> Result<String, String> {
     let status =
         connect_integration(root, &installed_executable()?).map_err(|error| error.to_string())?;
     Ok(format!(
-        "integration=codex\nconfig={}\ncollector=ready\nendpoint={}\nservice={}\nmanual_import=available",
+        "integration=codex\nconfig={}\ncollector={}\nendpoint={}\nservice={}\nmanual_import=available",
         connection_status(status.config),
+        collector_status(status.collector),
         status.endpoint.as_deref().unwrap_or_default(),
         status.service.as_deref().unwrap_or_default()
     ))
@@ -565,6 +567,7 @@ const fn connection_status(status: ConnectionStatus) -> &'static str {
 const fn collector_status(status: CollectorStatus) -> &'static str {
     match status {
         CollectorStatus::Ready => "ready",
+        CollectorStatus::Degraded => "degraded",
         CollectorStatus::Unavailable => "unavailable",
     }
 }
@@ -811,25 +814,40 @@ fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String>
     let config = load(&layout.config).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
     let store = open_store(&layout, &config)?;
-    let records = store.current_records().map_err(|error| error.to_string())?;
     let rate_table = rate_table_path
         .map(read_private_rate_table)
         .transpose()?
         .map(|body| parse_rate_table_json(&body).map_err(|error| error.to_string()))
         .transpose()?;
-    let report = project_report(
-        &records,
-        current_timestamp()?,
-        "Agent Observability Report",
-        rate_table.as_ref(),
-    )
-    .map_err(|error| error.to_string())?;
     let output_path = layout.logs.join(REPORT_FILE_NAME);
-    let bytes = write_private(&output_path, &report).map_err(|error| error.to_string())?;
+    let _render_guard = store
+        .acquire_report_render_guard()
+        .map_err(|error| error.to_string())?;
+    let mut rendered = None;
+    for _ in 0..REPORT_RENDER_RETRY_LIMIT {
+        let snapshot = store.report_snapshot().map_err(|error| error.to_string())?;
+        let report = project_report(
+            &snapshot.records,
+            current_timestamp()?,
+            "Agent Observability Report",
+            rate_table.as_ref(),
+        )
+        .map_err(|error| error.to_string())?;
+        let bytes = write_private(&output_path, &report).map_err(|error| error.to_string())?;
+        if store
+            .acknowledge_report_generation(snapshot.generation)
+            .map_err(|error| error.to_string())?
+        {
+            rendered = Some((snapshot.records.len(), report.cost.status, bytes));
+            break;
+        }
+    }
+    let (record_count, cost_status, bytes) = rendered
+        .ok_or_else(|| "report authority changed during every render attempt".to_string())?;
     Ok(format!(
         "report_schema={REPORT_DTO_VERSION}\nrecords={}\ncost_status={}\nreport={}\nbytes={bytes}\nteam_ingest=disabled",
-        records.len(),
-        report.cost.status,
+        record_count,
+        cost_status,
         output_path.display()
     ))
 }
