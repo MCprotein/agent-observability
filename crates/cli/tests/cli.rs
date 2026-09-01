@@ -105,7 +105,7 @@ fn invalid_real_process_command_fails_on_stderr() {
 }
 
 #[test]
-fn codex_notify_real_process_fails_open_with_zero_exit() {
+fn codex_notify_real_process_rejects_before_io_with_zero_exit() {
     let root = std::env::temp_dir().join(format!(
         "agent-observability-cli-notify-missing-{}",
         std::process::id()
@@ -123,9 +123,35 @@ fn codex_notify_real_process_fails_open_with_zero_exit() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
+        "notify=rejected"
+    );
+    assert!(output.stderr.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn codex_notify_real_process_is_unavailable_after_valid_projection() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-notify-unavailable-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let output = binary()
+        .args([
+            "codex-notify",
+            root.to_str().unwrap(),
+            r#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1","cwd":"/RAW_CWD_SENTINEL","input-messages":["RAW_PROMPT_SENTINEL"],"last-assistant-message":"RAW_ASSISTANT_SENTINEL"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
         "notify=unavailable"
     );
     assert!(output.stderr.is_empty());
+    assert!(!root.join("runtime/collector.json").exists());
     let _ = std::fs::remove_dir_all(root);
 }
 
