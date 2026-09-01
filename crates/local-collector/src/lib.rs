@@ -2,7 +2,8 @@
 #![allow(clippy::missing_errors_doc)]
 
 use agent_observability_adapter_codex::{
-    AdapterBatch, AdapterItem, MAX_HANDOFF_BYTES, parse_notify_json, parse_otlp_http_json,
+    AdapterBatch, AdapterItem, MAX_HANDOFF_BYTES, OtlpRequestCorrelationState, parse_notify_json,
+    parse_otlp_http_json_with_state,
 };
 use agent_observability_application::project_report;
 use agent_observability_local_runtime::{
@@ -246,6 +247,7 @@ struct CollectorState {
     source_generation: String,
     token: String,
     last_cursor: Option<String>,
+    request_correlation: OtlpRequestCorrelationState,
     accepted_requests: u64,
     rejected_requests: u64,
     suppressed_requests: u64,
@@ -291,13 +293,14 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         .map_err(runtime_error)?;
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), options.port);
     let initial_bind = TcpListener::bind(address).await;
-    let listener = bind_or_rotate_port(&layout, &options, initial_bind).await?;
+    let listener = bind_persisted_port(initial_bind)?;
     let collector = Arc::new(Mutex::new(CollectorState {
         layout,
         store,
         source_generation: options.source_generation,
         token: options.token,
         last_cursor,
+        request_correlation: OtlpRequestCorrelationState::default(),
         accepted_requests: 0,
         rejected_requests: 0,
         suppressed_requests: 0,
@@ -329,27 +332,10 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     result
 }
 
-async fn bind_or_rotate_port(
-    layout: &InstalledLayout,
-    options: &CollectorOptions,
-    initial_bind: std::io::Result<TcpListener>,
+fn bind_persisted_port(
+    bind_result: std::io::Result<TcpListener>,
 ) -> Result<TcpListener, CollectorError> {
-    match initial_bind {
-        Ok(listener) => Ok(listener),
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-            let port = listener.local_addr()?.port();
-            let settings = CollectorSettings {
-                schema_version: COLLECTOR_SETTINGS_VERSION.into(),
-                port,
-                token: options.token.clone(),
-                source_generation: options.source_generation.clone(),
-            };
-            write_private_json(&settings_path(layout), &settings)?;
-            Ok(listener)
-        }
-        Err(error) => Err(error.into()),
-    }
+    bind_result.map_err(Into::into)
 }
 
 fn router(state: AppState) -> Router {
@@ -690,16 +676,19 @@ fn ingest_locked(state: &mut CollectorState, body: &[u8]) -> Result<IngestOutcom
         })?
         .checked_add(u64::from(state.last_cursor.is_some()))
         .ok_or_else(|| CollectorError::Runtime("Codex cursor overflow".into()))?;
-    let (batch, last_cursor) = parse_otlp_http_json(
+    let mut request_correlation = state.request_correlation.clone();
+    let (batch, last_cursor) = parse_otlp_http_json_with_state(
         body,
         &state.source_generation,
         state.last_cursor.as_deref(),
         next_cursor,
         now,
+        &mut request_correlation,
     )
     .map_err(runtime_error)?;
     enforce_batch_policy(&batch, &config)?;
     commit_batch(state, &batch, last_cursor, now)?;
+    state.request_correlation = request_correlation;
     Ok(IngestOutcome::Committed)
 }
 
@@ -1199,9 +1188,10 @@ fn runtime_error(error: impl std::fmt::Display) -> CollectorError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome, REPORT_FILE_NAME,
-        TOKEN_HEADER, admit_request, constant_time_equal, enforce_batch_policy, ingest_locked,
-        ingest_notify_locked, install_settings, is_json, load_settings, open_store, project_report,
+        AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome,
+        OtlpRequestCorrelationState, REPORT_FILE_NAME, TOKEN_HEADER, admit_request,
+        constant_time_equal, enforce_batch_policy, ingest_locked, ingest_notify_locked,
+        install_settings, is_json, load_settings, open_store, project_report,
         reconcile_report_state, refresh_report_from_root, report_dirty_path, router,
         schedule_report_refresh, settings_path, submit_notify, timestamp_from_unix_ms,
         write_private, write_private_json,
@@ -1244,6 +1234,7 @@ mod tests {
             source_generation: "codex-test".into(),
             token: "a".repeat(64),
             last_cursor: None,
+            request_correlation: OtlpRequestCorrelationState::default(),
             accepted_requests: 0,
             rejected_requests: 0,
             suppressed_requests: 0,
@@ -1951,14 +1942,13 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn occupied_persisted_port_rotates_privately_and_serves() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn occupied_persisted_port_preserves_settings_and_returns_address_in_use() {
         let root = test_root("occupied-persisted-port");
         let _ = fs::remove_dir_all(&root);
         let original = install_settings(&root).unwrap();
+        let settings_path = settings_path(&install(&root).unwrap());
+        let original_bytes = fs::read(&settings_path).unwrap();
         let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, original.port)).unwrap();
         let options = original.options(&root);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1966,71 +1956,14 @@ mod tests {
             .build()
             .unwrap();
 
-        runtime.block_on(async {
-            let server = tokio::spawn(super::serve(options));
-            let rotated = tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    if let Ok(settings) = load_settings(&root)
-                        && settings.port != original.port
-                    {
-                        break settings;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(rotated.token, original.token);
-            assert_eq!(rotated.source_generation, original.source_generation);
-            assert_ne!(rotated.port, original.port);
-
-            tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    let health_root = root.clone();
-                    let health =
-                        tokio::task::spawn_blocking(move || super::check_health(&health_root))
-                            .await
-                            .unwrap();
-                    if health == super::HealthOutcome::Ready {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
-            tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    let notify_root = root.clone();
-                    let notify = tokio::task::spawn_blocking(move || {
-                        submit_notify(
-                            &notify_root,
-                            br#"{"type":"agent-turn-complete","thread-id":"thread","turn-id":"turn"}"#,
-                        )
-                    })
-                    .await
-                    .unwrap();
-                    if notify == NotifyOutcome::Accepted {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
-
-            server.abort();
-            let _ = server.await;
-        });
+        let error = runtime.block_on(super::serve(options)).unwrap_err();
+        assert!(matches!(
+            error,
+            super::CollectorError::Io(ref error)
+                if error.kind() == std::io::ErrorKind::AddrInUse
+        ));
+        assert_eq!(fs::read(&settings_path).unwrap(), original_bytes);
         drop(occupied);
-        assert_eq!(
-            fs::metadata(settings_path(&install(&root).unwrap()))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2039,23 +1972,12 @@ mod tests {
         let root = test_root("bind-failure-no-rotation");
         let _ = fs::remove_dir_all(&root);
         let settings = install_settings(&root).unwrap();
-        let layout = install(&root).unwrap();
-        let options = settings.options(&root);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
 
-        let error = runtime
-            .block_on(super::bind_or_rotate_port(
-                &layout,
-                &options,
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "injected bind failure",
-                )),
-            ))
-            .unwrap_err();
+        let error = super::bind_persisted_port(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected bind failure",
+        )))
+        .unwrap_err();
         assert!(matches!(
             error,
             super::CollectorError::Io(ref error)
@@ -2081,6 +2003,7 @@ mod tests {
             source_generation: "codex-test".into(),
             token: "x".repeat(32),
             last_cursor: None,
+            request_correlation: OtlpRequestCorrelationState::default(),
             accepted_requests: 0,
             rejected_requests: 0,
             suppressed_requests: 0,
@@ -2167,6 +2090,39 @@ mod tests {
         assert_eq!(state.store.disposition_count().unwrap(), 4);
         assert_eq!(state.last_cursor.as_deref(), Some("6"));
         assert_tree_excludes(&root, &[b"SECRET_PROMPT"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collector_correlates_model_request_across_otlp_exports() {
+        let root = test_root("split-otlp-correlation");
+        let _ = fs::remove_dir_all(&root);
+        let mut state = collector_state(&root);
+        let api_request = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
+          {"attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+            {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+            {"key":"model","value":{"stringValue":"gpt-test"}},
+            {"key":"auth.request_id","value":{"stringValue":"request-1"}}
+          ]}
+        ]}]}]}"#;
+        let completed = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
+          {"attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
+            {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+            {"key":"model","value":{"stringValue":"gpt-test"}},
+            {"key":"event.kind","value":{"stringValue":"response.completed"}}
+          ]}
+        ]}]}]}"#;
+
+        ingest_locked(&mut state, api_request).unwrap();
+        assert_eq!(state.request_correlation.pending_len(), 1);
+        ingest_locked(&mut state, completed).unwrap();
+
+        assert_eq!(state.request_correlation.pending_len(), 0);
+        assert_eq!(state.last_cursor.as_deref(), Some("2"));
+        assert_eq!(state.store.observation_count().unwrap(), 2);
+        assert_eq!(state.store.disposition_count().unwrap(), 0);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2566,6 +2522,7 @@ mod tests {
             source_generation: "codex-test".into(),
             token: "x".repeat(32),
             last_cursor: None,
+            request_correlation: OtlpRequestCorrelationState::default(),
             accepted_requests: 0,
             rejected_requests: 0,
             suppressed_requests: 0,

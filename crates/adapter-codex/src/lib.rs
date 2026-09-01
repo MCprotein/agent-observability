@@ -11,7 +11,7 @@ use agent_observability_domain::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
@@ -23,6 +23,8 @@ pub const MAX_HANDOFF_BYTES: u64 = 1024 * 1024;
 pub const MAX_HANDOFF_LINES: usize = 4096;
 pub const MAX_HANDOFF_LINE_BYTES: usize = 64 * 1024;
 pub const MAX_OTLP_LOG_RECORDS: usize = 4096;
+pub const MAX_PENDING_OTLP_REQUESTS: usize = 1024;
+pub const OTLP_REQUEST_CORRELATION_TTL_MS: u64 = 5 * 60 * 1000;
 const KNOWN_CODEX_MODELS: &[&str] = &[
     "gpt-test",
     "gpt-5.4",
@@ -73,6 +75,87 @@ pub enum AdapterItem {
 #[derive(Debug, Default)]
 pub struct AdapterBatch {
     pub items: Vec<AdapterItem>,
+}
+
+type OtlpRequestPairKey = (String, String, String);
+
+#[derive(Clone, Debug)]
+struct PendingOtlpRequest {
+    request_id: Option<String>,
+    inserted_at_unix_ms: u64,
+    sequence: u64,
+    current_record_index: Option<usize>,
+}
+
+/// Bounded, content-free correlation state for Codex OTLP requests split across HTTP exports.
+#[derive(Clone, Debug, Default)]
+pub struct OtlpRequestCorrelationState {
+    pending: BTreeMap<OtlpRequestPairKey, VecDeque<PendingOtlpRequest>>,
+    next_sequence: u64,
+}
+
+impl OtlpRequestCorrelationState {
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.pending.values().map(VecDeque::len).sum()
+    }
+
+    fn expire(&mut self, now_unix_ms: u64) {
+        self.pending.retain(|_, queue| {
+            queue.retain(|pending| {
+                now_unix_ms.saturating_sub(pending.inserted_at_unix_ms)
+                    < OTLP_REQUEST_CORRELATION_TTL_MS
+            });
+            !queue.is_empty()
+        });
+    }
+
+    fn push(&mut self, key: OtlpRequestPairKey, pending: PendingOtlpRequest) {
+        self.pending.entry(key).or_default().push_back(pending);
+        while self.pending_len() > MAX_PENDING_OTLP_REQUESTS {
+            self.evict_oldest();
+        }
+    }
+
+    fn evict_oldest(&mut self) {
+        let oldest_key = self
+            .pending
+            .iter()
+            .filter_map(|(key, queue)| queue.front().map(|pending| (pending.sequence, key)))
+            .min_by(Ord::cmp)
+            .map(|(_, key)| key.clone());
+        let Some(key) = oldest_key else {
+            return;
+        };
+        let remove_key = self.pending.get_mut(&key).is_some_and(|queue| {
+            queue.pop_front();
+            queue.is_empty()
+        });
+        if remove_key {
+            self.pending.remove(&key);
+        }
+    }
+
+    fn next_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        if let Some(next) = self.next_sequence.checked_add(1) {
+            self.next_sequence = next;
+        } else {
+            self.pending.clear();
+            self.next_sequence = 1;
+        }
+        sequence
+    }
+
+    fn finish_batch(&mut self) {
+        self.pending.retain(|_, queue| {
+            queue.retain(|pending| pending.request_id.is_some());
+            for pending in queue.iter_mut() {
+                pending.current_record_index = None;
+            }
+            !queue.is_empty()
+        });
+    }
 }
 
 impl AdapterBatch {
@@ -283,6 +366,30 @@ pub fn parse_otlp_http_json(
     first_cursor: u64,
     fallback_received_at_unix_ms: u64,
 ) -> Result<(AdapterBatch, Option<String>), AdapterError> {
+    parse_otlp_http_json_with_state(
+        input,
+        source_generation,
+        previous_cursor,
+        first_cursor,
+        fallback_received_at_unix_ms,
+        &mut OtlpRequestCorrelationState::default(),
+    )
+}
+
+/// Stateful variant of [`parse_otlp_http_json`] for collectors that receive one OTLP export at a
+/// time. State changes are applied only when the complete export maps successfully.
+///
+/// # Errors
+///
+/// Returns the same bounded decode and mapping errors as [`parse_otlp_http_json`].
+pub fn parse_otlp_http_json_with_state(
+    input: &[u8],
+    source_generation: &str,
+    previous_cursor: Option<&str>,
+    first_cursor: u64,
+    fallback_received_at_unix_ms: u64,
+    state: &mut OtlpRequestCorrelationState,
+) -> Result<(AdapterBatch, Option<String>), AdapterError> {
     if input.len() as u64 > MAX_HANDOFF_BYTES {
         return Err(AdapterError::HandoffTooLarge);
     }
@@ -340,13 +447,21 @@ pub fn parse_otlp_http_json(
             }
         }
     }
-    correlate_otlp_request_pairs(&mut records)?;
+    let mut next_state = state.clone();
+    correlate_otlp_request_pairs(
+        &mut records,
+        source_generation,
+        fallback_received_at_unix_ms,
+        &mut next_state,
+    )?;
     let mut jsonl = String::new();
     for record in &records {
         jsonl.push_str(&serde_json::to_string(record).map_err(|_| AdapterError::InvalidJson)?);
         jsonl.push('\n');
     }
-    parse_handoff_jsonl(&jsonl).map(|batch| (batch, prior))
+    let batch = parse_handoff_jsonl(&jsonl)?;
+    *state = next_state;
+    Ok((batch, prior))
 }
 
 /// Projects the raw Codex `agent-turn-complete` notify argument without retaining content fields.
@@ -481,8 +596,13 @@ fn canonical_otlp_attributes(
     Ok(output)
 }
 
-fn correlate_otlp_request_pairs(records: &mut [HandoffRecord]) -> Result<(), AdapterError> {
-    let mut pending = BTreeMap::<(String, String), usize>::new();
+fn correlate_otlp_request_pairs(
+    records: &mut [HandoffRecord],
+    source_generation: &str,
+    now_unix_ms: u64,
+    state: &mut OtlpRequestCorrelationState,
+) -> Result<(), AdapterError> {
+    state.expire(now_unix_ms);
     for index in 0..records.len() {
         let event_name = records[index].event_name.as_str();
         let is_completed = event_name == "codex.sse_event"
@@ -491,36 +611,57 @@ fn correlate_otlp_request_pairs(records: &mut [HandoffRecord]) -> Result<(), Ada
         if event_name != "codex.api_request" && !is_completed {
             continue;
         }
-        let Some(key) = otlp_request_pair_key(&records[index].attributes)? else {
+        let Some((conversation_id, model)) = otlp_request_pair_key(&records[index].attributes)?
+        else {
             continue;
         };
+        let key = (source_generation.to_owned(), conversation_id, model);
         if event_name == "codex.api_request" {
-            pending.insert(key, index);
+            let request_id = optional_string(&records[index].attributes, "request_id")?;
+            let sequence = state.next_sequence();
+            state.push(
+                key,
+                PendingOtlpRequest {
+                    request_id,
+                    inserted_at_unix_ms: now_unix_ms,
+                    sequence,
+                    current_record_index: Some(index),
+                },
+            );
             continue;
         }
-        let Some(api_index) = pending.remove(&key) else {
+        let pending = state.pending.get_mut(&key).and_then(VecDeque::pop_front);
+        let remove_key = state.pending.get(&key).is_some_and(VecDeque::is_empty);
+        if remove_key {
+            state.pending.remove(&key);
+        }
+        let Some(pending) = pending else {
             continue;
         };
-        let api_request_id = optional_string(&records[api_index].attributes, "request_id")?;
         let completed_request_id = optional_string(&records[index].attributes, "request_id")?;
-        let request_id = match (api_request_id, completed_request_id) {
+        let request_id = match (pending.request_id, completed_request_id) {
             (Some(api), Some(completed)) if api == completed => Some(api),
             (Some(api), None) => Some(api),
             (None, Some(completed)) => Some(completed),
             (None, None) | (Some(_), Some(_)) => None,
         };
         if let Some(request_id) = request_id {
-            records[api_index]
-                .attributes
-                .insert("request_id".into(), Value::String(request_id.clone()));
+            if let Some(api_index) = pending.current_record_index {
+                records[api_index]
+                    .attributes
+                    .insert("request_id".into(), Value::String(request_id.clone()));
+            }
             records[index]
                 .attributes
                 .insert("request_id".into(), Value::String(request_id));
         } else {
-            records[api_index].attributes.remove("request_id");
+            if let Some(api_index) = pending.current_record_index {
+                records[api_index].attributes.remove("request_id");
+            }
             records[index].attributes.remove("request_id");
         }
     }
+    state.finish_batch();
     Ok(())
 }
 
@@ -1014,8 +1155,10 @@ fn stable_id(prefix: &str, components: &[&str]) -> String {
 mod tests {
     use super::{
         AdapterError, AdapterItem, DiagnosticCode, MAX_HANDOFF_BYTES, MAX_HANDOFF_LINE_BYTES,
-        MAX_HANDOFF_LINES, MAX_OTLP_LOG_RECORDS, parse_handoff_jsonl, parse_notify_json,
-        parse_otlp_http_json, read_handoff_file,
+        MAX_HANDOFF_LINES, MAX_OTLP_LOG_RECORDS, MAX_PENDING_OTLP_REQUESTS,
+        OTLP_REQUEST_CORRELATION_TTL_MS, OtlpRequestCorrelationState, parse_handoff_jsonl,
+        parse_notify_json, parse_otlp_http_json, parse_otlp_http_json_with_state,
+        read_handoff_file,
     };
     use agent_observability_contracts::ObservationEvent;
     use agent_observability_domain::LifecycleState;
@@ -1027,6 +1170,38 @@ mod tests {
         "sha256:0b30a1810b6e34152310691a3a660ecf33e98d4940fc63fe9b340811241f526c";
     const EXPECTED_PROJECTION_HASH: &str =
         "sha256:6dc1fa2ad7837c0e9ac2dcd6ac0dca52da1b0c11872db203d53ae742c97ee45a";
+
+    fn otlp_api_request(conversation_id: &str, request_id: &str) -> Vec<u8> {
+        format!(
+            r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"attributes":[
+              {{"key":"event.name","value":{{"stringValue":"codex.api_request"}}}},
+              {{"key":"conversation.id","value":{{"stringValue":"{conversation_id}"}}}},
+              {{"key":"model","value":{{"stringValue":"gpt-test"}}}},
+              {{"key":"auth.request_id","value":{{"stringValue":"{request_id}"}}}}
+            ]}}]}}]}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    fn otlp_completed_response(conversation_id: &str) -> Vec<u8> {
+        format!(
+            r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"attributes":[
+              {{"key":"event.name","value":{{"stringValue":"codex.sse_event"}}}},
+              {{"key":"conversation.id","value":{{"stringValue":"{conversation_id}"}}}},
+              {{"key":"model","value":{{"stringValue":"gpt-test"}}}},
+              {{"key":"event.kind","value":{{"stringValue":"response.completed"}}}}
+            ]}}]}}]}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    fn only_request_id(batch: &super::AdapterBatch) -> Option<&str> {
+        batch
+            .observations()
+            .find(|observation| matches!(observation.event, ObservationEvent::ModelRequest { .. }))
+            .and_then(|observation| observation.correlation.request_id.as_ref())
+            .map(agent_observability_domain::RequestId::as_str)
+    }
 
     #[test]
     fn current_codex_otlp_json_is_allowlisted_before_canonical_mapping() {
@@ -1150,6 +1325,144 @@ mod tests {
         assert!(!debug.contains("otlp-42"));
         assert!(!debug.contains("RAW_API_ERROR_SECRET"));
         assert!(!debug.contains("RAW_RESPONSE_SECRET"));
+    }
+
+    #[test]
+    fn stateful_correlation_pairs_split_exports_in_fifo_order() {
+        let mut state = OtlpRequestCorrelationState::default();
+        for (cursor, request_id) in [(1, "request-1"), (2, "request-2")] {
+            let (batch, _) = parse_otlp_http_json_with_state(
+                &otlp_api_request("conversation-1", request_id),
+                "generation-a",
+                None,
+                cursor,
+                100,
+                &mut state,
+            )
+            .unwrap();
+            assert_eq!(only_request_id(&batch), Some(request_id));
+        }
+        assert_eq!(state.pending_len(), 2);
+
+        for (cursor, request_id) in [(3, "request-1"), (4, "request-2")] {
+            let (batch, _) = parse_otlp_http_json_with_state(
+                &otlp_completed_response("conversation-1"),
+                "generation-a",
+                None,
+                cursor,
+                101,
+                &mut state,
+            )
+            .unwrap();
+            assert_eq!(only_request_id(&batch), Some(request_id));
+        }
+        assert_eq!(state.pending_len(), 0);
+    }
+
+    #[test]
+    fn correlation_isolated_by_generation_and_restart_fails_closed() {
+        let mut state = OtlpRequestCorrelationState::default();
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("conversation-1", "request-1"),
+            "generation-a",
+            None,
+            1,
+            100,
+            &mut state,
+        )
+        .unwrap();
+
+        for (generation, state) in [
+            ("generation-b", &mut state),
+            ("generation-a", &mut OtlpRequestCorrelationState::default()),
+        ] {
+            let (batch, _) = parse_otlp_http_json_with_state(
+                &otlp_completed_response("conversation-1"),
+                generation,
+                None,
+                2,
+                101,
+                state,
+            )
+            .unwrap();
+            assert_eq!(batch.observations().count(), 0);
+            assert_eq!(
+                batch.diagnostics().next().map(|diagnostic| diagnostic.code),
+                Some(DiagnosticCode::MissingCorrelation)
+            );
+        }
+    }
+
+    #[test]
+    fn correlation_expires_and_never_exceeds_hard_capacity() {
+        let mut state = OtlpRequestCorrelationState::default();
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("expired", "request-expired"),
+            "generation-a",
+            None,
+            1,
+            100,
+            &mut state,
+        )
+        .unwrap();
+        let (expired, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response("expired"),
+            "generation-a",
+            None,
+            2,
+            100 + OTLP_REQUEST_CORRELATION_TTL_MS,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(expired.observations().count(), 0);
+        assert_eq!(state.pending_len(), 0);
+
+        for index in 0..=MAX_PENDING_OTLP_REQUESTS {
+            parse_otlp_http_json_with_state(
+                &otlp_api_request(
+                    &format!("conversation-{index}"),
+                    &format!("request-{index}"),
+                ),
+                "generation-a",
+                None,
+                index as u64 + 3,
+                200,
+                &mut state,
+            )
+            .unwrap();
+        }
+        assert_eq!(state.pending_len(), MAX_PENDING_OTLP_REQUESTS);
+
+        let (evicted, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response("conversation-0"),
+            "generation-a",
+            None,
+            2_000,
+            201,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(evicted.observations().count(), 0);
+        assert_eq!(
+            evicted
+                .diagnostics()
+                .next()
+                .map(|diagnostic| diagnostic.code),
+            Some(DiagnosticCode::MissingCorrelation)
+        );
+        let (retained, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response(&format!("conversation-{MAX_PENDING_OTLP_REQUESTS}")),
+            "generation-a",
+            None,
+            2_001,
+            201,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            only_request_id(&retained),
+            Some(format!("request-{MAX_PENDING_OTLP_REQUESTS}").as_str())
+        );
     }
 
     #[test]
