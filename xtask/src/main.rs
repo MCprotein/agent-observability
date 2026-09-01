@@ -3,7 +3,7 @@ use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, Permissions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,10 @@ use agent_observability_domain::{
     CorrelationIds, LifecycleState, ObservationId, SourceCursor, SourceGeneration, SpanId, Timing,
     TokenUsage, TraceId,
 };
-use agent_observability_local_collector::{CollectorSettings, TOKEN_HEADER, load_settings};
+use agent_observability_local_collector::{
+    CollectorSettings, HealthOutcome, check_health, install_settings, load_settings,
+    submit_otlp_json,
+};
 use agent_observability_local_runtime::{
     Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressMessage, IngressOutcome, LocalRuntimeConfigV2,
     PressureSample, RuntimeControl, StorageBudget,
@@ -31,7 +34,8 @@ const USAGE: &str =
 const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-performance-v1.yaml");
 const AUTOMATIC_PROTOCOL: &str =
     include_str!("../../crates/contracts/performance/automatic-local-performance-v1.yaml");
-const AUTOMATIC_PROTOCOL_REVISION: &str = "v1.3.0-sustained-primary-otlp-crash-lifecycle-scenarios";
+const AUTOMATIC_PROTOCOL_REVISION: &str =
+    "v1.4.0-centralized-mtls-primary-otlp-crash-lifecycle-scenarios";
 const REQUIRED_PROTOCOL_LINES: [&str; 50] = [
     "schema_version: local_performance.v1",
     "protocol_revision: v1.2.0-supported-rate-saturation-continuous-network",
@@ -1141,7 +1145,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
     let smoke = AutomaticConfig::for_profile(Profile::Smoke);
     AutomaticProtocol {
         schema_version: "automatic_local_performance.v1".into(),
-        version: "v1.3.0".into(),
+        version: "v1.4.0".into(),
         protocol_revision: AUTOMATIC_PROTOCOL_REVISION.into(),
         purpose: "normative performance evidence for the shipped Codex automatic local path".into(),
         profiles: AutomaticProtocolProfiles {
@@ -1169,13 +1173,13 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
         workload: AutomaticProtocolWorkload {
             lifecycle_preflight: "bounded built-binary no-argument setup --no-open under isolated HOME and CODEX_HOME".into(),
             lifecycle_seed: "exact private Codex config bytes and permission mode".into(),
-            lifecycle_assertions: "connected config, ready or degraded collector, installed LaunchAgent plist, pre-failure authenticated primary OTLP and notify durability, unexpected SIGKILL service termination and bounded launchd kickstart recovery, post-recovery authenticated primary OTLP and notify durability, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service".into(),
+            lifecycle_assertions: "connected config, ready or degraded collector, installed LaunchAgent plist, pre-failure mutual-TLS primary OTLP and notify durability, unexpected SIGKILL service termination and bounded launchd kickstart recovery, post-recovery mutual-TLS primary OTLP and notify durability, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service".into(),
             lifecycle_cleanup: "best-effort bounded disconnect, bootout, exact seed restoration, plist removal, and isolated directory removal on success or error".into(),
-            primary_boundary: "sustained authenticated Codex OTLP/HTTP /v1/logs requests through the built collector and durable report authority".into(),
-            notify_boundary: "separately verified built agent-observability codex-notify supplement through authenticated loopback response".into(),
+            primary_boundary: "sustained mutual-TLS Codex OTLP/HTTP /v1/logs requests through the centralized local-collector client and durable report authority".into(),
+            notify_boundary: "separately verified built agent-observability codex-notify supplement through mutual-TLS loopback response".into(),
             collector_boundary: "built agent-observability collector-serve subprocess".into(),
             payload: "bounded valid Codex OTLP log pairs with synthetic opaque identifiers; one bounded notify supplement per measured run".into(),
-            readiness: "accepted authenticated primary OTLP request within a bounded startup deadline".into(),
+            readiness: "successful mutual-TLS health probe through the centralized local-collector client within a bounded startup deadline".into(),
             collector_shutdown: "bounded child termination and wait".into(),
         },
         metrics: AutomaticProtocolMetrics {
@@ -1198,7 +1202,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
                 allocated_tree_bytes_max: AUTOMATIC_ALLOCATED_DISK_BYTES_MAX,
             },
             network: AutomaticNetworkMetrics {
-                allowed_transport: "authenticated IPv4 loopback only".into(),
+                allowed_transport: "mutual-TLS IPv4 loopback only".into(),
                 bytes: "measured collector process bytes from the existing platform NetworkMonitor and reported without classifying loopback traffic as external".into(),
                 endpoints: "every observed collector endpoint must be IPv4 loopback".into(),
                 evidence: "process NetworkMonitor plus independent socket endpoint scans plus static product surface validation".into(),
@@ -1213,7 +1217,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
         evidence: AutomaticProtocolEvidence {
             output: "docs/evidence/local/performance/automatic-<run>/manifest.yaml".into(),
             exact_source: "full git commit, locked build command, package version, profile, and protocol revision".into(),
-            sanitized_paths: "run-relative runtime and protocol paths only; token, port, host path, payload, and raw collector output are forbidden".into(),
+            sanitized_paths: "run-relative runtime and protocol paths only; credentials, private key content, port, host path, payload, and raw collector output are forbidden".into(),
         },
     }
 }
@@ -1998,7 +2002,6 @@ fn verify_inherited_automatic_plist(
 }
 
 fn submit_automatic_primary_otlp(root: &Path, run: usize, event: usize) -> Result<(), String> {
-    let settings = load_settings(root).map_err(|error| error.to_string())?;
     let body = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
       {"attributes":[
         {"key":"event.name","value":{"stringValue":"codex.api_request"}},
@@ -2018,32 +2021,11 @@ fn submit_automatic_primary_otlp(root: &Path, run: usize, event: usize) -> Resul
     ]}]}]}"#
         .replace("$RUN", &run.to_string())
         .replace("$EVENT", &event.to_string());
-    let mut stream = TcpStream::connect_timeout(
-        &(Ipv4Addr::LOCALHOST, settings.port).into(),
-        LOCAL_COMMAND_TIMEOUT,
-    )
-    .map_err(|error| format!("connect automatic lifecycle OTLP collector: {error}"))?;
-    stream
-        .set_read_timeout(Some(LOCAL_COMMAND_TIMEOUT))
-        .and_then(|()| stream.set_write_timeout(Some(LOCAL_COMMAND_TIMEOUT)))
-        .map_err(|error| format!("set automatic lifecycle OTLP timeout: {error}"))?;
-    write!(
-        stream,
-        "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\n{TOKEN_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        settings.token,
-        body.len()
-    )
-    .and_then(|()| stream.write_all(body.as_bytes()))
-    .and_then(|()| stream.flush())
-    .map_err(|error| format!("submit automatic lifecycle OTLP request: {error}"))?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| format!("read automatic lifecycle OTLP response: {error}"))?;
-    if !response.starts_with("HTTP/1.1 200") {
-        return Err("automatic lifecycle primary OTLP request was rejected".into());
+    if submit_otlp_json(root, body.as_bytes()).map_err(|error| error.to_string())? {
+        Ok(())
+    } else {
+        Err("automatic lifecycle primary OTLP request was rejected".into())
     }
-    Ok(())
 }
 
 fn wait_for_automatic_lifecycle_recovery(
@@ -2427,16 +2409,7 @@ fn execute_automatic_run(
 ) -> Result<AutomaticRunResult, String> {
     let root = runtime_root.join(format!("run-{run}"));
     run_bounded_product_command(binary, &["init", path_text(&root)?], LOCAL_COMMAND_TIMEOUT)?;
-    let port = available_loopback_port()?;
-    let settings = format!(
-        "{{\n  \"schema_version\": \"local_collector.v1\",\n  \"port\": {port},\n  \"token\": \"{}\",\n  \"source_generation\": \"automatic-perf-v1\"\n}}\n",
-        "a".repeat(64)
-    );
-    let settings_path = root.join("runtime/collector.json");
-    fs::write(&settings_path, settings)
-        .map_err(|error| format!("write automatic collector settings: {error}"))?;
-    fs::set_permissions(&settings_path, Permissions::from_mode(0o600))
-        .map_err(|error| format!("protect automatic collector settings: {error}"))?;
+    install_settings(&root).map_err(|error| error.to_string())?;
     let mut collector = ChildGuard(
         Command::new(binary)
             .args(["collector-serve", path_text(&root)?])
@@ -2447,7 +2420,7 @@ fn execute_automatic_run(
             .map_err(|error| format!("spawn built local collector: {error}"))?,
     );
     let mut network_monitor = NetworkMonitor::start(collector.id())?;
-    wait_for_automatic_ready(&root, &mut collector, run)?;
+    wait_for_automatic_ready(&root, &mut collector)?;
     assert_automatic_network_local(collector.id())?;
 
     let started = Instant::now();
@@ -2628,11 +2601,7 @@ fn run_bounded_status_command(
     Ok(output)
 }
 
-fn wait_for_automatic_ready(
-    root: &Path,
-    collector: &mut ChildGuard,
-    run: usize,
-) -> Result<(), String> {
+fn wait_for_automatic_ready(root: &Path, collector: &mut ChildGuard) -> Result<(), String> {
     let started = Instant::now();
     loop {
         if collector
@@ -2642,7 +2611,10 @@ fn wait_for_automatic_ready(
         {
             return Err("built automatic collector exited during startup".into());
         }
-        if submit_automatic_primary_otlp(root, run, usize::MAX).is_ok() {
+        if matches!(
+            check_health(root),
+            HealthOutcome::Ready | HealthOutcome::Degraded
+        ) {
             return Ok(());
         }
         if started.elapsed() >= AUTOMATIC_START_TIMEOUT {
@@ -2661,13 +2633,6 @@ fn automatic_notify_payload(run: usize, event: usize) -> String {
 fn path_text(path: &Path) -> Result<&str, String> {
     path.to_str()
         .ok_or_else(|| "non-UTF8 automatic path".into())
-}
-
-fn available_loopback_port() -> Result<u16, String> {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .and_then(|listener| listener.local_addr())
-        .map(|address| address.port())
-        .map_err(|error| format!("reserve automatic loopback port: {error}"))
 }
 
 fn automatic_sample_phase(
@@ -4057,7 +4022,8 @@ fn validate_network_urls(path: &str, body: &str) -> Result<(), String> {
                 })
                 .unwrap_or(suffix.len());
             let url = &suffix[..end];
-            let allowed_loopback = url.starts_with("http://127.0.0.1:");
+            let allowed_loopback =
+                url.starts_with("http://127.0.0.1:") || url.starts_with("https://127.0.0.1:");
             let allowed_non_destination = matches!(
                 (path, url),
                 (
@@ -4400,7 +4366,7 @@ fn render_automatic_manifest(
         .map(|result| result.network_monitor_samples)
         .sum::<u64>();
     let mut manifest = format!(
-        "schema_version: automatic_local_performance.v1\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-setup-sigkill-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  primary_boundary: sustained-authenticated-codex-otlp-http-v1-logs-through-built-collector-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-supplement\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  primary_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  primary_otlp_p95_us: {}\n  primary_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_peak_rss_kib: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
+        "schema_version: automatic_local_performance.v1\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-setup-sigkill-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  primary_boundary: sustained-mtls-codex-otlp-http-v1-logs-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-mtls-supplement\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  primary_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  primary_otlp_p95_us: {}\n  primary_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_peak_rss_kib: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
         profile_name(config.profile),
         profile_name(config.profile),
         env!("CARGO_PKG_VERSION"),
@@ -4467,12 +4433,12 @@ fn render_automatic_manifest(
 fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
     for field in [
         "schema_version: automatic_local_performance.v1",
-        "protocol_revision: v1.3.0-sustained-primary-otlp-crash-lifecycle-scenarios",
+        "protocol_revision: v1.4.0-centralized-mtls-primary-otlp-crash-lifecycle-scenarios",
         "source_revision:",
         "cargo_locked: true",
         "collector_boundary: built-agent-observability-collector-serve-subprocess",
-        "primary_boundary: sustained-authenticated-codex-otlp-http-v1-logs-through-built-collector-and-durable-report",
-        "notify_boundary: separately-verified-built-agent-observability-codex-notify-supplement",
+        "primary_boundary: sustained-mtls-codex-otlp-http-v1-logs-through-centralized-local-collector-client-and-durable-report",
+        "notify_boundary: separately-verified-built-agent-observability-codex-notify-mtls-supplement",
         "primary_otlp_p95_us:",
         "primary_otlp_p99_us:",
         "collector_idle_cpu_percent_max:",
@@ -4489,7 +4455,17 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
             return Err(format!("automatic performance manifest is missing {field}"));
         }
     }
-    for forbidden in ["/tmp/", "/private/tmp/", "collector.json", "\"token\""] {
+    for forbidden in [
+        "/tmp/",
+        "/private/tmp/",
+        "collector.json",
+        "\"token\"",
+        "private_key",
+        "private-key.pem",
+        "BEGIN PRIVATE KEY",
+        "BEGIN RSA PRIVATE KEY",
+        "BEGIN EC PRIVATE KEY",
+    ] {
         if manifest.contains(forbidden) {
             return Err(format!(
                 "automatic performance manifest contains unsanitized field {forbidden}"
@@ -5152,7 +5128,7 @@ mod tests {
         assert!(AUTOMATIC_PROTOCOL.contains("validation_scope: every run independently"));
         assert!(AUTOMATIC_PROTOCOL.contains("NetworkMonitor"));
         assert!(AUTOMATIC_PROTOCOL.contains("unexpected SIGKILL service termination"));
-        assert!(AUTOMATIC_PROTOCOL.contains("sustained authenticated Codex OTLP/HTTP /v1/logs"));
+        assert!(AUTOMATIC_PROTOCOL.contains("sustained mutual-TLS Codex OTLP/HTTP /v1/logs"));
         assert!(
             AUTOMATIC_PROTOCOL
                 .contains("separately verified built agent-observability codex-notify")
@@ -5402,6 +5378,20 @@ mod tests {
             "",
         );
         assert!(validate_automatic_manifest_shape(&missing_lifecycle).is_err());
+
+        for private_key_evidence in [
+            "private_key: leaked",
+            "client-private-key.pem",
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+        ] {
+            assert!(
+                validate_automatic_manifest_shape(&format!("{manifest}\n{private_key_evidence}\n"))
+                    .is_err(),
+                "automatic manifest accepted private key evidence: {private_key_evidence}"
+            );
+        }
     }
 
     #[test]
@@ -5409,7 +5399,7 @@ mod tests {
         validate_network_file(
             Path::new("crates/local-collector/src/lib.rs"),
             "use std::net::{Ipv4Addr, TcpStream}; use tokio::net::TcpListener; \
-             TcpListener::bind(Ipv4Addr::LOCALHOST); http://127.0.0.1:4318/v1/logs",
+             TcpListener::bind(Ipv4Addr::LOCALHOST); https://127.0.0.1:4318/v1/logs",
         )
         .unwrap();
         validate_network_file(

@@ -1,6 +1,6 @@
 schema_version: automatic_local_performance.v1
-version: v1.3.0
-protocol_revision: v1.3.0-sustained-primary-otlp-crash-lifecycle-scenarios
+version: v1.4.0
+protocol_revision: v1.4.0-centralized-mtls-primary-otlp-crash-lifecycle-scenarios
 purpose: normative performance evidence for the shipped Codex automatic local path
 profiles:
   release:
@@ -23,13 +23,13 @@ profiles:
 workload:
   lifecycle_preflight: bounded built-binary no-argument setup --no-open under isolated HOME and CODEX_HOME
   lifecycle_seed: exact private Codex config bytes and permission mode
-  lifecycle_assertions: connected config, ready or degraded collector, installed LaunchAgent plist, pre-failure authenticated primary OTLP and notify durability, unexpected SIGKILL service termination and bounded launchd kickstart recovery, post-recovery authenticated primary OTLP and notify durability, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service
+  lifecycle_assertions: connected config, ready or degraded collector, installed LaunchAgent plist, pre-failure mutual-TLS primary OTLP and notify durability, unexpected SIGKILL service termination and bounded launchd kickstart recovery, post-recovery mutual-TLS primary OTLP and notify durability, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service
   lifecycle_cleanup: best-effort bounded disconnect, bootout, exact seed restoration, plist removal, and isolated directory removal on success or error
-  primary_boundary: sustained authenticated Codex OTLP/HTTP /v1/logs requests through the built collector and durable report authority
-  notify_boundary: separately verified built agent-observability codex-notify supplement through authenticated loopback response
+  primary_boundary: sustained mutual-TLS Codex OTLP/HTTP /v1/logs requests through the centralized local-collector client and durable report authority
+  notify_boundary: separately verified built agent-observability codex-notify supplement through mutual-TLS loopback response
   collector_boundary: built agent-observability collector-serve subprocess
   payload: bounded valid Codex OTLP log pairs with synthetic opaque identifiers; one bounded notify supplement per measured run
-  readiness: accepted authenticated primary OTLP request within a bounded startup deadline
+  readiness: successful mutual-TLS health probe through the centralized local-collector client within a bounded startup deadline
   collector_shutdown: bounded child termination and wait
 metrics:
   primary_otlp:
@@ -47,7 +47,7 @@ metrics:
   disk:
     allocated_tree_bytes_max: 1073741824
   network:
-    allowed_transport: authenticated IPv4 loopback only
+    allowed_transport: mutual-TLS IPv4 loopback only
     bytes: measured collector process bytes from the existing platform NetworkMonitor and reported without classifying loopback traffic as external
     endpoints: every observed collector endpoint must be IPv4 loopback
     evidence: process NetworkMonitor plus independent socket endpoint scans plus static product surface validation
@@ -59,4 +59,4 @@ execution:
 evidence:
   output: docs/evidence/local/performance/automatic-<run>/manifest.yaml
   exact_source: full git commit, locked build command, package version, profile, and protocol revision
-  sanitized_paths: run-relative runtime and protocol paths only; token, port, host path, payload, and raw collector output are forbidden
+  sanitized_paths: run-relative runtime and protocol paths only; credentials, private key content, port, host path, payload, and raw collector output are forbidden
