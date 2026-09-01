@@ -547,7 +547,6 @@ fn terminate_monitor_descendants(pid: u32) -> Result<(), String> {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn errors_result(errors: &[String]) -> Result<(), String> {
     if errors.is_empty() {
         Ok(())
