@@ -4,28 +4,33 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.5.0 범위:** one-command local setup, 내장 demo, 시각적 로컬 설정, 수동 private handoff import를 지원한다.
+> **v1.6.0 범위:** one-command checksum-checked install, local setup, 내장 demo, 시각적 로컬 설정,
+> 수동 private handoff import를 지원한다.
 > agent 원본 로그를 자동으로 읽는 연결 기능은 아직 제공하지 않는다.
 
 ## 빠른 시작
 
 ### 1. 설치
 
-Apple Silicon과 Intel Mac을 모두 지원하는 universal binary를 설치한다.
+Apple Silicon과 Intel Mac을 모두 지원하는 universal binary를 설치한다. 설치기는 release
+checksum과 실행 파일 버전을 확인한 뒤 `~/.local/bin`에 원자적으로 설치하고, 현재 shell의
+profile에 PATH 블록을 한 번만 등록한다.
 
 ```bash
-gh release download v1.5.0 \
-  --repo MCprotein/agent-observability \
-  --pattern 'agent-observability-1.5.0-darwin-universal2.tar.gz'
-tar -xzf agent-observability-1.5.0-darwin-universal2.tar.gz
-install -d ~/.local/bin
-install -m 0755 \
-  agent-observability-1.5.0-darwin-universal2/agent-observability \
-  ~/.local/bin/agent-observability
-export PATH="$HOME/.local/bin:$PATH"
+(
+  set -eu
+  installer="$(mktemp)"
+  trap 'rm -f "$installer"' 0
+  curl -fsSL https://github.com/MCprotein/agent-observability/releases/latest/download/install.sh -o "$installer"
+  sh "$installer"
+)
 ```
 
-새 terminal에서도 사용하려면 같은 `export`를 `~/.zshrc`에 추가한다.
+새 terminal부터 별도 설정 없이 사용할 수 있다. 현재 terminal의 PATH에 설치 경로가 없으면
+설치기가 출력하는 `. <선택된 profile>` 명령(기본 zsh는 `. ~/.zshrc`)을 한 번 실행한다. 설치 위치와 profile은 각각
+`AGENT_OBSERVABILITY_INSTALL_DIR`, `AGENT_OBSERVABILITY_SHELL_PROFILE`로 변경할 수 있다.
+checksum은 다운로드 무결성을 확인한다. 릴리스 자산의 repository/workflow provenance는 GitHub
+artifact attestation으로 별도 게시된다.
 
 ### 2. 대시보드 체험
 
@@ -156,7 +161,7 @@ flowchart LR
 ```
 
 - 점선은 현재 release가 제공하지 않는 agent별 producer 경계다.
-- 실선은 `v1.5.0` CLI가 구현하고 검증하는 local-only 경로다.
+- 실선은 `v1.6.0` CLI가 구현하고 검증하는 local-only 경로다.
 - agent별 차이는 adapter에서 끝나고 이후 저장·비용·UI contract는 하나다.
 - SQLite가 로컬 권위 저장소이며 JSONL archive와 HTML은 다시 만들 수 있는 projection이다.
 - TypeScript UI는 원본 agent payload가 아니라 Rust가 검증한 report DTO만 받는다.

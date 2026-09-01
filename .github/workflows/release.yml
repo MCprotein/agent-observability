@@ -127,6 +127,8 @@ jobs:
           install -m 0755 stage/agent-observability \
             "stage/agent-observability-$version-darwin-universal2/agent-observability"
           cp README.md LICENSE "stage/agent-observability-$version-darwin-universal2/"
+          install -m 0755 scripts/install.sh \
+            "stage/agent-observability-$version-darwin-universal2/install.sh"
           cp examples/codex-handoff.v1.jsonl \
             "stage/agent-observability-$version-darwin-universal2/examples/"
           tar -C stage -czf "dist/agent-observability-$version-darwin-universal2.tar.gz" \
@@ -138,6 +140,8 @@ jobs:
           install -m 0755 stage/agent-observability npm-stage/bin/agent-observability
           npm pack ./npm-stage --pack-destination dist
 
+          install -m 0755 scripts/install.sh dist/install.sh
+
           tar -xzf dist/mcprotein-agent-observability-"$version".tgz -C stage
           test -x stage/package/bin/agent-observability
           test "$(stage/package/bin/agent-observability --version)" = "$version"
@@ -145,14 +149,34 @@ jobs:
 
           (
             cd dist
-            shasum -a 256 -- *.tar.gz *.tgz > SHA256SUMS
+            shasum -a 256 -- *.tar.gz *.tgz install.sh > SHA256SUMS
           )
+      - name: Smoke test release installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          fixture="$RUNNER_TEMP/agent-observability-releases/download/$GITHUB_REF_NAME"
+          home="$RUNNER_TEMP/agent-observability-installer-home"
+          mkdir -p "$fixture" "$home"
+          cp "dist/agent-observability-$version-darwin-universal2.tar.gz" \
+            dist/SHA256SUMS "$fixture/"
+
+          HOME="$home" \
+          SHELL=/bin/zsh \
+          AGENT_OBSERVABILITY_VERSION="$version" \
+          AGENT_OBSERVABILITY_RELEASE_BASE_URL="file://$RUNNER_TEMP/agent-observability-releases" \
+            sh dist/install.sh
+
+          test "$("$home/.local/bin/agent-observability" --version)" = "$version"
+          grep -Fxq '# >>> agent-observability PATH >>>' "$home/.zshrc"
       - name: Attest release artifacts
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: |
             dist/*.tar.gz
             dist/*.tgz
+            dist/install.sh
       - name: Create or update draft release
         env:
           GH_TOKEN: ${{ github.token }}

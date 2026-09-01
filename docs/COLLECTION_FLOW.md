@@ -6,7 +6,7 @@
 
 ## Scope Boundary
 
-| Boundary | v1.5.0 status |
+| Boundary | v1.6.0 status |
 | --- | --- |
 | Private canonical handoff parser | Implemented for Codex, Claude Code, Cursor |
 | One-shot local ingest CLI | Implemented |
@@ -59,7 +59,7 @@ flowchart TB
     Store --> Report --> Browser
 ```
 
-점선 경로는 v1.5.0 repository가 제공하지 않는 upstream producer boundary다. 실선은 현재 Rust CLI가
+점선 경로는 v1.6.0 repository가 제공하지 않는 upstream producer boundary다. 실선은 현재 Rust CLI가
 구현하고 테스트하는 local-only 경로다.
 
 ## Ingest Sequence
