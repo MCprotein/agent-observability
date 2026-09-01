@@ -5,6 +5,7 @@ set -eu
 repository="MCprotein/agent-observability"
 default_release_base_url="https://github.com/$repository/releases"
 release_base_url=${AGENT_OBSERVABILITY_RELEASE_BASE_URL:-$default_release_base_url}
+release_base_url=${release_base_url%/}
 install_dir=${AGENT_OBSERVABILITY_INSTALL_DIR:-"$HOME/.local/bin"}
 platform=${AGENT_OBSERVABILITY_PLATFORM:-$(uname -s)}
 
@@ -118,7 +119,15 @@ esac
 marker_start="# >>> agent-observability PATH >>>"
 marker_end="# <<< agent-observability PATH <<<"
 quoted_profile=$(printf '%s' "$profile" | sed "s/'/'\\\\''/g")
-if [ ! -f "$profile" ] || ! grep -Fq "$marker_start" "$profile"; then
+has_marker_start=false
+has_marker_end=false
+if [ -f "$profile" ]; then
+  grep -Fxq "$marker_start" "$profile" && has_marker_start=true
+  grep -Fxq "$marker_end" "$profile" && has_marker_end=true
+fi
+[ "$has_marker_start" = "$has_marker_end" ] ||
+  fail "shell profile contains an incomplete agent-observability PATH block"
+if [ "$has_marker_start" = false ]; then
   profile_dir=${profile%/*}
   [ "$profile_dir" = "$profile" ] || install -d -m 0755 "$profile_dir"
   quoted_install_dir=$(printf '%s' "$install_dir" | sed "s/'/'\\\\''/g")
@@ -126,7 +135,7 @@ if [ ! -f "$profile" ] || ! grep -Fq "$marker_start" "$profile"; then
     [ ! -s "$profile" ] || printf '\n'
     printf '%s\n' "$marker_start"
     printf 'case ":$PATH:" in\n'
-    printf '  *":%s:"*) ;;\n' "$quoted_install_dir"
+    printf "  *:'%s':*) ;;\n" "$quoted_install_dir"
     printf '  *) export PATH='"'"'%s'"'"':"$PATH" ;;\n' "$quoted_install_dir"
     printf 'esac\n'
     printf '%s\n' "$marker_end"

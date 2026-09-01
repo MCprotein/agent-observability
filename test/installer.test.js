@@ -103,3 +103,26 @@ test("checksum failure preserves an existing installation and profile", (t) => {
   assert.equal(readFileSync(binary, "utf8"), "existing installation\n");
   assert.equal(readFileSync(join(fixture.home, ".zshrc"), "utf8"), "existing profile\n");
 });
+
+test("custom install and profile paths remain valid shell syntax", (t) => {
+  const fixture = makeFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  const installDir = join(fixture.home, "tools' bin");
+  const profile = join(fixture.home, "shell profiles", "agent profile");
+  execFileSync("sh", [installer], {
+    env: {
+      ...fixture.env,
+      AGENT_OBSERVABILITY_INSTALL_DIR: installDir,
+      AGENT_OBSERVABILITY_SHELL_PROFILE: profile,
+    },
+  });
+
+  const quotedProfile = profile.replaceAll("'", "'\\''");
+  const output = execFileSync(
+    "sh",
+    ["-c", `. '${quotedProfile}'; agent-observability --version`],
+    { encoding: "utf8", env: fixture.env },
+  );
+  assert.equal(output.trim(), "1.6.0");
+});
