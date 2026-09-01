@@ -26,6 +26,7 @@ use std::{
 };
 
 const MAX_HEALTH_RESPONSE_BYTES: u64 = 4 * 1024;
+const COLLECTOR_READY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "macos")]
 const LAUNCH_AGENT_OWNERSHIP_VERSION: &str = "agent-observability.launch-agent-ownership.v1";
 #[cfg(target_os = "macos")]
@@ -1718,17 +1719,21 @@ fn uninstall_collector_service(_service: &CollectorService) -> Result<(), Integr
 }
 
 fn wait_for_collector(root: &Path) -> Result<CollectorStatus, IntegrationError> {
-    for _ in 0..40 {
+    let started = std::time::Instant::now();
+    loop {
         if let Ok(settings) = load_settings(root) {
             let status = probe_health(&settings);
             if matches!(status, CollectorStatus::Ready | CollectorStatus::Degraded) {
                 return Ok(status);
             }
         }
+        if started.elapsed() >= COLLECTOR_READY_TIMEOUT {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     Err(IntegrationError::Runtime(
-        "local collector did not become ready within 2 seconds".into(),
+        "local collector did not become ready within 10 seconds".into(),
     ))
 }
 
