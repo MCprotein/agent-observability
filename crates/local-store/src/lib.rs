@@ -34,6 +34,7 @@ const REPORT_ACKNOWLEDGED_GENERATION_KEY: &str = "report_acknowledged_generation
 const CODEX_CORRELATION_KEY_PREFIX: &str = "codex_request_correlation.v1:";
 const MAX_CODEX_CORRELATION_STATE_BYTES: usize = 512 * 1024;
 const MAX_CODEX_PENDING_CORRELATIONS: usize = 1024;
+const MAX_CODEX_RECENTLY_COMPLETED_CORRELATIONS: usize = 1024;
 const MAX_EXPIRED_SPAN_GUARDS: u64 = 100_000;
 const MAX_RETENTION_RECEIPTS: u64 = 1_024;
 const MAX_ADAPTER_DISPOSITIONS: u64 = 100_000;
@@ -176,6 +177,8 @@ struct CodexCorrelationStateV1 {
     schema_version: String,
     next_sequence: u64,
     pending: Vec<CodexPendingCorrelationV1>,
+    #[serde(default)]
+    recently_completed: Vec<CodexCompletedOfficialRetryV1>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +191,17 @@ struct CodexPendingCorrelationV1 {
     #[serde(default)]
     official_retry_identity: Option<String>,
     inserted_at_unix_ms: u64,
+    sequence: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexCompletedOfficialRetryV1 {
+    source_generation_hash: String,
+    conversation_hash: String,
+    model_hash: String,
+    official_retry_identity: String,
+    completed_at_unix_ms: u64,
     sequence: u64,
 }
 
@@ -1296,6 +1310,12 @@ fn validate_codex_correlation_state(
     let expected_generation = hash_opaque_identifier(source_generation);
     if state.schema_version != "codex_request_correlation.v1"
         || state.pending.len() > MAX_CODEX_PENDING_CORRELATIONS
+        || state.recently_completed.len() > MAX_CODEX_RECENTLY_COMPLETED_CORRELATIONS
+        || state
+            .pending
+            .len()
+            .checked_add(state.recently_completed.len())
+            .is_none_or(|len| len > MAX_CODEX_PENDING_CORRELATIONS)
         || state.pending.iter().any(|pending| {
             pending.source_generation_hash != expected_generation
                 || !is_private_identifier_hash(&pending.conversation_hash)
@@ -1307,6 +1327,14 @@ fn validate_codex_correlation_state(
                     .is_some_and(|identity| !is_private_identifier_hash(identity))
                 || pending.sequence >= state.next_sequence
                 || pending.inserted_at_unix_ms == 0
+        })
+        || state.recently_completed.iter().any(|completed| {
+            completed.source_generation_hash != expected_generation
+                || !is_private_identifier_hash(&completed.conversation_hash)
+                || !is_private_identifier_hash(&completed.model_hash)
+                || !is_private_identifier_hash(&completed.official_retry_identity)
+                || completed.sequence >= state.next_sequence
+                || completed.completed_at_unix_ms == 0
         })
     {
         return Err(StoreError::InvalidObservation);
@@ -3205,7 +3233,7 @@ mod tests {
     fn correlation_snapshot(request_id: &str) -> String {
         serde_json::json!({
             "schema_version": "codex_request_correlation.v1",
-            "next_sequence": 1,
+            "next_sequence": 2,
             "pending": [{
                 "source_generation_hash": hash_opaque_identifier("generation"),
                 "conversation_hash": hash_opaque_identifier("conversation"),
@@ -3213,6 +3241,31 @@ mod tests {
                 "correlation_id": hash_opaque_identifier(request_id),
                 "official_retry_identity": hash_opaque_identifier(request_id),
                 "inserted_at_unix_ms": 100,
+                "sequence": 0
+            }],
+            "recently_completed": [{
+                "source_generation_hash": hash_opaque_identifier("generation"),
+                "conversation_hash": hash_opaque_identifier("conversation"),
+                "model_hash": hash_opaque_identifier("model"),
+                "official_retry_identity": hash_opaque_identifier(&format!("{request_id}-completed")),
+                "completed_at_unix_ms": 101,
+                "sequence": 1
+            }]
+        })
+        .to_string()
+    }
+
+    fn completed_correlation_snapshot(request_id: &str) -> String {
+        serde_json::json!({
+            "schema_version": "codex_request_correlation.v1",
+            "next_sequence": 1,
+            "pending": [],
+            "recently_completed": [{
+                "source_generation_hash": hash_opaque_identifier("generation"),
+                "conversation_hash": hash_opaque_identifier("conversation"),
+                "model_hash": hash_opaque_identifier("model"),
+                "official_retry_identity": hash_opaque_identifier(request_id),
+                "completed_at_unix_ms": 100,
                 "sequence": 0
             }]
         })
@@ -3602,6 +3655,18 @@ mod tests {
                 &items,
                 "generation",
                 &raw_official_identity,
+            ),
+            Err(StoreError::InvalidObservation)
+        ));
+        let raw_completed_identity = completed_correlation_snapshot("request-private").replace(
+            &hash_opaque_identifier("request-private"),
+            "raw-completed-request-id",
+        );
+        assert!(matches!(
+            store.ingest_codex_batch_with_correlation_state_deferred_projection(
+                &items,
+                "generation",
+                &raw_completed_identity,
             ),
             Err(StoreError::InvalidObservation)
         ));

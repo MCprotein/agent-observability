@@ -5,8 +5,9 @@ use agent_observability_contracts::{
     canonical_observation_payload_hash, hash_opaque_identifier,
 };
 use agent_observability_domain::{
-    CorrelationIds, LifecycleState, ObservationId, OperationId, PermissionId, RequestId, SessionId,
-    SourceCursor, SourceGeneration, SpanId, Timing, TokenUsage, TraceId, TurnId,
+    CorrelationIds, LifecycleState, MAX_IDENTIFIER_BYTES, ObservationId, OperationId, PermissionId,
+    RequestId, SessionId, SourceCursor, SourceGeneration, SpanId, Timing, TokenUsage, TraceId,
+    TurnId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,8 +25,11 @@ pub const MAX_HANDOFF_LINES: usize = 4096;
 pub const MAX_HANDOFF_LINE_BYTES: usize = 64 * 1024;
 pub const MAX_OTLP_LOG_RECORDS: usize = 4096;
 pub const MAX_PENDING_OTLP_REQUESTS: usize = 1024;
+pub const MAX_RECENTLY_COMPLETED_OTLP_REQUESTS: usize = 1024;
 pub const MAX_PERSISTED_OTLP_CORRELATION_BYTES: usize = 512 * 1024;
 pub const OTLP_REQUEST_CORRELATION_TTL_MS: u64 = 5 * 60 * 1000;
+pub const PROJECTED_NOTIFY_SCHEMA_VERSION: &str = "codex_projected_notify.v1";
+pub const MAX_PROJECTED_NOTIFY_BYTES: usize = MAX_IDENTIFIER_BYTES * 2 + 256;
 const KNOWN_CODEX_MODELS: &[&str] = &[
     "gpt-test",
     "gpt-5.4",
@@ -40,6 +44,88 @@ const KNOWN_CODEX_MODELS: &[&str] = &[
 pub enum SourceSurface {
     OtelLog,
     Notify,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNotifyPayload {
+    #[serde(rename = "type")]
+    event_name: String,
+    #[serde(rename = "thread-id")]
+    thread_id: String,
+    #[serde(rename = "turn-id")]
+    turn_id: String,
+    #[serde(rename = "cwd")]
+    _cwd: String,
+    #[serde(rename = "input-messages")]
+    _input_messages: Vec<String>,
+    #[serde(rename = "last-assistant-message")]
+    _last_assistant_message: Option<String>,
+}
+
+/// Strict, bounded privacy projection for a Codex `agent-turn-complete` notification.
+///
+/// This is the only notify representation that may cross a transport boundary. It contains the
+/// official event discriminator and opaque correlation identifiers, but no prompt, response, cwd,
+/// tool argument, or extension metadata.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectedNotifyV1 {
+    schema_version: String,
+    event_name: String,
+    thread_id: String,
+    turn_id: String,
+}
+
+impl ProjectedNotifyV1 {
+    fn new(event_name: String, thread_id: String, turn_id: String) -> Result<Self, AdapterError> {
+        if event_name != "agent-turn-complete" {
+            return Err(AdapterError::InvalidSchema);
+        }
+        parse_identifier::<SessionId>(&thread_id)?;
+        parse_identifier::<TurnId>(&turn_id)?;
+        Ok(Self {
+            schema_version: PROJECTED_NOTIFY_SCHEMA_VERSION.into(),
+            event_name,
+            thread_id,
+            turn_id,
+        })
+    }
+
+    fn validate(self) -> Result<Self, AdapterError> {
+        if self.schema_version != PROJECTED_NOTIFY_SCHEMA_VERSION {
+            return Err(AdapterError::InvalidSchema);
+        }
+        Self::new(self.event_name, self.thread_id, self.turn_id)
+    }
+
+    #[must_use]
+    pub fn event_name(&self) -> &str {
+        &self.event_name
+    }
+
+    #[must_use]
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    #[must_use]
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    /// Serializes the bounded allowlisted payload for local transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] if serialization fails or the projection exceeds its hard bound.
+    pub fn to_json(&self) -> Result<Vec<u8>, AdapterError> {
+        let encoded = serde_json::to_vec(self).map_err(|_| AdapterError::InvalidJson)?;
+        if encoded.len() > MAX_PROJECTED_NOTIFY_BYTES {
+            return Err(AdapterError::RecordTooLarge);
+        }
+        Ok(encoded)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -95,6 +181,8 @@ struct PersistedOtlpRequestCorrelationState {
     schema_version: String,
     next_sequence: u64,
     pending: Vec<PersistedPendingOtlpRequest>,
+    #[serde(default)]
+    recently_completed: Vec<PersistedCompletedOfficialRetry>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -110,10 +198,30 @@ struct PersistedPendingOtlpRequest {
     sequence: u64,
 }
 
+#[derive(Clone, Debug)]
+struct CompletedOfficialRetry {
+    key: OtlpRequestPairKey,
+    official_retry_identity: String,
+    completed_at_unix_ms: u64,
+    sequence: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedCompletedOfficialRetry {
+    source_generation_hash: String,
+    conversation_hash: String,
+    model_hash: String,
+    official_retry_identity: String,
+    completed_at_unix_ms: u64,
+    sequence: u64,
+}
+
 /// Bounded, content-free correlation state for Codex OTLP requests split across HTTP exports.
 #[derive(Clone, Debug, Default)]
 pub struct OtlpRequestCorrelationState {
     pending: BTreeMap<OtlpRequestPairKey, VecDeque<PendingOtlpRequest>>,
+    recently_completed: VecDeque<CompletedOfficialRetry>,
     next_sequence: u64,
 }
 
@@ -136,11 +244,18 @@ impl OtlpRequestCorrelationState {
             serde_json::from_str(input).map_err(|_| AdapterError::InvalidJson)?;
         if persisted.schema_version != "codex_request_correlation.v1"
             || persisted.pending.len() > MAX_PENDING_OTLP_REQUESTS
+            || persisted.recently_completed.len() > MAX_RECENTLY_COMPLETED_OTLP_REQUESTS
+            || persisted
+                .pending
+                .len()
+                .checked_add(persisted.recently_completed.len())
+                .is_none_or(|len| len > MAX_PENDING_OTLP_REQUESTS)
         {
             return Err(AdapterError::InvalidSchema);
         }
         let mut state = Self {
             pending: BTreeMap::new(),
+            recently_completed: VecDeque::new(),
             next_sequence: persisted.next_sequence,
         };
         for pending in persisted.pending {
@@ -171,6 +286,26 @@ impl OtlpRequestCorrelationState {
                 },
             );
         }
+        for completed in persisted.recently_completed {
+            if !is_private_hash(&completed.source_generation_hash)
+                || !is_private_hash(&completed.conversation_hash)
+                || !is_private_hash(&completed.model_hash)
+                || !is_private_hash(&completed.official_retry_identity)
+                || completed.sequence >= state.next_sequence
+            {
+                return Err(AdapterError::InvalidSchema);
+            }
+            state.recently_completed.push_back(CompletedOfficialRetry {
+                key: (
+                    completed.source_generation_hash,
+                    completed.conversation_hash,
+                    completed.model_hash,
+                ),
+                official_retry_identity: completed.official_retry_identity,
+                completed_at_unix_ms: completed.completed_at_unix_ms,
+                sequence: completed.sequence,
+            });
+        }
         state.expire(now_unix_ms);
         Ok(state)
     }
@@ -196,10 +331,23 @@ impl OtlpRequestCorrelationState {
                 })
             })
             .collect();
+        let recently_completed = self
+            .recently_completed
+            .iter()
+            .map(|completed| PersistedCompletedOfficialRetry {
+                source_generation_hash: completed.key.0.clone(),
+                conversation_hash: completed.key.1.clone(),
+                model_hash: completed.key.2.clone(),
+                official_retry_identity: completed.official_retry_identity.clone(),
+                completed_at_unix_ms: completed.completed_at_unix_ms,
+                sequence: completed.sequence,
+            })
+            .collect();
         let encoded = serde_json::to_string(&PersistedOtlpRequestCorrelationState {
             schema_version: "codex_request_correlation.v1".into(),
             next_sequence: self.next_sequence,
             pending,
+            recently_completed,
         })
         .map_err(|_| AdapterError::InvalidJson)?;
         if encoded.len() > MAX_PERSISTED_OTLP_CORRELATION_BYTES {
@@ -216,11 +364,23 @@ impl OtlpRequestCorrelationState {
             });
             !queue.is_empty()
         });
+        self.recently_completed.retain(|completed| {
+            now_unix_ms.saturating_sub(completed.completed_at_unix_ms)
+                < OTLP_REQUEST_CORRELATION_TTL_MS
+        });
     }
 
     fn push(&mut self, key: OtlpRequestPairKey, pending: PendingOtlpRequest) {
         self.pending.entry(key).or_default().push_back(pending);
-        while self.pending_len() > MAX_PENDING_OTLP_REQUESTS {
+        self.enforce_capacity();
+    }
+
+    fn enforce_capacity(&mut self) {
+        while self
+            .pending_len()
+            .saturating_add(self.recently_completed.len())
+            > MAX_PENDING_OTLP_REQUESTS
+        {
             self.evict_oldest();
         }
     }
@@ -234,17 +394,57 @@ impl OtlpRequestCorrelationState {
             queue.iter().any(|pending| {
                 pending.official_retry_identity.as_deref() == Some(official_retry_identity)
             })
+        }) || self.recently_completed.iter().any(|completed| {
+            &completed.key == key && completed.official_retry_identity == official_retry_identity
         })
     }
 
+    fn push_completed(&mut self, completed: CompletedOfficialRetry) {
+        self.recently_completed.push_back(completed);
+        self.enforce_capacity();
+    }
+
+    fn remember_completed_official_retry(
+        &mut self,
+        key: OtlpRequestPairKey,
+        official_retry_identity: Option<&str>,
+        now_unix_ms: u64,
+    ) {
+        let Some(official_retry_identity) = official_retry_identity else {
+            return;
+        };
+        let sequence = self.next_sequence();
+        self.push_completed(CompletedOfficialRetry {
+            key,
+            official_retry_identity: official_retry_identity.to_owned(),
+            completed_at_unix_ms: now_unix_ms,
+            sequence,
+        });
+    }
+
     fn evict_oldest(&mut self) {
-        let oldest_key = self
+        let oldest_pending = self
             .pending
             .iter()
             .filter_map(|(key, queue)| queue.front().map(|pending| (pending.sequence, key)))
             .min_by(Ord::cmp)
-            .map(|(_, key)| key.clone());
-        let Some(key) = oldest_key else {
+            .map(|(sequence, key)| (sequence, key.clone()));
+        let oldest_completed = self
+            .recently_completed
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, completed)| completed.sequence)
+            .map(|(index, completed)| (completed.sequence, index));
+        if oldest_completed.is_some_and(|completed| {
+            oldest_pending
+                .as_ref()
+                .is_none_or(|pending| completed.0 <= pending.0)
+        }) {
+            self.recently_completed
+                .remove(oldest_completed.expect("checked above").1);
+            return;
+        }
+        let Some((_, key)) = oldest_pending else {
             return;
         };
         let remove_key = self.pending.get_mut(&key).is_some_and(|queue| {
@@ -262,6 +462,7 @@ impl OtlpRequestCorrelationState {
             self.next_sequence = next;
         } else {
             self.pending.clear();
+            self.recently_completed.clear();
             self.next_sequence = 1;
         }
         sequence
@@ -583,11 +784,31 @@ pub fn parse_otlp_http_json_with_state(
     Ok((batch, prior))
 }
 
-/// Projects the raw Codex `agent-turn-complete` notify argument without retaining content fields.
+/// Strictly projects a raw Codex `agent-turn-complete` notify argument before transport.
 ///
 /// # Errors
 ///
-/// Returns [`AdapterError`] when the bounded JSON payload lacks the supported type or identifiers.
+/// Returns [`AdapterError`] when the bounded JSON payload is malformed, contains unknown fields,
+/// lacks the supported event or identifiers, or exceeds the projected payload bound.
+pub fn project_notify_json(input: &[u8]) -> Result<ProjectedNotifyV1, AdapterError> {
+    if input.len() as u64 > MAX_HANDOFF_LINE_BYTES as u64 {
+        return Err(AdapterError::RecordTooLarge);
+    }
+    let payload: RawNotifyPayload =
+        serde_json::from_slice(input).map_err(|error| match error.classify() {
+            serde_json::error::Category::Data => AdapterError::InvalidSchema,
+            _ => AdapterError::InvalidJson,
+        })?;
+    let projected = ProjectedNotifyV1::new(payload.event_name, payload.thread_id, payload.turn_id)?;
+    projected.to_json()?;
+    Ok(projected)
+}
+
+/// Maps a strictly projected Codex notify argument without retaining content fields.
+///
+/// # Errors
+///
+/// Returns [`AdapterError`] when strict projection or canonical mapping fails.
 pub fn parse_notify_json(
     input: &[u8],
     source_generation: &str,
@@ -595,28 +816,21 @@ pub fn parse_notify_json(
     cursor: u64,
     received_at_unix_ms: u64,
 ) -> Result<AdapterBatch, AdapterError> {
-    if input.len() as u64 > MAX_HANDOFF_LINE_BYTES as u64 {
-        return Err(AdapterError::RecordTooLarge);
+    let payload = if input.len() <= MAX_PROJECTED_NOTIFY_BYTES {
+        serde_json::from_slice::<ProjectedNotifyV1>(input)
+            .ok()
+            .map(ProjectedNotifyV1::validate)
+            .transpose()?
+    } else {
+        None
     }
-    let payload: Value = serde_json::from_slice(input).map_err(|_| AdapterError::InvalidJson)?;
-    let event_name = payload
-        .get("type")
-        .and_then(Value::as_str)
-        .filter(|value| *value == "agent-turn-complete")
-        .ok_or(AdapterError::InvalidSchema)?;
-    let thread_id = payload
-        .get("thread-id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or(AdapterError::InvalidIdentifier)?;
-    let turn_id = payload
-        .get("turn-id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or(AdapterError::InvalidIdentifier)?;
+    .map_or_else(|| project_notify_json(input), Ok)?;
     let mut attributes = BTreeMap::new();
-    attributes.insert("thread_id".into(), Value::String(thread_id.into()));
-    attributes.insert("turn_id".into(), Value::String(turn_id.into()));
+    attributes.insert(
+        "thread_id".into(),
+        Value::String(payload.thread_id().into()),
+    );
+    attributes.insert("turn_id".into(), Value::String(payload.turn_id().into()));
     let record = HandoffRecord {
         schema_version: HANDOFF_SCHEMA_VERSION.into(),
         source_generation: source_generation.into(),
@@ -624,7 +838,7 @@ pub fn parse_notify_json(
         cursor: cursor.to_string(),
         surface: SourceSurface::Notify,
         received_at_unix_ms,
-        event_name: event_name.into(),
+        event_name: payload.event_name().into(),
         attributes,
     };
     let json = serde_json::to_string(&record).map_err(|_| AdapterError::InvalidJson)?;
@@ -787,6 +1001,11 @@ fn correlate_otlp_request_pairs(
         let Some(pending) = pending else {
             continue;
         };
+        state.remember_completed_official_retry(
+            key,
+            pending.official_retry_identity.as_deref(),
+            now_unix_ms,
+        );
         let completed_request_id = optional_string(&records[index].attributes, "request_id")?;
         let request_id = match completed_request_id {
             Some(completed) if hash_opaque_identifier(&completed) == pending.correlation_id => {
@@ -1312,13 +1531,16 @@ mod tests {
     use super::{
         AdapterError, AdapterItem, DiagnosticCode, MAX_HANDOFF_BYTES, MAX_HANDOFF_LINE_BYTES,
         MAX_HANDOFF_LINES, MAX_OTLP_LOG_RECORDS, MAX_PENDING_OTLP_REQUESTS,
-        OTLP_REQUEST_CORRELATION_TTL_MS, OtlpRequestCorrelationState, parse_handoff_jsonl,
-        parse_notify_json, parse_otlp_http_json, parse_otlp_http_json_with_state,
+        MAX_PROJECTED_NOTIFY_BYTES, MAX_RECENTLY_COMPLETED_OTLP_REQUESTS,
+        OTLP_REQUEST_CORRELATION_TTL_MS, OtlpRequestCorrelationState,
+        PROJECTED_NOTIFY_SCHEMA_VERSION, parse_handoff_jsonl, parse_notify_json,
+        parse_otlp_http_json, parse_otlp_http_json_with_state, project_notify_json,
         read_handoff_file,
     };
     use agent_observability_contracts::ObservationEvent;
     use agent_observability_contracts::hash_opaque_identifier;
     use agent_observability_domain::LifecycleState;
+    use agent_observability_domain::MAX_IDENTIFIER_BYTES;
     use std::fs;
 
     const FIXTURE: &str = include_str!("../tests/fixtures/codex-handoff.jsonl");
@@ -1589,8 +1811,11 @@ mod tests {
         );
         assert_eq!(restored.pending_len(), 0);
 
+        let completed_persisted = restored.to_persisted_json().unwrap();
+        let mut restored =
+            OtlpRequestCorrelationState::from_persisted_json(&completed_persisted, 105).unwrap();
         parse_otlp_http_json_with_state(
-            &otlp_api_request("conversation-1", "request-2"),
+            &first_request,
             "generation-a",
             Some("2"),
             3,
@@ -1598,12 +1823,23 @@ mod tests {
             &mut restored,
         )
         .unwrap();
-        let (subsequent, _) = parse_otlp_http_json_with_state(
-            &otlp_completed_response("conversation-1"),
+        assert_eq!(restored.pending_len(), 0);
+
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("conversation-1", "request-2"),
             "generation-a",
             Some("3"),
             4,
             106,
+            &mut restored,
+        )
+        .unwrap();
+        let (subsequent, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response("conversation-1"),
+            "generation-a",
+            Some("4"),
+            5,
+            107,
             &mut restored,
         )
         .unwrap();
@@ -1747,6 +1983,95 @@ mod tests {
     }
 
     #[test]
+    fn completed_official_retry_identities_expire_and_stay_bounded() {
+        let mut expired_state = OtlpRequestCorrelationState::default();
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("expired", "request-expired"),
+            "generation-a",
+            None,
+            1,
+            100,
+            &mut expired_state,
+        )
+        .unwrap();
+        parse_otlp_http_json_with_state(
+            &otlp_completed_response("expired"),
+            "generation-a",
+            Some("1"),
+            2,
+            101,
+            &mut expired_state,
+        )
+        .unwrap();
+        assert_eq!(expired_state.recently_completed.len(), 1);
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("expired", "request-expired"),
+            "generation-a",
+            Some("2"),
+            3,
+            101 + OTLP_REQUEST_CORRELATION_TTL_MS,
+            &mut expired_state,
+        )
+        .unwrap();
+        assert_eq!(expired_state.recently_completed.len(), 0);
+        assert_eq!(expired_state.pending_len(), 1);
+
+        let mut bounded_state = OtlpRequestCorrelationState::default();
+        for index in 0..=MAX_RECENTLY_COMPLETED_OTLP_REQUESTS {
+            let request_id = format!("request-{index}");
+            let request_cursor = index as u64 * 2 + 1;
+            parse_otlp_http_json_with_state(
+                &otlp_api_request("conversation", &request_id),
+                "generation-a",
+                None,
+                request_cursor,
+                200,
+                &mut bounded_state,
+            )
+            .unwrap();
+            parse_otlp_http_json_with_state(
+                &otlp_completed_response("conversation"),
+                "generation-a",
+                None,
+                request_cursor + 1,
+                201,
+                &mut bounded_state,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            bounded_state.recently_completed.len(),
+            MAX_RECENTLY_COMPLETED_OTLP_REQUESTS
+        );
+
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("conversation", "request-0"),
+            "generation-a",
+            None,
+            3_000,
+            202,
+            &mut bounded_state,
+        )
+        .unwrap();
+        assert_eq!(bounded_state.recently_completed.len(), 1023);
+        assert_eq!(bounded_state.pending_len(), 1);
+        parse_otlp_http_json_with_state(
+            &otlp_api_request(
+                "conversation",
+                &format!("request-{MAX_RECENTLY_COMPLETED_OTLP_REQUESTS}"),
+            ),
+            "generation-a",
+            None,
+            3_001,
+            202,
+            &mut bounded_state,
+        )
+        .unwrap();
+        assert_eq!(bounded_state.pending_len(), 1);
+        assert!(bounded_state.to_persisted_json().is_ok());
+    }
+
+    #[test]
     fn failed_retry_is_observed_but_does_not_consume_completion_fifo() {
         let input = br#"{
           "resourceLogs": [{"scopeLogs": [{"logRecords": [
@@ -1847,7 +2172,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_notify_discards_content_and_cwd_before_mapping() {
+    fn raw_notify_is_strictly_projected_before_mapping() {
         let input = br#"{
           "type":"agent-turn-complete",
           "thread-id":"conversation-1",
@@ -1856,9 +2181,33 @@ mod tests {
           "input-messages":["RAW_PROMPT_SECRET"],
           "last-assistant-message":"RAW_ASSISTANT_SECRET"
         }"#;
+        let projected = project_notify_json(input).unwrap();
+        let encoded = projected.to_json().unwrap();
+        assert!(encoded.len() <= MAX_PROJECTED_NOTIFY_BYTES);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
+            serde_json::json!({
+                "schema_version": PROJECTED_NOTIFY_SCHEMA_VERSION,
+                "event_name": "agent-turn-complete",
+                "thread_id": "conversation-1",
+                "turn_id": "turn-1"
+            })
+        );
+        for secret in [
+            "/SECRET/PRIVATE/REPO",
+            "RAW_PROMPT_SECRET",
+            "RAW_ASSISTANT_SECRET",
+        ] {
+            assert!(!String::from_utf8_lossy(&encoded).contains(secret));
+        }
+
         let batch = parse_notify_json(input, "codex-notify-v1", None, 1, 123).unwrap();
         let turn = batch.observations().next().unwrap();
         assert!(matches!(turn.event, ObservationEvent::Turn));
+        assert_eq!(
+            turn.correlation.session_id.as_ref().unwrap().as_str(),
+            "conversation-1"
+        );
         assert_eq!(
             turn.correlation.turn_id.as_ref().unwrap().as_str(),
             "turn-1"
@@ -1871,6 +2220,73 @@ mod tests {
         ] {
             assert!(!debug.contains(secret));
         }
+    }
+
+    #[test]
+    fn notify_projection_rejects_unknown_and_malformed_payloads() {
+        let unknown = br#"{
+          "type":"agent-turn-complete",
+          "thread-id":"conversation-1",
+          "turn-id":"turn-1",
+          "cwd":"/tmp",
+          "input-messages":[],
+          "last-assistant-message":null,
+          "unknown-metadata":"RAW_UNKNOWN_SENTINEL"
+        }"#;
+        assert!(matches!(
+            project_notify_json(unknown),
+            Err(AdapterError::InvalidSchema)
+        ));
+
+        let malformed = br#"{
+          "type":"agent-turn-complete",
+          "thread-id":"conversation-1",
+          "turn-id":"turn-1",
+          "cwd":"/tmp",
+          "input-messages":{"tool-arguments":"RAW_TOOL_ARGUMENTS"},
+          "last-assistant-message":null
+        }"#;
+        assert!(matches!(
+            project_notify_json(malformed),
+            Err(AdapterError::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn notify_projection_ids_are_bounded_and_deterministic() {
+        let bounded_id = "i".repeat(MAX_IDENTIFIER_BYTES);
+        let input = format!(
+            r#"{{"type":"agent-turn-complete","thread-id":"{bounded_id}","turn-id":"{bounded_id}","cwd":"/tmp","input-messages":[],"last-assistant-message":null}}"#
+        );
+        let first = project_notify_json(input.as_bytes()).unwrap();
+        let second = project_notify_json(input.as_bytes()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.to_json().unwrap(), second.to_json().unwrap());
+        assert!(first.to_json().unwrap().len() <= MAX_PROJECTED_NOTIFY_BYTES);
+
+        let oversized_id = "i".repeat(MAX_IDENTIFIER_BYTES + 1);
+        let oversized = format!(
+            r#"{{"type":"agent-turn-complete","thread-id":"{oversized_id}","turn-id":"turn-1","cwd":"/tmp","input-messages":[],"last-assistant-message":null}}"#
+        );
+        assert!(matches!(
+            project_notify_json(oversized.as_bytes()),
+            Err(AdapterError::InvalidIdentifier)
+        ));
+
+        let first_batch = parse_notify_json(input.as_bytes(), "generation", None, 1, 123).unwrap();
+        let second_batch = parse_notify_json(input.as_bytes(), "generation", None, 1, 123).unwrap();
+        let first_observation = first_batch.observations().next().unwrap();
+        let second_observation = second_batch.observations().next().unwrap();
+        assert_eq!(
+            first_observation.trace_id.as_str(),
+            second_observation.trace_id.as_str()
+        );
+        assert_eq!(
+            first_observation.span_id.as_str(),
+            second_observation.span_id.as_str()
+        );
+        assert!(first_observation.trace_id.as_str().len() <= MAX_IDENTIFIER_BYTES);
+        assert!(first_observation.span_id.as_str().len() <= MAX_IDENTIFIER_BYTES);
     }
 
     #[test]
