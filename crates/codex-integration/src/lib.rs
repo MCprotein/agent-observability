@@ -29,6 +29,13 @@ const MAX_HEALTH_RESPONSE_BYTES: u64 = 4 * 1024;
 #[cfg(target_os = "macos")]
 const LAUNCH_AGENT_OWNERSHIP_VERSION: &str = "agent-observability.launch-agent-ownership.v1";
 #[cfg(target_os = "macos")]
+const MAX_LAUNCH_AGENT_PLIST_BYTES: u64 = 1024 * 1024;
+#[cfg(target_os = "macos")]
+const MAX_LAUNCH_AGENT_OWNERSHIP_BYTES: u64 = MAX_LAUNCH_AGENT_PLIST_BYTES * 12 + 8192;
+#[cfg(target_os = "macos")]
+// Darwin's O_NOFOLLOW value from <sys/fcntl.h>; all uses are macOS-only.
+const MACOS_O_NOFOLLOW: i32 = 0x0000_0100;
+#[cfg(target_os = "macos")]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
@@ -745,6 +752,42 @@ struct LaunchAgentFileState {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+enum LaunchAgentFileExpectation<'a> {
+    Missing,
+    Present { bytes: &'a [u8], mode: u32 },
+}
+
+#[cfg(target_os = "macos")]
+impl<'a> LaunchAgentFileExpectation<'a> {
+    fn from_state(state: &'a LaunchAgentFileState) -> Self {
+        if state.existed {
+            Self::Present {
+                bytes: &state.bytes,
+                mode: state.mode,
+            }
+        } else {
+            Self::Missing
+        }
+    }
+
+    fn matches(self, state: &LaunchAgentFileState) -> bool {
+        match self {
+            Self::Missing => !state.existed,
+            Self::Present { bytes, mode } => {
+                state.existed && state.bytes == bytes && state.mode == mode
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchAgentMutationBoundary {
+    ReadyToRevalidate,
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum LaunchAgentOperation {
@@ -831,16 +874,20 @@ fn install_collector_service_with(
         return Ok(service);
     }
 
-    let mut transaction = if let Some(owned) = owned {
-        LaunchAgentTransaction {
-            rollback_plist: owned.desired_plist.clone(),
-            rollback_loaded: owned.desired_loaded,
-            desired_plist: desired,
-            desired_loaded: true,
-            operation: LaunchAgentOperation::Reconnect,
-            phase: LaunchAgentPhase::Prepared,
-            ..owned
-        }
+    let (mut transaction, expected_plist) = if let Some(owned) = owned {
+        let expected_plist = owned.desired_plist.clone();
+        (
+            LaunchAgentTransaction {
+                rollback_plist: owned.desired_plist.clone(),
+                rollback_loaded: owned.desired_loaded,
+                desired_plist: desired,
+                desired_loaded: true,
+                operation: LaunchAgentOperation::Reconnect,
+                phase: LaunchAgentPhase::Prepared,
+                ..owned
+            },
+            expected_plist,
+        )
     } else {
         let prior_plist = read_launch_agent_file(&service.plist)?;
         let prior_loaded = launchctl.is_loaded(&service.target)?;
@@ -850,21 +897,26 @@ fn install_collector_service_with(
                 service.target
             )));
         }
-        LaunchAgentTransaction {
-            schema_version: LAUNCH_AGENT_OWNERSHIP_VERSION.into(),
-            plist_path: service.plist.clone(),
-            prior_plist: prior_plist.clone(),
-            prior_loaded,
-            rollback_plist: prior_plist,
-            rollback_loaded: prior_loaded,
-            desired_plist: desired,
-            desired_loaded: true,
-            operation: LaunchAgentOperation::Connect,
-            phase: LaunchAgentPhase::Prepared,
-        }
+        (
+            LaunchAgentTransaction {
+                schema_version: LAUNCH_AGENT_OWNERSHIP_VERSION.into(),
+                plist_path: service.plist.clone(),
+                prior_plist: prior_plist.clone(),
+                prior_loaded,
+                rollback_plist: prior_plist.clone(),
+                rollback_loaded: prior_loaded,
+                desired_plist: desired,
+                desired_loaded: true,
+                operation: LaunchAgentOperation::Connect,
+                phase: LaunchAgentPhase::Prepared,
+            },
+            prior_plist,
+        )
     };
     save_launch_agent_transaction(&service, &transaction)?;
-    if let Err(error) = apply_launch_agent_desired(&service, launchctl, &mut transaction) {
+    if let Err(error) =
+        apply_launch_agent_desired(&service, launchctl, &mut transaction, &expected_plist)
+    {
         return Err(rollback_launch_agent_operation(&service, launchctl, error));
     }
     transaction.phase = LaunchAgentPhase::Applied;
@@ -912,6 +964,7 @@ fn uninstall_collector_service_with(
     {
         return Ok(());
     }
+    let expected_plist = transaction.desired_plist.clone();
     transaction.rollback_plist = transaction.desired_plist.clone();
     transaction.rollback_loaded = transaction.desired_loaded;
     transaction.desired_plist = transaction.prior_plist.clone();
@@ -919,7 +972,7 @@ fn uninstall_collector_service_with(
     transaction.operation = LaunchAgentOperation::Disconnect;
     transaction.phase = LaunchAgentPhase::Prepared;
     save_launch_agent_transaction(service, &transaction)?;
-    apply_launch_agent_desired(service, launchctl, &mut transaction)?;
+    apply_launch_agent_desired(service, launchctl, &mut transaction, &expected_plist)?;
     transaction.phase = LaunchAgentPhase::Restored;
     save_launch_agent_transaction(service, &transaction)
 }
@@ -1049,11 +1102,12 @@ fn rollback_collector_service_uninstall(
             "LaunchAgent ownership state is not disconnecting".into(),
         ));
     }
+    let expected_plist = validated_launch_agent_file(service, &transaction)?;
     transaction.desired_plist = transaction.rollback_plist.clone();
     transaction.desired_loaded = transaction.rollback_loaded;
     transaction.phase = LaunchAgentPhase::Prepared;
     save_launch_agent_transaction(service, &transaction)?;
-    apply_launch_agent_desired(service, &SystemLaunchctl, &mut transaction)?;
+    apply_launch_agent_desired(service, &SystemLaunchctl, &mut transaction, &expected_plist)?;
     transaction.operation = LaunchAgentOperation::Connect;
     transaction.phase = LaunchAgentPhase::Owned;
     save_launch_agent_transaction(service, &transaction)
@@ -1089,11 +1143,7 @@ fn recover_launch_agent_transaction(
     let Some(mut transaction) = load_launch_agent_transaction(service)? else {
         return Ok(None);
     };
-    if launch_agent_transaction_conflicts(service, &transaction)? {
-        return Err(IntegrationError::Runtime(
-            "LaunchAgent plist changed outside the owned transaction".into(),
-        ));
-    }
+    let expected_plist = validated_launch_agent_file(service, &transaction)?;
     if transaction.phase == LaunchAgentPhase::Owned {
         if launchctl.is_loaded(&service.target)? != transaction.desired_loaded {
             transaction.operation = LaunchAgentOperation::Reconnect;
@@ -1101,7 +1151,7 @@ fn recover_launch_agent_transaction(
             transaction.rollback_loaded = transaction.desired_loaded;
             transaction.phase = LaunchAgentPhase::Prepared;
             save_launch_agent_transaction(service, &transaction)?;
-            apply_launch_agent_desired(service, launchctl, &mut transaction)?;
+            apply_launch_agent_desired(service, launchctl, &mut transaction, &expected_plist)?;
             transaction.phase = LaunchAgentPhase::Owned;
             save_launch_agent_transaction(service, &transaction)?;
         }
@@ -1117,7 +1167,7 @@ fn recover_launch_agent_transaction(
             } else {
                 transaction.desired_plist = transaction.rollback_plist.clone();
                 transaction.desired_loaded = transaction.rollback_loaded;
-                apply_launch_agent_desired(service, launchctl, &mut transaction)?;
+                apply_launch_agent_desired(service, launchctl, &mut transaction, &expected_plist)?;
                 remove_launch_agent_transaction(service)?;
                 Ok(None)
             }
@@ -1131,7 +1181,7 @@ fn recover_launch_agent_transaction(
             } else {
                 transaction.desired_plist = transaction.rollback_plist.clone();
                 transaction.desired_loaded = transaction.rollback_loaded;
-                apply_launch_agent_desired(service, launchctl, &mut transaction)?;
+                apply_launch_agent_desired(service, launchctl, &mut transaction, &expected_plist)?;
                 transaction.operation = LaunchAgentOperation::Connect;
                 transaction.phase = LaunchAgentPhase::Owned;
                 save_launch_agent_transaction(service, &transaction)?;
@@ -1143,7 +1193,7 @@ fn recover_launch_agent_transaction(
             | LaunchAgentRecovery::Status(ConfigConnectionStatus::Connected) => {
                 transaction.desired_plist = transaction.rollback_plist.clone();
                 transaction.desired_loaded = transaction.rollback_loaded;
-                apply_launch_agent_desired(service, launchctl, &mut transaction)?;
+                apply_launch_agent_desired(service, launchctl, &mut transaction, &expected_plist)?;
                 transaction.operation = LaunchAgentOperation::Connect;
                 transaction.phase = LaunchAgentPhase::Owned;
                 save_launch_agent_transaction(service, &transaction)?;
@@ -1151,7 +1201,7 @@ fn recover_launch_agent_transaction(
             }
             LaunchAgentRecovery::Disconnect
             | LaunchAgentRecovery::Status(ConfigConnectionStatus::Disconnected) => {
-                apply_launch_agent_desired(service, launchctl, &mut transaction)?;
+                apply_launch_agent_desired(service, launchctl, &mut transaction, &expected_plist)?;
                 transaction.phase = LaunchAgentPhase::Restored;
                 save_launch_agent_transaction(service, &transaction)?;
                 if matches!(recovery, LaunchAgentRecovery::Status(_)) {
@@ -1183,6 +1233,24 @@ fn launch_agent_transaction_conflicts(
 }
 
 #[cfg(target_os = "macos")]
+fn validated_launch_agent_file(
+    service: &CollectorService,
+    transaction: &LaunchAgentTransaction,
+) -> Result<LaunchAgentFileState, IntegrationError> {
+    let current = read_launch_agent_file(&service.plist)?;
+    if (transaction.phase == LaunchAgentPhase::Owned && current != transaction.desired_plist)
+        || (transaction.phase != LaunchAgentPhase::Owned
+            && current != transaction.rollback_plist
+            && current != transaction.desired_plist)
+    {
+        return Err(IntegrationError::Runtime(
+            "LaunchAgent plist changed outside the owned transaction".into(),
+        ));
+    }
+    Ok(current)
+}
+
+#[cfg(target_os = "macos")]
 fn rollback_launch_agent_operation(
     service: &CollectorService,
     launchctl: &impl Launchctl,
@@ -1199,12 +1267,29 @@ fn apply_launch_agent_desired(
     service: &CollectorService,
     launchctl: &impl Launchctl,
     transaction: &mut LaunchAgentTransaction,
+    expected_plist: &LaunchAgentFileState,
+) -> Result<(), IntegrationError> {
+    apply_launch_agent_desired_with(service, launchctl, transaction, expected_plist, |_| Ok(()))
+}
+
+#[cfg(target_os = "macos")]
+fn apply_launch_agent_desired_with(
+    service: &CollectorService,
+    launchctl: &impl Launchctl,
+    transaction: &mut LaunchAgentTransaction,
+    expected_plist: &LaunchAgentFileState,
+    boundary: impl FnMut(LaunchAgentMutationBoundary) -> Result<(), IntegrationError>,
 ) -> Result<(), IntegrationError> {
     stop_launch_agent(launchctl, service)?;
     transaction.phase = LaunchAgentPhase::ServiceStopped;
     save_launch_agent_transaction(service, transaction)?;
 
-    replace_launch_agent_file(&service.plist, &transaction.desired_plist)?;
+    replace_launch_agent_file_with(
+        &service.plist,
+        LaunchAgentFileExpectation::from_state(expected_plist),
+        &transaction.desired_plist,
+        boundary,
+    )?;
     transaction.phase = LaunchAgentPhase::PlistWritten;
     save_launch_agent_transaction(service, transaction)?;
 
@@ -1264,36 +1349,97 @@ fn stop_launch_agent(
 }
 
 #[cfg(target_os = "macos")]
-fn read_launch_agent_file(path: &Path) -> Result<LaunchAgentFileState, IntegrationError> {
-    use std::os::unix::fs::PermissionsExt;
+fn open_bounded_regular_file(
+    path: &Path,
+    max_bytes: u64,
+    require_private: bool,
+    name: &str,
+) -> Result<Option<(File, fs::Metadata)>, IntegrationError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(LaunchAgentFileState {
-                existed: false,
-                bytes: Vec::new(),
-                mode: 0,
-            });
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(IntegrationError::Runtime(format!(
+            "{name} must be a regular file"
+        )));
+    }
+    if require_private && metadata.permissions().mode() & 0o077 != 0 {
+        return Err(IntegrationError::Runtime(format!(
+            "{name} is not a private regular file"
+        )));
+    }
+    if metadata.len() > max_bytes {
+        return Err(IntegrationError::Runtime(format!(
+            "{name} exceeds size bound"
+        )));
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(MACOS_O_NOFOLLOW)
+        .open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Err(IntegrationError::Runtime(format!(
+            "{name} must be a regular file"
+        )));
+    }
+    if require_private && opened.permissions().mode() & 0o077 != 0 {
+        return Err(IntegrationError::Runtime(format!(
+            "{name} is not a private regular file"
+        )));
+    }
+    if opened.len() > max_bytes {
+        return Err(IntegrationError::Runtime(format!(
+            "{name} exceeds size bound"
+        )));
+    }
+    Ok(Some((file, opened)))
+}
+
+#[cfg(target_os = "macos")]
+fn read_launch_agent_file(path: &Path) -> Result<LaunchAgentFileState, IntegrationError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some((mut file, metadata)) = open_bounded_regular_file(
+        path,
+        MAX_LAUNCH_AGENT_PLIST_BYTES,
+        false,
+        "LaunchAgent plist",
+    )?
+    else {
+        return Ok(LaunchAgentFileState {
+            existed: false,
+            bytes: Vec::new(),
+            mode: 0,
+        });
+    };
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_LAUNCH_AGENT_PLIST_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_LAUNCH_AGENT_PLIST_BYTES {
         return Err(IntegrationError::Runtime(
-            "LaunchAgent plist must be a regular file".into(),
+            "LaunchAgent plist exceeds size bound".into(),
         ));
     }
     Ok(LaunchAgentFileState {
         existed: true,
-        bytes: fs::read(path)?,
+        bytes,
         mode: metadata.permissions().mode() & 0o777,
     })
 }
 
 #[cfg(target_os = "macos")]
-fn replace_launch_agent_file(
+fn replace_launch_agent_file_with(
     path: &Path,
+    expected: LaunchAgentFileExpectation<'_>,
     desired: &LaunchAgentFileState,
+    mut boundary: impl FnMut(LaunchAgentMutationBoundary) -> Result<(), IntegrationError>,
 ) -> Result<(), IntegrationError> {
     let parent = path
         .parent()
@@ -1302,41 +1448,60 @@ fn replace_launch_agent_file(
         IntegrationError::Runtime(format!("LaunchAgent directory failed: {error}"))
     })?;
     if desired.existed {
-        atomic_write(path, &desired.bytes, desired.mode, "LaunchAgent")
+        atomic_write_checked(
+            path,
+            expected,
+            &desired.bytes,
+            desired.mode,
+            "LaunchAgent",
+            &mut boundary,
+        )
     } else {
-        match fs::remove_file(path) {
-            Ok(()) => sync_launch_agent_parent(path, "removal"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(IntegrationError::Runtime(format!(
-                "LaunchAgent removal failed: {error}"
-            ))),
+        boundary(LaunchAgentMutationBoundary::ReadyToRevalidate)?;
+        let current = read_launch_agent_file(path)?;
+        if !expected.matches(&current) {
+            return Err(launch_agent_conflict());
         }
+        if current.existed {
+            fs::remove_file(path).map_err(|error| {
+                IntegrationError::Runtime(format!("LaunchAgent removal failed: {error}"))
+            })?;
+        }
+        sync_launch_agent_parent(path, "removal")
     }
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_conflict() -> IntegrationError {
+    IntegrationError::Runtime("LaunchAgent plist changed outside the owned transaction".into())
 }
 
 #[cfg(target_os = "macos")]
 fn load_launch_agent_transaction(
     service: &CollectorService,
 ) -> Result<Option<LaunchAgentTransaction>, IntegrationError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let metadata = match fs::symlink_metadata(&service.ownership) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let Some((mut file, _)) = open_bounded_regular_file(
+        &service.ownership,
+        MAX_LAUNCH_AGENT_OWNERSHIP_BYTES,
+        true,
+        "LaunchAgent ownership state",
+    )?
+    else {
+        return Ok(None);
     };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.permissions().mode() & 0o077 != 0
-    {
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_LAUNCH_AGENT_OWNERSHIP_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_LAUNCH_AGENT_OWNERSHIP_BYTES {
         return Err(IntegrationError::Runtime(
-            "LaunchAgent ownership state is not a private regular file".into(),
+            "LaunchAgent ownership state exceeds size bound".into(),
         ));
     }
-    let transaction: LaunchAgentTransaction =
-        serde_json::from_slice(&fs::read(&service.ownership)?).map_err(|error| {
-            IntegrationError::Runtime(format!("invalid LaunchAgent ownership state: {error}"))
-        })?;
+    let transaction: LaunchAgentTransaction = serde_json::from_slice(&bytes).map_err(|error| {
+        IntegrationError::Runtime(format!("invalid LaunchAgent ownership state: {error}"))
+    })?;
+    validate_launch_agent_transaction_file_states(&transaction)?;
     if transaction.schema_version != LAUNCH_AGENT_OWNERSHIP_VERSION
         || transaction.plist_path != service.plist
     {
@@ -1352,6 +1517,7 @@ fn save_launch_agent_transaction(
     service: &CollectorService,
     transaction: &LaunchAgentTransaction,
 ) -> Result<(), IntegrationError> {
+    validate_launch_agent_transaction_file_states(transaction)?;
     let parent = service
         .ownership
         .parent()
@@ -1373,12 +1539,42 @@ fn save_launch_agent_transaction(
         IntegrationError::Runtime(format!("LaunchAgent state encode failed: {error}"))
     })?;
     bytes.push(b'\n');
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_LAUNCH_AGENT_OWNERSHIP_BYTES {
+        return Err(IntegrationError::Runtime(
+            "LaunchAgent ownership state exceeds size bound".into(),
+        ));
+    }
     atomic_write(
         &service.ownership,
         &bytes,
         0o600,
         "LaunchAgent ownership state",
     )
+}
+
+#[cfg(target_os = "macos")]
+fn validate_launch_agent_transaction_file_states(
+    transaction: &LaunchAgentTransaction,
+) -> Result<(), IntegrationError> {
+    for state in [
+        &transaction.prior_plist,
+        &transaction.rollback_plist,
+        &transaction.desired_plist,
+    ] {
+        if u64::try_from(state.bytes.len()).unwrap_or(u64::MAX) > MAX_LAUNCH_AGENT_PLIST_BYTES {
+            return Err(IntegrationError::Runtime(
+                "LaunchAgent ownership state contains an oversized plist".into(),
+            ));
+        }
+        if (!state.existed && (!state.bytes.is_empty() || state.mode != 0))
+            || state.mode & !0o777 != 0
+        {
+            return Err(IntegrationError::Runtime(
+                "LaunchAgent ownership state contains an invalid plist state".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1439,6 +1635,7 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32, name: &str) -> Result<(), 
             .create_new(true)
             .write(true)
             .mode(0o600)
+            .custom_flags(MACOS_O_NOFOLLOW)
             .open(&temporary)?;
         file.write_all(bytes)?;
         fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
@@ -1446,6 +1643,66 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32, name: &str) -> Result<(), 
         fs::rename(&temporary, path)?;
         File::open(path)?.sync_all()?;
         sync_launch_agent_parent(path, "write")
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn atomic_write_checked(
+    path: &Path,
+    expected: LaunchAgentFileExpectation<'_>,
+    bytes: &[u8],
+    mode: u32,
+    name: &str,
+    boundary: &mut impl FnMut(LaunchAgentMutationBoundary) -> Result<(), IntegrationError>,
+) -> Result<(), IntegrationError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| IntegrationError::Runtime(format!("{name} path has no parent")))?;
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{}.agentobs.{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("state"),
+        std::process::id(),
+        sequence
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(MACOS_O_NOFOLLOW)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
+        file.sync_all()?;
+        boundary(LaunchAgentMutationBoundary::ReadyToRevalidate)?;
+
+        let current = read_launch_agent_file(path)?;
+        if !expected.matches(&current) {
+            return Err(launch_agent_conflict());
+        }
+        fs::rename(&temporary, path)?;
+        sync_launch_agent_parent(path, "write")?;
+
+        let installed = read_launch_agent_file(path)?;
+        if installed
+            != (LaunchAgentFileState {
+                existed: true,
+                bytes: bytes.to_vec(),
+                mode,
+            })
+        {
+            return Err(launch_agent_conflict());
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -1595,9 +1852,11 @@ mod tests {
     };
     #[cfg(target_os = "macos")]
     use super::{
-        LaunchAgentOperation, LaunchAgentPhase, LaunchAgentRecovery, Launchctl,
+        LaunchAgentFileState, LaunchAgentMutationBoundary, LaunchAgentOperation, LaunchAgentPhase,
+        LaunchAgentRecovery, LaunchAgentTransaction, Launchctl, MAX_LAUNCH_AGENT_OWNERSHIP_BYTES,
+        MAX_LAUNCH_AGENT_PLIST_BYTES, apply_launch_agent_desired_with,
         commit_collector_service_install, commit_collector_service_uninstall,
-        install_collector_service_with, load_launch_agent_transaction,
+        install_collector_service_with, load_launch_agent_transaction, read_launch_agent_file,
         recover_launch_agent_transaction, save_launch_agent_transaction,
         uninstall_collector_service_with,
     };
@@ -1615,9 +1874,9 @@ mod tests {
         io::{Read as _, Write as _},
         net::TcpListener,
         path::{Path, PathBuf},
-        sync::{Arc, Barrier, Mutex},
+        sync::{Arc, Mutex, mpsc},
         thread,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     fn temporary_root(name: &str) -> PathBuf {
@@ -1952,14 +2211,14 @@ mod tests {
 
     #[test]
     fn root_lifecycle_lock_rejects_concurrent_interleaving_through_rollback() {
+        const CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
+
         let root = temporary_root("lifecycle-lock");
         let layout = agent_observability_local_runtime::install(&root).unwrap();
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
         let events = Arc::new(Mutex::new(Vec::new()));
         let worker_layout = layout.clone();
-        let worker_entered = Arc::clone(&entered);
-        let worker_release = Arc::clone(&release);
         let worker_events = Arc::clone(&events);
         let worker = thread::spawn(move || {
             with_lifecycle_lock(&worker_layout, || {
@@ -1967,35 +2226,54 @@ mod tests {
                     .lock()
                     .unwrap()
                     .extend(["service", "settings", "health", "config"]);
-                worker_entered.wait();
-                worker_release.wait();
+                entered_tx.send(()).map_err(|error| {
+                    IntegrationError::Runtime(format!("signal lifecycle entry: {error}"))
+                })?;
+                release_rx.recv_timeout(CHANNEL_TIMEOUT).map_err(|error| {
+                    IntegrationError::Runtime(format!("wait for lifecycle release: {error}"))
+                })?;
                 worker_events.lock().unwrap().push("rollback");
                 Ok(())
             })
-            .unwrap();
         });
 
-        entered.wait();
-        let config = LocalConfigService::new(&layout);
-        let versioned = config.read().unwrap();
+        let entered = entered_rx.recv_timeout(CHANNEL_TIMEOUT);
+        let config_save = entered.as_ref().ok().map(|()| {
+            let config = LocalConfigService::new(&layout);
+            config
+                .read()
+                .and_then(|versioned| config.save(&versioned.revision, &versioned.config))
+        });
+        let contender = entered.as_ref().ok().map(|()| {
+            let contender_events = Arc::clone(&events);
+            with_lifecycle_lock(&layout, || {
+                contender_events.lock().unwrap().push("interleaved");
+                Ok(())
+            })
+        });
+        let released = release_tx.send(());
+        let worker_result = worker.join();
+        let observed_events = events.lock().map(|events| events.clone());
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            entered.is_ok(),
+            "worker did not enter lifecycle: {entered:?}"
+        );
+        assert!(matches!(config_save, Some(Err(ConfigServiceError::Busy))));
         assert!(matches!(
-            config.save(&versioned.revision, &versioned.config),
-            Err(ConfigServiceError::Busy)
+            &contender,
+            Some(Err(error)) if error.to_string().contains("lifecycle is busy")
         ));
-        let contender_events = Arc::clone(&events);
-        let error = with_lifecycle_lock(&layout, || {
-            contender_events.lock().unwrap().push("interleaved");
-            Ok(())
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("lifecycle is busy"));
-        release.wait();
-        worker.join().unwrap();
+        assert!(released.is_ok(), "worker release failed: {released:?}");
+        assert!(
+            matches!(&worker_result, Ok(Ok(()))),
+            "worker failed: {worker_result:?}"
+        );
         assert_eq!(
-            *events.lock().unwrap(),
+            observed_events.unwrap(),
             ["service", "settings", "health", "config", "rollback"]
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     fn health_response(body: &str) -> Vec<u8> {
@@ -3147,6 +3425,215 @@ mod tests {
         assert_eq!(fs::read(&service.plist).unwrap(), b"inherited plist");
         assert!(launchctl.loaded.get());
         assert!(launchctl.events.borrow().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_launch_agent_race_case(
+        name: &str,
+        operation: LaunchAgentOperation,
+        phase: LaunchAgentPhase,
+        expected_existed: bool,
+        desired_existed: bool,
+        external_bytes: &[u8],
+        external_mode: u32,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root(&format!("launch-agent-race-{name}"));
+        let service = test_service(&root);
+        fs::create_dir_all(service.plist.parent().unwrap()).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        if expected_existed {
+            fs::write(&service.plist, b"initial plist").unwrap();
+            fs::set_permissions(&service.plist, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let expected = read_launch_agent_file(&service.plist).unwrap();
+        let desired = LaunchAgentFileState {
+            existed: desired_existed,
+            bytes: if desired_existed {
+                b"managed plist".to_vec()
+            } else {
+                Vec::new()
+            },
+            mode: if desired_existed { 0o644 } else { 0 },
+        };
+        let mut transaction = LaunchAgentTransaction {
+            schema_version: super::LAUNCH_AGENT_OWNERSHIP_VERSION.into(),
+            plist_path: service.plist.clone(),
+            prior_plist: LaunchAgentFileState {
+                existed: false,
+                bytes: Vec::new(),
+                mode: 0,
+            },
+            prior_loaded: false,
+            rollback_plist: expected.clone(),
+            rollback_loaded: false,
+            desired_plist: desired,
+            desired_loaded: false,
+            operation,
+            phase,
+        };
+        let launchctl = FakeLaunchctl::new(false);
+        let plist = service.plist.clone();
+
+        let error = apply_launch_agent_desired_with(
+            &service,
+            &launchctl,
+            &mut transaction,
+            &expected,
+            |boundary| {
+                assert_eq!(boundary, LaunchAgentMutationBoundary::ReadyToRevalidate);
+                fs::write(&plist, external_bytes)?;
+                fs::set_permissions(&plist, fs::Permissions::from_mode(external_mode))?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("outside the owned transaction"));
+        assert_eq!(fs::read(&service.plist).unwrap(), external_bytes, "{name}");
+        assert_eq!(
+            fs::metadata(&service.plist).unwrap().permissions().mode() & 0o777,
+            external_mode,
+            "{name}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_agent_lifecycle_races_fail_closed_before_publish_or_remove() {
+        let cases = [
+            (
+                "connect",
+                LaunchAgentOperation::Connect,
+                LaunchAgentPhase::Prepared,
+                false,
+                true,
+                b"external create".as_slice(),
+                0o640,
+            ),
+            (
+                "reconnect",
+                LaunchAgentOperation::Reconnect,
+                LaunchAgentPhase::Prepared,
+                true,
+                true,
+                b"external edit".as_slice(),
+                0o600,
+            ),
+            (
+                "disconnect",
+                LaunchAgentOperation::Disconnect,
+                LaunchAgentPhase::Prepared,
+                true,
+                false,
+                b"initial plist".as_slice(),
+                0o640,
+            ),
+            (
+                "crash-recovery",
+                LaunchAgentOperation::Disconnect,
+                LaunchAgentPhase::ServiceStopped,
+                true,
+                false,
+                b"recovery edit".as_slice(),
+                0o640,
+            ),
+        ];
+
+        for (
+            name,
+            operation,
+            phase,
+            expected_existed,
+            desired_existed,
+            external_bytes,
+            external_mode,
+        ) in cases
+        {
+            assert_launch_agent_race_case(
+                name,
+                operation,
+                phase,
+                expected_existed,
+                desired_existed,
+                external_bytes,
+                external_mode,
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn oversized_launch_agent_plist_and_ownership_are_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("launch-agent-size-bounds");
+        let service = test_service(&root);
+        fs::create_dir_all(service.plist.parent().unwrap()).unwrap();
+        fs::write(
+            &service.plist,
+            vec![b'x'; usize::try_from(MAX_LAUNCH_AGENT_PLIST_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        let launchctl = FakeLaunchctl::new(false);
+        let plist_error = install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs"),
+            &launchctl,
+            false,
+        )
+        .unwrap_err();
+        assert!(plist_error.to_string().contains("plist exceeds size bound"));
+        assert!(!service.ownership.exists());
+
+        fs::create_dir_all(service.ownership.parent().unwrap()).unwrap();
+        fs::write(
+            &service.ownership,
+            vec![b'x'; usize::try_from(MAX_LAUNCH_AGENT_OWNERSHIP_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        fs::set_permissions(&service.ownership, fs::Permissions::from_mode(0o600)).unwrap();
+        let ownership_error = load_launch_agent_transaction(&service).unwrap_err();
+        assert!(
+            ownership_error
+                .to_string()
+                .contains("ownership state exceeds size bound")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_agent_plist_and_ownership_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_root("launch-agent-no-follow");
+        let service = test_service(&root);
+        fs::create_dir_all(service.plist.parent().unwrap()).unwrap();
+        let plist_target = root.join("plist-target");
+        fs::write(&plist_target, b"target plist").unwrap();
+        symlink(&plist_target, &service.plist).unwrap();
+        assert!(
+            read_launch_agent_file(&service.plist)
+                .unwrap_err()
+                .to_string()
+                .contains("must be a regular file")
+        );
+
+        fs::create_dir_all(service.ownership.parent().unwrap()).unwrap();
+        let ownership_target = root.join("ownership-target");
+        fs::write(&ownership_target, b"{}").unwrap();
+        symlink(&ownership_target, &service.ownership).unwrap();
+        assert!(
+            load_launch_agent_transaction(&service)
+                .unwrap_err()
+                .to_string()
+                .contains("must be a regular file")
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -17,6 +17,7 @@ jobs:
   rust:
     name: Rust
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -43,6 +44,7 @@ jobs:
   rust-macos:
     name: Rust macOS
     runs-on: macos-15
+    timeout-minutes: 75
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -61,6 +63,7 @@ jobs:
   report-ui:
     name: Report UI
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v6

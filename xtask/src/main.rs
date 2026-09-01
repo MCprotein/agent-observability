@@ -18,12 +18,13 @@ use agent_observability_domain::{
     CorrelationIds, LifecycleState, ObservationId, SourceCursor, SourceGeneration, SpanId, Timing,
     TokenUsage, TraceId,
 };
-use agent_observability_local_collector::{TOKEN_HEADER, load_settings};
+use agent_observability_local_collector::{CollectorSettings, TOKEN_HEADER, load_settings};
 use agent_observability_local_runtime::{
     Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressMessage, IngressOutcome, LocalRuntimeConfigV2,
     PressureSample, RuntimeControl, StorageBudget,
 };
 use agent_observability_local_store::LocalStore;
+use serde::Deserialize;
 
 const USAGE: &str =
     "usage: cargo run -p xtask -- perf <local|automatic> --profile <release|smoke> --check";
@@ -106,6 +107,14 @@ const AUTOMATIC_ACTIVE_TIMEOUT_SMOKE: Duration = Duration::from_secs(15);
 const AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT: Duration = Duration::from_secs(15);
 const AUTOMATIC_LIFECYCLE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTOMATIC_PRIMARY_OTLP_P95_MS_MAX: u64 = 20;
+const AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX: u64 = 50;
+const AUTOMATIC_IDLE_CPU_PERCENT_MAX: f64 = 0.5;
+const AUTOMATIC_ACTIVE_CPU_PERCENT_MAX: f64 = 100.0;
+const AUTOMATIC_PEAK_RSS_MIB_MAX: f64 = 96.0;
+const AUTOMATIC_ALLOCATED_DISK_BYTES_MAX: u64 = 1_073_741_824;
+const AUTOMATIC_CONNECT_OUTPUT_MAX_BYTES: u64 = 4_096;
 const AUTOMATIC_LIFECYCLE_SEED: &[u8] = b"# exact automatic lifecycle seed\nmodel = \"gpt-test\"\n";
 const AUTOMATIC_LIFECYCLE_SEED_MODE: u32 = 0o600;
 #[cfg(target_os = "macos")]
@@ -175,6 +184,133 @@ impl AutomaticConfig {
             },
         }
     }
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticProtocol {
+    schema_version: String,
+    version: String,
+    protocol_revision: String,
+    purpose: String,
+    profiles: AutomaticProtocolProfiles,
+    workload: AutomaticProtocolWorkload,
+    metrics: AutomaticProtocolMetrics,
+    execution: AutomaticProtocolExecution,
+    evidence: AutomaticProtocolEvidence,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticProtocolProfiles {
+    release: AutomaticReleaseProfile,
+    smoke: AutomaticSmokeProfile,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticReleaseProfile {
+    build: String,
+    required_os: String,
+    warmup_seconds: u64,
+    idle_seconds: u64,
+    primary_otlp_requests: usize,
+    primary_otlp_inter_request_ms: u64,
+    runs: usize,
+    sample_interval_seconds: u64,
+    active_timeout_seconds: u64,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticSmokeProfile {
+    build: String,
+    normative: bool,
+    release_check: bool,
+    primary_otlp_requests: usize,
+    runs: usize,
+    active_timeout_seconds: u64,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticProtocolWorkload {
+    lifecycle_preflight: String,
+    lifecycle_seed: String,
+    lifecycle_assertions: String,
+    lifecycle_cleanup: String,
+    primary_boundary: String,
+    notify_boundary: String,
+    collector_boundary: String,
+    payload: String,
+    readiness: String,
+    collector_shutdown: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticProtocolMetrics {
+    primary_otlp: AutomaticPrimaryOtlpMetrics,
+    collector_cpu: AutomaticCpuMetrics,
+    collector_rss: AutomaticRssMetrics,
+    disk: AutomaticDiskMetrics,
+    network: AutomaticNetworkMetrics,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticPrimaryOtlpMetrics {
+    required_quantiles: Vec<String>,
+    validation_scope: String,
+    p95_ms_max: u64,
+    p99_ms_max: u64,
+    command_timeout_seconds: u64,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticCpuMetrics {
+    idle_average_percent_max: f64,
+    active_integrated_percent_max: f64,
+    normalization: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticRssMetrics {
+    peak_mib_max: f64,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticDiskMetrics {
+    allocated_tree_bytes_max: u64,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticNetworkMetrics {
+    allowed_transport: String,
+    bytes: String,
+    endpoints: String,
+    evidence: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticProtocolExecution {
+    build_timeout_seconds: u64,
+    startup_timeout_seconds: u64,
+    cleanup_timeout_seconds: u64,
+    fail_closed: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticProtocolEvidence {
+    output: String,
+    exact_source: String,
+    sanitized_paths: String,
 }
 
 #[derive(Debug)]
@@ -984,27 +1120,102 @@ fn run_automatic(config: AutomaticConfig) -> Result<(), String> {
 }
 
 fn validate_automatic_protocol_contract() -> Result<(), String> {
-    for line in [
-        "schema_version: automatic_local_performance.v1",
-        "protocol_revision: v1.3.0-sustained-primary-otlp-crash-lifecycle-scenarios",
-        "required_os: macos",
-        "lifecycle_preflight: bounded built-binary no-argument setup --no-open under isolated HOME and CODEX_HOME",
-        "lifecycle_assertions: connected config, ready or degraded collector, installed LaunchAgent plist, pre-failure authenticated primary OTLP and notify durability, unexpected SIGKILL service termination and bounded launchd kickstart recovery, post-recovery authenticated primary OTLP and notify durability, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service",
-        "primary_boundary: sustained authenticated Codex OTLP/HTTP /v1/logs requests through the built collector and durable report authority",
-        "notify_boundary: separately verified built agent-observability codex-notify supplement through authenticated loopback response",
-        "collector_boundary: built agent-observability collector-serve subprocess",
-        "validation_scope: every run independently",
-        "bytes: measured collector process bytes from the existing platform NetworkMonitor and reported without classifying loopback traffic as external",
-        "endpoints: every observed collector endpoint must be IPv4 loopback",
-        "cleanup_timeout_seconds: 5",
-    ] {
-        if !AUTOMATIC_PROTOCOL.contains(line) {
-            return Err(format!(
-                "embedded automatic performance protocol is missing {line}"
-            ));
-        }
+    validate_automatic_protocol(AUTOMATIC_PROTOCOL)
+}
+
+fn validate_automatic_protocol(protocol: &str) -> Result<(), String> {
+    let parsed = serde_saphyr::from_str::<AutomaticProtocol>(protocol)
+        .map_err(|error| format!("parse embedded automatic performance protocol: {error}"))?;
+    let expected = expected_automatic_protocol();
+    if parsed != expected {
+        return Err(format!(
+            "embedded automatic performance protocol drifted from executable configuration: {parsed:#?}"
+        ));
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn expected_automatic_protocol() -> AutomaticProtocol {
+    let release = AutomaticConfig::for_profile(Profile::Release);
+    let smoke = AutomaticConfig::for_profile(Profile::Smoke);
+    AutomaticProtocol {
+        schema_version: "automatic_local_performance.v1".into(),
+        version: "v1.3.0".into(),
+        protocol_revision: AUTOMATIC_PROTOCOL_REVISION.into(),
+        purpose: "normative performance evidence for the shipped Codex automatic local path".into(),
+        profiles: AutomaticProtocolProfiles {
+            release: AutomaticReleaseProfile {
+                build: "cargo build --locked -p agent-observability-cli --release".into(),
+                required_os: "macos".into(),
+                warmup_seconds: release.warmup.as_secs(),
+                idle_seconds: release.idle.as_secs(),
+                primary_otlp_requests: release.events,
+                primary_otlp_inter_request_ms: u64::try_from(release.inter_event.as_millis())
+                    .expect("release inter-request duration fits u64"),
+                runs: release.runs,
+                sample_interval_seconds: release.sample.as_secs(),
+                active_timeout_seconds: release.active_timeout.as_secs(),
+            },
+            smoke: AutomaticSmokeProfile {
+                build: "cargo build --locked -p agent-observability-cli".into(),
+                normative: false,
+                release_check: false,
+                primary_otlp_requests: smoke.events,
+                runs: smoke.runs,
+                active_timeout_seconds: smoke.active_timeout.as_secs(),
+            },
+        },
+        workload: AutomaticProtocolWorkload {
+            lifecycle_preflight: "bounded built-binary no-argument setup --no-open under isolated HOME and CODEX_HOME".into(),
+            lifecycle_seed: "exact private Codex config bytes and permission mode".into(),
+            lifecycle_assertions: "connected config, ready or degraded collector, installed LaunchAgent plist, pre-failure authenticated primary OTLP and notify durability, unexpected SIGKILL service termination and bounded launchd kickstart recovery, post-recovery authenticated primary OTLP and notify durability, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service".into(),
+            lifecycle_cleanup: "best-effort bounded disconnect, bootout, exact seed restoration, plist removal, and isolated directory removal on success or error".into(),
+            primary_boundary: "sustained authenticated Codex OTLP/HTTP /v1/logs requests through the built collector and durable report authority".into(),
+            notify_boundary: "separately verified built agent-observability codex-notify supplement through authenticated loopback response".into(),
+            collector_boundary: "built agent-observability collector-serve subprocess".into(),
+            payload: "bounded valid Codex OTLP log pairs with synthetic opaque identifiers; one bounded notify supplement per measured run".into(),
+            readiness: "accepted authenticated primary OTLP request within a bounded startup deadline".into(),
+            collector_shutdown: "bounded child termination and wait".into(),
+        },
+        metrics: AutomaticProtocolMetrics {
+            primary_otlp: AutomaticPrimaryOtlpMetrics {
+                required_quantiles: vec!["p95".into(), "p99".into()],
+                validation_scope: "every run independently".into(),
+                p95_ms_max: AUTOMATIC_PRIMARY_OTLP_P95_MS_MAX,
+                p99_ms_max: AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX,
+                command_timeout_seconds: LOCAL_COMMAND_TIMEOUT.as_secs(),
+            },
+            collector_cpu: AutomaticCpuMetrics {
+                idle_average_percent_max: AUTOMATIC_IDLE_CPU_PERCENT_MAX,
+                active_integrated_percent_max: AUTOMATIC_ACTIVE_CPU_PERCENT_MAX,
+                normalization: "percent of one logical core".into(),
+            },
+            collector_rss: AutomaticRssMetrics {
+                peak_mib_max: AUTOMATIC_PEAK_RSS_MIB_MAX,
+            },
+            disk: AutomaticDiskMetrics {
+                allocated_tree_bytes_max: AUTOMATIC_ALLOCATED_DISK_BYTES_MAX,
+            },
+            network: AutomaticNetworkMetrics {
+                allowed_transport: "authenticated IPv4 loopback only".into(),
+                bytes: "measured collector process bytes from the existing platform NetworkMonitor and reported without classifying loopback traffic as external".into(),
+                endpoints: "every observed collector endpoint must be IPv4 loopback".into(),
+                evidence: "process NetworkMonitor plus independent socket endpoint scans plus static product surface validation".into(),
+            },
+        },
+        execution: AutomaticProtocolExecution {
+            build_timeout_seconds: AUTOMATIC_BUILD_TIMEOUT.as_secs(),
+            startup_timeout_seconds: AUTOMATIC_START_TIMEOUT.as_secs(),
+            cleanup_timeout_seconds: AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT.as_secs(),
+            fail_closed: "missing or invalid metrics, rejected primary OTLP requests, missing notify supplement evidence, non-loopback endpoints, timeout, or threshold breach produce non-zero exit".into(),
+        },
+        evidence: AutomaticProtocolEvidence {
+            output: "docs/evidence/local/performance/automatic-<run>/manifest.yaml".into(),
+            exact_source: "full git commit, locked build command, package version, profile, and protocol revision".into(),
+            sanitized_paths: "run-relative runtime and protocol paths only; token, port, host path, payload, and raw collector output are forbidden".into(),
+        },
+    }
 }
 
 fn validate_automatic_profile_host(profile: Profile, os: &str) -> Result<(), String> {
@@ -1076,12 +1287,7 @@ impl AutomaticLifecycleCleanup<'_> {
         }
         let mut errors = Vec::new();
         if self.connection_may_exist
-            && let Err(error) = run_bounded_product_command_with_env(
-                self.binary,
-                &["disconnect", "codex"],
-                AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
-                &self.environment(),
-            )
+            && let Err(error) = retry_automatic_lifecycle_disconnect(self)
         {
             errors.push(format!(
                 "best-effort automatic lifecycle disconnect: {error}"
@@ -1440,16 +1646,46 @@ fn submit_automatic_notify(
     event: usize,
 ) -> Result<(), String> {
     let payload = automatic_notify_payload(0, event);
-    let notify = run_bounded_product_command_with_env(
-        binary,
-        &["codex-notify", path_text(root)?, &payload],
-        LOCAL_COMMAND_TIMEOUT,
-        &cleanup.environment(),
-    )?;
-    if notify.trim() != "notify=accepted" {
-        return Err("automatic lifecycle notify was not accepted".into());
+    let root = path_text(root)?;
+    let started = Instant::now();
+    loop {
+        if let Ok(notify) = run_bounded_product_command_with_env(
+            binary,
+            &["codex-notify", root, &payload],
+            LOCAL_COMMAND_TIMEOUT,
+            &cleanup.environment(),
+        ) && notify.trim() == "notify=accepted"
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= AUTOMATIC_LIFECYCLE_RECOVERY_TIMEOUT {
+            return Err("automatic lifecycle notify was not accepted".into());
+        }
+        sleep(Duration::from_millis(50));
     }
-    Ok(())
+}
+
+fn retry_automatic_lifecycle_disconnect(
+    cleanup: &AutomaticLifecycleCleanup<'_>,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        match run_bounded_product_command_with_env(
+            cleanup.binary,
+            &["disconnect", "codex"],
+            AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT,
+            &cleanup.environment(),
+        ) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if error.contains("lifecycle is busy")
+                    && started.elapsed() < AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT =>
+            {
+                sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn run_concurrent_automatic_connects(
@@ -1457,6 +1693,7 @@ fn run_concurrent_automatic_connects(
     root: &Path,
     cleanup: &AutomaticLifecycleCleanup<'_>,
 ) -> Result<(), String> {
+    let ownership = AutomaticLifecycleOwnership::capture(root, cleanup)?;
     let root_text = path_text(root)?;
     let mut commands = Vec::with_capacity(2);
     for _ in 0..2 {
@@ -1464,8 +1701,8 @@ fn run_concurrent_automatic_connects(
         command
             .args(["connect", "codex", root_text])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         for (name, value) in cleanup.environment() {
             command.env(name, value);
         }
@@ -1473,23 +1710,207 @@ fn run_concurrent_automatic_connects(
             format!("spawn concurrent automatic lifecycle connect: {error}")
         })?));
     }
-    let mut successes = 0_usize;
+
+    let deadline = Instant::now() + AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT;
+    let mut outcomes = Vec::with_capacity(commands.len());
     for command in &mut commands {
-        if wait_for_child(command, AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT)?.success() {
-            successes = successes.saturating_add(1);
-        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        outcomes.push(collect_automatic_connect_output(command, remaining));
     }
-    if successes == 0 {
-        return Err("automatic lifecycle concurrent connects both failed".into());
+    let mut completed = Vec::with_capacity(outcomes.len());
+    for outcome in outcomes {
+        completed.push(outcome?);
     }
+    let successes = completed
+        .iter()
+        .filter(|outcome| outcome.status.success())
+        .count();
+    let busy_failures = completed
+        .iter()
+        .filter(|outcome| {
+            !outcome.status.success()
+                && outcome
+                    .stderr
+                    .contains("Codex integration lifecycle is busy")
+        })
+        .count();
+    if !((successes == 1 && busy_failures == 1) || successes == 2) {
+        return Err(format!(
+            "automatic lifecycle concurrent connect outcomes violated the product contract: {}",
+            format_automatic_connect_outcomes(&completed)
+        ));
+    }
+    for outcome in completed.iter().filter(|outcome| outcome.status.success()) {
+        require_output_line(&outcome.stdout, "integration", "codex")?;
+        require_output_line(&outcome.stdout, "config", "connected")?;
+        require_collector_ready_or_degraded(&outcome.stdout)?;
+    }
+
     let status = run_bounded_product_command_with_env(
         binary,
         &["status", "codex", root_text],
         AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
         &cleanup.environment(),
     )?;
+    require_output_line(&status, "integration", "codex")?;
     require_output_line(&status, "config", "connected")?;
-    require_collector_ready_or_degraded(&status)
+    require_collector_ready_or_degraded(&status)?;
+    ownership.verify(binary, root, cleanup)
+}
+
+#[derive(Debug)]
+struct AutomaticConnectOutput {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug)]
+struct AutomaticLifecycleOwnership {
+    settings: CollectorSettings,
+    settings_bytes: Vec<u8>,
+    config_bytes: Vec<u8>,
+    config_mode: u32,
+    plist: PathBuf,
+    plist_bytes: Vec<u8>,
+    plist_mode: u32,
+    target: String,
+}
+
+impl AutomaticLifecycleOwnership {
+    fn capture(root: &Path, cleanup: &AutomaticLifecycleCleanup<'_>) -> Result<Self, String> {
+        let settings_path = root.join("runtime/collector.json");
+        let plist = cleanup
+            .plist
+            .clone()
+            .ok_or("automatic lifecycle plist ownership is unavailable")?;
+        Ok(Self {
+            settings: load_settings(root).map_err(|error| error.to_string())?,
+            settings_bytes: fs::read(settings_path).map_err(|error| {
+                format!("read automatic lifecycle settings before concurrency: {error}")
+            })?,
+            config_bytes: fs::read(&cleanup.config).map_err(|error| {
+                format!("read automatic lifecycle config before concurrency: {error}")
+            })?,
+            config_mode: file_mode(&cleanup.config, "automatic lifecycle config")?,
+            plist_bytes: fs::read(&plist).map_err(|error| {
+                format!("read automatic lifecycle plist before concurrency: {error}")
+            })?,
+            plist_mode: file_mode(&plist, "automatic lifecycle plist")?,
+            plist,
+            target: cleanup
+                .target
+                .clone()
+                .ok_or("automatic lifecycle target ownership is unavailable")?,
+        })
+    }
+
+    fn verify(
+        &self,
+        binary: &Path,
+        root: &Path,
+        cleanup: &AutomaticLifecycleCleanup<'_>,
+    ) -> Result<(), String> {
+        let settings_path = root.join("runtime/collector.json");
+        let settings_after = load_settings(root).map_err(|error| error.to_string())?;
+        let settings_bytes_after = fs::read(settings_path).map_err(|error| {
+            format!("read automatic lifecycle settings after concurrency: {error}")
+        })?;
+        if settings_after != self.settings || settings_bytes_after != self.settings_bytes {
+            return Err("automatic lifecycle concurrent connect changed collector settings".into());
+        }
+        verify_exact_file(
+            &cleanup.config,
+            &self.config_bytes,
+            self.config_mode,
+            "owned Codex config",
+        )?;
+        verify_exact_file(
+            &self.plist,
+            &self.plist_bytes,
+            self.plist_mode,
+            "owned LaunchAgent plist",
+        )?;
+        verify_automatic_launch_agent_plist(&self.plist, binary, root)?;
+        if !launch_agent_is_loaded(&self.target)? {
+            return Err("automatic lifecycle concurrent connect lost LaunchAgent ownership".into());
+        }
+        Ok(())
+    }
+}
+
+fn collect_automatic_connect_output(
+    child: &mut ChildGuard,
+    timeout: Duration,
+) -> Result<AutomaticConnectOutput, String> {
+    let status = match wait_for_child(child, timeout) {
+        Ok(status) => status,
+        Err(error) => {
+            child.terminate()?;
+            return Err(format!(
+                "concurrent automatic lifecycle connect did not terminate boundedly: {error}"
+            ));
+        }
+    };
+    let stdout = read_bounded_child_stream(
+        child
+            .stdout
+            .take()
+            .ok_or("concurrent automatic lifecycle connect stdout is unavailable")?,
+        "stdout",
+    )?;
+    let stderr = read_bounded_child_stream(
+        child
+            .stderr
+            .take()
+            .ok_or("concurrent automatic lifecycle connect stderr is unavailable")?,
+        "stderr",
+    )?;
+    Ok(AutomaticConnectOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_bounded_child_stream(stream: impl Read, label: &str) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    stream
+        .take(AUTOMATIC_CONNECT_OUTPUT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read concurrent automatic lifecycle connect {label}: {error}"))?;
+    if bytes.len() as u64 > AUTOMATIC_CONNECT_OUTPUT_MAX_BYTES {
+        return Err(format!(
+            "concurrent automatic lifecycle connect {label} exceeded {AUTOMATIC_CONNECT_OUTPUT_MAX_BYTES} bytes"
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| format!("concurrent automatic lifecycle connect {label} is not UTF-8"))
+}
+
+fn format_automatic_connect_outcomes(outcomes: &[AutomaticConnectOutput]) -> String {
+    outcomes
+        .iter()
+        .enumerate()
+        .map(|(index, outcome)| {
+            format!(
+                "child {} status={} stdout={:?} stderr={:?}",
+                index + 1,
+                outcome.status,
+                outcome.stdout.trim(),
+                outcome.stderr.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn file_mode(path: &Path, label: &str) -> Result<u32, String> {
+    Ok(fs::metadata(path)
+        .map_err(|error| format!("inspect {label}: {error}"))?
+        .permissions()
+        .mode()
+        & 0o777)
 }
 
 fn verify_inherited_automatic_plist(
@@ -3899,13 +4320,13 @@ fn validate_automatic_results(
         if config.profile == Profile::Release {
             let mut latencies = result.primary_otlp_latencies_us.clone();
             latencies.sort_unstable();
-            if percentile(&latencies, 95) > 20_000 {
+            if percentile(&latencies, 95) > u128::from(AUTOMATIC_PRIMARY_OTLP_P95_MS_MAX) * 1_000 {
                 return Err(format!(
                     "automatic run {} primary OTLP p95 latency budget exceeded",
                     result.run
                 ));
             }
-            if percentile(&latencies, 99) > 50_000 {
+            if percentile(&latencies, 99) > u128::from(AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX) * 1_000 {
                 return Err(format!(
                     "automatic run {} primary OTLP p99 latency budget exceeded",
                     result.run
@@ -3914,24 +4335,27 @@ fn validate_automatic_results(
         }
     }
     if config.profile == Profile::Release {
-        if results.iter().any(|result| result.idle_cpu_percent > 0.5) {
+        if results
+            .iter()
+            .any(|result| result.idle_cpu_percent > AUTOMATIC_IDLE_CPU_PERCENT_MAX)
+        {
             return Err("automatic collector idle CPU budget exceeded".into());
         }
         if results
             .iter()
-            .any(|result| result.active_cpu_percent > 100.0)
+            .any(|result| result.active_cpu_percent > AUTOMATIC_ACTIVE_CPU_PERCENT_MAX)
         {
             return Err("automatic collector active CPU exceeded one logical core".into());
         }
         if results
             .iter()
-            .any(|result| result.peak_rss_kib > 96.0 * 1024.0)
+            .any(|result| result.peak_rss_kib > AUTOMATIC_PEAK_RSS_MIB_MAX * 1024.0)
         {
             return Err("automatic collector RSS budget exceeded".into());
         }
         if results
             .iter()
-            .any(|result| result.peak_disk_bytes > 1_073_741_824)
+            .any(|result| result.peak_disk_bytes > AUTOMATIC_ALLOCATED_DISK_BYTES_MAX)
         {
             return Err("automatic allocated disk budget exceeded".into());
         }
@@ -4734,6 +5158,119 @@ mod tests {
                 .contains("separately verified built agent-observability codex-notify")
         );
         assert!(!AUTOMATIC_PROTOCOL.contains("external_network_bytes_required"));
+    }
+
+    #[test]
+    fn automatic_protocol_rejects_profile_and_threshold_mutations() {
+        for (name, original, replacement) in [
+            ("release runs", "    runs: 5\n", "    runs: 6\n"),
+            ("smoke runs", "    runs: 1\n", "    runs: 2\n"),
+            (
+                "release warmup",
+                "    warmup_seconds: 60\n",
+                "    warmup_seconds: 61\n",
+            ),
+            (
+                "release idle",
+                "    idle_seconds: 900\n",
+                "    idle_seconds: 901\n",
+            ),
+            (
+                "release request count",
+                "    primary_otlp_requests: 10000\n",
+                "    primary_otlp_requests: 9999\n",
+            ),
+            (
+                "smoke request count",
+                "    primary_otlp_requests: 25\n",
+                "    primary_otlp_requests: 24\n",
+            ),
+            (
+                "release request cadence",
+                "    primary_otlp_inter_request_ms: 3\n",
+                "    primary_otlp_inter_request_ms: 4\n",
+            ),
+            (
+                "release sample interval",
+                "    sample_interval_seconds: 1\n",
+                "    sample_interval_seconds: 2\n",
+            ),
+            (
+                "build timeout",
+                "  build_timeout_seconds: 600\n",
+                "  build_timeout_seconds: 601\n",
+            ),
+            (
+                "release active timeout",
+                "    active_timeout_seconds: 300\n",
+                "    active_timeout_seconds: 301\n",
+            ),
+            (
+                "smoke active timeout",
+                "    active_timeout_seconds: 15\n",
+                "    active_timeout_seconds: 16\n",
+            ),
+            (
+                "request timeout",
+                "    command_timeout_seconds: 1\n",
+                "    command_timeout_seconds: 2\n",
+            ),
+            (
+                "startup timeout",
+                "  startup_timeout_seconds: 10\n",
+                "  startup_timeout_seconds: 11\n",
+            ),
+            (
+                "cleanup timeout",
+                "  cleanup_timeout_seconds: 5\n",
+                "  cleanup_timeout_seconds: 6\n",
+            ),
+            ("p95", "    p95_ms_max: 20\n", "    p95_ms_max: 21\n"),
+            ("p99", "    p99_ms_max: 50\n", "    p99_ms_max: 51\n"),
+            (
+                "idle CPU",
+                "    idle_average_percent_max: 0.5\n",
+                "    idle_average_percent_max: 0.6\n",
+            ),
+            (
+                "active CPU",
+                "    active_integrated_percent_max: 100\n",
+                "    active_integrated_percent_max: 99\n",
+            ),
+            ("RSS", "    peak_mib_max: 96\n", "    peak_mib_max: 95\n"),
+            (
+                "disk",
+                "    allocated_tree_bytes_max: 1073741824\n",
+                "    allocated_tree_bytes_max: 1073741823\n",
+            ),
+        ] {
+            let mutated = AUTOMATIC_PROTOCOL.replacen(original, replacement, 1);
+            assert_ne!(
+                mutated, AUTOMATIC_PROTOCOL,
+                "missing mutation fixture for {name}"
+            );
+            assert!(
+                validate_automatic_protocol(&mutated).is_err(),
+                "automatic protocol accepted mutated {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_protocol_rejects_unknown_structure() {
+        let mutated = AUTOMATIC_PROTOCOL.replacen(
+            "execution:\n",
+            "execution:\n  undocumented_timeout_seconds: 1\n",
+            1,
+        );
+
+        assert!(validate_automatic_protocol(&mutated).is_err());
+        assert!(
+            validate_automatic_protocol(&format!(
+                "{AUTOMATIC_PROTOCOL}\n---\nschema_version: shadow\n"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

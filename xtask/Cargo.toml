@@ -12,6 +12,8 @@ agent-observability-domain = { path = "../crates/domain" }
 agent-observability-local-runtime = { path = "../crates/local-runtime" }
 agent-observability-local-collector = { path = "../crates/local-collector" }
 agent-observability-local-store = { path = "../crates/local-store" }
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "=1.2.0", default-features = false, features = ["deserialize"] }
 
 [lints]
 workspace = true

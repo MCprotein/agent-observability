@@ -8,7 +8,7 @@ use agent_observability_adapter_codex::{
 use agent_observability_application::project_report;
 use agent_observability_local_runtime::{
     Admission, InstalledLayout, LocalRuntimeConfigV2, MutationGuard, PressureSample,
-    RuntimeControl, Singleton, StorageBudget, install, load,
+    RuntimeControl, Singleton, SingletonError, StorageBudget, install, load,
 };
 use agent_observability_local_store::{LocalStore, StoreBatchItem};
 use agent_observability_static_report::write_private;
@@ -316,9 +316,10 @@ struct Health {
 pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     validate_options(&options)?;
     let layout = install(&options.root).map_err(runtime_error)?;
-    let config = load(&layout.config).map_err(runtime_error)?;
     let singleton = Singleton::acquire(&layout.runtime.join("collector")).map_err(runtime_error)?;
-    let store = open_store(&layout, &config)?;
+    let mutation = try_collector_mutation(&layout.runtime)?;
+    let config = load(&layout.config).map_err(runtime_error)?;
+    let store = open_store(&mutation, &layout, &config)?;
     let report_status = store.report_status().map_err(runtime_error)?;
     let report_missing = !layout.logs.join(REPORT_FILE_NAME).is_file();
     let report_wakeup = reconcile_report_state(&layout, report_status.pending() || report_missing);
@@ -334,6 +335,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         .transpose()
         .map_err(runtime_error)?
         .unwrap_or_default();
+    drop(mutation);
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), options.port);
     let initial_bind = TcpListener::bind(address).await;
     let listener = bind_persisted_port(initial_bind)?;
@@ -590,15 +592,15 @@ async fn ingest_notify(State(state): State<AppState>, body: Bytes) -> impl IntoR
     let (outcome, committed) = match ingest_notify_locked(&mut collector, &body) {
         Ok(IngestOutcome::Committed) => {
             collector.accepted_requests = collector.accepted_requests.saturating_add(1);
-            (StatusCode::OK, true)
+            (StatusCode::OK.into_response(), true)
         }
         Ok(IngestOutcome::Disabled) => {
             collector.suppressed_requests = collector.suppressed_requests.saturating_add(1);
-            (StatusCode::OK, false)
+            (StatusCode::OK.into_response(), false)
         }
         Err(error) => {
             collector.rejected_requests = collector.rejected_requests.saturating_add(1);
-            (error.status(), false)
+            (error.into_response(), false)
         }
     };
     drop(collector);
@@ -639,15 +641,15 @@ async fn ingest_logs(State(state): State<AppState>, body: Bytes) -> impl IntoRes
     let (outcome, committed) = match ingest_locked(&mut collector, &body) {
         Ok(IngestOutcome::Committed) => {
             collector.accepted_requests = collector.accepted_requests.saturating_add(1);
-            (StatusCode::OK, true)
+            (StatusCode::OK.into_response(), true)
         }
         Ok(IngestOutcome::Disabled) => {
             collector.suppressed_requests = collector.suppressed_requests.saturating_add(1);
-            (StatusCode::OK, false)
+            (StatusCode::OK.into_response(), false)
         }
         Err(error) => {
             collector.rejected_requests = collector.rejected_requests.saturating_add(1);
-            (error.status(), false)
+            (error.into_response(), false)
         }
     };
     drop(collector);
@@ -693,6 +695,7 @@ enum IngestOutcome {
 #[derive(Debug)]
 enum IngestError {
     Invalid(CollectorError),
+    Busy,
     Policy,
     Pressure,
     Storage,
@@ -703,10 +706,17 @@ impl IngestError {
         match self {
             Self::Invalid(CollectorError::Io(_)) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Invalid(CollectorError::Runtime(_)) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Busy | Self::Pressure => StatusCode::SERVICE_UNAVAILABLE,
             Self::Policy => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::Pressure => StatusCode::SERVICE_UNAVAILABLE,
             Self::Storage => StatusCode::INSUFFICIENT_STORAGE,
         }
+    }
+
+    fn into_response(self) -> Response {
+        if matches!(self, Self::Busy) {
+            return (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response();
+        }
+        self.status().into_response()
     }
 }
 
@@ -717,7 +727,7 @@ impl From<CollectorError> for IngestError {
 }
 
 fn ingest_locked(state: &mut CollectorState, body: &[u8]) -> Result<IngestOutcome, IngestError> {
-    let _mutation = MutationGuard::acquire(&state.layout.runtime).map_err(runtime_error)?;
+    let _mutation = try_ingest_mutation(&state.layout.runtime)?;
     let Some(config) = admit_request(state, body.len())? else {
         return Ok(IngestOutcome::Disabled);
     };
@@ -761,7 +771,7 @@ fn ingest_notify_locked(
     state: &mut CollectorState,
     body: &[u8],
 ) -> Result<IngestOutcome, IngestError> {
-    let _mutation = MutationGuard::acquire(&state.layout.runtime).map_err(runtime_error)?;
+    let _mutation = try_ingest_mutation(&state.layout.runtime)?;
     let Some(config) = admit_request(state, body.len())? else {
         return Ok(IngestOutcome::Disabled);
     };
@@ -778,6 +788,20 @@ fn ingest_notify_locked(
     enforce_batch_policy(&batch, &config)?;
     commit_batch(state, &batch, Some(cursor.to_string()), now, None)?;
     Ok(IngestOutcome::Committed)
+}
+
+fn try_ingest_mutation(runtime: &Path) -> Result<MutationGuard, IngestError> {
+    MutationGuard::try_acquire(runtime).map_err(|error| match error {
+        SingletonError::AlreadyRunning => IngestError::Busy,
+        error => IngestError::Invalid(runtime_error(error)),
+    })
+}
+
+fn try_collector_mutation(runtime: &Path) -> Result<MutationGuard, CollectorError> {
+    MutationGuard::try_acquire(runtime).map_err(|error| match error {
+        SingletonError::AlreadyRunning => CollectorError::Runtime("runtime mutation busy".into()),
+        error => runtime_error(error),
+    })
 }
 
 fn admit_request(
@@ -1123,8 +1147,9 @@ fn clear_report_dirty(layout: &InstalledLayout) -> Result<(), CollectorError> {
 
 fn refresh_report_from_root(root: &Path) -> Result<bool, CollectorError> {
     let layout = install(root).map_err(runtime_error)?;
+    let mutation = try_collector_mutation(&layout.runtime)?;
     let config = load(&layout.config).map_err(runtime_error)?;
-    let store = open_store(&layout, &config)?;
+    let store = open_store(&mutation, &layout, &config)?;
     store.rebuild_projection().map_err(runtime_error)?;
     refresh_report(&layout, &store, current_unix_ms()?)
 }
@@ -1226,6 +1251,7 @@ fn refresh_report(
 }
 
 fn open_store(
+    _mutation: &MutationGuard,
     layout: &InstalledLayout,
     config: &LocalRuntimeConfigV2,
 ) -> Result<LocalStore, CollectorError> {
@@ -1336,7 +1362,7 @@ mod tests {
     fn collector_state(root: &Path) -> CollectorState {
         let layout = install(root).unwrap();
         let config = load(&layout.config).unwrap();
-        let store = open_store(&layout, &config).unwrap();
+        let store = open_store_for_test(&layout, &config);
         let source_generation = "codex-test".to_owned();
         let last_cursor = store.cursor("codex", &source_generation).unwrap();
         let request_correlation = store
@@ -1365,6 +1391,14 @@ mod tests {
             report_degraded: false,
             report_refresh_failures: 0,
         }
+    }
+
+    fn open_store_for_test(
+        layout: &agent_observability_local_runtime::InstalledLayout,
+        config: &agent_observability_local_runtime::LocalRuntimeConfigV2,
+    ) -> agent_observability_local_store::LocalStore {
+        let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+        open_store(&mutation, layout, config).unwrap()
     }
 
     fn app_state(root: &Path) -> AppState {
@@ -1399,24 +1433,51 @@ mod tests {
     }
 
     #[test]
-    fn collector_ingest_waits_for_the_shared_runtime_mutation_guard() {
+    fn collector_ingest_returns_busy_without_waiting_for_the_shared_runtime_mutation_guard() {
         let root = test_root("shared-mutation-guard");
         let _ = fs::remove_dir_all(&root);
-        let state = collector_state(&root);
+        let mut state = collector_state(&root);
         let guard = MutationGuard::acquire(&state.layout.runtime).unwrap();
-        let (sent, received) = std::sync::mpsc::channel();
-        let handle = thread::spawn(move || {
-            let mut state = state;
-            let result = ingest_notify_locked(
-                &mut state,
-                br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-            );
-            sent.send(result.is_ok()).unwrap();
-        });
-        assert!(received.recv_timeout(Duration::from_millis(30)).is_err());
+        let result = ingest_notify_locked(
+            &mut state,
+            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+        );
+        assert!(matches!(result, Err(IngestError::Busy)));
+        assert_eq!(state.store.record_count().unwrap(), 0);
         drop(guard);
-        assert!(received.recv_timeout(Duration::from_secs(1)).unwrap());
-        handle.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn busy_ingest_response_is_visible_as_service_unavailable() {
+        let response = IngestError::Busy.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let body = runtime
+            .block_on(axum::body::to_bytes(response.into_body(), 16))
+            .unwrap();
+        assert_eq!(&body[..], b"busy");
+    }
+
+    #[test]
+    fn collector_migration_admission_and_projection_rebuild_are_busy_during_config_mutation() {
+        let root = test_root("open-rebuild-mutation");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        let layout = state.layout.clone();
+        drop(state);
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+
+        assert!(matches!(
+            refresh_report_from_root(&root),
+            Err(super::CollectorError::Runtime(ref message)) if message == "runtime mutation busy"
+        ));
+
+        drop(guard);
+        refresh_report_from_root(&root).unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1424,30 +1485,26 @@ mod tests {
     fn concurrent_disable_blocks_automatic_ingest_before_admission() {
         let root = test_root("concurrent-disable");
         let _ = fs::remove_dir_all(&root);
-        let state = collector_state(&root);
+        let mut state = collector_state(&root);
         let layout = state.layout.clone();
         let guard = ConfigMutationGuard::acquire(&layout).unwrap();
-        let (sent, received) = std::sync::mpsc::channel();
-        let handle = thread::spawn(move || {
-            let mut state = state;
-            let outcome = ingest_notify_locked(
-                &mut state,
-                br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-            );
-            sent.send((outcome, state.store.record_count().unwrap()))
-                .unwrap();
-        });
-        assert!(received.recv_timeout(Duration::from_millis(30)).is_err());
+        let busy = ingest_notify_locked(
+            &mut state,
+            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+        );
+        assert!(matches!(busy, Err(IngestError::Busy)));
 
         let mut config = load(&layout.config).unwrap();
         config.enabled = false;
         save(&guard, &config).unwrap();
         drop(guard);
 
-        let (outcome, records) = received.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(outcome.unwrap(), IngestOutcome::Disabled);
-        assert_eq!(records, 0);
-        handle.join().unwrap();
+        let retry = ingest_notify_locked(
+            &mut state,
+            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+        );
+        assert_eq!(retry.unwrap(), IngestOutcome::Disabled);
+        assert_eq!(state.store.record_count().unwrap(), 0);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1455,31 +1512,27 @@ mod tests {
     fn concurrent_budget_reduction_blocks_automatic_ingest_before_commit() {
         let root = test_root("concurrent-budget");
         let _ = fs::remove_dir_all(&root);
-        let state = collector_state(&root);
+        let mut state = collector_state(&root);
         let layout = state.layout.clone();
         inflate_allocated_accounting(&root);
         let guard = ConfigMutationGuard::acquire(&layout).unwrap();
-        let (sent, received) = std::sync::mpsc::channel();
-        let handle = thread::spawn(move || {
-            let mut state = state;
-            let outcome = ingest_notify_locked(
-                &mut state,
-                br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-            );
-            sent.send((outcome, state.store.record_count().unwrap()))
-                .unwrap();
-        });
-        assert!(received.recv_timeout(Duration::from_millis(30)).is_err());
+        let busy = ingest_notify_locked(
+            &mut state,
+            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+        );
+        assert!(matches!(busy, Err(IngestError::Busy)));
 
         let mut config = load(&layout.config).unwrap();
         config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
         save(&guard, &config).unwrap();
         drop(guard);
 
-        let (outcome, records) = received.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(matches!(outcome, Err(IngestError::Storage)));
-        assert_eq!(records, 0);
-        handle.join().unwrap();
+        let retry = ingest_notify_locked(
+            &mut state,
+            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+        );
+        assert!(matches!(retry, Err(IngestError::Storage)));
+        assert_eq!(state.store.record_count().unwrap(), 0);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2274,7 +2327,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let layout = install(&root).unwrap();
         let config = load(&layout.config).unwrap();
-        let store = open_store(&layout, &config).unwrap();
+        let store = open_store_for_test(&layout, &config);
         let mut state = CollectorState {
             layout: layout.clone(),
             store,
@@ -2555,7 +2608,7 @@ mod tests {
         let render_guard = {
             let collector = state.collector.blocking_lock();
             let config = load(&collector.layout.config).unwrap();
-            let store = open_store(&collector.layout, &config).unwrap();
+            let store = open_store_for_test(&collector.layout, &config);
             drop(collector);
             store.acquire_report_render_guard().unwrap()
         };
@@ -2735,7 +2788,7 @@ mod tests {
         .unwrap();
 
         let config = load(&collector.layout.config).unwrap();
-        let renderer = open_store(&collector.layout, &config).unwrap();
+        let renderer = open_store_for_test(&collector.layout, &config);
         let report_path = collector.layout.logs.join(REPORT_FILE_NAME);
         let snapshot_ready = Arc::new(std::sync::Barrier::new(2));
         let ingest_finished = Arc::new(std::sync::Barrier::new(2));
@@ -2974,7 +3027,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let layout = install(&root).unwrap();
         let initial = load(&layout.config).unwrap();
-        let store = open_store(&layout, &initial).unwrap();
+        let store = open_store_for_test(&layout, &initial);
         let mut state = CollectorState {
             layout: layout.clone(),
             store,

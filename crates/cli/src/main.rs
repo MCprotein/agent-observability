@@ -598,9 +598,10 @@ fn prepare_dashboard_with(
 
 fn current_record_count(root: &Path) -> Result<usize, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let config = load(&layout.config).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let store = open_store(&layout, &config)?;
+    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let store = open_store(&mutation, &layout, &config)?;
     store
         .current_records()
         .map(|records| records.len())
@@ -697,9 +698,10 @@ fn config_output(layout: &InstalledLayout, config: &LocalRuntimeConfigV2) -> Str
 
 fn storage_check(root: &Path) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let config = load(&layout.config).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let store = open_store(&layout, &config)?;
+    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let store = open_store(&mutation, &layout, &config)?;
     let (observations, records, outcomes) = store.counts().map_err(|error| error.to_string())?;
     Ok(format!(
         "store_schema={LOCAL_STORE_SCHEMA_VERSION}\nobservations={observations}\nrecords={records}\ndelivery_outcomes={outcomes}\nteam_ingest=disabled"
@@ -707,6 +709,7 @@ fn storage_check(root: &Path) -> Result<String, String> {
 }
 
 fn open_store(
+    _mutation: &MutationGuard,
     layout: &InstalledLayout,
     config: &LocalRuntimeConfigV2,
 ) -> Result<LocalStore, String> {
@@ -723,9 +726,10 @@ fn retention(root: &Path, apply: Option<(&str, &Path)>) -> Result<String, String
     let apply = apply
         .map(|(plan_id, path)| normalize_archive_path(&layout.root, plan_id, path))
         .transpose()?;
-    let config = load(&layout.config).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let store = open_store(&layout, &config)?;
+    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let store = open_store(&mutation, &layout, &config)?;
     let now_unix_ms = current_unix_ms()?;
     let retention_ms = u64::from(config.retention.max_record_age_days)
         .checked_mul(86_400_000)
@@ -812,9 +816,10 @@ fn report_command(arguments: &[String]) -> Result<String, String> {
 
 fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let config = load(&layout.config).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let store = open_store(&layout, &config)?;
+    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let store = open_store(&mutation, &layout, &config)?;
     let rate_table = rate_table_path
         .map(read_private_rate_table)
         .transpose()?
@@ -948,9 +953,10 @@ fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 
 fn runtime_check(root: &Path) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let config = load(&layout.config).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let store = open_store(&layout, &config)?;
+    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let store = open_store(&mutation, &layout, &config)?;
     drop(store);
     let allocated =
         StorageBudget::allocated_tree_bytes(&layout.root).map_err(|error| error.to_string())?;

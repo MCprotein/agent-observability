@@ -188,8 +188,11 @@ Invalid updates leave the previous bytes unchanged. User-facing names, defaults,
 - One process owns the private runtime directory through an OS-held file lock and random boot
 nonce. PID metadata alone never proves ownership.
 - Installed-root ingest acquires the cross-process mutation lock before loading this configuration and holds
-  it through admission, durable write, and projection repair. Ingest arguments are runtime roots; direct store-directory config
-  bypass is not supported.
+  it through admission, durable write, and projection repair. Manual CLI import may wait for an
+  operator-visible mutation to finish. Automatic collector requests use nonblocking admission instead:
+  lock contention returns HTTP `503` with `busy`, and a later retry reloads policy and repeats storage
+  accounting before any commit. Ingest arguments are runtime roots; direct store-directory config bypass
+  is not supported.
 - Storage accounting walks allocated filesystem blocks, rejects symlinks, and stops after 4,096
   entries. Admission reserves the worst-case batch against the configured hard cap.
 - Pressure transitions are normal -> pressured -> protected -> probe. Two 10-second over-budget
@@ -215,6 +218,10 @@ auto-vacuum with one atomic full-database rewrite before changing the schema ver
 open refuses a legacy rewrite. Product commands
 explicitly admit migration workspace against both the configured storage budget and actual
 filesystem availability; less than twice the database file size fails closed before the rewrite.
+Collector startup, report refresh, report generation, storage checks, retention, runtime checks, and
+dashboard store reads hold the same runtime `mutation.lock` from config load through migration-headroom
+accounting, store open or projection repair, and any resulting authority mutation. Callers pass explicit
+guard ownership into store-open helpers, preventing nested or reentrant lock acquisition.
 The supported bounds are 1..3650 days, 1..100,000 archive entries, and 64 KiB..256 MiB per pass.
 The default is 30 days, 10,000 entries, and 16 MiB.
 
