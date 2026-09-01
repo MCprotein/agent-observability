@@ -2,9 +2,9 @@
 
 ## Source of truth
 
-Status: Draft
-Date: 2026-08-28
-Product surfaces: standalone static report, team hosted operations console, team administration
+Status: Active
+Date: 2026-09-01
+Product surfaces: standalone static report, standalone loopback settings console, team hosted operations console, team administration
 
 Evidence reviewed:
 
@@ -47,6 +47,7 @@ Goals:
 - make ingestion freshness, partial data and privacy state visible beside the affected report
 - let authorized users manage membership, policies, retention, quota, sources, exports and audit
 - share analysis components and `ReportDtoVx` semantics across standalone and team
+- configure standalone collection, storage, retention and cadence through a visual local-only surface
 
 Non-goals:
 
@@ -54,7 +55,7 @@ Non-goals:
 - raw prompt/output viewer
 - general-purpose log search or arbitrary query language
 - model request gateway administration
-- remote control of standalone local files
+- remote control of standalone local files; the same-user loopback settings console is explicitly local-only
 
 Success signals:
 
@@ -86,6 +87,18 @@ Standalone file-open uses hash navigation or internal view state so it works fro
 
 - `#/overview`, `#/activity`, `#/traces`, `#/traces/:traceId`
 - `#/projects`, `#/costs`, `#/privacy`, `#/exports`
+
+Standalone settings use an ephemeral loopback route opened by `agent-observability ui`:
+
+- `/` renders overview, collection, storage and retention controls in one responsive workspace
+- `/api/config` reads and atomically replaces the Rust-validated local configuration
+- the browser receives a one-time session capability through the URL fragment, removes it from the visible URL,
+  and sends it only in a private request header
+
+The settings process binds an operating-system-selected port on `127.0.0.1`, rejects non-loopback host and
+origin values, sends no CORS permission, makes no external request and expires after inactivity. Closing it
+does not affect the static report or collection runtime. Rust remains authoritative for defaults, validation,
+atomic persistence and file permissions.
 
 Hosted team uses server routes:
 
@@ -174,6 +187,17 @@ Shared analysis components consume only `ReportDtoVx` or dedicated sanitized man
 - `EmptyState`, `LoadingState`, `PartialState`, `OfflineState`, `QuotaState`
 - `ExportDialog`, `FieldManifest`
 
+Standalone settings components consume only a versioned sanitized configuration DTO:
+
+- `LocalSettingsShell`, `SettingsNavigation`, `SessionStatus`
+- `CollectionSwitch`, `CadenceTimeline`, `BatchCapacityPlot`
+- `StorageBudgetGauge`, `RetentionWindow`, `ArchiveLimitEditor`
+- `StickySaveBar`, `ValidationSummary`, `ResetDefaultsDialog`
+
+Visualizations explain policy relationships; they do not invent runtime telemetry. Gauges and timelines label
+configured limits as policy, not current usage. Every numeric control keeps a direct text input and unit label,
+so the visualization never becomes the only editing mechanism.
+
 Team management components:
 
 - `SourceTable`, `EnrollmentDialog`, `CredentialRotationDialog`
@@ -225,6 +249,12 @@ Accessibility checks require automated rules plus manual keyboard, screen-reader
 
 ## Interaction states
 
+- Local settings clean/dirty: changed fields and the persistent save bar are visible without moving layout.
+- Local settings saving/saved: disable duplicate submission, announce completion and render the canonical
+  configuration returned by Rust.
+- Local settings invalid: preserve edits, focus the first invalid control and show bounded field errors.
+- Local settings conflict: reload the latest file before another save; never overwrite an external edit silently.
+- Local settings expired: disable mutation controls and provide the exact CLI command to start a fresh session.
 - Loading: preserve component dimensions and display which scope is loading.
 - Empty: distinguish no source enrolled, no data in range and filter with no match.
 - Partial: list missing source/time range and affected metrics; never silently total incomplete data.
