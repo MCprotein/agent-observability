@@ -2215,18 +2215,152 @@ fn record_macos_network_line(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct NetworkSurfacePolicy {
+    path: &'static str,
+    allowed_tokens: &'static [&'static str],
+    requires_ipv4_loopback: bool,
+}
+
+const NETWORK_SURFACE_POLICIES: &[NetworkSurfacePolicy] = &[
+    NetworkSurfacePolicy {
+        path: "crates/local-ui/Cargo.toml",
+        allowed_tokens: &["hyper", "tokio"],
+        requires_ipv4_loopback: false,
+    },
+    NetworkSurfacePolicy {
+        path: "crates/local-ui/src/lib.rs",
+        allowed_tokens: &["std::net", "TcpListener", "TcpStream", "hyper", "tokio"],
+        requires_ipv4_loopback: true,
+    },
+    NetworkSurfacePolicy {
+        path: "crates/local-collector/Cargo.toml",
+        allowed_tokens: &["tokio"],
+        requires_ipv4_loopback: false,
+    },
+    NetworkSurfacePolicy {
+        path: "crates/local-collector/src/lib.rs",
+        allowed_tokens: &["std::net", "TcpListener", "TcpStream", "tokio"],
+        requires_ipv4_loopback: true,
+    },
+    NetworkSurfacePolicy {
+        path: "crates/codex-integration/src/lib.rs",
+        allowed_tokens: &["std::net", "TcpListener", "TcpStream"],
+        requires_ipv4_loopback: true,
+    },
+    NetworkSurfacePolicy {
+        path: "crates/cli/Cargo.toml",
+        allowed_tokens: &["tokio"],
+        requires_ipv4_loopback: false,
+    },
+    NetworkSurfacePolicy {
+        path: "crates/cli/src/main.rs",
+        allowed_tokens: &["tokio"],
+        requires_ipv4_loopback: false,
+    },
+];
+
+const NETWORK_TOKENS: &[&str] = &[
+    "std::net",
+    "TcpListener",
+    "TcpStream",
+    "UdpSocket",
+    "reqwest",
+    "hyper",
+    "tokio",
+];
+
+const GLOBALLY_FORBIDDEN_NETWORK_TOKENS: &[&str] = &[
+    "UdpSocket",
+    "reqwest",
+    "hyper::client",
+    "ToSocketAddrs",
+    "collector_endpoint",
+    "TeamIngestEnvelope",
+];
+
+fn validate_network_file(path: &Path, body: &str) -> Result<(), String> {
+    let relative = path.to_string_lossy().replace('\\', "/");
+    if let Some(token) = GLOBALLY_FORBIDDEN_NETWORK_TOKENS
+        .iter()
+        .find(|token| body.contains(**token))
+    {
+        return Err(format!("network surface token {token} found in {relative}"));
+    }
+
+    validate_network_urls(&relative, body)?;
+
+    let policy = NETWORK_SURFACE_POLICIES
+        .iter()
+        .find(|policy| policy.path == relative);
+    for token in NETWORK_TOKENS.iter().filter(|token| body.contains(**token)) {
+        if !policy.is_some_and(|policy| policy.allowed_tokens.contains(token)) {
+            return Err(format!("network surface token {token} found in {relative}"));
+        }
+    }
+
+    if policy.is_some_and(|policy| policy.requires_ipv4_loopback)
+        && !body.contains("Ipv4Addr::LOCALHOST")
+    {
+        return Err(format!(
+            "approved network surface {relative} lacks an IPv4 loopback boundary"
+        ));
+    }
+    for token in [
+        "0.0.0.0",
+        "[::]",
+        "Ipv4Addr::UNSPECIFIED",
+        "Ipv6Addr::UNSPECIFIED",
+    ] {
+        if body.contains(token) {
+            return Err(format!(
+                "external network destination token {token} found in {relative}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_network_urls(path: &str, body: &str) -> Result<(), String> {
+    for scheme in ["http://", "https://"] {
+        for (offset, _) in body.match_indices(scheme) {
+            let suffix = &body[offset..];
+            let end = suffix
+                .find(|character: char| {
+                    character.is_ascii_whitespace()
+                        || matches!(character, '"' | '\'' | '<' | '>' | ')' | ']')
+                })
+                .unwrap_or(suffix.len());
+            let url = &suffix[..end];
+            let allowed_loopback = url.starts_with("http://127.0.0.1:");
+            let allowed_non_destination = matches!(
+                (path, url),
+                (
+                    "crates/local-ui/src/lib.rs",
+                    "http://{host}" | "http://example.invalid"
+                )
+            ) || (path == "crates/codex-integration/src/lib.rs"
+                && url.starts_with("http://www.apple.com/DTDs/PropertyList-1.0.dtd"))
+                || (url == scheme
+                    && matches!(
+                        path,
+                        "crates/static-report/src/lib.rs" | "crates/cli/src/main.rs"
+                    ));
+            if !allowed_loopback && !allowed_non_destination {
+                return Err(format!(
+                    "external network destination {url} found in {path}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_network_surface() -> Result<(), String> {
-    const FORBIDDEN: [&str; 8] = [
-        "std::net",
-        "TcpStream",
-        "UdpSocket",
-        "reqwest",
-        "hyper",
-        "tokio",
-        "collector_endpoint",
-        "TeamIngestEnvelope",
-    ];
-    let mut pending = vec![PathBuf::from("crates")];
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("xtask manifest directory has no workspace parent")?;
+    let mut pending = vec![workspace_root.join("crates")];
     let mut inspected = 1_usize;
     while let Some(path) = pending.pop() {
         let metadata =
@@ -2251,16 +2385,14 @@ fn validate_network_surface() -> Result<(), String> {
             }
         } else if path
             .extension()
-            .is_some_and(|extension| matches!(extension.to_str(), Some("rs" | "toml" | "lock")))
+            .is_some_and(|extension| matches!(extension.to_str(), Some("rs" | "toml")))
         {
             let body =
                 fs::read_to_string(&path).map_err(|e| format!("read network surface: {e}"))?;
-            if let Some(token) = FORBIDDEN.iter().find(|token| body.contains(**token)) {
-                return Err(format!(
-                    "network surface token {token} found in {}",
-                    path.display()
-                ));
-            }
+            let relative = path
+                .strip_prefix(workspace_root)
+                .map_err(|_| "network surface escaped the workspace root")?;
+            validate_network_file(relative, &body)?;
         }
     }
     Ok(())
@@ -3028,6 +3160,53 @@ mod tests {
         assert_eq!(TOTAL_PIPELINE_PAYLOAD_BYTES_MAX, 4_784_128);
         assert!(PROTOCOL.contains("active_any_minute_percent_max"));
     }
+
+    #[test]
+    fn approved_ipv4_loopback_network_surfaces_pass() {
+        validate_network_file(
+            Path::new("crates/local-collector/src/lib.rs"),
+            "use std::net::{Ipv4Addr, TcpStream}; use tokio::net::TcpListener; \
+             TcpListener::bind(Ipv4Addr::LOCALHOST); http://127.0.0.1:4318/v1/logs",
+        )
+        .unwrap();
+        validate_network_file(
+            Path::new("crates/codex-integration/src/lib.rs"),
+            "use std::net::{Ipv4Addr, TcpStream}; \
+             TcpStream::connect((Ipv4Addr::LOCALHOST, 4318));",
+        )
+        .unwrap();
+        validate_network_file(
+            Path::new("crates/local-ui/src/lib.rs"),
+            "use hyper::server; use std::net::Ipv4Addr; \
+             use tokio::net::TcpListener; TcpListener::bind(Ipv4Addr::LOCALHOST);",
+        )
+        .unwrap();
+        validate_network_surface().unwrap();
+    }
+
+    #[test]
+    fn network_surface_rejects_external_destinations_and_clients() {
+        let collector = Path::new("crates/local-collector/src/lib.rs");
+        for body in [
+            "use reqwest::Client; Ipv4Addr::LOCALHOST;",
+            "use std::net::{Ipv4Addr, TcpStream}; Ipv4Addr::LOCALHOST; \
+             https://collector.example.com/v1/logs",
+            "use std::net::{Ipv4Addr, TcpStream}; Ipv4Addr::LOCALHOST; \
+             TeamIngestEnvelope",
+            "use std::net::{Ipv4Addr, TcpStream}; Ipv4Addr::UNSPECIFIED;",
+        ] {
+            assert!(validate_network_file(collector, body).is_err(), "{body}");
+        }
+        let unapproved = Path::new("crates/application/src/lib.rs");
+        for body in [
+            "use std::net::TcpStream;",
+            "use hyper::server;",
+            "use tokio::runtime;",
+        ] {
+            assert!(validate_network_file(unapproved, body).is_err(), "{body}");
+        }
+    }
+
     #[test]
     fn missing_metric_fails_closed() {
         assert!(

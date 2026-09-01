@@ -205,5 +205,60 @@
         "cursor-projection.jsonl": "sha256:05dcb372927b809192ec9f307f1c537fdfb8753d9fb78ce02bc1742e8d4bef27"
       }
     }
+  ],
+  "automatic_local_capabilities": [
+    {
+      "capability_version": "codex_automatic_local.v1",
+      "adapter_family": "codex",
+      "support_status": "supported",
+      "platforms": ["macos"],
+      "profiles": ["standalone"],
+      "product_version": "0.151.0",
+      "verified_at": "2026-09-02",
+      "official_references": [
+        "https://developers.openai.com/codex/config-advanced",
+        "https://developers.openai.com/codex/config-reference"
+      ],
+      "receiver_boundary": "authenticated_ipv4_loopback_otlp_http_json_v1",
+      "source_generation": "codex-otel-v1",
+      "source_surfaces": [
+        {
+          "id": "codex_otlp_http_json_logs_v1",
+          "role": "primary",
+          "transport": "ipv4_loopback_http_json",
+          "endpoint": "/v1/logs",
+          "events": [
+            "codex.conversation_starts",
+            "codex.api_request",
+            "codex.sse_event",
+            "codex.tool_decision",
+            "codex.tool_result"
+          ]
+        },
+        {
+          "id": "codex_notify_agent_turn_complete_v1",
+          "role": "supplement",
+          "transport": "ipv4_loopback_http_json",
+          "endpoint": "/v1/notify",
+          "events": ["agent-turn-complete"]
+        }
+      ],
+      "privacy": {
+        "content_fields_durable": false,
+        "raw_identifiers_durable": false,
+        "raw_request_bodies_durable": false,
+        "unknown_fields": "rejected_before_durable_boundary"
+      },
+      "manual_ingest_boundary": "private_canonical_handoff_v1",
+      "team_ingest": "disabled",
+      "non_goals": [
+        "claude-code-automatic-collection",
+        "cursor-automatic-collection",
+        "otlp-grpc",
+        "agent-file-or-private-api-scraping",
+        "external-network-transport",
+        "team-ingest"
+      ]
+    }
   ]
 }

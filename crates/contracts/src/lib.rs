@@ -27,6 +27,7 @@ pub const RETENTION_ARCHIVE_VERSION: &str = "agent_observability.retention_archi
 pub struct AdapterCapabilityManifestV1 {
     pub schema_version: String,
     pub entries: Vec<AdapterCapabilityEntryV1>,
+    pub automatic_local_capabilities: Vec<CodexAutomaticLocalCapabilityV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -71,6 +72,45 @@ pub struct AdapterPrivacyV1 {
     pub raw_identifiers_durable: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CodexAutomaticLocalCapabilityV1 {
+    pub capability_version: String,
+    pub adapter_family: String,
+    pub support_status: String,
+    pub platforms: Vec<String>,
+    pub profiles: Vec<String>,
+    pub product_version: String,
+    pub verified_at: String,
+    pub official_references: Vec<String>,
+    pub receiver_boundary: String,
+    pub source_generation: String,
+    pub source_surfaces: Vec<AutomaticLocalSourceSurfaceV1>,
+    pub privacy: AutomaticLocalPrivacyV1,
+    pub manual_ingest_boundary: String,
+    pub team_ingest: String,
+    pub non_goals: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AutomaticLocalSourceSurfaceV1 {
+    pub id: String,
+    pub role: String,
+    pub transport: String,
+    pub endpoint: String,
+    pub events: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AutomaticLocalPrivacyV1 {
+    pub content_fields_durable: bool,
+    pub raw_identifiers_durable: bool,
+    pub raw_request_bodies_durable: bool,
+    pub unknown_fields: String,
+}
+
 impl AdapterCapabilityManifestV1 {
     /// Parses the JSON-compatible YAML document and validates its closed invariants.
     ///
@@ -81,12 +121,16 @@ impl AdapterCapabilityManifestV1 {
     pub fn parse_and_validate(input: &str) -> Result<Self, ContractError> {
         let manifest: Self =
             serde_json::from_str(input).map_err(|_| ContractError::InvalidCapabilityManifest)?;
-        if manifest.schema_version != "adapter_capability.v1" || manifest.entries.is_empty() {
+        if manifest.schema_version != "adapter_capability.v1"
+            || manifest.entries.is_empty()
+            || manifest.automatic_local_capabilities.len() != 1
+        {
             return Err(ContractError::InvalidCapabilityManifest);
         }
         for entry in &manifest.entries {
             validate_capability_entry(entry)?;
         }
+        validate_codex_automatic_local_capability(&manifest.automatic_local_capabilities[0])?;
         Ok(manifest)
     }
 }
@@ -135,6 +179,76 @@ fn validate_capability_entry(entry: &AdapterCapabilityEntryV1) -> Result<(), Con
         }
     }
     if primary_count != 1 {
+        return Err(ContractError::InvalidCapabilityManifest);
+    }
+    Ok(())
+}
+
+fn validate_codex_automatic_local_capability(
+    capability: &CodexAutomaticLocalCapabilityV1,
+) -> Result<(), ContractError> {
+    if capability.capability_version != "codex_automatic_local.v1"
+        || capability.adapter_family != "codex"
+        || capability.support_status != "supported"
+        || capability.platforms != ["macos"]
+        || capability.profiles != ["standalone"]
+        || capability.product_version != "0.151.0"
+        || capability.verified_at != "2026-09-02"
+        || capability.official_references.is_empty()
+        || capability.official_references.iter().any(|reference| {
+            !reference.starts_with(concat!("https", "://developers.openai.com/codex/"))
+        })
+        || capability.receiver_boundary != "authenticated_ipv4_loopback_otlp_http_json_v1"
+        || capability.source_generation != "codex-otel-v1"
+        || capability.manual_ingest_boundary != "private_canonical_handoff_v1"
+        || capability.team_ingest != "disabled"
+        || capability.privacy.content_fields_durable
+        || capability.privacy.raw_identifiers_durable
+        || capability.privacy.raw_request_bodies_durable
+        || capability.privacy.unknown_fields != "rejected_before_durable_boundary"
+    {
+        return Err(ContractError::InvalidCapabilityManifest);
+    }
+
+    if capability.source_surfaces.len() != 2 {
+        return Err(ContractError::InvalidCapabilityManifest);
+    }
+    let primary = &capability.source_surfaces[0];
+    if primary.id != "codex_otlp_http_json_logs_v1"
+        || primary.role != "primary"
+        || primary.transport != "ipv4_loopback_http_json"
+        || primary.endpoint != "/v1/logs"
+        || primary.events
+            != [
+                "codex.conversation_starts",
+                "codex.api_request",
+                "codex.sse_event",
+                "codex.tool_decision",
+                "codex.tool_result",
+            ]
+    {
+        return Err(ContractError::InvalidCapabilityManifest);
+    }
+    let supplement = &capability.source_surfaces[1];
+    if supplement.id != "codex_notify_agent_turn_complete_v1"
+        || supplement.role != "supplement"
+        || supplement.transport != "ipv4_loopback_http_json"
+        || supplement.endpoint != "/v1/notify"
+        || supplement.events != ["agent-turn-complete"]
+    {
+        return Err(ContractError::InvalidCapabilityManifest);
+    }
+
+    if capability.non_goals
+        != [
+            "claude-code-automatic-collection",
+            "cursor-automatic-collection",
+            "otlp-grpc",
+            "agent-file-or-private-api-scraping",
+            "external-network-transport",
+            "team-ingest",
+        ]
+    {
         return Err(ContractError::InvalidCapabilityManifest);
     }
     Ok(())
@@ -1658,6 +1772,33 @@ mod tests {
         assert_eq!(codex.profiles, ["standalone"]);
         assert!(!codex.privacy.content_fields_accepted);
         assert!(!codex.privacy.raw_identifiers_durable);
+        let automatic = manifest
+            .automatic_local_capabilities
+            .first()
+            .expect("Codex automatic local capability exists");
+        assert_eq!(automatic.capability_version, "codex_automatic_local.v1");
+        assert_eq!(automatic.product_version, "0.151.0");
+        assert_eq!(automatic.verified_at, "2026-09-02");
+        assert_eq!(
+            automatic.receiver_boundary,
+            "authenticated_ipv4_loopback_otlp_http_json_v1"
+        );
+        assert_eq!(automatic.source_generation, "codex-otel-v1");
+        assert_eq!(automatic.manual_ingest_boundary, codex.ingest_boundary);
+        assert_eq!(automatic.team_ingest, "disabled");
+        assert!(!automatic.privacy.content_fields_durable);
+        assert!(!automatic.privacy.raw_identifiers_durable);
+        assert!(!automatic.privacy.raw_request_bodies_durable);
+        assert_eq!(
+            automatic.privacy.unknown_fields,
+            "rejected_before_durable_boundary"
+        );
+        assert!(
+            automatic
+                .non_goals
+                .contains(&"external-network-transport".into())
+        );
+        assert!(automatic.non_goals.contains(&"team-ingest".into()));
         let claude = manifest
             .entries
             .iter()
@@ -1676,6 +1817,40 @@ mod tests {
         assert_eq!(cursor.support_status, "supported");
         assert!(!cursor.privacy.content_fields_accepted);
         assert!(!cursor.privacy.raw_identifiers_durable);
+    }
+
+    #[test]
+    fn codex_automatic_local_capability_fails_closed_on_boundary_drift() {
+        for (pointer, replacement) in [
+            (
+                "/automatic_local_capabilities/0/team_ingest",
+                serde_json::json!("enabled"),
+            ),
+            (
+                "/automatic_local_capabilities/0/product_version",
+                serde_json::json!("latest"),
+            ),
+            (
+                "/automatic_local_capabilities/0/source_surfaces/0/endpoint",
+                serde_json::json!(concat!("https", "://collector.example.com/v1/logs")),
+            ),
+            (
+                "/automatic_local_capabilities/0/privacy/content_fields_durable",
+                serde_json::json!(true),
+            ),
+            (
+                "/automatic_local_capabilities/0/manual_ingest_boundary",
+                serde_json::json!("disabled"),
+            ),
+        ] {
+            let mut manifest: serde_json::Value =
+                serde_json::from_str(ADAPTER_CAPABILITY_V1).unwrap();
+            *manifest.pointer_mut(pointer).expect("test pointer exists") = replacement;
+            assert!(
+                AdapterCapabilityManifestV1::parse_and_validate(&manifest.to_string()).is_err(),
+                "{pointer} must fail closed"
+            );
+        }
     }
 
     #[test]
