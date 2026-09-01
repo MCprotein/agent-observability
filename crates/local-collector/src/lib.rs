@@ -7,8 +7,8 @@ use agent_observability_adapter_codex::{
 };
 use agent_observability_application::project_report;
 use agent_observability_local_runtime::{
-    Admission, InstalledLayout, LocalRuntimeConfigV2, PressureSample, RuntimeControl, Singleton,
-    StorageBudget, install, load,
+    Admission, InstalledLayout, LocalRuntimeConfigV2, MutationGuard, PressureSample,
+    RuntimeControl, Singleton, StorageBudget, install, load,
 };
 use agent_observability_local_store::{LocalStore, StoreBatchItem};
 use agent_observability_static_report::write_private;
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener, TcpStream},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -51,6 +51,7 @@ const REPORT_RETRY_LIMIT: u32 = 4;
 const REPORT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
 const REPORT_DEBOUNCE_DELAY: Duration = Duration::from_millis(200);
 const REPORT_MAX_COALESCE_DELAY: Duration = Duration::from_secs(2);
+const REPORT_AUTHORITY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_LIFETIME: Duration = Duration::from_secs(30);
 const MAX_CONNECTIONS: usize = 64;
@@ -161,6 +162,40 @@ pub fn load_settings(root: &Path) -> Result<CollectorSettings, CollectorError> {
         .map_err(|_| CollectorError::Runtime("invalid collector settings".into()))?;
     validate_settings(&settings)?;
     Ok(settings)
+}
+
+/// Replaces an occupied persisted loopback port while preserving all other settings.
+///
+/// The caller must establish that the configured collector is unavailable before invoking this
+/// explicit recovery operation. A concurrently changed settings file or a port that has become
+/// free is left unchanged.
+pub fn recover_occupied_persisted_port(
+    root: &Path,
+    expected: &CollectorSettings,
+) -> Result<CollectorSettings, CollectorError> {
+    let layout = install(root).map_err(runtime_error)?;
+    let current = load_settings(root)?;
+    if current != *expected {
+        return Err(CollectorError::Runtime(
+            "collector settings changed during port recovery".into(),
+        ));
+    }
+
+    match StdTcpListener::bind((Ipv4Addr::LOCALHOST, current.port)) {
+        Ok(listener) => {
+            drop(listener);
+            return Ok(current);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let reservation = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let mut recovered = current;
+    recovered.port = reservation.local_addr()?.port();
+    write_private_json(&settings_path(&layout), &recovered)?;
+    drop(reservation);
+    Ok(recovered)
 }
 
 fn settings_path(layout: &InstalledLayout) -> PathBuf {
@@ -291,6 +326,14 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let last_cursor = store
         .cursor("codex", &options.source_generation)
         .map_err(runtime_error)?;
+    let now = current_unix_ms()?;
+    let request_correlation = store
+        .codex_request_correlation_state(&options.source_generation)
+        .map_err(runtime_error)?
+        .map(|snapshot| OtlpRequestCorrelationState::from_persisted_json(&snapshot, now))
+        .transpose()
+        .map_err(runtime_error)?
+        .unwrap_or_default();
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), options.port);
     let initial_bind = TcpListener::bind(address).await;
     let listener = bind_persisted_port(initial_bind)?;
@@ -300,7 +343,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         source_generation: options.source_generation,
         token: options.token,
         last_cursor,
-        request_correlation: OtlpRequestCorrelationState::default(),
+        request_correlation,
         accepted_requests: 0,
         rejected_requests: 0,
         suppressed_requests: 0,
@@ -320,6 +363,11 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     if report_wakeup {
         schedule_report_refresh(&state);
     }
+    let report_watcher = tokio::spawn(watch_report_authority(
+        state.clone(),
+        report_status.generation,
+        REPORT_AUTHORITY_POLL_INTERVAL,
+    ));
     let result = serve_transport(
         listener,
         app,
@@ -328,6 +376,8 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         MAX_CONNECTIONS,
     )
     .await;
+    report_watcher.abort();
+    let _ = report_watcher.await;
     drop(singleton);
     result
 }
@@ -559,12 +609,17 @@ async fn ingest_notify(State(state): State<AppState>, body: Bytes) -> impl IntoR
 }
 
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let collector = state.collector.lock().await;
+    let mut collector = state.collector.lock().await;
     if !authorized(&headers, &collector.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let report_pending = collector
+        .store
+        .report_status()
+        .map_or(true, agent_observability_local_store::ReportStatus::pending);
+    collector.report_dirty = report_pending;
     axum::Json(Health {
-        status: if collector.report_degraded {
+        status: if collector.report_degraded || report_pending {
             "degraded"
         } else {
             "ready"
@@ -662,6 +717,7 @@ impl From<CollectorError> for IngestError {
 }
 
 fn ingest_locked(state: &mut CollectorState, body: &[u8]) -> Result<IngestOutcome, IngestError> {
+    let _mutation = MutationGuard::acquire(&state.layout.runtime).map_err(runtime_error)?;
     let Some(config) = admit_request(state, body.len())? else {
         return Ok(IngestOutcome::Disabled);
     };
@@ -687,7 +743,16 @@ fn ingest_locked(state: &mut CollectorState, body: &[u8]) -> Result<IngestOutcom
     )
     .map_err(runtime_error)?;
     enforce_batch_policy(&batch, &config)?;
-    commit_batch(state, &batch, last_cursor, now)?;
+    let persisted_correlation = request_correlation
+        .to_persisted_json()
+        .map_err(runtime_error)?;
+    commit_batch(
+        state,
+        &batch,
+        last_cursor,
+        now,
+        Some(&persisted_correlation),
+    )?;
     state.request_correlation = request_correlation;
     Ok(IngestOutcome::Committed)
 }
@@ -696,6 +761,7 @@ fn ingest_notify_locked(
     state: &mut CollectorState,
     body: &[u8],
 ) -> Result<IngestOutcome, IngestError> {
+    let _mutation = MutationGuard::acquire(&state.layout.runtime).map_err(runtime_error)?;
     let Some(config) = admit_request(state, body.len())? else {
         return Ok(IngestOutcome::Disabled);
     };
@@ -710,7 +776,7 @@ fn ingest_notify_locked(
     )
     .map_err(runtime_error)?;
     enforce_batch_policy(&batch, &config)?;
-    commit_batch(state, &batch, Some(cursor.to_string()), now)?;
+    commit_batch(state, &batch, Some(cursor.to_string()), now, None)?;
     Ok(IngestOutcome::Committed)
 }
 
@@ -783,6 +849,7 @@ fn commit_batch(
     batch: &AdapterBatch,
     last_cursor: Option<String>,
     now: u64,
+    persisted_correlation: Option<&str>,
 ) -> Result<(), CollectorError> {
     let items = batch
         .items
@@ -800,7 +867,17 @@ fn commit_batch(
         })
         .collect::<Vec<_>>();
     let _ = mark_report_dirty(&state.layout);
-    match state.store.ingest_ordered_batch_deferred_projection(&items) {
+    let result = match persisted_correlation {
+        Some(snapshot) => state
+            .store
+            .ingest_codex_batch_with_correlation_state_deferred_projection(
+                &items,
+                &state.source_generation,
+                snapshot,
+            ),
+        None => state.store.ingest_ordered_batch_deferred_projection(&items),
+    };
+    match result {
         Ok(_) => {}
         Err(error) => {
             state.report_dirty = state
@@ -836,6 +913,30 @@ fn schedule_report_refresh(state: &AppState) {
             retry_initial: REPORT_RETRY_INITIAL_DELAY,
         },
     );
+}
+
+async fn watch_report_authority(state: AppState, mut observed_generation: u64, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let mut collector = state.collector.lock().await;
+        let Ok(status) = collector.store.report_status() else {
+            collector.report_dirty = true;
+            collector.report_degraded = true;
+            continue;
+        };
+        collector.report_dirty = status.pending();
+        let changed = status.generation != observed_generation;
+        observed_generation = status.generation;
+        if !status.pending() || !changed {
+            continue;
+        }
+        let _ = mark_report_dirty(&collector.layout);
+        drop(collector);
+        schedule_report_refresh(&state);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1192,12 +1293,14 @@ mod tests {
         OtlpRequestCorrelationState, REPORT_FILE_NAME, TOKEN_HEADER, admit_request,
         constant_time_equal, enforce_batch_policy, ingest_locked, ingest_notify_locked,
         install_settings, is_json, load_settings, open_store, project_report,
-        reconcile_report_state, refresh_report_from_root, report_dirty_path, router,
-        schedule_report_refresh, settings_path, submit_notify, timestamp_from_unix_ms,
-        write_private, write_private_json,
+        reconcile_report_state, recover_occupied_persisted_port, refresh_report_from_root,
+        report_dirty_path, router, schedule_report_refresh, settings_path, submit_notify,
+        timestamp_from_unix_ms, watch_report_authority, write_private, write_private_json,
     };
     use agent_observability_adapter_codex::{MAX_HANDOFF_BYTES, parse_otlp_http_json};
-    use agent_observability_local_runtime::{ConfigMutationGuard, install, load, save};
+    use agent_observability_local_runtime::{
+        ConfigMutationGuard, MutationGuard, install, load, save,
+    };
     use axum::{
         extract::State,
         http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -1228,13 +1331,26 @@ mod tests {
         let layout = install(root).unwrap();
         let config = load(&layout.config).unwrap();
         let store = open_store(&layout, &config).unwrap();
+        let source_generation = "codex-test".to_owned();
+        let last_cursor = store.cursor("codex", &source_generation).unwrap();
+        let request_correlation = store
+            .codex_request_correlation_state(&source_generation)
+            .unwrap()
+            .map(|snapshot| {
+                OtlpRequestCorrelationState::from_persisted_json(
+                    &snapshot,
+                    super::current_unix_ms().unwrap(),
+                )
+                .unwrap()
+            })
+            .unwrap_or_default();
         CollectorState {
             layout,
             store,
-            source_generation: "codex-test".into(),
+            source_generation,
             token: "a".repeat(64),
-            last_cursor: None,
-            request_correlation: OtlpRequestCorrelationState::default(),
+            last_cursor,
+            request_correlation,
             accepted_requests: 0,
             rejected_requests: 0,
             suppressed_requests: 0,
@@ -1260,6 +1376,28 @@ mod tests {
         padded.extend_from_slice(body);
         padded.resize(bytes, b' ');
         padded
+    }
+
+    #[test]
+    fn collector_ingest_waits_for_the_shared_runtime_mutation_guard() {
+        let root = test_root("shared-mutation-guard");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        let guard = MutationGuard::acquire(&state.layout.runtime).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut state = state;
+            let result = ingest_notify_locked(
+                &mut state,
+                br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+            );
+            sent.send(result.is_ok()).unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(30)).is_err());
+        drop(guard);
+        assert!(received.recv_timeout(Duration::from_secs(1)).unwrap());
+        handle.join().unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     async fn post(
@@ -1943,6 +2081,63 @@ mod tests {
     }
 
     #[test]
+    fn explicit_port_recovery_preserves_settings_scalars() {
+        let root = test_root("explicit-port-recovery");
+        let _ = fs::remove_dir_all(&root);
+        let original = install_settings(&root).unwrap();
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, original.port)).unwrap();
+
+        let recovered = recover_occupied_persisted_port(&root, &original).unwrap();
+
+        assert_ne!(recovered.port, original.port);
+        assert_eq!(recovered.schema_version, original.schema_version);
+        assert_eq!(recovered.token, original.token);
+        assert_eq!(recovered.source_generation, original.source_generation);
+        assert_eq!(load_settings(&root).unwrap(), recovered);
+        drop(occupied);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_port_recovery_does_not_rotate_a_free_port() {
+        let root = test_root("free-port-no-recovery");
+        let _ = fs::remove_dir_all(&root);
+        let original = install_settings(&root).unwrap();
+        let path = settings_path(&install(&root).unwrap());
+        let original_bytes = fs::read(&path).unwrap();
+
+        assert_eq!(
+            recover_occupied_persisted_port(&root, &original).unwrap(),
+            original
+        );
+        assert_eq!(fs::read(path).unwrap(), original_bytes);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_port_recovery_failure_preserves_settings() {
+        let root = test_root("port-recovery-failure");
+        let _ = fs::remove_dir_all(&root);
+        let original = install_settings(&root).unwrap();
+        let layout = install(&root).unwrap();
+        let path = settings_path(&layout);
+        let original_bytes = fs::read(&path).unwrap();
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, original.port)).unwrap();
+        let temporary = layout
+            .runtime
+            .join(format!(".collector.json.tmp.{}", std::process::id()));
+        fs::create_dir(&temporary).unwrap();
+
+        assert!(recover_occupied_persisted_port(&root, &original).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(load_settings(&root).unwrap(), original);
+
+        fs::remove_dir(temporary).unwrap();
+        drop(occupied);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn occupied_persisted_port_preserves_settings_and_returns_address_in_use() {
         let root = test_root("occupied-persisted-port");
         let _ = fs::remove_dir_all(&root);
@@ -2073,19 +2268,19 @@ mod tests {
         ]}]}]}"#;
 
         let (batch, cursor) = parse_otlp_http_json(body, "codex-test", None, 1, 0).unwrap();
-        super::commit_batch(&mut state, &batch, cursor.clone(), 1).unwrap();
+        super::commit_batch(&mut state, &batch, cursor.clone(), 1, None).unwrap();
         assert_eq!(state.store.observation_count().unwrap(), 1);
         assert_eq!(state.store.disposition_count().unwrap(), 2);
         assert_eq!(state.last_cursor.as_deref(), Some("3"));
         assert!(report_dirty_path(&state.layout).is_file());
 
-        super::commit_batch(&mut state, &batch, cursor, 2).unwrap();
+        super::commit_batch(&mut state, &batch, cursor, 2, None).unwrap();
         assert_eq!(state.store.observation_count().unwrap(), 1);
         assert_eq!(state.store.disposition_count().unwrap(), 2);
         assert_eq!(state.last_cursor.as_deref(), Some("3"));
 
         let (replayed, cursor) = parse_otlp_http_json(body, "codex-test", Some("3"), 4, 3).unwrap();
-        super::commit_batch(&mut state, &replayed, cursor, 3).unwrap();
+        super::commit_batch(&mut state, &replayed, cursor, 3, None).unwrap();
         assert_eq!(state.store.observation_count().unwrap(), 2);
         assert_eq!(state.store.disposition_count().unwrap(), 4);
         assert_eq!(state.last_cursor.as_deref(), Some("6"));
@@ -2123,6 +2318,86 @@ mod tests {
         assert_eq!(state.last_cursor.as_deref(), Some("2"));
         assert_eq!(state.store.observation_count().unwrap(), 2);
         assert_eq!(state.store.disposition_count().unwrap(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collector_restart_preserves_success_fifo_across_failed_retry_and_next_request() {
+        let root = test_root("restart-correlation-fifo");
+        let _ = fs::remove_dir_all(&root);
+        let failed = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[
+          {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+          {"key":"conversation.id","value":{"stringValue":"PRIVATE_CONVERSATION"}},
+          {"key":"model","value":{"stringValue":"gpt-test"}},
+          {"key":"http.response.status_code","value":{"intValue":"500"}},
+          {"key":"user.email","value":{"stringValue":"PRIVATE_EMAIL@example.com"}}
+        ]}]}]}]}"#;
+        let successful = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[
+          {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+          {"key":"conversation.id","value":{"stringValue":"PRIVATE_CONVERSATION"}},
+          {"key":"model","value":{"stringValue":"gpt-test"}},
+          {"key":"http.response.status_code","value":{"intValue":"200"}}
+        ]}]}]}]}"#;
+        let completed = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[
+          {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
+          {"key":"conversation.id","value":{"stringValue":"PRIVATE_CONVERSATION"}},
+          {"key":"model","value":{"stringValue":"gpt-test"}},
+          {"key":"event.kind","value":{"stringValue":"response.completed"}}
+        ]}]}]}]}"#;
+
+        let mut state = collector_state(&root);
+        ingest_locked(&mut state, failed).unwrap();
+        ingest_locked(&mut state, successful).unwrap();
+        assert_eq!(state.request_correlation.pending_len(), 1);
+        assert_eq!(state.store.observation_count().unwrap(), 2);
+        drop(state);
+
+        let mut restarted = collector_state(&root);
+        assert_eq!(restarted.last_cursor.as_deref(), Some("2"));
+        assert_eq!(restarted.request_correlation.pending_len(), 1);
+        ingest_locked(&mut restarted, completed).unwrap();
+        assert_eq!(restarted.request_correlation.pending_len(), 0);
+        assert_eq!(restarted.store.observation_count().unwrap(), 3);
+        let mut request_counts = std::collections::BTreeMap::new();
+        for request_id in restarted
+            .store
+            .current_records()
+            .unwrap()
+            .into_iter()
+            .filter_map(|record| {
+                serde_json::to_value(record.attributes.request_id)
+                    .ok()?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+        {
+            *request_counts.entry(request_id).or_insert(0_u8) += 1;
+        }
+        assert_eq!(request_counts.len(), 2);
+        assert!(request_counts.values().any(|count| *count == 2));
+        assert_eq!(restarted.store.disposition_count().unwrap(), 0);
+
+        ingest_locked(&mut restarted, successful).unwrap();
+        assert_eq!(restarted.request_correlation.pending_len(), 1);
+        assert_eq!(restarted.last_cursor.as_deref(), Some("4"));
+        assert_eq!(restarted.store.observation_count().unwrap(), 4);
+        let request_ids = restarted
+            .store
+            .current_records()
+            .unwrap()
+            .into_iter()
+            .filter_map(|record| {
+                serde_json::to_value(record.attributes.request_id)
+                    .ok()?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(request_ids.len(), 3);
+        assert_tree_excludes(
+            &root,
+            &[b"PRIVATE_CONVERSATION", b"PRIVATE_EMAIL@example.com"],
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2302,6 +2577,66 @@ mod tests {
         let html = fs::read_to_string(&report).unwrap();
         assert!(html.contains(r#""generatedSpans":2"#));
         assert!(!report_dirty_path(&state.collector.blocking_lock().layout).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_authority_watcher_converges_an_external_store_commit() {
+        let root = test_root("report-external-store-commit");
+        let _ = fs::remove_dir_all(&root);
+        let state = app_state(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let baseline = state
+                .collector
+                .lock()
+                .await
+                .store
+                .report_status()
+                .unwrap()
+                .generation;
+            let watcher = tokio::spawn(watch_report_authority(
+                state.clone(),
+                baseline,
+                Duration::from_millis(10),
+            ));
+            let mut external = collector_state(&root);
+            ingest_notify_locked(
+                &mut external,
+                br#"{"type":"agent-turn-complete","thread-id":"external-thread","turn-id":"external-turn"}"#,
+            )
+            .unwrap();
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if state.report_refresh_attempts.load(Ordering::Acquire) > 0
+                        && !state.report_refresh_scheduled.load(Ordering::Acquire)
+                        && root.join("logs").join(REPORT_FILE_NAME).is_file()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            watcher.abort();
+            let _ = watcher.await;
+            assert!(!state
+                .collector
+                .lock()
+                .await
+                .store
+                .report_status()
+                .unwrap()
+                .pending());
+        });
+        let html = fs::read_to_string(root.join("logs").join(REPORT_FILE_NAME)).unwrap();
+        assert!(html.contains(r#""generatedSpans":1"#));
         let _ = fs::remove_dir_all(root);
     }
 

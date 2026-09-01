@@ -16,7 +16,7 @@ pub mod storage;
 
 pub use control::{ControlError, RuntimeControl};
 pub use ingress::{Ingress, IngressCounters, IngressMessage, IngressOutcome};
-pub use lock::{Singleton, SingletonError};
+pub use lock::{MutationGuard, Singleton, SingletonError};
 pub use policy::{CollectionPolicyV1, RetentionPolicyV1};
 pub use scheduler::{PressureSample, Schedule, Scheduler, State};
 pub use storage::{Admission, Partition, StorageAccountingError, StorageBudget, StorageError};

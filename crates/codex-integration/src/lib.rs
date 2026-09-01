@@ -6,6 +6,7 @@ use agent_observability_codex_config::{
 };
 use agent_observability_local_collector::{
     CollectorError, CollectorSettings, TOKEN_HEADER, install_settings, load_settings,
+    recover_occupied_persisted_port,
 };
 use agent_observability_local_runtime::{ConfigMutationGuard, InstalledLayout, install};
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,13 @@ pub enum CollectorStatus {
     Ready,
     Degraded,
     Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchAgentOwnershipStatus {
+    Absent,
+    Owned,
+    Conflict,
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
@@ -106,25 +114,46 @@ impl From<std::io::Error> for IntegrationError {
 pub fn connect(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, IntegrationError> {
     let layout = install(root).map_err(runtime_error)?;
     with_lifecycle_lock(&layout, || {
-        install_settings(&layout.root)?;
+        let settings = install_settings(&layout.root)?;
+        let (_, restart) = recover_connect_settings(&layout.root, &settings)?;
         connect_with_reloaded_settings(
             &layout.root,
             executable,
             &SystemLifecycle,
+            restart,
             || load_settings(&layout.root).map_err(Into::into),
             |settings| codex_config_manager(&layout, executable, settings),
         )
     })
 }
 
+fn recover_connect_settings(
+    root: &Path,
+    settings: &CollectorSettings,
+) -> Result<(CollectorSettings, bool), IntegrationError> {
+    if matches!(
+        probe_health(settings),
+        CollectorStatus::Ready | CollectorStatus::Degraded
+    ) {
+        return Ok((settings.clone(), false));
+    }
+    let recovered = recover_occupied_persisted_port(root, settings)?;
+    Ok((recovered, true))
+}
+
 fn connect_with_reloaded_settings<C: ConfigLifecycle>(
     root: &Path,
     executable: &Path,
     lifecycle: &impl CollectorLifecycle,
+    restart: bool,
     load_after_ready: impl FnOnce() -> Result<CollectorSettings, IntegrationError>,
     config_from_settings: impl FnOnce(&CollectorSettings) -> Result<C, IntegrationError>,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
-    let service = lifecycle.install(root, executable)?;
+    let service = if restart {
+        lifecycle.restart(root, executable)?
+    } else {
+        lifecycle.install(root, executable)?
+    };
     let collector = lifecycle
         .wait_until_ready(root)
         .map_err(|error| rollback_install(lifecycle, &service, error))?;
@@ -177,23 +206,57 @@ pub fn disconnect(
     executable: &Path,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
     let layout = install(root).map_err(runtime_error)?;
-    with_lifecycle_lock(&layout, || {
-        let settings = load_settings(&layout.root)?;
-        let manager = codex_config_manager(&layout, executable, &settings)?;
-        disconnect_prepared(
-            &layout.root,
-            executable,
-            &settings.endpoint(),
-            &manager,
-            &SystemLifecycle,
-        )
+    with_lifecycle_lock(&layout, || match load_settings(&layout.root) {
+        Ok(settings) => {
+            let manager = codex_config_manager(&layout, executable, &settings)?;
+            disconnect_prepared(
+                &layout.root,
+                executable,
+                &settings.endpoint(),
+                &manager,
+                &SystemLifecycle,
+            )
+        }
+        Err(CollectorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            disconnect_without_settings(&layout, executable, &SystemLifecycle)
+        }
+        Err(error) => Err(error.into()),
     })
+}
+
+fn disconnect_without_settings(
+    layout: &InstalledLayout,
+    executable: &Path,
+    lifecycle: &impl CollectorLifecycle,
+) -> Result<CodexIntegrationStatus, IntegrationError> {
+    let manager = codex_config_ownership_manager(layout)?;
+    let config_ownership = manager.ownership_status()?;
+    let service_ownership = launch_agent_ownership_status(&layout.root)?;
+    if config_ownership.is_none() && service_ownership == LaunchAgentOwnershipStatus::Absent {
+        return Ok(disconnected_status());
+    }
+    if config_ownership == Some(ConfigConnectionStatus::Conflict)
+        || service_ownership == LaunchAgentOwnershipStatus::Conflict
+    {
+        return Err(ConfigError::Conflict.into());
+    }
+    disconnect_owned_prepared(&layout.root, executable, None, &manager, lifecycle)
 }
 
 fn disconnect_prepared(
     root: &Path,
     executable: &Path,
     endpoint: &str,
+    config: &impl ConfigLifecycle,
+    lifecycle: &impl CollectorLifecycle,
+) -> Result<CodexIntegrationStatus, IntegrationError> {
+    disconnect_owned_prepared(root, executable, Some(endpoint), config, lifecycle)
+}
+
+fn disconnect_owned_prepared(
+    root: &Path,
+    executable: &Path,
+    endpoint: Option<&str>,
     config: &impl ConfigLifecycle,
     lifecycle: &impl CollectorLifecycle,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
@@ -229,7 +292,7 @@ fn disconnect_prepared(
     Ok(CodexIntegrationStatus {
         config: status.into(),
         collector: CollectorStatus::Unavailable,
-        endpoint: Some(endpoint.into()),
+        endpoint: endpoint.map(str::to_owned),
         service: Some(service.label),
         data_retained: true,
     })
@@ -259,6 +322,13 @@ trait CollectorLifecycle {
     fn install(&self, root: &Path, executable: &Path)
     -> Result<CollectorService, IntegrationError>;
     fn service(&self, root: &Path) -> Result<CollectorService, IntegrationError>;
+    fn restart(
+        &self,
+        root: &Path,
+        executable: &Path,
+    ) -> Result<CollectorService, IntegrationError> {
+        self.install(root, executable)
+    }
     fn wait_until_ready(&self, root: &Path) -> Result<CollectorStatus, IntegrationError>;
     fn commit_install(&self, _service: &CollectorService) -> Result<(), IntegrationError> {
         Ok(())
@@ -293,6 +363,14 @@ impl CollectorLifecycle for SystemLifecycle {
 
     fn service(&self, root: &Path) -> Result<CollectorService, IntegrationError> {
         collector_service(root)
+    }
+
+    fn restart(
+        &self,
+        root: &Path,
+        executable: &Path,
+    ) -> Result<CollectorService, IntegrationError> {
+        restart_collector_service(root, executable)
     }
 
     fn wait_until_ready(&self, root: &Path) -> Result<CollectorStatus, IntegrationError> {
@@ -346,13 +424,7 @@ pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, 
         let settings = match load_settings(&layout.root) {
             Ok(settings) => settings,
             Err(CollectorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(CodexIntegrationStatus {
-                    config: ConnectionStatus::Disconnected,
-                    collector: CollectorStatus::Unavailable,
-                    endpoint: None,
-                    service: None,
-                    data_retained: true,
-                });
+                return status_without_settings(&layout);
             }
             Err(error) => return Err(error.into()),
         };
@@ -367,6 +439,48 @@ pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, 
             data_retained: true,
         })
     })
+}
+
+fn status_without_settings(
+    layout: &InstalledLayout,
+) -> Result<CodexIntegrationStatus, IntegrationError> {
+    let config = codex_config_ownership_manager(layout)?.ownership_status()?;
+    let service = launch_agent_ownership_status(&layout.root)?;
+    Ok(missing_settings_status(&layout.root, config, service))
+}
+
+fn missing_settings_status(
+    root: &Path,
+    config: Option<ConfigConnectionStatus>,
+    service: LaunchAgentOwnershipStatus,
+) -> CodexIntegrationStatus {
+    if config.is_none() && service == LaunchAgentOwnershipStatus::Absent {
+        return disconnected_status();
+    }
+    let config = if service == LaunchAgentOwnershipStatus::Conflict
+        || (config.is_none() && service == LaunchAgentOwnershipStatus::Owned)
+    {
+        ConnectionStatus::Conflict
+    } else {
+        config.unwrap_or(ConfigConnectionStatus::Conflict).into()
+    };
+    CodexIntegrationStatus {
+        config,
+        collector: CollectorStatus::Degraded,
+        endpoint: None,
+        service: (service != LaunchAgentOwnershipStatus::Absent).then(|| service_label(root)),
+        data_retained: true,
+    }
+}
+
+fn disconnected_status() -> CodexIntegrationStatus {
+    CodexIntegrationStatus {
+        config: ConnectionStatus::Disconnected,
+        collector: CollectorStatus::Unavailable,
+        endpoint: None,
+        service: None,
+        data_retained: true,
+    }
 }
 
 impl From<ConfigConnectionStatus> for ConnectionStatus {
@@ -493,6 +607,32 @@ fn codex_config_manager(
     executable: &Path,
     settings: &CollectorSettings,
 ) -> Result<CodexConfigManager, IntegrationError> {
+    let config_path = codex_config_path()?;
+    let codex_home = config_path
+        .parent()
+        .ok_or_else(|| IntegrationError::Runtime("Codex config path has no parent".into()))?;
+    ensure_codex_home(codex_home)?;
+    CodexConfigManager::new(
+        config_path,
+        layout.runtime.join("integrations/codex"),
+        executable,
+        &layout.root,
+        settings.port,
+        &settings.token,
+    )
+    .map_err(Into::into)
+}
+
+fn codex_config_ownership_manager(
+    layout: &InstalledLayout,
+) -> Result<CodexConfigManager, IntegrationError> {
+    Ok(CodexConfigManager::from_ownership_snapshot(
+        codex_config_path()?,
+        layout.runtime.join("integrations/codex"),
+    ))
+}
+
+fn codex_config_path() -> Result<PathBuf, IntegrationError> {
     let codex_home = env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -506,16 +646,7 @@ fn codex_config_manager(
             },
             Ok,
         )?;
-    ensure_codex_home(&codex_home)?;
-    CodexConfigManager::new(
-        codex_home.join("config.toml"),
-        layout.runtime.join("integrations/codex"),
-        executable,
-        &layout.root,
-        settings.port,
-        &settings.token,
-    )
-    .map_err(Into::into)
+    Ok(codex_home.join("config.toml"))
 }
 
 fn ensure_codex_home(path: &Path) -> Result<(), IntegrationError> {
@@ -658,7 +789,16 @@ fn install_collector_service(
     executable: &Path,
 ) -> Result<CollectorService, IntegrationError> {
     let service = collector_service(root)?;
-    install_collector_service_with(service, root, executable, &SystemLaunchctl)
+    install_collector_service_with(service, root, executable, &SystemLaunchctl, false)
+}
+
+#[cfg(target_os = "macos")]
+fn restart_collector_service(
+    root: &Path,
+    executable: &Path,
+) -> Result<CollectorService, IntegrationError> {
+    let service = collector_service(root)?;
+    install_collector_service_with(service, root, executable, &SystemLaunchctl, true)
 }
 
 #[cfg(target_os = "macos")]
@@ -667,6 +807,7 @@ fn install_collector_service_with(
     root: &Path,
     executable: &Path,
     launchctl: &impl Launchctl,
+    force_reconnect: bool,
 ) -> Result<CollectorService, IntegrationError> {
     let owned =
         recover_launch_agent_transaction(&service, launchctl, LaunchAgentRecovery::Connect)?;
@@ -675,9 +816,10 @@ fn install_collector_service_with(
         bytes: launch_agent_body(&service.label, executable, root).into_bytes(),
         mode: 0o644,
     };
-    if owned
-        .as_ref()
-        .is_some_and(|transaction| transaction.desired_plist == desired)
+    if !force_reconnect
+        && owned
+            .as_ref()
+            .is_some_and(|transaction| transaction.desired_plist == desired)
     {
         return Ok(service);
     }
@@ -733,6 +875,16 @@ fn install_collector_service(
     ))
 }
 
+#[cfg(not(target_os = "macos"))]
+fn restart_collector_service(
+    _root: &Path,
+    _executable: &Path,
+) -> Result<CollectorService, IntegrationError> {
+    Err(IntegrationError::Runtime(
+        "automatic local collection currently supports macOS".into(),
+    ))
+}
+
 #[cfg(target_os = "macos")]
 fn uninstall_collector_service(service: &CollectorService) -> Result<(), IntegrationError> {
     uninstall_collector_service_with(service, &SystemLaunchctl)
@@ -779,6 +931,20 @@ fn reconcile_collector_service(
     .map(|_| ())
 }
 
+#[cfg(target_os = "macos")]
+fn launch_agent_ownership_status(
+    root: &Path,
+) -> Result<LaunchAgentOwnershipStatus, IntegrationError> {
+    let service = collector_service(root)?;
+    let Some(transaction) = load_launch_agent_transaction(&service)? else {
+        return Ok(LaunchAgentOwnershipStatus::Absent);
+    };
+    if launch_agent_transaction_conflicts(&service, &transaction)? {
+        return Ok(LaunchAgentOwnershipStatus::Conflict);
+    }
+    Ok(LaunchAgentOwnershipStatus::Owned)
+}
+
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::unnecessary_wraps)] // Keep the cross-platform lifecycle contract uniform.
 fn reconcile_collector_service(
@@ -786,6 +952,14 @@ fn reconcile_collector_service(
     _config: ConfigConnectionStatus,
 ) -> Result<(), IntegrationError> {
     Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)] // Keep the cross-platform lifecycle contract uniform.
+fn launch_agent_ownership_status(
+    _root: &Path,
+) -> Result<LaunchAgentOwnershipStatus, IntegrationError> {
+    Ok(LaunchAgentOwnershipStatus::Absent)
 }
 
 #[cfg(target_os = "macos")]
@@ -908,13 +1082,12 @@ fn recover_launch_agent_transaction(
     let Some(mut transaction) = load_launch_agent_transaction(service)? else {
         return Ok(None);
     };
+    if launch_agent_transaction_conflicts(service, &transaction)? {
+        return Err(IntegrationError::Runtime(
+            "LaunchAgent plist changed outside the owned transaction".into(),
+        ));
+    }
     if transaction.phase == LaunchAgentPhase::Owned {
-        let current = read_launch_agent_file(&service.plist)?;
-        if current != transaction.desired_plist {
-            return Err(IntegrationError::Runtime(
-                "LaunchAgent plist changed outside the owned transaction".into(),
-            ));
-        }
         if launchctl.is_loaded(&service.target)? != transaction.desired_loaded {
             transaction.operation = LaunchAgentOperation::Reconnect;
             transaction.rollback_plist = transaction.desired_plist.clone();
@@ -988,6 +1161,18 @@ fn recover_launch_agent_transaction(
             }
         },
     }
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_transaction_conflicts(
+    service: &CollectorService,
+    transaction: &LaunchAgentTransaction,
+) -> Result<bool, IntegrationError> {
+    let current = read_launch_agent_file(&service.plist)?;
+    if transaction.phase == LaunchAgentPhase::Owned {
+        return Ok(current != transaction.desired_plist);
+    }
+    Ok(current != transaction.rollback_plist && current != transaction.desired_plist)
 }
 
 #[cfg(target_os = "macos")]
@@ -1396,9 +1581,10 @@ mod tests {
     use super::{
         CodexIntegrationStatus, CollectorLifecycle, CollectorService, CollectorStatus,
         ConfigConnectionStatus, ConfigLifecycle, ConnectionStatus, IntegrationError,
-        connect_prepared, connect_with_reloaded_settings, disconnect_prepared, ensure_codex_home,
-        launch_agent_body, parse_health_response, probe_health, service_label, status,
-        with_lifecycle_lock,
+        LaunchAgentOwnershipStatus, connect_prepared, connect_with_reloaded_settings,
+        disconnect_owned_prepared, disconnect_prepared, ensure_codex_home, launch_agent_body,
+        missing_settings_status, parse_health_response, probe_health, recover_connect_settings,
+        service_label, status, with_lifecycle_lock,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -1408,8 +1594,10 @@ mod tests {
         recover_launch_agent_transaction, save_launch_agent_transaction,
         uninstall_collector_service_with,
     };
+    use agent_observability_codex_config::CodexConfigManager;
     use agent_observability_local_collector::{
-        COLLECTOR_SETTINGS_VERSION, CollectorSettings, TOKEN_HEADER,
+        COLLECTOR_SETTINGS_VERSION, CollectorSettings, TOKEN_HEADER, install_settings,
+        load_settings,
     };
     use agent_observability_local_runtime::{ConfigServiceError, LocalConfigService};
     #[cfg(target_os = "macos")]
@@ -1560,6 +1748,18 @@ mod tests {
             Ok(Self::service())
         }
 
+        fn restart(
+            &self,
+            _root: &Path,
+            _executable: &Path,
+        ) -> Result<CollectorService, IntegrationError> {
+            self.events.borrow_mut().push("restart");
+            if self.install_error.get() {
+                return Err(IntegrationError::Runtime("install failed".into()));
+            }
+            Ok(Self::service())
+        }
+
         fn wait_until_ready(&self, _root: &Path) -> Result<CollectorStatus, IntegrationError> {
             self.events.borrow_mut().push("health");
             if self.wait_error {
@@ -1610,6 +1810,51 @@ mod tests {
     }
 
     #[test]
+    fn missing_settings_reports_owned_config_as_degraded() {
+        let root = Path::new("/runtime");
+
+        let status = missing_settings_status(
+            root,
+            Some(ConfigConnectionStatus::Connected),
+            LaunchAgentOwnershipStatus::Absent,
+        );
+
+        assert_eq!(status.config, ConnectionStatus::Connected);
+        assert_eq!(status.collector, CollectorStatus::Degraded);
+        assert_eq!(status.endpoint, None);
+        assert_eq!(status.service, None);
+    }
+
+    #[test]
+    fn missing_settings_reports_launch_agent_only_as_conflict() {
+        let root = Path::new("/runtime");
+
+        let status = missing_settings_status(root, None, LaunchAgentOwnershipStatus::Owned);
+
+        assert_eq!(status.config, ConnectionStatus::Conflict);
+        assert_eq!(status.collector, CollectorStatus::Degraded);
+        assert_eq!(status.endpoint, None);
+        assert_eq!(
+            status.service.as_deref(),
+            Some(service_label(root).as_str())
+        );
+    }
+
+    #[test]
+    fn missing_settings_without_ownership_remains_disconnected() {
+        let status = missing_settings_status(
+            Path::new("/runtime"),
+            None,
+            LaunchAgentOwnershipStatus::Absent,
+        );
+
+        assert_eq!(status.config, ConnectionStatus::Disconnected);
+        assert_eq!(status.collector, CollectorStatus::Unavailable);
+        assert_eq!(status.endpoint, None);
+        assert_eq!(status.service, None);
+    }
+
+    #[test]
     fn health_parser_distinguishes_ready_degraded_and_invalid_payloads() {
         assert_eq!(
             parse_health_response(&health_response(
@@ -1650,6 +1895,52 @@ mod tests {
         let (oversized, oversized_server) = serve_health_once(vec![b'x'; 4 * 1024 + 1]);
         assert_eq!(probe_health(&oversized), CollectorStatus::Unavailable);
         oversized_server.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_connect_recovery_does_not_rotate_a_healthy_collector() {
+        let root = temporary_root("healthy-no-port-recovery");
+        let original = install_settings(&root).unwrap();
+        let original_bytes = fs::read(root.join("runtime/collector.json")).unwrap();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, original.port)).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(&health_response(
+                    r#"{"status":"ready","report_dirty":false}"#,
+                ))
+                .unwrap();
+        });
+
+        let (settings, restart) = recover_connect_settings(&root, &original).unwrap();
+
+        assert_eq!(settings, original);
+        assert!(!restart);
+        assert_eq!(
+            fs::read(root.join("runtime/collector.json")).unwrap(),
+            original_bytes
+        );
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_connect_restarts_unavailable_collector_without_rotating_free_port() {
+        let root = temporary_root("free-port-restart");
+        let original = install_settings(&root).unwrap();
+        let original_bytes = fs::read(root.join("runtime/collector.json")).unwrap();
+
+        let (settings, restart) = recover_connect_settings(&root, &original).unwrap();
+
+        assert_eq!(settings, original);
+        assert!(restart);
+        assert_eq!(
+            fs::read(root.join("runtime/collector.json")).unwrap(),
+            original_bytes
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1816,6 +2107,7 @@ mod tests {
             Path::new("/runtime"),
             Path::new("/bin/agentobs"),
             &lifecycle,
+            false,
             || {
                 assert_eq!(*lifecycle.events.borrow(), ["install", "health"]);
                 Ok(CollectorSettings {
@@ -1838,6 +2130,202 @@ mod tests {
             Some("http://127.0.0.1:49321/v1/logs")
         );
         assert_eq!(status.config, ConnectionStatus::Connected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_connect_rotates_config_and_disconnect_restores_exact_prior() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("recover-and-restore-config");
+        let layout = agent_observability_local_runtime::install(&root).unwrap();
+        let codex_home = root.join("codex-home");
+        fs::create_dir(&codex_home).unwrap();
+        let config_path = codex_home.join("config.toml");
+        let original = b"# exact prior\nmodel = 'before'\n";
+        fs::write(&config_path, original).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let settings = install_settings(&root).unwrap();
+        let occupied = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, settings.port)).unwrap();
+        let (recovered, restart) = recover_connect_settings(&root, &settings).unwrap();
+        assert!(restart);
+        assert_ne!(recovered.port, settings.port);
+        let lifecycle = FakeLifecycle::ready();
+
+        let connected = connect_with_reloaded_settings(
+            &root,
+            Path::new("/bin/agentobs"),
+            &lifecycle,
+            restart,
+            || load_settings(&root).map_err(Into::into),
+            |settings| {
+                CodexConfigManager::new(
+                    &config_path,
+                    layout.runtime.join("integrations/codex"),
+                    Path::new("/bin/agentobs"),
+                    &root,
+                    settings.port,
+                    &settings.token,
+                )
+                .map_err(Into::into)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            connected.endpoint.as_deref(),
+            Some(recovered.endpoint().as_str())
+        );
+        assert_eq!(*lifecycle.events.borrow(), ["restart", "health"]);
+        assert!(
+            fs::read_to_string(&config_path)
+                .unwrap()
+                .contains(&recovered.endpoint())
+        );
+
+        let manager = CodexConfigManager::new(
+            &config_path,
+            layout.runtime.join("integrations/codex"),
+            Path::new("/bin/agentobs"),
+            &root,
+            recovered.port,
+            &recovered.token,
+        )
+        .unwrap();
+        let disconnected = disconnect_prepared(
+            &root,
+            Path::new("/bin/agentobs"),
+            &recovered.endpoint(),
+            &manager,
+            &lifecycle,
+        )
+        .unwrap();
+
+        assert_eq!(disconnected.config, ConnectionStatus::Disconnected);
+        assert_eq!(fs::read(config_path).unwrap(), original);
+        drop(occupied);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_settings_disconnect_restores_from_config_ownership_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("missing-settings-exact-restore");
+        let layout = agent_observability_local_runtime::install(&root).unwrap();
+        let config_path = root.join("config.toml");
+        let original = b"# exact prior\nmodel = 'before'\n";
+        fs::write(&config_path, original).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o400)).unwrap();
+        let state_dir = layout.runtime.join("integrations/codex");
+        CodexConfigManager::new(
+            &config_path,
+            &state_dir,
+            Path::new("/bin/agentobs"),
+            &root,
+            43_181,
+            "private-token",
+        )
+        .unwrap()
+        .connect()
+        .unwrap();
+        let recovery = CodexConfigManager::from_ownership_snapshot(&config_path, &state_dir);
+        let lifecycle = FakeLifecycle::ready();
+
+        let status = disconnect_owned_prepared(
+            &root,
+            Path::new("/bin/agentobs"),
+            None,
+            &recovery,
+            &lifecycle,
+        )
+        .unwrap();
+
+        assert_eq!(status.config, ConnectionStatus::Disconnected);
+        assert_eq!(status.endpoint, None);
+        assert_eq!(fs::read(&config_path).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(*lifecycle.events.borrow(), ["service", "uninstall"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_settings_disconnect_conflict_does_not_remove_service_or_edit_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("missing-settings-conflict");
+        let layout = agent_observability_local_runtime::install(&root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(&config_path, b"model = 'before'\n").unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let state_dir = layout.runtime.join("integrations/codex");
+        CodexConfigManager::new(
+            &config_path,
+            &state_dir,
+            Path::new("/bin/agentobs"),
+            &root,
+            43_181,
+            "private-token",
+        )
+        .unwrap()
+        .connect()
+        .unwrap();
+        let edited = b"model = 'external'\n";
+        fs::write(&config_path, edited).unwrap();
+        let recovery = CodexConfigManager::from_ownership_snapshot(&config_path, &state_dir);
+        let lifecycle = FakeLifecycle::ready();
+
+        assert!(matches!(
+            disconnect_owned_prepared(
+                &root,
+                Path::new("/bin/agentobs"),
+                None,
+                &recovery,
+                &lifecycle,
+            ),
+            Err(IntegrationError::Config(
+                agent_observability_codex_config::ConfigError::Conflict
+            ))
+        ));
+        assert_eq!(fs::read(&config_path).unwrap(), edited);
+        assert_eq!(*lifecycle.events.borrow(), ["service"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovered_connect_config_failure_rolls_back_service_without_partial_config() {
+        let root = temporary_root("recovered-connect-config-failure");
+        let settings = install_settings(&root).unwrap();
+        let occupied = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, settings.port)).unwrap();
+        let (recovered, restart) = recover_connect_settings(&root, &settings).unwrap();
+        let lifecycle = FakeLifecycle::ready();
+        let config = FakeConfig::disconnected();
+        config.connect_error.set(true);
+
+        assert!(
+            connect_with_reloaded_settings(
+                &root,
+                Path::new("/bin/agentobs"),
+                &lifecycle,
+                restart,
+                || load_settings(&root).map_err(Into::into),
+                |_| Ok(config),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            *lifecycle.events.borrow(),
+            ["restart", "health", "uninstall"]
+        );
+        let persisted = load_settings(&root).unwrap();
+        assert_eq!(persisted, recovered);
+        assert_eq!(persisted.token, settings.token);
+        assert_eq!(persisted.source_generation, settings.source_generation);
+        drop(occupied);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2140,6 +2628,7 @@ mod tests {
             &root,
             Path::new("/bin/agentobs"),
             &launchctl,
+            false,
         )
         .unwrap();
         commit_collector_service_install(&service).unwrap();
@@ -2189,6 +2678,7 @@ mod tests {
             &root,
             Path::new("/bin/agentobs"),
             &launchctl,
+            false,
         )
         .unwrap_err();
 
@@ -2219,6 +2709,7 @@ mod tests {
             &root,
             Path::new("/bin/agentobs"),
             &launchctl,
+            false,
         )
         .unwrap_err();
 
@@ -2240,6 +2731,7 @@ mod tests {
             &root,
             Path::new("/bin/agentobs-v1"),
             &launchctl,
+            false,
         )
         .unwrap();
         commit_collector_service_install(&service).unwrap();
@@ -2254,6 +2746,7 @@ mod tests {
             &root,
             Path::new("/bin/agentobs-v2"),
             &launchctl,
+            false,
         )
         .unwrap_err();
 
@@ -2277,6 +2770,7 @@ mod tests {
             &root,
             Path::new("/bin/agentobs"),
             &launchctl,
+            false,
         )
         .unwrap();
         commit_collector_service_install(&service).unwrap();
@@ -2287,11 +2781,98 @@ mod tests {
             &root,
             Path::new("/bin/agentobs"),
             &launchctl,
+            false,
         )
         .unwrap();
         commit_collector_service_install(&service).unwrap();
 
         assert_eq!(launchctl.events.borrow().len(), events + 1);
+        assert_eq!(
+            load_launch_agent_transaction(&service)
+                .unwrap()
+                .unwrap()
+                .phase,
+            LaunchAgentPhase::Owned
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn in_progress_launch_agent_conflict_preserves_unrelated_plist() {
+        let root = temporary_root("in-progress-launch-agent-conflict");
+        let service = test_service(&root);
+        let launchctl = FakeLaunchctl::new(false);
+        install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs"),
+            &launchctl,
+            false,
+        )
+        .unwrap();
+        commit_collector_service_install(&service).unwrap();
+        let mut transaction = load_launch_agent_transaction(&service).unwrap().unwrap();
+        transaction.phase = LaunchAgentPhase::Prepared;
+        save_launch_agent_transaction(&service, &transaction).unwrap();
+        let unrelated = b"unrelated plist";
+        fs::write(&service.plist, unrelated).unwrap();
+
+        let error = uninstall_collector_service_with(&service, &launchctl).unwrap_err();
+
+        assert!(error.to_string().contains("outside the owned transaction"));
+        assert_eq!(fs::read(&service.plist).unwrap(), unrelated);
+        assert!(service.ownership.exists());
+        assert!(launchctl.loaded.get());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn explicit_recovery_forces_owned_launch_agent_to_restart() {
+        let root = temporary_root("forced-reconnect-unchanged");
+        let service = test_service(&root);
+        let launchctl = FakeLaunchctl::new(false);
+        install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs"),
+            &launchctl,
+            false,
+        )
+        .unwrap();
+        commit_collector_service_install(&service).unwrap();
+        launchctl.events.borrow_mut().clear();
+
+        install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs"),
+            &launchctl,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *launchctl.events.borrow(),
+            [
+                "is-loaded",
+                "is-loaded",
+                "bootout",
+                "is-loaded",
+                "bootstrap",
+                "kickstart",
+                "is-loaded"
+            ]
+        );
+        assert_eq!(
+            load_launch_agent_transaction(&service)
+                .unwrap()
+                .unwrap()
+                .phase,
+            LaunchAgentPhase::Applied
+        );
+        commit_collector_service_install(&service).unwrap();
         assert_eq!(
             load_launch_agent_transaction(&service)
                 .unwrap()
@@ -2313,6 +2894,7 @@ mod tests {
             &root,
             Path::new("/bin/agentobs"),
             &launchctl,
+            false,
         )
         .unwrap();
         commit_collector_service_install(&service).unwrap();
@@ -2351,6 +2933,7 @@ mod tests {
             &root,
             Path::new("/bin/agentobs"),
             &launchctl,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -2386,6 +2969,7 @@ mod tests {
             &root,
             Path::new("/bin/agentobs-v1"),
             &launchctl,
+            false,
         )
         .unwrap();
         commit_collector_service_install(&service).unwrap();
@@ -2405,6 +2989,7 @@ mod tests {
             &root,
             Path::new("/bin/agentobs-v1"),
             &launchctl,
+            false,
         )
         .unwrap();
 
@@ -2431,6 +3016,7 @@ mod tests {
             &root,
             Path::new("/bin/agentobs"),
             &launchctl,
+            false,
         )
         .unwrap();
         commit_collector_service_install(&service).unwrap();

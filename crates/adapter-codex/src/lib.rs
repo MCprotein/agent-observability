@@ -2,7 +2,7 @@
 
 use agent_observability_contracts::{
     AdapterDispositionKind, AgentSource, ObservationEvent, SourceCheckpoint, SourceObservation,
-    canonical_observation_payload_hash,
+    canonical_observation_payload_hash, hash_opaque_identifier,
 };
 use agent_observability_domain::{
     CorrelationIds, LifecycleState, ObservationId, OperationId, PermissionId, RequestId, SessionId,
@@ -24,6 +24,7 @@ pub const MAX_HANDOFF_LINES: usize = 4096;
 pub const MAX_HANDOFF_LINE_BYTES: usize = 64 * 1024;
 pub const MAX_OTLP_LOG_RECORDS: usize = 4096;
 pub const MAX_PENDING_OTLP_REQUESTS: usize = 1024;
+pub const MAX_PERSISTED_OTLP_CORRELATION_BYTES: usize = 512 * 1024;
 pub const OTLP_REQUEST_CORRELATION_TTL_MS: u64 = 5 * 60 * 1000;
 const KNOWN_CODEX_MODELS: &[&str] = &[
     "gpt-test",
@@ -81,10 +82,29 @@ type OtlpRequestPairKey = (String, String, String);
 
 #[derive(Clone, Debug)]
 struct PendingOtlpRequest {
-    request_id: Option<String>,
+    correlation_id: String,
     inserted_at_unix_ms: u64,
     sequence: u64,
     current_record_index: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedOtlpRequestCorrelationState {
+    schema_version: String,
+    next_sequence: u64,
+    pending: Vec<PersistedPendingOtlpRequest>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedPendingOtlpRequest {
+    source_generation_hash: String,
+    conversation_hash: String,
+    model_hash: String,
+    correlation_id: String,
+    inserted_at_unix_ms: u64,
+    sequence: u64,
 }
 
 /// Bounded, content-free correlation state for Codex OTLP requests split across HTTP exports.
@@ -98,6 +118,85 @@ impl OtlpRequestCorrelationState {
     #[must_use]
     pub fn pending_len(&self) -> usize {
         self.pending.values().map(VecDeque::len).sum()
+    }
+
+    /// Restores bounded, privacy-projected correlation state and expires stale entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] when the snapshot is malformed, oversized, or violates bounds.
+    pub fn from_persisted_json(input: &str, now_unix_ms: u64) -> Result<Self, AdapterError> {
+        if input.len() > MAX_PERSISTED_OTLP_CORRELATION_BYTES {
+            return Err(AdapterError::HandoffTooLarge);
+        }
+        let persisted: PersistedOtlpRequestCorrelationState =
+            serde_json::from_str(input).map_err(|_| AdapterError::InvalidJson)?;
+        if persisted.schema_version != "codex_request_correlation.v1"
+            || persisted.pending.len() > MAX_PENDING_OTLP_REQUESTS
+        {
+            return Err(AdapterError::InvalidSchema);
+        }
+        let mut state = Self {
+            pending: BTreeMap::new(),
+            next_sequence: persisted.next_sequence,
+        };
+        for pending in persisted.pending {
+            if !is_private_hash(&pending.source_generation_hash)
+                || !is_private_hash(&pending.conversation_hash)
+                || !is_private_hash(&pending.model_hash)
+                || !is_private_hash(&pending.correlation_id)
+                || pending.sequence >= state.next_sequence
+            {
+                return Err(AdapterError::InvalidSchema);
+            }
+            state.push(
+                (
+                    pending.source_generation_hash,
+                    pending.conversation_hash,
+                    pending.model_hash,
+                ),
+                PendingOtlpRequest {
+                    correlation_id: pending.correlation_id,
+                    inserted_at_unix_ms: pending.inserted_at_unix_ms,
+                    sequence: pending.sequence,
+                    current_record_index: None,
+                },
+            );
+        }
+        state.expire(now_unix_ms);
+        Ok(state)
+    }
+
+    /// Serializes only hashed identifiers and bounded scalar correlation state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] if the bounded snapshot cannot be encoded.
+    pub fn to_persisted_json(&self) -> Result<String, AdapterError> {
+        let pending = self
+            .pending
+            .iter()
+            .flat_map(|(key, queue)| {
+                queue.iter().map(|request| PersistedPendingOtlpRequest {
+                    source_generation_hash: key.0.clone(),
+                    conversation_hash: key.1.clone(),
+                    model_hash: key.2.clone(),
+                    correlation_id: request.correlation_id.clone(),
+                    inserted_at_unix_ms: request.inserted_at_unix_ms,
+                    sequence: request.sequence,
+                })
+            })
+            .collect();
+        let encoded = serde_json::to_string(&PersistedOtlpRequestCorrelationState {
+            schema_version: "codex_request_correlation.v1".into(),
+            next_sequence: self.next_sequence,
+            pending,
+        })
+        .map_err(|_| AdapterError::InvalidJson)?;
+        if encoded.len() > MAX_PERSISTED_OTLP_CORRELATION_BYTES {
+            return Err(AdapterError::HandoffTooLarge);
+        }
+        Ok(encoded)
     }
 
     fn expire(&mut self, now_unix_ms: u64) {
@@ -149,7 +248,6 @@ impl OtlpRequestCorrelationState {
 
     fn finish_batch(&mut self) {
         self.pending.retain(|_, queue| {
-            queue.retain(|pending| pending.request_id.is_some());
             for pending in queue.iter_mut() {
                 pending.current_record_index = None;
             }
@@ -615,14 +713,39 @@ fn correlate_otlp_request_pairs(
         else {
             continue;
         };
-        let key = (source_generation.to_owned(), conversation_id, model);
+        let key = (
+            hash_opaque_identifier(source_generation),
+            hash_opaque_identifier(&conversation_id),
+            hash_opaque_identifier(&model),
+        );
         if event_name == "codex.api_request" {
             let request_id = optional_string(&records[index].attributes, "request_id")?;
+            let correlation_id = request_id.as_deref().map_or_else(
+                || {
+                    stable_id(
+                        "id:sha256",
+                        &[
+                            "codex-local-request-v1",
+                            source_generation,
+                            &conversation_id,
+                            &model,
+                            &records[index].cursor,
+                        ],
+                    )
+                },
+                hash_opaque_identifier,
+            );
+            records[index]
+                .attributes
+                .insert("request_id".into(), Value::String(correlation_id.clone()));
+            if optional_bool(&records[index].attributes, "success")? != Some(true) {
+                continue;
+            }
             let sequence = state.next_sequence();
             state.push(
                 key,
                 PendingOtlpRequest {
-                    request_id,
+                    correlation_id,
                     inserted_at_unix_ms: now_unix_ms,
                     sequence,
                     current_record_index: Some(index),
@@ -639,11 +762,12 @@ fn correlate_otlp_request_pairs(
             continue;
         };
         let completed_request_id = optional_string(&records[index].attributes, "request_id")?;
-        let request_id = match (pending.request_id, completed_request_id) {
-            (Some(api), Some(completed)) if api == completed => Some(api),
-            (Some(api), None) => Some(api),
-            (None, Some(completed)) => Some(completed),
-            (None, None) | (Some(_), Some(_)) => None,
+        let request_id = match completed_request_id {
+            Some(completed) if hash_opaque_identifier(&completed) == pending.correlation_id => {
+                Some(completed)
+            }
+            Some(_) => None,
+            None => Some(pending.correlation_id.clone()),
         };
         if let Some(request_id) = request_id {
             if let Some(api_index) = pending.current_record_index {
@@ -663,6 +787,12 @@ fn correlate_otlp_request_pairs(
     }
     state.finish_batch();
     Ok(())
+}
+
+fn is_private_hash(value: &str) -> bool {
+    value.len() == 74
+        && value.starts_with("id:sha256:")
+        && value[10..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn otlp_request_pair_key(
@@ -1161,6 +1291,7 @@ mod tests {
         read_handoff_file,
     };
     use agent_observability_contracts::ObservationEvent;
+    use agent_observability_contracts::hash_opaque_identifier;
     use agent_observability_domain::LifecycleState;
     use std::fs;
 
@@ -1266,7 +1397,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .as_str(),
-            "request-native-1"
+            hash_opaque_identifier("request-native-1")
         );
         assert_eq!(requests[1].token_usage.input, Some(100));
         assert_eq!(requests[1].token_usage.output, Some(25));
@@ -1287,7 +1418,7 @@ mod tests {
     }
 
     #[test]
-    fn native_request_pair_without_official_request_id_is_diagnosed() {
+    fn native_request_pair_without_official_request_id_gets_local_correlation() {
         let input = br#"{
           "resourceLogs": [{"scopeLogs": [{"logRecords": [
             {"timeUnixNano":"1787875200000000000","attributes":[
@@ -1312,14 +1443,22 @@ mod tests {
         }"#;
         let (batch, cursor) = parse_otlp_http_json(input, "codex-0.151.0", None, 41, 0).unwrap();
         assert_eq!(cursor.as_deref(), Some("42"));
-        assert_eq!(batch.observations().count(), 0);
-        let diagnostics = batch.diagnostics().collect::<Vec<_>>();
-        assert_eq!(diagnostics.len(), 2);
-        assert!(
-            diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.code == DiagnosticCode::MissingCorrelation)
+        let requests = batch.observations().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].correlation.request_id,
+            requests[1].correlation.request_id
         );
+        assert!(
+            requests[0]
+                .correlation
+                .request_id
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .starts_with("id:sha256:")
+        );
+        assert_eq!(batch.diagnostics().count(), 0);
         let debug = format!("{batch:?}");
         assert!(!debug.contains("otlp-41"));
         assert!(!debug.contains("otlp-42"));
@@ -1340,7 +1479,10 @@ mod tests {
                 &mut state,
             )
             .unwrap();
-            assert_eq!(only_request_id(&batch), Some(request_id));
+            assert_eq!(
+                only_request_id(&batch),
+                Some(hash_opaque_identifier(request_id).as_str())
+            );
         }
         assert_eq!(state.pending_len(), 2);
 
@@ -1354,7 +1496,10 @@ mod tests {
                 &mut state,
             )
             .unwrap();
-            assert_eq!(only_request_id(&batch), Some(request_id));
+            assert_eq!(
+                only_request_id(&batch),
+                Some(hash_opaque_identifier(request_id).as_str())
+            );
         }
         assert_eq!(state.pending_len(), 0);
     }
@@ -1461,8 +1606,104 @@ mod tests {
         .unwrap();
         assert_eq!(
             only_request_id(&retained),
-            Some(format!("request-{MAX_PENDING_OTLP_REQUESTS}").as_str())
+            Some(hash_opaque_identifier(&format!("request-{MAX_PENDING_OTLP_REQUESTS}")).as_str())
         );
+    }
+
+    #[test]
+    fn failed_retry_is_observed_but_does_not_consume_completion_fifo() {
+        let input = br#"{
+          "resourceLogs": [{"scopeLogs": [{"logRecords": [
+            {"timeUnixNano":"100000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-test"}},
+              {"key":"http.response.status_code","value":{"intValue":"500"}}
+            ]},
+            {"timeUnixNano":"101000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-test"}},
+              {"key":"http.response.status_code","value":{"intValue":"200"}}
+            ]},
+            {"timeUnixNano":"102000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-test"}},
+              {"key":"event.kind","value":{"stringValue":"response.completed"}}
+            ]},
+            {"timeUnixNano":"103000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-test"}},
+              {"key":"http.response.status_code","value":{"intValue":"200"}}
+            ]}
+          ]}]}]
+        }"#;
+        let mut state = OtlpRequestCorrelationState::default();
+        let (batch, _) =
+            parse_otlp_http_json_with_state(input, "generation-a", None, 1, 100, &mut state)
+                .unwrap();
+        let requests = batch.observations().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].lifecycle, LifecycleState::Failed);
+        assert_eq!(
+            requests[1].correlation.request_id,
+            requests[2].correlation.request_id
+        );
+        assert_ne!(
+            requests[0].correlation.request_id,
+            requests[1].correlation.request_id
+        );
+        assert_ne!(
+            requests[1].correlation.request_id,
+            requests[3].correlation.request_id
+        );
+        assert_eq!(state.pending_len(), 1);
+    }
+
+    #[test]
+    fn persisted_correlation_state_is_bounded_private_and_restartable() {
+        let mut state = OtlpRequestCorrelationState::default();
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("PRIVATE_CONVERSATION", "PRIVATE_REQUEST"),
+            "PRIVATE_GENERATION",
+            None,
+            1,
+            100,
+            &mut state,
+        )
+        .unwrap();
+        let persisted = state.to_persisted_json().unwrap();
+        for raw in [
+            "PRIVATE_CONVERSATION",
+            "PRIVATE_REQUEST",
+            "PRIVATE_GENERATION",
+        ] {
+            assert!(!persisted.contains(raw));
+        }
+        let expired = OtlpRequestCorrelationState::from_persisted_json(
+            &persisted,
+            100 + OTLP_REQUEST_CORRELATION_TTL_MS,
+        )
+        .unwrap();
+        assert_eq!(expired.pending_len(), 0);
+        let mut restored =
+            OtlpRequestCorrelationState::from_persisted_json(&persisted, 101).unwrap();
+        let (completed, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response("PRIVATE_CONVERSATION"),
+            "PRIVATE_GENERATION",
+            Some("1"),
+            2,
+            102,
+            &mut restored,
+        )
+        .unwrap();
+        assert_eq!(
+            only_request_id(&completed),
+            Some(hash_opaque_identifier("PRIVATE_REQUEST").as_str())
+        );
+        assert_eq!(restored.pending_len(), 0);
     }
 
     #[test]

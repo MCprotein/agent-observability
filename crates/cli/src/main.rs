@@ -21,8 +21,8 @@ use agent_observability_contracts::{CONTRACT_MANIFEST, ContractManifest};
 use agent_observability_local_collector::{NotifyOutcome, load_settings, serve, submit_notify};
 use agent_observability_local_runtime::{
     Admission, ConfigMutationGuard, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION,
-    LocalRuntimeConfigV2, PressureSample, RuntimeControl, Singleton, StorageBudget, install, load,
-    save,
+    LocalRuntimeConfigV2, MutationGuard, PressureSample, RuntimeControl, Singleton, StorageBudget,
+    install, load, save,
 };
 use agent_observability_local_store::{
     IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore, RetentionPlan,
@@ -982,8 +982,8 @@ fn ingest_items<'a>(
     items: impl Iterator<Item = IngestItem<'a>>,
 ) -> Result<IngestResult, String> {
     let paths = ingest_paths(Path::new(directory))?;
-    let _singleton =
-        Singleton::acquire(&paths.runtime_directory).map_err(|error| error.to_string())?;
+    let _mutation =
+        MutationGuard::acquire(&paths.runtime_directory).map_err(|error| error.to_string())?;
     let mut control = RuntimeControl::new(&paths.config).map_err(|error| error.to_string())?;
     let items = items.collect::<Vec<_>>();
     if !paths.config.enabled {

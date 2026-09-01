@@ -80,10 +80,7 @@ impl From<toml_edit::TomlError> for ConfigError {
 pub struct CodexConfigManager {
     config_path: PathBuf,
     state_dir: PathBuf,
-    agentobs_binary: PathBuf,
-    runtime_root: PathBuf,
-    port: u16,
-    token: String,
+    managed: Option<ManagedValues>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -145,27 +142,48 @@ impl CodexConfigManager {
         port: u16,
         token: impl Into<String>,
     ) -> Result<Self, ConfigError> {
-        let manager = Self {
-            config_path: config_path.into(),
-            state_dir: state_dir.into(),
-            agentobs_binary: agentobs_binary.into(),
-            runtime_root: runtime_root.into(),
-            port,
-            token: token.into(),
-        };
-        if !manager.agentobs_binary.is_absolute() {
+        let agentobs_binary = agentobs_binary.into();
+        let runtime_root = runtime_root.into();
+        let token = token.into();
+        if !agentobs_binary.is_absolute() {
             return Err(ConfigError::InvalidArgument("agentobs binary path"));
         }
-        if !manager.runtime_root.is_absolute() {
+        if !runtime_root.is_absolute() {
             return Err(ConfigError::InvalidArgument("runtime root path"));
         }
-        if manager.port == 0 {
+        if port == 0 {
             return Err(ConfigError::InvalidArgument("OTLP port"));
         }
-        if manager.token.is_empty() {
+        if token.is_empty() {
             return Err(ConfigError::InvalidArgument("OTLP token"));
         }
-        Ok(manager)
+        Ok(Self {
+            config_path: config_path.into(),
+            state_dir: state_dir.into(),
+            managed: Some(ManagedValues {
+                binary: agentobs_binary.to_string_lossy().into_owned(),
+                runtime_root: runtime_root.to_string_lossy().into_owned(),
+                endpoint: format!("http://127.0.0.1:{port}/v1/logs"),
+                token,
+            }),
+        })
+    }
+
+    /// Creates a manager that can inspect and restore an existing ownership snapshot without
+    /// collector settings.
+    ///
+    /// This mode cannot connect or rotate managed values. Status and disconnect trust only the
+    /// private ownership snapshot and require the live config to match its exact connected bytes.
+    #[must_use]
+    pub fn from_ownership_snapshot(
+        config_path: impl Into<PathBuf>,
+        state_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            config_path: config_path.into(),
+            state_dir: state_dir.into(),
+            managed: None,
+        }
     }
 
     /// Applies and takes ownership of the managed Codex values.
@@ -182,6 +200,7 @@ impl CodexConfigManager {
         &self,
         mutations: &impl FileMutations,
     ) -> Result<ConnectionStatus, ConfigError> {
+        let managed = self.managed_values()?.clone();
         self.ensure_private_state_dir()?;
         let _lock = self.lock()?;
         let snapshot_path = self.snapshot_path();
@@ -193,7 +212,6 @@ impl CodexConfigManager {
 
         let prior = self.read_config()?;
         let mut document = parse_document(&prior.bytes)?;
-        let managed = self.managed_values();
         ensure_no_managed_conflict(&document, &managed)?;
         patch_managed_values(&mut document, &managed);
         let updated = document.to_string().into_bytes();
@@ -271,7 +289,7 @@ impl CodexConfigManager {
         snapshot_path: &Path,
     ) -> Result<Option<ConnectionStatus>, ConfigError> {
         let (mut snapshot, snapshot_file) = self.read_snapshot()?;
-        let managed = self.managed_values();
+        let managed = self.managed_values()?;
         let managed_fingerprint = managed.fingerprint();
         let state = self.snapshot_state(&snapshot)?;
         if snapshot.phase == SnapshotPhase::Rotating {
@@ -285,7 +303,7 @@ impl CodexConfigManager {
             if state != SnapshotState::Connected {
                 return Err(ConfigError::Conflict);
             }
-            self.rotate_connected(mutations, &mut snapshot, &snapshot_file, &managed)?;
+            self.rotate_connected(mutations, &mut snapshot, &snapshot_file, managed)?;
             return Ok(Some(ConnectionStatus::Connected));
         }
         match state {
@@ -333,16 +351,21 @@ impl CodexConfigManager {
             return Ok(ConnectionStatus::Disconnected);
         }
         let (mut snapshot, mut snapshot_file) = self.read_snapshot()?;
-        let managed_fingerprint = self.managed_values().fingerprint();
+        let managed_fingerprint = self.managed.as_ref().map(ManagedValues::fingerprint);
         let mut state = self.snapshot_state(&snapshot)?;
         if snapshot.phase == SnapshotPhase::Rotating {
-            if snapshot.pending_managed_fingerprint() != Some(managed_fingerprint.as_str()) {
+            if managed_fingerprint.as_deref().is_some_and(|fingerprint| {
+                snapshot.pending_managed_fingerprint() != Some(fingerprint)
+            }) {
                 return Err(ConfigError::Conflict);
             }
             snapshot_file =
                 self.finish_rotation(mutations, &mut snapshot, &snapshot_file, state)?;
             state = SnapshotState::Connected;
-        } else if snapshot.managed_fingerprint != managed_fingerprint {
+        } else if managed_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| snapshot.managed_fingerprint != fingerprint)
+        {
             return Err(ConfigError::Conflict);
         }
         match state {
@@ -404,36 +427,52 @@ impl CodexConfigManager {
     ///
     /// Returns an error when config or state paths are unsafe, malformed, or unreadable.
     pub fn status(&self) -> Result<ConnectionStatus, ConfigError> {
+        Ok(self
+            .ownership_status()?
+            .unwrap_or(ConnectionStatus::Disconnected))
+    }
+
+    /// Reports validated ownership separately from the no-snapshot case.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when config or state paths are unsafe, malformed, or unreadable.
+    pub fn ownership_status(&self) -> Result<Option<ConnectionStatus>, ConfigError> {
         let Some(state_metadata) = checked_metadata(&self.state_dir)? else {
-            return Ok(ConnectionStatus::Disconnected);
+            return Ok(None);
         };
         validate_private_dir_metadata(&self.state_dir, &state_metadata)?;
         let _lock = self.lock()?;
         let snapshot_path = self.snapshot_path();
         let Some(metadata) = checked_metadata(&snapshot_path)? else {
-            return Ok(ConnectionStatus::Disconnected);
+            return Ok(None);
         };
         validate_private_file(&snapshot_path, &metadata)?;
         let (mut snapshot, mut snapshot_file) = self.read_snapshot()?;
-        let managed_fingerprint = self.managed_values().fingerprint();
+        let managed_fingerprint = self.managed.as_ref().map(ManagedValues::fingerprint);
         let mut state = self.snapshot_state(&snapshot)?;
         if snapshot.phase == SnapshotPhase::Rotating {
-            if snapshot.pending_managed_fingerprint() != Some(managed_fingerprint.as_str()) {
-                return Ok(ConnectionStatus::Conflict);
+            if managed_fingerprint.as_deref().is_some_and(|fingerprint| {
+                snapshot.pending_managed_fingerprint() != Some(fingerprint)
+            }) {
+                return Ok(Some(ConnectionStatus::Conflict));
             }
             if state == SnapshotState::Conflict {
-                return Ok(ConnectionStatus::Conflict);
+                return Ok(Some(ConnectionStatus::Conflict));
             }
             snapshot_file =
                 self.finish_rotation(&FilesystemMutations, &mut snapshot, &snapshot_file, state)?;
             state = SnapshotState::Connected;
-        } else if snapshot.managed_fingerprint != managed_fingerprint {
-            return Ok(ConnectionStatus::Conflict);
+        } else if managed_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| snapshot.managed_fingerprint != fingerprint)
+        {
+            return Ok(Some(ConnectionStatus::Conflict));
         }
         match state {
             SnapshotState::PreparedPrior | SnapshotState::RestoredPrior => {
                 remove_checked(&snapshot_path, FileExpectation::present(&snapshot_file))?;
-                Ok(ConnectionStatus::Disconnected)
+                Ok(None)
             }
             SnapshotState::Connected => {
                 if snapshot.phase != SnapshotPhase::Connected {
@@ -444,12 +483,12 @@ impl CodexConfigManager {
                         SnapshotPhase::Connected,
                     )?;
                 }
-                Ok(ConnectionStatus::Connected)
+                Ok(Some(ConnectionStatus::Connected))
             }
             SnapshotState::RotationPrepared | SnapshotState::RotationApplied => {
                 Err(ConfigError::InvalidSnapshot)
             }
-            SnapshotState::Conflict => Ok(ConnectionStatus::Conflict),
+            SnapshotState::Conflict => Ok(Some(ConnectionStatus::Conflict)),
         }
     }
 
@@ -617,13 +656,10 @@ impl CodexConfigManager {
         ensure_private_directory(&self.state_dir)
     }
 
-    fn managed_values(&self) -> ManagedValues {
-        ManagedValues {
-            binary: self.agentobs_binary.to_string_lossy().into_owned(),
-            runtime_root: self.runtime_root.to_string_lossy().into_owned(),
-            endpoint: format!("http://127.0.0.1:{}/v1/logs", self.port),
-            token: self.token.clone(),
-        }
+    fn managed_values(&self) -> Result<&ManagedValues, ConfigError> {
+        self.managed
+            .as_ref()
+            .ok_or(ConfigError::InvalidArgument("managed Codex values"))
     }
 }
 
@@ -830,7 +866,7 @@ impl MutationLock {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ManagedValues {
     binary: String,
     runtime_root: String,
@@ -1541,7 +1577,7 @@ mod tests {
                 assert!(snapshot.pending_rotation.is_none());
                 assert_eq!(
                     snapshot.managed_fingerprint,
-                    rotated.managed_values().fingerprint()
+                    rotated.managed_values().unwrap().fingerprint()
                 );
 
                 assert_eq!(
@@ -1599,6 +1635,83 @@ mod tests {
             unix_mode(&fs::metadata(&manager.config_path).unwrap()),
             0o400
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_recovery_restores_exact_prior_without_managed_settings() {
+        let root = root("ownership-recovery-exact");
+        prepare(&root);
+        let original = b"# exact prior\nmodel = 'before'\n";
+        fs::write(root.join("config.toml"), original).unwrap();
+        set_mode(&root.join("config.toml"), 0o400).unwrap();
+        let manager = manager(&root);
+        manager.connect().unwrap();
+
+        let recovery = CodexConfigManager::from_ownership_snapshot(
+            root.join("config.toml"),
+            root.join("state"),
+        );
+        assert_eq!(
+            recovery.ownership_status().unwrap(),
+            Some(ConnectionStatus::Connected)
+        );
+        assert_eq!(
+            recovery.disconnect().unwrap(),
+            ConnectionStatus::Disconnected
+        );
+        assert_eq!(fs::read(root.join("config.toml")).unwrap(), original);
+        assert_eq!(
+            unix_mode(&fs::metadata(root.join("config.toml")).unwrap()),
+            0o400
+        );
+        assert_eq!(recovery.ownership_status().unwrap(), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ownership_recovery_without_snapshot_leaves_unrelated_config_untouched() {
+        let root = root("ownership-recovery-none");
+        prepare(&root);
+        let unrelated = b"model = 'unrelated'\n";
+        fs::write(root.join("config.toml"), unrelated).unwrap();
+        set_mode(&root.join("config.toml"), 0o600).unwrap();
+        let recovery = CodexConfigManager::from_ownership_snapshot(
+            root.join("config.toml"),
+            root.join("state"),
+        );
+
+        assert_eq!(recovery.ownership_status().unwrap(), None);
+        assert_eq!(
+            recovery.disconnect().unwrap(),
+            ConnectionStatus::Disconnected
+        );
+        assert_eq!(fs::read(root.join("config.toml")).unwrap(), unrelated);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ownership_recovery_conflicts_without_overwriting_external_edit() {
+        let root = root("ownership-recovery-conflict");
+        prepare(&root);
+        fs::write(root.join("config.toml"), b"model = 'before'\n").unwrap();
+        set_mode(&root.join("config.toml"), 0o600).unwrap();
+        manager(&root).connect().unwrap();
+        let edited = b"model = 'external'\n";
+        fs::write(root.join("config.toml"), edited).unwrap();
+        let recovery = CodexConfigManager::from_ownership_snapshot(
+            root.join("config.toml"),
+            root.join("state"),
+        );
+
+        assert_eq!(
+            recovery.ownership_status().unwrap(),
+            Some(ConnectionStatus::Conflict)
+        );
+        assert!(matches!(recovery.disconnect(), Err(ConfigError::Conflict)));
+        assert_eq!(fs::read(root.join("config.toml")).unwrap(), edited);
+        assert!(recovery.snapshot_path().exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2006,7 +2119,7 @@ mod tests {
         prepare(&root);
         let manager = manager(&root);
         let mut document = DocumentMut::new();
-        patch_managed_values(&mut document, &manager.managed_values());
+        patch_managed_values(&mut document, manager.managed_values().unwrap());
         let original = document.to_string().into_bytes();
         fs::write(&manager.config_path, &original).unwrap();
         set_mode(&manager.config_path, 0o600).unwrap();

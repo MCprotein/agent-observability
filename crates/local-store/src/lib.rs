@@ -31,6 +31,9 @@ const REPORT_RENDER_LOCK_NAME: &str = ".report-render.lock";
 pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v4";
 const REPORT_GENERATION_KEY: &str = "report_generation";
 const REPORT_ACKNOWLEDGED_GENERATION_KEY: &str = "report_acknowledged_generation";
+const CODEX_CORRELATION_KEY_PREFIX: &str = "codex_request_correlation.v1:";
+const MAX_CODEX_CORRELATION_STATE_BYTES: usize = 512 * 1024;
+const MAX_CODEX_PENDING_CORRELATIONS: usize = 1024;
 const MAX_EXPIRED_SPAN_GUARDS: u64 = 100_000;
 const MAX_RETENTION_RECEIPTS: u64 = 1_024;
 const MAX_ADAPTER_DISPOSITIONS: u64 = 100_000;
@@ -165,6 +168,25 @@ pub enum StoreBatchItem<'a> {
         code: AdapterDispositionCode,
         canonical_payload_hash: Option<&'a str>,
     },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexCorrelationStateV1 {
+    schema_version: String,
+    next_sequence: u64,
+    pending: Vec<CodexPendingCorrelationV1>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexPendingCorrelationV1 {
+    source_generation_hash: String,
+    conversation_hash: String,
+    model_hash: String,
+    correlation_id: String,
+    inserted_at_unix_ms: u64,
+    sequence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -457,9 +479,72 @@ impl LocalStore {
         self.ingest_ordered_batch_at(items, None)
     }
 
+    /// Atomically commits a Codex batch and its bounded privacy-safe correlation snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::ingest_ordered_batch_deferred_projection`] and rejects
+    /// malformed or non-private correlation snapshots.
+    pub fn ingest_codex_batch_with_correlation_state_deferred_projection(
+        &mut self,
+        items: &[StoreBatchItem<'_>],
+        source_generation: &str,
+        correlation_state_json: &str,
+    ) -> Result<Vec<IngestStatus>, StoreError> {
+        self.ingest_ordered_batch_with_correlation_state_at(
+            items,
+            source_generation,
+            correlation_state_json,
+            None,
+        )
+    }
+
+    /// Loads the private correlation snapshot for one Codex source generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for invalid identifiers, malformed state, or storage failure.
+    pub fn codex_request_correlation_state(
+        &self,
+        source_generation: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let key = codex_correlation_key(source_generation)?;
+        let value = self
+            .db
+            .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        if let Some(value) = value.as_deref() {
+            validate_codex_correlation_state(value, source_generation)?;
+        }
+        Ok(value)
+    }
+
     fn ingest_ordered_batch_at(
         &mut self,
         items: &[StoreBatchItem<'_>],
+        crash: Option<CrashPoint>,
+    ) -> Result<Vec<IngestStatus>, StoreError> {
+        self.ingest_ordered_batch_at_inner(items, None, crash)
+    }
+
+    fn ingest_ordered_batch_with_correlation_state_at(
+        &mut self,
+        items: &[StoreBatchItem<'_>],
+        source_generation: &str,
+        correlation_state_json: &str,
+        crash: Option<CrashPoint>,
+    ) -> Result<Vec<IngestStatus>, StoreError> {
+        validate_codex_correlation_state(correlation_state_json, source_generation)?;
+        let key = codex_correlation_key(source_generation)?;
+        self.ingest_ordered_batch_at_inner(items, Some((&key, correlation_state_json)), crash)
+    }
+
+    fn ingest_ordered_batch_at_inner(
+        &mut self,
+        items: &[StoreBatchItem<'_>],
+        correlation_state: Option<(&str, &str)>,
         crash: Option<CrashPoint>,
     ) -> Result<Vec<IngestStatus>, StoreError> {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
@@ -482,6 +567,12 @@ impl LocalStore {
                     *canonical_payload_hash,
                 )?,
             });
+        }
+        if let Some((key, value)) = correlation_state {
+            tx.execute(
+                "INSERT INTO metadata(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            )?;
         }
         if crash == Some(CrashPoint::BeforeCommit) {
             return Err(StoreError::Crash(CrashPoint::BeforeCommit));
@@ -1180,6 +1271,47 @@ impl LocalStore {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn codex_correlation_key(source_generation: &str) -> Result<String, StoreError> {
+    if source_generation.is_empty() || source_generation.len() > 512 {
+        return Err(StoreError::InvalidObservation);
+    }
+    Ok(format!(
+        "{CODEX_CORRELATION_KEY_PREFIX}{}",
+        hash_opaque_identifier(source_generation)
+    ))
+}
+
+fn validate_codex_correlation_state(
+    input: &str,
+    source_generation: &str,
+) -> Result<(), StoreError> {
+    if input.len() > MAX_CODEX_CORRELATION_STATE_BYTES {
+        return Err(StoreError::InvalidObservation);
+    }
+    let state: CodexCorrelationStateV1 = serde_json::from_str(input)?;
+    let expected_generation = hash_opaque_identifier(source_generation);
+    if state.schema_version != "codex_request_correlation.v1"
+        || state.pending.len() > MAX_CODEX_PENDING_CORRELATIONS
+        || state.pending.iter().any(|pending| {
+            pending.source_generation_hash != expected_generation
+                || !is_private_identifier_hash(&pending.conversation_hash)
+                || !is_private_identifier_hash(&pending.model_hash)
+                || !is_private_identifier_hash(&pending.correlation_id)
+                || pending.sequence >= state.next_sequence
+                || pending.inserted_at_unix_ms == 0
+        })
+    {
+        return Err(StoreError::InvalidObservation);
+    }
+    Ok(())
+}
+
+fn is_private_identifier_hash(value: &str) -> bool {
+    value.len() == 74
+        && value.starts_with("id:sha256:")
+        && value[10..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn prune_expired_span_guards(tx: &Transaction<'_>) -> Result<(), StoreError> {
@@ -3064,6 +3196,22 @@ mod tests {
         }
     }
 
+    fn correlation_snapshot(request_id: &str) -> String {
+        serde_json::json!({
+            "schema_version": "codex_request_correlation.v1",
+            "next_sequence": 1,
+            "pending": [{
+                "source_generation_hash": hash_opaque_identifier("generation"),
+                "conversation_hash": hash_opaque_identifier("conversation"),
+                "model_hash": hash_opaque_identifier("model"),
+                "correlation_id": hash_opaque_identifier(request_id),
+                "inserted_at_unix_ms": 100,
+                "sequence": 0
+            }]
+        })
+        .to_string()
+    }
+
     fn temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "agent-observability-local-store-{label}-{}",
@@ -3378,6 +3526,74 @@ mod tests {
             assert_eq!(reopened.observation_count().unwrap(), 2);
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn correlation_snapshot_and_cursor_share_crash_atomicity() {
+        for (label, point, committed) in [
+            ("correlation-before-commit", CrashPoint::BeforeCommit, false),
+            ("correlation-after-commit", CrashPoint::AfterCommit, true),
+        ] {
+            let dir = temp_dir(label);
+            let _ = fs::remove_dir_all(&dir);
+            let item = observation("1", "session", None);
+            let items = [StoreBatchItem::Observation(&item)];
+            let snapshot = correlation_snapshot("request-private");
+            let mut store = LocalStore::open(&dir).unwrap();
+            assert!(matches!(
+                store.ingest_ordered_batch_with_correlation_state_at(
+                    &items,
+                    "generation",
+                    &snapshot,
+                    Some(point),
+                ),
+                Err(StoreError::Crash(actual)) if actual == point
+            ));
+            drop(store);
+
+            let reopened = LocalStore::open(&dir).unwrap();
+            assert_eq!(
+                reopened.cursor("codex", "generation").unwrap().as_deref(),
+                committed.then_some("1")
+            );
+            assert_eq!(
+                reopened
+                    .codex_request_correlation_state("generation")
+                    .unwrap()
+                    .as_deref(),
+                committed.then_some(snapshot.as_str())
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn correlation_snapshot_rejects_raw_or_cross_generation_identifiers() {
+        let dir = temp_dir("correlation-privacy-validation");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let item = observation("1", "session", None);
+        let items = [StoreBatchItem::Observation(&item)];
+        let raw = correlation_snapshot("request-private").replace(
+            &hash_opaque_identifier("conversation"),
+            "private@example.com",
+        );
+        assert!(matches!(
+            store.ingest_codex_batch_with_correlation_state_deferred_projection(
+                &items,
+                "generation",
+                &raw,
+            ),
+            Err(StoreError::InvalidObservation)
+        ));
+        assert_eq!(store.cursor("codex", "generation").unwrap(), None);
+        assert_eq!(
+            store
+                .codex_request_correlation_state("other-generation")
+                .unwrap(),
+            None
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
