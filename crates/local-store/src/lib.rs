@@ -372,6 +372,45 @@ impl LocalStore {
         Self::open_internal(dir.as_ref(), Some(admitted_temporary_bytes))
     }
 
+    /// Opens an already initialized current-schema store without creating, migrating, or repairing
+    /// artifacts. This is intended for concurrent projection consumers such as report rendering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the store is missing, insecure, or not on the current schema.
+    pub fn open_current(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let dir = dir.as_ref();
+        fs::symlink_metadata(dir)?;
+        private_dir(dir)?;
+        let dir = fs::canonicalize(dir)?;
+        let db_path = dir.join(DB_NAME);
+        private_file(&db_path)?;
+        let db = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        db.pragma_update(None, "foreign_keys", true)?;
+        db.pragma_update(None, "synchronous", "FULL")?;
+        let schema = db
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| StoreError::SchemaMismatch)?;
+        if schema != LOCAL_STORE_SCHEMA_VERSION {
+            return Err(StoreError::SchemaMismatch);
+        }
+        validate_schema(&db)?;
+        metadata_generation(&db, REPORT_GENERATION_KEY)?;
+        metadata_generation(&db, REPORT_ACKNOWLEDGED_GENERATION_KEY)?;
+        Ok(Self { dir, db })
+    }
+
     fn open_internal(
         dir: &Path,
         admitted_temporary_bytes: Option<u64>,
@@ -3370,6 +3409,53 @@ mod tests {
             before
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_open_requires_existing_schema_without_repairing_projection() {
+        let missing = temp_dir("current-open-missing");
+        let _ = fs::remove_dir_all(&missing);
+        assert!(matches!(
+            LocalStore::open_current(&missing),
+            Err(StoreError::Io(ref error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(!missing.exists());
+
+        let dir = temp_dir("current-open-no-repair");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        let projection = store.projection_path();
+        fs::remove_file(&projection).unwrap();
+        drop(store);
+
+        let reopened = LocalStore::open_current(&dir).unwrap();
+        assert!(reopened.report_status().unwrap().pending());
+        assert!(!projection.exists());
+        let _ = fs::remove_dir_all(&dir);
+
+        let legacy = temp_dir("current-open-legacy");
+        let _ = fs::remove_dir_all(&legacy);
+        let store = LocalStore::open(&legacy).unwrap();
+        let database = store.database_path();
+        drop(store);
+        downgrade_to_historical_schema(&database, "local_state.v3");
+        assert!(matches!(
+            LocalStore::open_current(&legacy),
+            Err(StoreError::SchemaMismatch)
+        ));
+        let connection = Connection::open(database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "local_state.v3"
+        );
+        let _ = fs::remove_dir_all(&legacy);
     }
 
     #[test]

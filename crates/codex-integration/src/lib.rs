@@ -10,17 +10,19 @@ use agent_observability_local_collector::{
     settings_migration_pending,
 };
 use agent_observability_local_runtime::{InstalledLayout, MutationGuard, install};
-use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use serde::Deserialize;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     env, fmt, fs,
-    io::{Read, Write},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
 #[cfg(target_os = "macos")]
 use std::{
     fs::{File, OpenOptions},
+    io::{Read, Write},
     process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
 };

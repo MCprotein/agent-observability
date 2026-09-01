@@ -2170,13 +2170,7 @@ fn clear_report_dirty(layout: &InstalledLayout) -> Result<(), CollectorError> {
 
 fn refresh_report_from_root(root: &Path) -> Result<bool, CollectorError> {
     let layout = install(root).map_err(runtime_error)?;
-    let store = {
-        let mutation = try_collector_mutation(&layout.runtime)?;
-        let config = load(&layout.config).map_err(runtime_error)?;
-        let store = open_store(&mutation, &layout, &config)?;
-        drop(mutation);
-        store
-    };
+    let store = LocalStore::open_current(layout.state.join("store")).map_err(runtime_error)?;
     store.rebuild_projection().map_err(runtime_error)?;
     refresh_report(&layout, &store, current_unix_ms()?)
 }
@@ -2775,7 +2769,7 @@ mod tests {
     }
 
     #[test]
-    fn collector_migration_admission_and_projection_rebuild_are_busy_during_config_mutation() {
+    fn current_schema_report_refresh_is_independent_of_config_mutation() {
         let root = test_root("open-rebuild-mutation");
         let _ = fs::remove_dir_all(&root);
         let state = collector_state(&root);
@@ -2783,13 +2777,9 @@ mod tests {
         drop(state);
         let guard = ConfigMutationGuard::acquire(&layout).unwrap();
 
-        assert!(matches!(
-            refresh_report_from_root(&root),
-            Err(super::CollectorError::Runtime(ref message)) if message == "runtime mutation busy"
-        ));
+        assert!(refresh_report_from_root(&root).unwrap());
 
         drop(guard);
-        refresh_report_from_root(&root).unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4959,8 +4949,8 @@ mod tests {
     }
 
     #[test]
-    fn report_render_wait_does_not_reject_concurrent_ingest_as_busy() {
-        let root = test_root("report-render-ingest-lock-boundary");
+    fn report_refresh_does_not_require_the_runtime_mutation_guard() {
+        let root = test_root("report-render-mutation-lock-boundary");
         let _ = fs::remove_dir_all(&root);
         let mut collector = collector_state(&root);
         ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
@@ -4968,43 +4958,23 @@ mod tests {
         let config = load(&collector.layout.config).unwrap();
         let blocker = open_store_for_test(&collector.layout, &config);
         let render_guard = blocker.acquire_report_render_guard().unwrap();
+        let mutation = MutationGuard::acquire(&collector.layout.runtime).unwrap();
         let projection = collector.layout.state.join("store/observations.jsonl");
-        let _ = fs::remove_file(&projection);
+        fs::remove_file(&projection).unwrap();
         let refresh_root = root.clone();
         let refresh = thread::spawn(move || refresh_report_from_root(&refresh_root));
 
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !projection.is_file() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert!(
-            projection.is_file(),
-            "report refresh did not rebuild projection"
-        );
-        loop {
-            match MutationGuard::try_acquire(&collector.layout.runtime) {
-                Ok(mutation) => {
-                    drop(mutation);
-                    break;
-                }
-                Err(agent_observability_local_runtime::SingletonError::AlreadyRunning)
-                    if Instant::now() < deadline =>
-                {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("report refresh retained mutation lock: {error}"),
-            }
-        }
-        ingest_notify_locked(&mut collector, &projected_notify("thread-2", "turn-2")).unwrap();
-
+        thread::sleep(Duration::from_millis(50));
+        assert!(projection.is_file());
         drop(render_guard);
         assert!(refresh.join().unwrap().unwrap());
-        assert_eq!(collector.store.record_count().unwrap(), 2);
+        drop(mutation);
+        assert_eq!(collector.store.record_count().unwrap(), 1);
         assert!(!collector.store.report_status().unwrap().pending());
         assert!(
             fs::read_to_string(collector.layout.logs.join(REPORT_FILE_NAME))
                 .unwrap()
-                .contains(r#""generatedSpans":2"#)
+                .contains(r#""generatedSpans":1"#)
         );
         let _ = fs::remove_dir_all(root);
     }
