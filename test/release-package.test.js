@@ -80,6 +80,9 @@ test("release workflow pins actions and uses the tested publication state machin
   assert.match(releaseWorkflow, /publish-release\.mjs draft/);
   assert.match(releaseWorkflow, /publish-release\.mjs package/);
   assert.match(releaseWorkflow, /publish-release\.mjs finalize/);
+  assert.match(releaseWorkflow, /install -m 0755 scripts\/install\.sh dist\/install\.sh/);
+  assert.match(releaseWorkflow, /\*\.tar\.gz \*\.tgz install\.sh > SHA256SUMS/);
+  assert.match(releaseWorkflow, /dist\/install\.sh/);
 });
 
 function scriptedExecutor(results) {

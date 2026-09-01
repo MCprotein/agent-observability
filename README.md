@@ -12,21 +12,17 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
 ### 1. 설치
 
-Apple Silicon과 Intel Mac을 모두 지원하는 universal binary를 설치한다.
+Apple Silicon과 Intel Mac을 모두 지원하는 universal binary를 설치한다. 설치기는 release
+checksum과 실행 파일 버전을 확인한 뒤 `~/.local/bin`에 원자적으로 설치하고, 현재 shell의
+profile에 PATH 블록을 한 번만 등록한다.
 
 ```bash
-gh release download v1.5.0 \
-  --repo MCprotein/agent-observability \
-  --pattern 'agent-observability-1.5.0-darwin-universal2.tar.gz'
-tar -xzf agent-observability-1.5.0-darwin-universal2.tar.gz
-install -d ~/.local/bin
-install -m 0755 \
-  agent-observability-1.5.0-darwin-universal2/agent-observability \
-  ~/.local/bin/agent-observability
-export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://github.com/MCprotein/agent-observability/releases/latest/download/install.sh | sh
 ```
 
-새 terminal에서도 사용하려면 같은 `export`를 `~/.zshrc`에 추가한다.
+새 terminal부터 별도 설정 없이 사용할 수 있다. 현재 terminal의 PATH에 설치 경로가 없으면
+설치기가 출력하는 `. ~/.zshrc` 명령을 한 번 실행한다. 설치 위치와 profile은 각각
+`AGENT_OBSERVABILITY_INSTALL_DIR`, `AGENT_OBSERVABILITY_SHELL_PROFILE`로 변경할 수 있다.
 
 ### 2. 대시보드 체험
 
@@ -157,7 +153,7 @@ flowchart LR
 ```
 
 - 점선은 현재 release가 제공하지 않는 agent별 producer 경계다.
-- 실선은 `v1.5.0` CLI가 구현하고 검증하는 local-only 경로다.
+- 실선은 `v1.6.0` CLI가 구현하고 검증하는 local-only 경로다.
 - agent별 차이는 adapter에서 끝나고 이후 저장·비용·UI contract는 하나다.
 - SQLite가 로컬 권위 저장소이며 JSONL archive와 HTML은 다시 만들 수 있는 projection이다.
 - TypeScript UI는 원본 agent payload가 아니라 Rust가 검증한 report DTO만 받는다.

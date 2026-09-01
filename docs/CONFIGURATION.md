@@ -75,7 +75,7 @@ UI process는 UI 중복 실행만 막는 전용 lock을 유지한다. 실제 저
 
 현재 one-shot/manual import 제품 경로에서 직접 체감되는 option은 `enabled`, `storage-bytes`,
 retention과 archive 범위다. reconcile, flush, batch, heartbeat option은 동일한 bounded runtime
-contract를 사용하는 producer embedding을 위한 값이며, 자동 producer가 없는 v1.5.0 CLI가 background
+contract를 사용하는 producer embedding을 위한 값이며, 자동 producer가 없는 v1.6.0 CLI가 background
 schedule을 시작한다는 뜻이 아니다.
 
 ## 자주 쓰는 변경
