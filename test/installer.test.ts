@@ -42,7 +42,7 @@ function makeFixture(version = "1.6.0") {
   }).split(/\s+/)[0];
   writeFileSync(join(downloadDir, "SHA256SUMS"), `${checksum}  ${archiveName}\n`);
 
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     AGENT_OBSERVABILITY_PLATFORM: "Darwin",
     AGENT_OBSERVABILITY_RELEASE_BASE_URL: pathToFileURL(releaseRoot).href,
@@ -68,9 +68,12 @@ test("installer verifies, installs, and registers PATH idempotently", (t) => {
   });
 
   const binary = join(fixture.home, ".local", "bin", "agent-observability");
+  const alias = join(fixture.home, ".local", "bin", "agentobs");
   assert.equal(execFileSync(binary, { encoding: "utf8" }).trim(), "1.6.0");
+  assert.equal(lstatSync(alias).isSymbolicLink(), true);
+  assert.equal(execFileSync(alias, { encoding: "utf8" }).trim(), "1.6.0");
   assert.match(first, /Activate it in this terminal: \. '.*\.zshrc'/);
-  assert.match(second, /Installed agent-observability 1\.6\.0/);
+  assert.match(second, /Installed agentobs 1\.6\.0 \(alias: agent-observability\)/);
 
   const profile = readFileSync(join(fixture.home, ".zshrc"), "utf8");
   assert.match(profile, /^existing profile\n/);
@@ -105,6 +108,71 @@ test("checksum failure preserves an existing installation and profile", (t) => {
   assert.match(result.stderr, /checksum verification failed/);
   assert.equal(readFileSync(binary, "utf8"), "existing installation\n");
   assert.equal(readFileSync(join(fixture.home, ".zshrc"), "utf8"), "existing profile\n");
+});
+
+test("unmanaged agentobs command blocks installation without replacing either command", (t) => {
+  const fixture = makeFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  const binDir = join(fixture.home, ".local", "bin");
+  const binary = join(binDir, "agent-observability");
+  const alias = join(binDir, "agentobs");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(binary, "existing binary\n");
+  writeFileSync(alias, "unrelated command\n");
+
+  const result = spawnSync("sh", [installer], { encoding: "utf8", env: fixture.env });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /command alias is not managed by this installer/);
+  assert.equal(readFileSync(binary, "utf8"), "existing binary\n");
+  assert.equal(readFileSync(alias, "utf8"), "unrelated command\n");
+});
+
+test("agentobs directory collision blocks installation before replacing the binary", (t) => {
+  const fixture = makeFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  const binDir = join(fixture.home, ".local", "bin");
+  const binary = join(binDir, "agent-observability");
+  mkdirSync(join(binDir, "agentobs"), { recursive: true });
+  writeFileSync(binary, "existing binary\n");
+
+  const result = spawnSync("sh", [installer], { encoding: "utf8", env: fixture.env });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /command alias is not managed by this installer/);
+  assert.equal(readFileSync(binary, "utf8"), "existing binary\n");
+});
+
+test("alias publication failure rolls back the primary command", (t) => {
+  const fixture = makeFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  const binDir = join(fixture.home, ".local", "bin");
+  const binary = join(binDir, "agent-observability");
+  const alias = join(binDir, "agentobs");
+  const stubDir = join(fixture.root, "stub-bin");
+  mkdirSync(binDir, { recursive: true });
+  mkdirSync(stubDir);
+  writeFileSync(binary, "existing binary\n");
+  writeFileSync(
+    join(stubDir, "mv"),
+    `#!/bin/sh
+for last do :; done
+case "$last" in
+  */agentobs) exit 73 ;;
+esac
+exec /bin/mv "$@"
+`,
+  );
+  chmodSync(join(stubDir, "mv"), 0o755);
+
+  const result = spawnSync("sh", [installer], {
+    encoding: "utf8",
+    env: { ...fixture.env, PATH: `${stubDir}:${fixture.env.PATH}` },
+  });
+  assert.equal(result.status, 73);
+  assert.equal(readFileSync(binary, "utf8"), "existing binary\n");
+  assert.equal(lstatSync(alias, { throwIfNoEntry: false }), undefined);
 });
 
 test("custom install and profile paths remain valid shell syntax", (t) => {
@@ -231,11 +299,11 @@ copyFileSync(fileURLToPath(args[outputIndex - 1]), args[outputIndex + 1]);
   );
   chmodSync(curlStub, 0o755);
 
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...fixture.env,
     PATH: `${stubDir}:${fixture.env.PATH}`,
   };
   delete env.AGENT_OBSERVABILITY_VERSION;
   const output = execFileSync("sh", [installer], { encoding: "utf8", env });
-  assert.match(output, /Installed agent-observability 1\.6\.0/);
+  assert.match(output, /Installed agentobs 1\.6\.0/);
 });

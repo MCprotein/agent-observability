@@ -23,7 +23,7 @@ case "$platform" in
   *) fail "macOS is required (detected $platform)" ;;
 esac
 
-for command_name in awk cat chmod cp curl install mkdir mktemp mv readlink rm sed shasum tar; do
+for command_name in awk cat chmod cp curl install ln mkdir mktemp mv readlink rm sed shasum tar; do
   require_command "$command_name"
 done
 
@@ -67,11 +67,30 @@ download_base="$release_base_url/download/$tag"
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/agent-observability-install.XXXXXX") ||
   fail "could not create a temporary directory"
 pending_binary=""
+pending_alias=""
 pending_profile=""
+install_mutating=0
+install_complete=0
+binary_path="$install_dir/agent-observability"
+alias_path="$install_dir/agentobs"
+backup_binary="$work_dir/agent-observability.backup"
+backup_alias="$work_dir/agentobs.backup"
 cleanup() {
+  if [ "$install_mutating" -eq 1 ] && [ "$install_complete" -eq 0 ]; then
+    rm -f "$binary_path" "$alias_path"
+    if [ -e "$backup_binary" ] || [ -L "$backup_binary" ]; then
+      mv "$backup_binary" "$binary_path"
+    fi
+    if [ -e "$backup_alias" ] || [ -L "$backup_alias" ]; then
+      mv "$backup_alias" "$alias_path"
+    fi
+  fi
   rm -rf "$work_dir"
   if [ -n "$pending_binary" ]; then
     rm -f "$pending_binary"
+  fi
+  if [ -n "$pending_alias" ]; then
+    rm -f "$pending_alias"
   fi
   if [ -n "$pending_profile" ]; then
     rm -f "$pending_profile"
@@ -105,10 +124,28 @@ if [ ! -d "$install_dir" ]; then
   [ ! -e "$install_dir" ] || fail "install path is not a directory: $install_dir"
   install -d -m 0755 "$install_dir"
 fi
+[ ! -d "$binary_path" ] || fail "command path is a directory: $binary_path"
+if [ -e "$alias_path" ] || [ -L "$alias_path" ]; then
+  [ -L "$alias_path" ] && [ "$(readlink "$alias_path")" = "agent-observability" ] ||
+    fail "command alias is not managed by this installer: $alias_path"
+fi
 pending_binary="$install_dir/.agent-observability.install.$$"
 install -m 0755 "$source_binary" "$pending_binary"
-mv -f "$pending_binary" "$install_dir/agent-observability"
+pending_alias="$install_dir/.agentobs.install.$$"
+ln -s agent-observability "$pending_alias"
+
+install_mutating=1
+if [ -e "$binary_path" ] || [ -L "$binary_path" ]; then
+  mv "$binary_path" "$backup_binary"
+fi
+if [ -e "$alias_path" ] || [ -L "$alias_path" ]; then
+  mv "$alias_path" "$backup_alias"
+fi
+mv "$pending_binary" "$binary_path"
 pending_binary=""
+mv "$pending_alias" "$alias_path"
+pending_alias=""
+install_complete=1
 
 profile=${AGENT_OBSERVABILITY_SHELL_PROFILE:-}
 if [ -z "$profile" ]; then
@@ -218,7 +255,7 @@ fi
 mv -f "$pending_profile" "$profile_target"
 pending_profile=""
 
-printf 'Installed agent-observability %s to %s\n' "$version" "$install_dir/agent-observability"
+printf 'Installed agentobs %s (alias: agent-observability) to %s\n' "$version" "$install_dir"
 case ":$PATH:" in
   *":$install_dir:"*) ;;
   *) printf "Activate it in this terminal: . '%s'\n" "$quoted_profile" ;;

@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import Ajv2020 from "ajv/dist/2020.js";
-import standaloneCode from "ajv/dist/standalone/index.js";
+import Ajv2020Module from "ajv/dist/2020.js";
+import standaloneCodeModule from "ajv/dist/standalone/index.js";
 import { build } from "esbuild";
 import { compileFromFile } from "json-schema-to-typescript";
 
@@ -13,6 +13,8 @@ const shellPath = "src/report/generated/report-shell.html";
 const viewSummaryPath = "ui/report/generated/view-summary.js";
 const viewStatePath = "ui/report/generated/view-state.js";
 const banner = "Generated from contracts/report-dto-v1.schema.json. Do not edit.";
+const Ajv2020 = Ajv2020Module as unknown as typeof import("ajv/dist/2020.js").default;
+const standaloneCode = standaloneCodeModule as unknown as typeof import("ajv/dist/standalone/index.js").default;
 
 await Promise.all([
   mkdir("ui/report/generated", { recursive: true }),
@@ -54,8 +56,13 @@ await build({
   banner: { js: `/* ${banner} */` },
 });
 
-const { reportDocumentTemplate } = await import("../src/report/html.js");
-await writeFile(shellPath, reportDocumentTemplate(), "utf8");
+const reportUi = await readFile(bundlePath, "utf8");
+const currentShell = await readFile(shellPath, "utf8");
+const scriptPattern = /(<script id="report-data"[^>]*>[^<]*<\/script>\s*<script>)[\s\S]*?(<\/script>\s*<\/body>)/;
+if (!scriptPattern.test(currentShell)) {
+  throw new Error(`Unable to locate the generated report UI block in ${shellPath}`);
+}
+await writeFile(shellPath, currentShell.replace(scriptPattern, `$1${reportUi}$2`), "utf8");
 
 await build({
   entryPoints: ["ui/report/view-summary.ts"],

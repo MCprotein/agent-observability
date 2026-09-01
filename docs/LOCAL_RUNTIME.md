@@ -16,18 +16,18 @@ Install a universal macOS binary from GitHub Releases or the authenticated GitHu
 documented in the repository README. The package is only a transport for the Rust executable.
 
 ~~~bash
-agent-observability demo
-agent-observability setup
-agent-observability ui
-agent-observability config show
-agent-observability config set retention-days 90
-agent-observability dashboard
-agent-observability retention-plan ~/.agent-observability
-agent-observability retention-apply ~/.agent-observability PLAN_ID /path/to/private-retention-archive.jsonl
-agent-observability codex-ingest ~/.agent-observability /path/to/private-handoff.jsonl
-agent-observability claude-code-ingest ~/.agent-observability /path/to/private-handoff.jsonl
-agent-observability cursor-ingest ~/.agent-observability /path/to/private-handoff.jsonl
-agent-observability report ~/.agent-observability /path/to/private-rate-table.json
+agentobs demo
+agentobs setup
+agentobs ui
+agentobs config show
+agentobs config set retention-days 90
+agentobs dashboard
+agentobs retention-plan ~/.agent-observability
+agentobs retention-apply ~/.agent-observability PLAN_ID /path/to/private-retention-archive.jsonl
+agentobs codex-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+agentobs claude-code-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+agentobs cursor-ingest ~/.agent-observability /path/to/private-handoff.jsonl
+agentobs report ~/.agent-observability /path/to/private-rate-table.json
 ~~~
 
 `setup` composes private install, store initialization, report generation, and macOS browser open.

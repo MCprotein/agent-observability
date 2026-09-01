@@ -1,29 +1,33 @@
 {
   "name": "agent-observability",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "private": true,
   "type": "module",
   "description": "Local-first observability primitives for coding agents.",
   "scripts": {
-    "build:report-ui": "node scripts/build-report-ui.mjs",
-    "build:settings-ui": "node scripts/build-settings-ui.mjs",
+    "build:report-ui": "tsx scripts/build-report-ui.ts",
+    "build:settings-ui": "tsx scripts/build-settings-ui.ts",
     "build:ui": "npm run build:report-ui && npm run build:settings-ui",
     "setup:browser": "playwright-core install chromium --no-shell",
     "pretest": "npm run setup:browser",
-    "test:browser": "node scripts/browser-smoke.mjs",
-    "test:settings-browser": "cargo build -q -p agent-observability-cli && node scripts/settings-browser-smoke.mjs",
-    "typecheck": "tsc -p tsconfig.report.json --noEmit",
-    "test": "npm run build:ui && npm run typecheck && node --test && npm run test:browser && npm run test:settings-browser"
+    "test:browser": "tsx scripts/browser-smoke.ts",
+    "test:settings-browser": "cargo build -q -p agent-observability-cli && tsx scripts/settings-browser-smoke.ts",
+    "check:authored-js": "tsx scripts/check-authored-js.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:unit": "node --import tsx --test test/*.test.ts",
+    "test": "npm run build:ui && npm run check:authored-js && npm run typecheck && npm run test:unit && npm run test:browser && npm run test:settings-browser"
   },
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
+    "@types/node": "20.19.43",
     "ajv": "^8.20.0",
     "esbuild": "^0.28.2",
     "json-schema-to-typescript": "^16.0.0",
     "lucide": "1.38.0",
     "playwright-core": "1.62.1",
+    "tsx": "^4.23.13",
     "typescript": "^7.0.2"
   }
 }

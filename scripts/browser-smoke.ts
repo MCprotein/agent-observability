@@ -6,7 +6,11 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { chromium } from "playwright-core";
-import { createSpanRecord, renderStaticHtmlReport } from "../src/index.js";
+import type {
+  AgentObservabilityReportV1,
+  Span,
+  Trace,
+} from "../ui/report/generated/report-dto-v1.js";
 
 const execute = promisify(execFile);
 
@@ -26,11 +30,12 @@ try {
   await writeFile(rateTablePath, `${JSON.stringify(rateTable(), null, 2)}\n`, { mode: 0o600 });
   await execute("cargo", ["build", "-q", "-p", "agent-observability-cli"]);
   const binary = join(process.cwd(), "target", "debug", "agent-observability");
-  for (const [command, sourceFixture] of [
+  const sources: ReadonlyArray<readonly [string, string]> = [
     ["codex-ingest", "crates/adapter-codex/tests/fixtures/codex-handoff.jsonl"],
     ["claude-code-ingest", "crates/adapter-claude-code/tests/fixtures/claude-handoff.jsonl"],
     ["cursor-ingest", "crates/adapter-cursor/tests/fixtures/cursor-handoff.jsonl"],
-  ]) {
+  ];
+  for (const [command, sourceFixture] of sources) {
     const fixturePath = join(directory, `${command}.jsonl`);
     await copyFile(sourceFixture, fixturePath);
     await chmod(fixturePath, 0o600);
@@ -60,9 +65,9 @@ try {
     { name: "mobile", viewport: { width: 375, height: 812 } },
   ]) {
     const page = await browser.newPage({ viewport: testCase.viewport });
-    const consoleErrors = [];
-    const externalRequests = [];
-    const failedRequests = [];
+    const consoleErrors: string[] = [];
+    const externalRequests: string[] = [];
+    const failedRequests: string[] = [];
     page.on("console", (message) => {
       if (message.type() === "error") consoleErrors.push(message.text());
     });
@@ -85,14 +90,14 @@ try {
     await page.keyboard.press("Tab");
     assert.equal(await page.evaluate(() => document.activeElement?.id), "repo-filter");
     await page.locator("#model-filter").selectOption({ label: "gpt-test" });
-    assert.match(await page.locator("#filter-status").textContent(), /^[1-9]\d* spans match the active filters\.$/);
+    assert.match((await page.locator("#filter-status").textContent()) ?? "", /^[1-9]\d* spans match the active filters\.$/);
     assert.equal(await page.locator("#span-table tr").count() <= 200, true);
     await page.locator("#save-filter").click();
     assert.equal(await page.locator("#saved-filter option").count(), 2);
     const storedView = await page.evaluate(() =>
       localStorage.getItem("agent-observability.report.v1.saved-filters"),
     );
-    assert.deepEqual(JSON.parse(storedView), {
+    assert.deepEqual(JSON.parse(storedView ?? "null"), {
       version: 1,
       filters: [{ model: "gpt-test" }],
     });
@@ -122,14 +127,15 @@ try {
     results.push({ name: testCase.name, overflow: false, consoleErrors: 0, externalRequests: 0 });
     await page.close();
   }
+
   const largeReportPath = join(directory, "large-report.html");
-  await writeFile(largeReportPath, renderStaticHtmlReport(largeReportFixture(), {
-    generated_at: "2026-07-10T00:00:00.000Z",
-  }), { mode: 0o600 });
+  const largeReport = largeReportFixture();
+  const reportShell = await readFile("src/report/generated/report-shell.html", "utf8");
+  await writeFile(largeReportPath, renderReportDto(reportShell, largeReport), { mode: 0o600 });
   const largePage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-  const largeConsoleErrors = [];
-  const largeExternalRequests = [];
-  const largeFailedRequests = [];
+  const largeConsoleErrors: string[] = [];
+  const largeExternalRequests: string[] = [];
+  const largeFailedRequests: string[] = [];
   largePage.on("console", (message) => {
     if (message.type() === "error") largeConsoleErrors.push(message.text());
   });
@@ -175,18 +181,84 @@ function rateTable() {
   };
 }
 
-function largeReportFixture() {
-  return Array.from({ length: 4_096 }, (_, index) => createSpanRecord({
-    trace_id: index < 200 ? "trace-large-0" : `trace-large-${1 + (index % 255)}`,
-    span_id: `span-large-${index}`,
-    span_kind: "tool.execution",
+function renderReportDto(shell: string, report: AgentObservabilityReportV1): string {
+  return shell
+    .replaceAll("__AGENT_OBSERVABILITY_REPORT_TITLE__", report.title)
+    .replaceAll("__AGENT_OBSERVABILITY_REPORT_GENERATED_AT__", report.generatedAt)
+    .replace(
+      "__AGENT_OBSERVABILITY_REPORT_DATA__",
+      JSON.stringify(report).replaceAll("<", "\\u003c"),
+    );
+}
+
+function largeReportFixture(): AgentObservabilityReportV1 {
+  const spans: Span[] = Array.from({ length: 4_096 }, (_, index) => ({
+    schemaVersion: "agent_observability.v1",
+    traceId: index < 200 ? "trace-large-0" : `trace-large-${1 + (index % 255)}`,
+    spanId: `span-large-${index}`,
+    parentSpanId: null,
+    kind: "tool.execution",
     name: `operation-${index}`,
     status: index % 31 === 0 ? "error" : "ok",
-    start_time_unix_ms: 1_000 + index * 10,
-    end_time_unix_ms: 1_005 + index * 10,
+    startTimeUnixMs: 1_000 + index * 10,
+    endTimeUnixMs: 1_005 + index * 10,
+    repo: "agent-observability",
     agent: { name: "codex", model: index % 2 === 0 ? "gpt-test" : "other-model" },
-    project: { name: "agent-observability" },
-    attributes: { session_id: `session-${index}`, tool_name: "exec_command" },
-    metrics: { duration_ms: 5 },
+    sessionId: `session-${index % 501}`,
+    toolName: "exec_command",
+    attributes: { session_id: `session-${index % 501}`, tool_name: "exec_command" },
+    metrics: { durationMs: 5 },
+    cost: { status: "unknown", rate_table: {}, cost: { assumption: "fixture" } },
   }));
+  const traceIds = [...new Set(spans.map((span) => span.traceId))];
+  const traces: Trace[] = traceIds.map((traceId) => {
+    const traceSpans = spans.filter((span) => span.traceId === traceId);
+    const first = traceSpans[0];
+    const last = traceSpans.at(-1);
+    if (!first || !last) throw new Error(`empty trace fixture: ${traceId}`);
+    return {
+      traceId,
+      repo: "agent-observability",
+      spans: traceSpans.length,
+      errors: traceSpans.filter((span) => span.status === "error").length,
+      inputTokens: 0,
+      outputTokens: 0,
+      estimatedCost: 0,
+      startTimeUnixMs: first.startTimeUnixMs,
+      endTimeUnixMs: last.endTimeUnixMs,
+      sessions: [...new Set(traceSpans.flatMap((span) => span.sessionId ?? []))],
+      turns: [],
+    };
+  });
+  return {
+    schemaVersion: "agent_observability.report.v1",
+    generatedAt: "2026-07-10T00:00:00.000Z",
+    title: "Agent Observability Report",
+    summary: {
+      generatedSpans: spans.length,
+      sessions: 501,
+      turns: 0,
+      llmRequests: 0,
+      toolExecutions: spans.length,
+      errors: spans.filter((span) => span.status === "error").length,
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      reasoningOutputTokens: 0,
+      latencyMs: 0,
+      durationMs: spans.length * 5,
+      estimatedCost: 0,
+    },
+    cost: { status: "unknown", rate_table: {}, cost: { assumption: "fixture" } },
+    filters: {
+      repos: ["agent-observability"],
+      sessions: Array.from({ length: 501 }, (_, index) => `session-${index}`),
+      turns: [],
+      agents: ["codex"],
+      models: ["gpt-test", "other-model"],
+    },
+    traces,
+    spans,
+  };
 }

@@ -6,8 +6,7 @@
 
 ## Current and target stack
 
-현재 `v1.6.0` Rust 경로는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
-보존하면서 macOS standalone private handoff import 범위의 Rust Codex, Claude Code와 Cursor adapter,
+현재 `v1.7.0` 경로는 macOS standalone private handoff import 범위의 Rust Codex, Claude Code와 Cursor adapter,
 TypeScript static report UI, strict local config와 bounded runtime policy를 제공한다. Rust 경로는 closed contract,
 deterministic lifecycle reduction, topology validation, pricing/report projection, bounded product handoff와
 private embedded transaction, static HTML assembly와 CLI `report`를 구현한다. SQLite `local_state.v4`가 source cursor,
@@ -23,11 +22,10 @@ stable observation, current reduced record, adapter disposition과 profile-neutr
 | Static report and local settings web UI | TypeScript | sanitized report/config DTO 조회, filtering, policy visualization, interaction |
 | Rust-TypeScript boundary | Versioned JSON schema | generated or validated types, compatibility fixtures |
 
-새 core/runtime 기능을 기존 JavaScript 구조에 계속 추가하지 않는다. 먼저 현재 동작을
-contract fixture로 고정한 뒤 Rust CLI를 별도 실행 경로로 병렬 구현한다. Node.js와 Rust를
-모듈 단위 FFI나 subprocess 호출로 섞지 않는다. 동일한 입력 fixture에서 durable record와
-report DTO parity가 확인되면 완성된 수직 기능 단위를 release boundary에서 Rust CLI로
-전환하고 대응하는 JavaScript 경로를 제거한다.
+제품 소스는 UI의 TypeScript와 그 외 영역의 Rust로 제한한다. Node.js는 strict TypeScript 빌드,
+테스트와 릴리스 도구를 실행할 때만 사용한다. 브라우저·Rust embed용 JavaScript는 TypeScript 또는
+schema에서 생성된 추적 가능한 artifact만 허용하며 직접 편집하지 않는다. CI는 사용자 작성
+`.js`, `.mjs`, `.cjs`가 다시 들어오지 않도록 허용 목록을 검사한다.
 
 배포 경계도 같은 원칙을 따른다. GitHub Release archive와 GitHub Packages npm package는
 동일한 universal Rust executable을 운반한다. npm metadata의 `bin`은 실행 파일을 직접
@@ -103,7 +101,7 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
-v1.6.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
+v1.7.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
 `crates/adapter-claude-code`, `crates/adapter-cursor`,
 `crates/application`, `crates/local-store`, `crates/local-runtime`, `crates/local-ui`, `crates/static-report`, `crates/cli`와 release
 evidence runner인 `xtask`로 나뉜다. domain은 외부 형식을
@@ -441,17 +439,11 @@ identity, unknown model, alias, snapshot, cache breakdown, pricing modifier를 �
   block하지 않아야 한다.
 - architecture boundary 변경은 간단한 ADR 또는 이 문서의 decision section으로 근거를 남긴다.
 
-## Migration strategy
+## Migration status
 
-1. JavaScript v0.6 fixture를 source input, durable record, report DTO의 golden contract로 고정한다.
-2. Rust workspace와 CLI composition root를 만들고 JavaScript 경로와 독립적으로 실행한다.
-3. Rust domain/application, durable I/O, adapter를 작은 수직 결과 단위로 구현해 같은 fixture와
-   privacy sentinel을 통과시킨다.
-4. 한 release의 전체 command path가 parity를 통과하면 기본 CLI를 Rust로 전환한다.
-5. 전환된 command path의 JavaScript 구현을 제거하되 fixture는 compatibility evidence로 남긴다.
-
-중간 단계의 사용자 경로는 항상 완전한 JavaScript CLI 또는 완전한 Rust CLI 중 하나다. 두
-runtime을 한 요청 안에서 연결하는 임시 production architecture는 만들지 않는다.
+v0.6 JavaScript 제품 구현은 v1.7.0에서 제거됐다. source input과 contract fixture는 Rust adapter,
+domain, application, store와 report 테스트의 compatibility evidence로 유지한다. 새 제품 기능은
+Rust와 TypeScript 경계 안에서만 구현하며 두 runtime을 한 요청 안에서 연결하지 않는다.
 
 ## Rejected defaults
 

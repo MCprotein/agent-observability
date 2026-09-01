@@ -37,8 +37,9 @@ gate를 통과해 추가한다.
 
 - web UI는 TypeScript로 구현한다.
 - domain, application, agent adapters, storage, export, CLI는 Rust로 구현한다.
-- 현재 JavaScript v0.6 구현은 migration baseline으로 유지한다. Rust는 별도 CLI 경로로
-  구현하고, 전체 command path의 contract parity가 확인된 release boundary에서 대체한다.
+- v0.6 JavaScript 제품 구현은 v1.7.0에서 제거됐다. compatibility fixture는 유지하고,
+  사용자 작성 JavaScript는 허용하지 않는다. 제품 소스는 Rust/TypeScript로 제한하고,
+  빌드·테스트·릴리스 로직은 strict TypeScript를 사용하되 얇은 Shell/YAML 배포 glue는 허용한다.
 - architecture와 engineering rule의 정본은 `docs/ARCHITECTURE.md`다.
 - standalone은 collector, login, network 없이 완전하게 동작해야 한다. team profile은 같은
   domain 의미와 report contract를 사용하되 별도 strict ingest contract를 가지며 local 경로를
@@ -53,7 +54,7 @@ gate를 통과해 추가한다.
 | v0.x | Completed | Local-only PoC를 작은 minor release로 쪼개 검증했다. |
 | v1.x | Active | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
 
-## Active Train: v0.1.0-v1.6.0
+## Active Train: v0.1.0-v1.7.0
 
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
@@ -85,6 +86,7 @@ gate를 통과해 추가한다.
 | v1.4.0 | Released | Local onboarding and documentation usability | Release workflow `33422477557` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
 | v1.5.0 | Released | Local visual configuration console | Release workflow `33478394514` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
 | v1.6.0 | Released | Integrity-checked one-command installer | Release workflow `33481569104` published the Package, public Release, and attested installer; downloaded checksums, universal `x86_64 arm64` version, fresh public install, and all five artifact attestations verified independently |
+| v1.7.0 | In progress | TypeScript tooling completion and short CLI alias | Authored JavaScript removed, strict TypeScript build/test/release tooling, `agentobs` plus compatibility alias, explicit monitoring/settings commands, package/install smoke and independent review |
 
 ## Branch Strategy
 

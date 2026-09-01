@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import Ajv2020 from "ajv/dist/2020.js";
-import standaloneCode from "ajv/dist/standalone/index.js";
+import Ajv2020Module from "ajv/dist/2020.js";
+import standaloneCodeModule from "ajv/dist/standalone/index.js";
 import { build } from "esbuild";
 import { compileFromFile } from "json-schema-to-typescript";
 
@@ -8,6 +8,8 @@ const schemaPath = "contracts/local-runtime-config-v2.schema.json";
 const generatedUiPath = "ui/settings/generated";
 const generatedRustPath = "crates/local-ui/src/generated";
 const banner = "Generated from contracts/local-runtime-config-v2.schema.json. Do not edit.";
+const Ajv2020 = Ajv2020Module as unknown as typeof import("ajv/dist/2020.js").default;
+const standaloneCode = standaloneCodeModule as unknown as typeof import("ajv/dist/standalone/index.js").default;
 
 await Promise.all([
   mkdir(generatedUiPath, { recursive: true }),

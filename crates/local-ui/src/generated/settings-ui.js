@@ -1,4 +1,5 @@
 /* Generated from contracts/local-runtime-config-v2.schema.json. Do not edit. */
+"use strict";
 (() => {
   // node_modules/lucide/dist/esm/defaultAttributes.mjs
   var defaultAttributes = {

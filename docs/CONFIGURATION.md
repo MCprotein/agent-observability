@@ -6,14 +6,14 @@ runtime option을 조회하고 변경할 수 있다. 기본 runtime은 `~/.agent
 ## 사용법
 
 ```bash
-agent-observability ui
+agentobs ui
 ```
 
 별도 runtime은 root를 지정한다. 브라우저를 자동으로 열 수 없는 환경에서는 출력된 URL을 직접 연다.
 
 ```bash
-agent-observability ui /private/runtime
-agent-observability ui /private/runtime --no-open
+agentobs ui /private/runtime
+agentobs ui /private/runtime --no-open
 ```
 
 UI는 `127.0.0.1`의 임의 port에만 bind하고 URL fragment의 session capability를 private header로
@@ -30,16 +30,16 @@ deadline은 로컬 executor와 filesystem이 응답하는 동안 적용된다. �
 자동화와 headless 환경에서는 CLI를 사용한다.
 
 ```bash
-agent-observability config show
-agent-observability config set retention-days 90
-agent-observability config set storage-bytes 2147483648
+agentobs config show
+agentobs config set retention-days 90
+agentobs config set storage-bytes 2147483648
 ```
 
 별도 runtime은 root를 option 앞에 둔다.
 
 ```bash
-agent-observability config show /private/runtime
-agent-observability config set /private/runtime retention-days 90
+agentobs config show /private/runtime
+agentobs config set /private/runtime retention-days 90
 ```
 
 변경값은 먼저 전체 config bounds로 검증된다. `config.json` 직접 편집은 지원 인터페이스가 아니다.
@@ -75,20 +75,20 @@ UI process는 UI 중복 실행만 막는 전용 lock을 유지한다. 실제 저
 
 현재 one-shot/manual import 제품 경로에서 직접 체감되는 option은 `enabled`, `storage-bytes`,
 retention과 archive 범위다. reconcile, flush, batch, heartbeat option은 동일한 bounded runtime
-contract를 사용하는 producer embedding을 위한 값이며, 자동 producer가 없는 v1.6.0 CLI가 background
+contract를 사용하는 producer embedding을 위한 값이며, 자동 producer가 없는 v1.7.0 CLI가 background
 schedule을 시작한다는 뜻이 아니다.
 
 ## 자주 쓰는 변경
 
 ```bash
 # 수집 일시 중지
-agent-observability config set enabled false
+agentobs config set enabled false
 
 # 7일 보관
-agent-observability config set retention-days 7
+agentobs config set retention-days 7
 
 # 4 GiB storage budget
-agent-observability config set storage-bytes 4294967296
+agentobs config set storage-bytes 4294967296
 ```
 
 낮은 flush/reconcile 간격과 큰 batch는 처리량뿐 아니라 foreground I/O와 memory 사용량에도

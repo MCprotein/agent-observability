@@ -8,7 +8,9 @@ import {
   parseSavedFilters,
   sameDimensions,
   serializeSavedFilters,
-} from "../ui/report/generated/view-state.js";
+  type DimensionFilters,
+} from "../ui/report/view-state.ts";
+import type { Span, Trace } from "../ui/report/generated/report-dto-v1.js";
 
 test("keeps large local report view work and rendered slices bounded", () => {
   const spans = Array.from({ length: 4_096 }, (_, index) => spanFixture(index));
@@ -40,14 +42,17 @@ test("keeps large local report view work and rendered slices bounded", () => {
 });
 
 test("clamps pages and infers timeline duration without mutating input order", () => {
-  const spans = [spanFixture(0), spanFixture(1), spanFixture(2)];
-  spans[0].startTimeUnixMs = 1_000;
-  spans[0].endTimeUnixMs = 1_100;
-  spans[1].startTimeUnixMs = 1_050;
-  spans[1].endTimeUnixMs = null;
-  spans[1].metrics.durationMs = 200;
-  spans[2].startTimeUnixMs = 1_400;
-  spans[2].endTimeUnixMs = 1_400;
+  const first = spanFixture(0);
+  const second = spanFixture(1);
+  const third = spanFixture(2);
+  const spans = [first, second, third];
+  first.startTimeUnixMs = 1_000;
+  first.endTimeUnixMs = 1_100;
+  second.startTimeUnixMs = 1_050;
+  second.endTimeUnixMs = null;
+  second.metrics.durationMs = 200;
+  third.startTimeUnixMs = 1_400;
+  third.endTimeUnixMs = 1_400;
 
   const page = paginate(spans, 99, 2);
   const timeline = buildTimeline(spans, 3);
@@ -55,7 +60,9 @@ test("clamps pages and infers timeline duration without mutating input order", (
   assert.equal(page.index, 1);
   assert.deepEqual(page.items.map((span) => span.spanId), ["span-2"]);
   assert.deepEqual(timeline.map((item) => item.span.spanId), ["span-0", "span-1", "span-2"]);
-  assert.equal(timeline[1].widthPercent > timeline[0].widthPercent, true);
+  const [firstTimeline, secondTimeline] = timeline;
+  assert.ok(firstTimeline && secondTimeline);
+  assert.equal(secondTimeline.widthPercent > firstTimeline.widthPercent, true);
 });
 
 test("loads only bounded structured saved filters", () => {
@@ -93,7 +100,7 @@ test("rejects sensitive-looking values at the saved-view sink", () => {
     { repo: "user@example.com" },
     { agent: "raw prompt content" },
     { session: "session-plain-text" },
-  ]) {
+  ] as unknown as DimensionFilters[]) {
     assert.equal(isPersistableDimensions(filters), false);
     assert.throws(() => serializeSavedFilters([filters]), /non-persistable/);
   }
@@ -105,7 +112,7 @@ test("rejects sensitive-looking values at the saved-view sink", () => {
   }), true);
 });
 
-function spanFixture(index) {
+function spanFixture(index: number): Span {
   const traceIndex = index % 256;
   return {
     schemaVersion: "agent_observability.v1",
@@ -126,7 +133,7 @@ function spanFixture(index) {
   };
 }
 
-function traceFixture(index) {
+function traceFixture(index: number): Trace {
   return {
     traceId: `trace-${index}`,
     repo: "repo-a",
