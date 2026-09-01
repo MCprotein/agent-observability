@@ -1097,16 +1097,20 @@
   }
   async function toggleIntegration() {
     if (busy || !integration) return;
+    const lifecycleToken = token;
     setBusy(true);
     try {
       const method = integration.config === "connected" ? "DELETE" : "POST";
-      integration = await api("/api/integrations/codex", { method });
+      const nextIntegration = await api("/api/integrations/codex", { method });
+      if (token !== lifecycleToken) return;
+      integration = nextIntegration;
       renderSettings("toggle-integration");
       showToast(
         integration.config === "connected" ? "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD588\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uD574\uC81C\uD588\uC2B5\uB2C8\uB2E4.",
         "success"
       );
     } catch (error) {
+      if (token !== lifecycleToken) return;
       setBusy(false);
       showToast(messageOf(error), "error");
     }

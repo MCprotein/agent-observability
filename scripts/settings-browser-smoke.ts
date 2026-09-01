@@ -148,6 +148,31 @@ try {
   assert.equal(await lifecyclePage.evaluate(() => sessionStorage.length), 0);
   await lifecyclePage.close();
 
+  for (const lifecycleMethod of ["POST", "DELETE"] as const) {
+    const delayedLifecyclePage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+    const delayedLifecycle = await mockCodexApi(delayedLifecyclePage, {
+      startConnected: lifecycleMethod === "DELETE",
+      delayedMethod: lifecycleMethod,
+    });
+    await delayedLifecyclePage.route(`${origin}/api/shutdown`, async (route) => {
+      await route.fulfill({ status: 204 });
+    });
+    await delayedLifecyclePage.goto(url, { waitUntil: "networkidle" });
+    await delayedLifecyclePage.locator("#toggle-integration").click();
+    await delayedLifecycle.waitForStart();
+    await delayedLifecyclePage.locator("#close-session").click();
+    await delayedLifecyclePage.locator("text=설정 세션이 종료되었습니다").waitFor();
+    delayedLifecycle.complete();
+    await delayedLifecycle.waitForCompletion();
+    await delayedLifecyclePage.evaluate(() => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    }));
+    assert.equal(await delayedLifecyclePage.locator("text=설정 세션이 종료되었습니다").count(), 1);
+    assert.equal(await delayedLifecyclePage.locator("#overview-title").count(), 0);
+    assert.equal(await delayedLifecyclePage.evaluate(() => sessionStorage.length), 0);
+    await delayedLifecyclePage.close();
+  }
+
   for (const testCase of [
     { name: "desktop", viewport: { width: 1440, height: 900 } },
     { name: "mobile", viewport: { width: 390, height: 844 } },
@@ -474,21 +499,46 @@ type IntegrationStatus = {
 
 type MockCodexOptions = {
   startConflicted?: boolean;
+  startConnected?: boolean;
   failConnect?: boolean;
   conflictDisconnect?: boolean;
+  delayedMethod?: "POST" | "DELETE";
 };
 
 async function mockCodexApi(page: Page, options: MockCodexOptions = {}) {
+  let startLifecycle: (() => void) | undefined;
+  const lifecycleStarted = new Promise<void>((resolve) => {
+    startLifecycle = resolve;
+  });
+  let completeLifecycle: (() => void) | undefined;
+  const lifecycleCompletion = new Promise<void>((resolve) => {
+    completeLifecycle = resolve;
+  });
+  let releaseLifecycle: (() => void) | undefined;
+  const lifecycleRelease = new Promise<void>((resolve) => {
+    releaseLifecycle = resolve;
+  });
   const lifecycle = {
-    status: options.startConflicted ? conflictStatus() : disconnectedStatus(),
-    launchAgentRunning: false,
+    status: options.startConflicted
+      ? conflictStatus()
+      : options.startConnected
+        ? connectedStatus()
+        : disconnectedStatus(),
+    launchAgentRunning: options.startConnected ?? false,
     methods: [] as string[],
+    waitForStart: () => lifecycleStarted,
+    complete: () => releaseLifecycle?.(),
+    waitForCompletion: () => lifecycleCompletion,
   };
   let failConnect = options.failConnect ?? false;
   let conflictDisconnect = options.conflictDisconnect ?? false;
   await page.route("**/api/integrations/codex", async (route) => {
     const method = route.request().method();
     lifecycle.methods.push(method);
+    if (method === options.delayedMethod) {
+      startLifecycle?.();
+      await lifecycleRelease;
+    }
     if (method === "POST" && failConnect) {
       failConnect = false;
       await route.fulfill({
@@ -519,6 +569,7 @@ async function mockCodexApi(page: Page, options: MockCodexOptions = {}) {
       contentType: "application/json",
       body: JSON.stringify(lifecycle.status),
     });
+    if (method === options.delayedMethod) completeLifecycle?.();
   });
   return lifecycle;
 }

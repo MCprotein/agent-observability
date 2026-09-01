@@ -510,16 +510,20 @@ function bindEvents(): void {
 
 async function toggleIntegration(): Promise<void> {
   if (busy || !integration) return;
+  const lifecycleToken = token;
   setBusy(true);
   try {
     const method = integration.config === "connected" ? "DELETE" : "POST";
-    integration = await api<IntegrationStatus>("/api/integrations/codex", { method });
+    const nextIntegration = await api<IntegrationStatus>("/api/integrations/codex", { method });
+    if (token !== lifecycleToken) return;
+    integration = nextIntegration;
     renderSettings("toggle-integration");
     showToast(
       integration.config === "connected" ? "Codex 자동 수집을 연결했습니다." : "Codex 자동 수집을 해제했습니다.",
       "success",
     );
   } catch (error) {
+    if (token !== lifecycleToken) return;
     setBusy(false);
     showToast(messageOf(error), "error");
   }
