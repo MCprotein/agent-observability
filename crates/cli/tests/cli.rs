@@ -53,6 +53,31 @@ fn invalid_real_process_command_fails_on_stderr() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown command"));
 }
 
+#[test]
+fn codex_notify_real_process_fails_open_with_zero_exit() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-notify-missing-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let output = binary()
+        .args([
+            "codex-notify",
+            root.to_str().unwrap(),
+            r#"{"type":"agent-turn-complete"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "notify=unavailable"
+    );
+    assert!(output.stderr.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[test]
 fn init_and_runtime_check_create_only_private_local_paths() {

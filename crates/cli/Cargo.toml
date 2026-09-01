@@ -14,8 +14,10 @@ agent-observability-adapter-claude-code = { path = "../adapter-claude-code" }
 agent-observability-adapter-codex = { path = "../adapter-codex" }
 agent-observability-adapter-cursor = { path = "../adapter-cursor" }
 agent-observability-application = { path = "../application" }
+agent-observability-codex-integration = { path = "../codex-integration" }
 agent-observability-contracts = { path = "../contracts" }
 agent-observability-local-runtime = { path = "../local-runtime" }
+agent-observability-local-collector = { path = "../local-collector" }
 agent-observability-local-store = { path = "../local-store" }
 agent-observability-local-ui = { path = "../local-ui" }
 agent-observability-static-report = { path = "../static-report" }

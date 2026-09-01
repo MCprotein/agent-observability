@@ -8,7 +8,7 @@ use agent_observability_domain::{
     CorrelationIds, LifecycleState, ObservationId, OperationId, PermissionId, RequestId, SessionId,
     SourceCursor, SourceGeneration, SpanId, Timing, TokenUsage, TraceId, TurnId,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -22,6 +22,7 @@ pub const HANDOFF_SCHEMA_VERSION: &str = "codex_handoff.v1";
 pub const MAX_HANDOFF_BYTES: u64 = 1024 * 1024;
 pub const MAX_HANDOFF_LINES: usize = 4096;
 pub const MAX_HANDOFF_LINE_BYTES: usize = 64 * 1024;
+pub const MAX_OTLP_LOG_RECORDS: usize = 4096;
 const KNOWN_CODEX_MODELS: &[&str] = &[
     "gpt-test",
     "gpt-5.4",
@@ -31,14 +32,14 @@ const KNOWN_CODEX_MODELS: &[&str] = &[
     "gpt-5.6-terra",
 ];
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceSurface {
     OtelLog,
     Notify,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct HandoffRecord {
     schema_version: String,
@@ -264,6 +265,269 @@ pub fn parse_handoff_jsonl(input: &str) -> Result<AdapterBatch, AdapterError> {
     Ok(batch)
 }
 
+/// Decodes one bounded OTLP/HTTP JSON logs request into the existing content-free Codex adapter
+/// boundary. Only explicitly owned scalar fields are copied; prompt text, tool arguments/output,
+/// account identity, and unknown attributes are discarded before canonical mapping.
+///
+/// `first_cursor` must be the next monotonic cursor for `source_generation`. The returned cursor is
+/// the last consumed cursor, or `previous_cursor` when the request contains no log records.
+///
+/// # Errors
+///
+/// Returns [`AdapterError`] for oversized or malformed OTLP JSON, invalid cursor values, or a
+/// request containing more than [`MAX_OTLP_LOG_RECORDS`] records.
+pub fn parse_otlp_http_json(
+    input: &[u8],
+    source_generation: &str,
+    previous_cursor: Option<&str>,
+    first_cursor: u64,
+    fallback_received_at_unix_ms: u64,
+) -> Result<(AdapterBatch, Option<String>), AdapterError> {
+    if input.len() as u64 > MAX_HANDOFF_BYTES {
+        return Err(AdapterError::HandoffTooLarge);
+    }
+    if source_generation.is_empty() || first_cursor == 0 {
+        return Err(AdapterError::InvalidCursorSequence);
+    }
+    let root: Value = serde_json::from_slice(input).map_err(|_| AdapterError::InvalidJson)?;
+    let resource_logs = root
+        .get("resourceLogs")
+        .and_then(Value::as_array)
+        .ok_or(AdapterError::InvalidJson)?;
+    let mut records = Vec::new();
+    let mut next_cursor = first_cursor;
+    let mut prior = previous_cursor.map(str::to_owned);
+    for resource in resource_logs {
+        let scope_logs = resource
+            .get("scopeLogs")
+            .and_then(Value::as_array)
+            .ok_or(AdapterError::InvalidJson)?;
+        for scope in scope_logs {
+            let log_records = scope
+                .get("logRecords")
+                .and_then(Value::as_array)
+                .ok_or(AdapterError::InvalidJson)?;
+            for log_record in log_records {
+                if records.len() >= MAX_OTLP_LOG_RECORDS {
+                    return Err(AdapterError::TooManyRecords);
+                }
+                let cursor = next_cursor.to_string();
+                next_cursor = next_cursor
+                    .checked_add(1)
+                    .ok_or(AdapterError::InvalidCursorSequence)?;
+                let attributes = otlp_attributes(log_record)?;
+                let event_name = attributes
+                    .get("event.name")
+                    .and_then(Value::as_str)
+                    .ok_or(AdapterError::InvalidFieldType)?
+                    .to_owned();
+                let received_at_unix_ms = log_record
+                    .get("timeUnixNano")
+                    .and_then(otlp_u64)
+                    .map_or(fallback_received_at_unix_ms, |value| value / 1_000_000);
+                let canonical = canonical_otlp_attributes(&event_name, &attributes, &cursor)?;
+                records.push(HandoffRecord {
+                    schema_version: HANDOFF_SCHEMA_VERSION.into(),
+                    source_generation: source_generation.into(),
+                    previous_cursor: prior.clone(),
+                    cursor: cursor.clone(),
+                    surface: SourceSurface::OtelLog,
+                    received_at_unix_ms,
+                    event_name,
+                    attributes: canonical,
+                });
+                prior = Some(cursor);
+            }
+        }
+    }
+    let mut jsonl = String::new();
+    for record in &records {
+        jsonl.push_str(&serde_json::to_string(record).map_err(|_| AdapterError::InvalidJson)?);
+        jsonl.push('\n');
+    }
+    parse_handoff_jsonl(&jsonl).map(|batch| (batch, prior))
+}
+
+/// Projects the raw Codex `agent-turn-complete` notify argument without retaining content fields.
+///
+/// # Errors
+///
+/// Returns [`AdapterError`] when the bounded JSON payload lacks the supported type or identifiers.
+pub fn parse_notify_json(
+    input: &[u8],
+    source_generation: &str,
+    previous_cursor: Option<&str>,
+    cursor: u64,
+    received_at_unix_ms: u64,
+) -> Result<AdapterBatch, AdapterError> {
+    if input.len() as u64 > MAX_HANDOFF_LINE_BYTES as u64 {
+        return Err(AdapterError::RecordTooLarge);
+    }
+    let payload: Value = serde_json::from_slice(input).map_err(|_| AdapterError::InvalidJson)?;
+    let event_name = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|value| *value == "agent-turn-complete")
+        .ok_or(AdapterError::InvalidSchema)?;
+    let thread_id = payload
+        .get("thread-id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(AdapterError::InvalidIdentifier)?;
+    let turn_id = payload
+        .get("turn-id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(AdapterError::InvalidIdentifier)?;
+    let mut attributes = BTreeMap::new();
+    attributes.insert("thread_id".into(), Value::String(thread_id.into()));
+    attributes.insert("turn_id".into(), Value::String(turn_id.into()));
+    let record = HandoffRecord {
+        schema_version: HANDOFF_SCHEMA_VERSION.into(),
+        source_generation: source_generation.into(),
+        previous_cursor: previous_cursor.map(str::to_owned),
+        cursor: cursor.to_string(),
+        surface: SourceSurface::Notify,
+        received_at_unix_ms,
+        event_name: event_name.into(),
+        attributes,
+    };
+    let json = serde_json::to_string(&record).map_err(|_| AdapterError::InvalidJson)?;
+    parse_handoff_jsonl(&json)
+}
+
+fn otlp_attributes(record: &Value) -> Result<BTreeMap<String, Value>, AdapterError> {
+    let values = record
+        .get("attributes")
+        .and_then(Value::as_array)
+        .ok_or(AdapterError::InvalidJson)?;
+    let mut attributes = BTreeMap::new();
+    for attribute in values {
+        let key = attribute
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or(AdapterError::InvalidJson)?;
+        let value = attribute
+            .get("value")
+            .and_then(otlp_any_value)
+            .ok_or(AdapterError::InvalidFieldType)?;
+        attributes.insert(key.to_owned(), value);
+    }
+    Ok(attributes)
+}
+
+fn otlp_any_value(value: &Value) -> Option<Value> {
+    if let Some(value) = value.get("stringValue").and_then(Value::as_str) {
+        return Some(Value::String(value.to_owned()));
+    }
+    if let Some(value) = value.get("boolValue").and_then(Value::as_bool) {
+        return Some(Value::Bool(value));
+    }
+    if let Some(value) = value.get("intValue").and_then(otlp_u64) {
+        return Some(Value::Number(value.into()));
+    }
+    value
+        .get("doubleValue")
+        .and_then(Value::as_f64)
+        .and_then(serde_json::Number::from_f64)
+        .map(Value::Number)
+}
+
+fn otlp_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn canonical_otlp_attributes(
+    event_name: &str,
+    source: &BTreeMap<String, Value>,
+    cursor: &str,
+) -> Result<BTreeMap<String, Value>, AdapterError> {
+    let mut output = BTreeMap::new();
+    copy_string(source, &mut output, "conversation.id", "conversation_id")?;
+    copy_string(source, &mut output, "turn.id", "turn_id")?;
+    copy_string(source, &mut output, "model", "model")?;
+    copy_string(source, &mut output, "event.kind", "kind")?;
+    copy_string(source, &mut output, "tool_name", "tool_name")?;
+    copy_string(source, &mut output, "call_id", "call_id")?;
+    copy_string(source, &mut output, "decision", "decision")?;
+    copy_u64(source, &mut output, "duration_ms", "duration_ms")?;
+    copy_u64(source, &mut output, "input_token_count", "input_tokens")?;
+    copy_u64(source, &mut output, "output_token_count", "output_tokens")?;
+    copy_u64(
+        source,
+        &mut output,
+        "cached_token_count",
+        "cached_input_tokens",
+    )?;
+    copy_u64(
+        source,
+        &mut output,
+        "reasoning_token_count",
+        "reasoning_output_tokens",
+    )?;
+    copy_u64(source, &mut output, "tool_token_count", "total_tokens")?;
+
+    if matches!(event_name, "codex.api_request" | "codex.sse_event") {
+        let request_id = source
+            .get("auth.request_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map_or_else(|| format!("otlp-{cursor}"), str::to_owned);
+        output.insert("request_id".into(), Value::String(request_id));
+    }
+    let success = source
+        .get("success")
+        .and_then(otlp_bool)
+        .or_else(|| success_from_status(source))
+        .unwrap_or_else(|| !source.contains_key("error.message"));
+    output.insert("success".into(), Value::Bool(success));
+    Ok(output)
+}
+
+fn copy_string(
+    source: &BTreeMap<String, Value>,
+    output: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    output_key: &str,
+) -> Result<(), AdapterError> {
+    let Some(value) = source.get(source_key) else {
+        return Ok(());
+    };
+    let value = value.as_str().ok_or(AdapterError::InvalidFieldType)?;
+    if value.is_empty() {
+        return Err(AdapterError::InvalidIdentifier);
+    }
+    output.insert(output_key.into(), Value::String(value.into()));
+    Ok(())
+}
+
+fn copy_u64(
+    source: &BTreeMap<String, Value>,
+    output: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    output_key: &str,
+) -> Result<(), AdapterError> {
+    let Some(value) = source.get(source_key) else {
+        return Ok(());
+    };
+    let value = otlp_u64(value).ok_or(AdapterError::InvalidFieldType)?;
+    output.insert(output_key.into(), Value::Number(value.into()));
+    Ok(())
+}
+
+fn otlp_bool(value: &Value) -> Option<bool> {
+    value
+        .as_bool()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn success_from_status(source: &BTreeMap<String, Value>) -> Option<bool> {
+    let status = source.get("http.response.status_code").and_then(otlp_u64)?;
+    Some((200..=299).contains(&status))
+}
+
 fn checkpoint_from_record(record: &HandoffRecord) -> Result<SourceCheckpoint, AdapterError> {
     Ok(SourceCheckpoint {
         source: AgentSource::Codex,
@@ -389,11 +653,14 @@ fn request_observation(
     includes_usage: bool,
 ) -> Result<Mapping, AdapterError> {
     let session = required_string(&record.attributes, "conversation_id")?;
-    let turn = required_string(&record.attributes, "turn_id")?;
+    let turn = optional_string(&record.attributes, "turn_id")?;
     let request = required_string(&record.attributes, "request_id")?;
     let correlation = CorrelationIds {
         session_id: Some(parse_identifier::<SessionId>(&session)?),
-        turn_id: Some(parse_identifier::<TurnId>(&turn)?),
+        turn_id: turn
+            .as_deref()
+            .map(parse_identifier::<TurnId>)
+            .transpose()?,
         request_id: Some(parse_identifier::<RequestId>(&request)?),
         ..CorrelationIds::default()
     };
@@ -414,7 +681,7 @@ fn request_observation(
         record,
         previous_cursor,
         &session,
-        Some(&turn),
+        turn.as_deref(),
         &format!(
             "request:{request}:{}",
             if includes_usage { "response" } else { "api" }
@@ -434,11 +701,14 @@ fn tool_observation(
     previous_cursor: Option<String>,
 ) -> Result<Mapping, AdapterError> {
     let session = required_string(&record.attributes, "conversation_id")?;
-    let turn = required_string(&record.attributes, "turn_id")?;
+    let turn = optional_string(&record.attributes, "turn_id")?;
     let operation = required_string(&record.attributes, "call_id")?;
     let correlation = CorrelationIds {
         session_id: Some(parse_identifier::<SessionId>(&session)?),
-        turn_id: Some(parse_identifier::<TurnId>(&turn)?),
+        turn_id: turn
+            .as_deref()
+            .map(parse_identifier::<TurnId>)
+            .transpose()?,
         operation_id: Some(parse_identifier::<OperationId>(&operation)?),
         ..CorrelationIds::default()
     };
@@ -446,7 +716,7 @@ fn tool_observation(
         record,
         previous_cursor,
         &session,
-        Some(&turn),
+        turn.as_deref(),
         &format!("tool:{operation}"),
         correlation,
         ObservationEvent::ToolOperation {
@@ -464,12 +734,15 @@ fn permission_observation(
     previous_cursor: Option<String>,
 ) -> Result<Mapping, AdapterError> {
     let session = required_string(&record.attributes, "conversation_id")?;
-    let turn = required_string(&record.attributes, "turn_id")?;
+    let turn = optional_string(&record.attributes, "turn_id")?;
     let permission = required_string(&record.attributes, "call_id")?;
     let decision = canonical_decision(&record.attributes)?;
     let correlation = CorrelationIds {
         session_id: Some(parse_identifier::<SessionId>(&session)?),
-        turn_id: Some(parse_identifier::<TurnId>(&turn)?),
+        turn_id: turn
+            .as_deref()
+            .map(parse_identifier::<TurnId>)
+            .transpose()?,
         permission_id: Some(parse_identifier::<PermissionId>(&permission)?),
         ..CorrelationIds::default()
     };
@@ -477,7 +750,7 @@ fn permission_observation(
         record,
         previous_cursor,
         &session,
-        Some(&turn),
+        turn.as_deref(),
         &format!("permission:{permission}"),
         correlation,
         ObservationEvent::Permission {
@@ -509,7 +782,11 @@ fn build_observation(
     let trace_id = parse_identifier::<TraceId>(&stable_id("codex-trace", &[session]))?;
     let session_span = stable_id("codex-session", &[session]);
     let (span_id, parent_span_id) = match turn {
-        None => (session_span, None),
+        None if leaf == "session" => (session_span, None),
+        None => (
+            stable_id("codex-span", &[session, leaf]),
+            Some(session_span),
+        ),
         Some(turn_id) if leaf == "turn" => (
             stable_id("codex-turn", &[session, turn_id]),
             Some(session_span),
@@ -691,7 +968,8 @@ fn stable_id(prefix: &str, components: &[&str]) -> String {
 mod tests {
     use super::{
         AdapterError, AdapterItem, DiagnosticCode, MAX_HANDOFF_BYTES, MAX_HANDOFF_LINE_BYTES,
-        MAX_HANDOFF_LINES, parse_handoff_jsonl, read_handoff_file,
+        MAX_HANDOFF_LINES, parse_handoff_jsonl, parse_notify_json, parse_otlp_http_json,
+        read_handoff_file,
     };
     use agent_observability_contracts::ObservationEvent;
     use agent_observability_domain::LifecycleState;
@@ -703,6 +981,87 @@ mod tests {
         "sha256:0b30a1810b6e34152310691a3a660ecf33e98d4940fc63fe9b340811241f526c";
     const EXPECTED_PROJECTION_HASH: &str =
         "sha256:6dc1fa2ad7837c0e9ac2dcd6ac0dca52da1b0c11872db203d53ae742c97ee45a";
+
+    #[test]
+    fn current_codex_otlp_json_is_allowlisted_before_canonical_mapping() {
+        let input = br#"{
+          "resourceLogs": [{"scopeLogs": [{"logRecords": [
+            {"timeUnixNano":"1787875200000000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
+              {"key":"user.email","value":{"stringValue":"SECRET_EMAIL@example.com"}}
+            ]},
+            {"timeUnixNano":"1787875200100000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"event.kind","value":{"stringValue":"response.completed"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
+              {"key":"input_token_count","value":{"stringValue":"100"}},
+              {"key":"output_token_count","value":{"stringValue":"25"}},
+              {"key":"cached_token_count","value":{"intValue":"10"}},
+              {"key":"reasoning_token_count","value":{"intValue":"5"}},
+              {"key":"tool_token_count","value":{"stringValue":"125"}}
+            ]},
+            {"timeUnixNano":"1787875200200000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.tool_result"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"tool_name","value":{"stringValue":"exec_command"}},
+              {"key":"call_id","value":{"stringValue":"call-1"}},
+              {"key":"success","value":{"stringValue":"true"}},
+              {"key":"arguments","value":{"stringValue":"RAW_ARGUMENT_SECRET"}},
+              {"key":"output","value":{"stringValue":"RAW_OUTPUT_SECRET"}}
+            ]}
+          ]}]}]
+        }"#;
+        let (batch, cursor) = parse_otlp_http_json(input, "codex-0.151.0", None, 1, 0).unwrap();
+        assert_eq!(cursor.as_deref(), Some("3"));
+        assert_eq!(batch.observations().count(), 3);
+        assert_eq!(batch.diagnostics().count(), 0);
+        let request = batch
+            .observations()
+            .find(|observation| matches!(observation.event, ObservationEvent::ModelRequest { .. }))
+            .unwrap();
+        assert_eq!(request.token_usage.input, Some(100));
+        assert_eq!(request.token_usage.output, Some(25));
+        assert_eq!(request.token_usage.total, Some(125));
+        assert!(request.correlation.turn_id.is_none());
+        let debug = format!("{batch:?}");
+        for secret in [
+            "SECRET_EMAIL@example.com",
+            "RAW_ARGUMENT_SECRET",
+            "RAW_OUTPUT_SECRET",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[test]
+    fn raw_notify_discards_content_and_cwd_before_mapping() {
+        let input = br#"{
+          "type":"agent-turn-complete",
+          "thread-id":"conversation-1",
+          "turn-id":"turn-1",
+          "cwd":"/SECRET/PRIVATE/REPO",
+          "input-messages":["RAW_PROMPT_SECRET"],
+          "last-assistant-message":"RAW_ASSISTANT_SECRET"
+        }"#;
+        let batch = parse_notify_json(input, "codex-notify-v1", None, 1, 123).unwrap();
+        let turn = batch.observations().next().unwrap();
+        assert!(matches!(turn.event, ObservationEvent::Turn));
+        assert_eq!(
+            turn.correlation.turn_id.as_ref().unwrap().as_str(),
+            "turn-1"
+        );
+        let debug = format!("{batch:?}");
+        for secret in [
+            "/SECRET/PRIVATE/REPO",
+            "RAW_PROMPT_SECRET",
+            "RAW_ASSISTANT_SECRET",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+    }
 
     #[test]
     fn maps_primary_and_supplement_sources_without_losing_timing_updates() {

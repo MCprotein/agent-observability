@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+agent-observability-codex-integration = { path = "../codex-integration" }
+agent-observability-local-collector = { path = "../local-collector" }
 agent-observability-local-runtime = { path = "../local-runtime" }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 getrandom = "0.3"

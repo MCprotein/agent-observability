@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
+use agent_observability_codex_integration::{
+    CodexIntegrationStatus, connect as connect_codex, disconnect as disconnect_codex,
+    status as codex_status,
+};
+use agent_observability_local_collector::REPORT_FILE_NAME;
 use agent_observability_local_runtime::{
     ConfigServiceError, InstalledLayout, LocalConfigService, LocalRuntimeConfigV2, Singleton,
     VersionedLocalConfig,
@@ -18,6 +23,9 @@ use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
 use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -163,6 +171,7 @@ impl PreparedUi {
 #[derive(Clone, Debug)]
 struct AppState {
     config: LocalConfigService,
+    root: PathBuf,
     host: String,
     origin: String,
     token: String,
@@ -241,6 +250,7 @@ pub async fn prepare(layout: &InstalledLayout) -> Result<PreparedUi, UiError> {
     let last_seen = Arc::new(Mutex::new(Instant::now()));
     let state = AppState {
         config: LocalConfigService::new(layout),
+        root: layout.root.clone(),
         host,
         origin: origin.clone(),
         token: token.clone(),
@@ -266,6 +276,13 @@ fn router(state: AppState) -> Router {
         .route("/assets/app.css", get(style))
         .route("/favicon.ico", get(empty))
         .route("/api/config", get(get_config).put(put_config))
+        .route(
+            "/api/integrations/codex",
+            get(get_codex_integration)
+                .post(connect_codex_integration)
+                .delete(disconnect_codex_integration),
+        )
+        .route("/api/dashboard/open", post(open_dashboard))
         .route("/api/heartbeat", post(heartbeat))
         .route("/api/shutdown", post(shutdown))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -325,6 +342,97 @@ async fn put_config(
         .map_err(|_| config_error(ConfigServiceError::Unavailable))?
         .map_err(config_error)?;
     Ok(Json(envelope(saved)))
+}
+
+async fn get_codex_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<CodexIntegrationStatus>, ApiError> {
+    authorize(&state, &headers, false)?;
+    touch(&state)?;
+    run_integration(state.root, codex_status).await.map(Json)
+}
+
+async fn connect_codex_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<CodexIntegrationStatus>, ApiError> {
+    authorize(&state, &headers, true)?;
+    touch(&state)?;
+    run_integration(state.root, connect_codex).await.map(Json)
+}
+
+async fn disconnect_codex_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<CodexIntegrationStatus>, ApiError> {
+    authorize(&state, &headers, true)?;
+    touch(&state)?;
+    run_integration(state.root, disconnect_codex)
+        .await
+        .map(Json)
+}
+
+async fn run_integration(
+    root: PathBuf,
+    operation: fn(
+        &Path,
+        &Path,
+    ) -> Result<
+        CodexIntegrationStatus,
+        agent_observability_codex_integration::IntegrationError,
+    >,
+) -> Result<CodexIntegrationStatus, ApiError> {
+    let executable = env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|error| integration_error(format!("실행 파일을 확인할 수 없습니다: {error}")))?;
+    tokio::task::spawn_blocking(move || operation(&root, &executable))
+        .await
+        .map_err(|_| integration_error("Codex 연결 작업이 중단되었습니다."))?
+        .map_err(|error| integration_error(error.to_string()))
+}
+
+async fn open_dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    authorize(&state, &headers, true)?;
+    touch(&state)?;
+    let report = state.root.join("logs").join(REPORT_FILE_NAME);
+    tokio::task::spawn_blocking(move || open_dashboard_file(&report))
+        .await
+        .map_err(|_| dashboard_error("모니터링 리포트 열기 작업이 중단되었습니다."))?
+        .map_err(dashboard_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(target_os = "macos")]
+fn open_dashboard_file(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("아직 생성된 모니터링 리포트가 없습니다.".into());
+    }
+    Command::new("open")
+        .arg(path)
+        .spawn()
+        .map(|mut child| {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        })
+        .map_err(|error| format!("모니터링 리포트를 열 수 없습니다: {error}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_dashboard_file(_path: &Path) -> Result<(), String> {
+    Err("브라우저 자동 열기는 현재 macOS에서 지원합니다.".into())
+}
+
+fn integration_error(message: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::CONFLICT, "integration_failed", message)
+}
+
+fn dashboard_error(message: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::CONFLICT, "dashboard_unavailable", message)
 }
 
 async fn heartbeat(
@@ -436,7 +544,7 @@ fn envelope(versioned: VersionedLocalConfig) -> ConfigEnvelope {
         config: versioned.config,
         defaults: LocalRuntimeConfigV2::default(),
         revision: versioned.revision,
-        collection_mode: "manual_import",
+        collection_mode: "automatic_codex",
     }
 }
 
@@ -667,6 +775,7 @@ mod tests {
                 let layout = install(&root).unwrap();
                 let state = AppState {
                     config: LocalConfigService::new(&layout),
+                    root: layout.root.clone(),
                     host: "127.0.0.1:43191".into(),
                     origin: "http://127.0.0.1:43191".into(),
                     token: "test-session".into(),

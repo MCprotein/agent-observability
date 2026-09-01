@@ -511,7 +511,13 @@ fn valid_parent_kind(child: SpanKind, parent: SpanKind) -> bool {
     matches!(
         (child, parent),
         (SpanKind::AgentSession, SpanKind::Workstream)
-            | (SpanKind::Turn, SpanKind::AgentSession)
+            | (
+                SpanKind::Turn
+                    | SpanKind::LlmRequest
+                    | SpanKind::ToolExecution
+                    | SpanKind::Permission,
+                SpanKind::AgentSession,
+            )
             | (SpanKind::LlmRequest, SpanKind::Turn)
             | (
                 SpanKind::ToolExecution | SpanKind::Permission,
@@ -720,6 +726,9 @@ mod tests {
         for (child_kind, parent_kind) in [
             (SpanKind::AgentSession, SpanKind::Workstream),
             (SpanKind::Turn, SpanKind::AgentSession),
+            (SpanKind::LlmRequest, SpanKind::AgentSession),
+            (SpanKind::ToolExecution, SpanKind::AgentSession),
+            (SpanKind::Permission, SpanKind::AgentSession),
             (SpanKind::LlmRequest, SpanKind::Turn),
             (SpanKind::ToolExecution, SpanKind::Turn),
             (SpanKind::ToolExecution, SpanKind::LlmRequest),

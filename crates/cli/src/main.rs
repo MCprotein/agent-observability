@@ -9,11 +9,16 @@ use agent_observability_adapter_cursor::{
     AdapterItem as CursorAdapterItem, read_handoff_file as read_cursor_handoff_file,
 };
 use agent_observability_application::{parse_rate_table_json, project_report};
+use agent_observability_codex_integration::{
+    CollectorStatus, ConnectionStatus, connect as connect_integration,
+    disconnect as disconnect_integration, status as integration_status,
+};
 use agent_observability_contracts::{
     AdapterDispositionCode, AdapterDispositionKind, REPORT_DTO_VERSION, SourceCheckpoint,
     SourceObservation,
 };
 use agent_observability_contracts::{CONTRACT_MANIFEST, ContractManifest};
+use agent_observability_local_collector::{NotifyOutcome, load_settings, serve, submit_notify};
 use agent_observability_local_runtime::{
     Admission, ConfigMutationGuard, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION,
     LocalRuntimeConfigV2, PressureSample, RuntimeControl, Singleton, StorageBudget, install, load,
@@ -25,7 +30,7 @@ use agent_observability_local_store::{
 use agent_observability_local_ui::PreparedUi;
 use agent_observability_static_report::write_private;
 use std::env;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
@@ -37,9 +42,14 @@ const USAGE: &str = "Agent Observability (`agentobs`, legacy alias: `agent-obser
 
 Quick start:
   agentobs demo [root] [--no-open]       Open the sample monitoring dashboard
-  agentobs setup [root] [--no-open]      Initialize a runtime and open monitoring
+  agentobs setup [root] [--no-open]      One-click Codex setup and monitoring
   agentobs dashboard [root] [--no-open]  Refresh and open the monitoring dashboard
   agentobs ui [root] [--no-open]         Open settings only
+
+Automatic collection:
+  agentobs connect codex [root]
+  agentobs status codex [root]
+  agentobs disconnect codex [root]
 
 Configuration:
   agentobs config show [root]
@@ -119,6 +129,19 @@ impl IngestResult {
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
+    if let Some(result) = run_collector_command(&arguments) {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("{message}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(output) = run_notify_command(&arguments) {
+        println!("{output}");
+        return ExitCode::SUCCESS;
+    }
     if let Some(result) = run_ui_command(&arguments) {
         return match result {
             Ok(()) => ExitCode::SUCCESS,
@@ -140,6 +163,46 @@ fn main() -> ExitCode {
     }
 }
 
+fn run_collector_command(arguments: &[String]) -> Option<Result<(), String>> {
+    let [command, root] = arguments else {
+        return None;
+    };
+    if command != "collector-serve" {
+        return None;
+    }
+    let root = Path::new(root);
+    let settings = match load_settings(root) {
+        Ok(settings) => settings,
+        Err(error) => return Some(Err(error.to_string())),
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return Some(Err(format!("collector runtime failed: {error}"))),
+    };
+    Some(
+        runtime
+            .block_on(serve(settings.options(root)))
+            .map_err(|error| error.to_string()),
+    )
+}
+
+fn run_notify_command(arguments: &[String]) -> Option<&'static str> {
+    let [command, root, payload] = arguments else {
+        return None;
+    };
+    if command != "codex-notify" {
+        return None;
+    }
+    Some(match submit_notify(Path::new(root), payload.as_bytes()) {
+        NotifyOutcome::Accepted => "notify=accepted",
+        NotifyOutcome::Rejected => "notify=rejected",
+        NotifyOutcome::Unavailable => "notify=unavailable",
+    })
+}
+
 fn run_ui_command(arguments: &[String]) -> Option<Result<(), String>> {
     let result = match arguments {
         [command] if command == "ui" => default_root().and_then(|root| settings_ui(&root, true)),
@@ -156,6 +219,7 @@ fn run_ui_command(arguments: &[String]) -> Option<Result<(), String>> {
 }
 
 fn settings_ui(root: &Path, open: bool) -> Result<(), String> {
+    let _ = prepare_dashboard(root, false)?;
     let layout = install(root).map_err(|error| error.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -186,7 +250,7 @@ fn announce_settings_ui(ui: &PreparedUi, open: bool) -> Result<(), String> {
     if !opened {
         println!("url={}", ui.url());
     }
-    println!("opened={opened}\ncollection=manual_import");
+    println!("opened={opened}\ncollection=automatic_codex_available");
     std::io::stdout()
         .flush()
         .map_err(|error| format!("settings output failed: {error}"))?;
@@ -321,13 +385,31 @@ fn run_onboarding(arguments: &[String]) -> Option<Result<String, String>> {
         [command, root, flag] if command == "demo" && flag == "--no-open" => {
             demo(Path::new(root), false)
         }
-        [command] if command == "setup" => default_root().and_then(|root| setup(&root, true)),
+        [command] if command == "setup" => default_root().and_then(|root| setup(&root, true, true)),
         [command, flag] if command == "setup" && flag == "--no-open" => {
-            default_root().and_then(|root| setup(&root, false))
+            default_root().and_then(|root| setup(&root, false, true))
         }
-        [command, root] if command == "setup" => setup(Path::new(root), true),
+        [command, root] if command == "setup" => setup(Path::new(root), true, false),
         [command, root, flag] if command == "setup" && flag == "--no-open" => {
-            setup(Path::new(root), false)
+            setup(Path::new(root), false, false)
+        }
+        [command, source] if command == "connect" && source == "codex" => {
+            default_root().and_then(|root| connect_codex(&root))
+        }
+        [command, source, root] if command == "connect" && source == "codex" => {
+            connect_codex(Path::new(root))
+        }
+        [command, source] if command == "disconnect" && source == "codex" => {
+            default_root().and_then(|root| disconnect_codex(&root))
+        }
+        [command, source, root] if command == "disconnect" && source == "codex" => {
+            disconnect_codex(Path::new(root))
+        }
+        [command, source] if command == "status" && source == "codex" => {
+            default_root().and_then(|root| codex_status(&root))
+        }
+        [command, source, root] if command == "status" && source == "codex" => {
+            codex_status(Path::new(root))
         }
         [command] if command == "dashboard" => {
             default_root().and_then(|root| dashboard(&root, true))
@@ -415,14 +497,76 @@ fn require_demo_ingest(ingest: &IngestResult) -> Result<(), String> {
     }
 }
 
-fn setup(root: &Path, open: bool) -> Result<String, String> {
+fn setup(root: &Path, open: bool, automatic: bool) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
+    let connection = automatic.then(|| connect_codex(&layout.root)).transpose()?;
     let dashboard = prepare_dashboard(&layout.root, open)?;
     Ok(format!(
-        "status=ready\nroot={}\ndashboard={}\ncollection=manual_import\nopened={open}",
+        "status=ready\nroot={}\ndashboard={}\ncollection={}\nopened={open}{}",
         layout.root.display(),
-        dashboard.display()
+        dashboard.display(),
+        if automatic {
+            "automatic_codex"
+        } else {
+            "manual_import"
+        },
+        connection.map_or_else(String::new, |output| format!("\n{output}"))
     ))
+}
+
+fn connect_codex(root: &Path) -> Result<String, String> {
+    let status =
+        connect_integration(root, &installed_executable()?).map_err(|error| error.to_string())?;
+    Ok(format!(
+        "integration=codex\nconfig={}\ncollector=ready\nendpoint={}\nservice={}\nmanual_import=available",
+        connection_status(status.config),
+        status.endpoint.as_deref().unwrap_or_default(),
+        status.service.as_deref().unwrap_or_default()
+    ))
+}
+
+fn disconnect_codex(root: &Path) -> Result<String, String> {
+    let status = disconnect_integration(root, &installed_executable()?)
+        .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "integration=codex\nconfig={}\ncollector=stopped\ndata=retained",
+        connection_status(status.config)
+    ))
+}
+
+fn codex_status(root: &Path) -> Result<String, String> {
+    let status =
+        integration_status(root, &installed_executable()?).map_err(|error| error.to_string())?;
+    if status.endpoint.is_none() {
+        return Ok("integration=codex\nconfig=disconnected\ncollector=unavailable".into());
+    }
+    Ok(format!(
+        "integration=codex\nconfig={}\ncollector={}\nendpoint={}",
+        connection_status(status.config),
+        collector_status(status.collector),
+        status.endpoint.as_deref().unwrap_or_default()
+    ))
+}
+
+fn installed_executable() -> Result<PathBuf, String> {
+    env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|error| format!("cannot resolve the installed agentobs executable: {error}"))
+}
+
+const fn connection_status(status: ConnectionStatus) -> &'static str {
+    match status {
+        ConnectionStatus::Connected => "connected",
+        ConnectionStatus::Disconnected => "disconnected",
+        ConnectionStatus::Conflict => "conflict",
+    }
+}
+
+const fn collector_status(status: CollectorStatus) -> &'static str {
+    match status {
+        CollectorStatus::Ready => "ready",
+        CollectorStatus::Unavailable => "unavailable",
+    }
 }
 
 fn dashboard(root: &Path, open: bool) -> Result<String, String> {

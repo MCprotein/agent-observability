@@ -1,0 +1,21 @@
+[package]
+name = "agent-observability-local-collector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent-observability-adapter-codex = { path = "../adapter-codex" }
+agent-observability-application = { path = "../application" }
+agent-observability-local-runtime = { path = "../local-runtime" }
+agent-observability-local-store = { path = "../local-store" }
+agent-observability-static-report = { path = "../static-report" }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.53.1", features = ["net", "rt", "sync", "time"] }
+
+[lints]
+workspace = true
