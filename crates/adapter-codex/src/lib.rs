@@ -83,6 +83,7 @@ type OtlpRequestPairKey = (String, String, String);
 #[derive(Clone, Debug)]
 struct PendingOtlpRequest {
     correlation_id: String,
+    official_retry_identity: Option<String>,
     inserted_at_unix_ms: u64,
     sequence: u64,
     current_record_index: Option<usize>,
@@ -103,6 +104,8 @@ struct PersistedPendingOtlpRequest {
     conversation_hash: String,
     model_hash: String,
     correlation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    official_retry_identity: Option<String>,
     inserted_at_unix_ms: u64,
     sequence: u64,
 }
@@ -145,6 +148,10 @@ impl OtlpRequestCorrelationState {
                 || !is_private_hash(&pending.conversation_hash)
                 || !is_private_hash(&pending.model_hash)
                 || !is_private_hash(&pending.correlation_id)
+                || pending
+                    .official_retry_identity
+                    .as_deref()
+                    .is_some_and(|identity| !is_private_hash(identity))
                 || pending.sequence >= state.next_sequence
             {
                 return Err(AdapterError::InvalidSchema);
@@ -157,6 +164,7 @@ impl OtlpRequestCorrelationState {
                 ),
                 PendingOtlpRequest {
                     correlation_id: pending.correlation_id,
+                    official_retry_identity: pending.official_retry_identity,
                     inserted_at_unix_ms: pending.inserted_at_unix_ms,
                     sequence: pending.sequence,
                     current_record_index: None,
@@ -182,6 +190,7 @@ impl OtlpRequestCorrelationState {
                     conversation_hash: key.1.clone(),
                     model_hash: key.2.clone(),
                     correlation_id: request.correlation_id.clone(),
+                    official_retry_identity: request.official_retry_identity.clone(),
                     inserted_at_unix_ms: request.inserted_at_unix_ms,
                     sequence: request.sequence,
                 })
@@ -214,6 +223,18 @@ impl OtlpRequestCorrelationState {
         while self.pending_len() > MAX_PENDING_OTLP_REQUESTS {
             self.evict_oldest();
         }
+    }
+
+    fn contains_official_retry(
+        &self,
+        key: &OtlpRequestPairKey,
+        official_retry_identity: &str,
+    ) -> bool {
+        self.pending.get(key).is_some_and(|queue| {
+            queue.iter().any(|pending| {
+                pending.official_retry_identity.as_deref() == Some(official_retry_identity)
+            })
+        })
     }
 
     fn evict_oldest(&mut self) {
@@ -720,25 +741,29 @@ fn correlate_otlp_request_pairs(
         );
         if event_name == "codex.api_request" {
             let request_id = optional_string(&records[index].attributes, "request_id")?;
-            let correlation_id = request_id.as_deref().map_or_else(
-                || {
-                    stable_id(
-                        "id:sha256",
-                        &[
-                            "codex-local-request-v1",
-                            source_generation,
-                            &conversation_id,
-                            &model,
-                            &records[index].cursor,
-                        ],
-                    )
-                },
-                hash_opaque_identifier,
-            );
+            let official_retry_identity = request_id.as_deref().map(hash_opaque_identifier);
+            let correlation_id = official_retry_identity.clone().unwrap_or_else(|| {
+                stable_id(
+                    "id:sha256",
+                    &[
+                        "codex-local-request-v1",
+                        source_generation,
+                        &conversation_id,
+                        &model,
+                        &records[index].cursor,
+                    ],
+                )
+            });
             records[index]
                 .attributes
                 .insert("request_id".into(), Value::String(correlation_id.clone()));
             if optional_bool(&records[index].attributes, "success")? != Some(true) {
+                continue;
+            }
+            if official_retry_identity
+                .as_deref()
+                .is_some_and(|identity| state.contains_official_retry(&key, identity))
+            {
                 continue;
             }
             let sequence = state.next_sequence();
@@ -746,6 +771,7 @@ fn correlate_otlp_request_pairs(
                 key,
                 PendingOtlpRequest {
                     correlation_id,
+                    official_retry_identity,
                     inserted_at_unix_ms: now_unix_ms,
                     sequence,
                     current_record_index: Some(index),
@@ -1314,6 +1340,17 @@ mod tests {
         .into_bytes()
     }
 
+    fn otlp_api_request_without_id(conversation_id: &str) -> Vec<u8> {
+        format!(
+            r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"attributes":[
+              {{"key":"event.name","value":{{"stringValue":"codex.api_request"}}}},
+              {{"key":"conversation.id","value":{{"stringValue":"{conversation_id}"}}}},
+              {{"key":"model","value":{{"stringValue":"gpt-test"}}}}
+            ]}}]}}]}}]}}"#
+        )
+        .into_bytes()
+    }
+
     fn otlp_completed_response(conversation_id: &str) -> Vec<u8> {
         format!(
             r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"attributes":[
@@ -1505,6 +1542,105 @@ mod tests {
     }
 
     #[test]
+    fn successful_official_retry_is_idempotent_across_restart_and_completion() {
+        let first_request = otlp_api_request("conversation-1", "request-1");
+        let mut state = OtlpRequestCorrelationState::default();
+        parse_otlp_http_json_with_state(&first_request, "generation-a", None, 1, 100, &mut state)
+            .unwrap();
+        assert_eq!(state.pending_len(), 1);
+
+        let before_retry = state.to_persisted_json().unwrap();
+        parse_otlp_http_json_with_state(&first_request, "generation-a", None, 1, 101, &mut state)
+            .unwrap();
+        assert_eq!(state.pending_len(), 1);
+        assert_eq!(state.to_persisted_json().unwrap(), before_retry);
+
+        let persisted = state.to_persisted_json().unwrap();
+        let mut restored =
+            OtlpRequestCorrelationState::from_persisted_json(&persisted, 102).unwrap();
+        let (retry, _) = parse_otlp_http_json_with_state(
+            &first_request,
+            "generation-a",
+            None,
+            1,
+            103,
+            &mut restored,
+        )
+        .unwrap();
+        assert_eq!(
+            only_request_id(&retry),
+            Some(hash_opaque_identifier("request-1").as_str())
+        );
+        assert_eq!(restored.pending_len(), 1);
+        assert_eq!(restored.to_persisted_json().unwrap(), persisted);
+
+        let (completed, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response("conversation-1"),
+            "generation-a",
+            Some("1"),
+            2,
+            104,
+            &mut restored,
+        )
+        .unwrap();
+        assert_eq!(
+            only_request_id(&completed),
+            Some(hash_opaque_identifier("request-1").as_str())
+        );
+        assert_eq!(restored.pending_len(), 0);
+
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("conversation-1", "request-2"),
+            "generation-a",
+            Some("2"),
+            3,
+            105,
+            &mut restored,
+        )
+        .unwrap();
+        let (subsequent, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response("conversation-1"),
+            "generation-a",
+            Some("3"),
+            4,
+            106,
+            &mut restored,
+        )
+        .unwrap();
+        assert_eq!(
+            only_request_id(&subsequent),
+            Some(hash_opaque_identifier("request-2").as_str())
+        );
+        assert_eq!(restored.pending_len(), 0);
+    }
+
+    #[test]
+    fn no_id_retry_keeps_cursor_identity_without_official_deduplication() {
+        let request = otlp_api_request_without_id("conversation-1");
+        let mut state = OtlpRequestCorrelationState::default();
+        let mut request_ids = Vec::new();
+        for _ in 0..2 {
+            let (batch, _) =
+                parse_otlp_http_json_with_state(&request, "generation-a", None, 7, 100, &mut state)
+                    .unwrap();
+            request_ids.push(only_request_id(&batch).unwrap().to_owned());
+        }
+        assert_eq!(request_ids[0], request_ids[1]);
+        assert_eq!(state.pending_len(), 2);
+
+        parse_otlp_http_json_with_state(
+            &otlp_completed_response("conversation-1"),
+            "generation-a",
+            Some("7"),
+            8,
+            101,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.pending_len(), 1);
+    }
+
+    #[test]
     fn correlation_isolated_by_generation_and_restart_fails_closed() {
         let mut state = OtlpRequestCorrelationState::default();
         parse_otlp_http_json_with_state(
@@ -1618,12 +1754,14 @@ mod tests {
               {"key":"event.name","value":{"stringValue":"codex.api_request"}},
               {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
               {"key":"model","value":{"stringValue":"gpt-test"}},
+              {"key":"auth.request_id","value":{"stringValue":"request-retry"}},
               {"key":"http.response.status_code","value":{"intValue":"500"}}
             ]},
             {"timeUnixNano":"101000000","attributes":[
               {"key":"event.name","value":{"stringValue":"codex.api_request"}},
               {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
               {"key":"model","value":{"stringValue":"gpt-test"}},
+              {"key":"auth.request_id","value":{"stringValue":"request-retry"}},
               {"key":"http.response.status_code","value":{"intValue":"200"}}
             ]},
             {"timeUnixNano":"102000000","attributes":[
@@ -1647,11 +1785,13 @@ mod tests {
         let requests = batch.observations().collect::<Vec<_>>();
         assert_eq!(requests.len(), 4);
         assert_eq!(requests[0].lifecycle, LifecycleState::Failed);
+        assert_ne!(requests[0].observation_id, requests[1].observation_id);
+        assert_ne!(requests[0].source_cursor, requests[1].source_cursor);
         assert_eq!(
             requests[1].correlation.request_id,
             requests[2].correlation.request_id
         );
-        assert_ne!(
+        assert_eq!(
             requests[0].correlation.request_id,
             requests[1].correlation.request_id
         );

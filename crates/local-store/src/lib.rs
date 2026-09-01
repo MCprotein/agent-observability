@@ -185,6 +185,8 @@ struct CodexPendingCorrelationV1 {
     conversation_hash: String,
     model_hash: String,
     correlation_id: String,
+    #[serde(default)]
+    official_retry_identity: Option<String>,
     inserted_at_unix_ms: u64,
     sequence: u64,
 }
@@ -1299,6 +1301,10 @@ fn validate_codex_correlation_state(
                 || !is_private_identifier_hash(&pending.conversation_hash)
                 || !is_private_identifier_hash(&pending.model_hash)
                 || !is_private_identifier_hash(&pending.correlation_id)
+                || pending
+                    .official_retry_identity
+                    .as_deref()
+                    .is_some_and(|identity| !is_private_identifier_hash(identity))
                 || pending.sequence >= state.next_sequence
                 || pending.inserted_at_unix_ms == 0
         })
@@ -3205,6 +3211,7 @@ mod tests {
                 "conversation_hash": hash_opaque_identifier("conversation"),
                 "model_hash": hash_opaque_identifier("model"),
                 "correlation_id": hash_opaque_identifier(request_id),
+                "official_retry_identity": hash_opaque_identifier(request_id),
                 "inserted_at_unix_ms": 100,
                 "sequence": 0
             }]
@@ -3583,6 +3590,18 @@ mod tests {
                 &items,
                 "generation",
                 &raw,
+            ),
+            Err(StoreError::InvalidObservation)
+        ));
+        let raw_official_identity = correlation_snapshot("request-private").replace(
+            &hash_opaque_identifier("request-private"),
+            "raw-official-request-id",
+        );
+        assert!(matches!(
+            store.ingest_codex_batch_with_correlation_state_deferred_projection(
+                &items,
+                "generation",
+                &raw_official_identity,
             ),
             Err(StoreError::InvalidObservation)
         ));
