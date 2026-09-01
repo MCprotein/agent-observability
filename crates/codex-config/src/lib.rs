@@ -99,6 +99,16 @@ struct OwnershipSnapshot {
     connected_hash: String,
     connected_mode: u32,
     managed_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_rotation: Option<PendingRotation>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PendingRotation {
+    connected_bytes_hex: String,
+    connected_hash: String,
+    connected_mode: u32,
+    managed_fingerprint: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -106,6 +116,7 @@ struct OwnershipSnapshot {
 enum SnapshotPhase {
     Prepared,
     Connected,
+    Rotating,
     Restoring,
 }
 
@@ -113,6 +124,8 @@ enum SnapshotPhase {
 enum SnapshotState {
     PreparedPrior,
     Connected,
+    RotationPrepared,
+    RotationApplied,
     RestoredPrior,
     Conflict,
 }
@@ -172,29 +185,10 @@ impl CodexConfigManager {
         self.ensure_private_state_dir()?;
         let _lock = self.lock()?;
         let snapshot_path = self.snapshot_path();
-        if checked_metadata(&snapshot_path)?.is_some() {
-            let (mut snapshot, snapshot_file) = self.read_snapshot()?;
-            if snapshot.managed_fingerprint != self.managed_values().fingerprint() {
-                return Err(ConfigError::Conflict);
-            }
-            match self.snapshot_state(&snapshot)? {
-                SnapshotState::PreparedPrior | SnapshotState::RestoredPrior => {
-                    mutations
-                        .remove_checked(&snapshot_path, FileExpectation::present(&snapshot_file))?;
-                }
-                SnapshotState::Connected => {
-                    if snapshot.phase != SnapshotPhase::Connected {
-                        self.transition_snapshot(
-                            mutations,
-                            &mut snapshot,
-                            &snapshot_file,
-                            SnapshotPhase::Connected,
-                        )?;
-                    }
-                    return Ok(ConnectionStatus::Connected);
-                }
-                SnapshotState::Conflict => return Err(ConfigError::Conflict),
-            }
+        if checked_metadata(&snapshot_path)?.is_some()
+            && let Some(status) = self.connect_existing(mutations, &snapshot_path)?
+        {
+            return Ok(status);
         }
 
         let prior = self.read_config()?;
@@ -220,6 +214,7 @@ impl CodexConfigManager {
             connected_hash: hash(&updated),
             connected_mode: prior.mode,
             managed_fingerprint: managed.fingerprint(),
+            pending_rotation: None,
         };
         let snapshot_bytes = snapshot.to_bytes()?;
 
@@ -251,7 +246,10 @@ impl CodexConfigManager {
                     }
                 }
                 SnapshotState::Connected => {}
-                SnapshotState::RestoredPrior | SnapshotState::Conflict => {
+                SnapshotState::RotationPrepared
+                | SnapshotState::RotationApplied
+                | SnapshotState::RestoredPrior
+                | SnapshotState::Conflict => {
                     return Err(ConfigError::Conflict);
                 }
             }
@@ -265,6 +263,53 @@ impl CodexConfigManager {
             SnapshotPhase::Connected,
         )?;
         Ok(ConnectionStatus::Connected)
+    }
+
+    fn connect_existing(
+        &self,
+        mutations: &impl FileMutations,
+        snapshot_path: &Path,
+    ) -> Result<Option<ConnectionStatus>, ConfigError> {
+        let (mut snapshot, snapshot_file) = self.read_snapshot()?;
+        let managed = self.managed_values();
+        let managed_fingerprint = managed.fingerprint();
+        let state = self.snapshot_state(&snapshot)?;
+        if snapshot.phase == SnapshotPhase::Rotating {
+            if snapshot.pending_managed_fingerprint() != Some(managed_fingerprint.as_str()) {
+                return Err(ConfigError::Conflict);
+            }
+            self.finish_rotation(mutations, &mut snapshot, &snapshot_file, state)?;
+            return Ok(Some(ConnectionStatus::Connected));
+        }
+        if snapshot.managed_fingerprint != managed_fingerprint {
+            if state != SnapshotState::Connected {
+                return Err(ConfigError::Conflict);
+            }
+            self.rotate_connected(mutations, &mut snapshot, &snapshot_file, &managed)?;
+            return Ok(Some(ConnectionStatus::Connected));
+        }
+        match state {
+            SnapshotState::PreparedPrior | SnapshotState::RestoredPrior => {
+                mutations
+                    .remove_checked(snapshot_path, FileExpectation::present(&snapshot_file))?;
+                Ok(None)
+            }
+            SnapshotState::Connected => {
+                if snapshot.phase != SnapshotPhase::Connected {
+                    self.transition_snapshot(
+                        mutations,
+                        &mut snapshot,
+                        &snapshot_file,
+                        SnapshotPhase::Connected,
+                    )?;
+                }
+                Ok(Some(ConnectionStatus::Connected))
+            }
+            SnapshotState::RotationPrepared | SnapshotState::RotationApplied => {
+                Err(ConfigError::InvalidSnapshot)
+            }
+            SnapshotState::Conflict => Err(ConfigError::Conflict),
+        }
     }
 
     /// Restores the exact pre-connect bytes when the managed values remain unchanged.
@@ -288,16 +333,28 @@ impl CodexConfigManager {
             return Ok(ConnectionStatus::Disconnected);
         }
         let (mut snapshot, mut snapshot_file) = self.read_snapshot()?;
-        if snapshot.managed_fingerprint != self.managed_values().fingerprint() {
+        let managed_fingerprint = self.managed_values().fingerprint();
+        let mut state = self.snapshot_state(&snapshot)?;
+        if snapshot.phase == SnapshotPhase::Rotating {
+            if snapshot.pending_managed_fingerprint() != Some(managed_fingerprint.as_str()) {
+                return Err(ConfigError::Conflict);
+            }
+            snapshot_file =
+                self.finish_rotation(mutations, &mut snapshot, &snapshot_file, state)?;
+            state = SnapshotState::Connected;
+        } else if snapshot.managed_fingerprint != managed_fingerprint {
             return Err(ConfigError::Conflict);
         }
-        match self.snapshot_state(&snapshot)? {
+        match state {
             SnapshotState::PreparedPrior | SnapshotState::RestoredPrior => {
                 mutations
                     .remove_checked(&snapshot_path, FileExpectation::present(&snapshot_file))?;
                 return Ok(ConnectionStatus::Disconnected);
             }
             SnapshotState::Connected => {}
+            SnapshotState::RotationPrepared | SnapshotState::RotationApplied => {
+                return Err(ConfigError::InvalidSnapshot);
+            }
             SnapshotState::Conflict => return Err(ConfigError::Conflict),
         }
 
@@ -330,9 +387,10 @@ impl CodexConfigManager {
                     Ok(ConnectionStatus::Disconnected)
                 }
                 SnapshotState::Connected => Err(error),
-                SnapshotState::PreparedPrior | SnapshotState::Conflict => {
-                    Err(ConfigError::Conflict)
-                }
+                SnapshotState::PreparedPrior
+                | SnapshotState::RotationPrepared
+                | SnapshotState::RotationApplied
+                | SnapshotState::Conflict => Err(ConfigError::Conflict),
             };
         }
 
@@ -356,11 +414,23 @@ impl CodexConfigManager {
             return Ok(ConnectionStatus::Disconnected);
         };
         validate_private_file(&snapshot_path, &metadata)?;
-        let (mut snapshot, snapshot_file) = self.read_snapshot()?;
-        if snapshot.managed_fingerprint != self.managed_values().fingerprint() {
+        let (mut snapshot, mut snapshot_file) = self.read_snapshot()?;
+        let managed_fingerprint = self.managed_values().fingerprint();
+        let mut state = self.snapshot_state(&snapshot)?;
+        if snapshot.phase == SnapshotPhase::Rotating {
+            if snapshot.pending_managed_fingerprint() != Some(managed_fingerprint.as_str()) {
+                return Ok(ConnectionStatus::Conflict);
+            }
+            if state == SnapshotState::Conflict {
+                return Ok(ConnectionStatus::Conflict);
+            }
+            snapshot_file =
+                self.finish_rotation(&FilesystemMutations, &mut snapshot, &snapshot_file, state)?;
+            state = SnapshotState::Connected;
+        } else if snapshot.managed_fingerprint != managed_fingerprint {
             return Ok(ConnectionStatus::Conflict);
         }
-        match self.snapshot_state(&snapshot)? {
+        match state {
             SnapshotState::PreparedPrior | SnapshotState::RestoredPrior => {
                 remove_checked(&snapshot_path, FileExpectation::present(&snapshot_file))?;
                 Ok(ConnectionStatus::Disconnected)
@@ -375,6 +445,9 @@ impl CodexConfigManager {
                     )?;
                 }
                 Ok(ConnectionStatus::Connected)
+            }
+            SnapshotState::RotationPrepared | SnapshotState::RotationApplied => {
+                Err(ConfigError::InvalidSnapshot)
             }
             SnapshotState::Conflict => Ok(ConnectionStatus::Conflict),
         }
@@ -419,9 +492,98 @@ impl CodexConfigManager {
             SnapshotPhase::Restoring if snapshot.matches_prior(&current)? => {
                 Ok(SnapshotState::RestoredPrior)
             }
+            SnapshotPhase::Rotating if snapshot.matches_connected(&current)? => {
+                Ok(SnapshotState::RotationPrepared)
+            }
+            SnapshotPhase::Rotating if snapshot.matches_pending(&current)? => {
+                Ok(SnapshotState::RotationApplied)
+            }
             _ if snapshot.matches_connected(&current)? => Ok(SnapshotState::Connected),
             _ => Ok(SnapshotState::Conflict),
         }
+    }
+
+    fn rotate_connected(
+        &self,
+        mutations: &impl FileMutations,
+        snapshot: &mut OwnershipSnapshot,
+        snapshot_file: &ExistingFile,
+        managed: &ManagedValues,
+    ) -> Result<ExistingFile, ConfigError> {
+        let mut document = parse_document(&snapshot.connected_bytes()?)?;
+        replace_managed_values(&mut document, managed);
+        let pending_bytes = document.to_string().into_bytes();
+        snapshot.phase = SnapshotPhase::Rotating;
+        snapshot.pending_rotation = Some(PendingRotation {
+            connected_hash: hash(&pending_bytes),
+            connected_bytes_hex: hex_encode(&pending_bytes),
+            connected_mode: snapshot.connected_mode,
+            managed_fingerprint: managed.fingerprint(),
+        });
+        let rotating_file = self.write_snapshot(mutations, snapshot, snapshot_file)?;
+        self.finish_rotation(
+            mutations,
+            snapshot,
+            &rotating_file,
+            SnapshotState::RotationPrepared,
+        )
+    }
+
+    fn finish_rotation(
+        &self,
+        mutations: &impl FileMutations,
+        snapshot: &mut OwnershipSnapshot,
+        snapshot_file: &ExistingFile,
+        state: SnapshotState,
+    ) -> Result<ExistingFile, ConfigError> {
+        if state == SnapshotState::RotationPrepared {
+            let pending = snapshot
+                .pending_rotation
+                .as_ref()
+                .ok_or(ConfigError::InvalidSnapshot)?;
+            mutations.atomic_replace(
+                &self.config_path,
+                FileExpectation::present_bytes(
+                    &snapshot.connected_bytes()?,
+                    snapshot.connected_mode,
+                ),
+                &pending.connected_bytes()?,
+                pending.connected_mode,
+            )?;
+        } else if state != SnapshotState::RotationApplied {
+            return Err(if state == SnapshotState::Conflict {
+                ConfigError::Conflict
+            } else {
+                ConfigError::InvalidSnapshot
+            });
+        }
+
+        let pending = snapshot
+            .pending_rotation
+            .take()
+            .ok_or(ConfigError::InvalidSnapshot)?;
+        snapshot.phase = SnapshotPhase::Connected;
+        snapshot.connected_bytes_hex = pending.connected_bytes_hex;
+        snapshot.connected_hash = pending.connected_hash;
+        snapshot.connected_mode = pending.connected_mode;
+        snapshot.managed_fingerprint = pending.managed_fingerprint;
+        self.write_snapshot(mutations, snapshot, snapshot_file)
+    }
+
+    fn write_snapshot(
+        &self,
+        mutations: &impl FileMutations,
+        snapshot: &OwnershipSnapshot,
+        current: &ExistingFile,
+    ) -> Result<ExistingFile, ConfigError> {
+        let bytes = snapshot.to_bytes()?;
+        mutations.atomic_replace(
+            &self.snapshot_path(),
+            FileExpectation::present(current),
+            &bytes,
+            0o600,
+        )?;
+        Ok(ExistingFile::present(bytes, 0o600))
     }
 
     fn transition_snapshot(
@@ -432,14 +594,7 @@ impl CodexConfigManager {
         phase: SnapshotPhase,
     ) -> Result<ExistingFile, ConfigError> {
         snapshot.phase = phase;
-        let bytes = snapshot.to_bytes()?;
-        mutations.atomic_replace(
-            &self.snapshot_path(),
-            FileExpectation::present(current),
-            &bytes,
-            0o600,
-        )?;
-        Ok(ExistingFile::present(bytes, 0o600))
+        self.write_snapshot(mutations, snapshot, current)
     }
 
     fn snapshot_path(&self) -> PathBuf {
@@ -454,22 +609,12 @@ impl CodexConfigManager {
     }
 
     fn ensure_private_state_dir(&self) -> Result<(), ConfigError> {
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        match builder.create(&self.state_dir) {
-            Ok(()) => {
-                if let Some(parent) = self.state_dir.parent() {
-                    sync_dir(parent)?;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        validate_private_dir(&self.state_dir)
+        let parent = self
+            .state_dir
+            .parent()
+            .ok_or(ConfigError::InvalidArgument("ownership state path"))?;
+        ensure_private_directory(parent)?;
+        ensure_private_directory(&self.state_dir)
     }
 
     fn managed_values(&self) -> ManagedValues {
@@ -480,6 +625,25 @@ impl CodexConfigManager {
             token: self.token.clone(),
         }
     }
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), ConfigError> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                sync_dir(parent)?;
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    validate_private_dir(path)
 }
 
 trait FileMutations {
@@ -521,6 +685,15 @@ impl OwnershipSnapshot {
     fn validate_path_and_prior(&self, manager: &CodexConfigManager) -> Result<(), ConfigError> {
         let prior = self.prior_bytes()?;
         let connected = self.connected_bytes()?;
+        let pending_is_valid = match &self.pending_rotation {
+            Some(pending) => {
+                let pending_bytes = pending.connected_bytes()?;
+                self.phase == SnapshotPhase::Rotating
+                    && pending.connected_hash == hash(&pending_bytes)
+                    && pending.connected_mode == self.connected_mode
+            }
+            None => self.phase != SnapshotPhase::Rotating,
+        };
         if self.schema_version != SNAPSHOT_VERSION
             || self.config_path != path_identity(&manager.config_path)
             || self.prior_hash != hash(&prior)
@@ -529,6 +702,7 @@ impl OwnershipSnapshot {
             || self.prior_mode & 0o077 != 0
             || self.connected_mode & 0o077 != 0
             || self.connected_mode != self.prior_mode
+            || !pending_is_valid
         {
             return Err(ConfigError::InvalidSnapshot);
         }
@@ -560,6 +734,26 @@ impl OwnershipSnapshot {
 
     fn matches_connected(&self, current: &ExistingFile) -> Result<bool, ConfigError> {
         Ok(current.matches(&self.connected_bytes()?, self.connected_mode))
+    }
+
+    fn matches_pending(&self, current: &ExistingFile) -> Result<bool, ConfigError> {
+        let pending = self
+            .pending_rotation
+            .as_ref()
+            .ok_or(ConfigError::InvalidSnapshot)?;
+        Ok(current.matches(&pending.connected_bytes()?, pending.connected_mode))
+    }
+
+    fn pending_managed_fingerprint(&self) -> Option<&str> {
+        self.pending_rotation
+            .as_ref()
+            .map(|pending| pending.managed_fingerprint.as_str())
+    }
+}
+
+impl PendingRotation {
+    fn connected_bytes(&self) -> Result<Vec<u8>, ConfigError> {
+        hex_decode(&self.connected_bytes_hex).ok_or(ConfigError::InvalidSnapshot)
     }
 }
 
@@ -733,6 +927,16 @@ fn patch_managed_values(document: &mut DocumentMut, managed: &ManagedValues) {
     if otel.get("environment").is_none() {
         otel.insert("environment", value("local"));
     }
+}
+
+fn replace_managed_values(document: &mut DocumentMut, managed: &ManagedValues) {
+    document["notify"] = value(managed.notify());
+    let otel = document["otel"]
+        .as_table_like_mut()
+        .expect("manager-owned connected snapshot has an otel table");
+    otel.insert("exporter", value(managed.exporter()));
+    otel.insert("log_user_prompt", value(false));
+    otel.insert("environment", value("local"));
 }
 
 fn notify_matches(item: &Item, managed: &ManagedValues) -> bool {
@@ -1122,12 +1326,16 @@ mod tests {
     }
 
     fn manager(root: &Path) -> CodexConfigManager {
+        manager_with_port(root, 4318)
+    }
+
+    fn manager_with_port(root: &Path, port: u16) -> CodexConfigManager {
         CodexConfigManager::new(
             root.join("config.toml"),
             root.join("state"),
             root.join("bin/agent-observability"),
             root.join("runtime"),
-            4318,
+            port,
             "private-token",
         )
         .unwrap()
@@ -1154,6 +1362,36 @@ mod tests {
             ConnectionStatus::Disconnected
         );
         assert!(!manager.config_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn connect_creates_a_missing_private_state_parent() {
+        let root = root("missing-state-parent");
+        prepare(&root);
+        let state_dir = root.join("runtime/integrations/codex");
+        fs::create_dir(root.join("runtime")).unwrap();
+        set_mode(&root.join("runtime"), 0o700).unwrap();
+        let manager = CodexConfigManager::new(
+            root.join("config.toml"),
+            &state_dir,
+            root.join("bin/agent-observability"),
+            root.join("runtime-root"),
+            4318,
+            "private-token",
+        )
+        .unwrap();
+
+        assert_eq!(manager.connect().unwrap(), ConnectionStatus::Connected);
+        assert_eq!(
+            unix_mode(&fs::metadata(root.join("runtime/integrations")).unwrap()),
+            0o700
+        );
+        assert_eq!(unix_mode(&fs::metadata(&state_dir).unwrap()), 0o700);
+        assert_eq!(
+            manager.disconnect().unwrap(),
+            ConnectionStatus::Disconnected
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1205,6 +1443,119 @@ mod tests {
         assert_eq!(fs::read(&manager.config_path).unwrap(), config);
         assert_eq!(fs::read(manager.snapshot_path()).unwrap(), snapshot);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn connect_rotates_an_owned_endpoint_and_disconnect_restores_original() {
+        let root = root("rotate-endpoint");
+        prepare(&root);
+        let original = b"# retained\nmodel = 'before'\n";
+        fs::write(root.join("config.toml"), original).unwrap();
+        set_mode(&root.join("config.toml"), 0o400).unwrap();
+        manager_with_port(&root, 4318).connect().unwrap();
+
+        let rotated = manager_with_port(&root, 5318);
+        assert_eq!(rotated.connect().unwrap(), ConnectionStatus::Connected);
+        let connected = fs::read_to_string(&rotated.config_path).unwrap();
+        assert!(connected.contains("http://127.0.0.1:5318/v1/logs"));
+        assert!(!connected.contains("http://127.0.0.1:4318/v1/logs"));
+        assert!(connected.contains("# retained"));
+        assert!(connected.contains("model = 'before'"));
+        assert_eq!(
+            unix_mode(&fs::metadata(&rotated.config_path).unwrap()),
+            0o400
+        );
+
+        assert_eq!(
+            rotated.disconnect().unwrap(),
+            ConnectionStatus::Disconnected
+        );
+        assert_eq!(fs::read(&rotated.config_path).unwrap(), original);
+        assert_eq!(
+            unix_mode(&fs::metadata(&rotated.config_path).unwrap()),
+            0o400
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn endpoint_rotation_conflicts_with_an_intervening_user_edit() {
+        let root = root("rotate-user-edit");
+        prepare(&root);
+        let original = b"model = 'before'\n";
+        fs::write(root.join("config.toml"), original).unwrap();
+        set_mode(&root.join("config.toml"), 0o600).unwrap();
+        manager_with_port(&root, 4318).connect().unwrap();
+        let rotated = manager_with_port(&root, 5318);
+        let mut edited = fs::read(&rotated.config_path).unwrap();
+        edited.extend_from_slice(b"user_setting = true\n");
+        let edit_started = Arc::new(Barrier::new(2));
+        let edit_finished = Arc::new(Barrier::new(2));
+        let editor_path = rotated.config_path.clone();
+        let editor_started = Arc::clone(&edit_started);
+        let editor_finished = Arc::clone(&edit_finished);
+        let editor_bytes = edited.clone();
+        let editor = thread::spawn(move || {
+            editor_started.wait();
+            fs::write(editor_path, editor_bytes).unwrap();
+            editor_finished.wait();
+        });
+        let mutations = ConcurrentEditMutations {
+            config_path: rotated.config_path.clone(),
+            edit_started,
+            edit_finished,
+        };
+
+        assert!(matches!(
+            rotated.connect_with(&mutations),
+            Err(ConfigError::Conflict)
+        ));
+        editor.join().unwrap();
+        assert_eq!(fs::read(&rotated.config_path).unwrap(), edited);
+        assert!(rotated.snapshot_path().exists());
+        assert_eq!(rotated.status().unwrap(), ConnectionStatus::Conflict);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn endpoint_rotation_recovers_at_every_durable_mutation_boundary() {
+        for failed_call in 1..=3 {
+            for apply_first in [false, true] {
+                let root = root(&format!("rotate-crash-{failed_call}-{apply_first}"));
+                prepare(&root);
+                let original = b"# exact prior\nmodel = 'before'\n";
+                fs::write(root.join("config.toml"), original).unwrap();
+                set_mode(&root.join("config.toml"), 0o400).unwrap();
+                manager_with_port(&root, 4318).connect().unwrap();
+                let rotated = manager_with_port(&root, 5318);
+
+                assert!(matches!(
+                    rotated.connect_with(&FaultMutations::new(&[(failed_call, apply_first)])),
+                    Err(ConfigError::Io(_))
+                ));
+                assert_eq!(rotated.connect().unwrap(), ConnectionStatus::Connected);
+                let connected = fs::read_to_string(&rotated.config_path).unwrap();
+                assert!(connected.contains("http://127.0.0.1:5318/v1/logs"));
+                let (snapshot, _) = rotated.read_snapshot().unwrap();
+                assert_eq!(snapshot.phase, SnapshotPhase::Connected);
+                assert!(snapshot.pending_rotation.is_none());
+                assert_eq!(
+                    snapshot.managed_fingerprint,
+                    rotated.managed_values().fingerprint()
+                );
+
+                assert_eq!(
+                    rotated.disconnect().unwrap(),
+                    ConnectionStatus::Disconnected
+                );
+                assert_eq!(fs::read(&rotated.config_path).unwrap(), original);
+                assert_eq!(
+                    unix_mode(&fs::metadata(&rotated.config_path).unwrap()),
+                    0o400
+                );
+                let _ = fs::remove_dir_all(root);
+            }
+        }
     }
 
     #[cfg(unix)]

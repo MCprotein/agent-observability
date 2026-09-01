@@ -21,9 +21,14 @@ use std::{
 use std::{
     fs::{File, OpenOptions},
     process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 const MAX_HEALTH_RESPONSE_BYTES: u64 = 4 * 1024;
+#[cfg(target_os = "macos")]
+const LAUNCH_AGENT_OWNERSHIP_VERSION: &str = "agent-observability.launch-agent-ownership.v1";
+#[cfg(target_os = "macos")]
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -101,18 +106,47 @@ impl From<std::io::Error> for IntegrationError {
 pub fn connect(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, IntegrationError> {
     let layout = install(root).map_err(runtime_error)?;
     with_lifecycle_lock(&layout, || {
-        let settings = install_settings(&layout.root)?;
-        let manager = codex_config_manager(&layout, executable, &settings)?;
-        connect_prepared(
+        install_settings(&layout.root)?;
+        connect_with_reloaded_settings(
             &layout.root,
             executable,
-            &settings.endpoint(),
-            &manager,
             &SystemLifecycle,
+            || load_settings(&layout.root).map_err(Into::into),
+            |settings| codex_config_manager(&layout, executable, settings),
         )
     })
 }
 
+fn connect_with_reloaded_settings<C: ConfigLifecycle>(
+    root: &Path,
+    executable: &Path,
+    lifecycle: &impl CollectorLifecycle,
+    load_after_ready: impl FnOnce() -> Result<CollectorSettings, IntegrationError>,
+    config_from_settings: impl FnOnce(&CollectorSettings) -> Result<C, IntegrationError>,
+) -> Result<CodexIntegrationStatus, IntegrationError> {
+    let service = lifecycle.install(root, executable)?;
+    let collector = lifecycle
+        .wait_until_ready(root)
+        .map_err(|error| rollback_install(lifecycle, &service, error))?;
+    let settings =
+        load_after_ready().map_err(|error| rollback_install(lifecycle, &service, error))?;
+    let manager = config_from_settings(&settings)
+        .map_err(|error| rollback_install(lifecycle, &service, error))?;
+    let config = manager
+        .connect()
+        .map(Into::into)
+        .map_err(|error| rollback_install(lifecycle, &service, error))?;
+    lifecycle.commit_install(&service)?;
+    Ok(CodexIntegrationStatus {
+        config,
+        collector,
+        endpoint: Some(settings.endpoint()),
+        service: Some(service.label),
+        data_retained: true,
+    })
+}
+
+#[cfg(test)]
 fn connect_prepared(
     root: &Path,
     executable: &Path,
@@ -123,11 +157,12 @@ fn connect_prepared(
     let service = lifecycle.install(root, executable)?;
     let collector = lifecycle
         .wait_until_ready(root)
-        .map_err(|error| rollback_service(lifecycle, &service, error))?;
+        .map_err(|error| rollback_install(lifecycle, &service, error))?;
     let config = match config.connect() {
         Ok(status) => status.into(),
-        Err(error) => return Err(rollback_service(lifecycle, &service, error)),
+        Err(error) => return Err(rollback_install(lifecycle, &service, error)),
     };
+    lifecycle.commit_install(&service)?;
     Ok(CodexIntegrationStatus {
         config,
         collector,
@@ -168,16 +203,28 @@ fn disconnect_prepared(
     }
     lifecycle.uninstall(&service)?;
     let status = match config.disconnect() {
-        Ok(status) => status,
-        Err(error) => {
-            let reinstall = lifecycle
-                .install(root, executable)
-                .and_then(|_| lifecycle.wait_until_ready(root).map(|_| ()));
-            return match reinstall {
-                Ok(()) => Err(error),
-                Err(reinstall) => Err(rollback_error(&error, &reinstall)),
-            };
+        Ok(status) => {
+            lifecycle.commit_uninstall(&service)?;
+            status
         }
+        Err(error) => match config.status() {
+            Ok(ConfigConnectionStatus::Connected) => {
+                let reinstall = lifecycle
+                    .rollback_uninstall(&service, root, executable)
+                    .and_then(|()| lifecycle.wait_until_ready(root).map(|_| ()));
+                return match reinstall {
+                    Ok(()) => Err(error),
+                    Err(reinstall) => Err(rollback_error(&error, &reinstall)),
+                };
+            }
+            Ok(ConfigConnectionStatus::Disconnected | ConfigConnectionStatus::Conflict) => {
+                lifecycle
+                    .commit_uninstall(&service)
+                    .map_err(|commit| rollback_error(&error, &commit))?;
+                return Err(error);
+            }
+            Err(status_error) => return Err(rollback_error(&error, &status_error)),
+        },
     };
     Ok(CodexIntegrationStatus {
         config: status.into(),
@@ -213,7 +260,24 @@ trait CollectorLifecycle {
     -> Result<CollectorService, IntegrationError>;
     fn service(&self, root: &Path) -> Result<CollectorService, IntegrationError>;
     fn wait_until_ready(&self, root: &Path) -> Result<CollectorStatus, IntegrationError>;
+    fn commit_install(&self, _service: &CollectorService) -> Result<(), IntegrationError> {
+        Ok(())
+    }
+    fn rollback_install(&self, service: &CollectorService) -> Result<(), IntegrationError> {
+        self.uninstall(service)
+    }
     fn uninstall(&self, service: &CollectorService) -> Result<(), IntegrationError>;
+    fn commit_uninstall(&self, _service: &CollectorService) -> Result<(), IntegrationError> {
+        Ok(())
+    }
+    fn rollback_uninstall(
+        &self,
+        _service: &CollectorService,
+        root: &Path,
+        executable: &Path,
+    ) -> Result<(), IntegrationError> {
+        self.install(root, executable).map(|_| ())
+    }
 }
 
 struct SystemLifecycle;
@@ -235,17 +299,38 @@ impl CollectorLifecycle for SystemLifecycle {
         wait_for_collector(root)
     }
 
+    fn commit_install(&self, service: &CollectorService) -> Result<(), IntegrationError> {
+        commit_collector_service_install(service)
+    }
+
+    fn rollback_install(&self, service: &CollectorService) -> Result<(), IntegrationError> {
+        rollback_collector_service_install(service)
+    }
+
     fn uninstall(&self, service: &CollectorService) -> Result<(), IntegrationError> {
         uninstall_collector_service(service)
     }
+
+    fn commit_uninstall(&self, service: &CollectorService) -> Result<(), IntegrationError> {
+        commit_collector_service_uninstall(service)
+    }
+
+    fn rollback_uninstall(
+        &self,
+        service: &CollectorService,
+        _root: &Path,
+        _executable: &Path,
+    ) -> Result<(), IntegrationError> {
+        rollback_collector_service_uninstall(service)
+    }
 }
 
-fn rollback_service(
+fn rollback_install(
     lifecycle: &impl CollectorLifecycle,
     service: &CollectorService,
     error: IntegrationError,
 ) -> IntegrationError {
-    match lifecycle.uninstall(service) {
+    match lifecycle.rollback_install(service) {
         Ok(()) => error,
         Err(rollback) => rollback_error(&error, &rollback),
     }
@@ -272,8 +357,10 @@ pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, 
             Err(error) => return Err(error.into()),
         };
         let manager = codex_config_manager(&layout, executable, &settings)?;
+        let config = manager.status()?;
+        reconcile_collector_service(&layout.root, config)?;
         Ok(CodexIntegrationStatus {
-            config: manager.status()?.into(),
+            config: config.into(),
             collector: probe_health(&settings),
             endpoint: Some(settings.endpoint()),
             service: Some(service_label(&layout.root)),
@@ -419,8 +506,7 @@ fn codex_config_manager(
             },
             Ok,
         )?;
-    fs::create_dir_all(&codex_home)
-        .map_err(|error| IntegrationError::Runtime(format!("cannot create Codex home: {error}")))?;
+    ensure_codex_home(&codex_home)?;
     CodexConfigManager::new(
         codex_home.join("config.toml"),
         layout.runtime.join("integrations/codex"),
@@ -432,11 +518,51 @@ fn codex_config_manager(
     .map_err(Into::into)
 }
 
-#[derive(Debug)]
+fn ensure_codex_home(path: &Path) -> Result<(), IntegrationError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(IntegrationError::Runtime(
+                "Codex home must be a real directory".into(),
+            ));
+        }
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        Err(_) => {}
+    }
+
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                Err(IntegrationError::Runtime(
+                    "Codex home must be a real directory".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => Err(IntegrationError::Runtime(format!(
+            "cannot create Codex home: {error}"
+        ))),
+    }
+}
+
+#[derive(Clone, Debug)]
 struct CollectorService {
     label: String,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     plist: PathBuf,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     target: String,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    ownership: PathBuf,
 }
 
 fn service_label(root: &Path) -> String {
@@ -466,8 +592,64 @@ fn collector_service(root: &Path) -> Result<CollectorService, IntegrationError> 
             .join("Library/LaunchAgents")
             .join(format!("{label}.plist")),
         target: format!("gui/{uid}/{label}"),
+        ownership: root.join("runtime/integrations/codex/launch-agent-ownership-v1.json"),
         label,
     })
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct LaunchAgentFileState {
+    existed: bool,
+    bytes: Vec<u8>,
+    mode: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum LaunchAgentOperation {
+    Connect,
+    Reconnect,
+    Disconnect,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum LaunchAgentPhase {
+    Prepared,
+    ServiceStopped,
+    PlistWritten,
+    Bootstrapped,
+    Applied,
+    Owned,
+    Restored,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum LaunchAgentRecovery {
+    Connect,
+    Disconnect,
+    Status(ConfigConnectionStatus),
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct LaunchAgentTransaction {
+    schema_version: String,
+    plist_path: PathBuf,
+    prior_plist: LaunchAgentFileState,
+    prior_loaded: bool,
+    rollback_plist: LaunchAgentFileState,
+    rollback_loaded: bool,
+    desired_plist: LaunchAgentFileState,
+    desired_loaded: bool,
+    operation: LaunchAgentOperation,
+    phase: LaunchAgentPhase,
 }
 
 #[cfg(target_os = "macos")]
@@ -486,51 +668,58 @@ fn install_collector_service_with(
     executable: &Path,
     launchctl: &impl Launchctl,
 ) -> Result<CollectorService, IntegrationError> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let owned =
+        recover_launch_agent_transaction(&service, launchctl, LaunchAgentRecovery::Connect)?;
+    let desired = LaunchAgentFileState {
+        existed: true,
+        bytes: launch_agent_body(&service.label, executable, root).into_bytes(),
+        mode: 0o644,
+    };
+    if owned
+        .as_ref()
+        .is_some_and(|transaction| transaction.desired_plist == desired)
+    {
+        return Ok(service);
+    }
 
-    let parent = service
-        .plist
-        .parent()
-        .ok_or_else(|| IntegrationError::Runtime("LaunchAgent path has no parent".into()))?;
-    fs::create_dir_all(parent).map_err(|error| {
-        IntegrationError::Runtime(format!("LaunchAgent directory failed: {error}"))
-    })?;
-    let body = launch_agent_body(&service.label, executable, root);
-    let temporary = service
-        .plist
-        .with_extension(format!("plist.tmp.{}", std::process::id()));
-    let _ = fs::remove_file(&temporary);
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o644)
-        .open(&temporary)
-        .map_err(|error| IntegrationError::Runtime(format!("LaunchAgent write failed: {error}")))?;
-    file.write_all(body.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|error| IntegrationError::Runtime(format!("LaunchAgent write failed: {error}")))?;
-    fs::rename(&temporary, &service.plist).map_err(|error| {
-        IntegrationError::Runtime(format!("LaunchAgent install failed: {error}"))
-    })?;
-    fs::set_permissions(&service.plist, fs::Permissions::from_mode(0o644)).map_err(|error| {
-        IntegrationError::Runtime(format!("LaunchAgent permissions failed: {error}"))
-    })?;
-    File::open(&service.plist)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| IntegrationError::Runtime(format!("LaunchAgent sync failed: {error}")))?;
-    sync_launch_agent_parent(&service.plist, "install")?;
-    let domain = service
-        .target
-        .rsplit_once('/')
-        .map(|(domain, _)| domain)
-        .ok_or_else(|| IntegrationError::Runtime("invalid LaunchAgent target".into()))?;
-    stop_before_install(launchctl, &service)?;
-    if let Err(error) = launchctl.bootstrap(domain, &service.plist) {
-        return Err(cleanup_failed_install(launchctl, &service, error));
+    let mut transaction = if let Some(owned) = owned {
+        LaunchAgentTransaction {
+            rollback_plist: owned.desired_plist.clone(),
+            rollback_loaded: owned.desired_loaded,
+            desired_plist: desired,
+            desired_loaded: true,
+            operation: LaunchAgentOperation::Reconnect,
+            phase: LaunchAgentPhase::Prepared,
+            ..owned
+        }
+    } else {
+        let prior_plist = read_launch_agent_file(&service.plist)?;
+        let prior_loaded = launchctl.is_loaded(&service.target)?;
+        if prior_loaded && !prior_plist.existed {
+            return Err(IntegrationError::Runtime(format!(
+                "loaded LaunchAgent {} has no restorable plist",
+                service.target
+            )));
+        }
+        LaunchAgentTransaction {
+            schema_version: LAUNCH_AGENT_OWNERSHIP_VERSION.into(),
+            plist_path: service.plist.clone(),
+            prior_plist: prior_plist.clone(),
+            prior_loaded,
+            rollback_plist: prior_plist,
+            rollback_loaded: prior_loaded,
+            desired_plist: desired,
+            desired_loaded: true,
+            operation: LaunchAgentOperation::Connect,
+            phase: LaunchAgentPhase::Prepared,
+        }
+    };
+    save_launch_agent_transaction(&service, &transaction)?;
+    if let Err(error) = apply_launch_agent_desired(&service, launchctl, &mut transaction) {
+        return Err(rollback_launch_agent_operation(&service, launchctl, error));
     }
-    if let Err(error) = launchctl.kickstart(&service.target) {
-        return Err(cleanup_failed_install(launchctl, &service, error));
-    }
+    transaction.phase = LaunchAgentPhase::Applied;
+    save_launch_agent_transaction(&service, &transaction)?;
     Ok(service)
 }
 
@@ -554,24 +743,145 @@ fn uninstall_collector_service_with(
     service: &CollectorService,
     launchctl: &impl Launchctl,
 ) -> Result<(), IntegrationError> {
-    if !launchctl.bootout(&service.target)? && launchctl.is_loaded(&service.target)? {
-        return Err(IntegrationError::Runtime(format!(
-            "LaunchAgent stop failed for {}",
-            service.target
-        )));
+    let Some(mut transaction) =
+        recover_launch_agent_transaction(service, launchctl, LaunchAgentRecovery::Disconnect)?
+    else {
+        return Ok(());
+    };
+    if transaction.operation == LaunchAgentOperation::Disconnect
+        && transaction.phase == LaunchAgentPhase::Restored
+    {
+        return Ok(());
     }
-    remove_service_plist(service)
+    transaction.rollback_plist = transaction.desired_plist.clone();
+    transaction.rollback_loaded = transaction.desired_loaded;
+    transaction.desired_plist = transaction.prior_plist.clone();
+    transaction.desired_loaded = transaction.prior_loaded;
+    transaction.operation = LaunchAgentOperation::Disconnect;
+    transaction.phase = LaunchAgentPhase::Prepared;
+    save_launch_agent_transaction(service, &transaction)?;
+    apply_launch_agent_desired(service, launchctl, &mut transaction)?;
+    transaction.phase = LaunchAgentPhase::Restored;
+    save_launch_agent_transaction(service, &transaction)
 }
 
 #[cfg(target_os = "macos")]
-fn remove_service_plist(service: &CollectorService) -> Result<(), IntegrationError> {
-    match fs::remove_file(&service.plist) {
-        Ok(()) => sync_launch_agent_parent(&service.plist, "removal"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(IntegrationError::Runtime(format!(
-            "LaunchAgent removal failed: {error}"
-        ))),
+fn reconcile_collector_service(
+    root: &Path,
+    config: ConfigConnectionStatus,
+) -> Result<(), IntegrationError> {
+    let service = collector_service(root)?;
+    recover_launch_agent_transaction(
+        &service,
+        &SystemLaunchctl,
+        LaunchAgentRecovery::Status(config),
+    )
+    .map(|_| ())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reconcile_collector_service(
+    _root: &Path,
+    _config: ConfigConnectionStatus,
+) -> Result<(), IntegrationError> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn commit_collector_service_install(service: &CollectorService) -> Result<(), IntegrationError> {
+    let Some(mut transaction) = load_launch_agent_transaction(service)? else {
+        return Err(IntegrationError::Runtime(
+            "LaunchAgent install ownership state is missing".into(),
+        ));
+    };
+    if transaction.operation == LaunchAgentOperation::Connect
+        && transaction.phase == LaunchAgentPhase::Owned
+    {
+        return Ok(());
     }
+    if !matches!(
+        transaction.operation,
+        LaunchAgentOperation::Connect | LaunchAgentOperation::Reconnect
+    ) || transaction.phase != LaunchAgentPhase::Applied
+    {
+        return Err(IntegrationError::Runtime(
+            "LaunchAgent install is not ready to commit".into(),
+        ));
+    }
+    transaction.operation = LaunchAgentOperation::Connect;
+    transaction.phase = LaunchAgentPhase::Owned;
+    save_launch_agent_transaction(service, &transaction)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn commit_collector_service_install(_service: &CollectorService) -> Result<(), IntegrationError> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn rollback_collector_service_install(service: &CollectorService) -> Result<(), IntegrationError> {
+    recover_launch_agent_transaction(service, &SystemLaunchctl, LaunchAgentRecovery::Connect)
+        .map(|_| ())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rollback_collector_service_install(_service: &CollectorService) -> Result<(), IntegrationError> {
+    Err(IntegrationError::Runtime(
+        "automatic local collection currently supports macOS".into(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn commit_collector_service_uninstall(service: &CollectorService) -> Result<(), IntegrationError> {
+    let Some(transaction) = load_launch_agent_transaction(service)? else {
+        return Ok(());
+    };
+    if transaction.operation != LaunchAgentOperation::Disconnect
+        || transaction.phase != LaunchAgentPhase::Restored
+    {
+        return Err(IntegrationError::Runtime(
+            "LaunchAgent disconnect is not ready to commit".into(),
+        ));
+    }
+    remove_launch_agent_transaction(service)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn commit_collector_service_uninstall(_service: &CollectorService) -> Result<(), IntegrationError> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn rollback_collector_service_uninstall(
+    service: &CollectorService,
+) -> Result<(), IntegrationError> {
+    let Some(mut transaction) = load_launch_agent_transaction(service)? else {
+        return Err(IntegrationError::Runtime(
+            "LaunchAgent disconnect ownership state is missing".into(),
+        ));
+    };
+    if transaction.operation != LaunchAgentOperation::Disconnect {
+        return Err(IntegrationError::Runtime(
+            "LaunchAgent ownership state is not disconnecting".into(),
+        ));
+    }
+    transaction.desired_plist = transaction.rollback_plist.clone();
+    transaction.desired_loaded = transaction.rollback_loaded;
+    transaction.phase = LaunchAgentPhase::Prepared;
+    save_launch_agent_transaction(service, &transaction)?;
+    apply_launch_agent_desired(service, &SystemLaunchctl, &mut transaction)?;
+    transaction.operation = LaunchAgentOperation::Connect;
+    transaction.phase = LaunchAgentPhase::Owned;
+    save_launch_agent_transaction(service, &transaction)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rollback_collector_service_uninstall(
+    _service: &CollectorService,
+) -> Result<(), IntegrationError> {
+    Err(IntegrationError::Runtime(
+        "automatic local collection currently supports macOS".into(),
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -587,57 +897,365 @@ fn sync_launch_agent_parent(path: &Path, action: &str) -> Result<(), Integration
 }
 
 #[cfg(target_os = "macos")]
-fn stop_before_install(
-    launchctl: &impl Launchctl,
+fn recover_launch_agent_transaction(
     service: &CollectorService,
-) -> Result<(), IntegrationError> {
-    match launchctl.bootout(&service.target) {
-        Ok(true) => Ok(()),
-        Ok(false) => {
-            if launchctl.is_loaded(&service.target)? {
-                Err(IntegrationError::Runtime(format!(
-                    "LaunchAgent stop failed for {}",
-                    service.target
-                )))
+    launchctl: &impl Launchctl,
+    recovery: LaunchAgentRecovery,
+) -> Result<Option<LaunchAgentTransaction>, IntegrationError> {
+    let Some(mut transaction) = load_launch_agent_transaction(service)? else {
+        return Ok(None);
+    };
+    if transaction.phase == LaunchAgentPhase::Owned {
+        let current = read_launch_agent_file(&service.plist)?;
+        if current != transaction.desired_plist {
+            return Err(IntegrationError::Runtime(
+                "LaunchAgent plist changed outside the owned transaction".into(),
+            ));
+        }
+        if launchctl.is_loaded(&service.target)? != transaction.desired_loaded {
+            transaction.operation = LaunchAgentOperation::Reconnect;
+            transaction.rollback_plist = transaction.desired_plist.clone();
+            transaction.rollback_loaded = transaction.desired_loaded;
+            transaction.phase = LaunchAgentPhase::Prepared;
+            save_launch_agent_transaction(service, &transaction)?;
+            apply_launch_agent_desired(service, launchctl, &mut transaction)?;
+            transaction.phase = LaunchAgentPhase::Owned;
+            save_launch_agent_transaction(service, &transaction)?;
+        }
+        return Ok(Some(transaction));
+    }
+
+    match transaction.operation {
+        LaunchAgentOperation::Connect => {
+            if let LaunchAgentRecovery::Status(ConfigConnectionStatus::Connected) = recovery {
+                transaction.phase = LaunchAgentPhase::Owned;
+                save_launch_agent_transaction(service, &transaction)?;
+                Ok(Some(transaction))
             } else {
-                Ok(())
+                transaction.desired_plist = transaction.rollback_plist.clone();
+                transaction.desired_loaded = transaction.rollback_loaded;
+                apply_launch_agent_desired(service, launchctl, &mut transaction)?;
+                remove_launch_agent_transaction(service)?;
+                Ok(None)
             }
         }
-        Err(error) => match launchctl.is_loaded(&service.target) {
-            Ok(false) => Ok(()),
-            Ok(true) => Err(error),
-            Err(status_error) => Err(rollback_error(&error, &status_error)),
+        LaunchAgentOperation::Reconnect => {
+            if let LaunchAgentRecovery::Status(ConfigConnectionStatus::Connected) = recovery {
+                transaction.operation = LaunchAgentOperation::Connect;
+                transaction.phase = LaunchAgentPhase::Owned;
+                save_launch_agent_transaction(service, &transaction)?;
+                Ok(Some(transaction))
+            } else {
+                transaction.desired_plist = transaction.rollback_plist.clone();
+                transaction.desired_loaded = transaction.rollback_loaded;
+                apply_launch_agent_desired(service, launchctl, &mut transaction)?;
+                transaction.operation = LaunchAgentOperation::Connect;
+                transaction.phase = LaunchAgentPhase::Owned;
+                save_launch_agent_transaction(service, &transaction)?;
+                Ok(Some(transaction))
+            }
+        }
+        LaunchAgentOperation::Disconnect => match recovery {
+            LaunchAgentRecovery::Connect
+            | LaunchAgentRecovery::Status(ConfigConnectionStatus::Connected) => {
+                transaction.desired_plist = transaction.rollback_plist.clone();
+                transaction.desired_loaded = transaction.rollback_loaded;
+                apply_launch_agent_desired(service, launchctl, &mut transaction)?;
+                transaction.operation = LaunchAgentOperation::Connect;
+                transaction.phase = LaunchAgentPhase::Owned;
+                save_launch_agent_transaction(service, &transaction)?;
+                Ok(Some(transaction))
+            }
+            LaunchAgentRecovery::Disconnect
+            | LaunchAgentRecovery::Status(ConfigConnectionStatus::Disconnected) => {
+                apply_launch_agent_desired(service, launchctl, &mut transaction)?;
+                transaction.phase = LaunchAgentPhase::Restored;
+                save_launch_agent_transaction(service, &transaction)?;
+                if matches!(recovery, LaunchAgentRecovery::Status(_)) {
+                    remove_launch_agent_transaction(service)?;
+                    Ok(None)
+                } else {
+                    Ok(Some(transaction))
+                }
+            }
+            LaunchAgentRecovery::Status(ConfigConnectionStatus::Conflict) => {
+                Err(IntegrationError::Runtime(
+                    "cannot reconcile LaunchAgent with conflicting Codex config".into(),
+                ))
+            }
         },
     }
 }
 
 #[cfg(target_os = "macos")]
-fn cleanup_failed_install(
-    launchctl: &impl Launchctl,
+fn rollback_launch_agent_operation(
     service: &CollectorService,
+    launchctl: &impl Launchctl,
     error: IntegrationError,
 ) -> IntegrationError {
-    let stopped = launchctl.bootout(&service.target).and_then(|stopped| {
-        if stopped {
-            Ok(true)
-        } else {
-            launchctl.is_loaded(&service.target).map(|loaded| !loaded)
-        }
-    });
-    match stopped {
-        Ok(true) => match remove_service_plist(service) {
-            Ok(()) => error,
-            Err(rollback) => rollback_error(&error, &rollback),
-        },
-        Ok(false) => rollback_error(
-            &error,
-            &IntegrationError::Runtime(format!(
-                "LaunchAgent termination unconfirmed for {}; plist retained",
-                service.target
-            )),
-        ),
+    match recover_launch_agent_transaction(service, launchctl, LaunchAgentRecovery::Connect) {
+        Ok(_) => error,
         Err(rollback) => rollback_error(&error, &rollback),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_launch_agent_desired(
+    service: &CollectorService,
+    launchctl: &impl Launchctl,
+    transaction: &mut LaunchAgentTransaction,
+) -> Result<(), IntegrationError> {
+    stop_launch_agent(launchctl, service)?;
+    transaction.phase = LaunchAgentPhase::ServiceStopped;
+    save_launch_agent_transaction(service, transaction)?;
+
+    replace_launch_agent_file(&service.plist, &transaction.desired_plist)?;
+    transaction.phase = LaunchAgentPhase::PlistWritten;
+    save_launch_agent_transaction(service, transaction)?;
+
+    if transaction.desired_loaded {
+        if !transaction.desired_plist.existed {
+            return Err(IntegrationError::Runtime(
+                "cannot load a LaunchAgent without a plist".into(),
+            ));
+        }
+        let domain = service
+            .target
+            .rsplit_once('/')
+            .map(|(domain, _)| domain)
+            .ok_or_else(|| IntegrationError::Runtime("invalid LaunchAgent target".into()))?;
+        launchctl.bootstrap(domain, &service.plist)?;
+        transaction.phase = LaunchAgentPhase::Bootstrapped;
+        save_launch_agent_transaction(service, transaction)?;
+        launchctl.kickstart(&service.target)?;
+        if !launchctl.is_loaded(&service.target)? {
+            return Err(IntegrationError::Runtime(format!(
+                "LaunchAgent start unconfirmed for {}",
+                service.target
+            )));
+        }
+    } else if launchctl.is_loaded(&service.target)? {
+        return Err(IntegrationError::Runtime(format!(
+            "LaunchAgent termination unconfirmed for {}",
+            service.target
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn stop_launch_agent(
+    launchctl: &impl Launchctl,
+    service: &CollectorService,
+) -> Result<(), IntegrationError> {
+    if !launchctl.is_loaded(&service.target)? {
+        return Ok(());
+    }
+    let bootout = launchctl.bootout(&service.target);
+    match launchctl.is_loaded(&service.target) {
+        Ok(false) => Ok(()),
+        Ok(true) => match bootout {
+            Ok(_) => Err(IntegrationError::Runtime(format!(
+                "LaunchAgent stop failed for {}",
+                service.target
+            ))),
+            Err(error) => Err(error),
+        },
+        Err(status_error) => match bootout {
+            Ok(_) => Err(status_error),
+            Err(error) => Err(rollback_error(&error, &status_error)),
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_launch_agent_file(path: &Path) -> Result<LaunchAgentFileState, IntegrationError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LaunchAgentFileState {
+                existed: false,
+                bytes: Vec::new(),
+                mode: 0,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(IntegrationError::Runtime(
+            "LaunchAgent plist must be a regular file".into(),
+        ));
+    }
+    Ok(LaunchAgentFileState {
+        existed: true,
+        bytes: fs::read(path)?,
+        mode: metadata.permissions().mode() & 0o777,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn replace_launch_agent_file(
+    path: &Path,
+    desired: &LaunchAgentFileState,
+) -> Result<(), IntegrationError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| IntegrationError::Runtime("LaunchAgent path has no parent".into()))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        IntegrationError::Runtime(format!("LaunchAgent directory failed: {error}"))
+    })?;
+    if desired.existed {
+        atomic_write(path, &desired.bytes, desired.mode, "LaunchAgent")
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => sync_launch_agent_parent(path, "removal"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(IntegrationError::Runtime(format!(
+                "LaunchAgent removal failed: {error}"
+            ))),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn load_launch_agent_transaction(
+    service: &CollectorService,
+) -> Result<Option<LaunchAgentTransaction>, IntegrationError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = match fs::symlink_metadata(&service.ownership) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(IntegrationError::Runtime(
+            "LaunchAgent ownership state is not a private regular file".into(),
+        ));
+    }
+    let transaction: LaunchAgentTransaction =
+        serde_json::from_slice(&fs::read(&service.ownership)?).map_err(|error| {
+            IntegrationError::Runtime(format!("invalid LaunchAgent ownership state: {error}"))
+        })?;
+    if transaction.schema_version != LAUNCH_AGENT_OWNERSHIP_VERSION
+        || transaction.plist_path != service.plist
+    {
+        return Err(IntegrationError::Runtime(
+            "LaunchAgent ownership state does not match this service".into(),
+        ));
+    }
+    Ok(Some(transaction))
+}
+
+#[cfg(target_os = "macos")]
+fn save_launch_agent_transaction(
+    service: &CollectorService,
+    transaction: &LaunchAgentTransaction,
+) -> Result<(), IntegrationError> {
+    let parent = service
+        .ownership
+        .parent()
+        .ok_or_else(|| IntegrationError::Runtime("LaunchAgent state path has no parent".into()))?;
+    let integrations = parent.parent().ok_or_else(|| {
+        IntegrationError::Runtime("LaunchAgent state parent has no runtime directory".into())
+    })?;
+    let runtime = integrations.parent().ok_or_else(|| {
+        IntegrationError::Runtime("LaunchAgent state path has no runtime root".into())
+    })?;
+    let root = runtime.parent().ok_or_else(|| {
+        IntegrationError::Runtime("LaunchAgent state path has no installed root".into())
+    })?;
+    ensure_private_runtime_directory(root)?;
+    ensure_private_runtime_directory(runtime)?;
+    ensure_private_runtime_directory(integrations)?;
+    ensure_private_runtime_directory(parent)?;
+    let mut bytes = serde_json::to_vec(transaction).map_err(|error| {
+        IntegrationError::Runtime(format!("LaunchAgent state encode failed: {error}"))
+    })?;
+    bytes.push(b'\n');
+    atomic_write(
+        &service.ownership,
+        &bytes,
+        0o600,
+        "LaunchAgent ownership state",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_private_runtime_directory(path: &Path) -> Result<(), IntegrationError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => {
+            let parent = path.parent().ok_or_else(|| {
+                IntegrationError::Runtime("private runtime directory has no parent".into())
+            })?;
+            File::open(parent)?.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(IntegrationError::Runtime(
+            "LaunchAgent state directory must be private and real".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_launch_agent_transaction(service: &CollectorService) -> Result<(), IntegrationError> {
+    match fs::remove_file(&service.ownership) {
+        Ok(()) => sync_launch_agent_parent(&service.ownership, "state removal"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn atomic_write(path: &Path, bytes: &[u8], mode: u32, name: &str) -> Result<(), IntegrationError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| IntegrationError::Runtime(format!("{name} path has no parent")))?;
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{}.agentobs.{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("state"),
+        std::process::id(),
+        sequence
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        File::open(path)?.sync_all()?;
+        sync_launch_agent_parent(path, "write")
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -750,6 +1368,7 @@ fn command_success(command: &mut Command, name: &str) -> Result<(), IntegrationE
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn launch_agent_body(label: &str, executable: &Path, root: &Path) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>collector-serve</string><string>{}</string></array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ProcessType</key><string>Background</string>\n</dict></plist>\n",
@@ -759,6 +1378,7 @@ fn launch_agent_body(label: &str, executable: &Path, root: &Path) -> String {
     )
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn xml_escape(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -773,11 +1393,18 @@ mod tests {
     use super::{
         CodexIntegrationStatus, CollectorLifecycle, CollectorService, CollectorStatus,
         ConfigConnectionStatus, ConfigLifecycle, ConnectionStatus, IntegrationError,
-        connect_prepared, disconnect_prepared, launch_agent_body, parse_health_response,
-        probe_health, service_label, status, with_lifecycle_lock,
+        connect_prepared, connect_with_reloaded_settings, disconnect_prepared, ensure_codex_home,
+        launch_agent_body, parse_health_response, probe_health, service_label, status,
+        with_lifecycle_lock,
     };
     #[cfg(target_os = "macos")]
-    use super::{Launchctl, install_collector_service_with, uninstall_collector_service_with};
+    use super::{
+        LaunchAgentOperation, LaunchAgentPhase, LaunchAgentRecovery, Launchctl,
+        commit_collector_service_install, commit_collector_service_uninstall,
+        install_collector_service_with, load_launch_agent_transaction,
+        recover_launch_agent_transaction, save_launch_agent_transaction,
+        uninstall_collector_service_with,
+    };
     use agent_observability_local_collector::{
         COLLECTOR_SETTINGS_VERSION, CollectorSettings, TOKEN_HEADER,
     };
@@ -806,10 +1433,31 @@ mod tests {
         ))
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn new_codex_home_is_private_and_existing_directory_is_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("codex-home");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let codex_home = root.join(".codex");
+
+        ensure_codex_home(&codex_home).unwrap();
+        assert_eq!(
+            fs::metadata(&codex_home).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        ensure_codex_home(&codex_home).unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     struct FakeConfig {
         state: Cell<ConfigConnectionStatus>,
         connect_error: Cell<bool>,
         disconnect_error: Cell<bool>,
+        disconnect_error_after_restore: Cell<bool>,
         events: RefCell<Vec<&'static str>>,
     }
 
@@ -819,6 +1467,7 @@ mod tests {
                 state: Cell::new(ConfigConnectionStatus::Connected),
                 connect_error: Cell::new(false),
                 disconnect_error: Cell::new(false),
+                disconnect_error_after_restore: Cell::new(false),
                 events: RefCell::new(Vec::new()),
             }
         }
@@ -852,6 +1501,11 @@ mod tests {
                 return Err(IntegrationError::Runtime("config disconnect failed".into()));
             }
             self.state.set(ConfigConnectionStatus::Disconnected);
+            if self.disconnect_error_after_restore.get() {
+                return Err(IntegrationError::Runtime(
+                    "config cleanup failed after restore".into(),
+                ));
+            }
             Ok(ConfigConnectionStatus::Disconnected)
         }
     }
@@ -880,6 +1534,7 @@ mod tests {
                 label: "test-service".into(),
                 plist: PathBuf::from("/tmp/test-service.plist"),
                 target: "gui/1/test-service".into(),
+                ownership: PathBuf::from("/tmp/launch-agent-ownership-v1.json"),
             }
         }
     }
@@ -1151,6 +1806,38 @@ mod tests {
     }
 
     #[test]
+    fn connect_builds_config_from_settings_reloaded_after_collector_ready() {
+        let lifecycle = FakeLifecycle::ready();
+        let manager_port = Cell::new(0);
+        let status = connect_with_reloaded_settings(
+            Path::new("/runtime"),
+            Path::new("/bin/agentobs"),
+            &lifecycle,
+            || {
+                assert_eq!(*lifecycle.events.borrow(), ["install", "health"]);
+                Ok(CollectorSettings {
+                    schema_version: COLLECTOR_SETTINGS_VERSION.into(),
+                    port: 49_321,
+                    token: "rotated-token".into(),
+                    source_generation: "rotated-generation".into(),
+                })
+            },
+            |settings| {
+                manager_port.set(settings.port);
+                Ok(FakeConfig::disconnected())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(manager_port.get(), 49_321);
+        assert_eq!(
+            status.endpoint.as_deref(),
+            Some("http://127.0.0.1:49321/v1/logs")
+        );
+        assert_eq!(status.config, ConnectionStatus::Connected);
+    }
+
+    #[test]
     fn connect_health_failure_uninstalls_service_before_config_mutation() {
         let config = FakeConfig::disconnected();
         let lifecycle = FakeLifecycle {
@@ -1222,9 +1909,34 @@ mod tests {
         );
         assert_eq!(
             *config.events.borrow(),
-            ["config-status", "config-disconnect"]
+            ["config-status", "config-disconnect", "config-status"]
         );
         assert_eq!(config.state.get(), ConfigConnectionStatus::Connected);
+    }
+
+    #[test]
+    fn disconnect_cleanup_error_after_restore_does_not_reinstall_orphan_collector() {
+        let config = FakeConfig::connected();
+        config.disconnect_error_after_restore.set(true);
+        let lifecycle = FakeLifecycle::ready();
+
+        assert!(
+            disconnect_prepared(
+                Path::new("/runtime"),
+                Path::new("/bin/agentobs"),
+                "http://127.0.0.1:43181/v1/logs",
+                &config,
+                &lifecycle,
+            )
+            .is_err()
+        );
+
+        assert_eq!(*lifecycle.events.borrow(), ["service", "uninstall"]);
+        assert_eq!(
+            *config.events.borrow(),
+            ["config-status", "config-disconnect", "config-status"]
+        );
+        assert_eq!(config.state.get(), ConfigConnectionStatus::Disconnected);
     }
 
     #[test]
@@ -1334,90 +2046,66 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     struct FakeLaunchctl {
-        bootstrap_error: bool,
-        kickstart_error: bool,
+        loaded: Cell<bool>,
+        bootstrap_results: RefCell<VecDeque<Result<(), &'static str>>>,
+        kickstart_results: RefCell<VecDeque<Result<(), &'static str>>>,
         bootout_results: RefCell<VecDeque<Result<bool, &'static str>>>,
         events: RefCell<Vec<&'static str>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl FakeLaunchctl {
+        fn new(loaded: bool) -> Self {
+            Self {
+                loaded: Cell::new(loaded),
+                bootstrap_results: RefCell::new(VecDeque::new()),
+                kickstart_results: RefCell::new(VecDeque::new()),
+                bootout_results: RefCell::new(VecDeque::new()),
+                events: RefCell::new(Vec::new()),
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
     impl Launchctl for FakeLaunchctl {
         fn bootout(&self, _target: &str) -> Result<bool, IntegrationError> {
             self.events.borrow_mut().push("bootout");
-            self.bootout_results
+            let result = self
+                .bootout_results
                 .borrow_mut()
                 .pop_front()
-                .unwrap_or(Ok(true))
-                .map_err(|message| IntegrationError::Runtime(message.into()))
-        }
-
-        fn bootstrap(&self, _domain: &str, _plist: &Path) -> Result<(), IntegrationError> {
-            self.events.borrow_mut().push("bootstrap");
-            if self.bootstrap_error {
-                Err(IntegrationError::Runtime("bootstrap failed".into()))
-            } else {
-                Ok(())
+                .unwrap_or(Ok(true));
+            if matches!(result, Ok(true)) {
+                self.loaded.set(false);
             }
-        }
-
-        fn kickstart(&self, _target: &str) -> Result<(), IntegrationError> {
-            self.events.borrow_mut().push("kickstart");
-            if self.kickstart_error {
-                Err(IntegrationError::Runtime("kickstart failed".into()))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    struct AlreadyStoppedLaunchctl;
-
-    #[cfg(target_os = "macos")]
-    impl Launchctl for AlreadyStoppedLaunchctl {
-        fn bootout(&self, _target: &str) -> Result<bool, IntegrationError> {
-            Ok(false)
-        }
-
-        fn is_loaded(&self, _target: &str) -> Result<bool, IntegrationError> {
-            Ok(false)
-        }
-
-        fn bootstrap(&self, _domain: &str, _plist: &Path) -> Result<(), IntegrationError> {
-            unreachable!()
-        }
-
-        fn kickstart(&self, _target: &str) -> Result<(), IntegrationError> {
-            unreachable!()
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    struct FailedBootoutLaunchctl {
-        loaded: bool,
-        events: RefCell<Vec<&'static str>>,
-    }
-
-    #[cfg(target_os = "macos")]
-    impl Launchctl for FailedBootoutLaunchctl {
-        fn bootout(&self, _target: &str) -> Result<bool, IntegrationError> {
-            self.events.borrow_mut().push("bootout");
-            Err(IntegrationError::Runtime("bootout failed".into()))
+            result.map_err(|message| IntegrationError::Runtime(message.into()))
         }
 
         fn is_loaded(&self, _target: &str) -> Result<bool, IntegrationError> {
             self.events.borrow_mut().push("is-loaded");
-            Ok(self.loaded)
+            Ok(self.loaded.get())
         }
 
         fn bootstrap(&self, _domain: &str, _plist: &Path) -> Result<(), IntegrationError> {
             self.events.borrow_mut().push("bootstrap");
-            Ok(())
+            let result = self
+                .bootstrap_results
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Ok(()));
+            if result.is_ok() {
+                self.loaded.set(true);
+            }
+            result.map_err(|message| IntegrationError::Runtime(message.into()))
         }
 
         fn kickstart(&self, _target: &str) -> Result<(), IntegrationError> {
             self.events.borrow_mut().push("kickstart");
-            Ok(())
+            self.kickstart_results
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Ok(()))
+                .map_err(|message| IntegrationError::Runtime(message.into()))
         }
     }
 
@@ -1427,213 +2115,354 @@ mod tests {
             label: "test-service".into(),
             plist: root.join("LaunchAgents/test-service.plist"),
             target: "gui/1/test-service".into(),
+            ownership: root.join("runtime/integrations/codex/launch-agent-ownership-v1.json"),
         }
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn install_continues_when_failed_bootout_is_verified_unloaded() {
-        let root = temporary_root("install-bootout-verified-unloaded");
-        let service = test_service(&root);
-        let launchctl = FailedBootoutLaunchctl {
-            loaded: false,
-            events: RefCell::new(Vec::new()),
-        };
+    fn install_and_disconnect_restore_inherited_plist_mode_and_loaded_state() {
+        use std::os::unix::fs::PermissionsExt;
 
-        install_collector_service_with(service, &root, Path::new("/bin/agentobs"), &launchctl)
-            .unwrap();
-
-        assert_eq!(
-            *launchctl.events.borrow(),
-            ["bootout", "is-loaded", "bootstrap", "kickstart"]
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn install_stops_when_failed_bootout_is_still_loaded() {
-        let root = temporary_root("install-bootout-still-loaded");
-        let service = test_service(&root);
-        let launchctl = FailedBootoutLaunchctl {
-            loaded: true,
-            events: RefCell::new(Vec::new()),
-        };
-
-        let error =
-            install_collector_service_with(service, &root, Path::new("/bin/agentobs"), &launchctl)
-                .unwrap_err();
-
-        assert!(error.to_string().contains("bootout failed"));
-        assert_eq!(*launchctl.events.borrow(), ["bootout", "is-loaded"]);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn bootstrap_failure_removes_plist_and_boots_out_partial_service() {
-        let root = temporary_root("bootstrap-failure");
-        let service = test_service(&root);
-        let plist = service.plist.clone();
-        let launchctl = FakeLaunchctl {
-            bootstrap_error: true,
-            kickstart_error: false,
-            bootout_results: RefCell::new(VecDeque::from([Ok(true), Ok(true)])),
-            events: RefCell::new(Vec::new()),
-        };
-
-        assert!(
-            install_collector_service_with(service, &root, Path::new("/bin/agentobs"), &launchctl,)
-                .is_err()
-        );
-        assert_eq!(
-            *launchctl.events.borrow(),
-            ["bootout", "bootstrap", "bootout"]
-        );
-        assert!(!plist.exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn kickstart_failure_removes_plist_and_boots_out_service() {
-        let root = temporary_root("kickstart-failure");
-        let service = test_service(&root);
-        let plist = service.plist.clone();
-        let launchctl = FakeLaunchctl {
-            bootstrap_error: false,
-            kickstart_error: true,
-            bootout_results: RefCell::new(VecDeque::from([Ok(true), Ok(true)])),
-            events: RefCell::new(Vec::new()),
-        };
-
-        assert!(
-            install_collector_service_with(service, &root, Path::new("/bin/agentobs"), &launchctl,)
-                .is_err()
-        );
-        assert_eq!(
-            *launchctl.events.borrow(),
-            ["bootout", "bootstrap", "kickstart", "bootout"]
-        );
-        assert!(!plist.exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn failed_install_retains_plist_when_bootout_is_unconfirmed() {
-        let root = temporary_root("cleanup-bootout-false");
-        let service = test_service(&root);
-        let plist = service.plist.clone();
-        let launchctl = FakeLaunchctl {
-            bootstrap_error: true,
-            kickstart_error: false,
-            bootout_results: RefCell::new(VecDeque::from([Ok(true), Ok(false)])),
-            events: RefCell::new(Vec::new()),
-        };
-
-        let error =
-            install_collector_service_with(service, &root, Path::new("/bin/agentobs"), &launchctl)
-                .unwrap_err();
-
-        assert!(error.to_string().contains("termination unconfirmed"));
-        assert!(plist.exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn failed_install_retains_plist_when_bootout_errors() {
-        let root = temporary_root("cleanup-bootout-error");
-        let service = test_service(&root);
-        let plist = service.plist.clone();
-        let launchctl = FakeLaunchctl {
-            bootstrap_error: true,
-            kickstart_error: false,
-            bootout_results: RefCell::new(VecDeque::from([Ok(true), Err("bootout failed")])),
-            events: RefCell::new(Vec::new()),
-        };
-
-        let error =
-            install_collector_service_with(service, &root, Path::new("/bin/agentobs"), &launchctl)
-                .unwrap_err();
-
-        assert!(error.to_string().contains("bootout failed"));
-        assert!(plist.exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn uninstall_retains_plist_when_bootout_is_unconfirmed() {
-        let root = temporary_root("uninstall-bootout-false");
+        let root = temporary_root("restore-inherited");
         let service = test_service(&root);
         fs::create_dir_all(service.plist.parent().unwrap()).unwrap();
-        fs::write(&service.plist, b"plist").unwrap();
-        let launchctl = FakeLaunchctl {
-            bootstrap_error: false,
-            kickstart_error: false,
-            bootout_results: RefCell::new(VecDeque::from([Ok(false)])),
-            events: RefCell::new(Vec::new()),
-        };
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&service.plist, b"inherited plist").unwrap();
+        fs::set_permissions(&service.plist, fs::Permissions::from_mode(0o640)).unwrap();
+        let launchctl = FakeLaunchctl::new(true);
 
-        assert!(uninstall_collector_service_with(&service, &launchctl).is_err());
-        assert!(service.plist.exists());
-        let _ = fs::remove_dir_all(root);
-    }
+        install_collector_service_with(
+            test_service(&root),
+            &root,
+            Path::new("/bin/agentobs"),
+            &launchctl,
+        )
+        .unwrap();
+        commit_collector_service_install(&service).unwrap();
+        assert_ne!(fs::read(&service.plist).unwrap(), b"inherited plist");
+        assert!(service.ownership.is_file());
+        assert_eq!(
+            fs::metadata(&service.ownership)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn uninstall_retains_plist_when_bootout_errors() {
-        let root = temporary_root("uninstall-bootout-error");
-        let service = test_service(&root);
-        fs::create_dir_all(service.plist.parent().unwrap()).unwrap();
-        fs::write(&service.plist, b"plist").unwrap();
-        let launchctl = FakeLaunchctl {
-            bootstrap_error: false,
-            kickstart_error: false,
-            bootout_results: RefCell::new(VecDeque::from([Err("bootout failed")])),
-            events: RefCell::new(Vec::new()),
-        };
-
-        assert!(uninstall_collector_service_with(&service, &launchctl).is_err());
-        assert!(service.plist.exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn uninstall_recovery_removes_retained_plist_after_confirmed_bootout() {
-        let root = temporary_root("uninstall-recovery");
-        let service = test_service(&root);
-        fs::create_dir_all(service.plist.parent().unwrap()).unwrap();
-        fs::write(&service.plist, b"plist").unwrap();
-        let launchctl = FakeLaunchctl {
-            bootstrap_error: false,
-            kickstart_error: false,
-            bootout_results: RefCell::new(VecDeque::from([Ok(false), Ok(true)])),
-            events: RefCell::new(Vec::new()),
-        };
-
-        assert!(uninstall_collector_service_with(&service, &launchctl).is_err());
-        assert!(service.plist.exists());
         uninstall_collector_service_with(&service, &launchctl).unwrap();
-        assert!(!service.plist.exists());
-        assert_eq!(*launchctl.events.borrow(), ["bootout", "bootout"]);
+        commit_collector_service_uninstall(&service).unwrap();
+
+        assert_eq!(fs::read(&service.plist).unwrap(), b"inherited plist");
+        assert_eq!(
+            fs::metadata(&service.plist).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(launchctl.loaded.get());
+        assert!(!service.ownership.exists());
         let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn uninstall_accepts_independently_confirmed_already_stopped_service() {
-        let root = temporary_root("uninstall-already-stopped");
+    fn install_failure_restores_inherited_working_service() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("install-failure-inherited");
         let service = test_service(&root);
         fs::create_dir_all(service.plist.parent().unwrap()).unwrap();
-        fs::write(&service.plist, b"plist").unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&service.plist, b"working plist").unwrap();
+        fs::set_permissions(&service.plist, fs::Permissions::from_mode(0o600)).unwrap();
+        let launchctl = FakeLaunchctl::new(true);
+        launchctl
+            .bootstrap_results
+            .borrow_mut()
+            .extend([Err("new bootstrap failed"), Ok(())]);
 
-        uninstall_collector_service_with(&service, &AlreadyStoppedLaunchctl).unwrap();
+        let error = install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs"),
+            &launchctl,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("new bootstrap failed"));
+        assert_eq!(fs::read(&service.plist).unwrap(), b"working plist");
+        assert_eq!(
+            fs::metadata(&service.plist).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(launchctl.loaded.get());
+        assert!(!service.ownership.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_install_kickstart_failure_removes_only_new_service() {
+        let root = temporary_root("fresh-kickstart-failure");
+        let service = test_service(&root);
+        let launchctl = FakeLaunchctl::new(false);
+        launchctl
+            .kickstart_results
+            .borrow_mut()
+            .push_back(Err("kickstart failed"));
+
+        let error = install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs"),
+            &launchctl,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("kickstart failed"));
+        assert!(!service.plist.exists());
+        assert!(!service.ownership.exists());
+        assert!(!launchctl.loaded.get());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reconnect_failure_restores_previous_owned_service() {
+        let root = temporary_root("reconnect-failure");
+        let service = test_service(&root);
+        let launchctl = FakeLaunchctl::new(false);
+        install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs-v1"),
+            &launchctl,
+        )
+        .unwrap();
+        commit_collector_service_install(&service).unwrap();
+        let previous = fs::read(&service.plist).unwrap();
+        launchctl
+            .kickstart_results
+            .borrow_mut()
+            .extend([Err("reconnect kickstart failed"), Ok(())]);
+
+        let error = install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs-v2"),
+            &launchctl,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("reconnect kickstart failed"));
+        assert_eq!(fs::read(&service.plist).unwrap(), previous);
+        assert!(launchctl.loaded.get());
+        let transaction = load_launch_agent_transaction(&service).unwrap().unwrap();
+        assert_eq!(transaction.phase, LaunchAgentPhase::Owned);
+        assert_eq!(transaction.desired_plist.bytes, previous);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reconnect_with_unchanged_plist_keeps_owned_transaction_idempotent() {
+        let root = temporary_root("reconnect-unchanged");
+        let service = test_service(&root);
+        let launchctl = FakeLaunchctl::new(false);
+        install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs"),
+            &launchctl,
+        )
+        .unwrap();
+        commit_collector_service_install(&service).unwrap();
+        let events = launchctl.events.borrow().len();
+
+        install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs"),
+            &launchctl,
+        )
+        .unwrap();
+        commit_collector_service_install(&service).unwrap();
+
+        assert_eq!(launchctl.events.borrow().len(), events + 1);
+        assert_eq!(
+            load_launch_agent_transaction(&service)
+                .unwrap()
+                .unwrap()
+                .phase,
+            LaunchAgentPhase::Owned
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_recovery_converges_crashed_disconnect_to_prior_state() {
+        let root = temporary_root("status-crash-recovery");
+        let service = test_service(&root);
+        let launchctl = FakeLaunchctl::new(false);
+        install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs"),
+            &launchctl,
+        )
+        .unwrap();
+        commit_collector_service_install(&service).unwrap();
+        let mut transaction = load_launch_agent_transaction(&service).unwrap().unwrap();
+        transaction.rollback_plist = transaction.desired_plist.clone();
+        transaction.rollback_loaded = true;
+        transaction.desired_plist = transaction.prior_plist.clone();
+        transaction.desired_loaded = transaction.prior_loaded;
+        transaction.operation = LaunchAgentOperation::Disconnect;
+        transaction.phase = LaunchAgentPhase::ServiceStopped;
+        save_launch_agent_transaction(&service, &transaction).unwrap();
+        launchctl.loaded.set(false);
+
+        let recovered = recover_launch_agent_transaction(
+            &service,
+            &launchctl,
+            LaunchAgentRecovery::Status(ConfigConnectionStatus::Disconnected),
+        )
+        .unwrap();
+
+        assert!(recovered.is_none());
+        assert!(!service.plist.exists());
+        assert!(!service.ownership.exists());
+        assert!(!launchctl.loaded.get());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_commits_applied_install_after_config_connected_crash() {
+        let root = temporary_root("status-connect-commit-crash");
+        let service = test_service(&root);
+        let launchctl = FakeLaunchctl::new(false);
+        install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs"),
+            &launchctl,
+        )
+        .unwrap();
+        assert_eq!(
+            load_launch_agent_transaction(&service)
+                .unwrap()
+                .unwrap()
+                .phase,
+            LaunchAgentPhase::Applied
+        );
+
+        let recovered = recover_launch_agent_transaction(
+            &service,
+            &launchctl,
+            LaunchAgentRecovery::Status(ConfigConnectionStatus::Connected),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(recovered.phase, LaunchAgentPhase::Owned);
+        assert!(service.plist.exists());
+        assert!(launchctl.loaded.get());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn connect_recovers_interrupted_reconnect_before_retrying() {
+        let root = temporary_root("connect-crash-recovery");
+        let service = test_service(&root);
+        let launchctl = FakeLaunchctl::new(false);
+        install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs-v1"),
+            &launchctl,
+        )
+        .unwrap();
+        commit_collector_service_install(&service).unwrap();
+        let previous = fs::read(&service.plist).unwrap();
+        let mut transaction = load_launch_agent_transaction(&service).unwrap().unwrap();
+        transaction.rollback_plist = transaction.desired_plist.clone();
+        transaction.rollback_loaded = true;
+        transaction.desired_plist.bytes = b"partial replacement".to_vec();
+        transaction.operation = LaunchAgentOperation::Reconnect;
+        transaction.phase = LaunchAgentPhase::PlistWritten;
+        save_launch_agent_transaction(&service, &transaction).unwrap();
+        fs::write(&service.plist, b"partial replacement").unwrap();
+        launchctl.loaded.set(false);
+
+        install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs-v1"),
+            &launchctl,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&service.plist).unwrap(), previous);
+        assert!(launchctl.loaded.get());
+        assert_eq!(
+            load_launch_agent_transaction(&service)
+                .unwrap()
+                .unwrap()
+                .phase,
+            LaunchAgentPhase::Owned
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn disconnect_after_crash_finishes_pending_restore_idempotently() {
+        let root = temporary_root("disconnect-crash-recovery");
+        let service = test_service(&root);
+        let launchctl = FakeLaunchctl::new(false);
+        install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs"),
+            &launchctl,
+        )
+        .unwrap();
+        commit_collector_service_install(&service).unwrap();
+        let mut transaction = load_launch_agent_transaction(&service).unwrap().unwrap();
+        transaction.rollback_plist = transaction.desired_plist.clone();
+        transaction.rollback_loaded = true;
+        transaction.desired_plist = transaction.prior_plist.clone();
+        transaction.desired_loaded = false;
+        transaction.operation = LaunchAgentOperation::Disconnect;
+        transaction.phase = LaunchAgentPhase::Prepared;
+        save_launch_agent_transaction(&service, &transaction).unwrap();
+
+        uninstall_collector_service_with(&service, &launchctl).unwrap();
+        commit_collector_service_uninstall(&service).unwrap();
 
         assert!(!service.plist.exists());
+        assert!(!service.ownership.exists());
+        assert!(!launchctl.loaded.get());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unowned_disconnect_preserves_inherited_service() {
+        let root = temporary_root("unowned-disconnect");
+        let service = test_service(&root);
+        fs::create_dir_all(service.plist.parent().unwrap()).unwrap();
+        fs::write(&service.plist, b"inherited plist").unwrap();
+        let launchctl = FakeLaunchctl::new(true);
+
+        uninstall_collector_service_with(&service, &launchctl).unwrap();
+
+        assert_eq!(fs::read(&service.plist).unwrap(), b"inherited plist");
+        assert!(launchctl.loaded.get());
+        assert!(launchctl.events.borrow().is_empty());
         let _ = fs::remove_dir_all(root);
     }
 }
