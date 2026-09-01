@@ -42,6 +42,8 @@ The fragment capability is retained only in same-tab session storage for reload 
 after explicit close, an invalid session, or a bootstrap/heartbeat network failure; it is never placed in a
 cookie or local storage.
 The process stops after 10 minutes without an active browser heartbeat and has an absolute one-hour lifetime.
+HTTP/1 header reads are limited to five seconds, and graceful connection draining is limited to one second,
+so a partial request cannot keep the foreground settings process alive indefinitely.
 The lower-level `init` command remains available for automation. Install creates the root, logs,
 queue, state, and runtime directories with mode 0700 and creates config.json with mode 0600.
 Existing configuration is validated and preserved. Broad permissions,

@@ -14,19 +14,28 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use hyper::{body::Incoming, server::conn::http1, service::service_fn};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::{net::TcpListener, sync::Notify};
+use tokio::{
+    net::TcpListener,
+    sync::{Notify, watch},
+    task::JoinSet,
+};
+use tower::ServiceExt;
 
 const SESSION_HEADER: &str = "x-agent-observability-session";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 const MAX_SESSION_LIFETIME: Duration = Duration::from_hours(1);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const SETTINGS_SHELL: &str = include_str!("generated/settings-shell.html");
 const SETTINGS_SCRIPT: &str = include_str!("generated/settings-ui.js");
 const SETTINGS_STYLE: &str = include_str!("generated/settings-ui.css");
@@ -73,10 +82,74 @@ impl PreparedUi {
     }
 
     pub async fn serve(self) -> Result<(), UiError> {
-        let shutdown = shutdown_signal(self.shutdown, self.last_seen);
-        axum::serve(self.listener, self.router)
-            .with_graceful_shutdown(shutdown)
-            .await?;
+        self.serve_with_limits(HEADER_READ_TIMEOUT, GRACEFUL_DRAIN_TIMEOUT)
+            .await
+    }
+
+    async fn serve_with_limits(
+        self,
+        header_read_timeout: Duration,
+        drain_timeout: Duration,
+    ) -> Result<(), UiError> {
+        let Self {
+            listener,
+            router,
+            shutdown,
+            last_seen,
+            _ui_singleton,
+            ..
+        } = self;
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let mut connections = JoinSet::new();
+        let shutdown = shutdown_signal(shutdown, last_seen);
+        tokio::pin!(shutdown);
+
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut shutdown => break,
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted?;
+                    let router = router.clone();
+                    let mut stop_rx = stop_rx.clone();
+                    connections.spawn(async move {
+                        let service = service_fn(move |request: Request<Incoming>| {
+                            router.clone().oneshot(request.map(Body::new))
+                        });
+                        let mut builder = http1::Builder::new();
+                        builder
+                            .timer(TokioTimer::new())
+                            .header_read_timeout(header_read_timeout);
+                        let connection = builder.serve_connection(TokioIo::new(stream), service);
+                        tokio::pin!(connection);
+                        tokio::select! {
+                            _ = &mut connection => {}
+                            changed = stop_rx.changed() => {
+                                if changed.is_ok() {
+                                    connection.as_mut().graceful_shutdown();
+                                    let _ = tokio::time::timeout(drain_timeout, &mut connection).await;
+                                }
+                            }
+                        }
+                    });
+                }
+                joined = connections.join_next(), if !connections.is_empty() => {
+                    let _ = joined;
+                }
+            }
+        }
+
+        let _ = stop_tx.send(true);
+        drop(listener);
+        if tokio::time::timeout(drain_timeout, async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+        }
         Ok(())
     }
 }
@@ -475,7 +548,7 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, constant_time_equal, router, session_token};
+    use super::{AppState, constant_time_equal, prepare, router, session_token};
     use agent_observability_local_runtime::{LocalRuntimeConfigV2, install, revision};
     use axum::{
         body::{Body, to_bytes},
@@ -485,9 +558,13 @@ mod tests {
     use std::{
         fs,
         sync::{Arc, Mutex},
-        time::Instant,
+        time::{Duration, Instant},
     };
-    use tokio::sync::Notify;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+        sync::Notify,
+    };
     use tower::ServiceExt;
 
     #[test]
@@ -509,6 +586,58 @@ mod tests {
         second.enabled = false;
         assert_eq!(revision(&first).unwrap(), revision(&first).unwrap());
         assert_ne!(revision(&first).unwrap(), revision(&second).unwrap());
+    }
+
+    #[test]
+    fn transport_bounds_partial_headers_and_shutdown_drain() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let root = std::env::temp_dir().join(format!(
+                    "agent-observability-local-ui-transport-test-{}",
+                    std::process::id()
+                ));
+                let _ = fs::remove_dir_all(&root);
+                let layout = install(&root).unwrap();
+                let prepared = prepare(&layout).await.unwrap();
+                let address = prepared.listener.local_addr().unwrap();
+                let shutdown = Arc::clone(&prepared.shutdown);
+                let server = tokio::spawn(
+                    prepared
+                        .serve_with_limits(Duration::from_millis(50), Duration::from_millis(50)),
+                );
+
+                let mut timed_out_header = TcpStream::connect(address).await.unwrap();
+                timed_out_header
+                    .write_all(b"GET / HTTP/1.1\r\nHost:")
+                    .await
+                    .unwrap();
+                let mut byte = [0_u8; 1];
+                let bytes_read = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    timed_out_header.read(&mut byte),
+                )
+                .await
+                .expect("partial header connection must close")
+                .unwrap();
+                assert_eq!(bytes_read, 0);
+
+                let mut draining_connection = TcpStream::connect(address).await.unwrap();
+                draining_connection
+                    .write_all(b"GET / HTTP/1.1\r\nHost:")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                shutdown.notify_one();
+                tokio::time::timeout(Duration::from_millis(500), server)
+                    .await
+                    .expect("shutdown drain must be bounded")
+                    .unwrap()
+                    .unwrap();
+                let _ = fs::remove_dir_all(root);
+            });
     }
 
     #[test]

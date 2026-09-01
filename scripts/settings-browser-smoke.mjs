@@ -176,6 +176,11 @@ try {
       assert.equal(rebased.collection.flush_interval_ms, 6000);
       await page.locator("#reset").click();
       assert.equal(await page.locator("#reset-dialog").getAttribute("open"), "");
+      await page.locator("#cancel-reset").focus();
+      await page.keyboard.press("Shift+Tab");
+      assert.equal(await page.evaluate(() => document.activeElement?.id), "confirm-reset");
+      await page.keyboard.press("Tab");
+      assert.equal(await page.evaluate(() => document.activeElement?.id), "cancel-reset");
       await page.locator("#confirm-reset").click();
       await page.locator("#reset").waitFor();
       await page.waitForFunction(() => document.activeElement?.id === "reset");
@@ -260,6 +265,11 @@ try {
     if (testCase.name === "compact") {
       await page.locator("#close-session").click();
       assert.equal(await page.locator("#close-dialog").getAttribute("open"), "");
+      await page.locator("#cancel-close").focus();
+      await page.keyboard.press("Shift+Tab");
+      assert.equal(await page.evaluate(() => document.activeElement?.id), "confirm-close");
+      await page.keyboard.press("Tab");
+      assert.equal(await page.evaluate(() => document.activeElement?.id), "cancel-close");
       await page.locator("#cancel-close").click();
       assert.equal(await page.evaluate(() => document.activeElement?.id), "close-session");
       await page.locator("#discard").click();

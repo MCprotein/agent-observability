@@ -1010,6 +1010,9 @@
     document.querySelector("#close-session")?.addEventListener("click", requestCloseSession);
     document.querySelector("#cancel-close")?.addEventListener("click", closeCloseDialog);
     document.querySelector("#confirm-close")?.addEventListener("click", () => void closeSession());
+    document.querySelectorAll("dialog").forEach((dialog) => {
+      dialog.addEventListener("keydown", trapDialogFocus);
+    });
     document.querySelectorAll(".section-nav a").forEach((link) => {
       link.addEventListener("click", () => {
         setActiveNavigation(link.hash);
@@ -1024,6 +1027,27 @@
       { rootMargin: "-32% 0px -60% 0px", threshold: 0 }
     );
     document.querySelectorAll(".settings-section").forEach((section) => navigationObserver?.observe(section));
+  }
+  function trapDialogFocus(event) {
+    if (event.key !== "Tab") return;
+    const dialog = event.currentTarget;
+    if (!(dialog instanceof HTMLDialogElement) || !dialog.open) return;
+    const controls = Array.from(
+      dialog.querySelectorAll(
+        "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"
+      )
+    );
+    if (controls.length === 0) return;
+    const first = controls[0];
+    const last = controls.at(-1);
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !dialog.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+      event.preventDefault();
+      first.focus();
+    }
   }
   function handleInput(event) {
     const input = event.target;
