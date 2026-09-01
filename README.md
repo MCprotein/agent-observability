@@ -14,8 +14,8 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 > script는 `agentobs setup ~/.agent-observability --no-open`처럼 root를 명시한다. 자동 연결은 이후
 > `agentobs connect codex`로 언제든 추가할 수 있다.
 
-아래 automatic 명령은 v1.8.0 development build 기준이다. v1.8.0이 release되기 전에는 public installer의
-latest stable binary가 이 automatic slice를 포함하지 않을 수 있다.
+아래 automatic 명령과 설치 경로는 v1.8.0 기준이다. release 전에는 고정 버전 installer가 아직
+게시되지 않았으므로 이 branch를 source에서 검증한다.
 
 ## 빠른 시작
 
@@ -30,7 +30,7 @@ profile에 PATH 블록을 한 번만 등록한다.
   set -eu
   installer="$(mktemp)"
   trap 'rm -f "$installer"' 0
-  curl -fsSL https://github.com/MCprotein/agent-observability/releases/latest/download/install.sh -o "$installer"
+  curl -fsSL https://github.com/MCprotein/agent-observability/releases/download/v1.8.0/install.sh -o "$installer"
   sh "$installer"
 )
 ```
