@@ -9,7 +9,7 @@ use agent_observability_local_runtime::{
     Admission, InstalledLayout, LocalRuntimeConfigV2, PressureSample, RuntimeControl, Singleton,
     StorageBudget, install, load,
 };
-use agent_observability_local_store::{IngestStatus, LocalStore};
+use agent_observability_local_store::{LocalStore, StoreBatchItem};
 use agent_observability_static_report::write_private;
 use axum::{
     Router,
@@ -36,6 +36,9 @@ use tokio::{net::TcpListener, sync::Mutex};
 pub const TOKEN_HEADER: &str = "x-agent-observability-token";
 pub const REPORT_FILE_NAME: &str = "agent-observability-report.html";
 pub const COLLECTOR_SETTINGS_VERSION: &str = "local_collector.v1";
+const REPORT_DIRTY_FILE_NAME: &str = "report-dirty";
+const REPORT_RETRY_LIMIT: u32 = 4;
+const REPORT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -233,6 +236,9 @@ struct CollectorState {
     suppressed_requests: u64,
     last_ingest_unix_ms: Option<u64>,
     report_generation: u64,
+    report_dirty: bool,
+    report_degraded: bool,
+    report_refresh_failures: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -248,6 +254,8 @@ struct Health {
     rejected_requests: u64,
     suppressed_requests: u64,
     last_ingest_unix_ms: Option<u64>,
+    report_dirty: bool,
+    report_refresh_failures: u32,
 }
 
 /// Runs the authenticated OTLP/HTTP receiver until the process is terminated.
@@ -257,6 +265,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let config = load(&layout.config).map_err(runtime_error)?;
     let singleton = Singleton::acquire(&layout.runtime.join("collector")).map_err(runtime_error)?;
     let store = open_store(&layout, &config)?;
+    let report_dirty = reconcile_report_state(&layout)?;
     let last_cursor = store
         .cursor("codex", &options.source_generation)
         .map_err(runtime_error)?;
@@ -276,12 +285,18 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         suppressed_requests: 0,
         last_ingest_unix_ms: None,
         report_generation: 0,
+        report_dirty,
+        report_degraded: report_dirty,
+        report_refresh_failures: 0,
     }));
     let state = AppState {
         collector,
         report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
     };
-    let app = router(state);
+    let app = router(state.clone());
+    if report_dirty {
+        schedule_report_refresh(&state);
+    }
     let result = axum::serve(listener, app).await;
     drop(singleton);
     result.map_err(CollectorError::Io)
@@ -339,11 +354,17 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         return StatusCode::UNAUTHORIZED.into_response();
     }
     axum::Json(Health {
-        status: "ready",
+        status: if collector.report_degraded {
+            "degraded"
+        } else {
+            "ready"
+        },
         accepted_requests: collector.accepted_requests,
         rejected_requests: collector.rejected_requests,
         suppressed_requests: collector.suppressed_requests,
         last_ingest_unix_ms: collector.last_ingest_unix_ms,
+        report_dirty: collector.report_dirty,
+        report_refresh_failures: collector.report_refresh_failures,
     })
     .into_response()
 }
@@ -562,30 +583,32 @@ fn commit_batch(
     last_cursor: Option<String>,
     now: u64,
 ) -> Result<(), CollectorError> {
-    if batch.diagnostics().next().is_some() {
-        return Err(CollectorError::Runtime(
-            "Codex OTLP batch did not satisfy the canonical adapter contract".into(),
-        ));
-    }
-    let observations = batch
+    let items = batch
         .items
         .iter()
-        .filter_map(|item| match item {
-            AdapterItem::Observation(observation) => Some(observation.as_ref().clone()),
-            AdapterItem::Disposition(_) => None,
+        .map(|item| match item {
+            AdapterItem::Observation(observation) => {
+                StoreBatchItem::Observation(observation.as_ref())
+            }
+            AdapterItem::Disposition(diagnostic) => StoreBatchItem::Disposition {
+                checkpoint: &diagnostic.checkpoint,
+                disposition: diagnostic.disposition,
+                code: diagnostic.code,
+                canonical_payload_hash: diagnostic.payload_hash.as_deref(),
+            },
         })
         .collect::<Vec<_>>();
-    let statuses = state
-        .store
-        .ingest_batch_deferred_projection(&observations)
-        .map_err(runtime_error)?;
-    if statuses
-        .iter()
-        .any(|status| !matches!(status, IngestStatus::Committed | IngestStatus::Duplicate))
-    {
-        return Err(CollectorError::Runtime(
-            "Codex OTLP batch was suppressed by the local store".into(),
-        ));
+    let was_dirty = state.report_dirty;
+    mark_report_dirty(&state.layout)?;
+    state.report_dirty = true;
+    match state.store.ingest_ordered_batch_deferred_projection(&items) {
+        Ok(_) => {}
+        Err(error) => {
+            if !was_dirty && clear_report_dirty(&state.layout).is_ok() {
+                state.report_dirty = false;
+            }
+            return Err(runtime_error(error));
+        }
     }
     state.last_cursor = last_cursor;
     state.last_ingest_unix_ms = Some(now);
@@ -603,8 +626,9 @@ fn schedule_report_refresh(state: &AppState) {
     }
     let state = state.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        loop {
+        let mut delay = REPORT_RETRY_INITIAL_DELAY;
+        for attempt in 1..=REPORT_RETRY_LIMIT {
+            tokio::time::sleep(delay).await;
             let (root, generation) = {
                 let collector = state.collector.lock().await;
                 (collector.layout.root.clone(), collector.report_generation)
@@ -612,17 +636,99 @@ fn schedule_report_refresh(state: &AppState) {
             let refreshed = tokio::task::spawn_blocking(move || refresh_report_from_root(&root))
                 .await
                 .is_ok_and(|result| result.is_ok());
-            let collector = state.collector.lock().await;
-            if refreshed && collector.report_generation == generation {
+            let mut collector = state.collector.lock().await;
+            let generation_changed = collector.report_generation != generation;
+            let completed =
+                refreshed && !generation_changed && clear_report_dirty(&collector.layout).is_ok();
+            if completed {
+                collector.report_dirty = false;
+                collector.report_degraded = false;
+                collector.report_refresh_failures = 0;
                 state
                     .report_refresh_scheduled
                     .store(false, Ordering::Release);
                 return;
             }
+            if refreshed && generation_changed {
+                delay = REPORT_RETRY_INITIAL_DELAY;
+            } else {
+                collector.report_refresh_failures =
+                    collector.report_refresh_failures.saturating_add(1);
+                delay = delay.saturating_mul(2);
+            }
+            if attempt == REPORT_RETRY_LIMIT {
+                collector.report_degraded = true;
+                state
+                    .report_refresh_scheduled
+                    .store(false, Ordering::Release);
+                drop(collector);
+                if generation_changed && refreshed {
+                    schedule_report_refresh(&state);
+                }
+                return;
+            }
             drop(collector);
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     });
+}
+
+fn report_dirty_path(layout: &InstalledLayout) -> PathBuf {
+    layout.runtime.join(REPORT_DIRTY_FILE_NAME)
+}
+
+fn reconcile_report_state(layout: &InstalledLayout) -> Result<bool, CollectorError> {
+    let dirty = report_dirty_path(layout);
+    if dirty.exists() || !layout.logs.join(REPORT_FILE_NAME).is_file() {
+        mark_report_dirty(layout)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn mark_report_dirty(layout: &InstalledLayout) -> Result<(), CollectorError> {
+    let path = report_dirty_path(layout);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(CollectorError::Runtime(
+                    "report dirty marker must be a private regular file".into(),
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    return Err(CollectorError::Runtime(
+                        "report dirty marker permissions are too broad".into(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&path)?;
+            file.write_all(b"dirty\n")?;
+            file.sync_all()?;
+            File::open(&layout.runtime)?.sync_all()?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn clear_report_dirty(layout: &InstalledLayout) -> Result<(), CollectorError> {
+    match fs::remove_file(report_dirty_path(layout)) {
+        Ok(()) => File::open(&layout.runtime)?.sync_all().map_err(Into::into),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn refresh_report_from_root(root: &Path) -> Result<(), CollectorError> {
@@ -799,12 +905,17 @@ mod tests {
         AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome, REPORT_FILE_NAME,
         TOKEN_HEADER, admit_request, constant_time_equal, enforce_batch_policy, ingest_locked,
         ingest_notify_locked, install_settings, is_json, load_settings, open_store,
-        refresh_report_from_root, router, schedule_report_refresh, settings_path, submit_notify,
-        timestamp_from_unix_ms, write_private_json,
+        reconcile_report_state, refresh_report_from_root, report_dirty_path, router,
+        schedule_report_refresh, settings_path, submit_notify, timestamp_from_unix_ms,
+        write_private_json,
     };
     use agent_observability_adapter_codex::{MAX_HANDOFF_BYTES, parse_otlp_http_json};
     use agent_observability_local_runtime::{ConfigMutationGuard, install, load, save};
-    use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+    use axum::{
+        extract::State,
+        http::{HeaderMap, HeaderValue, StatusCode, header},
+        response::IntoResponse,
+    };
     use std::{
         fs,
         io::{Read, Write},
@@ -841,6 +952,9 @@ mod tests {
             suppressed_requests: 0,
             last_ingest_unix_ms: None,
             report_generation: 0,
+            report_dirty: false,
+            report_degraded: false,
+            report_refresh_failures: 0,
         }
     }
 
@@ -1205,6 +1319,9 @@ mod tests {
             suppressed_requests: 0,
             last_ingest_unix_ms: None,
             report_generation: 0,
+            report_dirty: false,
+            report_degraded: false,
+            report_refresh_failures: 0,
         };
         let body = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
           {"timeUnixNano":"1787875200000000000","attributes":[
@@ -1241,6 +1358,49 @@ mod tests {
         assert!(!html.contains("SECRET_PROMPT"));
         assert!(!html.contains("SECRET_OUTPUT"));
         assert!(!html.contains("SECRET_PATH"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mixed_otlp_batch_commits_content_disposition_in_source_order_idempotently() {
+        let root = test_root("mixed-otlp-batch");
+        let _ = fs::remove_dir_all(&root);
+        let mut state = collector_state(&root);
+        let body = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
+          {"attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},
+            {"key":"conversation.id","value":{"stringValue":"conversation-1"}}
+          ]},
+          {"attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.user_prompt"}},
+            {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+            {"key":"body","value":{"stringValue":"SECRET_PROMPT"}}
+          ]},
+          {"attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
+            {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+            {"key":"event.kind","value":{"stringValue":"response.completed"}}
+          ]}
+        ]}]}]}"#;
+
+        let (batch, cursor) = parse_otlp_http_json(body, "codex-test", None, 1, 0).unwrap();
+        super::commit_batch(&mut state, &batch, cursor.clone(), 1).unwrap();
+        assert_eq!(state.store.observation_count().unwrap(), 2);
+        assert_eq!(state.store.disposition_count().unwrap(), 1);
+        assert_eq!(state.last_cursor.as_deref(), Some("3"));
+        assert!(report_dirty_path(&state.layout).is_file());
+
+        super::commit_batch(&mut state, &batch, cursor, 2).unwrap();
+        assert_eq!(state.store.observation_count().unwrap(), 2);
+        assert_eq!(state.store.disposition_count().unwrap(), 1);
+        assert_eq!(state.last_cursor.as_deref(), Some("3"));
+
+        let (replayed, cursor) = parse_otlp_http_json(body, "codex-test", Some("3"), 4, 3).unwrap();
+        super::commit_batch(&mut state, &replayed, cursor, 3).unwrap();
+        assert_eq!(state.store.observation_count().unwrap(), 4);
+        assert_eq!(state.store.disposition_count().unwrap(), 2);
+        assert_eq!(state.last_cursor.as_deref(), Some("6"));
+        assert_tree_excludes(&root, &[b"SECRET_PROMPT"]);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1292,6 +1452,104 @@ mod tests {
 
         let html = fs::read_to_string(&report).unwrap();
         assert!(html.contains(r#""generatedSpans":2"#));
+        assert!(!report_dirty_path(&state.collector.blocking_lock().layout).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_reconciles_durable_dirty_marker_after_ingest_crash_window() {
+        let root = test_root("report-startup-reconcile");
+        let _ = fs::remove_dir_all(&root);
+        {
+            let mut crashed = collector_state(&root);
+            ingest_notify_locked(
+                &mut crashed,
+                br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+            )
+            .unwrap();
+            assert!(report_dirty_path(&crashed.layout).is_file());
+        }
+
+        let mut restarted = collector_state(&root);
+        assert!(reconcile_report_state(&restarted.layout).unwrap());
+        restarted.report_dirty = true;
+        restarted.report_degraded = true;
+        let state = AppState {
+            collector: Arc::new(Mutex::new(restarted)),
+            report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            schedule_report_refresh(&state);
+            for _ in 0..100 {
+                if !state.report_refresh_scheduled.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let collector = state.collector.lock().await;
+            assert!(!collector.report_dirty);
+            assert!(!collector.report_degraded);
+        });
+        assert!(root.join("logs").join(REPORT_FILE_NAME).is_file());
+        assert!(!report_dirty_path(&install(&root).unwrap()).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persistent_report_failure_exhausts_retries_and_degrades_health_state() {
+        let root = test_root("report-persistent-failure");
+        let _ = fs::remove_dir_all(&root);
+        let state = app_state(&root);
+        let report = root.join("logs").join(REPORT_FILE_NAME);
+        fs::create_dir(&report).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            {
+                let mut collector = state.collector.lock().await;
+                ingest_notify_locked(
+                    &mut collector,
+                    br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+                )
+                .unwrap();
+            }
+            schedule_report_refresh(&state);
+            for _ in 0..100 {
+                if !state.report_refresh_scheduled.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!state.report_refresh_scheduled.load(Ordering::Acquire));
+            let collector = state.collector.lock().await;
+            assert!(collector.report_dirty);
+            assert!(collector.report_degraded);
+            assert_eq!(collector.report_refresh_failures, super::REPORT_RETRY_LIMIT);
+            drop(collector);
+
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                TOKEN_HEADER,
+                HeaderValue::from_str(&"a".repeat(64)).unwrap(),
+            );
+            let response = super::health(State(state.clone()), headers)
+                .await
+                .into_response();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(health["status"], "degraded");
+            assert_eq!(health["report_dirty"], true);
+            assert_eq!(health["report_refresh_failures"], super::REPORT_RETRY_LIMIT);
+        });
+        assert!(report_dirty_path(&install(&root).unwrap()).is_file());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1354,6 +1612,9 @@ mod tests {
             suppressed_requests: 0,
             last_ingest_unix_ms: None,
             report_generation: 0,
+            report_dirty: false,
+            report_degraded: false,
+            report_refresh_failures: 0,
         };
         let guard = ConfigMutationGuard::acquire(&layout).unwrap();
         let mut disabled = initial;

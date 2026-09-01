@@ -12,9 +12,10 @@ use std::{
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Value, value};
 
 const SNAPSHOT_FILE: &str = "codex-config-ownership-v1.json";
+const LOCK_FILE: &str = ".codex-config-ownership.lock";
 const SNAPSHOT_VERSION: &str = "codex_config_ownership.v1";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-const MAX_SNAPSHOT_BYTES: u64 = MAX_CONFIG_BYTES * 2 + 8192;
+const MAX_SNAPSHOT_BYTES: u64 = MAX_CONFIG_BYTES * 4 + 8192;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,11 +90,31 @@ pub struct CodexConfigManager {
 struct OwnershipSnapshot {
     schema_version: String,
     config_path: String,
+    phase: SnapshotPhase,
     prior_existed: bool,
     prior_bytes_hex: String,
     prior_hash: String,
     prior_mode: u32,
+    connected_bytes_hex: String,
+    connected_hash: String,
+    connected_mode: u32,
     managed_fingerprint: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SnapshotPhase {
+    Prepared,
+    Connected,
+    Restoring,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotState {
+    PreparedPrior,
+    Connected,
+    RestoredPrior,
+    Conflict,
 }
 
 impl CodexConfigManager {
@@ -149,14 +170,31 @@ impl CodexConfigManager {
         mutations: &impl FileMutations,
     ) -> Result<ConnectionStatus, ConfigError> {
         self.ensure_private_state_dir()?;
+        let _lock = self.lock()?;
         let snapshot_path = self.snapshot_path();
         if checked_metadata(&snapshot_path)?.is_some() {
-            return match self.status()? {
-                ConnectionStatus::Connected => Ok(ConnectionStatus::Connected),
-                ConnectionStatus::Disconnected | ConnectionStatus::Conflict => {
-                    Err(ConfigError::Conflict)
+            let (mut snapshot, snapshot_file) = self.read_snapshot()?;
+            if snapshot.managed_fingerprint != self.managed_values().fingerprint() {
+                return Err(ConfigError::Conflict);
+            }
+            match self.snapshot_state(&snapshot)? {
+                SnapshotState::PreparedPrior | SnapshotState::RestoredPrior => {
+                    mutations
+                        .remove_checked(&snapshot_path, FileExpectation::present(&snapshot_file))?;
                 }
-            };
+                SnapshotState::Connected => {
+                    if snapshot.phase != SnapshotPhase::Connected {
+                        self.transition_snapshot(
+                            mutations,
+                            &mut snapshot,
+                            &snapshot_file,
+                            SnapshotPhase::Connected,
+                        )?;
+                    }
+                    return Ok(ConnectionStatus::Connected);
+                }
+                SnapshotState::Conflict => return Err(ConfigError::Conflict),
+            }
         }
 
         let prior = self.read_config()?;
@@ -165,54 +203,67 @@ impl CodexConfigManager {
         ensure_no_managed_conflict(&document, &managed)?;
         patch_managed_values(&mut document, &managed);
         let updated = document.to_string().into_bytes();
-        let snapshot = OwnershipSnapshot {
+        let already_connected = prior.matches(&updated, prior.mode);
+        let mut snapshot = OwnershipSnapshot {
             schema_version: SNAPSHOT_VERSION.into(),
             config_path: path_identity(&self.config_path),
+            phase: if already_connected {
+                SnapshotPhase::Connected
+            } else {
+                SnapshotPhase::Prepared
+            },
             prior_existed: prior.existed,
             prior_bytes_hex: hex_encode(&prior.bytes),
             prior_hash: hash(&prior.bytes),
             prior_mode: prior.mode,
+            connected_bytes_hex: hex_encode(&updated),
+            connected_hash: hash(&updated),
+            connected_mode: prior.mode,
             managed_fingerprint: managed.fingerprint(),
         };
-        let mut snapshot_bytes =
-            serde_json::to_vec_pretty(&snapshot).map_err(|_| ConfigError::InvalidSnapshot)?;
-        snapshot_bytes.push(b'\n');
+        let snapshot_bytes = snapshot.to_bytes()?;
 
-        mutations.atomic_replace(&snapshot_path, None, &snapshot_bytes, 0o600)?;
+        mutations.atomic_replace(
+            &snapshot_path,
+            FileExpectation::Missing,
+            &snapshot_bytes,
+            0o600,
+        )?;
+        if already_connected {
+            return Ok(ConnectionStatus::Connected);
+        }
         if let Err(error) = mutations.atomic_replace(
             &self.config_path,
-            prior.existed.then_some(prior.bytes.as_slice()),
+            FileExpectation::from_existing(&prior),
             &updated,
             prior.mode,
         ) {
-            let current_is_updated = self
-                .read_config()
-                .is_ok_and(|current| current.existed && current.bytes == updated);
-            let config_rollback = if current_is_updated {
-                if prior.existed {
-                    mutations.atomic_replace(
-                        &self.config_path,
-                        Some(&updated),
-                        &prior.bytes,
-                        prior.mode,
-                    )
-                } else {
-                    mutations.remove_checked(&self.config_path, Some(&updated))
+            match self.snapshot_state(&snapshot)? {
+                SnapshotState::PreparedPrior => {
+                    if mutations
+                        .remove_checked(
+                            &snapshot_path,
+                            FileExpectation::present_bytes(&snapshot_bytes, 0o600),
+                        )
+                        .is_err()
+                    {
+                        return Err(ConfigError::RollbackFailed);
+                    }
                 }
-            } else {
-                Ok(())
-            };
-            if config_rollback.is_err() {
-                return Err(ConfigError::RollbackFailed);
-            }
-            if mutations
-                .remove_checked(&snapshot_path, Some(&snapshot_bytes))
-                .is_err()
-            {
-                return Err(ConfigError::RollbackFailed);
+                SnapshotState::Connected => {}
+                SnapshotState::RestoredPrior | SnapshotState::Conflict => {
+                    return Err(ConfigError::Conflict);
+                }
             }
             return Err(error);
         }
+        let snapshot_file = ExistingFile::present(snapshot_bytes, 0o600);
+        self.transition_snapshot(
+            mutations,
+            &mut snapshot,
+            &snapshot_file,
+            SnapshotPhase::Connected,
+        )?;
         Ok(ConnectionStatus::Connected)
     }
 
@@ -231,74 +282,61 @@ impl CodexConfigManager {
         mutations: &impl FileMutations,
     ) -> Result<ConnectionStatus, ConfigError> {
         self.ensure_private_state_dir()?;
+        let _lock = self.lock()?;
         let snapshot_path = self.snapshot_path();
         if checked_metadata(&snapshot_path)?.is_none() {
             return Ok(ConnectionStatus::Disconnected);
         }
-        let (snapshot, snapshot_bytes) = self.read_snapshot()?;
+        let (mut snapshot, mut snapshot_file) = self.read_snapshot()?;
         if snapshot.managed_fingerprint != self.managed_values().fingerprint() {
             return Err(ConfigError::Conflict);
         }
-        let current = self.read_config()?;
-        if !current.existed
-            || !managed_values_match(&parse_document(&current.bytes)?, &self.managed_values())
-        {
-            return Err(ConfigError::Conflict);
+        match self.snapshot_state(&snapshot)? {
+            SnapshotState::PreparedPrior | SnapshotState::RestoredPrior => {
+                mutations
+                    .remove_checked(&snapshot_path, FileExpectation::present(&snapshot_file))?;
+                return Ok(ConnectionStatus::Disconnected);
+            }
+            SnapshotState::Connected => {}
+            SnapshotState::Conflict => return Err(ConfigError::Conflict),
         }
+
+        if snapshot.phase != SnapshotPhase::Restoring {
+            snapshot_file = self.transition_snapshot(
+                mutations,
+                &mut snapshot,
+                &snapshot_file,
+                SnapshotPhase::Restoring,
+            )?;
+        }
+
+        let current = self.read_config()?;
         let prior = snapshot.prior_bytes()?;
         let restore_result = if snapshot.prior_existed {
             mutations.atomic_replace(
                 &self.config_path,
-                Some(&current.bytes),
+                FileExpectation::present(&current),
                 &prior,
                 snapshot.prior_mode,
             )
         } else {
-            mutations.remove_checked(&self.config_path, Some(&current.bytes))
+            mutations.remove_checked(&self.config_path, FileExpectation::present(&current))
         };
         if let Err(error) = restore_result {
-            let restored = if snapshot.prior_existed {
-                self.read_config()
-                    .is_ok_and(|config| config.existed && config.bytes == prior)
-            } else {
-                self.read_config().is_ok_and(|config| !config.existed)
-            };
-            if restored {
-                let rollback = mutations.atomic_replace(
-                    &self.config_path,
-                    snapshot.prior_existed.then_some(prior.as_slice()),
-                    &current.bytes,
-                    current.mode,
-                );
-                if rollback.is_err() {
-                    return Err(ConfigError::RollbackFailed);
+            return match self.snapshot_state(&snapshot)? {
+                SnapshotState::RestoredPrior => {
+                    mutations
+                        .remove_checked(&snapshot_path, FileExpectation::present(&snapshot_file))?;
+                    Ok(ConnectionStatus::Disconnected)
                 }
-            }
-            return Err(error);
+                SnapshotState::Connected => Err(error),
+                SnapshotState::PreparedPrior | SnapshotState::Conflict => {
+                    Err(ConfigError::Conflict)
+                }
+            };
         }
 
-        if mutations
-            .remove_checked(&snapshot_path, Some(&snapshot_bytes))
-            .is_err()
-        {
-            let rollback = if snapshot.prior_existed {
-                mutations.atomic_replace(
-                    &self.config_path,
-                    Some(&prior),
-                    &current.bytes,
-                    current.mode,
-                )
-            } else {
-                mutations.atomic_replace(&self.config_path, None, &current.bytes, current.mode)
-            };
-            return if rollback.is_ok() {
-                Err(ConfigError::Io(io::Error::other(
-                    "ownership snapshot removal failed",
-                )))
-            } else {
-                Err(ConfigError::RollbackFailed)
-            };
-        }
+        mutations.remove_checked(&snapshot_path, FileExpectation::present(&snapshot_file))?;
         Ok(ConnectionStatus::Disconnected)
     }
 
@@ -312,23 +350,33 @@ impl CodexConfigManager {
             return Ok(ConnectionStatus::Disconnected);
         };
         validate_private_dir_metadata(&self.state_dir, &state_metadata)?;
+        let _lock = self.lock()?;
         let snapshot_path = self.snapshot_path();
         let Some(metadata) = checked_metadata(&snapshot_path)? else {
             return Ok(ConnectionStatus::Disconnected);
         };
         validate_private_file(&snapshot_path, &metadata)?;
-        let (snapshot, _) = self.read_snapshot()?;
-        let current = self.read_config()?;
-        if !current.existed {
+        let (mut snapshot, snapshot_file) = self.read_snapshot()?;
+        if snapshot.managed_fingerprint != self.managed_values().fingerprint() {
             return Ok(ConnectionStatus::Conflict);
         }
-        let document = parse_document(&current.bytes)?;
-        if managed_values_match(&document, &self.managed_values())
-            && snapshot.managed_fingerprint == self.managed_values().fingerprint()
-        {
-            Ok(ConnectionStatus::Connected)
-        } else {
-            Ok(ConnectionStatus::Conflict)
+        match self.snapshot_state(&snapshot)? {
+            SnapshotState::PreparedPrior | SnapshotState::RestoredPrior => {
+                remove_checked(&snapshot_path, FileExpectation::present(&snapshot_file))?;
+                Ok(ConnectionStatus::Disconnected)
+            }
+            SnapshotState::Connected => {
+                if snapshot.phase != SnapshotPhase::Connected {
+                    self.transition_snapshot(
+                        &FilesystemMutations,
+                        &mut snapshot,
+                        &snapshot_file,
+                        SnapshotPhase::Connected,
+                    )?;
+                }
+                Ok(ConnectionStatus::Connected)
+            }
+            SnapshotState::Conflict => Ok(ConnectionStatus::Conflict),
         }
     }
 
@@ -336,7 +384,7 @@ impl CodexConfigManager {
         read_optional_private_file(&self.config_path)
     }
 
-    fn read_snapshot(&self) -> Result<(OwnershipSnapshot, Vec<u8>), ConfigError> {
+    fn read_snapshot(&self) -> Result<(OwnershipSnapshot, ExistingFile), ConfigError> {
         let existing = read_optional_private_file(&self.snapshot_path())?;
         if !existing.existed {
             return Err(ConfigError::InvalidSnapshot);
@@ -344,11 +392,62 @@ impl CodexConfigManager {
         let snapshot: OwnershipSnapshot =
             serde_json::from_slice(&existing.bytes).map_err(|_| ConfigError::InvalidSnapshot)?;
         snapshot.validate_path_and_prior(self)?;
-        Ok((snapshot, existing.bytes))
+        Ok((snapshot, existing))
+    }
+
+    fn snapshot_state(&self, snapshot: &OwnershipSnapshot) -> Result<SnapshotState, ConfigError> {
+        let current = match checked_metadata(&self.config_path)? {
+            None => ExistingFile {
+                existed: false,
+                bytes: Vec::new(),
+                mode: 0o600,
+            },
+            Some(metadata) => {
+                if !metadata.is_file() {
+                    return Err(ConfigError::NonRegularFile(self.config_path.clone()));
+                }
+                if unix_mode(&metadata) != snapshot.connected_mode {
+                    return Ok(SnapshotState::Conflict);
+                }
+                self.read_config()?
+            }
+        };
+        match snapshot.phase {
+            SnapshotPhase::Prepared if snapshot.matches_prior(&current)? => {
+                Ok(SnapshotState::PreparedPrior)
+            }
+            SnapshotPhase::Restoring if snapshot.matches_prior(&current)? => {
+                Ok(SnapshotState::RestoredPrior)
+            }
+            _ if snapshot.matches_connected(&current)? => Ok(SnapshotState::Connected),
+            _ => Ok(SnapshotState::Conflict),
+        }
+    }
+
+    fn transition_snapshot(
+        &self,
+        mutations: &impl FileMutations,
+        snapshot: &mut OwnershipSnapshot,
+        current: &ExistingFile,
+        phase: SnapshotPhase,
+    ) -> Result<ExistingFile, ConfigError> {
+        snapshot.phase = phase;
+        let bytes = snapshot.to_bytes()?;
+        mutations.atomic_replace(
+            &self.snapshot_path(),
+            FileExpectation::present(current),
+            &bytes,
+            0o600,
+        )?;
+        Ok(ExistingFile::present(bytes, 0o600))
     }
 
     fn snapshot_path(&self) -> PathBuf {
         self.state_dir.join(SNAPSHOT_FILE)
+    }
+
+    fn lock(&self) -> Result<MutationLock, ConfigError> {
+        MutationLock::acquire(&self.state_dir.join(LOCK_FILE))
     }
 
     fn ensure_private_state_dir(&self) -> Result<(), ConfigError> {
@@ -375,12 +474,13 @@ trait FileMutations {
     fn atomic_replace(
         &self,
         path: &Path,
-        expected: Option<&[u8]>,
+        expected: FileExpectation<'_>,
         bytes: &[u8],
         mode: u32,
     ) -> Result<(), ConfigError>;
 
-    fn remove_checked(&self, path: &Path, expected: Option<&[u8]>) -> Result<(), ConfigError>;
+    fn remove_checked(&self, path: &Path, expected: FileExpectation<'_>)
+    -> Result<(), ConfigError>;
 }
 
 struct FilesystemMutations;
@@ -389,14 +489,18 @@ impl FileMutations for FilesystemMutations {
     fn atomic_replace(
         &self,
         path: &Path,
-        expected: Option<&[u8]>,
+        expected: FileExpectation<'_>,
         bytes: &[u8],
         mode: u32,
     ) -> Result<(), ConfigError> {
         atomic_replace(path, expected, bytes, mode)
     }
 
-    fn remove_checked(&self, path: &Path, expected: Option<&[u8]>) -> Result<(), ConfigError> {
+    fn remove_checked(
+        &self,
+        path: &Path,
+        expected: FileExpectation<'_>,
+    ) -> Result<(), ConfigError> {
         remove_checked(path, expected)
     }
 }
@@ -404,11 +508,15 @@ impl FileMutations for FilesystemMutations {
 impl OwnershipSnapshot {
     fn validate_path_and_prior(&self, manager: &CodexConfigManager) -> Result<(), ConfigError> {
         let prior = self.prior_bytes()?;
+        let connected = self.connected_bytes()?;
         if self.schema_version != SNAPSHOT_VERSION
             || self.config_path != path_identity(&manager.config_path)
             || self.prior_hash != hash(&prior)
+            || self.connected_hash != hash(&connected)
             || (!self.prior_existed && !prior.is_empty())
             || self.prior_mode & 0o077 != 0
+            || self.connected_mode & 0o077 != 0
+            || self.connected_mode != self.prior_mode
         {
             return Err(ConfigError::InvalidSnapshot);
         }
@@ -418,6 +526,29 @@ impl OwnershipSnapshot {
     fn prior_bytes(&self) -> Result<Vec<u8>, ConfigError> {
         hex_decode(&self.prior_bytes_hex).ok_or(ConfigError::InvalidSnapshot)
     }
+
+    fn connected_bytes(&self) -> Result<Vec<u8>, ConfigError> {
+        hex_decode(&self.connected_bytes_hex).ok_or(ConfigError::InvalidSnapshot)
+    }
+
+    fn to_bytes(&self) -> Result<Vec<u8>, ConfigError> {
+        let mut bytes =
+            serde_json::to_vec_pretty(self).map_err(|_| ConfigError::InvalidSnapshot)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    fn matches_prior(&self, current: &ExistingFile) -> Result<bool, ConfigError> {
+        Ok(if self.prior_existed {
+            current.matches(&self.prior_bytes()?, self.prior_mode)
+        } else {
+            !current.existed
+        })
+    }
+
+    fn matches_connected(&self, current: &ExistingFile) -> Result<bool, ConfigError> {
+        Ok(current.matches(&self.connected_bytes()?, self.connected_mode))
+    }
 }
 
 #[derive(Debug)]
@@ -425,6 +556,83 @@ struct ExistingFile {
     existed: bool,
     bytes: Vec<u8>,
     mode: u32,
+}
+
+impl ExistingFile {
+    fn present(bytes: Vec<u8>, mode: u32) -> Self {
+        Self {
+            existed: true,
+            bytes,
+            mode,
+        }
+    }
+
+    fn matches(&self, bytes: &[u8], mode: u32) -> bool {
+        self.existed && self.bytes == bytes && self.mode == mode
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FileExpectation<'a> {
+    Missing,
+    Present { bytes: &'a [u8], mode: u32 },
+}
+
+impl<'a> FileExpectation<'a> {
+    fn from_existing(file: &'a ExistingFile) -> Self {
+        if file.existed {
+            Self::present(file)
+        } else {
+            Self::Missing
+        }
+    }
+
+    fn present(file: &'a ExistingFile) -> Self {
+        Self::present_bytes(&file.bytes, file.mode)
+    }
+
+    fn present_bytes(bytes: &'a [u8], mode: u32) -> Self {
+        Self::Present { bytes, mode }
+    }
+
+    fn matches(self, file: &ExistingFile) -> bool {
+        match self {
+            Self::Missing => !file.existed,
+            Self::Present { bytes, mode } => file.matches(bytes, mode),
+        }
+    }
+
+    fn matches_metadata(self, path: &Path) -> Result<bool, ConfigError> {
+        let metadata = checked_metadata(path)?;
+        Ok(match (self, metadata) {
+            (Self::Missing, None) => true,
+            (Self::Present { mode, .. }, Some(metadata)) => {
+                metadata.is_file() && unix_mode(&metadata) == mode
+            }
+            _ => false,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct MutationLock {
+    _file: File,
+}
+
+impl MutationLock {
+    fn acquire(path: &Path) -> Result<Self, ConfigError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(path)?;
+        validate_private_file(path, &file.metadata()?)?;
+        file.lock()?;
+        Ok(Self { _file: file })
+    }
 }
 
 #[derive(Debug)]
@@ -524,22 +732,6 @@ fn patch_managed_values(document: &mut DocumentMut, managed: &ManagedValues) {
     if otel.get("environment").is_none() {
         otel.insert("environment", value("local"));
     }
-}
-
-fn managed_values_match(document: &DocumentMut, managed: &ManagedValues) -> bool {
-    ensure_no_managed_conflict(document, managed).is_ok()
-        && document
-            .get("notify")
-            .is_some_and(|item| notify_matches(item, managed))
-        && document
-            .get("otel")
-            .and_then(Item::as_table_like)
-            .is_some_and(|otel| {
-                otel.get("exporter")
-                    .is_some_and(|item| exporter_matches(item, managed))
-                    && otel.get("log_user_prompt").and_then(Item::as_bool) == Some(false)
-                    && otel.get("environment").and_then(Item::as_str) == Some("local")
-            })
 }
 
 fn notify_matches(item: &Item, managed: &ManagedValues) -> bool {
@@ -670,23 +862,14 @@ fn open_read_no_follow(path: &Path) -> io::Result<File> {
 
 fn atomic_replace(
     path: &Path,
-    expected: Option<&[u8]>,
+    expected: FileExpectation<'_>,
     bytes: &[u8],
     mode: u32,
 ) -> Result<(), ConfigError> {
     let parent = path
         .parent()
         .ok_or(ConfigError::InvalidArgument("configuration path"))?;
-    let mut temp = path.to_path_buf();
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    temp.set_file_name(format!(
-        ".{}.agentobs.{}.{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("config"),
-        std::process::id(),
-        sequence
-    ));
+    let temp = unique_sibling(path, "new");
     let result = (|| {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -699,8 +882,41 @@ fn atomic_replace(
         file.write_all(bytes)?;
         file.sync_all()?;
         set_mode(&temp, mode)?;
-        verify_expected(path, expected)?;
-        fs::rename(&temp, path)?;
+        match expected {
+            FileExpectation::Missing => install_without_replace(&temp, path)?,
+            FileExpectation::Present { .. } => {
+                let displaced = unique_sibling(path, "displaced");
+                match fs::rename(path, &displaced) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        return Err(ConfigError::Conflict);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+
+                if !expected.matches_metadata(&displaced)? {
+                    restore_displaced(&displaced, path)?;
+                    return Err(ConfigError::Conflict);
+                }
+                let displaced_file = read_optional_private_file(&displaced)?;
+                if !expected.matches(&displaced_file) {
+                    restore_displaced(&displaced, path)?;
+                    return Err(ConfigError::Conflict);
+                }
+                if let Err(error) = install_without_replace(&temp, path) {
+                    restore_displaced(&displaced, path)?;
+                    return Err(error);
+                }
+
+                let installed = read_optional_private_file(path)?;
+                let displaced_after = read_optional_private_file(&displaced)?;
+                if !installed.matches(bytes, mode) || !expected.matches(&displaced_after) {
+                    return Err(ConfigError::Conflict);
+                }
+                fs::remove_file(&displaced)?;
+            }
+        }
+        fs::remove_file(&temp)?;
         sync_dir(parent)?;
         Ok(())
     })();
@@ -710,22 +926,68 @@ fn atomic_replace(
     result
 }
 
-fn verify_expected(path: &Path, expected: Option<&[u8]>) -> Result<(), ConfigError> {
-    let current = read_optional_private_file(path)?;
-    match (expected, current.existed) {
-        (None, false) => Ok(()),
-        (Some(expected), true) if current.bytes == expected => Ok(()),
-        _ => Err(ConfigError::Conflict),
+fn install_without_replace(source: &Path, destination: &Path) -> Result<(), ConfigError> {
+    match fs::hard_link(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(ConfigError::Conflict),
+        Err(error) => Err(error.into()),
     }
 }
 
-fn remove_checked(path: &Path, expected: Option<&[u8]>) -> Result<(), ConfigError> {
-    verify_expected(path, expected)?;
-    fs::remove_file(path)?;
+fn restore_displaced(displaced: &Path, path: &Path) -> Result<(), ConfigError> {
+    install_without_replace(displaced, path)?;
+    fs::remove_file(displaced)?;
     if let Some(parent) = path.parent() {
         sync_dir(parent)?;
     }
     Ok(())
+}
+
+fn remove_checked(path: &Path, expected: FileExpectation<'_>) -> Result<(), ConfigError> {
+    if matches!(expected, FileExpectation::Missing) {
+        return if checked_metadata(path)?.is_none() {
+            Ok(())
+        } else {
+            Err(ConfigError::Conflict)
+        };
+    }
+    let parent = path
+        .parent()
+        .ok_or(ConfigError::InvalidArgument("configuration path"))?;
+    let displaced = unique_sibling(path, "removed");
+    match fs::rename(path, &displaced) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(ConfigError::Conflict);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    if !expected.matches_metadata(&displaced)? {
+        restore_displaced(&displaced, path)?;
+        return Err(ConfigError::Conflict);
+    }
+    let displaced_file = read_optional_private_file(&displaced)?;
+    if !expected.matches(&displaced_file) {
+        restore_displaced(&displaced, path)?;
+        return Err(ConfigError::Conflict);
+    }
+    fs::remove_file(displaced)?;
+    sync_dir(parent)?;
+    Ok(())
+}
+
+fn unique_sibling(path: &Path, kind: &str) -> PathBuf {
+    let mut sibling = path.to_path_buf();
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    sibling.set_file_name(format!(
+        ".{}.agentobs.{kind}.{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config"),
+        std::process::id(),
+        sequence
+    ));
+    sibling
 }
 
 fn sync_dir(path: &Path) -> io::Result<()> {
@@ -792,6 +1054,8 @@ mod tests {
     use super::*;
     use std::{
         cell::Cell,
+        sync::{Arc, Barrier},
+        thread,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -833,15 +1097,49 @@ mod tests {
         fn atomic_replace(
             &self,
             path: &Path,
-            expected: Option<&[u8]>,
+            expected: FileExpectation<'_>,
             bytes: &[u8],
             mode: u32,
         ) -> Result<(), ConfigError> {
             self.mutate(|| atomic_replace(path, expected, bytes, mode))
         }
 
-        fn remove_checked(&self, path: &Path, expected: Option<&[u8]>) -> Result<(), ConfigError> {
+        fn remove_checked(
+            &self,
+            path: &Path,
+            expected: FileExpectation<'_>,
+        ) -> Result<(), ConfigError> {
             self.mutate(|| remove_checked(path, expected))
+        }
+    }
+
+    struct ConcurrentEditMutations {
+        config_path: PathBuf,
+        edit_started: Arc<Barrier>,
+        edit_finished: Arc<Barrier>,
+    }
+
+    impl FileMutations for ConcurrentEditMutations {
+        fn atomic_replace(
+            &self,
+            path: &Path,
+            expected: FileExpectation<'_>,
+            bytes: &[u8],
+            mode: u32,
+        ) -> Result<(), ConfigError> {
+            if path == self.config_path {
+                self.edit_started.wait();
+                self.edit_finished.wait();
+            }
+            atomic_replace(path, expected, bytes, mode)
+        }
+
+        fn remove_checked(
+            &self,
+            path: &Path,
+            expected: FileExpectation<'_>,
+        ) -> Result<(), ConfigError> {
+            remove_checked(path, expected)
         }
     }
 
@@ -974,6 +1272,9 @@ mod tests {
         set_mode(&root.join("config.toml"), 0o400).unwrap();
         let manager = manager(&root);
         manager.connect().unwrap();
+        let (snapshot, _) = manager.read_snapshot().unwrap();
+        assert_eq!(snapshot.prior_mode, 0o400);
+        assert_eq!(snapshot.connected_mode, 0o400);
         manager.disconnect().unwrap();
         assert_eq!(fs::read(&manager.config_path).unwrap(), original);
         assert_eq!(
@@ -1006,7 +1307,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_config_write_failure_rolls_back_exact_bytes_mode_and_snapshot() {
+    fn connect_config_write_failure_cleans_prepared_snapshot() {
         let root = root("config-write-failure");
         prepare(&root);
         let original = b"# exact\nmodel = 'before'\n";
@@ -1015,7 +1316,7 @@ mod tests {
         let manager = manager(&root);
 
         assert!(matches!(
-            manager.connect_with(&FaultMutations::new(&[(2, true)])),
+            manager.connect_with(&FaultMutations::new(&[(2, false)])),
             Err(ConfigError::Io(_))
         ));
         assert_eq!(fs::read(&manager.config_path).unwrap(), original);
@@ -1028,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_cleanup_failure_retains_snapshot_and_reports_rollback_failure() {
+    fn stale_prepared_snapshot_with_prior_current_recovers_disconnected() {
         let root = root("connect-cleanup-failure");
         prepare(&root);
         let original = b"model = 'before'\n";
@@ -1042,20 +1343,22 @@ mod tests {
         ));
         assert_eq!(fs::read(&manager.config_path).unwrap(), original);
         assert!(manager.snapshot_path().exists());
+        assert_eq!(manager.status().unwrap(), ConnectionStatus::Disconnected);
+        assert!(!manager.snapshot_path().exists());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn connect_config_rollback_failure_retains_managed_config_and_snapshot() {
-        let root = root("connect-rollback-failure");
+    fn prepared_snapshot_with_connected_current_recovers_connected() {
+        let root = root("connect-after-config-crash");
         prepare(&root);
         fs::write(root.join("config.toml"), b"model = 'before'\n").unwrap();
         set_mode(&root.join("config.toml"), 0o600).unwrap();
         let manager = manager(&root);
 
         assert!(matches!(
-            manager.connect_with(&FaultMutations::new(&[(2, true), (3, false)])),
-            Err(ConfigError::RollbackFailed)
+            manager.connect_with(&FaultMutations::new(&[(2, true)])),
+            Err(ConfigError::Io(_))
         ));
         assert!(
             fs::read_to_string(&manager.config_path)
@@ -1064,12 +1367,14 @@ mod tests {
         );
         assert!(manager.snapshot_path().exists());
         assert_eq!(manager.status().unwrap(), ConnectionStatus::Connected);
+        let (snapshot, _) = manager.read_snapshot().unwrap();
+        assert_eq!(snapshot.phase, SnapshotPhase::Connected);
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn disconnect_restore_failure_after_replace_rolls_back_to_connected_state() {
-        let root = root("disconnect-restore-failure");
+    fn restoring_snapshot_with_connected_current_recovers_connected() {
+        let root = root("disconnect-before-restore-crash");
         prepare(&root);
         fs::write(root.join("config.toml"), b"model = 'before'\n").unwrap();
         set_mode(&root.join("config.toml"), 0o400).unwrap();
@@ -1089,31 +1394,33 @@ mod tests {
         );
         assert!(manager.snapshot_path().exists());
         assert_eq!(manager.status().unwrap(), ConnectionStatus::Connected);
+        let (snapshot, _) = manager.read_snapshot().unwrap();
+        assert_eq!(snapshot.phase, SnapshotPhase::Connected);
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn disconnect_snapshot_removal_failure_rolls_back_to_connected_state() {
-        let root = root("disconnect-snapshot-removal-failure");
+    fn restoring_snapshot_with_prior_current_finishes_cleanup() {
+        let root = root("disconnect-after-restore-crash");
         prepare(&root);
-        fs::write(root.join("config.toml"), b"model = 'before'\n").unwrap();
+        let original = b"model = 'before'\n";
+        fs::write(root.join("config.toml"), original).unwrap();
         set_mode(&root.join("config.toml"), 0o400).unwrap();
         let manager = manager(&root);
         manager.connect().unwrap();
-        let connected = fs::read(&manager.config_path).unwrap();
-        let connected_mode = unix_mode(&fs::metadata(&manager.config_path).unwrap());
 
         assert!(matches!(
-            manager.disconnect_with(&FaultMutations::new(&[(2, false)])),
+            manager.disconnect_with(&FaultMutations::new(&[(3, false)])),
             Err(ConfigError::Io(_))
         ));
-        assert_eq!(fs::read(&manager.config_path).unwrap(), connected);
+        assert_eq!(fs::read(&manager.config_path).unwrap(), original);
         assert_eq!(
             unix_mode(&fs::metadata(&manager.config_path).unwrap()),
-            connected_mode
+            0o400
         );
         assert!(manager.snapshot_path().exists());
-        assert_eq!(manager.status().unwrap(), ConnectionStatus::Connected);
+        assert_eq!(manager.status().unwrap(), ConnectionStatus::Disconnected);
+        assert!(!manager.snapshot_path().exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1154,9 +1461,134 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn disconnect_conflicts_after_an_unrelated_edit_and_preserves_it() {
+        let root = root("unrelated-edit-conflict");
+        prepare(&root);
+        fs::write(root.join("config.toml"), b"model = 'before'\n").unwrap();
+        set_mode(&root.join("config.toml"), 0o600).unwrap();
+        let manager = manager(&root);
+        manager.connect().unwrap();
+        let mut edited = fs::read(&manager.config_path).unwrap();
+        edited.extend_from_slice(b"unrelated = true\n");
+        fs::write(&manager.config_path, &edited).unwrap();
+
+        assert_eq!(manager.status().unwrap(), ConnectionStatus::Conflict);
+        assert!(matches!(manager.disconnect(), Err(ConfigError::Conflict)));
+        assert_eq!(fs::read(&manager.config_path).unwrap(), edited);
+        assert!(manager.snapshot_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
-    fn ownership_state_is_private_and_contains_the_exact_prior_snapshot() {
+    fn disconnect_conflicts_after_a_mode_only_edit_and_preserves_it() {
+        let root = root("mode-edit-conflict");
+        prepare(&root);
+        fs::write(root.join("config.toml"), b"model = 'before'\n").unwrap();
+        set_mode(&root.join("config.toml"), 0o600).unwrap();
+        let manager = manager(&root);
+        manager.connect().unwrap();
+        let connected = fs::read(&manager.config_path).unwrap();
+        set_mode(&manager.config_path, 0o000).unwrap();
+
+        assert_eq!(manager.status().unwrap(), ConnectionStatus::Conflict);
+        assert!(matches!(manager.disconnect(), Err(ConfigError::Conflict)));
+        assert_eq!(
+            unix_mode(&fs::metadata(&manager.config_path).unwrap()),
+            0o000
+        );
+        set_mode(&manager.config_path, 0o400).unwrap();
+        assert_eq!(fs::read(&manager.config_path).unwrap(), connected);
+        assert!(manager.snapshot_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_external_edit_is_not_overwritten() {
+        let root = root("concurrent-external-edit");
+        prepare(&root);
+        fs::write(root.join("config.toml"), b"model = 'before'\n").unwrap();
+        set_mode(&root.join("config.toml"), 0o600).unwrap();
+        let manager = manager(&root);
+        let edited = b"model = 'edited concurrently'\n".to_vec();
+        let edit_started = Arc::new(Barrier::new(2));
+        let edit_finished = Arc::new(Barrier::new(2));
+        let editor_path = manager.config_path.clone();
+        let editor_started = Arc::clone(&edit_started);
+        let editor_finished = Arc::clone(&edit_finished);
+        let editor_bytes = edited.clone();
+        let editor = thread::spawn(move || {
+            editor_started.wait();
+            fs::write(&editor_path, editor_bytes).unwrap();
+            editor_finished.wait();
+        });
+        let mutations = ConcurrentEditMutations {
+            config_path: manager.config_path.clone(),
+            edit_started,
+            edit_finished,
+        };
+
+        assert!(matches!(
+            manager.connect_with(&mutations),
+            Err(ConfigError::Conflict)
+        ));
+        editor.join().unwrap();
+        assert_eq!(fs::read(&manager.config_path).unwrap(), edited);
+        assert!(manager.snapshot_path().exists());
+        assert_eq!(manager.status().unwrap(), ConnectionStatus::Conflict);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_supported_mutations_are_serialized() {
+        let root = root("serialized-mutations");
+        prepare(&root);
+        let manager = Arc::new(manager(&root));
+        let start = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let manager = Arc::clone(&manager);
+            let start = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                manager.connect()
+            }));
+        }
+        start.wait();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap().unwrap(), ConnectionStatus::Connected);
+        }
+        assert_eq!(manager.status().unwrap(), ConnectionStatus::Connected);
+        manager.disconnect().unwrap();
+        assert!(!manager.config_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn already_managed_config_has_unambiguous_ownership() {
+        let root = root("already-managed");
+        prepare(&root);
+        let manager = manager(&root);
+        let mut document = DocumentMut::new();
+        patch_managed_values(&mut document, &manager.managed_values());
+        let original = document.to_string().into_bytes();
+        fs::write(&manager.config_path, &original).unwrap();
+        set_mode(&manager.config_path, 0o600).unwrap();
+
+        assert_eq!(manager.connect().unwrap(), ConnectionStatus::Connected);
+        assert_eq!(manager.status().unwrap(), ConnectionStatus::Connected);
+        assert_eq!(
+            manager.disconnect().unwrap(),
+            ConnectionStatus::Disconnected
+        );
+        assert_eq!(fs::read(&manager.config_path).unwrap(), original);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_state_is_private_and_contains_exact_prior_and_connected_state() {
         use std::os::unix::fs::PermissionsExt;
         let root = root("private-state");
         prepare(&root);
@@ -1184,6 +1616,19 @@ mod tests {
         let (snapshot, _) = manager.read_snapshot().unwrap();
         assert_eq!(snapshot.prior_bytes().unwrap(), original);
         assert_eq!(snapshot.prior_hash, hash(original));
+        let connected = fs::read(&manager.config_path).unwrap();
+        assert_eq!(snapshot.connected_bytes().unwrap(), connected);
+        assert_eq!(snapshot.connected_hash, hash(&connected));
+        assert_eq!(snapshot.connected_mode, 0o600);
+        assert_eq!(snapshot.phase, SnapshotPhase::Connected);
+        assert_eq!(
+            fs::metadata(manager.state_dir.join(LOCK_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         assert!(
             !fs::read_to_string(manager.snapshot_path())
                 .unwrap()

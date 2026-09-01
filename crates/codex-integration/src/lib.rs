@@ -155,21 +155,22 @@ fn disconnect_prepared(
     lifecycle: &impl CollectorLifecycle,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
     let service = lifecycle.service(root)?;
-    let was_connected = config.status()? == ConfigConnectionStatus::Connected;
-    let status = config.disconnect()?;
-    if let Err(error) = lifecycle.uninstall(&service) {
-        if was_connected {
-            let rollback = lifecycle
+    if config.status()? == ConfigConnectionStatus::Conflict {
+        return Err(ConfigError::Conflict.into());
+    }
+    lifecycle.uninstall(&service)?;
+    let status = match config.disconnect() {
+        Ok(status) => status,
+        Err(error) => {
+            let reinstall = lifecycle
                 .install(root, executable)
-                .and_then(|_| lifecycle.wait_until_ready(root))
-                .and_then(|()| config.connect().map(|_| ()));
-            return match rollback {
+                .and_then(|_| lifecycle.wait_until_ready(root));
+            return match reinstall {
                 Ok(()) => Err(error),
-                Err(rollback) => Err(rollback_error(&error, &rollback)),
+                Err(reinstall) => Err(rollback_error(&error, &reinstall)),
             };
         }
-        return Err(error);
-    }
+    };
     Ok(CodexIntegrationStatus {
         config: status.into(),
         collector: CollectorStatus::Unavailable,
@@ -469,10 +470,18 @@ fn cleanup_failed_install(
     service: &CollectorService,
     error: IntegrationError,
 ) -> IntegrationError {
-    let bootout = launchctl.bootout(&service.target).map(|_| ());
-    let removal = remove_service_plist(service);
-    match bootout.and(removal) {
-        Ok(()) => error,
+    match launchctl.bootout(&service.target) {
+        Ok(true) => match remove_service_plist(service) {
+            Ok(()) => error,
+            Err(rollback) => rollback_error(&error, &rollback),
+        },
+        Ok(false) => rollback_error(
+            &error,
+            &IntegrationError::Runtime(format!(
+                "LaunchAgent termination unconfirmed for {}; plist retained",
+                service.target
+            )),
+        ),
         Err(rollback) => rollback_error(&error, &rollback),
     }
 }
@@ -595,7 +604,9 @@ mod tests {
         connect_prepared, disconnect_prepared, launch_agent_body, service_label, status,
     };
     #[cfg(target_os = "macos")]
-    use super::{Launchctl, install_collector_service_with};
+    use super::{Launchctl, install_collector_service_with, uninstall_collector_service_with};
+    #[cfg(target_os = "macos")]
+    use std::collections::VecDeque;
     use std::{
         cell::{Cell, RefCell},
         fs,
@@ -667,6 +678,7 @@ mod tests {
     struct FakeLifecycle {
         wait_error: bool,
         uninstall_error: bool,
+        install_error: Cell<bool>,
         events: RefCell<Vec<&'static str>>,
     }
 
@@ -675,6 +687,7 @@ mod tests {
             Self {
                 wait_error: false,
                 uninstall_error: false,
+                install_error: Cell::new(false),
                 events: RefCell::new(Vec::new()),
             }
         }
@@ -695,6 +708,9 @@ mod tests {
             _executable: &Path,
         ) -> Result<CollectorService, IntegrationError> {
             self.events.borrow_mut().push("install");
+            if self.install_error.get() {
+                return Err(IntegrationError::Runtime("install failed".into()));
+            }
             Ok(Self::service())
         }
 
@@ -843,36 +859,10 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_config_failure_does_not_stop_service() {
+    fn disconnect_config_failure_reinstalls_service_after_confirmed_removal() {
         let config = FakeConfig::connected();
         config.disconnect_error.set(true);
         let lifecycle = FakeLifecycle::ready();
-
-        assert!(
-            disconnect_prepared(
-                Path::new("/runtime"),
-                Path::new("/bin/agentobs"),
-                "http://127.0.0.1:43181/v1/logs",
-                &config,
-                &lifecycle,
-            )
-            .is_err()
-        );
-        assert_eq!(*lifecycle.events.borrow(), ["service"]);
-        assert_eq!(
-            *config.events.borrow(),
-            ["config-status", "config-disconnect"]
-        );
-        assert_eq!(config.state.get(), ConfigConnectionStatus::Connected);
-    }
-
-    #[test]
-    fn disconnect_service_failure_reconnects_config() {
-        let config = FakeConfig::connected();
-        let lifecycle = FakeLifecycle {
-            uninstall_error: true,
-            ..FakeLifecycle::ready()
-        };
 
         assert!(
             disconnect_prepared(
@@ -890,8 +880,31 @@ mod tests {
         );
         assert_eq!(
             *config.events.borrow(),
-            ["config-status", "config-disconnect", "config-connect"]
+            ["config-status", "config-disconnect"]
         );
+        assert_eq!(config.state.get(), ConfigConnectionStatus::Connected);
+    }
+
+    #[test]
+    fn disconnect_service_failure_does_not_mutate_config() {
+        let config = FakeConfig::connected();
+        let lifecycle = FakeLifecycle {
+            uninstall_error: true,
+            ..FakeLifecycle::ready()
+        };
+
+        assert!(
+            disconnect_prepared(
+                Path::new("/runtime"),
+                Path::new("/bin/agentobs"),
+                "http://127.0.0.1:43181/v1/logs",
+                &config,
+                &lifecycle,
+            )
+            .is_err()
+        );
+        assert_eq!(*lifecycle.events.borrow(), ["service", "uninstall"]);
+        assert_eq!(*config.events.borrow(), ["config-status"]);
         assert_eq!(config.state.get(), ConfigConnectionStatus::Connected);
     }
 
@@ -913,21 +926,16 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(
-            *config.events.borrow(),
-            ["config-status", "config-disconnect"]
-        );
+        assert_eq!(*config.events.borrow(), ["config-status"]);
         assert_eq!(config.state.get(), ConfigConnectionStatus::Disconnected);
     }
 
     #[test]
-    fn disconnect_reports_failed_config_rollback() {
+    fn disconnect_reports_failed_service_reinstall() {
         let config = FakeConfig::connected();
-        config.connect_error.set(true);
-        let lifecycle = FakeLifecycle {
-            uninstall_error: true,
-            ..FakeLifecycle::ready()
-        };
+        config.disconnect_error.set(true);
+        let lifecycle = FakeLifecycle::ready();
+        lifecycle.install_error.set(true);
 
         let error = disconnect_prepared(
             Path::new("/runtime"),
@@ -938,13 +946,55 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("rollback failed"));
+        assert_eq!(config.state.get(), ConfigConnectionStatus::Connected);
+        assert_eq!(
+            *lifecycle.events.borrow(),
+            ["service", "uninstall", "install"]
+        );
+    }
+
+    #[test]
+    fn disconnect_recovery_is_idempotent_after_failed_reinstall() {
+        let config = FakeConfig::connected();
+        config.disconnect_error.set(true);
+        let lifecycle = FakeLifecycle::ready();
+        lifecycle.install_error.set(true);
+
+        assert!(
+            disconnect_prepared(
+                Path::new("/runtime"),
+                Path::new("/bin/agentobs"),
+                "http://127.0.0.1:43181/v1/logs",
+                &config,
+                &lifecycle,
+            )
+            .is_err()
+        );
+
+        config.disconnect_error.set(false);
+        lifecycle.install_error.set(false);
+        let status = disconnect_prepared(
+            Path::new("/runtime"),
+            Path::new("/bin/agentobs"),
+            "http://127.0.0.1:43181/v1/logs",
+            &config,
+            &lifecycle,
+        )
+        .unwrap();
+
+        assert_eq!(status.config, ConnectionStatus::Disconnected);
         assert_eq!(config.state.get(), ConfigConnectionStatus::Disconnected);
+        assert_eq!(
+            *lifecycle.events.borrow(),
+            ["service", "uninstall", "install", "service", "uninstall"]
+        );
     }
 
     #[cfg(target_os = "macos")]
     struct FakeLaunchctl {
         bootstrap_error: bool,
         kickstart_error: bool,
+        bootout_results: RefCell<VecDeque<Result<bool, &'static str>>>,
         events: RefCell<Vec<&'static str>>,
     }
 
@@ -952,7 +1002,11 @@ mod tests {
     impl Launchctl for FakeLaunchctl {
         fn bootout(&self, _target: &str) -> Result<bool, IntegrationError> {
             self.events.borrow_mut().push("bootout");
-            Ok(true)
+            self.bootout_results
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Ok(true))
+                .map_err(|message| IntegrationError::Runtime(message.into()))
         }
 
         fn bootstrap(&self, _domain: &str, _plist: &Path) -> Result<(), IntegrationError> {
@@ -992,6 +1046,7 @@ mod tests {
         let launchctl = FakeLaunchctl {
             bootstrap_error: true,
             kickstart_error: false,
+            bootout_results: RefCell::new(VecDeque::from([Ok(true), Ok(true)])),
             events: RefCell::new(Vec::new()),
         };
 
@@ -1016,6 +1071,7 @@ mod tests {
         let launchctl = FakeLaunchctl {
             bootstrap_error: false,
             kickstart_error: true,
+            bootout_results: RefCell::new(VecDeque::from([Ok(true), Ok(true)])),
             events: RefCell::new(Vec::new()),
         };
 
@@ -1028,6 +1084,110 @@ mod tests {
             ["bootout", "bootstrap", "kickstart", "bootout"]
         );
         assert!(!plist.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_install_retains_plist_when_bootout_is_unconfirmed() {
+        let root = temporary_root("cleanup-bootout-false");
+        let service = test_service(&root);
+        let plist = service.plist.clone();
+        let launchctl = FakeLaunchctl {
+            bootstrap_error: true,
+            kickstart_error: false,
+            bootout_results: RefCell::new(VecDeque::from([Ok(true), Ok(false)])),
+            events: RefCell::new(Vec::new()),
+        };
+
+        let error =
+            install_collector_service_with(service, &root, Path::new("/bin/agentobs"), &launchctl)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("termination unconfirmed"));
+        assert!(plist.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_install_retains_plist_when_bootout_errors() {
+        let root = temporary_root("cleanup-bootout-error");
+        let service = test_service(&root);
+        let plist = service.plist.clone();
+        let launchctl = FakeLaunchctl {
+            bootstrap_error: true,
+            kickstart_error: false,
+            bootout_results: RefCell::new(VecDeque::from([Ok(true), Err("bootout failed")])),
+            events: RefCell::new(Vec::new()),
+        };
+
+        let error =
+            install_collector_service_with(service, &root, Path::new("/bin/agentobs"), &launchctl)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("bootout failed"));
+        assert!(plist.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uninstall_retains_plist_when_bootout_is_unconfirmed() {
+        let root = temporary_root("uninstall-bootout-false");
+        let service = test_service(&root);
+        fs::create_dir_all(service.plist.parent().unwrap()).unwrap();
+        fs::write(&service.plist, b"plist").unwrap();
+        let launchctl = FakeLaunchctl {
+            bootstrap_error: false,
+            kickstart_error: false,
+            bootout_results: RefCell::new(VecDeque::from([Ok(false)])),
+            events: RefCell::new(Vec::new()),
+        };
+
+        assert!(uninstall_collector_service_with(&service, &launchctl).is_err());
+        assert!(service.plist.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uninstall_retains_plist_when_bootout_errors() {
+        let root = temporary_root("uninstall-bootout-error");
+        let service = test_service(&root);
+        fs::create_dir_all(service.plist.parent().unwrap()).unwrap();
+        fs::write(&service.plist, b"plist").unwrap();
+        let launchctl = FakeLaunchctl {
+            bootstrap_error: false,
+            kickstart_error: false,
+            bootout_results: RefCell::new(VecDeque::from([Err("bootout failed")])),
+            events: RefCell::new(Vec::new()),
+        };
+
+        assert!(uninstall_collector_service_with(&service, &launchctl).is_err());
+        assert!(service.plist.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uninstall_recovery_removes_retained_plist_after_confirmed_bootout() {
+        let root = temporary_root("uninstall-recovery");
+        let service = test_service(&root);
+        fs::create_dir_all(service.plist.parent().unwrap()).unwrap();
+        fs::write(&service.plist, b"plist").unwrap();
+        let launchctl = FakeLaunchctl {
+            bootstrap_error: false,
+            kickstart_error: false,
+            bootout_results: RefCell::new(VecDeque::from([Ok(false), Ok(true)])),
+            events: RefCell::new(Vec::new()),
+        };
+
+        assert!(uninstall_collector_service_with(&service, &launchctl).is_err());
+        assert!(service.plist.exists());
+        uninstall_collector_service_with(&service, &launchctl).unwrap();
+        assert!(!service.plist.exists());
+        assert_eq!(*launchctl.events.borrow(), ["bootout", "bootout"]);
         let _ = fs::remove_dir_all(root);
     }
 }

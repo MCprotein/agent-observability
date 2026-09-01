@@ -130,6 +130,17 @@ pub enum IngestStatus {
     Suppressed,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum StoreBatchItem<'a> {
+    Observation(&'a SourceObservation),
+    Disposition {
+        checkpoint: &'a SourceCheckpoint,
+        disposition: AdapterDispositionKind,
+        code: AdapterDispositionCode,
+        canonical_payload_hash: Option<&'a str>,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetentionPlan {
     pub plan_id: String,
@@ -409,23 +420,54 @@ impl LocalStore {
         &mut self,
         observations: &[SourceObservation],
     ) -> Result<Vec<IngestStatus>, StoreError> {
-        self.ingest_batch_at(observations, None)
+        let items = observations
+            .iter()
+            .map(StoreBatchItem::Observation)
+            .collect::<Vec<_>>();
+        self.ingest_ordered_batch_at(&items, None)
     }
 
-    fn ingest_batch_at(
+    /// Atomically commits ordered observations and content-free dispositions while deferring the
+    /// replayable projection rebuild.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::ingest`] and [`Self::ingest_disposition`].
+    pub fn ingest_ordered_batch_deferred_projection(
         &mut self,
-        observations: &[SourceObservation],
+        items: &[StoreBatchItem<'_>],
+    ) -> Result<Vec<IngestStatus>, StoreError> {
+        self.ingest_ordered_batch_at(items, None)
+    }
+
+    fn ingest_ordered_batch_at(
+        &mut self,
+        items: &[StoreBatchItem<'_>],
         crash: Option<CrashPoint>,
     ) -> Result<Vec<IngestStatus>, StoreError> {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-        let mut statuses = Vec::with_capacity(observations.len());
-        for observation in observations {
-            statuses.push(Self::ingest_in_transaction(
-                &tx,
-                observation,
-                None,
-                self.has_expired_guards.get(),
-            )?);
+        let mut statuses = Vec::with_capacity(items.len());
+        for item in items {
+            statuses.push(match item {
+                StoreBatchItem::Observation(observation) => Self::ingest_in_transaction(
+                    &tx,
+                    observation,
+                    None,
+                    self.has_expired_guards.get(),
+                )?,
+                StoreBatchItem::Disposition {
+                    checkpoint,
+                    disposition,
+                    code,
+                    canonical_payload_hash,
+                } => Self::ingest_disposition_in_transaction(
+                    &tx,
+                    checkpoint,
+                    *disposition,
+                    *code,
+                    *canonical_payload_hash,
+                )?,
+            });
         }
         if crash == Some(CrashPoint::BeforeCommit) {
             return Err(StoreError::Crash(CrashPoint::BeforeCommit));
@@ -465,6 +507,25 @@ impl LocalStore {
         code: AdapterDispositionCode,
         canonical_payload_hash: Option<&str>,
     ) -> Result<IngestStatus, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let status = Self::ingest_disposition_in_transaction(
+            &tx,
+            checkpoint,
+            disposition,
+            code,
+            canonical_payload_hash,
+        )?;
+        tx.commit()?;
+        Ok(status)
+    }
+
+    fn ingest_disposition_in_transaction(
+        tx: &Transaction<'_>,
+        checkpoint: &SourceCheckpoint,
+        disposition: AdapterDispositionKind,
+        code: AdapterDispositionCode,
+        canonical_payload_hash: Option<&str>,
+    ) -> Result<IngestStatus, StoreError> {
         let source = checkpoint.source.as_str();
         let generation = hash_opaque_identifier(checkpoint.source_generation.as_str());
         let cursor = checkpoint.source_cursor.as_str();
@@ -487,7 +548,6 @@ impl LocalStore {
             },
             str::to_owned,
         );
-        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         if let Some((existing_disposition, existing_code, existing_hash)) = tx
             .query_row(
                 "SELECT disposition, code, payload_hash FROM adapter_dispositions WHERE source=?1 AND generation=?2 AND cursor=?3",
@@ -504,19 +564,18 @@ impl LocalStore {
             }
             return Ok(IngestStatus::Duplicate);
         }
-        if cursor_exists(&tx, "source_inputs", source, &generation, cursor)? {
+        if cursor_exists(tx, "source_inputs", source, &generation, cursor)? {
             return Err(StoreError::PayloadConflict);
         }
-        if !checkpoint_cursor_matches(&tx, checkpoint)? {
+        if !checkpoint_cursor_matches(tx, checkpoint)? {
             return Err(StoreError::CursorConflict);
         }
         tx.execute(
             "INSERT INTO adapter_dispositions(source,generation,cursor,disposition,code,payload_hash) VALUES (?1,?2,?3,?4,?5,?6)",
             params![source, generation, cursor, disposition.as_str(), code.as_str(), payload_hash],
         )?;
-        advance_checkpoint_cursor(&tx, checkpoint)?;
-        prune_adapter_dispositions(&tx)?;
-        tx.commit()?;
+        advance_checkpoint_cursor(tx, checkpoint)?;
+        prune_adapter_dispositions(tx)?;
         Ok(IngestStatus::Committed)
     }
 
@@ -3026,6 +3085,93 @@ mod tests {
     }
 
     #[test]
+    fn ordered_mixed_batch_commits_and_replays_in_one_cursor_namespace() {
+        let dir = temp_dir("ordered-mixed-batch");
+        let _ = fs::remove_dir_all(&dir);
+        let first = observation("1", "session", None);
+        let disposition = SourceCheckpoint {
+            source: AgentSource::Codex,
+            source_generation: SourceGeneration::parse("generation").unwrap(),
+            previous_source_cursor: Some(SourceCursor::parse("1").unwrap()),
+            source_cursor: SourceCursor::parse("2").unwrap(),
+        };
+        let last = observation_after("3", Some("2"), "turn", Some("session"));
+        let items = [
+            StoreBatchItem::Observation(&first),
+            StoreBatchItem::Disposition {
+                checkpoint: &disposition,
+                disposition: AdapterDispositionKind::Diagnostic,
+                code: AdapterDispositionCode::ContentEventIgnored,
+                canonical_payload_hash: None,
+            },
+            StoreBatchItem::Observation(&last),
+        ];
+        let mut store = LocalStore::open(&dir).unwrap();
+
+        assert_eq!(
+            store
+                .ingest_ordered_batch_deferred_projection(&items)
+                .unwrap(),
+            [
+                IngestStatus::Committed,
+                IngestStatus::Committed,
+                IngestStatus::Committed
+            ]
+        );
+        assert_eq!(store.observation_count().unwrap(), 2);
+        assert_eq!(store.disposition_count().unwrap(), 1);
+        assert_eq!(
+            store.cursor("codex", "generation").unwrap().as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            store
+                .ingest_ordered_batch_deferred_projection(&items)
+                .unwrap(),
+            [
+                IngestStatus::Duplicate,
+                IngestStatus::Duplicate,
+                IngestStatus::Duplicate
+            ]
+        );
+        assert_eq!(store.observation_count().unwrap(), 2);
+        assert_eq!(store.disposition_count().unwrap(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ordered_mixed_batch_rolls_back_dispositions_and_observations() {
+        let dir = temp_dir("ordered-mixed-rollback");
+        let _ = fs::remove_dir_all(&dir);
+        let first = observation("1", "session", None);
+        let disposition = SourceCheckpoint {
+            source: AgentSource::Codex,
+            source_generation: SourceGeneration::parse("generation").unwrap(),
+            previous_source_cursor: Some(SourceCursor::parse("1").unwrap()),
+            source_cursor: SourceCursor::parse("2").unwrap(),
+        };
+        let items = [
+            StoreBatchItem::Observation(&first),
+            StoreBatchItem::Disposition {
+                checkpoint: &disposition,
+                disposition: AdapterDispositionKind::Diagnostic,
+                code: AdapterDispositionCode::ContentEventIgnored,
+                canonical_payload_hash: Some("invalid"),
+            },
+        ];
+        let mut store = LocalStore::open(&dir).unwrap();
+
+        assert!(matches!(
+            store.ingest_ordered_batch_deferred_projection(&items),
+            Err(StoreError::InvalidObservation)
+        ));
+        assert_eq!(store.observation_count().unwrap(), 0);
+        assert_eq!(store.disposition_count().unwrap(), 0);
+        assert_eq!(store.cursor("codex", "generation").unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn deferred_batch_crash_boundaries_reopen_without_partial_progress() {
         for (label, point, expected) in [
             ("batch-before-commit", CrashPoint::BeforeCommit, 0),
@@ -3037,9 +3183,13 @@ mod tests {
                 observation("1", "session", None),
                 observation_after("2", Some("1"), "turn", Some("session")),
             ];
+            let items = batch
+                .iter()
+                .map(StoreBatchItem::Observation)
+                .collect::<Vec<_>>();
             let mut store = LocalStore::open(&dir).unwrap();
             assert!(matches!(
-                store.ingest_batch_at(&batch, Some(point)),
+                store.ingest_ordered_batch_at(&items, Some(point)),
                 Err(StoreError::Crash(actual)) if actual == point
             ));
             drop(store);
