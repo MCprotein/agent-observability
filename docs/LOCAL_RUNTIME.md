@@ -82,8 +82,8 @@ Codex config ownership is transactional. The manager uses `$CODEX_HOME/config.to
 otherwise `~/.codex/config.toml`, and manages only top-level `notify`, the local JSON `otel.exporter`,
 `otel.log_user_prompt=false`, and `otel.environment="local"`. Notify is exactly the absolute `agentobs` path,
 `codex-notify`, and absolute runtime root. The exporter contains only the configured local `/v1/logs` endpoint,
-JSON protocol and private token header. The endpoint port comes from private collector settings; `43181` is the
-current default. Connect refuses pre-existing managed values unless they match exactly.
+JSON protocol and private token header. The endpoint port is an OS-assigned available loopback port persisted in
+private collector settings. Connect refuses pre-existing managed values unless they match exactly.
 Before changing the file, it stores the exact prior and connected bytes, hashes, existence, permission modes
 and transaction phase in `runtime/integrations/codex/codex-config-ownership-v1.json` with private permissions.
 A private mutation lock and displaced-file compare/replace preserve conflicting edits. Prepared and restoring

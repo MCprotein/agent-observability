@@ -247,7 +247,7 @@ archive는 managed runtime 밖에 둔다.
 Team은 standalone을 대체하지 않고 같은 domain semantics 위에 선택적으로 추가한다.
 
 ```mermaid
-flowchart LR
+flowchart TB
     Domain["Domain / application state"]
     Projector["Strict team projector"]
     Outbox["Bounded encrypted outbox"]

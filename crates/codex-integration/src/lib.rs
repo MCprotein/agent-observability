@@ -444,7 +444,7 @@ fn uninstall_collector_service_with(
     service: &CollectorService,
     launchctl: &impl Launchctl,
 ) -> Result<(), IntegrationError> {
-    if !launchctl.bootout(&service.target)? && service.plist.exists() {
+    if !launchctl.bootout(&service.target)? && launchctl.is_loaded(&service.target)? {
         return Err(IntegrationError::Runtime(format!(
             "LaunchAgent stop failed for {}",
             service.target
@@ -470,7 +470,14 @@ fn cleanup_failed_install(
     service: &CollectorService,
     error: IntegrationError,
 ) -> IntegrationError {
-    match launchctl.bootout(&service.target) {
+    let stopped = launchctl.bootout(&service.target).and_then(|stopped| {
+        if stopped {
+            Ok(true)
+        } else {
+            launchctl.is_loaded(&service.target).map(|loaded| !loaded)
+        }
+    });
+    match stopped {
         Ok(true) => match remove_service_plist(service) {
             Ok(()) => error,
             Err(rollback) => rollback_error(&error, &rollback),
@@ -529,6 +536,9 @@ fn current_uid() -> Result<String, IntegrationError> {
 #[cfg(target_os = "macos")]
 trait Launchctl {
     fn bootout(&self, target: &str) -> Result<bool, IntegrationError>;
+    fn is_loaded(&self, _target: &str) -> Result<bool, IntegrationError> {
+        Ok(true)
+    }
     fn bootstrap(&self, domain: &str, plist: &Path) -> Result<(), IntegrationError>;
     fn kickstart(&self, target: &str) -> Result<(), IntegrationError>;
 }
@@ -545,6 +555,18 @@ impl Launchctl for SystemLaunchctl {
             .status()
             .map(|status| status.success())
             .map_err(|error| IntegrationError::Runtime(format!("LaunchAgent stop failed: {error}")))
+    }
+
+    fn is_loaded(&self, target: &str) -> Result<bool, IntegrationError> {
+        Command::new("launchctl")
+            .args(["print", target])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .map_err(|error| {
+                IntegrationError::Runtime(format!("LaunchAgent status check failed: {error}"))
+            })
     }
 
     fn bootstrap(&self, domain: &str, plist: &Path) -> Result<(), IntegrationError> {
@@ -1029,6 +1051,28 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    struct AlreadyStoppedLaunchctl;
+
+    #[cfg(target_os = "macos")]
+    impl Launchctl for AlreadyStoppedLaunchctl {
+        fn bootout(&self, _target: &str) -> Result<bool, IntegrationError> {
+            Ok(false)
+        }
+
+        fn is_loaded(&self, _target: &str) -> Result<bool, IntegrationError> {
+            Ok(false)
+        }
+
+        fn bootstrap(&self, _domain: &str, _plist: &Path) -> Result<(), IntegrationError> {
+            unreachable!()
+        }
+
+        fn kickstart(&self, _target: &str) -> Result<(), IntegrationError> {
+            unreachable!()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn test_service(root: &Path) -> CollectorService {
         CollectorService {
             label: "test-service".into(),
@@ -1188,6 +1232,20 @@ mod tests {
         uninstall_collector_service_with(&service, &launchctl).unwrap();
         assert!(!service.plist.exists());
         assert_eq!(*launchctl.events.borrow(), ["bootout", "bootout"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uninstall_accepts_independently_confirmed_already_stopped_service() {
+        let root = temporary_root("uninstall-already-stopped");
+        let service = test_service(&root);
+        fs::create_dir_all(service.plist.parent().unwrap()).unwrap();
+        fs::write(&service.plist, b"plist").unwrap();
+
+        uninstall_collector_service_with(&service, &AlreadyStoppedLaunchctl).unwrap();
+
+        assert!(!service.plist.exists());
         let _ = fs::remove_dir_all(root);
     }
 }
