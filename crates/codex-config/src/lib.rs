@@ -14,6 +14,7 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Value, value};
 const SNAPSHOT_FILE: &str = "codex-config-ownership-v1.json";
 const LOCK_FILE: &str = ".codex-config-ownership.lock";
 const SNAPSHOT_VERSION: &str = "codex_config_ownership.v1";
+const AUTH_HEADER_NAME: &str = "x-agent-observability-token";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: u64 = MAX_CONFIG_BYTES * 4 + 8192;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -84,27 +85,35 @@ pub struct CodexConfigManager {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MutualTlsPaths {
+pub struct ExporterSecurity {
     ca_certificate: String,
-    client_certificate: String,
-    client_private_key: String,
+    auth_header_value: String,
 }
 
-impl MutualTlsPaths {
-    /// Validates the three certificate paths used by the Codex OTLP exporter.
+impl ExporterSecurity {
+    /// Validates the CA path and private request header used by the Codex OTLP exporter.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::InvalidArgument`] when any path is empty, relative, or not UTF-8.
+    /// Returns [`ConfigError::InvalidArgument`] when the path is empty, relative, or not UTF-8,
+    /// or when the header value is empty or cannot be represented as an HTTP header value.
     pub fn new(
         ca_certificate: impl Into<PathBuf>,
-        client_certificate: impl Into<PathBuf>,
-        client_private_key: impl Into<PathBuf>,
+        auth_header_value: impl Into<String>,
     ) -> Result<Self, ConfigError> {
+        let auth_header_value = auth_header_value.into();
+        if auth_header_value.is_empty()
+            || auth_header_value
+                .bytes()
+                .any(|byte| !matches!(byte, 0x21..=0x7e))
+        {
+            return Err(ConfigError::InvalidArgument(
+                "collector authentication header value",
+            ));
+        }
         Ok(Self {
             ca_certificate: managed_path(ca_certificate.into(), "CA certificate path")?,
-            client_certificate: managed_path(client_certificate.into(), "client certificate path")?,
-            client_private_key: managed_path(client_private_key.into(), "client private key path")?,
+            auth_header_value,
         })
     }
 }
@@ -159,14 +168,15 @@ impl CodexConfigManager {
     /// # Errors
     ///
     /// Returns [`ConfigError::InvalidArgument`] when the binary or runtime path is empty, relative,
-    /// or not UTF-8, or when the port is zero. TLS paths are validated by [`MutualTlsPaths::new`].
+    /// or not UTF-8, or when the port is zero. Exporter security values are validated by
+    /// [`ExporterSecurity::new`].
     pub fn new(
         config_path: impl Into<PathBuf>,
         state_dir: impl Into<PathBuf>,
         agentobs_binary: impl Into<PathBuf>,
         runtime_root: impl Into<PathBuf>,
         port: u16,
-        tls: MutualTlsPaths,
+        security: ExporterSecurity,
     ) -> Result<Self, ConfigError> {
         let agentobs_binary = managed_path(agentobs_binary.into(), "agentobs binary path")?;
         let runtime_root = managed_path(runtime_root.into(), "runtime root path")?;
@@ -180,9 +190,8 @@ impl CodexConfigManager {
                 binary: agentobs_binary,
                 runtime_root,
                 endpoint: format!("https://127.0.0.1:{port}/v1/logs"),
-                ca_certificate: tls.ca_certificate,
-                client_certificate: tls.client_certificate,
-                client_private_key: tls.client_private_key,
+                ca_certificate: security.ca_certificate,
+                auth_header_value: security.auth_header_value,
             }),
         })
     }
@@ -659,10 +668,18 @@ impl CodexConfigManager {
     }
 
     fn lock(&self) -> Result<MutationLock, ConfigError> {
-        // Creation can race another supported writer. Revalidate the winning directory before
-        // opening its lock file; never chmod a directory created by somebody else.
-        validate_private_dir(&self.state_dir)?;
-        MutationLock::acquire(&self.state_dir.join(LOCK_FILE))
+        let lock_path = self.lock_path()?;
+        // Every runtime mutates the same user-global Codex config. Keep its lock at that shared
+        // boundary so managers with different ownership state directories still serialize.
+        MutationLock::acquire(&lock_path)
+    }
+
+    fn lock_path(&self) -> Result<PathBuf, ConfigError> {
+        Ok(self
+            .config_path
+            .parent()
+            .ok_or(ConfigError::InvalidArgument("Codex config path"))?
+            .join(LOCK_FILE))
     }
 
     fn ensure_private_state_dir(&self) -> Result<(), ConfigError> {
@@ -890,8 +907,7 @@ struct ManagedValues {
     runtime_root: String,
     endpoint: String,
     ca_certificate: String,
-    client_certificate: String,
-    client_private_key: String,
+    auth_header_value: String,
 }
 
 impl ManagedValues {
@@ -906,18 +922,13 @@ impl ManagedValues {
     fn exporter(&self) -> Value {
         let mut tls = InlineTable::new();
         tls.insert("ca-certificate", self.ca_certificate.as_str().into());
-        tls.insert(
-            "client-certificate",
-            self.client_certificate.as_str().into(),
-        );
-        tls.insert(
-            "client-private-key",
-            self.client_private_key.as_str().into(),
-        );
+        let mut headers = InlineTable::new();
+        headers.insert(AUTH_HEADER_NAME, self.auth_header_value.as_str().into());
         let mut http = InlineTable::new();
         http.insert("endpoint", self.endpoint.as_str().into());
         http.insert("protocol", "json".into());
         http.insert("tls", Value::InlineTable(tls));
+        http.insert("headers", Value::InlineTable(headers));
         let mut exporter = InlineTable::new();
         exporter.insert("otlp-http", Value::InlineTable(http));
         Value::InlineTable(exporter)
@@ -1032,17 +1043,19 @@ fn exporter_matches(item: &Item, managed: &ManagedValues) -> bool {
     let Some(tls) = http.get("tls").and_then(Value::as_inline_table) else {
         return false;
     };
+    let Some(headers) = http.get("headers").and_then(Value::as_inline_table) else {
+        return false;
+    };
     exporter.len() == 1
-        && http.len() == 3
-        && tls.len() == 3
+        && http.len() == 4
+        && tls.len() == 1
+        && headers.len() == 1
         && http.get("endpoint").and_then(Value::as_str) == Some(managed.endpoint.as_str())
         && http.get("protocol").and_then(Value::as_str) == Some("json")
         && tls.get("ca-certificate").and_then(Value::as_str)
             == Some(managed.ca_certificate.as_str())
-        && tls.get("client-certificate").and_then(Value::as_str)
-            == Some(managed.client_certificate.as_str())
-        && tls.get("client-private-key").and_then(Value::as_str)
-            == Some(managed.client_private_key.as_str())
+        && headers.get(AUTH_HEADER_NAME).and_then(Value::as_str)
+            == Some(managed.auth_header_value.as_str())
 }
 
 fn read_optional_private_file(path: &Path) -> Result<ExistingFile, ConfigError> {
@@ -1405,36 +1418,34 @@ mod tests {
     }
 
     fn manager_with_port(root: &Path, port: u16) -> CodexConfigManager {
-        manager_with_tls(root, port, "current")
+        manager_with_security(root, port, "current")
     }
 
-    fn manager_with_tls(root: &Path, port: u16, generation: &str) -> CodexConfigManager {
+    fn manager_with_security(root: &Path, port: u16, generation: &str) -> CodexConfigManager {
         let tls_root = root.join(format!("tls/{generation}"));
-        manager_with_tls_paths(
+        manager_with_security_values(
             root,
             port,
             tls_root.join("ca-certificate.pem"),
-            tls_root.join("client-certificate.pem"),
-            tls_root.join("client-private-key.pem"),
+            format!("token-{generation}"),
         )
         .unwrap()
     }
 
-    fn manager_with_tls_paths(
+    fn manager_with_security_values(
         root: &Path,
         port: u16,
         ca_certificate: impl Into<PathBuf>,
-        client_certificate: impl Into<PathBuf>,
-        client_private_key: impl Into<PathBuf>,
+        auth_header_value: impl Into<String>,
     ) -> Result<CodexConfigManager, ConfigError> {
-        let tls = MutualTlsPaths::new(ca_certificate, client_certificate, client_private_key)?;
+        let security = ExporterSecurity::new(ca_certificate, auth_header_value)?;
         CodexConfigManager::new(
             root.join("config.toml"),
             root.join("state"),
             root.join("bin/agent-observability"),
             root.join("runtime"),
             port,
-            tls,
+            security,
         )
     }
 
@@ -1444,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_exact_mutual_tls_toml_and_removes_new_file_on_disconnect() {
+    fn emits_exact_server_authenticated_toml_and_removes_new_file_on_disconnect() {
         let root = root("new");
         prepare(&root);
         let manager = manager(&root);
@@ -1461,18 +1472,16 @@ mod tests {
                     "\n[otel]\n",
                     "exporter = {{ otlp-http = {{ endpoint = ",
                     "\"https://127.0.0.1:4318/v1/logs\", protocol = \"json\", tls = {{ ",
-                    "ca-certificate = \"{0}/tls/current/ca-certificate.pem\", ",
-                    "client-certificate = \"{0}/tls/current/client-certificate.pem\", ",
-                    "client-private-key = \"{0}/tls/current/client-private-key.pem\" ",
-                    "}} }} }}\n",
+                    "ca-certificate = \"{0}/tls/current/ca-certificate.pem\" }}, ",
+                    "headers = {{ x-agent-observability-token = \"token-current\" }} }} }}\n",
                     "log_user_prompt = false\n",
                     "environment = \"local\"\n"
                 ),
                 root.display()
             )
         );
-        assert!(!text.contains("token"));
-        assert!(!text.contains("headers"));
+        assert!(!text.contains("client-certificate"));
+        assert!(!text.contains("client-private-key"));
         assert_eq!(
             manager.disconnect().unwrap(),
             ConnectionStatus::Disconnected
@@ -1494,12 +1503,7 @@ mod tests {
             root.join("bin/agent-observability"),
             root.join("runtime-root"),
             4318,
-            MutualTlsPaths::new(
-                root.join("tls/ca-certificate.pem"),
-                root.join("tls/client-certificate.pem"),
-                root.join("tls/client-private-key.pem"),
-            )
-            .unwrap(),
+            ExporterSecurity::new(root.join("tls/ca-certificate.pem"), "private-token").unwrap(),
         )
         .unwrap();
 
@@ -1517,18 +1521,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_or_relative_tls_paths() {
+    fn rejects_invalid_exporter_security_values() {
         let root = root("invalid-tls-paths");
         prepare(&root);
         let absolute = root.join("certificate.pem");
 
         for result in [
-            manager_with_tls_paths(&root, 4318, "", &absolute, &absolute),
-            manager_with_tls_paths(&root, 4318, &absolute, "", &absolute),
-            manager_with_tls_paths(&root, 4318, &absolute, &absolute, ""),
-            manager_with_tls_paths(&root, 4318, "relative.pem", &absolute, &absolute),
-            manager_with_tls_paths(&root, 4318, &absolute, "relative.pem", &absolute),
-            manager_with_tls_paths(&root, 4318, &absolute, &absolute, "relative.pem"),
+            manager_with_security_values(&root, 4318, "", "private-token"),
+            manager_with_security_values(&root, 4318, "relative.pem", "private-token"),
+            manager_with_security_values(&root, 4318, &absolute, ""),
+            manager_with_security_values(&root, 4318, &absolute, "token with spaces"),
+            manager_with_security_values(&root, 4318, &absolute, "token\nwith-control"),
         ] {
             assert!(matches!(result, Err(ConfigError::InvalidArgument(_))));
         }
@@ -1537,7 +1540,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_non_utf8_tls_paths() {
+    fn rejects_non_utf8_ca_path() {
         use std::os::unix::ffi::OsStringExt;
 
         let root = root("non-utf8-tls-path");
@@ -1545,15 +1548,10 @@ mod tests {
         let mut invalid = root.clone().into_os_string();
         invalid.push(std::ffi::OsString::from_vec(vec![b'/', 0xff]));
         let invalid = PathBuf::from(invalid);
-        let absolute = root.join("certificate.pem");
-
-        for result in [
-            manager_with_tls_paths(&root, 4318, &invalid, &absolute, &absolute),
-            manager_with_tls_paths(&root, 4318, &absolute, &invalid, &absolute),
-            manager_with_tls_paths(&root, 4318, &absolute, &absolute, &invalid),
-        ] {
-            assert!(matches!(result, Err(ConfigError::InvalidArgument(_))));
-        }
+        assert!(matches!(
+            manager_with_security_values(&root, 4318, &invalid, "private-token"),
+            Err(ConfigError::InvalidArgument(_))
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1594,40 +1592,44 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_headers_and_non_exact_tls_exporters() {
+    fn rejects_non_exact_server_authenticated_exporters() {
         for (name, conflict) in [
-            ("legacy-token-header", "legacy"),
+            ("missing-token-header", "missing-header"),
             ("tls-additional-key", "tls-additional"),
             ("http-additional-header", "http-additional"),
-            ("tls-unknown-key", "tls-unknown"),
+            ("headers-additional-key", "headers-additional"),
+            ("wrong-token", "wrong-token"),
         ] {
             let root = root(name);
             prepare(&root);
             let expected = manager(&root).managed_values().unwrap().clone();
             let endpoint = expected.endpoint;
             let ca = expected.ca_certificate;
-            let certificate = expected.client_certificate;
-            let key = expected.client_private_key;
+            let token = expected.auth_header_value;
             let exporter = match conflict {
-                "legacy" => format!(
+                "missing-header" => format!(
                     "{{ otlp-http = {{ endpoint = \"{endpoint}\", protocol = \"json\", \
-                     headers = {{ x-agent-observability-token = \"legacy-token\" }} }} }}"
+                     tls = {{ ca-certificate = \"{ca}\" }} }} }}"
                 ),
                 "tls-additional" => format!(
                     "{{ otlp-http = {{ endpoint = \"{endpoint}\", protocol = \"json\", \
-                     tls = {{ ca-certificate = \"{ca}\", client-certificate = \
-                     \"{certificate}\", client-private-key = \"{key}\", domain-name = \
-                     \"localhost\" }} }} }}"
+                     tls = {{ ca-certificate = \"{ca}\", domain-name = \"localhost\" }}, \
+                     headers = {{ x-agent-observability-token = \"{token}\" }} }} }}"
                 ),
                 "http-additional" => format!(
                     "{{ otlp-http = {{ endpoint = \"{endpoint}\", protocol = \"json\", \
-                     tls = {{ ca-certificate = \"{ca}\", client-certificate = \
-                     \"{certificate}\", client-private-key = \"{key}\" }}, headers = {{}} }} }}"
+                     tls = {{ ca-certificate = \"{ca}\" }}, headers = {{ \
+                     x-agent-observability-token = \"{token}\" }}, timeout = 10 }} }}"
                 ),
-                "tls-unknown" => format!(
+                "headers-additional" => format!(
                     "{{ otlp-http = {{ endpoint = \"{endpoint}\", protocol = \"json\", \
-                     tls = {{ ca-certificate = \"{ca}\", client-certificate = \
-                     \"{certificate}\", unknown = \"{key}\" }} }} }}"
+                     tls = {{ ca-certificate = \"{ca}\" }}, headers = {{ \
+                     x-agent-observability-token = \"{token}\", unknown = \"value\" }} }} }}"
+                ),
+                "wrong-token" => format!(
+                    "{{ otlp-http = {{ endpoint = \"{endpoint}\", protocol = \"json\", \
+                     tls = {{ ca-certificate = \"{ca}\" }}, headers = {{ \
+                     x-agent-observability-token = \"wrong-token\" }} }} }}"
                 ),
                 _ => unreachable!(),
             };
@@ -1659,32 +1661,23 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_and_matching_cover_each_tls_path() {
-        let root = root("tls-fingerprint");
+    fn fingerprint_and_matching_cover_ca_path_and_auth_header() {
+        let root = root("security-fingerprint");
         let base = manager(&root).managed_values().unwrap().clone();
         let base_exporter = value(base.exporter());
         let tls_root = root.join("tls/current");
         for candidate in [
-            manager_with_tls_paths(
+            manager_with_security_values(
                 &root,
                 4318,
                 root.join("tls/other-ca.pem"),
-                tls_root.join("client-certificate.pem"),
-                tls_root.join("client-private-key.pem"),
+                "token-current",
             ),
-            manager_with_tls_paths(
+            manager_with_security_values(
                 &root,
                 4318,
                 tls_root.join("ca-certificate.pem"),
-                root.join("tls/other-client.pem"),
-                tls_root.join("client-private-key.pem"),
-            ),
-            manager_with_tls_paths(
-                &root,
-                4318,
-                tls_root.join("ca-certificate.pem"),
-                tls_root.join("client-certificate.pem"),
-                root.join("tls/other-client-key.pem"),
+                "other-token",
             ),
         ] {
             let candidate = candidate.unwrap().managed_values().unwrap().clone();
@@ -1694,21 +1687,22 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_rotates_owned_tls_paths_then_restores_original() {
-        let root = root("rotate-tls");
+    fn reconnect_rotates_owned_security_values_then_restores_original() {
+        let root = root("rotate-security");
         prepare(&root);
         let original = b"# retained\nmodel = 'before'\n";
         fs::write(root.join("config.toml"), original).unwrap();
         set_mode(&root.join("config.toml"), 0o400).unwrap();
-        manager_with_tls(&root, 4318, "first").connect().unwrap();
+        manager_with_security(&root, 4318, "first")
+            .connect()
+            .unwrap();
 
-        let rotated = manager_with_tls(&root, 4318, "second");
+        let rotated = manager_with_security(&root, 4318, "second");
         assert_eq!(rotated.connect().unwrap(), ConnectionStatus::Connected);
         let connected = fs::read_to_string(&rotated.config_path).unwrap();
         assert!(connected.contains("https://127.0.0.1:4318/v1/logs"));
         assert!(connected.contains("/tls/second/ca-certificate.pem"));
-        assert!(connected.contains("/tls/second/client-certificate.pem"));
-        assert!(connected.contains("/tls/second/client-private-key.pem"));
+        assert!(connected.contains("x-agent-observability-token = \"token-second\""));
         assert!(!connected.contains("/tls/first/"));
         assert!(connected.contains("# retained"));
         assert!(connected.contains("model = 'before'"));
@@ -1730,14 +1724,16 @@ mod tests {
     }
 
     #[test]
-    fn tls_rotation_conflicts_with_an_intervening_user_edit() {
-        let root = root("rotate-tls-user-edit");
+    fn security_rotation_conflicts_with_an_intervening_user_edit() {
+        let root = root("rotate-security-user-edit");
         prepare(&root);
         let original = b"model = 'before'\n";
         fs::write(root.join("config.toml"), original).unwrap();
         set_mode(&root.join("config.toml"), 0o600).unwrap();
-        manager_with_tls(&root, 4318, "first").connect().unwrap();
-        let rotated = manager_with_tls(&root, 4318, "second");
+        manager_with_security(&root, 4318, "first")
+            .connect()
+            .unwrap();
+        let rotated = manager_with_security(&root, 4318, "second");
         let mut edited = fs::read(&rotated.config_path).unwrap();
         edited.extend_from_slice(b"user_setting = true\n");
         let edit_started = Arc::new(Barrier::new(2));
@@ -1769,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_rotation_recovers_at_every_durable_mutation_boundary() {
+    fn security_rotation_recovers_at_every_durable_mutation_boundary() {
         for failed_call in 1..=3 {
             for apply_first in [false, true] {
                 let root = root(&format!("rotate-crash-{failed_call}-{apply_first}"));
@@ -1777,8 +1773,10 @@ mod tests {
                 let original = b"# exact prior\nmodel = 'before'\n";
                 fs::write(root.join("config.toml"), original).unwrap();
                 set_mode(&root.join("config.toml"), 0o400).unwrap();
-                manager_with_tls(&root, 4318, "first").connect().unwrap();
-                let rotated = manager_with_tls(&root, 4318, "second");
+                manager_with_security(&root, 4318, "first")
+                    .connect()
+                    .unwrap();
+                let rotated = manager_with_security(&root, 4318, "second");
 
                 assert!(matches!(
                     rotated.connect_with(&FaultMutations::new(&[(failed_call, apply_first)])),
@@ -1787,6 +1785,7 @@ mod tests {
                 assert_eq!(rotated.connect().unwrap(), ConnectionStatus::Connected);
                 let connected = fs::read_to_string(&rotated.config_path).unwrap();
                 assert!(connected.contains("/tls/second/ca-certificate.pem"));
+                assert!(connected.contains("x-agent-observability-token = \"token-second\""));
                 assert!(!connected.contains("/tls/first/"));
                 let (snapshot, _) = rotated.read_snapshot().unwrap();
                 assert_eq!(snapshot.phase, SnapshotPhase::Connected);
@@ -1818,8 +1817,10 @@ mod tests {
         let original = b"# exact prior\nmodel = 'before'\n";
         fs::write(root.join("config.toml"), original).unwrap();
         set_mode(&root.join("config.toml"), 0o400).unwrap();
-        manager_with_tls(&root, 4318, "first").connect().unwrap();
-        let rotated = manager_with_tls(&root, 4318, "second");
+        manager_with_security(&root, 4318, "first")
+            .connect()
+            .unwrap();
+        let rotated = manager_with_security(&root, 4318, "second");
 
         assert!(matches!(
             rotated.connect_with(&FaultMutations::new(&[(2, false)])),
@@ -2320,6 +2321,50 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn two_runtime_roots_contend_on_one_user_config_lock() {
+        let root = root("two-runtime-global-lock");
+        prepare(&root);
+        let config_path = root.join("config.toml");
+        let first = CodexConfigManager::new(
+            &config_path,
+            root.join("runtime-one/codex"),
+            root.join("bin/agent-observability"),
+            root.join("runtime-one"),
+            4318,
+            ExporterSecurity::new(root.join("runtime-one/tls/ca.pem"), "token-one").unwrap(),
+        )
+        .unwrap();
+        let second = CodexConfigManager::new(
+            &config_path,
+            root.join("runtime-two/codex"),
+            root.join("bin/agent-observability"),
+            root.join("runtime-two"),
+            4319,
+            ExporterSecurity::new(root.join("runtime-two/tls/ca.pem"), "token-two").unwrap(),
+        )
+        .unwrap();
+        first.ensure_private_state_dir().unwrap();
+        second.ensure_private_state_dir().unwrap();
+
+        assert_ne!(first.state_dir, second.state_dir);
+        assert_eq!(first.lock_path().unwrap(), second.lock_path().unwrap());
+        let first_lock = first.lock().unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(second.lock_path().unwrap())
+            .unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop(first_lock);
+        contender.lock().unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn concurrent_state_dir_initialization_is_atomic_and_private() {
@@ -2418,7 +2463,7 @@ mod tests {
         assert_eq!(snapshot.connected_mode, 0o600);
         assert_eq!(snapshot.phase, SnapshotPhase::Connected);
         assert_eq!(
-            fs::metadata(manager.state_dir.join(LOCK_FILE))
+            fs::metadata(manager.lock_path().unwrap())
                 .unwrap()
                 .permissions()
                 .mode()

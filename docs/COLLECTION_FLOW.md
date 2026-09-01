@@ -10,7 +10,7 @@
 | --- | --- |
 | Private canonical handoff parser | Implemented for Codex, Claude Code, Cursor |
 | One-shot local ingest CLI | Implemented |
-| Codex OTLP/HTTP JSON receiver | Implemented on authenticated IPv4 loopback; release In Progress |
+| Codex OTLP/HTTP JSON receiver | Private-CA HTTPS on IPv4 loopback with exact private random request header; compatibility correction and release evidence In Progress |
 | Codex `agent-turn-complete` notify supplement | Implemented with bounded fail-open local delivery |
 | Codex config ownership and macOS LaunchAgent | Implemented with exact restore; release In Progress |
 | SQLite authority and JSONL projection | Implemented |
@@ -21,8 +21,9 @@
 | Commercial team collector and hosted query/UI | Future TODO; requires G0-G4 approvals and evidence |
 
 수동 import는 별도 producer가 공식 surface를 versioned canonical handoff로 변환한 private file부터
-지원한다. Codex automatic path만 bounded raw OTLP/notify payload를 local process memory에서 받아
-allowlisted scalar로 즉시 축소한다. Raw payload와 unknown field는 저장하거나 출력하지 않는다.
+지원한다. Codex automatic path에서 raw notify는 foreground helper가 transport 전에 projection하고,
+receiver는 bounded raw OTLP만 decode해 allowlisted scalar로 즉시 축소한다. Raw payload와 unknown field는
+저장하거나 출력하지 않는다.
 
 ## System Context
 
@@ -34,7 +35,7 @@ flowchart TB
         Cursor["Cursor handoff"]
     end
 
-    Receiver["Authenticated Codex receiver on 127.0.0.1"]
+    Receiver["Authenticated HTTPS Codex receiver on 127.0.0.1"]
     Allowlist["Raw JSON to allowlisted scalars"]
     Files["Private bounded handoff files"]
 
@@ -51,8 +52,9 @@ flowchart TB
     Browser["Local browser"]
     Archive["Private archive outside runtime"]
 
-    Codex -->|"OTLP HTTP JSON"| Receiver
-    Codex -->|"bounded notify"| Receiver
+    Codex -->|"private-CA HTTPS + exact private header"| Receiver
+    Codex -->|"raw notify callback"| Notify["codex-notify allowlist projector"]
+    Notify -->|"projected notify over authenticated HTTPS"| Receiver
     Receiver --> Allowlist --> Adapters
     Claude --> Files
     Cursor --> Files
@@ -75,20 +77,23 @@ sequenceDiagram
     participant Launchd as macOS launchd
     participant Receiver as Local receiver
     participant Codex
+    participant Notify as codex-notify projector
     participant Adapter as Codex adapter
     participant Store as SQLite authority
     participant Report as Private HTML report
 
     Operator->>CLI: setup or connect codex
     CLI->>Launchd: install and start LaunchAgent
-    CLI->>Receiver: authenticated health check
+    CLI->>Receiver: private-CA HTTPS + exact-header health check
     Receiver-->>CLI: ready
     CLI->>Config: connect with exact ownership snapshot
     Config-->>Codex: local OTLP exporter and notify command
-    Codex->>Receiver: authenticated OTLP HTTP JSON
-    Codex->>Receiver: bounded notify supplement
+    Codex->>Receiver: private-CA HTTPS + exact-header OTLP HTTP JSON
+    Codex->>Notify: raw notify callback
+    Notify->>Notify: strict allowlist projection
+    Notify->>Receiver: projected supplement over authenticated HTTPS
     Receiver->>Adapter: copy allowlisted scalars only
-    Note over Receiver,Adapter: raw content may exist transiently in memory only
+    Note over Receiver,Adapter: only bounded raw OTLP may exist transiently in receiver memory
     Adapter->>Store: source-ordered observations and dispositions
     Store->>Store: advance durable report generation
     Store->>Report: render generation-consistent snapshot
@@ -102,12 +107,15 @@ recorded prior state, then restores the exact prior Codex config only while the 
 still match. It retains local observations. Unacknowledged SQLite report generations survive crashes; startup
 reconciles them and bounded exponential retries expose an exhausted refresh as degraded health through CLI/UI.
 
-The receiver binds only `127.0.0.1`, requires `x-agent-observability-token` on health and ingest routes,
-admits at most 64 concurrent connections, closes incomplete headers after five seconds, bounds each request
-lifetime to 30 seconds, accepts at most 1 MiB per OTLP request and 4096 log records, and writes no request body log. The notify helper
-accepts at most 64 KiB, uses bounded local connect/read/write deadlines, and always returns success to Codex
-with an accepted, rejected or unavailable outcome. It supplements turn completion; OTLP remains primary for
-model, request, usage, tool and permission signals.
+The receiver binds only `127.0.0.1`. Clients validate its private-CA server certificate and loopback IP SAN; every
+route requires the exact `x-agent-observability-token` header containing the runtime's private random 256-bit
+value. No client certificate or client private-key field is configured, so this is not mTLS. The receiver admits
+at most 64 concurrent connections, bounds incomplete TLS handshakes and headers, limits each request lifetime to
+30 seconds, accepts at most 1 MiB per OTLP request and 4096 log records, and writes no request body log. The notify
+helper accepts at most 64 KiB of raw input, creates a closed content-free projection before settings or socket
+access, uses bounded local connect/TLS/read/write deadlines, and always returns success to Codex with an accepted,
+rejected or unavailable outcome. It supplements turn completion; OTLP remains primary for model, request, usage,
+tool and permission signals.
 
 ## Ingest Sequence
 
@@ -171,8 +179,9 @@ session/turn/request, Claude Code의 prompt/tool use, Cursor의 conversation/gen
 `DurableRecordV1`로 만들며 prompt, output, command, path, cwd, raw email과 arbitrary metadata는
 durable boundary를 통과하지 않는다.
 
-Codex automatic parsing에서 raw notify payload와 OTLP/tool attribute는 bounded request를 decode하는 동안
-process memory에 일시적으로 들어올 수 있다. `conversation.id`, `turn.id`, bounded model/tool/decision,
+Codex automatic parsing에서 raw notify payload는 foreground helper가 pre-transport projection하는 동안만
+존재하고, raw OTLP/tool attribute는 bounded request를 decode하는 동안 receiver memory에 일시적으로
+들어올 수 있다. `conversation.id`, `turn.id`, bounded model/tool/decision,
 request/call ID, duration, token counts와 success처럼 adapter가 소유한 scalar만 다음 단계로 복사된다.
 Raw body, prompt, response, tool arguments/output, command, cwd, path, account identity와 unknown field는
 persist, log, diagnostic, projection, report 또는 export되지 않는다.
@@ -189,7 +198,8 @@ stateDiagram-v2
     Probe --> Protected: pressure returns
 ```
 
-Foreground notify work는 bounded local loopback handoff까지만 수행한다. Rejected, oversized와 unavailable은
+Foreground notify work는 pre-transport projection과 bounded local private-CA HTTPS + exact-header handoff까지만
+수행한다. Rejected, oversized와 unavailable은
 명시적 fail-open 결과이며 external network, report render, full transcript scan이나 queue drain을 기다리지
 않는다. Manual imports는 이 foreground helper나 resident collector를 사용하지 않는다. Pressure가 높아지면
 Future team sync와 report refresh를 coding agent 작업보다 먼저 낮춰야 한다.

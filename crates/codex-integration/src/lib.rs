@@ -2,11 +2,12 @@
 #![allow(clippy::missing_errors_doc)]
 
 use agent_observability_codex_config::{
-    CodexConfigManager, ConfigError, ConnectionStatus as ConfigConnectionStatus, MutualTlsPaths,
+    CodexConfigManager, ConfigError, ConnectionStatus as ConfigConnectionStatus, ExporterSecurity,
 };
 use agent_observability_local_collector::{
-    CollectorError, CollectorSettings, HealthOutcome, check_health, install_settings,
-    load_settings, recover_occupied_persisted_port,
+    CollectorError, CollectorSettings, HealthOutcome, check_health, commit_settings_migration,
+    install_settings, load_settings, recover_occupied_persisted_port, rollback_settings_migration,
+    settings_migration_pending,
 };
 use agent_observability_local_runtime::{InstalledLayout, MutationGuard, install};
 use serde::{Deserialize, Serialize};
@@ -120,17 +121,51 @@ impl From<std::io::Error> for IntegrationError {
 pub fn connect(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, IntegrationError> {
     let layout = install(root).map_err(runtime_error)?;
     with_lifecycle_lock(&layout, || {
-        let settings = install_settings(&layout.root)?;
-        let (_, restart) = recover_connect_settings(&layout.root, &settings)?;
-        connect_with_reloaded_settings(
-            &layout.root,
-            executable,
-            &SystemLifecycle,
-            restart,
-            || load_settings(&layout.root).map_err(Into::into),
-            |settings| codex_config_manager(&layout, executable, settings),
-        )
+        let result = (|| {
+            let settings = install_settings(&layout.root)?;
+            let (_, restart) = recover_connect_settings(&layout.root, &settings)
+                .map_err(|error| rollback_migration_without_service(&layout.root, error))?;
+            connect_with_reloaded_settings(
+                &layout.root,
+                executable,
+                &SystemLifecycle,
+                restart,
+                || load_settings(&layout.root).map_err(Into::into),
+                |settings| codex_config_manager(&layout, executable, settings),
+            )
+        })();
+        finish_settings_migration(&layout.root, result)
     })
+}
+
+fn finish_settings_migration(
+    root: &Path,
+    result: Result<CodexIntegrationStatus, IntegrationError>,
+) -> Result<CodexIntegrationStatus, IntegrationError> {
+    match result {
+        Ok(status) => {
+            commit_settings_migration(root)?;
+            Ok(status)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn settle_settings_migration_for_status(
+    root: &Path,
+    config: ConfigConnectionStatus,
+) -> Result<bool, IntegrationError> {
+    match config {
+        ConfigConnectionStatus::Connected => {
+            commit_settings_migration(root)?;
+            Ok(false)
+        }
+        ConfigConnectionStatus::Disconnected if settings_migration_pending(root)? => {
+            rollback_settings_migration(root)?;
+            Ok(true)
+        }
+        ConfigConnectionStatus::Disconnected | ConfigConnectionStatus::Conflict => Ok(false),
+    }
 }
 
 fn recover_connect_settings(
@@ -161,21 +196,25 @@ fn connect_with_reloaded_settings<C: ConfigLifecycle>(
     config_from_settings: impl FnOnce(&CollectorSettings) -> Result<C, IntegrationError>,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
     let service = if restart {
-        lifecycle.restart(root, executable)?
+        lifecycle.restart(root, executable)
     } else {
-        lifecycle.install(root, executable)?
-    };
+        lifecycle.install(root, executable)
+    }?;
     let collector = lifecycle
         .wait_until_ready(root)
-        .map_err(|error| rollback_install(lifecycle, &service, error))?;
-    let settings =
-        load_after_ready().map_err(|error| rollback_install(lifecycle, &service, error))?;
+        .map_err(|error| rollback_migration_install(root, lifecycle, &service, error))?;
+    let settings = load_after_ready()
+        .map_err(|error| rollback_migration_install(root, lifecycle, &service, error))?;
     let manager = config_from_settings(&settings)
-        .map_err(|error| rollback_install(lifecycle, &service, error))?;
-    let config = manager
-        .connect()
-        .map(Into::into)
-        .map_err(|error| rollback_install(lifecycle, &service, error))?;
+        .map_err(|error| rollback_migration_install(root, lifecycle, &service, error))?;
+    let config = match manager.connect() {
+        Ok(config) => config.into(),
+        Err(error) => {
+            return Err(recover_failed_config_connect(
+                root, &manager, lifecycle, &service, error,
+            ));
+        }
+    };
     lifecycle.commit_install(&service)?;
     Ok(CodexIntegrationStatus {
         config,
@@ -198,13 +237,13 @@ fn connect_prepared(
     let collector = lifecycle
         .wait_until_ready(root)
         .map_err(|error| rollback_install(lifecycle, &service, error))?;
-    let config = match config.connect() {
+    let config_status = match config.connect() {
         Ok(status) => status.into(),
         Err(error) => return Err(rollback_install(lifecycle, &service, error)),
     };
     lifecycle.commit_install(&service)?;
     Ok(CodexIntegrationStatus {
-        config,
+        config: config_status,
         collector,
         endpoint: Some(endpoint.into()),
         service: Some(service.label),
@@ -217,13 +256,34 @@ pub fn disconnect(
     executable: &Path,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
     let layout = install(root).map_err(runtime_error)?;
-    with_lifecycle_lock(&layout, || match load_settings(&layout.root) {
-        Ok(settings) => disconnect_with_settings(&layout, executable, &settings, &SystemLifecycle),
-        Err(CollectorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            disconnect_without_settings(&layout, executable, &SystemLifecycle)
+    with_lifecycle_lock(&layout, || {
+        if let Some(status) = settle_pending_migration_before_disconnect(&layout)? {
+            return Ok(status);
         }
-        Err(error) => Err(error.into()),
+        let result = match load_settings(&layout.root) {
+            Ok(settings) => {
+                disconnect_with_settings(&layout, executable, &settings, &SystemLifecycle)
+            }
+            Err(CollectorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                disconnect_without_settings(&layout, executable, &SystemLifecycle)
+            }
+            Err(error) => Err(error.into()),
+        };
+        finish_disconnect_settings_migration(&layout.root, result)
     })
+}
+
+fn finish_disconnect_settings_migration(
+    root: &Path,
+    result: Result<CodexIntegrationStatus, IntegrationError>,
+) -> Result<CodexIntegrationStatus, IntegrationError> {
+    match result {
+        Ok(status) => {
+            rollback_settings_migration(root)?;
+            Ok(status)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn disconnect_with_settings(
@@ -421,6 +481,7 @@ impl CollectorLifecycle for SystemLifecycle {
     }
 }
 
+#[cfg(test)]
 fn rollback_install(
     lifecycle: &impl CollectorLifecycle,
     service: &CollectorService,
@@ -432,6 +493,41 @@ fn rollback_install(
     }
 }
 
+fn rollback_migration_install(
+    root: &Path,
+    lifecycle: &impl CollectorLifecycle,
+    service: &CollectorService,
+    error: IntegrationError,
+) -> IntegrationError {
+    if let Err(rollback) = lifecycle.rollback_install(service) {
+        return rollback_error(&error, &rollback);
+    }
+    rollback_migration_without_service(root, error)
+}
+
+fn recover_failed_config_connect(
+    root: &Path,
+    config: &impl ConfigLifecycle,
+    lifecycle: &impl CollectorLifecycle,
+    service: &CollectorService,
+    error: IntegrationError,
+) -> IntegrationError {
+    match config.status() {
+        Ok(ConfigConnectionStatus::Disconnected) => {
+            rollback_migration_install(root, lifecycle, service, error)
+        }
+        Ok(ConfigConnectionStatus::Connected | ConfigConnectionStatus::Conflict) => error,
+        Err(status) => rollback_error(&error, &status),
+    }
+}
+
+fn rollback_migration_without_service(root: &Path, error: IntegrationError) -> IntegrationError {
+    match rollback_settings_migration(root) {
+        Ok(()) => error,
+        Err(rollback) => rollback_error(&error, &rollback.into()),
+    }
+}
+
 fn rollback_error(error: &IntegrationError, rollback: &IntegrationError) -> IntegrationError {
     IntegrationError::Runtime(format!("{error}; rollback failed: {rollback}"))
 }
@@ -439,6 +535,9 @@ fn rollback_error(error: &IntegrationError, rollback: &IntegrationError) -> Inte
 pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, IntegrationError> {
     let layout = install(root).map_err(runtime_error)?;
     with_lifecycle_lock(&layout, || {
+        if let Some(status) = settle_pending_migration_before_status(&layout)? {
+            return Ok(status);
+        }
         let settings = match load_settings(&layout.root) {
             Ok(settings) => settings,
             Err(CollectorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -449,6 +548,9 @@ pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, 
         let manager = codex_config_manager(&layout, executable, &settings)?;
         let config = manager.status()?;
         reconcile_collector_service(&layout.root, config)?;
+        if settle_settings_migration_for_status(&layout.root, config)? {
+            return status_without_settings(&layout);
+        }
         Ok(CodexIntegrationStatus {
             config: config.into(),
             collector: collector_status(check_health(&layout.root)),
@@ -457,6 +559,46 @@ pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, 
             data_retained: true,
         })
     })
+}
+
+fn settle_pending_migration_before_status(
+    layout: &InstalledLayout,
+) -> Result<Option<CodexIntegrationStatus>, IntegrationError> {
+    if !settings_migration_pending(&layout.root)? {
+        return Ok(None);
+    }
+    let config = codex_config_ownership_manager(layout)?.ownership_status()?;
+    match config {
+        Some(ConfigConnectionStatus::Connected) => {
+            reconcile_collector_service(&layout.root, ConfigConnectionStatus::Connected)?;
+            commit_settings_migration(&layout.root)?;
+            Ok(None)
+        }
+        Some(ConfigConnectionStatus::Conflict) => status_without_settings(layout).map(Some),
+        Some(ConfigConnectionStatus::Disconnected) | None => {
+            reconcile_collector_service(&layout.root, ConfigConnectionStatus::Disconnected)?;
+            rollback_settings_migration(&layout.root)?;
+            status_without_settings(layout).map(Some)
+        }
+    }
+}
+
+fn settle_pending_migration_before_disconnect(
+    layout: &InstalledLayout,
+) -> Result<Option<CodexIntegrationStatus>, IntegrationError> {
+    if !settings_migration_pending(&layout.root)? {
+        return Ok(None);
+    }
+    let config = codex_config_ownership_manager(layout)?.ownership_status()?;
+    match config {
+        Some(ConfigConnectionStatus::Connected) => Ok(None),
+        Some(ConfigConnectionStatus::Conflict) => Err(ConfigError::Conflict.into()),
+        Some(ConfigConnectionStatus::Disconnected) | None => {
+            reconcile_collector_service(&layout.root, ConfigConnectionStatus::Disconnected)?;
+            rollback_settings_migration(&layout.root)?;
+            status_without_settings(layout).map(Some)
+        }
+    }
 }
 
 fn status_without_settings(
@@ -484,7 +626,7 @@ fn missing_settings_status(
     };
     CodexIntegrationStatus {
         config,
-        collector: CollectorStatus::Degraded,
+        collector: CollectorStatus::Unavailable,
         endpoint: None,
         service: (service != LaunchAgentOwnershipStatus::Absent).then(|| service_label(root)),
         data_retained: true,
@@ -556,22 +698,22 @@ fn codex_config_manager(
         .parent()
         .ok_or_else(|| IntegrationError::Runtime("Codex config path has no parent".into()))?;
     ensure_codex_home(codex_home)?;
-    let tls = mutual_tls_paths(layout, settings)?;
+    let security = exporter_security(layout, settings)?;
     CodexConfigManager::new(
         config_path,
         layout.runtime.join("integrations/codex"),
         executable,
         &layout.root,
         settings.port,
-        tls,
+        security,
     )
     .map_err(Into::into)
 }
 
-fn mutual_tls_paths(
+fn exporter_security(
     layout: &InstalledLayout,
     settings: &CollectorSettings,
-) -> Result<MutualTlsPaths, IntegrationError> {
+) -> Result<ExporterSecurity, IntegrationError> {
     let absolute = |relative: &str| {
         let relative = Path::new(relative);
         if relative.as_os_str().is_empty()
@@ -585,10 +727,9 @@ fn mutual_tls_paths(
         }
         Ok(layout.runtime.join(relative))
     };
-    MutualTlsPaths::new(
+    ExporterSecurity::new(
         absolute(&settings.credentials.ca_certificate)?,
-        absolute(&settings.credentials.client_certificate)?,
-        absolute(&settings.credentials.client_private_key)?,
+        settings.auth_token.clone(),
     )
     .map_err(Into::into)
 }
@@ -1807,9 +1948,11 @@ mod tests {
         ConfigConnectionStatus, ConfigLifecycle, ConnectionStatus, IntegrationError,
         LaunchAgentOwnershipStatus, collector_status, connect_prepared,
         connect_with_reloaded_settings, disconnect_owned_prepared, disconnect_prepared,
-        ensure_codex_home, launch_agent_body, missing_settings_status, mutual_tls_paths,
-        recover_connect_settings, recover_connect_settings_with, service_label, status,
-        with_lifecycle_lock,
+        ensure_codex_home, exporter_security, finish_disconnect_settings_migration,
+        finish_settings_migration, launch_agent_body, missing_settings_status,
+        recover_connect_settings, recover_connect_settings_with, service_label,
+        settle_pending_migration_before_disconnect, settle_pending_migration_before_status,
+        settle_settings_migration_for_status, status, with_lifecycle_lock,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -1821,9 +1964,11 @@ mod tests {
         recover_launch_agent_transaction, save_launch_agent_transaction,
         uninstall_collector_service_with,
     };
-    use agent_observability_codex_config::{CodexConfigManager, MutualTlsPaths};
-    use agent_observability_local_collector::{HealthOutcome, install_settings, load_settings};
-    use agent_observability_local_runtime::LocalConfigService;
+    use agent_observability_codex_config::{CodexConfigManager, ExporterSecurity};
+    use agent_observability_local_collector::{
+        HealthOutcome, install_settings, load_settings, rollback_settings_migration,
+    };
+    use agent_observability_local_runtime::{LocalConfigService, install};
     #[cfg(target_os = "macos")]
     use std::collections::VecDeque;
     use std::{
@@ -1847,18 +1992,13 @@ mod tests {
         ))
     }
 
-    fn test_tls_paths(root: &Path) -> MutualTlsPaths {
-        MutualTlsPaths::new(
-            root.join("ca-certificate.pem"),
-            root.join("client-certificate.pem"),
-            root.join("client-private-key.pem"),
-        )
-        .unwrap()
+    fn test_exporter_security(root: &Path) -> ExporterSecurity {
+        ExporterSecurity::new(root.join("ca-certificate.pem"), "private-token").unwrap()
     }
 
     #[test]
-    fn mutual_tls_paths_are_absolute_and_reject_traversal() {
-        let root = temporary_root("mutual-tls-paths");
+    fn exporter_security_uses_absolute_ca_path_and_settings_token() {
+        let root = temporary_root("exporter-security");
         let layout = agent_observability_local_runtime::install(&root).unwrap();
         let settings = install_settings(&root).unwrap();
         let config_path = root.join("codex-config.toml");
@@ -1868,22 +2008,27 @@ mod tests {
             root.join("bin/agentobs"),
             &root,
             settings.port,
-            mutual_tls_paths(&layout, &settings).unwrap(),
+            exporter_security(&layout, &settings).unwrap(),
         )
         .unwrap();
         manager.connect().unwrap();
         let config = fs::read_to_string(&config_path).unwrap();
-        for relative in [
-            &settings.credentials.ca_certificate,
-            &settings.credentials.client_certificate,
-            &settings.credentials.client_private_key,
-        ] {
-            assert!(config.contains(&layout.runtime.join(relative).display().to_string()));
-        }
+        assert!(
+            config.contains(
+                &layout
+                    .runtime
+                    .join(&settings.credentials.ca_certificate)
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(config.contains(&settings.auth_token));
+        assert!(!config.contains("client-certificate"));
+        assert!(!config.contains("client-private-key"));
 
         let mut traversal = settings;
-        traversal.credentials.client_private_key = "../client-private-key.pem".into();
-        assert!(mutual_tls_paths(&layout, &traversal).is_err());
+        traversal.credentials.ca_certificate = "../ca-certificate.pem".into();
+        assert!(exporter_security(&layout, &traversal).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1910,6 +2055,7 @@ mod tests {
     struct FakeConfig {
         state: Cell<ConfigConnectionStatus>,
         connect_error: Cell<bool>,
+        connect_error_after_apply: Cell<bool>,
         disconnect_error: Cell<bool>,
         disconnect_error_after_restore: Cell<bool>,
         events: RefCell<Vec<&'static str>>,
@@ -1920,6 +2066,7 @@ mod tests {
             Self {
                 state: Cell::new(ConfigConnectionStatus::Connected),
                 connect_error: Cell::new(false),
+                connect_error_after_apply: Cell::new(false),
                 disconnect_error: Cell::new(false),
                 disconnect_error_after_restore: Cell::new(false),
                 events: RefCell::new(Vec::new()),
@@ -1946,6 +2093,11 @@ mod tests {
                 return Err(IntegrationError::Runtime("config connect failed".into()));
             }
             self.state.set(ConfigConnectionStatus::Connected);
+            if self.connect_error_after_apply.get() {
+                return Err(IntegrationError::Runtime(
+                    "config connect failed after apply".into(),
+                ));
+            }
             Ok(ConfigConnectionStatus::Connected)
         }
 
@@ -1967,6 +2119,7 @@ mod tests {
     struct FakeLifecycle {
         wait_error: bool,
         uninstall_error: bool,
+        commit_error: bool,
         install_error: Cell<bool>,
         collector_status: CollectorStatus,
         events: RefCell<Vec<&'static str>>,
@@ -1977,6 +2130,7 @@ mod tests {
             Self {
                 wait_error: false,
                 uninstall_error: false,
+                commit_error: false,
                 install_error: Cell::new(false),
                 collector_status: CollectorStatus::Ready,
                 events: RefCell::new(Vec::new()),
@@ -2032,6 +2186,15 @@ mod tests {
             }
         }
 
+        fn commit_install(&self, _service: &CollectorService) -> Result<(), IntegrationError> {
+            self.events.borrow_mut().push("commit");
+            if self.commit_error {
+                Err(IntegrationError::Runtime("commit failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+
         fn uninstall(&self, _service: &CollectorService) -> Result<(), IntegrationError> {
             self.events.borrow_mut().push("uninstall");
             if self.uninstall_error {
@@ -2047,7 +2210,7 @@ mod tests {
         let status = CodexIntegrationStatus {
             config: ConnectionStatus::Conflict,
             collector: CollectorStatus::Unavailable,
-            endpoint: Some("http://127.0.0.1:43181/v1/logs".into()),
+            endpoint: Some("https://127.0.0.1:43181/v1/logs".into()),
             service: Some("io.agent-observability.collector.example".into()),
             data_retained: true,
         };
@@ -2055,6 +2218,175 @@ mod tests {
         assert_eq!(value["config"], "conflict");
         assert_eq!(value["collector"], "unavailable");
         assert_eq!(value["data_retained"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_coordinator_commits_success_and_preserves_failed_compensation_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
+        let status = CodexIntegrationStatus {
+            config: ConnectionStatus::Connected,
+            collector: CollectorStatus::Ready,
+            endpoint: Some("https://127.0.0.1:4318/v1/logs".into()),
+            service: Some("io.agent-observability.collector.test".into()),
+            data_retained: true,
+        };
+
+        let success_root = temporary_root("settings-migration-commit");
+        let success_layout = install(&success_root).unwrap();
+        let success_path = success_layout.runtime.join("collector.json");
+        fs::write(&success_path, legacy).unwrap();
+        fs::set_permissions(&success_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let committed_settings = install_settings(&success_root).unwrap();
+        assert_eq!(
+            finish_settings_migration(&success_root, Ok(status.clone())).unwrap(),
+            status
+        );
+        assert_eq!(load_settings(&success_root).unwrap(), committed_settings);
+        assert!(
+            !success_layout
+                .runtime
+                .join("collector-settings-migration.json")
+                .exists()
+        );
+
+        let failure_root = temporary_root("settings-migration-rollback");
+        let failure_layout = install(&failure_root).unwrap();
+        let failure_path = failure_layout.runtime.join("collector.json");
+        fs::write(&failure_path, legacy).unwrap();
+        fs::set_permissions(&failure_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = install_settings(&failure_root).unwrap();
+        let error = finish_settings_migration(
+            &failure_root,
+            Err(IntegrationError::Runtime("connect failed".into())),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("connect failed"));
+        assert_eq!(load_settings(&failure_root).unwrap(), replacement);
+        assert!(
+            failure_layout
+                .runtime
+                .join("integrations/codex/tls")
+                .join(&replacement.generation)
+                .exists()
+        );
+        assert!(
+            failure_layout
+                .runtime
+                .join("collector-settings-migration.json")
+                .exists()
+        );
+        rollback_settings_migration(&failure_root).unwrap();
+        assert_eq!(fs::read(&failure_path).unwrap(), legacy);
+
+        let _ = fs::remove_dir_all(success_root);
+        let _ = fs::remove_dir_all(failure_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_settles_pending_settings_from_observed_config_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
+
+        let connected_root = temporary_root("settings-status-connected");
+        let connected_layout = install(&connected_root).unwrap();
+        let connected_path = connected_layout.runtime.join("collector.json");
+        fs::write(&connected_path, legacy).unwrap();
+        fs::set_permissions(&connected_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = install_settings(&connected_root).unwrap();
+        assert!(
+            !settle_settings_migration_for_status(
+                &connected_root,
+                ConfigConnectionStatus::Connected,
+            )
+            .unwrap()
+        );
+        assert_eq!(load_settings(&connected_root).unwrap(), replacement);
+        assert!(
+            !connected_layout
+                .runtime
+                .join("collector-settings-migration.json")
+                .exists()
+        );
+
+        let disconnected_root = temporary_root("settings-status-disconnected");
+        let disconnected_layout = install(&disconnected_root).unwrap();
+        let disconnected_path = disconnected_layout.runtime.join("collector.json");
+        fs::write(&disconnected_path, legacy).unwrap();
+        fs::set_permissions(&disconnected_path, fs::Permissions::from_mode(0o600)).unwrap();
+        install_settings(&disconnected_root).unwrap();
+        fs::write(&disconnected_path, legacy).unwrap();
+        let status = settle_pending_migration_before_status(&disconnected_layout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.config, ConnectionStatus::Disconnected);
+        assert_eq!(fs::read(&disconnected_path).unwrap(), legacy);
+        assert!(
+            !disconnected_layout
+                .runtime
+                .join("collector-settings-migration.json")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(connected_root);
+        let _ = fs::remove_dir_all(disconnected_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnect_settles_pending_and_committed_settings_without_crossing_phases() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
+        let status = CodexIntegrationStatus {
+            config: ConnectionStatus::Disconnected,
+            collector: CollectorStatus::Unavailable,
+            endpoint: None,
+            service: None,
+            data_retained: true,
+        };
+
+        let pending_root = temporary_root("disconnect-pending-migration");
+        let pending_layout = install(&pending_root).unwrap();
+        let pending_path = pending_layout.runtime.join("collector.json");
+        fs::write(&pending_path, legacy).unwrap();
+        fs::set_permissions(&pending_path, fs::Permissions::from_mode(0o600)).unwrap();
+        install_settings(&pending_root).unwrap();
+        fs::write(&pending_path, legacy).unwrap();
+        assert_eq!(
+            settle_pending_migration_before_disconnect(&pending_layout)
+                .unwrap()
+                .unwrap(),
+            status
+        );
+        assert_eq!(fs::read(&pending_path).unwrap(), legacy);
+
+        let committed_root = temporary_root("disconnect-committed-migration");
+        let committed_layout = install(&committed_root).unwrap();
+        let committed_path = committed_layout.runtime.join("collector.json");
+        fs::write(&committed_path, legacy).unwrap();
+        fs::set_permissions(&committed_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = install_settings(&committed_root).unwrap();
+        let journal_path = committed_layout
+            .runtime
+            .join("collector-settings-migration.json");
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        journal["phase"] = serde_json::Value::String("integration_committed".into());
+        fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert_eq!(
+            finish_disconnect_settings_migration(&committed_root, Ok(status.clone())).unwrap(),
+            status
+        );
+        assert_eq!(load_settings(&committed_root).unwrap(), replacement);
+        assert!(!journal_path.exists());
+
+        let _ = fs::remove_dir_all(pending_root);
+        let _ = fs::remove_dir_all(committed_root);
     }
 
     #[test]
@@ -2073,7 +2405,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_settings_reports_owned_config_as_degraded() {
+    fn missing_settings_reports_owned_config_as_unavailable() {
         let root = Path::new("/runtime");
 
         let status = missing_settings_status(
@@ -2083,7 +2415,7 @@ mod tests {
         );
 
         assert_eq!(status.config, ConnectionStatus::Connected);
-        assert_eq!(status.collector, CollectorStatus::Degraded);
+        assert_eq!(status.collector, CollectorStatus::Unavailable);
         assert_eq!(status.endpoint, None);
         assert_eq!(status.service, None);
     }
@@ -2095,7 +2427,7 @@ mod tests {
         let status = missing_settings_status(root, None, LaunchAgentOwnershipStatus::Owned);
 
         assert_eq!(status.config, ConnectionStatus::Conflict);
-        assert_eq!(status.collector, CollectorStatus::Degraded);
+        assert_eq!(status.collector, CollectorStatus::Unavailable);
         assert_eq!(status.endpoint, None);
         assert_eq!(
             status.service.as_deref(),
@@ -2354,8 +2686,185 @@ mod tests {
 
         assert_eq!(status.config, ConnectionStatus::Connected);
         assert_eq!(status.collector, CollectorStatus::Degraded);
-        assert_eq!(*lifecycle.events.borrow(), ["install", "health"]);
+        assert_eq!(*lifecycle.events.borrow(), ["install", "health", "commit"]);
         assert_eq!(*config.events.borrow(), ["config-connect"]);
+    }
+
+    #[test]
+    fn uncertain_connect_commit_failure_retains_connected_state() {
+        let config = FakeConfig::disconnected();
+        let lifecycle = FakeLifecycle {
+            commit_error: true,
+            ..FakeLifecycle::ready()
+        };
+
+        let error = connect_prepared(
+            Path::new("/runtime"),
+            Path::new("/bin/agentobs"),
+            "https://127.0.0.1:43181/v1/logs",
+            &config,
+            &lifecycle,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("commit failed"));
+        assert_eq!(config.state.get(), ConfigConnectionStatus::Connected);
+        assert_eq!(*config.events.borrow(), ["config-connect"]);
+        assert_eq!(*lifecycle.events.borrow(), ["install", "health", "commit"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_connect_commit_failure_retains_recoverable_v3_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("migration-commit-failure");
+        let layout = install(&root).unwrap();
+        let settings_path = layout.runtime.join("collector.json");
+        let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
+        fs::write(&settings_path, legacy).unwrap();
+        fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = install_settings(&root).unwrap();
+        let config_path = root.join("codex-config.toml");
+        let lifecycle = FakeLifecycle {
+            commit_error: true,
+            ..FakeLifecycle::ready()
+        };
+
+        let error = connect_with_reloaded_settings(
+            &root,
+            Path::new("/bin/agentobs"),
+            &lifecycle,
+            false,
+            || load_settings(&root).map_err(Into::into),
+            |settings| {
+                CodexConfigManager::new(
+                    &config_path,
+                    layout.runtime.join("integrations/codex"),
+                    Path::new("/bin/agentobs"),
+                    &root,
+                    settings.port,
+                    exporter_security(&layout, settings)?,
+                )
+                .map_err(Into::into)
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("commit failed"));
+        assert_eq!(load_settings(&root).unwrap(), replacement);
+        assert!(config_path.exists());
+        assert!(
+            layout
+                .runtime
+                .join("collector-settings-migration.json")
+                .exists()
+        );
+        assert!(
+            layout
+                .runtime
+                .join("integrations/codex/tls")
+                .join(&replacement.generation)
+                .exists()
+        );
+        assert_eq!(*lifecycle.events.borrow(), ["install", "health", "commit"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncertain_config_connect_retains_service_and_v3_until_status_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("uncertain-config-connect");
+        let layout = install(&root).unwrap();
+        let settings_path = layout.runtime.join("collector.json");
+        let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
+        fs::write(&settings_path, legacy).unwrap();
+        fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = install_settings(&root).unwrap();
+        let lifecycle = FakeLifecycle::ready();
+
+        let error = connect_with_reloaded_settings(
+            &root,
+            Path::new("/bin/agentobs"),
+            &lifecycle,
+            false,
+            || load_settings(&root).map_err(Into::into),
+            |_| {
+                let config = FakeConfig::disconnected();
+                config.connect_error_after_apply.set(true);
+                Ok(config)
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("failed after apply"));
+        assert_eq!(load_settings(&root).unwrap(), replacement);
+        assert!(
+            layout
+                .runtime
+                .join("collector-settings-migration.json")
+                .exists()
+        );
+        assert!(
+            layout
+                .runtime
+                .join("integrations/codex/tls")
+                .join(&replacement.generation)
+                .exists()
+        );
+        assert_eq!(*lifecycle.events.borrow(), ["install", "health"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncertain_service_install_or_restart_retains_v3_for_lifecycle_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
+        for (restart, event) in [(false, "install"), (true, "restart")] {
+            let root = temporary_root(&format!("uncertain-service-{event}"));
+            let layout = install(&root).unwrap();
+            let settings_path = layout.runtime.join("collector.json");
+            fs::write(&settings_path, legacy).unwrap();
+            fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let replacement = install_settings(&root).unwrap();
+            let lifecycle = FakeLifecycle::ready();
+            lifecycle.install_error.set(true);
+
+            let error = connect_with_reloaded_settings(
+                &root,
+                Path::new("/bin/agentobs"),
+                &lifecycle,
+                restart,
+                || load_settings(&root).map_err(Into::into),
+                |_| Ok(FakeConfig::disconnected()),
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("install failed"));
+            assert_eq!(load_settings(&root).unwrap(), replacement);
+            assert!(
+                layout
+                    .runtime
+                    .join("collector-settings-migration.json")
+                    .exists()
+            );
+            assert!(
+                layout
+                    .runtime
+                    .join("integrations/codex/tls")
+                    .join(&replacement.generation)
+                    .exists()
+            );
+            assert_eq!(*lifecycle.events.borrow(), [event]);
+
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -2387,6 +2896,7 @@ mod tests {
             Some("https://127.0.0.1:49321/v1/logs")
         );
         assert_eq!(status.config, ConnectionStatus::Connected);
+        assert_eq!(*lifecycle.events.borrow(), ["install", "health", "commit"]);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2417,14 +2927,14 @@ mod tests {
             restart,
             || load_settings(&root).map_err(Into::into),
             |settings| {
-                let tls = mutual_tls_paths(&layout, settings)?;
+                let security = exporter_security(&layout, settings)?;
                 CodexConfigManager::new(
                     &config_path,
                     layout.runtime.join("integrations/codex"),
                     Path::new("/bin/agentobs"),
                     &root,
                     settings.port,
-                    tls,
+                    security,
                 )
                 .map_err(Into::into)
             },
@@ -2434,7 +2944,7 @@ mod tests {
             connected.endpoint.as_deref(),
             Some(recovered.endpoint().as_str())
         );
-        assert_eq!(*lifecycle.events.borrow(), ["restart", "health"]);
+        assert_eq!(*lifecycle.events.borrow(), ["restart", "health", "commit"]);
         assert!(
             fs::read_to_string(&config_path)
                 .unwrap()
@@ -2450,15 +2960,18 @@ mod tests {
                     .to_string()
             )
         );
+        assert!(connected_config.contains(&recovered.auth_token));
+        assert!(!connected_config.contains("client-certificate"));
+        assert!(!connected_config.contains("client-private-key"));
 
-        let tls = mutual_tls_paths(&layout, &recovered).unwrap();
+        let security = exporter_security(&layout, &recovered).unwrap();
         let manager = CodexConfigManager::new(
             &config_path,
             layout.runtime.join("integrations/codex"),
             Path::new("/bin/agentobs"),
             &root,
             recovered.port,
-            tls,
+            security,
         )
         .unwrap();
         let disconnected = disconnect_prepared(
@@ -2494,7 +3007,7 @@ mod tests {
             Path::new("/bin/agentobs"),
             &root,
             43_181,
-            test_tls_paths(&root),
+            test_exporter_security(&root),
         )
         .unwrap()
         .connect()
@@ -2538,7 +3051,7 @@ mod tests {
             Path::new("/bin/agentobs"),
             &root,
             43_181,
-            test_tls_paths(&root),
+            test_exporter_security(&root),
         )
         .unwrap()
         .connect()
@@ -2610,14 +3123,14 @@ mod tests {
         fs::write(&config_path, original).unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o400)).unwrap();
         let original_settings = install_settings(&root).unwrap();
-        let tls = mutual_tls_paths(&layout, &original_settings).unwrap();
+        let security = exporter_security(&layout, &original_settings).unwrap();
         CodexConfigManager::new(
             &config_path,
             layout.runtime.join("integrations/codex"),
             Path::new("/bin/agentobs"),
             &root,
             original_settings.port,
-            tls,
+            security,
         )
         .unwrap()
         .connect()
@@ -2682,7 +3195,7 @@ mod tests {
             connect_prepared(
                 Path::new("/runtime"),
                 Path::new("/bin/agentobs"),
-                "http://127.0.0.1:43181/v1/logs",
+                "https://127.0.0.1:43181/v1/logs",
                 &config,
                 &lifecycle,
             )
@@ -2706,7 +3219,7 @@ mod tests {
             connect_prepared(
                 Path::new("/runtime"),
                 Path::new("/bin/agentobs"),
-                "http://127.0.0.1:43181/v1/logs",
+                "https://127.0.0.1:43181/v1/logs",
                 &config,
                 &lifecycle,
             )
@@ -2730,7 +3243,7 @@ mod tests {
             disconnect_prepared(
                 Path::new("/runtime"),
                 Path::new("/bin/agentobs"),
-                "http://127.0.0.1:43181/v1/logs",
+                "https://127.0.0.1:43181/v1/logs",
                 &config,
                 &lifecycle,
             )
@@ -2757,7 +3270,7 @@ mod tests {
             disconnect_prepared(
                 Path::new("/runtime"),
                 Path::new("/bin/agentobs"),
-                "http://127.0.0.1:43181/v1/logs",
+                "https://127.0.0.1:43181/v1/logs",
                 &config,
                 &lifecycle,
             )
@@ -2784,7 +3297,7 @@ mod tests {
             disconnect_prepared(
                 Path::new("/runtime"),
                 Path::new("/bin/agentobs"),
-                "http://127.0.0.1:43181/v1/logs",
+                "https://127.0.0.1:43181/v1/logs",
                 &config,
                 &lifecycle,
             )
@@ -2807,7 +3320,7 @@ mod tests {
             disconnect_prepared(
                 Path::new("/runtime"),
                 Path::new("/bin/agentobs"),
-                "http://127.0.0.1:43181/v1/logs",
+                "https://127.0.0.1:43181/v1/logs",
                 &config,
                 &lifecycle,
             )
@@ -2827,7 +3340,7 @@ mod tests {
         let error = disconnect_prepared(
             Path::new("/runtime"),
             Path::new("/bin/agentobs"),
-            "http://127.0.0.1:43181/v1/logs",
+            "https://127.0.0.1:43181/v1/logs",
             &config,
             &lifecycle,
         )
@@ -2851,7 +3364,7 @@ mod tests {
             disconnect_prepared(
                 Path::new("/runtime"),
                 Path::new("/bin/agentobs"),
-                "http://127.0.0.1:43181/v1/logs",
+                "https://127.0.0.1:43181/v1/logs",
                 &config,
                 &lifecycle,
             )
@@ -2863,7 +3376,7 @@ mod tests {
         let status = disconnect_prepared(
             Path::new("/runtime"),
             Path::new("/bin/agentobs"),
-            "http://127.0.0.1:43181/v1/logs",
+            "https://127.0.0.1:43181/v1/logs",
             &config,
             &lifecycle,
         )

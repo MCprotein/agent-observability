@@ -88,7 +88,7 @@ gate를 통과해 추가한다.
 | v1.5.0 | Released | Local visual configuration console | Release workflow `33478394514` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
 | v1.6.0 | Released | Integrity-checked one-command installer | Release workflow `33481569104` published the Package, public Release, and attested installer; downloaded checksums, universal `x86_64 arm64` version, fresh public install, and all five artifact attestations verified independently |
 | v1.7.0 | Released | TypeScript tooling completion and short CLI alias | Release workflow `33486442683` published the Package and public Release; downloaded checksums, universal `x86_64 arm64` version, both installed command aliases, and all five artifact attestations verified independently |
-| v1.8.0 | In Progress | Codex automatic local collection | Authenticated `127.0.0.1` OTLP/HTTP JSON receiver, bounded fail-open notify supplement, macOS LaunchAgent lifecycle, exact Codex config ownership/restore, scalar-only adapter projection, automatic private report refresh, and unchanged daemon-free/network-free manual imports; Claude Code/Cursor automatic and commercial team remain TODO | Targeted and workspace tests, privacy sentinels, command smoke, docs consistency, independent review, and release publication evidence remain required before `Released` |
+| v1.8.0 | In Progress | Codex automatic local collection | Private-CA HTTPS `127.0.0.1` OTLP/HTTP JSON receiver with an exact private random request header, pre-transport projected fail-open notify supplement, macOS LaunchAgent lifecycle, exact Codex config ownership/restore, scalar-only adapter projection, automatic private report refresh, and unchanged daemon-free/network-free manual imports; Claude Code/Cursor automatic and commercial team remain TODO | Targeted and workspace tests, privacy sentinels, command smoke, docs consistency, independent review, and release publication evidence remain required before `Released` |
 
 ## Branch Strategy
 
@@ -170,9 +170,10 @@ Team 항목은 local receiver나 collector endpoint 하나로 완료되지 않�
 - team profile이 추가되어도 standalone manual import는 network, login, daemon, collector 없이
   동일한 local 기능을 유지해야 한다. Optional local automatic collection은 team dependency가 아니다.
 - agent별 adapter가 달라도 뒤쪽 schema는 하나로 유지한다.
-- hook foreground path는 local bounded handoff만 수행하고 network, full-file scan, report render나 queue
-  drain을 기다리지 않는다. Local release는 declared CPU/RSS/disk/latency budget과 pressure fixture를
-  통과해야 한다.
+- hook foreground path는 local bounded handoff만 수행하고 external network, full-file scan, report
+  render나 queue drain을 기다리지 않는다. Automatic local adapter는 declared deadline 안의 인증된
+  loopback transport만 사용할 수 있다. Local release는 declared CPU/RSS/disk/latency budget과 pressure
+  fixture를 통과해야 한다.
 - accepted observation을 직접 수정하지 않는다. 귀속 보정과 분석 제외는 idempotent append-only
   revision으로 처리하고 privacy deletion과 구분한다.
 - unsupported 또는 불안정한 agent log/hook format은 추측으로 안정 계약처럼 쓰지

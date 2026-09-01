@@ -3,12 +3,13 @@
 v1.0.0 introduced the standalone local-only Rust runtime boundary. v1.2.0 added bounded local
 retention and private archive export; v1.4.0 added one-command setup, an isolated built-in demo,
 dashboard open, and atomic CLI configuration updates. v1.5.0 adds an explicit, ephemeral loopback
-settings UI. v1.8.0 is **In Progress** and adds optional Codex automatic local collection through an
-authenticated IPv4 loopback receiver and macOS LaunchAgent. Manual Codex, Claude Code and Cursor imports remain
+settings UI. v1.8.0 is **In Progress** and adds optional Codex automatic local collection through a
+private-CA HTTPS IPv4 loopback receiver with an exact private random request header, plus a macOS LaunchAgent.
+This transport is not mTLS. Manual Codex, Claude Code and Cursor imports remain
 fully functional without a daemon, receiver, login or network. The automatic path makes no external request.
 The runtime installs private local state,
 validates a closed configuration, admits writes against a hard storage budget, and keeps foreground
-handoff bounded. It contains no external or team endpoint, email, team identity, envelope, outbox, or
+handoff bounded. It contains no external or team endpoint, email, team identity, envelope, outbox, or external
 network client. The optional Codex collector binds a configured `127.0.0.1` port and persists only while
 connected. The settings UI uses a separate ephemeral `127.0.0.1:0` endpoint, a private browser session,
 and expires after inactivity.
@@ -66,23 +67,37 @@ bounds fail closed.
 
 ## Codex automatic collection
 
-`connect codex [root]` creates or loads private collector settings, installs a root-specific LaunchAgent,
-waits for an authenticated health response, and then takes ownership of the exact Codex settings it needs.
-The receiver binds only `127.0.0.1` and accepts OTLP/HTTP JSON at `/v1/logs`; the bounded notify helper posts
-`agent-turn-complete` to `/v1/notify`. `/health` and both ingest routes require the private
-`x-agent-observability-token`. The token is 32 random bytes encoded as 64 hex characters, stored in
-`runtime/collector.json` with mode `0600`, and compared without early byte mismatch exit.
+`connect codex [root]` creates or loads private collector settings and credentials, installs a root-specific
+LaunchAgent, waits for an authenticated HTTPS health response, and then takes ownership of the exact Codex
+settings it needs. The receiver binds only `127.0.0.1` and accepts OTLP/HTTP JSON at `/v1/logs`; the bounded
+notify helper posts a content-free `agent-turn-complete` projection to `/v1/notify`. Codex and internal probes
+validate the receiver's private-CA server certificate and loopback IP SAN. `/health` and both ingest routes also
+require the exact `x-agent-observability-token` header containing the runtime's private random 256-bit value.
+No client certificate or client private-key field is configured, so this is HTTPS plus request authentication,
+not mTLS. `runtime/collector.json` uses `local_collector.v3` and contains the private header value plus bounded
+credential metadata and paths, never PEM bodies. Credentials live under `runtime/integrations/codex/tls` in
+`0700` directories and `0600` regular files. The CA private key is not persisted. The server credential is valid
+for one year. Startup fails closed after expiry; rerunning `connect codex` replaces a recognized expired owned
+credential set and rotates the owned Codex TLS and header settings. Exact legacy `local_collector.v2` mTLS
+settings enter a durable two-phase migration: prior settings bytes/mode and credentials remain available while
+the v3 candidate, LaunchAgent and Codex config converge. They are removed only after all commits succeed; any
+failure restores the prior settings and credentials, and an interrupted phase resumes deterministically.
 
 The LaunchAgent plist is written to `~/Library/LaunchAgents` with a label derived from the runtime root. It
 runs the canonical absolute installed executable as `collector-serve <root>`, starts at load, and is kept alive
 by launchd. Automatic collection currently supports macOS Codex only. It does not scrape Codex files,
-credentials, browser sessions or private APIs and does not connect to an external host.
+credentials, browser sessions or private APIs and does not connect to an external host. The private-CA server
+certificate prevents a listener without the server private key from impersonating the trusted receiver to Codex,
+and the exact private header rejects requests without the runtime credential. This does not isolate a malicious
+process running as the same OS user because that process can read the same `0600` header secret or server private
+key and impersonate a client or receiver; separate user identities or an OS sandbox are required for that threat.
 
 Codex config ownership is transactional. The manager uses `$CODEX_HOME/config.toml` when `CODEX_HOME` is set,
 otherwise `~/.codex/config.toml`, and manages only top-level `notify`, the local JSON `otel.exporter`,
 `otel.log_user_prompt=false`, and `otel.environment="local"`. Notify is exactly the canonical absolute installed executable path,
-`codex-notify`, and absolute runtime root. The exporter contains only the configured local `/v1/logs` endpoint,
-JSON protocol and private token header. The endpoint port is an OS-assigned available loopback port persisted in
+`codex-notify`, and absolute runtime root. The exporter contains only the configured local HTTPS `/v1/logs`
+endpoint, JSON protocol, private CA path and exact `x-agent-observability-token` header. It contains no client
+identity fields. The endpoint port is an OS-assigned available loopback port persisted in
 private collector settings. If that port is occupied after restart, autonomous collector startup fails closed
 without changing settings. The next explicit `connect codex` verifies the unavailable owned endpoint, rotates
 only the persisted port to another OS-assigned loopback port, and crash-safely reconnects the LaunchAgent.
@@ -91,7 +106,7 @@ collector whose durable report is pending or whose bounded report refresh retrie
 Connect refuses conflicting pre-existing managed values unless they match exactly.
 Before changing the file, it stores the exact prior and connected bytes, hashes, existence, permission modes
 and transaction phase in `runtime/integrations/codex/codex-config-ownership-v1.json` with private permissions.
-A private mutation lock, exact-state comparison, temp-file fsync and atomic rename preserve supported concurrent
+A lock scoped to the canonical Codex config path, exact-state comparison, temp-file fsync and atomic rename preserve supported concurrent
 edits without ever displacing the canonical file. Prepared and restoring snapshots recover deterministically on
 the next lifecycle command after a process crash.
 
@@ -101,10 +116,12 @@ created by connect. It then restores the exact prior config bytes and mode, or r
 created it, only while the complete current bytes and mode equal the recorded connected state. Any intervening
 edit fails closed and is preserved. SQLite, JSONL and HTML data remain.
 
-The raw OTLP and notify request can exist transiently in bounded process memory while JSON is decoded. Only
-explicitly allowlisted scalar identifiers, model/tool categories, decisions, timing, token counts and success
-state cross into the adapter. Raw prompt/response, tool arguments/output, command, cwd, path, account identity,
-unknown attributes and request bodies are never persisted, logged, projected, reported or exported.
+The raw notify argument exists transiently only in the bounded foreground projector and is reduced before
+settings or socket access; the receiver sees only `ProjectedNotifyV1`. Raw OTLP requests can exist transiently in
+bounded receiver memory while JSON is decoded. Only explicitly allowlisted scalar identifiers, model/tool
+categories, decisions, timing, token counts and success state cross into the adapter. Raw prompt/response, tool
+arguments/output, command, cwd, path, account identity, unknown attributes and request bodies are never
+persisted, logged, projected, reported or exported.
 
 The collector transactionally commits source-ordered canonical observations and content-free dispositions
 through the same SQLite authority as manual import. Every current-record mutation, including retention, advances
@@ -154,8 +171,9 @@ Invalid updates leave the previous bytes unchanged. User-facing names, defaults,
 ## Runtime bounds
 
 - Codex automatic OTLP/HTTP JSON request: at most 1 MiB and 4096 log records.
-- Codex notify payload: at most 64 KiB. The helper uses a 10 ms loopback connect timeout and 40 ms read/write
-  timeouts, then returns a fail-open accepted, rejected or unavailable outcome without waiting for report work.
+- Codex notify payload: raw input at most 64 KiB and a smaller closed projected wire object. Projection happens
+  before I/O; one absolute foreground deadline constrains loopback connect, server-authenticated TLS handshake and the HTTP exchange
+  before the helper returns a fail-open accepted, rejected or unavailable outcome without waiting for report work.
 - Raw foreground input: at most 1 MiB.
 - Privacy-projected local message: at most 64 KiB.
 - In-process ingress channel: 64 messages, one normalization writer, nonblocking admission. The
@@ -299,10 +317,11 @@ cargo run -p xtask -- perf automatic --profile release --check
 
 The `local` workload measures the fixed-capacity manual-ingress runtime against
 `crates/contracts/performance/local-performance-v1.yaml`. The `automatic` workload launches the built
-collector and foreground `codex-notify` commands, then measures authenticated response latency, collector
-idle/active CPU, RSS, allocated disk and loopback-only network behavior against
-`crates/contracts/performance/automatic-local-performance-v1.yaml`. This keeps automatic-path evidence
-separate from the older internal-ingress benchmark.
+collector and foreground `codex-notify` commands, then sends synthetic Codex-shaped OTLP through the product's
+private-CA HTTPS and exact-header client. It measures authenticated response latency, collector idle/active CPU,
+RSS, allocated disk and loopback-only network behavior against
+`crates/contracts/performance/automatic-local-performance-v1.yaml`. This combines a real Codex compatibility
+gate with synthetic collector performance evidence while remaining separate from the older internal-ingress benchmark.
 
 smoke is non-normative and deletes its temporary output. release writes sanitized evidence under
 docs/evidence/local/performance/ and exits nonzero when required evidence is missing or a budget is breached.
@@ -310,8 +329,12 @@ For `perf local`, enabled runs permit at most 1% explicit fail-open rejection an
 event with one durable observation after graceful fixture shutdown; foreground enqueue does not itself imply
 durability. For `perf automatic`, every foreground notify must be accepted and each run independently enforces
 the response-latency, collector CPU/RSS, allocated-disk and loopback-only network rules in the automatic
-protocol. Its isolated lifecycle preflight also sends an authenticated Codex OTLP request through the installed
-LaunchAgent collector and requires a durable report record; notify remains a separately verified supplement.
+protocol. Its isolated lifecycle preflight runs actual Codex `0.151.0` `codex exec` against a content-free loopback
+Responses fixture before the synthetic load. The gate requires exporter construction, one accepted native OTLP
+batch, a private session record, exact 10 input and 2 output token records, and absence of the raw prompt sentinel
+from the durable tree. It then sends synthetic Codex-shaped OTLP through the installed LaunchAgent collector;
+notify remains a separately verified supplement. This catches the macOS client-identity exporter failure that
+strict config parsing alone did not detect.
 Both profiles delete measured durable stores after validation; release retains only the sanitized manifest. A
 release run also requires a clean worktree and records the full source commit SHA. A retained failed
 release manifest therefore has to be reviewed and committed before another release-profile attempt;

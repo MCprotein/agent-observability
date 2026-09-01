@@ -578,7 +578,7 @@ function connectedStatus(): IntegrationStatus {
   return {
     config: "connected",
     collector: "ready",
-    endpoint: "http://127.0.0.1:4318/v1/traces",
+    endpoint: "https://127.0.0.1:4318/v1/logs",
     service: "dev.agent-observability.collector",
     data_retained: true,
   };
@@ -588,7 +588,7 @@ function degradedStatus(): IntegrationStatus {
   return {
     config: "connected",
     collector: "degraded",
-    endpoint: "http://127.0.0.1:4318/v1/traces",
+    endpoint: "https://127.0.0.1:4318/v1/logs",
     service: "dev.agent-observability.collector",
     data_retained: true,
   };

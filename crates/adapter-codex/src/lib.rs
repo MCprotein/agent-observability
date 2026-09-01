@@ -738,20 +738,18 @@ pub fn parse_otlp_http_json_with_state(
                 if records.len() >= MAX_OTLP_LOG_RECORDS {
                     return Err(AdapterError::TooManyRecords);
                 }
+                let attributes = otlp_attributes(log_record)?;
+                let event_name = match attributes.get("event.name") {
+                    None => continue,
+                    Some(Value::String(value)) if !value.is_empty() => value.clone(),
+                    Some(_) => return Err(AdapterError::InvalidFieldType),
+                };
                 let cursor = next_cursor.to_string();
                 next_cursor = next_cursor
                     .checked_add(1)
                     .ok_or(AdapterError::InvalidCursorSequence)?;
-                let attributes = otlp_attributes(log_record)?;
-                let event_name = attributes
-                    .get("event.name")
-                    .and_then(Value::as_str)
-                    .ok_or(AdapterError::InvalidFieldType)?
-                    .to_owned();
-                let received_at_unix_ms = log_record
-                    .get("timeUnixNano")
-                    .and_then(otlp_u64)
-                    .map_or(fallback_received_at_unix_ms, |value| value / 1_000_000);
+                let received_at_unix_ms =
+                    otlp_observed_time_unix_ms(log_record, fallback_received_at_unix_ms)?;
                 let canonical = canonical_otlp_attributes(&event_name, &attributes)?;
                 records.push(HandoffRecord {
                     schema_version: HANDOFF_SCHEMA_VERSION.into(),
@@ -784,6 +782,22 @@ pub fn parse_otlp_http_json_with_state(
     Ok((batch, prior))
 }
 
+fn otlp_observed_time_unix_ms(
+    record: &Value,
+    fallback_received_at_unix_ms: u64,
+) -> Result<u64, AdapterError> {
+    for key in ["timeUnixNano", "observedTimeUnixNano"] {
+        let Some(value) = record.get(key) else {
+            continue;
+        };
+        let nanos = otlp_u64(value).ok_or(AdapterError::InvalidTiming)?;
+        if nanos != 0 {
+            return Ok(nanos / 1_000_000);
+        }
+    }
+    Ok(fallback_received_at_unix_ms)
+}
+
 /// Strictly projects a raw Codex `agent-turn-complete` notify argument before transport.
 ///
 /// # Errors
@@ -804,27 +818,27 @@ pub fn project_notify_json(input: &[u8]) -> Result<ProjectedNotifyV1, AdapterErr
     Ok(projected)
 }
 
-/// Maps a strictly projected Codex notify argument without retaining content fields.
+/// Maps a strictly projected Codex notify wire payload without retaining content fields.
 ///
 /// # Errors
 ///
 /// Returns [`AdapterError`] when strict projection or canonical mapping fails.
-pub fn parse_notify_json(
+pub fn parse_projected_notify_json(
     input: &[u8],
     source_generation: &str,
     previous_cursor: Option<&str>,
     cursor: u64,
     received_at_unix_ms: u64,
 ) -> Result<AdapterBatch, AdapterError> {
-    let payload = if input.len() <= MAX_PROJECTED_NOTIFY_BYTES {
-        serde_json::from_slice::<ProjectedNotifyV1>(input)
-            .ok()
-            .map(ProjectedNotifyV1::validate)
-            .transpose()?
-    } else {
-        None
+    if input.len() > MAX_PROJECTED_NOTIFY_BYTES {
+        return Err(AdapterError::RecordTooLarge);
     }
-    .map_or_else(|| project_notify_json(input), Ok)?;
+    let payload = serde_json::from_slice::<ProjectedNotifyV1>(input)
+        .map_err(|error| match error.classify() {
+            serde_json::error::Category::Data => AdapterError::InvalidSchema,
+            _ => AdapterError::InvalidJson,
+        })?
+        .validate()?;
     let mut attributes = BTreeMap::new();
     attributes.insert(
         "thread_id".into(),
@@ -920,12 +934,9 @@ fn canonical_otlp_attributes(
     if matches!(event_name, "codex.api_request" | "codex.sse_event") {
         copy_string(source, &mut output, "auth.request_id", "request_id")?;
     }
-    let success = source
-        .get("success")
-        .and_then(otlp_bool)
-        .or_else(|| success_from_status(source))
-        .unwrap_or_else(|| !source.contains_key("error.message"));
-    output.insert("success".into(), Value::Bool(success));
+    if let Some(success) = canonical_success(event_name, source)? {
+        output.insert("success".into(), Value::Bool(success));
+    }
     Ok(output)
 }
 
@@ -971,7 +982,7 @@ fn correlate_otlp_request_pairs(
             records[index]
                 .attributes
                 .insert("request_id".into(), Value::String(correlation_id.clone()));
-            if optional_bool(&records[index].attributes, "success")? != Some(true) {
+            if optional_bool(&records[index].attributes, "success")? == Some(false) {
                 continue;
             }
             if official_retry_identity
@@ -1085,9 +1096,37 @@ fn otlp_bool(value: &Value) -> Option<bool> {
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
-fn success_from_status(source: &BTreeMap<String, Value>) -> Option<bool> {
-    let status = source.get("http.response.status_code").and_then(otlp_u64)?;
-    Some((200..=299).contains(&status))
+fn canonical_success(
+    event_name: &str,
+    source: &BTreeMap<String, Value>,
+) -> Result<Option<bool>, AdapterError> {
+    let explicit = source
+        .get("success")
+        .map(|value| otlp_bool(value).ok_or(AdapterError::InvalidFieldType))
+        .transpose()?;
+    let status = source
+        .get("http.response.status_code")
+        .map(|value| {
+            let status = otlp_u64(value).ok_or(AdapterError::InvalidFieldType)?;
+            if !(100..=599).contains(&status) {
+                return Err(AdapterError::InvalidFieldType);
+            }
+            Ok((200..=299).contains(&status))
+        })
+        .transpose()?;
+    let completed = (event_name == "codex.sse_event"
+        && source.get("event.kind").and_then(Value::as_str) == Some("response.completed"))
+    .then_some(true);
+    let error = source.contains_key("error.message").then_some(false);
+
+    let mut signals = [explicit, status, completed, error].into_iter().flatten();
+    let Some(success) = signals.next() else {
+        return Ok(None);
+    };
+    if signals.any(|signal| signal != success) {
+        return Err(AdapterError::InvalidFieldType);
+    }
+    Ok(Some(success))
 }
 
 fn checkpoint_from_record(record: &HandoffRecord) -> Result<SourceCheckpoint, AdapterError> {
@@ -1533,8 +1572,8 @@ mod tests {
         MAX_HANDOFF_LINES, MAX_OTLP_LOG_RECORDS, MAX_PENDING_OTLP_REQUESTS,
         MAX_PROJECTED_NOTIFY_BYTES, MAX_RECENTLY_COMPLETED_OTLP_REQUESTS,
         OTLP_REQUEST_CORRELATION_TTL_MS, OtlpRequestCorrelationState,
-        PROJECTED_NOTIFY_SCHEMA_VERSION, parse_handoff_jsonl, parse_notify_json,
-        parse_otlp_http_json, parse_otlp_http_json_with_state, project_notify_json,
+        PROJECTED_NOTIFY_SCHEMA_VERSION, parse_handoff_jsonl, parse_otlp_http_json,
+        parse_otlp_http_json_with_state, parse_projected_notify_json, project_notify_json,
         read_handoff_file,
     };
     use agent_observability_contracts::ObservationEvent;
@@ -1556,7 +1595,8 @@ mod tests {
               {{"key":"event.name","value":{{"stringValue":"codex.api_request"}}}},
               {{"key":"conversation.id","value":{{"stringValue":"{conversation_id}"}}}},
               {{"key":"model","value":{{"stringValue":"gpt-test"}}}},
-              {{"key":"auth.request_id","value":{{"stringValue":"{request_id}"}}}}
+              {{"key":"auth.request_id","value":{{"stringValue":"{request_id}"}}}},
+              {{"key":"http.response.status_code","value":{{"intValue":"200"}}}}
             ]}}]}}]}}]}}"#
         )
         .into_bytes()
@@ -1567,7 +1607,8 @@ mod tests {
             r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"attributes":[
               {{"key":"event.name","value":{{"stringValue":"codex.api_request"}}}},
               {{"key":"conversation.id","value":{{"stringValue":"{conversation_id}"}}}},
-              {{"key":"model","value":{{"stringValue":"gpt-test"}}}}
+              {{"key":"model","value":{{"stringValue":"gpt-test"}}}},
+              {{"key":"http.response.status_code","value":{{"intValue":"200"}}}}
             ]}}]}}]}}]}}"#
         )
         .into_bytes()
@@ -1677,6 +1718,28 @@ mod tests {
     }
 
     #[test]
+    fn current_codex_otlp_skips_internal_logs_and_uses_observed_time_for_zero_time() {
+        let input = br#"{
+          "resourceLogs": [{"scopeLogs": [{"logRecords": [
+            {"timeUnixNano":"0","observedTimeUnixNano":"1787875200000000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}}
+            ]},
+            {"timeUnixNano":"0","observedTimeUnixNano":"1787875200001000000","attributes":[]}
+          ]}]}]
+        }"#;
+
+        let (batch, cursor) = parse_otlp_http_json(input, "codex-0.151.0", None, 1, 99).unwrap();
+
+        assert_eq!(cursor.as_deref(), Some("1"));
+        let observations = batch.observations().collect::<Vec<_>>();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].timing.start_unix_ms, 1_787_875_200_000);
+        assert_eq!(observations[0].timing.end_unix_ms, Some(1_787_875_200_000));
+    }
+
+    #[test]
     fn native_request_pair_without_official_request_id_gets_local_correlation() {
         let input = br#"{
           "resourceLogs": [{"scopeLogs": [{"logRecords": [
@@ -1686,8 +1749,7 @@ mod tests {
               {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
               {"key":"attempt","value":{"intValue":"1"}},
               {"key":"http.response.status_code","value":{"intValue":"200"}},
-              {"key":"duration_ms","value":{"stringValue":"100"}},
-              {"key":"error.message","value":{"stringValue":"RAW_API_ERROR_SECRET"}}
+              {"key":"duration_ms","value":{"stringValue":"100"}}
             ]},
             {"timeUnixNano":"1787875200100000000","attributes":[
               {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
@@ -1721,8 +1783,69 @@ mod tests {
         let debug = format!("{batch:?}");
         assert!(!debug.contains("otlp-41"));
         assert!(!debug.contains("otlp-42"));
-        assert!(!debug.contains("RAW_API_ERROR_SECRET"));
         assert!(!debug.contains("RAW_RESPONSE_SECRET"));
+    }
+
+    #[test]
+    fn otlp_rejects_present_but_invalid_timestamp_and_outcome_fields() {
+        let cases: &[(&[u8], AdapterError)] = &[
+            (
+                br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"not-a-timestamp","attributes":[{"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},{"key":"conversation.id","value":{"stringValue":"conversation-1"}}]}]}]}]}"#,
+                AdapterError::InvalidTiming,
+            ),
+            (
+                br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[{"key":"event.name","value":{"stringValue":"codex.tool_result"}},{"key":"conversation.id","value":{"stringValue":"conversation-1"}},{"key":"call_id","value":{"stringValue":"call-1"}},{"key":"success","value":{"stringValue":"yes"}}]}]}]}]}"#,
+                AdapterError::InvalidFieldType,
+            ),
+            (
+                br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[{"key":"event.name","value":{"stringValue":"codex.api_request"}},{"key":"conversation.id","value":{"stringValue":"conversation-1"}},{"key":"model","value":{"stringValue":"gpt-test"}},{"key":"http.response.status_code","value":{"stringValue":"invalid"}}]}]}]}]}"#,
+                AdapterError::InvalidFieldType,
+            ),
+            (
+                br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[{"key":"event.name","value":{"stringValue":"codex.api_request"}},{"key":"conversation.id","value":{"stringValue":"conversation-1"}},{"key":"model","value":{"stringValue":"gpt-test"}},{"key":"http.response.status_code","value":{"intValue":"600"}}]}]}]}]}"#,
+                AdapterError::InvalidFieldType,
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let error = parse_otlp_http_json(input, "generation-a", None, 1, 123).unwrap_err();
+            assert_eq!(error.to_string(), expected.to_string());
+        }
+    }
+
+    #[test]
+    fn otlp_rejects_contradictory_success_signals() {
+        let contradictory_attributes = [
+            r#"{"key":"success","value":{"boolValue":true}},{"key":"http.response.status_code","value":{"intValue":"500"}}"#,
+            r#"{"key":"success","value":{"boolValue":false}},{"key":"http.response.status_code","value":{"intValue":"200"}}"#,
+            r#"{"key":"success","value":{"boolValue":true}},{"key":"error.message","value":{"stringValue":"PRIVATE_ERROR"}}"#,
+            r#"{"key":"http.response.status_code","value":{"intValue":"200"}},{"key":"error.message","value":{"stringValue":"PRIVATE_ERROR"}}"#,
+        ];
+
+        for attributes in contradictory_attributes {
+            let input = format!(
+                r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"attributes":[{{"key":"event.name","value":{{"stringValue":"codex.api_request"}}}},{{"key":"conversation.id","value":{{"stringValue":"conversation-1"}}}},{{"key":"model","value":{{"stringValue":"gpt-test"}}}},{attributes}]}}]}}]}}]}}"#
+            );
+            assert!(matches!(
+                parse_otlp_http_json(input.as_bytes(), "generation-a", None, 1, 123),
+                Err(AdapterError::InvalidFieldType)
+            ));
+        }
+
+        let completed_but_failed = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[{"key":"event.name","value":{"stringValue":"codex.sse_event"}},{"key":"conversation.id","value":{"stringValue":"conversation-1"}},{"key":"model","value":{"stringValue":"gpt-test"}},{"key":"event.kind","value":{"stringValue":"response.completed"}},{"key":"success","value":{"boolValue":false}}]}]}]}]}"#;
+        assert!(matches!(
+            parse_otlp_http_json(completed_but_failed, "generation-a", None, 1, 123),
+            Err(AdapterError::InvalidFieldType)
+        ));
+    }
+
+    #[test]
+    fn otlp_uses_fallback_time_and_observed_lifecycle_only_when_signals_are_absent() {
+        let input = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[{"key":"event.name","value":{"stringValue":"codex.tool_result"}},{"key":"conversation.id","value":{"stringValue":"conversation-1"}},{"key":"call_id","value":{"stringValue":"call-1"}}]}]}]}]}"#;
+        let (batch, _) = parse_otlp_http_json(input, "generation-a", None, 1, 123).unwrap();
+        let observation = batch.observations().next().unwrap();
+        assert_eq!(observation.lifecycle, LifecycleState::Observed);
+        assert_eq!(observation.timing.end_unix_ms, Some(123));
     }
 
     #[test]
@@ -2201,7 +2324,7 @@ mod tests {
             assert!(!String::from_utf8_lossy(&encoded).contains(secret));
         }
 
-        let batch = parse_notify_json(input, "codex-notify-v1", None, 1, 123).unwrap();
+        let batch = parse_projected_notify_json(&encoded, "codex-notify-v1", None, 1, 123).unwrap();
         let turn = batch.observations().next().unwrap();
         assert!(matches!(turn.event, ObservationEvent::Turn));
         assert_eq!(
@@ -2273,8 +2396,14 @@ mod tests {
             Err(AdapterError::InvalidIdentifier)
         ));
 
-        let first_batch = parse_notify_json(input.as_bytes(), "generation", None, 1, 123).unwrap();
-        let second_batch = parse_notify_json(input.as_bytes(), "generation", None, 1, 123).unwrap();
+        let projected = project_notify_json(input.as_bytes())
+            .unwrap()
+            .to_json()
+            .unwrap();
+        let first_batch =
+            parse_projected_notify_json(&projected, "generation", None, 1, 123).unwrap();
+        let second_batch =
+            parse_projected_notify_json(&projected, "generation", None, 1, 123).unwrap();
         let first_observation = first_batch.observations().next().unwrap();
         let second_observation = second_batch.observations().next().unwrap();
         assert_eq!(
@@ -2287,6 +2416,34 @@ mod tests {
         );
         assert!(first_observation.trace_id.as_str().len() <= MAX_IDENTIFIER_BYTES);
         assert!(first_observation.span_id.as_str().len() <= MAX_IDENTIFIER_BYTES);
+    }
+
+    #[test]
+    fn projected_notify_parser_rejects_raw_and_extended_wire_payloads() {
+        let raw = br#"{
+          "type":"agent-turn-complete",
+          "thread-id":"conversation-1",
+          "turn-id":"turn-1",
+          "cwd":"/RAW_PATH_SECRET",
+          "input-messages":["RAW_PROMPT_SECRET"],
+          "last-assistant-message":"RAW_ASSISTANT_SECRET"
+        }"#;
+        assert!(matches!(
+            parse_projected_notify_json(raw, "generation", None, 1, 123),
+            Err(AdapterError::InvalidSchema)
+        ));
+
+        let extended = br#"{
+          "schema_version":"codex_projected_notify.v1",
+          "event_name":"agent-turn-complete",
+          "thread_id":"conversation-1",
+          "turn_id":"turn-1",
+          "raw_content":"RAW_PROMPT_SECRET"
+        }"#;
+        assert!(matches!(
+            parse_projected_notify_json(extended, "generation", None, 1, 123),
+            Err(AdapterError::InvalidSchema)
+        ));
     }
 
     #[test]

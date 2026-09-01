@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches:
@@ -20,7 +21,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
       - name: Check pull request diff
@@ -29,17 +30,16 @@ jobs:
       - name: Check pushed commit
         if: github.event_name == 'push'
         run: git diff-tree --check --root -r HEAD
-      - name: Select stable Rust
+      - name: Install release Rust toolchain
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
-          rustup component add rustfmt clippy
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup component add --toolchain 1.97.0 rustfmt clippy
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: cargo +1.97.0 fmt --all -- --check
       - name: Run tests
-        run: cargo test --workspace --no-fail-fast
+        run: cargo +1.97.0 test --workspace --no-fail-fast
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo +1.97.0 clippy --workspace --all-targets -- -D warnings
 
   rust-macos:
     name: Rust macOS
@@ -47,18 +47,26 @@ jobs:
     timeout-minutes: 75
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
-      - name: Select stable Rust
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install release Rust toolchain
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
-          rustup component add clippy
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup component add --toolchain 1.97.0 clippy
       - name: Run macOS tests
-        run: cargo test --workspace --no-fail-fast
+        run: cargo +1.97.0 test --workspace --no-fail-fast
+      - name: Install exact supported Codex CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/codex-0.151.0"
+          npm install --prefix "$prefix" @openai/codex@0.151.0
+          echo "$prefix/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Verify exact Codex CLI
+        run: test "$(codex --version)" = "codex-cli 0.151.0"
       - name: Run automatic performance smoke
-        run: cargo run -p xtask -- perf automatic --profile smoke --check
+        run: cargo +1.97.0 run --locked -p xtask -- perf automatic --profile smoke --check
       - name: Run macOS Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo +1.97.0 clippy --workspace --all-targets -- -D warnings
 
   report-ui:
     name: Report UI
@@ -66,9 +74,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install release Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal
       - name: Use minimum supported Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 20
           cache: npm
@@ -76,3 +86,56 @@ jobs:
         run: npm ci
       - name: Run report UI checks
         run: npm test
+
+  automatic-release-evidence:
+    name: Exact-revision automatic release evidence
+    if: github.event_name == 'workflow_dispatch'
+    needs:
+      - rust
+      - rust-macos
+      - report-ui
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install release Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+      - name: Install exact supported Codex CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/codex-0.151.0"
+          npm install --prefix "$prefix" @openai/codex@0.151.0
+          echo "$prefix/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Verify exact Codex CLI
+        run: test "$(codex --version)" = "codex-cli 0.151.0"
+      - name: Run normative automatic release gate
+        id: evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.97.0 build --release --locked -p agent-observability-cli
+          binary="$PWD/target/release/agent-observability"
+          test "$("$binary" --version)" = "1.8.0"
+          cargo +1.97.0 run --locked -p xtask -- perf automatic --profile release --check \
+            --binary "$binary" | tee "$RUNNER_TEMP/automatic-release-evidence.out"
+          manifest="$(sed -n 's/^manifest=//p' "$RUNNER_TEMP/automatic-release-evidence.out")"
+          test -f "$manifest"
+          grep -Fxq "status: pass" "$manifest"
+          grep -Fxq "evidence_kind: automatic_release_evidence" "$manifest"
+          grep -Fxq "release_readiness: verified" "$manifest"
+          grep -Fxq "real_codex_e2e_status: passed" "$manifest"
+          grep -Fxq "source_revision: $GITHUB_SHA" "$manifest"
+          grep -Fxq "profile: release" "$manifest"
+          grep -Fxq "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-and-synthetic-benchmark" "$manifest"
+          grep -Fxq "  codex_version: 0.151.0" "$manifest"
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+      - name: Upload exact-revision automatic release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: automatic-release-evidence-${{ github.sha }}
+          path: ${{ steps.evidence.outputs.manifest }}
+          if-no-files-found: error
+          retention-days: 30

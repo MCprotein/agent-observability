@@ -893,7 +893,7 @@
         <a href="#collection"><i data-lucide="activity"></i>\uC218\uC9D1</a>
         <a href="#storage"><i data-lucide="database"></i>\uC800\uC7A5\uC18C</a>
         <a href="#retention"><i data-lucide="archive"></i>\uBCF4\uAD00</a>
-        <div class="nav-note"><strong>Codex</strong><span>${integration?.config === "connected" ? "\uC790\uB3D9 \uC218\uC9D1 \uC5F0\uACB0\uB428" : "\uC790\uB3D9 \uC218\uC9D1 \uC5F0\uACB0 \uC548 \uB428"}</span><span>${collectorNavigationStatus()}</span></div>
+        <div class="nav-note"><strong>Codex</strong><span>${configNavigationStatus()}</span><span>${collectorNavigationStatus()}</span></div>
       </nav>
       <main class="settings-main">
         <form id="settings-form" novalidate>
@@ -959,11 +959,16 @@
     const action = connected ? `<button class="button secondary" id="toggle-integration" type="button"><i data-lucide="power"></i>\uC5F0\uACB0 \uD574\uC81C</button>` : `<button class="button primary" id="toggle-integration" type="button"><i data-lucide="cable"></i>Codex \uC5F0\uACB0</button>`;
     const panelState = conflicted2 ? "conflict" : degraded ? "degraded" : ready ? "ready" : "idle";
     const collectorLabel = degraded ? "\uB9AC\uD3EC\uD2B8 \uC9C0\uC5F0" : ready ? "\uC815\uC0C1" : "\uC911\uC9C0";
-    return `<div class="integration-panel" data-state="${panelState}">
+    return `<div class="integration-panel" data-state="${panelState}" data-config-state="${integration?.config ?? "disconnected"}" data-collector-state="${integration?.collector ?? "unavailable"}">
     <div class="integration-identity"><span class="integration-icon"><i data-lucide="activity"></i></span><div><span>Codex</span><strong>${state}</strong><small>${detail}</small></div></div>
     <div class="integration-meta"><span><b>\uC218\uC9D1\uAE30</b>${collectorLabel}</span><span><b>\uC800\uC7A5</b>\uB85C\uCEEC \uC804\uC6A9</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
     <div class="integration-actions">${action}<button class="button monitor-button" id="overview-dashboard" type="button"><i data-lucide="external-link"></i>\uB9AC\uD3EC\uD2B8 \uC5F4\uAE30</button></div>
   </div>`;
+  }
+  function configNavigationStatus() {
+    if (integration?.config === "connected") return "\uC790\uB3D9 \uC218\uC9D1 \uC5F0\uACB0\uB428";
+    if (integration?.config === "conflict") return "Codex \uC124\uC815 \uCDA9\uB3CC";
+    return "\uC790\uB3D9 \uC218\uC9D1 \uC5F0\uACB0 \uC548 \uB428";
   }
   function collectorNavigationStatus() {
     if (integration?.collector === "ready") return "collector \uC2E4\uD589 \uC911";

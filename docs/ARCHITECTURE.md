@@ -7,8 +7,9 @@
 ## Current and target stack
 
 현재 `v1.8.0`은 **In Progress**다. macOS standalone은 Codex, Claude Code와 Cursor의 private
-handoff 수동 import를 daemon과 network 없이 계속 제공한다. 선택적 Codex automatic path는 인증된
-`127.0.0.1` OTLP/HTTP JSON receiver, bounded notify supplement와 LaunchAgent를 추가한다. Rust 경로는
+handoff 수동 import를 daemon과 network 없이 계속 제공한다. 선택적 Codex automatic path는 private-CA
+HTTPS와 exact private random request header로 인증하는 `127.0.0.1` OTLP/HTTP JSON receiver,
+pre-transport projected notify supplement와 LaunchAgent를 추가한다. 이 transport는 mTLS가 아니다. Rust 경로는
 closed contract, deterministic lifecycle reduction, topology validation, pricing/report projection, bounded
 input과 private embedded transaction, static HTML assembly를 구현한다. SQLite `local_state.v4`가 source
 cursor, stable observation, current reduced record, adapter disposition과 profile-neutral delivery outcome의
@@ -114,11 +115,13 @@ evidence runner인 `xtask`로 나뉜다. domain은 외부 형식을
 source와 durable/report DTO 경계를 소유한다. application은 pricing과 report projection을,
 inbound adapters는 제품별 source precedence/correlation/dedupe와 raw-to-allowlisted-scalar projection을,
 codex-config는 user-level Codex 설정의 exact ownership/restore를, codex-integration은 config/LaunchAgent/
-health lifecycle을 하나의 CLI/UI use case로 조립한다. local-collector는 authenticated loopback HTTP 수신,
-durable commit과 report refresh를, local-store는 SQLite transaction과 JSONL
+health lifecycle을 하나의 CLI/UI use case로 조립한다. local-collector는 standalone automatic mode의
+별도 composition root로서 private-CA HTTPS + exact-header loopback 수신, durable commit과 report refresh를,
+local-store는 SQLite transaction과 JSONL
 projection을, static-report는 generated UI asset의 self-contained artifact 조립과 private atomic write를,
 local-ui는 authenticated loopback config/integration inbound adapter와 embedded generated asset을, local-runtime은
-blocking config I/O를 캡슐화한 standalone config use-case를, CLI는 composition root를 소유한다.
+blocking config I/O를 캡슐화한 standalone config use-case를 소유한다. CLI는 foreground/manual composition
+root를, local-collector는 automatic collector composition root를 소유한다.
 local-ui handler는 이 use-case를 blocking executor에서 호출하고 HTTP 연결 task는 최대 64개로 제한한다.
 `contracts/*.schema.json`은 closed wire contract이고 versioned config fixture와 전체 bounds parity
 corpus가 strict Rust wire DTO와 생성된 TypeScript validator의 required/default/min/max/unknown-field
@@ -127,8 +130,9 @@ corpus가 strict Rust wire DTO와 생성된 TypeScript validator의 required/def
 
 ```mermaid
 flowchart TB
-    Codex["Codex"] -->|"authenticated OTLP HTTP JSON"| Receiver["Local Codex receiver"]
-    Codex -->|"bounded notify supplement"| Receiver
+    Codex["Codex"] -->|"private-CA HTTPS + exact private header"| Receiver["Local Codex receiver"]
+    Codex -->|"raw notify callback"| Notify["codex-notify allowlist projector"]
+    Notify -->|"projected supplement over authenticated HTTPS"| Receiver
     Manual["Private canonical handoff files"] --> Adapters["Rust inbound adapters"]
     Receiver --> Allowlist["Codex scalar allowlist"]
     Allowlist --> Adapters
@@ -210,8 +214,9 @@ anti-corruption layer다.
 - downstream consumer가 agent별 ID prefix를 파싱하지 않도록 `session_id`, `turn_id`,
   `operation_id` 등을 명시적으로 채운다.
 - 원문 prompt, output, command, diff, file content를 canonical metadata로 가장하지 않는다.
-- Codex automatic receiver는 bounded raw OTLP/notify JSON을 process memory에서 decode한 뒤
-  `conversation.id`, `turn.id`, model, bounded tool category, request/call ID, decision, duration, token
+- Codex automatic notify helper는 raw notify를 settings/socket 접근 전에 closed content-free wire object로
+  축약한다. Receiver는 bounded raw OTLP JSON을 process memory에서 decode한 뒤 `conversation.id`,
+  `turn.id`, model, bounded tool category, request/call ID, decision, duration, token
   counts와 success처럼 명시적으로 소유한 scalar만 canonical adapter에 복사한다. Raw body, prompt,
   response, tool arguments/output, command, cwd, path, account identity와 unknown attribute는 persist,
   log, diagnostic, projection 또는 export하지 않는다.
@@ -221,9 +226,12 @@ anti-corruption layer다.
   두며, 동일 canonical span의 재전달만 adapter에서 억제한다.
 - unsupported, content-ignored와 duplicate-suppressed 입력도 raw payload 없이 fixed enum만
   `adapter_dispositions`에 기록하며 같은 transaction에서 cursor를 진행한다.
-- Codex notify helper는 최대 64 KiB payload만 loopback receiver로 전달하고 bounded connect/read/write
-  deadline 뒤 항상 fail open한다. 외부 network, full transcript parse, report render나 queue drain을
-  기다리지 않는다. Future file fallback은 persisted cursor와 source generation으로 incrementally reconcile한다.
+- Codex notify helper는 최대 64 KiB의 raw input을 받은 뒤 settings 또는 socket 접근 전에 더 작은 closed
+  content-free projection으로 축약한다. 이 projection만 private-CA HTTPS와 exact private request header로
+  loopback receiver에 전달하며 전체
+  connect/TLS/HTTP deadline 뒤 항상 fail open한다. 외부 network, full transcript parse, report render나
+  queue drain을 기다리지 않는다. Future file fallback은 persisted cursor와 source generation으로
+  incrementally reconcile한다.
 - 제품별 공식 source 우선순위와 지원 evidence는
   [`ADAPTER_COMPATIBILITY.md`](ADAPTER_COMPATIBILITY.md)를 따른다.
 - Manual Rust adapter 입력은 private regular JSONL file로 제한하며 최대 1 MiB, 4096 record,
@@ -254,11 +262,26 @@ anti-corruption layer다.
 - standalone 설정은 `local_runtime.v2` strict JSON이다. 기존 v1은 retention 기본값으로 호환
   로드한다. 팀 identity, 이메일, endpoint와 transport
   설정은 포함하지 않는다.
-- Codex automatic integration은 별도 private `runtime/collector.json`과
-  `runtime/integrations/codex/codex-config-ownership-v1.json`을 사용한다. Collector token은 32 random
-  bytes의 hex encoding이며 HTTP header에서 constant-time 비교한다. Receiver는 IPv4 loopback에만
-  bind하고 `/health`, `/v1/logs`, `/v1/notify` 모두 token을 요구한다. 외부 network client는 없다.
+- Codex automatic integration은 별도 private `runtime/collector.json`,
+  `runtime/integrations/codex/tls` credential tree와
+  `runtime/integrations/codex/codex-config-ownership-v1.json`을 사용한다. Collector settings은 private
+  random 256-bit request-header value와 bounded credential path metadata를 소유하고 PEM body를 넣지
+  않는다. Receiver는 IPv4 loopback에만 bind한다. Codex와 내부 probe는 private CA가 서명한
+  server certificate와 IP SAN을 검증하고, `/health`, `/v1/logs`, `/v1/notify` request는 exact
+  `x-agent-observability-token` header를 제공해야 한다. Codex exporter에 client certificate/private-key
+  field를 구성하지 않으며 transport는 mTLS가 아니다. 외부 network client는 없다. 같은 OS user가
+  private header secret이나 server key를 읽을 수 있는 위협은 이 경계 밖이며 별도 account 또는
+  sandbox가 필요하다.
 - `connect codex`는 collector LaunchAgent를 준비하고 health를 확인한 뒤 Codex config를 변경한다.
+  v2 mTLS에서 v3로 바뀌는 경우 settings migration journal이 exact prior bytes/mode와 credential
+  generation을 보존한다. LaunchAgent와 Codex config commit 전에는 legacy credential을 지우지 않으며,
+  실패 시 config 해제와 service rollback이 모두 확인된 뒤에만 settings와 replacement credential을
+  복원·정리한다. 보상 실패 시에는 v3 settings, journal, credential을 유지해 실행 중 참조를 깨지 않는다.
+  service install/restart 또는 commit 결과가 불확실한 오류도 같은 방식으로 보존하고 다음 lifecycle
+  command가 LaunchAgent ownership phase를 먼저 복구한다.
+  성공 시 durable `integration_committed` phase를 기록한 뒤에만 obsolete generation과 journal을
+  fsync하며 제거한다. `status`와 `disconnect`는 settings parse 전에 남은 journal과 config ownership을
+  조정하며 committed phase는 이전 settings로 되돌리지 않는다.
   `$CODEX_HOME/config.toml` 또는 기본 `~/.codex/config.toml`의 exact prior/connected bytes, hash, mode와
   transaction phase를 private ownership snapshot에 보존한다. 관리하는 값은 top-level `notify`, `otel.exporter`,
   `otel.log_user_prompt=false`, `otel.environment="local"`뿐이다. 기존 값이 다르면 connect는 conflict로

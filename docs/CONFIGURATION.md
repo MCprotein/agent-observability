@@ -110,10 +110,16 @@ agentobs disconnect codex /private/runtime
 ```
 
 Collector settings는 `<root>/runtime/collector.json`에 mode `0600`으로 기록한다. 현재 schema는
-`local_collector.v1`이며 loopback port, 64-character random token과 source generation을 소유한다.
-이 파일은 supported user-editable config가 아니다. Receiver는 configured IPv4 loopback port에만 bind하고
-`/health`, `/v1/logs`, `/v1/notify`의 token header를 확인한다. External endpoint나 network client 설정은
-없다.
+`local_collector.v3`이며 loopback port, transport, private random 256-bit request-header value와 bounded
+credential generation metadata를 소유한다. PEM 본문은 settings에 넣지 않고
+`<root>/runtime/integrations/codex/tls` 아래의 `0700` directory와 `0600` regular file로 분리한다.
+이 파일들은 supported user-editable config가 아니다. Receiver는 configured IPv4 loopback port에만
+bind한다. Client는 private CA가 서명한 server certificate와 loopback IP SAN을 검증하고, 모든
+request에 exact `x-agent-observability-token` header를 제공한다. Client certificate/private-key field는
+구성하지 않으며 이 transport는 mTLS가 아니다. 정확히 인식한 `local_collector.v2` mTLS settings는
+exact prior bytes/mode와 credential generation을 durable migration journal에 보존한 뒤 v3 후보를
+게시한다. LaunchAgent와 Codex config commit이 모두 끝난 뒤에만 obsolete client identity artifact를
+제거하며, 실패하면 prior settings와 credentials를 복원한다. External endpoint 설정은 없다.
 
 Codex config는 `$CODEX_HOME/config.toml` 또는 기본 `~/.codex/config.toml`이다. Connection manager가
 소유하는 값은 다음 네 항목뿐이다.
@@ -121,7 +127,7 @@ Codex config는 `$CODEX_HOME/config.toml` 또는 기본 `~/.codex/config.toml`�
 | Managed value | Required value |
 | --- | --- |
 | top-level `notify` | canonical absolute installed executable path, `codex-notify`, absolute runtime root의 3-element command |
-| `otel.exporter` | local `/v1/logs` endpoint, JSON protocol, private token header만 포함한 OTLP/HTTP exporter |
+| `otel.exporter` | local HTTPS `/v1/logs` endpoint, JSON protocol, private CA path와 exact `x-agent-observability-token` header만 포함한 OTLP/HTTP exporter; client identity field 없음 |
 | `otel.log_user_prompt` | `false` |
 | `otel.environment` | `local` |
 
@@ -137,6 +143,10 @@ bytes와 mode를 복원한다. 연결 전 config가 없었다면 생성한 file�
 managed value가 아닌 설정만 바꾼 경우에도 conflict로 중단하고 그 편집을 보존한다. Successful
 disconnect는 연결 전 LaunchAgent plist와 loaded 상태를 먼저 복원한다. Connect가 새로 만든 service만
 종료·제거하며, 그 뒤 config를 복원한다. Local observation, SQLite와 dashboard는 보존한다.
+
+Private CA는 trusted client가 올바른 receiver를 검증하게 하고 exact private header는 credential이 없는
+request를 거부한다. 다만 같은 OS user로 실행되어 `0600` header secret이나 server private key를
+읽을 수 있는 process는 이 경계만으로 구분할 수 없다.
 
 ## 자주 쓰는 변경
 

@@ -5,8 +5,9 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
 > **v1.8.0 상태: In Progress.** 기존 Codex, Claude Code, Cursor private handoff 수동 import는
-> daemon이나 network 없이 계속 동작한다. 선택적 Codex 자동 수집은 인증된 `127.0.0.1`
-> OTLP/HTTP JSON receiver, bounded notify supplement와 macOS LaunchAgent를 사용한다.
+> daemon이나 network 없이 계속 동작한다. 선택적 Codex 자동 수집은 private CA HTTPS와
+> exact private random request header로 보호한 `127.0.0.1` OTLP/HTTP JSON receiver, bounded notify
+> supplement와 macOS LaunchAgent를 사용한다. 이 transport는 mTLS가 아니다.
 > Claude Code/Cursor 자동 수집과 commercial team profile은 아직 TODO다.
 
 > **v1.7 이하에서 업그레이드할 때:** 인자 없는 `agentobs setup`은 v1.8부터 Codex 설정을 연결하고
@@ -21,9 +22,20 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
 ### 1. 설치
 
-Apple Silicon과 Intel Mac을 모두 지원하는 universal binary를 설치한다. 설치기는 release
-checksum과 실행 파일 버전을 확인한 뒤 `~/.local/bin`에 원자적으로 설치하고, 현재 shell의
+게시된 installer는 Apple Silicon과 Intel Mac을 모두 지원하는 universal binary를 설치한다. 설치기는
+release checksum과 실행 파일 버전을 확인한 뒤 `~/.local/bin`에 원자적으로 설치하고, 현재 shell의
 profile에 PATH 블록을 한 번만 등록한다.
+
+`v1.8.0` tag가 게시되기 전 이 release branch를 검증할 때는 checkout 안에서 현재 Mac architecture용
+Rust `1.97.0` native release binary를 직접 실행한다. 이 경로는 기존 설치 파일을 덮어쓰지 않는다.
+
+```bash
+cargo +1.97.0 build --release --locked -p agent-observability-cli
+target/release/agent-observability --version
+target/release/agent-observability setup ~/.agent-observability --no-open
+```
+
+게시된 `v1.8.0` release에서는 검증된 installer를 사용한다.
 
 ```bash
 (
@@ -72,7 +84,7 @@ Host와 Origin을 모두 확인한다. token은 같은 tab의 새로고침에서
 agentobs setup
 ```
 
-이 한 명령은 기본 위치 `~/.agent-observability`에 private runtime과 SQLite 저장소를 만들고,
+이 한 명령은 기본 위치 `~/.agent-observability`에 private runtime과 embedded SQLite transactional store를 만들고,
 Codex 설정을 연결하고, local collector LaunchAgent를 시작한 뒤 대시보드를 연다. 브라우저를 열지
 않는 환경에서는 `agentobs setup --no-open`을 사용한다. 처음에는 수집된 데이터가 없으므로 빈
 화면이 정상이다.
@@ -106,7 +118,7 @@ local data는 유지된다.
 | 로컬 설정 UI | 지원 | UI server는 `ui` 실행 중에만 존재하며 Codex 연결과 runtime config 관리 제공 |
 | 내장 sample 체험 | 지원 | 외부 파일 없이 `demo` 한 명령으로 확인 |
 | Canonical handoff 수동 import | 지원 | 세 agent 모두 daemon과 network 없이 private JSONL import 가능 |
-| Codex 자동 연결 | v1.8.0 In Progress | macOS LaunchAgent와 인증된 loopback OTLP/HTTP JSON + notify 사용 |
+| Codex 자동 연결 | v1.8.0 In Progress | macOS LaunchAgent와 private-CA HTTPS + exact private random header를 사용한 loopback OTLP/HTTP JSON + projected notify |
 | Claude Code/Cursor 자동 연결 | TODO | 현재 자동 receiver/config 연결은 Codex만 지원 |
 | Commercial team profile | TODO | G0-G4 승인과 evidence 전에는 완료로 간주하지 않음 |
 
@@ -129,14 +141,18 @@ local data는 유지된다.
 ### Codex 자동 수집
 
 `agentobs setup` 또는 `agentobs connect codex`가 `$CODEX_HOME/config.toml`을 연결한다.
-`CODEX_HOME`이 없으면 `~/.codex/config.toml`을 사용한다. Codex telemetry는 token header가 있는
-OTLP/HTTP JSON으로 `127.0.0.1` receiver에 들어오고, `agent-turn-complete` notify는 bounded local
-supplement로 turn 완료만 보완한다. 어느 경로도 외부 network를 사용하지 않는다.
+`CODEX_HOME`이 없으면 `~/.codex/config.toml`을 사용한다. Codex telemetry는 private CA로 server를
+검증하는 HTTPS와 exact `x-agent-observability-token` request header를 사용해 `127.0.0.1`
+receiver에 들어온다. Header 값은 runtime이 생성하는 private random 256-bit value다. Codex
+exporter에 client certificate나 client private-key field를 넣지 않으며, 이 transport는 mTLS가 아니다.
+`agent-turn-complete` notify는 raw payload를 전송 전에 bounded allowlist로 축약한 뒤 turn 완료만
+보완한다. 어느 경로도 외부 network를 사용하지 않는다.
 
-Receiver가 받은 raw notify payload와 raw OTLP/tool field는 bounded parsing 동안 process memory에
-일시적으로 들어올 수 있다. Adapter boundary를 통과하는 값은 명시적으로 허용된 scalar뿐이다.
-Prompt, response, tool arguments/output, command, cwd, path, account identity와 unknown field는
-persist, log, projection 또는 export 전에 버려진다.
+Raw notify payload는 foreground helper의 bounded parsing 동안에만 process memory에 존재하며 receiver나
+socket에는 들어가지 않는다. Raw OTLP/tool field는 receiver의 bounded parsing 동안 일시적으로 존재할
+수 있다. Adapter boundary를 통과하는 값은 명시적으로 허용된 scalar뿐이다. Prompt, response, tool
+arguments/output, command, cwd, path, account identity와 unknown field는 persist, log, projection 또는
+export 전에 버려진다.
 
 ### 수동 import
 
@@ -181,11 +197,16 @@ agentobs config set storage-bytes 2147483648
 ## Agent 지원 범위
 
 `Verified version`은 capability manifest가 해당 버전의 canonical source 의미를 검증한다는 뜻이다.
-v1.8.0 automatic release evidence는 아직 진행 중이다.
+Codex `0.151.0` strict config load는 config parsing만 검증하며 exporter construction이나 native
+telemetry delivery를 검증하지 않는다. macOS에서 client identity field가 있는 이전 config는
+exporter construction에 실패했다. 보정된 transport에서 실제 Codex process가 content-free loopback
+Responses fixture를 호출해 native telemetry를
+collector와 durable report까지 전달하는 local e2e는 통과했다. 최종 source revision에 묶인 CI artifact와
+게시 검증이 남아 있으므로 automatic capability는 아직 `experimental`이다.
 
-| Agent | Verified version | 현재 지원 | 알려진 제한 |
+| Agent | Pinned / verified version | 현재 지원 | 알려진 제한 |
 | --- | --- | --- | --- |
-| Codex | 수동 `0.150.1`, 자동 `0.151.0` | 수동 handoff + 자동 local OTLP/HTTP JSON/notify | 자동 경로는 macOS only, v1.8.0 In Progress |
+| Codex | 수동 verified `0.150.1`; 자동 pinned `0.151.0` (local actual e2e passed) | 수동 handoff + 자동 local OTLP/HTTP JSON/notify | 자동 경로는 macOS only, exact-revision CI/publication pending |
 | Claude Code | `2.1.248` | OTel/hook canonical handoff 수동 import | 자동 연결 TODO, user interrupt signal 미확인 |
 | Cursor | `3.17.21` | generic tool canonical handoff 수동 import | 자동 연결 TODO, 일부 shell/MCP/file event는 diagnostic-only |
 
@@ -195,8 +216,9 @@ v1.8.0 automatic release evidence는 아직 진행 중이다.
 
 ```mermaid
 flowchart TB
-    Codex["Codex"] -->|"OTLP HTTP JSON with token"| Receiver["Local receiver on 127.0.0.1"]
-    Codex -->|"bounded notify supplement"| Receiver
+    Codex["Codex"] -->|"private-CA HTTPS + exact private header"| Receiver["HTTPS receiver on 127.0.0.1"]
+    Codex -->|"raw notify callback"| Notify["codex-notify allowlist projector"]
+    Notify -->|"projected supplement over authenticated HTTPS"| Receiver
     Manual["Private canonical handoff files"] --> Adapters["Rust adapters"]
     Receiver --> Allowlist["Codex scalar allowlist"]
     Allowlist --> Adapters
@@ -215,7 +237,7 @@ flowchart TB
 - Codex automatic path와 manual handoff path는 같은 adapter, domain, store와 report contract로 합류한다.
 - Claude Code와 Cursor automatic producer/receiver는 아직 이 그림의 구현 범위가 아니다.
 - agent별 차이는 adapter에서 끝나고 이후 저장·비용·UI contract는 하나다.
-- SQLite가 로컬 권위 저장소이며 JSONL archive와 HTML은 다시 만들 수 있는 projection이다.
+- Embedded SQLite store가 로컬 권위 저장소이며 JSONL archive와 HTML은 다시 만들 수 있는 projection이다.
 - TypeScript UI는 원본 agent payload가 아니라 Rust가 검증한 report DTO만 받는다.
 - report는 endpoint 없이 `file://`로 열린다. 자동 collector와 설정 UI는 서로 다른 인증된 loopback
   endpoint이며 외부 interface에 bind하지 않는다.
@@ -235,7 +257,7 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    A["Local SQLite"] --> B["Read-only plan"]
+    A["Local SQLite authority"] --> B["Read-only plan"]
     B --> C{"Review result"}
     C -->|keep| A
     C -->|apply| D["Private archive"]
@@ -265,11 +287,17 @@ Crash recovery와 replay 규칙은 [Local Runtime](docs/LOCAL_RUNTIME.md#retenti
 | --- | --- |
 | Prompt, response, tool output | durable storage와 report에 저장하지 않음 |
 | Command, cwd, path, raw email | allowlist contract 밖에서는 저장하지 않음 |
-| Raw notify/OTLP/tool field | bounded parse 동안 memory에만 일시 존재할 수 있고 persist/log/project/export하지 않음 |
+| Raw notify | foreground helper에서 allowlist projection한 뒤에만 private-CA HTTPS와 exact private header로 전달 |
+| Raw OTLP/tool field | bounded parse 동안 memory에만 일시 존재할 수 있고 persist/log/project/export하지 않음 |
 | Runtime directory | `0700`만 허용 |
 | Config, archive, report | `0600`으로 기록 |
 | Unknown field와 schema | 추측하지 않고 거부 |
-| External network | standalone outbound 경로 없음; 자동 collector와 설정 화면은 인증된 loopback만 사용 |
+| External network | standalone outbound 경로 없음; 자동 collector는 인증된 HTTPS loopback, 설정 화면은 별도 인증 loopback만 사용 |
+
+Private CA server certificate는 정상 client가 신뢰하지 않는 loopback listener로 payload를
+보내지 않게 하고, exact private random header는 credential이 없는 request를 receiver가 거부하게
+한다. 같은 OS 사용자 권한으로 `0600` header secret이나 server private key를 읽을 수 있는
+악성 process는 이 경계로 격리할 수 없으며, 그런 위협에는 별도 계정이나 OS sandbox가 필요하다.
 
 ## 다른 설치 방법
 

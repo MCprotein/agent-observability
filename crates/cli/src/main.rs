@@ -10,7 +10,7 @@ use agent_observability_adapter_cursor::{
 };
 use agent_observability_application::{parse_rate_table_json, project_report};
 use agent_observability_codex_integration::{
-    CollectorStatus, ConnectionStatus, connect as connect_integration,
+    CodexIntegrationStatus, CollectorStatus, ConnectionStatus, connect as connect_integration,
     disconnect as disconnect_integration, status as integration_status,
 };
 use agent_observability_contracts::{
@@ -540,15 +540,20 @@ fn disconnect_codex(root: &Path) -> Result<String, String> {
 fn codex_status(root: &Path) -> Result<String, String> {
     let status =
         integration_status(root, &installed_executable()?).map_err(|error| error.to_string())?;
-    if status.endpoint.is_none() {
-        return Ok("integration=codex\nconfig=disconnected\ncollector=unavailable".into());
-    }
-    Ok(format!(
-        "integration=codex\nconfig={}\ncollector={}\nendpoint={}",
+    Ok(format_codex_status(&status))
+}
+
+fn format_codex_status(status: &CodexIntegrationStatus) -> String {
+    let mut output = format!(
+        "integration=codex\nconfig={}\ncollector={}",
         connection_status(status.config),
         collector_status(status.collector),
-        status.endpoint.as_deref().unwrap_or_default()
-    ))
+    );
+    if let Some(endpoint) = &status.endpoint {
+        output.push_str("\nendpoint=");
+        output.push_str(endpoint);
+    }
+    output
 }
 
 fn installed_executable() -> Result<PathBuf, String> {
@@ -1115,7 +1120,11 @@ fn ingest_paths(path: &Path) -> Result<IngestPaths, String> {
 mod tests {
     use super::{
         IngestBlock, IngestResult, LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME,
-        prepare_dashboard_with, require_demo_ingest, run, timestamp_from_duration,
+        format_codex_status, prepare_dashboard_with, require_demo_ingest, run,
+        timestamp_from_duration,
+    };
+    use agent_observability_codex_integration::{
+        CodexIntegrationStatus, CollectorStatus, ConnectionStatus,
     };
     use std::fs;
     use std::path::Path;
@@ -1132,6 +1141,22 @@ mod tests {
     fn unknown_command_fails_closed() {
         assert!(run(["serve".into()].into_iter()).is_err());
         assert!(run(["storage-check".into()].into_iter()).is_err());
+    }
+
+    #[test]
+    fn codex_status_preserves_conflict_and_degraded_without_an_endpoint() {
+        let output = format_codex_status(&CodexIntegrationStatus {
+            config: ConnectionStatus::Conflict,
+            collector: CollectorStatus::Degraded,
+            endpoint: None,
+            service: None,
+            data_retained: true,
+        });
+
+        assert_eq!(
+            output,
+            "integration=codex\nconfig=conflict\ncollector=degraded"
+        );
     }
 
     #[cfg(unix)]

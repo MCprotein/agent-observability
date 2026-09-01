@@ -3,7 +3,7 @@ use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, Permissions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -29,13 +29,18 @@ use agent_observability_local_runtime::{
 use agent_observability_local_store::LocalStore;
 use serde::Deserialize;
 
-const USAGE: &str =
-    "usage: cargo run -p xtask -- perf <local|automatic> --profile <release|smoke> --check";
+const USAGE: &str = "usage: cargo run -p xtask -- perf <local|automatic> --profile <release|smoke> --check [--binary <absolute-path>]";
 const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-performance-v1.yaml");
 const AUTOMATIC_PROTOCOL: &str =
     include_str!("../../crates/contracts/performance/automatic-local-performance-v1.yaml");
 const AUTOMATIC_PROTOCOL_REVISION: &str =
-    "v1.4.0-centralized-mtls-primary-otlp-crash-lifecycle-scenarios";
+    "v1.8.0-codex-0.151-private-ca-header-real-e2e-and-synthetic-benchmark";
+const AUTOMATIC_CODEX_VERSION: &str = "codex-cli 0.151.0";
+const AUTOMATIC_NOTIFY_SENTINELS: [&[u8]; 3] = [
+    b"AUTOMATIC_RAW_CWD_SENTINEL",
+    b"AUTOMATIC_RAW_PROMPT_SENTINEL",
+    b"AUTOMATIC_RAW_ASSISTANT_SENTINEL",
+];
 const REQUIRED_PROTOCOL_LINES: [&str; 50] = [
     "schema_version: local_performance.v1",
     "protocol_revision: v1.2.0-supported-rate-saturation-continuous-network",
@@ -109,6 +114,7 @@ const AUTOMATIC_START_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTOMATIC_ACTIVE_TIMEOUT_RELEASE: Duration = Duration::from_mins(5);
 const AUTOMATIC_ACTIVE_TIMEOUT_SMOKE: Duration = Duration::from_secs(15);
 const AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTOMATIC_BINARY_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT: Duration = Duration::from_secs(15);
 const AUTOMATIC_LIFECYCLE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -119,8 +125,9 @@ const AUTOMATIC_ACTIVE_CPU_PERCENT_MAX: f64 = 100.0;
 const AUTOMATIC_PEAK_RSS_MIB_MAX: f64 = 96.0;
 const AUTOMATIC_ALLOCATED_DISK_BYTES_MAX: u64 = 1_073_741_824;
 const AUTOMATIC_CONNECT_OUTPUT_MAX_BYTES: u64 = 4_096;
-const AUTOMATIC_LIFECYCLE_SEED: &[u8] = b"# exact automatic lifecycle seed\nmodel = \"gpt-test\"\n";
 const AUTOMATIC_LIFECYCLE_SEED_MODE: u32 = 0o600;
+const AUTOMATIC_CODEX_E2E_PROMPT: &str =
+    "AUTOMATIC_CODEX_E2E_RAW_PROMPT_SENTINEL Reply with OK only.";
 #[cfg(target_os = "macos")]
 const NETWORK_MONITOR_START_ATTEMPTS: usize = 3;
 #[cfg(target_os = "macos")]
@@ -218,8 +225,8 @@ struct AutomaticReleaseProfile {
     required_os: String,
     warmup_seconds: u64,
     idle_seconds: u64,
-    primary_otlp_requests: usize,
-    primary_otlp_inter_request_ms: u64,
+    synthetic_otlp_requests: usize,
+    synthetic_otlp_inter_request_ms: u64,
     runs: usize,
     sample_interval_seconds: u64,
     active_timeout_seconds: u64,
@@ -231,7 +238,7 @@ struct AutomaticSmokeProfile {
     build: String,
     normative: bool,
     release_check: bool,
-    primary_otlp_requests: usize,
+    synthetic_otlp_requests: usize,
     runs: usize,
     active_timeout_seconds: u64,
 }
@@ -243,7 +250,10 @@ struct AutomaticProtocolWorkload {
     lifecycle_seed: String,
     lifecycle_assertions: String,
     lifecycle_cleanup: String,
-    primary_boundary: String,
+    codex_config_load_boundary: String,
+    observed_compatibility_correction: String,
+    real_codex_e2e_release_gate: String,
+    synthetic_benchmark_boundary: String,
     notify_boundary: String,
     collector_boundary: String,
     payload: String,
@@ -254,7 +264,7 @@ struct AutomaticProtocolWorkload {
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct AutomaticProtocolMetrics {
-    primary_otlp: AutomaticPrimaryOtlpMetrics,
+    synthetic_collector_otlp: AutomaticPrimaryOtlpMetrics,
     collector_cpu: AutomaticCpuMetrics,
     collector_rss: AutomaticRssMetrics,
     disk: AutomaticDiskMetrics,
@@ -315,12 +325,36 @@ struct AutomaticProtocolEvidence {
     output: String,
     exact_source: String,
     sanitized_paths: String,
+    release_scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexDiagnostic {
+    checks: CodexDiagnosticChecks,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexDiagnosticChecks {
+    #[serde(rename = "config.load")]
+    config_load: CodexConfigLoadCheck,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexConfigLoadCheck {
+    status: String,
+    details: CodexConfigLoadDetails,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexConfigLoadDetails {
+    #[serde(rename = "CODEX_HOME")]
+    codex_home: String,
 }
 
 #[derive(Debug)]
 struct AutomaticRunResult {
     run: usize,
-    primary_otlp_latencies_us: Vec<u128>,
+    synthetic_otlp_latencies_us: Vec<u128>,
     idle_samples: Vec<Sample>,
     idle_cpu_percent: f64,
     active_cpu_percent: f64,
@@ -1005,7 +1039,14 @@ fn command(args: &[String]) -> Result<(), String> {
         );
         return Ok(());
     }
-    if args.len() != 5
+    let supplied_binary = match args {
+        [_, mode, _, _, _, flag, path] if mode == "automatic" && flag == "--binary" => {
+            Some(Path::new(path))
+        }
+        [_, _, _, _, _] => None,
+        _ => return Err(USAGE.into()),
+    };
+    if args.len() < 5
         || args[0] != "perf"
         || !matches!(args[1].as_str(), "local" | "automatic")
         || args[2] != "--profile"
@@ -1019,13 +1060,13 @@ fn command(args: &[String]) -> Result<(), String> {
         _ => return Err("--profile must be release or smoke".into()),
     };
     if args[1] == "automatic" {
-        run_automatic(AutomaticConfig::for_profile(profile))
+        run_automatic(AutomaticConfig::for_profile(profile), supplied_binary)
     } else {
         run(Config::for_profile(profile))
     }
 }
 
-fn run_automatic(config: AutomaticConfig) -> Result<(), String> {
+fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Result<(), String> {
     validate_automatic_protocol_contract()?;
     validate_automatic_profile_host(config.profile, env::consts::OS)?;
     validate_network_surface()?;
@@ -1033,7 +1074,7 @@ fn run_automatic(config: AutomaticConfig) -> Result<(), String> {
         require_clean_worktree()?;
     }
     let source_revision = source_revision()?;
-    let binary = build_automatic_binary(config.profile)?;
+    let binary = resolve_automatic_binary(config.profile, supplied_binary)?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "clock before epoch")?
@@ -1145,45 +1186,48 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
     let smoke = AutomaticConfig::for_profile(Profile::Smoke);
     AutomaticProtocol {
         schema_version: "automatic_local_performance.v1".into(),
-        version: "v1.4.0".into(),
+        version: "v1.8.0".into(),
         protocol_revision: AUTOMATIC_PROTOCOL_REVISION.into(),
-        purpose: "normative performance evidence for the shipped Codex automatic local path".into(),
+        purpose: "normative automatic release evidence for real Codex compatibility, local lifecycle, privacy, and synthetic collector performance".into(),
         profiles: AutomaticProtocolProfiles {
             release: AutomaticReleaseProfile {
-                build: "cargo build --locked -p agent-observability-cli --release".into(),
+                build: "cargo +1.97.0 build --locked -p agent-observability-cli --release".into(),
                 required_os: "macos".into(),
                 warmup_seconds: release.warmup.as_secs(),
                 idle_seconds: release.idle.as_secs(),
-                primary_otlp_requests: release.events,
-                primary_otlp_inter_request_ms: u64::try_from(release.inter_event.as_millis())
+                synthetic_otlp_requests: release.events,
+                synthetic_otlp_inter_request_ms: u64::try_from(release.inter_event.as_millis())
                     .expect("release inter-request duration fits u64"),
                 runs: release.runs,
                 sample_interval_seconds: release.sample.as_secs(),
                 active_timeout_seconds: release.active_timeout.as_secs(),
             },
             smoke: AutomaticSmokeProfile {
-                build: "cargo build --locked -p agent-observability-cli".into(),
+                build: "cargo +1.97.0 build --locked -p agent-observability-cli".into(),
                 normative: false,
                 release_check: false,
-                primary_otlp_requests: smoke.events,
+                synthetic_otlp_requests: smoke.events,
                 runs: smoke.runs,
                 active_timeout_seconds: smoke.active_timeout.as_secs(),
             },
         },
         workload: AutomaticProtocolWorkload {
-            lifecycle_preflight: "bounded built-binary no-argument setup --no-open under isolated HOME and CODEX_HOME".into(),
+            lifecycle_preflight: "bounded built-binary no-argument setup --no-open under isolated HOME and CODEX_HOME, installed Codex 0.151.0 strict config loading, and one actual codex exec against a content-free loopback Responses fixture".into(),
             lifecycle_seed: "exact private Codex config bytes and permission mode".into(),
-            lifecycle_assertions: "connected config, ready or degraded collector, installed LaunchAgent plist, pre-failure mutual-TLS primary OTLP and notify durability, unexpected SIGKILL service termination and bounded launchd kickstart recovery, post-recovery mutual-TLS primary OTLP and notify durability, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service".into(),
+            lifecycle_assertions: "connected config, exact Codex 0.151.0 version and strict config loading, ready or degraded collector, installed KeepAlive LaunchAgent plist, pre-failure synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, unexpected SIGKILL service termination and bounded unaided launchd KeepAlive recovery, post-recovery synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service".into(),
             lifecycle_cleanup: "best-effort bounded disconnect, bootout, exact seed restoration, plist removal, and isolated directory removal on success or error".into(),
-            primary_boundary: "sustained mutual-TLS Codex OTLP/HTTP /v1/logs requests through the centralized local-collector client and durable report authority".into(),
-            notify_boundary: "separately verified built agent-observability codex-notify supplement through mutual-TLS loopback response".into(),
+            codex_config_load_boundary: "installed @openai/codex 0.151.0 exact version, strict diagnostic loading, and actual codex exec proving exporter construction and native OTLP delivery without an external model request".into(),
+            observed_compatibility_correction: "Codex 0.151.0 on macOS fails exporter construction when client certificate and client private-key identity fields are present; corrected product config uses private-CA HTTPS plus the exact x-agent-observability-token private random request header and no client identity fields".into(),
+            real_codex_e2e_release_gate: "the same exact-revision evidence runs actual Codex 0.151.0 macOS codex exec against a content-free loopback Responses fixture and requires exporter construction, native OTLP acceptance, a private session record, exact 10 input and 2 output token records, and no raw prompt persistence".into(),
+            synthetic_benchmark_boundary: "after the real Codex gate passes, sustained synthetic Codex-shaped OTLP/HTTP JSON /v1/logs requests measure the private-CA HTTPS exact-header collector path and durable report authority".into(),
+            notify_boundary: "separately verified built agent-observability codex-notify supplement through private-CA HTTPS with the exact private random request header".into(),
             collector_boundary: "built agent-observability collector-serve subprocess".into(),
-            payload: "bounded valid Codex OTLP log pairs with synthetic opaque identifiers; one bounded notify supplement per measured run".into(),
-            readiness: "successful mutual-TLS health probe through the centralized local-collector client within a bounded startup deadline".into(),
+            payload: "bounded synthetic Codex-shaped OTLP log pairs with opaque identifiers; one bounded notify supplement per measured run whose raw sentinels must be absent from the durable tree".into(),
+            readiness: "successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline".into(),
             collector_shutdown: "bounded child termination and wait".into(),
         },
         metrics: AutomaticProtocolMetrics {
-            primary_otlp: AutomaticPrimaryOtlpMetrics {
+            synthetic_collector_otlp: AutomaticPrimaryOtlpMetrics {
                 required_quantiles: vec!["p95".into(), "p99".into()],
                 validation_scope: "every run independently".into(),
                 p95_ms_max: AUTOMATIC_PRIMARY_OTLP_P95_MS_MAX,
@@ -1202,7 +1246,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
                 allocated_tree_bytes_max: AUTOMATIC_ALLOCATED_DISK_BYTES_MAX,
             },
             network: AutomaticNetworkMetrics {
-                allowed_transport: "mutual-TLS IPv4 loopback only".into(),
+                allowed_transport: "private-CA HTTPS with exact private random request header on IPv4 loopback only; not mTLS".into(),
                 bytes: "measured collector process bytes from the existing platform NetworkMonitor and reported without classifying loopback traffic as external".into(),
                 endpoints: "every observed collector endpoint must be IPv4 loopback".into(),
                 evidence: "process NetworkMonitor plus independent socket endpoint scans plus static product surface validation".into(),
@@ -1212,12 +1256,13 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
             build_timeout_seconds: AUTOMATIC_BUILD_TIMEOUT.as_secs(),
             startup_timeout_seconds: AUTOMATIC_START_TIMEOUT.as_secs(),
             cleanup_timeout_seconds: AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT.as_secs(),
-            fail_closed: "missing or invalid metrics, rejected primary OTLP requests, missing notify supplement evidence, non-loopback endpoints, timeout, or threshold breach produce non-zero exit".into(),
+            fail_closed: "missing or invalid benchmark metrics, real Codex execution or native OTLP failure, rejected synthetic OTLP requests, Codex version or strict config-load incompatibility, missing notify evidence, durable raw sentinels, non-loopback endpoints, timeout, or threshold breach produce non-zero exit".into(),
         },
         evidence: AutomaticProtocolEvidence {
             output: "docs/evidence/local/performance/automatic-<run>/manifest.yaml".into(),
-            exact_source: "full git commit, locked build command, package version, profile, and protocol revision".into(),
+            exact_source: "full git commit, Rust 1.97.0 locked build command, tested binary, package version, profile, and protocol revision".into(),
             sanitized_paths: "run-relative runtime and protocol paths only; credentials, private key content, port, host path, payload, and raw collector output are forbidden".into(),
+            release_scope: "exact-revision release gate combining actual Codex 0.151.0 macOS end-to-end telemetry compatibility with synthetic collector performance evidence".into(),
         },
     }
 }
@@ -1236,7 +1281,13 @@ fn build_automatic_binary(profile: Profile) -> Result<PathBuf, String> {
     let mut command = Command::new("cargo");
     command
         .current_dir(workspace)
-        .args(["build", "--locked", "-p", "agent-observability-cli"])
+        .args([
+            "+1.97.0",
+            "build",
+            "--locked",
+            "-p",
+            "agent-observability-cli",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
@@ -1267,12 +1318,42 @@ fn build_automatic_binary(profile: Profile) -> Result<PathBuf, String> {
     Ok(binary)
 }
 
+fn resolve_automatic_binary(
+    profile: Profile,
+    supplied_binary: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let Some(binary) = supplied_binary else {
+        return build_automatic_binary(profile);
+    };
+    if !binary.is_absolute() {
+        return Err("supplied automatic binary path must be absolute".into());
+    }
+    let metadata = fs::symlink_metadata(binary)
+        .map_err(|error| format!("inspect supplied automatic binary: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("supplied automatic binary must be a regular file, not a symlink".into());
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err("supplied automatic binary must be executable".into());
+    }
+    let version =
+        run_bounded_product_command(binary, &["--version"], AUTOMATIC_BINARY_VERSION_TIMEOUT)?;
+    if version.trim() != env!("CARGO_PKG_VERSION") {
+        return Err(format!(
+            "supplied automatic binary version mismatch: expected {}, got {}",
+            env!("CARGO_PKG_VERSION"),
+            version.trim()
+        ));
+    }
+    Ok(binary.to_path_buf())
+}
+
 struct AutomaticLifecycleCleanup<'a> {
     binary: &'a Path,
     home: PathBuf,
     codex_home: PathBuf,
     config: PathBuf,
-    seed: &'static [u8],
+    seed: Vec<u8>,
     seed_mode: u32,
     target: Option<String>,
     plist: Option<PathBuf>,
@@ -1330,7 +1411,7 @@ impl AutomaticLifecycleCleanup<'_> {
                 "best-effort automatic lifecycle config parent: {error}"
             ));
         }
-        if let Err(error) = fs::write(&self.config, self.seed) {
+        if let Err(error) = fs::write(&self.config, &self.seed) {
             errors.push(format!(
                 "best-effort automatic lifecycle config restoration: {error}"
             ));
@@ -1410,6 +1491,161 @@ impl Drop for AutomaticLifecycleCleanup<'_> {
     }
 }
 
+struct LocalCodexModelServer {
+    port: u16,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl LocalCodexModelServer {
+    fn start() -> Result<Self, String> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| format!("bind local Codex model fixture: {error}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| format!("inspect local Codex model fixture: {error}"))?
+            .port();
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("configure local Codex model fixture: {error}"))?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let thread = thread::spawn(move || {
+            while !worker_shutdown.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = serve_local_codex_model_request(&mut stream);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            port,
+            shutdown,
+            thread: Some(thread),
+        })
+    }
+
+    const fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for LocalCodexModelServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = TcpStream::connect((Ipv4Addr::LOCALHOST, self.port));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn automatic_lifecycle_seed(port: u16) -> Vec<u8> {
+    format!(
+        "# exact automatic lifecycle seed\nmodel = \"gpt-test\"\nmodel_provider = \"agentobs-e2e\"\n\n[model_providers.agentobs-e2e]\nname = \"Agent Observability local e2e\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\nwire_api = \"responses\"\nenv_key = \"HOME\"\nrequest_max_retries = 0\nstream_max_retries = 0\nrequires_openai_auth = false\n"
+    )
+    .into_bytes()
+}
+
+fn serve_local_codex_model_request(stream: &mut TcpStream) -> Result<(), String> {
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("bound local Codex model fixture read: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("bound local Codex model fixture write: {error}"))?;
+    let mut request = Vec::with_capacity(8_192);
+    let mut buffer = [0_u8; 8_192];
+    let (header_end, content_length) = loop {
+        let bytes = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("read local Codex model fixture request: {error}"))?;
+        if bytes == 0 {
+            return Err("local Codex model fixture request ended before headers".into());
+        }
+        request.extend_from_slice(&buffer[..bytes]);
+        if request.len() > MAX_REQUEST_BYTES {
+            return Err("local Codex model fixture request exceeded size bound".into());
+        }
+        if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = index + 4;
+            let headers = std::str::from_utf8(&request[..header_end])
+                .map_err(|_| "local Codex model fixture headers were not UTF-8")?;
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            break (header_end, content_length);
+        }
+    };
+    if header_end.saturating_add(content_length) > MAX_REQUEST_BYTES {
+        return Err("local Codex model fixture body exceeded size bound".into());
+    }
+    while request.len() < header_end + content_length {
+        let bytes = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("read local Codex model fixture body: {error}"))?;
+        if bytes == 0 {
+            return Err("local Codex model fixture request ended before body".into());
+        }
+        request.extend_from_slice(&buffer[..bytes]);
+    }
+    let request_line = std::str::from_utf8(&request[..header_end])
+        .map_err(|_| "local Codex model fixture request line was not UTF-8")?
+        .lines()
+        .next()
+        .ok_or("local Codex model fixture request line was missing")?;
+    let response = if request_line.contains(" /v1/responses ") {
+        local_codex_sse_response()
+    } else {
+        "{}".into()
+    };
+    let content_type = if request_line.contains(" /v1/responses ") {
+        "text/event-stream"
+    } else {
+        "application/json"
+    };
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+        response.len(),
+    )
+    .map_err(|error| format!("write local Codex model fixture response: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("flush local Codex model fixture response: {error}"))
+}
+
+fn local_codex_sse_response() -> String {
+    const EVENTS: [&str; 8] = [
+        r#"{"type":"response.created","response":{"id":"resp_agentobs","object":"response","created_at":0,"status":"in_progress","output":[]}}"#,
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_agentobs","type":"message","role":"assistant","status":"in_progress","content":[]}}"#,
+        r#"{"type":"response.content_part.added","item_id":"msg_agentobs","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}"#,
+        r#"{"type":"response.output_text.delta","item_id":"msg_agentobs","output_index":0,"content_index":0,"delta":"OK"}"#,
+        r#"{"type":"response.output_text.done","item_id":"msg_agentobs","output_index":0,"content_index":0,"text":"OK"}"#,
+        r#"{"type":"response.content_part.done","item_id":"msg_agentobs","output_index":0,"content_index":0,"part":{"type":"output_text","text":"OK","annotations":[]}}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_agentobs","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK","annotations":[]}]}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_agentobs","object":"response","created_at":0,"status":"completed","output":[{"id":"msg_agentobs","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK","annotations":[]}]}],"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":12}}}"#,
+    ];
+    EVENTS
+        .into_iter()
+        .fold(String::new(), |mut response, event| {
+            write!(response, "data: {event}\n\n").expect("writing to a String cannot fail");
+            response
+        })
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(), String> {
     if env::consts::OS != "macos" {
@@ -1426,8 +1662,10 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
         .map_err(|error| format!("create automatic lifecycle Codex home: {error}"))?;
     fs::set_permissions(&codex_home, Permissions::from_mode(0o700))
         .map_err(|error| format!("protect automatic lifecycle Codex home: {error}"))?;
+    let model_server = LocalCodexModelServer::start()?;
+    let seed = automatic_lifecycle_seed(model_server.port());
     let config = codex_home.join("config.toml");
-    fs::write(&config, AUTOMATIC_LIFECYCLE_SEED)
+    fs::write(&config, &seed)
         .map_err(|error| format!("seed automatic lifecycle Codex config: {error}"))?;
     fs::set_permissions(
         &config,
@@ -1439,7 +1677,7 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
         home,
         codex_home,
         config,
-        seed: AUTOMATIC_LIFECYCLE_SEED,
+        seed,
         seed_mode: AUTOMATIC_LIFECYCLE_SEED_MODE,
         target: None,
         plist: None,
@@ -1456,6 +1694,7 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
         require_output_line(&setup, "status", "ready")?;
         require_output_line(&setup, "config", "connected")?;
         require_collector_ready_or_degraded(&setup)?;
+        verify_installed_codex_compatibility(&cleanup)?;
         let service =
             output_value(&setup, "service").ok_or("automatic lifecycle setup omitted service")?;
         if !service.starts_with("io.agent-observability.collector.") {
@@ -1480,13 +1719,14 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
         require_output_line(&status, "config", "connected")?;
         require_collector_ready_or_degraded(&status)?;
         let initial_records = automatic_report_record_count(binary, &root, &cleanup)?;
-        submit_automatic_primary_otlp(&root, 0, 0)?;
+        let live_codex_records = verify_real_codex_e2e(binary, &root, &cleanup, initial_records)?;
+        submit_automatic_synthetic_otlp(&root, 0, 0)?;
         let pre_failure_otlp_records = require_automatic_record_growth(
             binary,
             &root,
             &cleanup,
-            initial_records,
-            "pre-failure primary OTLP",
+            live_codex_records,
+            "pre-failure synthetic collector OTLP",
         )?;
         submit_automatic_notify(binary, &root, &cleanup, 0)?;
         require_automatic_record_growth(
@@ -1496,6 +1736,7 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
             pre_failure_otlp_records,
             "pre-failure notify",
         )?;
+        assert_automatic_notify_sentinels_absent(&root)?;
 
         run_bounded_status_command(
             "/bin/launchctl",
@@ -1503,22 +1744,16 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
             AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
             &[0],
         )?;
-        run_bounded_status_command(
-            "/bin/launchctl",
-            &["kickstart", &target],
-            AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
-            &[0],
-        )?;
         wait_for_automatic_lifecycle_recovery(binary, &cleanup)?;
 
         let recovered_records = automatic_report_record_count(binary, &root, &cleanup)?;
-        submit_automatic_primary_otlp(&root, 0, 1)?;
+        submit_automatic_synthetic_otlp(&root, 0, 1)?;
         let post_recovery_otlp_records = require_automatic_record_growth(
             binary,
             &root,
             &cleanup,
             recovered_records,
-            "post-recovery primary OTLP",
+            "post-recovery synthetic collector OTLP",
         )?;
         submit_automatic_notify(binary, &root, &cleanup, 1)?;
         require_automatic_record_growth(
@@ -1528,6 +1763,7 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
             post_recovery_otlp_records,
             "post-recovery notify",
         )?;
+        assert_automatic_notify_sentinels_absent(&root)?;
 
         let occupied_port = load_settings(&root)
             .map_err(|error| error.to_string())?
@@ -1570,7 +1806,7 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
         cleanup.connection_may_exist = false;
         verify_exact_file(
             &cleanup.config,
-            AUTOMATIC_LIFECYCLE_SEED,
+            &cleanup.seed,
             AUTOMATIC_LIFECYCLE_SEED_MODE,
             "Codex config",
         )?;
@@ -1584,6 +1820,7 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
         verify_inherited_automatic_plist(binary, &root, &mut cleanup, &plist, &target, true)?;
         Ok(())
     })();
+    drop(model_server);
     combine_cleanup(smoke, cleanup.cleanup())
 }
 
@@ -1602,6 +1839,105 @@ fn automatic_report_record_count(
         .ok_or_else(|| String::from("automatic lifecycle report omitted records"))?
         .parse::<u64>()
         .map_err(|_| "automatic lifecycle report returned invalid records".into())
+}
+
+fn verify_real_codex_e2e(
+    binary: &Path,
+    root: &Path,
+    cleanup: &AutomaticLifecycleCleanup<'_>,
+    previous_records: u64,
+) -> Result<u64, String> {
+    let output = run_bounded_external_command_with_env(
+        "codex",
+        &[
+            "exec",
+            "--strict-config",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--json",
+            AUTOMATIC_CODEX_E2E_PROMPT,
+        ],
+        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+        &cleanup.environment(),
+        &[0],
+    )?;
+    if !output.lines().any(|line| {
+        line.contains(r#""type":"turn.completed""#)
+            && line.contains(r#""input_tokens":10"#)
+            && line.contains(r#""output_tokens":2"#)
+    }) {
+        return Err("real Codex end-to-end fixture did not complete with exact token usage".into());
+    }
+    let records = require_automatic_record_growth(
+        binary,
+        root,
+        cleanup,
+        previous_records,
+        "real Codex native OTLP",
+    )?;
+    let observations = fs::read_to_string(root.join("state/store/observations.jsonl"))
+        .map_err(|error| format!("read real Codex durable observations: {error}"))?;
+    let mut saw_session = false;
+    let mut saw_token_usage = false;
+    for line in observations.lines() {
+        if !line.contains(r#""agent":{"name":"codex","model":"gpt-test"}"#) {
+            continue;
+        }
+        saw_session |= line.contains(r#""event_type":"session""#);
+        saw_token_usage |= line.contains(r#""input_tokens":10.0"#)
+            && line.contains(r#""output_tokens":2.0"#)
+            && line.contains(r#""total_tokens":12.0"#);
+    }
+    if !saw_session || !saw_token_usage {
+        return Err(
+            "real Codex native OTLP did not produce the expected private session and token records"
+                .into(),
+        );
+    }
+    assert_tree_excludes_bytes(root, &[AUTOMATIC_CODEX_E2E_PROMPT.as_bytes()])?;
+    Ok(records)
+}
+
+fn assert_tree_excludes_bytes(root: &Path, sentinels: &[&[u8]]) -> Result<(), String> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect automatic privacy path: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path)
+                .map_err(|error| format!("scan automatic privacy directory: {error}"))?
+            {
+                pending.push(
+                    entry
+                        .map_err(|error| format!("scan automatic privacy entry: {error}"))?
+                        .path(),
+                );
+            }
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let body =
+            fs::read(&path).map_err(|error| format!("read automatic privacy artifact: {error}"))?;
+        for sentinel in sentinels {
+            if body
+                .windows(sentinel.len())
+                .any(|window| window == *sentinel)
+            {
+                return Err(format!(
+                    "automatic privacy sentinel persisted in {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn require_automatic_record_growth(
@@ -1984,7 +2320,7 @@ fn verify_inherited_automatic_plist(
     }
     verify_exact_file(
         &cleanup.config,
-        AUTOMATIC_LIFECYCLE_SEED,
+        &cleanup.seed,
         AUTOMATIC_LIFECYCLE_SEED_MODE,
         "Codex config",
     )?;
@@ -2001,7 +2337,7 @@ fn verify_inherited_automatic_plist(
     Ok(())
 }
 
-fn submit_automatic_primary_otlp(root: &Path, run: usize, event: usize) -> Result<(), String> {
+fn submit_automatic_synthetic_otlp(root: &Path, run: usize, event: usize) -> Result<(), String> {
     let body = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
       {"attributes":[
         {"key":"event.name","value":{"stringValue":"codex.api_request"}},
@@ -2024,8 +2360,83 @@ fn submit_automatic_primary_otlp(root: &Path, run: usize, event: usize) -> Resul
     if submit_otlp_json(root, body.as_bytes()).map_err(|error| error.to_string())? {
         Ok(())
     } else {
-        Err("automatic lifecycle primary OTLP request was rejected".into())
+        Err("automatic lifecycle synthetic collector OTLP request was rejected".into())
     }
+}
+
+fn verify_installed_codex_compatibility(
+    cleanup: &AutomaticLifecycleCleanup<'_>,
+) -> Result<(), String> {
+    let environment = cleanup.environment();
+    let version = run_bounded_external_command_with_env(
+        "codex",
+        &["--version"],
+        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+        &environment,
+        &[0],
+    )?;
+    if version.trim() != AUTOMATIC_CODEX_VERSION {
+        return Err(format!(
+            "automatic lifecycle requires {AUTOMATIC_CODEX_VERSION}, found {}",
+            version.trim()
+        ));
+    }
+    let diagnostic = run_bounded_external_command_with_env(
+        "codex",
+        &["--strict-config", "doctor", "--json"],
+        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+        &environment,
+        &[0, 1],
+    )?;
+    let diagnostic = serde_saphyr::from_str::<CodexDiagnostic>(&diagnostic)
+        .map_err(|error| format!("parse Codex compatibility diagnostic: {error}"))?;
+    if diagnostic.checks.config_load.status != "ok" {
+        return Err("Codex 0.151.0 rejected the generated strict config".into());
+    }
+    let expected_home = fs::canonicalize(&cleanup.codex_home)
+        .map_err(|error| format!("canonicalize isolated CODEX_HOME: {error}"))?;
+    let observed_home = fs::canonicalize(&diagnostic.checks.config_load.details.codex_home)
+        .map_err(|error| format!("canonicalize Codex diagnostic CODEX_HOME: {error}"))?;
+    if observed_home != expected_home {
+        return Err("Codex compatibility diagnostic did not load the isolated CODEX_HOME".into());
+    }
+    Ok(())
+}
+
+fn assert_automatic_notify_sentinels_absent(root: &Path) -> Result<(), String> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect automatic durable path: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            let entries = fs::read_dir(&path)
+                .map_err(|error| format!("scan automatic durable directory: {error}"))?;
+            for entry in entries {
+                pending.push(
+                    entry
+                        .map_err(|error| format!("scan automatic durable entry: {error}"))?
+                        .path(),
+                );
+            }
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("read automatic durable file for privacy scan: {error}"))?;
+        if AUTOMATIC_NOTIFY_SENTINELS.iter().any(|sentinel| {
+            bytes
+                .windows(sentinel.len())
+                .any(|window| window == *sentinel)
+        }) {
+            return Err("automatic durable tree retained a raw notify sentinel".into());
+        }
+    }
+    Ok(())
 }
 
 fn wait_for_automatic_lifecycle_recovery(
@@ -2447,7 +2858,7 @@ fn execute_automatic_run(
     let active_started = Instant::now();
     let mut active_sampler =
         start_pressure_sampler(root.clone(), collector.id(), false, None, config.sample)?;
-    let mut primary_otlp_latencies_us = Vec::with_capacity(config.events);
+    let mut synthetic_otlp_latencies_us = Vec::with_capacity(config.events);
     let mut accepted_primary_requests = 0_usize;
     for event in 0..config.events {
         if active_started.elapsed() >= config.active_timeout {
@@ -2459,9 +2870,9 @@ fn execute_automatic_run(
         let event_offset = u32::try_from(event).map_err(|_| "automatic event count overflow")?;
         let scheduled = active_started + config.inter_event.saturating_mul(event_offset);
         sleep(scheduled.saturating_duration_since(Instant::now()));
-        let primary_started = Instant::now();
-        submit_automatic_primary_otlp(&root, run, event)?;
-        primary_otlp_latencies_us.push(primary_started.elapsed().as_micros());
+        let synthetic_started = Instant::now();
+        submit_automatic_synthetic_otlp(&root, run, event)?;
+        synthetic_otlp_latencies_us.push(synthetic_started.elapsed().as_micros());
         accepted_primary_requests = accepted_primary_requests.saturating_add(1);
         if event % 100 == 0 {
             assert_automatic_network_local(collector.id())?;
@@ -2487,6 +2898,7 @@ fn execute_automatic_run(
         ));
     }
     sleep(Duration::from_millis(250));
+    assert_automatic_notify_sentinels_absent(&root)?;
     assert_automatic_network_local(collector.id())?;
     network_monitor.final_sample()?;
     let peak_disk_bytes = active_peaks.disk_bytes.max(
@@ -2498,7 +2910,7 @@ fn execute_automatic_run(
     collector.terminate()?;
     Ok(AutomaticRunResult {
         run,
-        primary_otlp_latencies_us,
+        synthetic_otlp_latencies_us,
         idle_samples,
         idle_cpu_percent,
         active_cpu_percent,
@@ -2565,6 +2977,99 @@ fn run_bounded_product_command_with_env(
         ));
     }
     Ok(output)
+}
+
+fn run_bounded_external_command_with_env(
+    program: &str,
+    arguments: &[&str],
+    timeout: Duration,
+    environment: &[(&str, &Path)],
+    accepted_codes: &[i32],
+) -> Result<String, String> {
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = ChildGuard(
+        command
+            .spawn()
+            .map_err(|error| format!("spawn bounded command {program}: {error}"))?,
+    );
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("bounded command {program} stdout is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("bounded command {program} stderr is unavailable"))?;
+    let stdout_reader = spawn_bounded_text_reader(stdout, 262_144, "stdout");
+    let stderr_reader = spawn_bounded_text_reader(stderr, 4_096, "stderr");
+    let status = match wait_for_child(&mut child, timeout) {
+        Ok(status) => status,
+        Err(error) => {
+            let cleanup = child.terminate();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(combine_cleanup(
+                Err(format!("wait for bounded command {program}: {error}")),
+                cleanup,
+            )
+            .unwrap_err());
+        }
+    };
+    let output = stdout_reader
+        .join()
+        .map_err(|_| format!("bounded command {program} stdout reader panicked"))??;
+    let error = stderr_reader
+        .join()
+        .map_err(|_| format!("bounded command {program} stderr reader panicked"))??;
+    if !status
+        .code()
+        .is_some_and(|code| accepted_codes.contains(&code))
+    {
+        return Err(format!(
+            "bounded command {program} failed: {status}: {}",
+            error.trim()
+        ));
+    }
+    Ok(output)
+}
+
+fn spawn_bounded_text_reader<R>(
+    mut reader: R,
+    limit: usize,
+    label: &'static str,
+) -> thread::JoinHandle<Result<String, String>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut bounded = Vec::with_capacity(limit.min(8_192));
+        let mut buffer = [0_u8; 8_192];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|error| format!("read bounded command {label}: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            if bounded.len() <= limit {
+                let remaining = limit.saturating_add(1).saturating_sub(bounded.len());
+                bounded.extend_from_slice(&buffer[..read.min(remaining)]);
+            }
+        }
+        if bounded.len() > limit {
+            return Err(format!("bounded command {label} exceeded {limit} bytes"));
+        }
+        String::from_utf8(bounded)
+            .map_err(|_| format!("bounded command {label} was not valid UTF-8"))
+    })
 }
 
 fn run_bounded_status_command(
@@ -4260,13 +4765,13 @@ fn validate_automatic_results(
     }
     for result in results {
         if result.accepted_primary_requests != config.events
-            || result.primary_otlp_latencies_us.len() != config.events
+            || result.synthetic_otlp_latencies_us.len() != config.events
             || result.idle_samples.is_empty()
         {
-            return Err("incomplete automatic primary OTLP or idle evidence".into());
+            return Err("incomplete automatic synthetic collector OTLP or idle evidence".into());
         }
         if result.rejected_primary_requests != 0 {
-            return Err("automatic primary OTLP requests were rejected".into());
+            return Err("automatic synthetic collector OTLP requests were rejected".into());
         }
         if !result.notify_supplement_accepted {
             return Err("automatic notify supplement evidence is missing".into());
@@ -4284,17 +4789,17 @@ fn validate_automatic_results(
             return Err("automatic collector network monitor samples are missing".into());
         }
         if config.profile == Profile::Release {
-            let mut latencies = result.primary_otlp_latencies_us.clone();
+            let mut latencies = result.synthetic_otlp_latencies_us.clone();
             latencies.sort_unstable();
             if percentile(&latencies, 95) > u128::from(AUTOMATIC_PRIMARY_OTLP_P95_MS_MAX) * 1_000 {
                 return Err(format!(
-                    "automatic run {} primary OTLP p95 latency budget exceeded",
+                    "automatic run {} synthetic collector OTLP p95 latency budget exceeded",
                     result.run
                 ));
             }
             if percentile(&latencies, 99) > u128::from(AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX) * 1_000 {
                 return Err(format!(
-                    "automatic run {} primary OTLP p99 latency budget exceeded",
+                    "automatic run {} synthetic collector OTLP p99 latency budget exceeded",
                     result.run
                 ));
             }
@@ -4339,7 +4844,7 @@ fn render_automatic_manifest(
 ) -> String {
     let mut latencies = results
         .iter()
-        .flat_map(|result| result.primary_otlp_latencies_us.iter().copied())
+        .flat_map(|result| result.synthetic_otlp_latencies_us.iter().copied())
         .collect::<Vec<_>>();
     latencies.sort_unstable();
     let p95 = (!latencies.is_empty()).then(|| percentile(&latencies, 95));
@@ -4366,7 +4871,7 @@ fn render_automatic_manifest(
         .map(|result| result.network_monitor_samples)
         .sum::<u64>();
     let mut manifest = format!(
-        "schema_version: automatic_local_performance.v1\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-setup-sigkill-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  primary_boundary: sustained-mtls-codex-otlp-http-v1-logs-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-mtls-supplement\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  primary_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  primary_otlp_p95_us: {}\n  primary_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_peak_rss_kib: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
+        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: verified\nreal_codex_e2e_status: passed\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.151.0\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_peak_rss_kib: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
         profile_name(config.profile),
         profile_name(config.profile),
         env!("CARGO_PKG_VERSION"),
@@ -4400,11 +4905,11 @@ fn render_automatic_manifest(
         network_samples,
     );
     for result in results {
-        let mut run_latencies = result.primary_otlp_latencies_us.clone();
+        let mut run_latencies = result.synthetic_otlp_latencies_us.clone();
         run_latencies.sort_unstable();
         let _ = writeln!(
             manifest,
-            "  - run: {}\n    accepted_primary_otlp_requests: {}\n    rejected_primary_otlp_requests: {}\n    notify_supplement_accepted: {}\n    primary_otlp_p95_us: {}\n    primary_otlp_p99_us: {}\n    idle_cpu_percent: {}\n    active_cpu_percent: {}\n    peak_rss_kib: {}\n    allocated_disk_bytes: {}\n    collector_network_bytes: {}\n    network_monitor_samples: {}\n    all_observed_endpoints_loopback: true",
+            "  - run: {}\n    accepted_synthetic_otlp_requests: {}\n    rejected_synthetic_otlp_requests: {}\n    notify_supplement_accepted: {}\n    raw_notify_sentinels_absent: true\n    synthetic_collector_otlp_p95_us: {}\n    synthetic_collector_otlp_p99_us: {}\n    idle_cpu_percent: {}\n    active_cpu_percent: {}\n    peak_rss_kib: {}\n    allocated_disk_bytes: {}\n    collector_network_bytes: {}\n    network_monitor_samples: {}\n    all_observed_endpoints_loopback: true",
             result.run,
             result.accepted_primary_requests,
             result.rejected_primary_requests,
@@ -4433,14 +4938,22 @@ fn render_automatic_manifest(
 fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
     for field in [
         "schema_version: automatic_local_performance.v1",
-        "protocol_revision: v1.4.0-centralized-mtls-primary-otlp-crash-lifecycle-scenarios",
+        "evidence_kind: automatic_release_evidence",
+        "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-and-synthetic-benchmark",
+        "release_readiness: verified",
+        "real_codex_e2e_status: passed",
         "source_revision:",
         "cargo_locked: true",
+        "codex_version: 0.151.0",
         "collector_boundary: built-agent-observability-collector-serve-subprocess",
-        "primary_boundary: sustained-mtls-codex-otlp-http-v1-logs-through-centralized-local-collector-client-and-durable-report",
-        "notify_boundary: separately-verified-built-agent-observability-codex-notify-mtls-supplement",
-        "primary_otlp_p95_us:",
-        "primary_otlp_p99_us:",
+        "transport: private-ca-https-exact-private-random-request-header-not-mtls",
+        "codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp",
+        "observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity",
+        "real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt",
+        "synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report",
+        "notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan",
+        "synthetic_collector_otlp_p95_us:",
+        "synthetic_collector_otlp_p99_us:",
         "collector_idle_cpu_percent_max:",
         "collector_active_cpu_percent_max:",
         "collector_peak_rss_kib:",
@@ -4448,7 +4961,7 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
         "collector_network_bytes_max:",
         "network_monitor_samples:",
         "all_observed_endpoints_loopback: true",
-        "lifecycle_preflight: built-binary-isolated-home-codex-home-setup-sigkill-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect",
+        "lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect",
         "runtime_path: run-relative/runtime",
     ] {
         if !manifest.contains(field) {
@@ -5074,11 +5587,63 @@ mod tests {
             active_timeout: Duration::from_secs(1),
         }
     }
+
+    #[test]
+    fn supplied_automatic_binary_must_be_absolute_regular_executable_and_versioned() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("agent-observability-binary-{stamp}"));
+        fs::create_dir(&root).unwrap();
+        let binary = root.join("agent-observability");
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nsleep 2\nprintf '{}\\n'\n",
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            resolve_automatic_binary(Profile::Smoke, Some(&binary)).unwrap(),
+            binary
+        );
+        assert!(
+            resolve_automatic_binary(Profile::Smoke, Some(Path::new("relative-binary")))
+                .unwrap_err()
+                .contains("must be absolute")
+        );
+
+        let symlink = root.join("agentobs");
+        std::os::unix::fs::symlink(&binary, &symlink).unwrap();
+        assert!(
+            resolve_automatic_binary(Profile::Smoke, Some(&symlink))
+                .unwrap_err()
+                .contains("not a symlink")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_external_command_drains_output_while_the_process_is_running() {
+        let output = run_bounded_external_command_with_env(
+            "awk",
+            &["BEGIN { for (i = 0; i < 131072; i++) printf \"x\" }"],
+            Duration::from_secs(5),
+            &[],
+            &[0],
+        )
+        .unwrap();
+        assert_eq!(output.len(), 131_072);
+    }
     fn automatic_result(run: usize, latencies_us: Vec<u128>) -> AutomaticRunResult {
         AutomaticRunResult {
             run,
             accepted_primary_requests: latencies_us.len(),
-            primary_otlp_latencies_us: latencies_us,
+            synthetic_otlp_latencies_us: latencies_us,
             idle_samples: vec![s("idle", Some(0.1), Some(1.0), Some(1), Some(321))],
             idle_cpu_percent: 0.1,
             active_cpu_percent: 0.1,
@@ -5128,7 +5693,22 @@ mod tests {
         assert!(AUTOMATIC_PROTOCOL.contains("validation_scope: every run independently"));
         assert!(AUTOMATIC_PROTOCOL.contains("NetworkMonitor"));
         assert!(AUTOMATIC_PROTOCOL.contains("unexpected SIGKILL service termination"));
-        assert!(AUTOMATIC_PROTOCOL.contains("sustained mutual-TLS Codex OTLP/HTTP /v1/logs"));
+        assert!(AUTOMATIC_PROTOCOL.contains("bounded unaided launchd KeepAlive recovery"));
+        assert!(AUTOMATIC_PROTOCOL.contains("installed @openai/codex 0.151.0 exact version"));
+        assert!(
+            AUTOMATIC_PROTOCOL.contains(
+                "actual codex exec proving exporter construction and native OTLP delivery"
+            )
+        );
+        assert!(
+            AUTOMATIC_PROTOCOL
+                .contains("client certificate and client private-key identity fields are present")
+        );
+        assert!(AUTOMATIC_PROTOCOL.contains("exact 10 input and 2 output token records"));
+        assert!(AUTOMATIC_PROTOCOL.contains("sustained synthetic Codex-shaped OTLP/HTTP JSON"));
+        assert!(AUTOMATIC_PROTOCOL.contains("after the real Codex gate passes"));
+        assert!(AUTOMATIC_PROTOCOL.contains("not mTLS"));
+        assert!(!AUTOMATIC_PROTOCOL.contains("launchd kickstart recovery"));
         assert!(
             AUTOMATIC_PROTOCOL
                 .contains("separately verified built agent-observability codex-notify")
@@ -5153,18 +5733,18 @@ mod tests {
             ),
             (
                 "release request count",
-                "    primary_otlp_requests: 10000\n",
-                "    primary_otlp_requests: 9999\n",
+                "    synthetic_otlp_requests: 10000\n",
+                "    synthetic_otlp_requests: 9999\n",
             ),
             (
                 "smoke request count",
-                "    primary_otlp_requests: 25\n",
-                "    primary_otlp_requests: 24\n",
+                "    synthetic_otlp_requests: 25\n",
+                "    synthetic_otlp_requests: 24\n",
             ),
             (
                 "release request cadence",
-                "    primary_otlp_inter_request_ms: 3\n",
-                "    primary_otlp_inter_request_ms: 4\n",
+                "    synthetic_otlp_inter_request_ms: 3\n",
+                "    synthetic_otlp_inter_request_ms: 4\n",
             ),
             (
                 "release sample interval",
@@ -5264,7 +5844,7 @@ mod tests {
 
         let error = validate_automatic_results(automatic_config(), &results, &[]).unwrap_err();
 
-        assert!(error.contains("run 1 primary OTLP p95"));
+        assert!(error.contains("run 1 synthetic collector OTLP p95"));
     }
 
     #[test]
@@ -5275,7 +5855,7 @@ mod tests {
 
         let error = validate_automatic_results(automatic_config(), &results, &[]).unwrap_err();
 
-        assert!(error.contains("run 1 primary OTLP p99"));
+        assert!(error.contains("run 1 synthetic collector OTLP p99"));
     }
 
     #[test]
@@ -5374,7 +5954,7 @@ mod tests {
         validate_automatic_manifest_shape(&manifest).unwrap();
 
         let missing_lifecycle = manifest.replace(
-            "  lifecycle_preflight: built-binary-isolated-home-codex-home-setup-sigkill-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n",
+            "  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n",
             "",
         );
         assert!(validate_automatic_manifest_shape(&missing_lifecycle).is_err());
@@ -5392,6 +5972,27 @@ mod tests {
                 "automatic manifest accepted private key evidence: {private_key_evidence}"
             );
         }
+    }
+
+    #[test]
+    fn automatic_notify_privacy_scan_rejects_raw_sentinels_anywhere_in_durable_tree() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("agent-observability-notify-scan-{stamp}"));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("projected.bin"), b"privacy-safe projection").unwrap();
+        assert_automatic_notify_sentinels_absent(&root).unwrap();
+
+        fs::write(
+            nested.join("leaked.bin"),
+            b"prefix AUTOMATIC_RAW_PROMPT_SENTINEL suffix",
+        )
+        .unwrap();
+        assert!(assert_automatic_notify_sentinels_absent(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

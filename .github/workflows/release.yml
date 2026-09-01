@@ -6,6 +6,7 @@ on:
       - "v*.*.*"
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -16,11 +17,15 @@ jobs:
   validate:
     name: Validate release tag
     runs-on: ubuntu-latest
+    outputs:
+      evidence-source-revision: ${{ steps.evidence-source.outputs.revision }}
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+      - name: Install release Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal
       - name: Validate tag, source, and versions
         shell: bash
         run: |
@@ -36,6 +41,17 @@ jobs:
           test "$version" = "$cargo_version"
           test "$version" = "$root_version"
           test "$version" = "$package_version"
+      - name: Resolve the exact pre-merge evidence revision
+        id: evidence-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="$GITHUB_SHA"
+          if second_parent="$(git rev-parse "$GITHUB_SHA^2" 2>/dev/null)"; then
+            test "$(git rev-parse "$GITHUB_SHA^{tree}")" = "$(git rev-parse "$second_parent^{tree}")"
+            revision="$second_parent"
+          fi
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.label }}
@@ -59,6 +75,22 @@ jobs:
           rustup toolchain install 1.97.0 --profile minimal --target "${{ matrix.target }}"
       - name: Build native CLI
         run: cargo +1.97.0 build --release --locked -p agent-observability-cli --target "${{ matrix.target }}"
+      - name: Install exact supported Codex CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/codex-0.151.0"
+          npm install --prefix "$prefix" @openai/codex@0.151.0
+          echo "$prefix/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Smoke test the exact native release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(codex --version)" = "codex-cli 0.151.0"
+          binary="$PWD/target/${{ matrix.target }}/release/agent-observability"
+          test "$("$binary" --version)" = "${GITHUB_REF_NAME#v}"
+          cargo +1.97.0 run --locked -p xtask -- perf automatic --profile smoke --check \
+            --binary "$binary"
       - name: Verify native CLI
         shell: bash
         run: |
@@ -84,9 +116,65 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  automatic-release-evidence:
+    name: Validate exact-revision automatic release evidence
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Download and validate exact-revision automatic release evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REVISION: ${{ needs.validate.outputs.evidence-source-revision }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SOURCE_REVISION"
+          artifact="automatic-release-evidence-$SOURCE_REVISION"
+          evidence_root="$RUNNER_TEMP/automatic-release-evidence"
+          mkdir -p "$evidence_root"
+          run_id=""
+          while IFS= read -r candidate; do
+            candidate_root="$evidence_root/$candidate"
+            mkdir -p "$candidate_root"
+            if gh run download "$candidate" --repo "$GITHUB_REPOSITORY" \
+              --name "$artifact" --dir "$candidate_root"; then
+              run_id="$candidate"
+              evidence_root="$candidate_root"
+              break
+            fi
+          done < <(
+            gh api --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+              -f head_sha="$SOURCE_REVISION" \
+              -f event=workflow_dispatch \
+              -f status=success \
+              --paginate \
+              --jq '.workflow_runs[].id'
+          )
+          test -n "$run_id"
+          mapfile -t manifests < <(find "$evidence_root" -type f -name manifest.yaml -print)
+          test "${#manifests[@]}" -eq 1
+          manifest="${manifests[0]}"
+          grep -Fxq "status: pass" "$manifest"
+          grep -Fxq "evidence_kind: automatic_release_evidence" "$manifest"
+          grep -Fxq "release_readiness: verified" "$manifest"
+          grep -Fxq "real_codex_e2e_status: passed" "$manifest"
+          grep -Fxq "source_revision: $SOURCE_REVISION" "$manifest"
+          grep -Fxq "profile: release" "$manifest"
+          grep -Fxq "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-and-synthetic-benchmark" "$manifest"
+          grep -Fxq "  codex_version: 0.151.0" "$manifest"
+          grep -Fxq "  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp" "$manifest"
+          grep -Fxq "  real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt" "$manifest"
+          grep -Fxq "  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report" "$manifest"
+
   publish:
     name: Publish release and package
-    needs: build
+    needs:
+      - build
+      - automatic-release-evidence
     runs-on: macos-15
     permissions:
       contents: write

@@ -2,8 +2,8 @@
 #![allow(clippy::missing_errors_doc)]
 
 use agent_observability_adapter_codex::{
-    AdapterBatch, AdapterItem, MAX_HANDOFF_BYTES, OtlpRequestCorrelationState, parse_notify_json,
-    parse_otlp_http_json_with_state, project_notify_json,
+    AdapterBatch, AdapterItem, MAX_HANDOFF_BYTES, OtlpRequestCorrelationState,
+    parse_otlp_http_json_with_state, parse_projected_notify_json, project_notify_json,
 };
 use agent_observability_application::project_report;
 use agent_observability_local_runtime::{
@@ -30,7 +30,6 @@ use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, StreamOwned,
     crypto::aws_lc_rs,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject},
-    server::WebPkiClientVerifier,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -44,29 +43,32 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 use time::OffsetDateTime;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream as TokioTcpStream},
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
     time::Sleep,
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
 pub const REPORT_FILE_NAME: &str = "agent-observability-report.html";
-pub const COLLECTOR_SETTINGS_VERSION: &str = "local_collector.v2";
-pub const COLLECTOR_TRANSPORT: &str = "mtls";
+pub const COLLECTOR_SETTINGS_VERSION: &str = "local_collector.v3";
+pub const COLLECTOR_TRANSPORT: &str = "private-ca-https-token";
+pub const AUTH_HEADER_NAME: &str = "x-agent-observability-token";
 const TLS_DIRECTORY: &str = "integrations/codex/tls";
 const CA_CERTIFICATE_NAME: &str = "ca-certificate.pem";
 const SERVER_CERTIFICATE_NAME: &str = "server-certificate.pem";
 const SERVER_PRIVATE_KEY_NAME: &str = "server-private-key.pem";
-const CLIENT_CERTIFICATE_NAME: &str = "client-certificate.pem";
-const CLIENT_PRIVATE_KEY_NAME: &str = "client-private-key.pem";
+const LEGACY_CLIENT_CERTIFICATE_NAME: &str = "client-certificate.pem";
+const LEGACY_CLIENT_PRIVATE_KEY_NAME: &str = "client-private-key.pem";
 const CREDENTIAL_LIFETIME: Duration = Duration::from_hours(8_760);
 const SOURCE_GENERATION: &str = "codex-otel-v1";
 const MAX_SETTINGS_BYTES: u64 = 16 * 1024;
+const MAX_SETTINGS_MIGRATION_BYTES: u64 = 128 * 1024;
+const SETTINGS_MIGRATION_VERSION: &str = "local_collector_settings_migration.v1";
 const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
 const MAX_CREDENTIAL_PATH_BYTES: usize = 256;
 static SETTINGS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -88,6 +90,7 @@ pub struct CollectorSettings {
     pub generation: String,
     pub port: u16,
     pub transport: String,
+    pub auth_token: String,
     pub credentials: CredentialMetadata,
 }
 
@@ -97,8 +100,6 @@ pub struct CredentialMetadata {
     pub ca_certificate: String,
     pub server_certificate: String,
     pub server_private_key: String,
-    pub client_certificate: String,
-    pub client_private_key: String,
     pub expires_at_unix_ms: u64,
 }
 
@@ -111,10 +112,49 @@ struct LegacyCollectorSettingsV1 {
     source_generation: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCollectorSettingsV2Mtls {
+    schema_version: String,
+    generation: String,
+    port: u16,
+    transport: String,
+    credentials: LegacyCredentialMetadataV2Mtls,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCredentialMetadataV2Mtls {
+    ca_certificate: String,
+    server_certificate: String,
+    server_private_key: String,
+    client_certificate: String,
+    client_private_key: String,
+    expires_at_unix_ms: u64,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct PrivateFileSnapshot {
     bytes: Vec<u8>,
     mode: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum SettingsMigrationPhase {
+    Pending,
+    IntegrationCommitted,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsMigrationV1 {
+    schema_version: String,
+    phase: SettingsMigrationPhase,
+    previous_settings: Vec<u8>,
+    previous_mode: u32,
+    previous_generation: Option<String>,
+    replacement_generation: String,
 }
 
 impl CollectorSettings {
@@ -129,6 +169,7 @@ impl CollectorSettings {
             root: root.to_path_buf(),
             port: self.port,
             generation: self.generation.clone(),
+            auth_token: self.auth_token.clone(),
             credentials: self.credentials.clone(),
         }
     }
@@ -139,6 +180,7 @@ pub struct CollectorOptions {
     pub root: PathBuf,
     pub port: u16,
     pub generation: String,
+    pub auth_token: String,
     pub credentials: CredentialMetadata,
 }
 
@@ -165,6 +207,7 @@ pub enum CollectorError {
 /// Creates or loads the private, idempotent local collector settings.
 pub fn install_settings(root: &Path) -> Result<CollectorSettings, CollectorError> {
     let layout = install(root).map_err(runtime_error)?;
+    recover_settings_migration_before_install(&layout)?;
     let path = settings_path(&layout);
     match fs::symlink_metadata(&path) {
         Ok(_) => {
@@ -177,27 +220,92 @@ pub fn install_settings(root: &Path) -> Result<CollectorSettings, CollectorError
                 validate_owned_credentials(&layout, &settings)?;
                 return replace_settings(&layout, Some(&snapshot));
             }
-            validate_legacy_settings_for_migration(&snapshot.bytes)?;
-            replace_settings(&layout, Some(&snapshot))
+            let legacy_generation =
+                validate_legacy_settings_for_migration(&layout, &snapshot.bytes)?;
+            begin_settings_migration(&layout, &snapshot, legacy_generation)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => rotate_settings(&layout),
         Err(error) => Err(error.into()),
     }
 }
 
-fn validate_legacy_settings_for_migration(bytes: &[u8]) -> Result<(), CollectorError> {
-    let legacy: LegacyCollectorSettingsV1 = serde_json::from_slice(bytes)
+fn validate_legacy_settings_for_migration(
+    layout: &InstalledLayout,
+    bytes: &[u8],
+) -> Result<Option<String>, CollectorError> {
+    if let Ok(legacy) = serde_json::from_slice::<LegacyCollectorSettingsV1>(bytes)
+        && legacy.schema_version == "local_collector.v1"
+        && legacy.port != 0
+        && legacy.token.len() == 64
+        && legacy.token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && legacy.source_generation == SOURCE_GENERATION
+    {
+        return Ok(None);
+    }
+    let legacy: LegacyCollectorSettingsV2Mtls = serde_json::from_slice(bytes)
         .map_err(|_| CollectorError::Runtime("invalid legacy collector settings".into()))?;
-    if legacy.schema_version != "local_collector.v1"
-        || legacy.port == 0
-        || legacy.token.len() != 64
-        || !legacy.token.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || legacy.source_generation != SOURCE_GENERATION
+    validate_legacy_v2_mtls(layout, &legacy)?;
+    Ok(Some(legacy.generation))
+}
+
+fn validate_legacy_v2_mtls(
+    layout: &InstalledLayout,
+    settings: &LegacyCollectorSettingsV2Mtls,
+) -> Result<(), CollectorError> {
+    if settings.schema_version != "local_collector.v2"
+        || settings.port == 0
+        || settings.transport != "mtls"
+        || settings.generation.len() != 64
+        || !settings
+            .generation
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || settings.credentials.expires_at_unix_ms == 0
     {
         return Err(CollectorError::Runtime(
             "invalid legacy collector settings".into(),
         ));
     }
+    let expected_prefix = format!("{TLS_DIRECTORY}/{}/", settings.generation);
+    for (path, name) in [
+        (&settings.credentials.ca_certificate, CA_CERTIFICATE_NAME),
+        (
+            &settings.credentials.server_certificate,
+            SERVER_CERTIFICATE_NAME,
+        ),
+        (
+            &settings.credentials.server_private_key,
+            SERVER_PRIVATE_KEY_NAME,
+        ),
+        (
+            &settings.credentials.client_certificate,
+            LEGACY_CLIENT_CERTIFICATE_NAME,
+        ),
+        (
+            &settings.credentials.client_private_key,
+            LEGACY_CLIENT_PRIVATE_KEY_NAME,
+        ),
+    ] {
+        if path.len() > MAX_CREDENTIAL_PATH_BYTES || path != &format!("{expected_prefix}{name}") {
+            return Err(CollectorError::Runtime(
+                "invalid legacy collector credential path".into(),
+            ));
+        }
+        read_private_bounded(&credential_path(layout, path)?, MAX_CREDENTIAL_BYTES)?;
+    }
+    let generation_dir = layout
+        .runtime
+        .join(TLS_DIRECTORY)
+        .join(&settings.generation);
+    validate_private_directory_tree(&layout.runtime, &generation_dir)?;
+    let current_credentials = CredentialMetadata {
+        ca_certificate: settings.credentials.ca_certificate.clone(),
+        server_certificate: settings.credentials.server_certificate.clone(),
+        server_private_key: settings.credentials.server_private_key.clone(),
+        expires_at_unix_ms: settings.credentials.expires_at_unix_ms,
+    };
+    build_server_config(layout, &current_credentials)?;
+    build_legacy_client_config(layout, &settings.credentials)?;
     Ok(())
 }
 
@@ -205,53 +313,146 @@ fn rotate_settings(layout: &InstalledLayout) -> Result<CollectorSettings, Collec
     replace_settings(layout, None)
 }
 
+fn begin_settings_migration(
+    layout: &InstalledLayout,
+    previous: &PrivateFileSnapshot,
+    previous_generation: Option<String>,
+) -> Result<CollectorSettings, CollectorError> {
+    let replacement_generation = random_hex_256()?;
+    let migration = SettingsMigrationV1 {
+        schema_version: SETTINGS_MIGRATION_VERSION.into(),
+        phase: SettingsMigrationPhase::Pending,
+        previous_settings: previous.bytes.clone(),
+        previous_mode: previous.mode,
+        previous_generation,
+        replacement_generation: replacement_generation.clone(),
+    };
+    let migration_path = settings_migration_path(layout);
+    match fs::symlink_metadata(&migration_path) {
+        Ok(_) => {
+            return Err(CollectorError::Runtime(
+                "collector settings migration is already pending".into(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    write_private_json(&migration_path, &migration)?;
+    let settings = match generate_settings_for_generation(layout, replacement_generation) {
+        Ok(settings) => settings,
+        Err(error) => {
+            let cleanup = cleanup_credential_generation(layout, &migration.replacement_generation)
+                .and_then(|()| remove_private_file(&migration_path));
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => CollectorError::Runtime(format!(
+                    "{error}; collector migration rollback failed: {cleanup}"
+                )),
+            });
+        }
+    };
+    if let Err(error) = write_private_json_if_unchanged(
+        &settings_path(layout),
+        &settings,
+        previous,
+        MAX_SETTINGS_BYTES,
+    ) {
+        let cleanup = cleanup_credential_generation(layout, &settings.generation)
+            .and_then(|()| remove_private_file(&migration_path));
+        return Err(match cleanup {
+            Ok(()) => error,
+            Err(cleanup) => CollectorError::Runtime(format!(
+                "{error}; collector migration rollback failed: {cleanup}"
+            )),
+        });
+    }
+    Ok(settings)
+}
+
 fn replace_settings(
     layout: &InstalledLayout,
     expected: Option<&PrivateFileSnapshot>,
 ) -> Result<CollectorSettings, CollectorError> {
+    let settings = generate_settings(layout)?;
+    let write_result = match expected {
+        Some(expected) => write_private_json_if_unchanged(
+            &settings_path(layout),
+            &settings,
+            expected,
+            MAX_SETTINGS_BYTES,
+        ),
+        None => write_private_json(&settings_path(layout), &settings),
+    };
+    if let Err(error) = write_result {
+        return Err(
+            match cleanup_credential_generation(layout, &settings.generation) {
+                Ok(()) => error,
+                Err(cleanup) => CollectorError::Runtime(format!(
+                    "{error}; collector credential cleanup failed: {cleanup}"
+                )),
+            },
+        );
+    }
+    Ok(settings)
+}
+
+fn generate_settings(layout: &InstalledLayout) -> Result<CollectorSettings, CollectorError> {
+    let generation = random_hex_256()?;
+    generate_settings_for_generation(layout, generation)
+}
+
+fn generate_settings_for_generation(
+    layout: &InstalledLayout,
+    generation: String,
+) -> Result<CollectorSettings, CollectorError> {
+    let auth_token = random_hex_256()?;
+    let port = available_port()?;
+    let credentials = match generate_credentials(layout, &generation) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            return Err(match cleanup_credential_generation(layout, &generation) {
+                Ok(()) => error,
+                Err(cleanup) => CollectorError::Runtime(format!(
+                    "{error}; collector credential cleanup failed: {cleanup}"
+                )),
+            });
+        }
+    };
+    Ok(CollectorSettings {
+        schema_version: COLLECTOR_SETTINGS_VERSION.into(),
+        generation,
+        port,
+        transport: COLLECTOR_TRANSPORT.into(),
+        auth_token,
+        credentials,
+    })
+}
+
+fn random_hex_256() -> Result<String, CollectorError> {
     let mut random = [0_u8; 32];
     getrandom::fill(&mut random)
         .map_err(|error| CollectorError::Runtime(format!("collector entropy failed: {error}")))?;
-    let generation = random
+    Ok(random
         .iter()
         .fold(String::with_capacity(64), |mut value, byte| {
             use std::fmt::Write as _;
             write!(value, "{byte:02x}").expect("writing to String cannot fail");
             value
-        });
-    let credentials = match generate_credentials(layout, &generation) {
-        Ok(credentials) => credentials,
-        Err(error) => {
-            cleanup_credential_generation(layout, &generation);
-            return Err(error);
-        }
-    };
-    let settings = CollectorSettings {
-        schema_version: COLLECTOR_SETTINGS_VERSION.into(),
-        generation,
-        port: available_port()?,
-        transport: COLLECTOR_TRANSPORT.into(),
-        credentials,
-    };
-    let write_result = match expected {
-        Some(expected) => {
-            write_private_json_if_unchanged(&settings_path(layout), &settings, expected)
-        }
-        None => write_private_json(&settings_path(layout), &settings),
-    };
-    if let Err(error) = write_result {
-        cleanup_credential_generation(layout, &settings.generation);
-        return Err(error);
-    }
-    Ok(settings)
+        }))
 }
 
-fn cleanup_credential_generation(layout: &InstalledLayout, generation: &str) {
+fn cleanup_credential_generation(
+    layout: &InstalledLayout,
+    generation: &str,
+) -> Result<(), CollectorError> {
     let tls_root = layout.runtime.join(TLS_DIRECTORY);
-    let _ = fs::remove_dir_all(tls_root.join(generation));
-    if let Ok(directory) = File::open(tls_root) {
-        let _ = directory.sync_all();
+    match fs::remove_dir_all(tls_root.join(generation)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
     }
+    File::open(tls_root)?.sync_all()?;
+    Ok(())
 }
 
 fn available_port() -> Result<u16, CollectorError> {
@@ -270,6 +471,146 @@ pub fn load_settings(root: &Path) -> Result<CollectorSettings, CollectorError> {
     let settings = parse_current_settings(&snapshot.bytes)?;
     validate_owned_credentials(&layout, &settings)?;
     Ok(settings)
+}
+
+/// Commits a pending legacy settings migration after collector service and Codex config commit.
+pub fn commit_settings_migration(root: &Path) -> Result<(), CollectorError> {
+    let layout = install(root).map_err(runtime_error)?;
+    let Some(mut migration) = load_settings_migration(&layout)? else {
+        return Ok(());
+    };
+    let current = read_private_snapshot(&settings_path(&layout), MAX_SETTINGS_BYTES)?;
+    let settings = parse_owned_settings(&current.bytes)?;
+    if settings.generation != migration.replacement_generation {
+        return Err(CollectorError::Runtime(
+            "collector settings changed before migration commit".into(),
+        ));
+    }
+    if migration.phase == SettingsMigrationPhase::Pending {
+        let path = settings_migration_path(&layout);
+        let snapshot = read_private_snapshot(&path, MAX_SETTINGS_MIGRATION_BYTES)?;
+        migration.phase = SettingsMigrationPhase::IntegrationCommitted;
+        write_private_json_if_unchanged(
+            &path,
+            &migration,
+            &snapshot,
+            MAX_SETTINGS_MIGRATION_BYTES,
+        )?;
+    }
+    finalize_committed_settings_migration(&layout, &migration)
+}
+
+/// Restores exact legacy settings when a collector/config integration transaction fails.
+pub fn rollback_settings_migration(root: &Path) -> Result<(), CollectorError> {
+    let layout = install(root).map_err(runtime_error)?;
+    let Some(migration) = load_settings_migration(&layout)? else {
+        return Ok(());
+    };
+    if migration.phase == SettingsMigrationPhase::IntegrationCommitted {
+        return finalize_committed_settings_migration(&layout, &migration);
+    }
+    let path = settings_path(&layout);
+    let current = read_private_snapshot(&path, MAX_SETTINGS_BYTES)?;
+    let previous = PrivateFileSnapshot {
+        bytes: migration.previous_settings.clone(),
+        mode: migration.previous_mode,
+    };
+    if current != previous {
+        let settings = parse_owned_settings(&current.bytes)?;
+        if settings.generation != migration.replacement_generation {
+            return Err(CollectorError::Runtime(
+                "collector settings changed before migration rollback".into(),
+            ));
+        }
+        let validated_generation =
+            validate_legacy_settings_for_migration(&layout, &previous.bytes)?;
+        if validated_generation != migration.previous_generation {
+            return Err(CollectorError::Runtime(
+                "collector migration rollback generation mismatch".into(),
+            ));
+        }
+        write_private_bytes_if_unchanged(&path, &previous, &current)?;
+    }
+    cleanup_credential_generation(&layout, &migration.replacement_generation)?;
+    remove_private_file(&settings_migration_path(&layout))
+}
+
+/// Reports whether an exact settings migration journal still requires settlement.
+pub fn settings_migration_pending(root: &Path) -> Result<bool, CollectorError> {
+    let layout = install(root).map_err(runtime_error)?;
+    load_settings_migration(&layout).map(|migration| migration.is_some())
+}
+
+fn load_settings_migration(
+    layout: &InstalledLayout,
+) -> Result<Option<SettingsMigrationV1>, CollectorError> {
+    let path = settings_migration_path(layout);
+    let snapshot = match fs::symlink_metadata(&path) {
+        Ok(_) => read_private_snapshot(&path, MAX_SETTINGS_MIGRATION_BYTES)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let migration: SettingsMigrationV1 = serde_json::from_slice(&snapshot.bytes)
+        .map_err(|_| CollectorError::Runtime("invalid collector settings migration".into()))?;
+    if migration.schema_version != SETTINGS_MIGRATION_VERSION
+        || migration.previous_settings.len()
+            > usize::try_from(MAX_SETTINGS_BYTES).expect("settings bound fits usize")
+        || !valid_generation(&migration.replacement_generation)
+        || migration
+            .previous_generation
+            .as_deref()
+            .is_some_and(|generation| !valid_generation(generation))
+        || migration.previous_mode & 0o077 != 0
+    {
+        return Err(CollectorError::Runtime(
+            "invalid collector settings migration".into(),
+        ));
+    }
+    Ok(Some(migration))
+}
+
+fn recover_settings_migration_before_install(
+    layout: &InstalledLayout,
+) -> Result<(), CollectorError> {
+    let Some(migration) = load_settings_migration(layout)? else {
+        return Ok(());
+    };
+    if migration.phase == SettingsMigrationPhase::IntegrationCommitted {
+        return finalize_committed_settings_migration(layout, &migration);
+    }
+    let current = read_private_snapshot(&settings_path(layout), MAX_SETTINGS_BYTES)?;
+    if current.bytes == migration.previous_settings && current.mode == migration.previous_mode {
+        cleanup_credential_generation(layout, &migration.replacement_generation)?;
+        return remove_private_file(&settings_migration_path(layout));
+    }
+    let settings = parse_owned_settings(&current.bytes)?;
+    if settings.generation != migration.replacement_generation {
+        return Err(CollectorError::Runtime(
+            "collector settings migration cannot be resumed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn finalize_committed_settings_migration(
+    layout: &InstalledLayout,
+    migration: &SettingsMigrationV1,
+) -> Result<(), CollectorError> {
+    let current = read_private_snapshot(&settings_path(layout), MAX_SETTINGS_BYTES)?;
+    let settings = parse_owned_settings(&current.bytes)?;
+    if settings.generation != migration.replacement_generation {
+        return Err(CollectorError::Runtime(
+            "committed collector settings migration cannot be finalized".into(),
+        ));
+    }
+    if let Some(previous_generation) = &migration.previous_generation {
+        cleanup_credential_generation(layout, previous_generation)?;
+    }
+    remove_private_file(&settings_migration_path(layout))
+}
+
+fn valid_generation(generation: &str) -> bool {
+    generation.len() == 64 && generation.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn parse_current_settings(bytes: &[u8]) -> Result<CollectorSettings, CollectorError> {
@@ -327,6 +668,10 @@ fn settings_path(layout: &InstalledLayout) -> PathBuf {
     layout.runtime.join("collector.json")
 }
 
+fn settings_migration_path(layout: &InstalledLayout) -> PathBuf {
+    layout.runtime.join("collector-settings-migration.json")
+}
+
 fn validate_settings_shape(settings: &CollectorSettings) -> Result<(), CollectorError> {
     if settings.schema_version != COLLECTOR_SETTINGS_VERSION
         || settings.port == 0
@@ -334,6 +679,11 @@ fn validate_settings_shape(settings: &CollectorSettings) -> Result<(), Collector
         || settings.generation.len() != 64
         || !settings
             .generation
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || settings.auth_token.len() != 64
+        || !settings
+            .auth_token
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
         || settings.credentials.expires_at_unix_ms == 0
@@ -352,14 +702,6 @@ fn validate_settings_shape(settings: &CollectorSettings) -> Result<(), Collector
         (
             &settings.credentials.server_private_key,
             SERVER_PRIVATE_KEY_NAME,
-        ),
-        (
-            &settings.credentials.client_certificate,
-            CLIENT_CERTIFICATE_NAME,
-        ),
-        (
-            &settings.credentials.client_private_key,
-            CLIENT_PRIVATE_KEY_NAME,
         ),
     ] {
         if path.len() > MAX_CREDENTIAL_PATH_BYTES || path != &format!("{expected_prefix}{name}") {
@@ -384,8 +726,6 @@ fn validate_owned_credentials(
         &settings.credentials.ca_certificate,
         &settings.credentials.server_certificate,
         &settings.credentials.server_private_key,
-        &settings.credentials.client_certificate,
-        &settings.credentials.client_private_key,
     ] {
         read_private_bounded(&credential_path(layout, relative)?, MAX_CREDENTIAL_BYTES)?;
     }
@@ -429,17 +769,6 @@ fn generate_credentials(
         .signed_by(&server_key, &issuer)
         .map_err(crypto_error)?;
 
-    let client_key = KeyPair::generate().map_err(crypto_error)?;
-    let mut client_params = CertificateParams::default();
-    client_params.not_before = ca_params.not_before;
-    client_params.not_after = ca_params.not_after;
-    client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    client_params.distinguished_name = distinguished_name("agent-observability local client");
-    let client_certificate = client_params
-        .signed_by(&client_key, &issuer)
-        .map_err(crypto_error)?;
-
     for (name, bytes) in [
         (CA_CERTIFICATE_NAME, ca_certificate.pem().into_bytes()),
         (
@@ -449,14 +778,6 @@ fn generate_credentials(
         (
             SERVER_PRIVATE_KEY_NAME,
             server_key.serialize_pem().into_bytes(),
-        ),
-        (
-            CLIENT_CERTIFICATE_NAME,
-            client_certificate.pem().into_bytes(),
-        ),
-        (
-            CLIENT_PRIVATE_KEY_NAME,
-            client_key.serialize_pem().into_bytes(),
         ),
     ] {
         write_private_file(&generation_dir.join(name), &bytes)?;
@@ -469,8 +790,6 @@ fn generate_credentials(
         ca_certificate: format!("{prefix}/{CA_CERTIFICATE_NAME}"),
         server_certificate: format!("{prefix}/{SERVER_CERTIFICATE_NAME}"),
         server_private_key: format!("{prefix}/{SERVER_PRIVATE_KEY_NAME}"),
-        client_certificate: format!("{prefix}/{CLIENT_CERTIFICATE_NAME}"),
-        client_private_key: format!("{prefix}/{CLIENT_PRIVATE_KEY_NAME}"),
         expires_at_unix_ms: u64::try_from(not_after.unix_timestamp())
             .map_err(|_| CollectorError::Runtime("credential expiry is invalid".into()))?
             .saturating_mul(1_000),
@@ -561,9 +880,9 @@ fn settings_temporary_path(parent: &Path) -> PathBuf {
     ))
 }
 
-fn write_private_json_temporary(
+fn write_private_json_temporary<T: Serialize>(
     path: &Path,
-    settings: &CollectorSettings,
+    value: &T,
 ) -> Result<File, CollectorError> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
@@ -573,21 +892,21 @@ fn write_private_json_temporary(
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(path)?;
-    serde_json::to_writer_pretty(&mut file, settings)
+    serde_json::to_writer_pretty(&mut file, value)
         .map_err(|_| CollectorError::Runtime("collector settings serialization failed".into()))?;
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(file)
 }
 
-fn write_private_json(path: &Path, settings: &CollectorSettings) -> Result<(), CollectorError> {
+fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CollectorError> {
     let parent = path
         .parent()
         .ok_or_else(|| CollectorError::Runtime("collector settings have no parent".into()))?;
     validate_private_directory(parent)?;
     let temporary = settings_temporary_path(parent);
     let result = (|| {
-        let file = write_private_json_temporary(&temporary, settings)?;
+        let file = write_private_json_temporary(&temporary, value)?;
         drop(file);
         fs::rename(&temporary, path)?;
         File::open(parent)?.sync_all()?;
@@ -597,10 +916,11 @@ fn write_private_json(path: &Path, settings: &CollectorSettings) -> Result<(), C
     result
 }
 
-fn write_private_json_if_unchanged(
+fn write_private_json_if_unchanged<T: Serialize>(
     path: &Path,
-    settings: &CollectorSettings,
+    value: &T,
     expected: &PrivateFileSnapshot,
+    max_bytes: u64,
 ) -> Result<(), CollectorError> {
     let parent = path
         .parent()
@@ -608,9 +928,9 @@ fn write_private_json_if_unchanged(
     validate_private_directory(parent)?;
     let temporary = settings_temporary_path(parent);
     let result = (|| {
-        let file = write_private_json_temporary(&temporary, settings)?;
+        let file = write_private_json_temporary(&temporary, value)?;
         drop(file);
-        let current = read_private_snapshot(path, MAX_SETTINGS_BYTES)?;
+        let current = read_private_snapshot(path, max_bytes)?;
         if current != *expected {
             return Err(CollectorError::Runtime(
                 "collector settings changed during credential replacement".into(),
@@ -622,6 +942,55 @@ fn write_private_json_if_unchanged(
     })();
     let _ = fs::remove_file(&temporary);
     result
+}
+
+fn write_private_bytes_if_unchanged(
+    path: &Path,
+    replacement: &PrivateFileSnapshot,
+    expected: &PrivateFileSnapshot,
+) -> Result<(), CollectorError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CollectorError::Runtime("collector settings have no parent".into()))?;
+    validate_private_directory(parent)?;
+    let temporary = settings_temporary_path(parent);
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(replacement.mode & 0o777)
+                .custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&replacement.bytes)?;
+        file.sync_all()?;
+        drop(file);
+        let current = read_private_snapshot(path, MAX_SETTINGS_BYTES)?;
+        if current != *expected {
+            return Err(CollectorError::Runtime(
+                "collector settings changed during migration rollback".into(),
+            ));
+        }
+        fs::rename(&temporary, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
+fn remove_private_file(path: &Path) -> Result<(), CollectorError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CollectorError::Runtime("collector file has no parent".into()))?;
+    match fs::remove_file(path) {
+        Ok(()) => File::open(parent)?.sync_all().map_err(Into::into),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), CollectorError> {
@@ -773,24 +1142,14 @@ fn build_server_config(
     layout: &InstalledLayout,
     credentials: &CredentialMetadata,
 ) -> Result<Arc<ServerConfig>, CollectorError> {
-    let ca = load_certificates(&credential_path(layout, &credentials.ca_certificate)?)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| CollectorError::Runtime("collector CA certificate is empty".into()))?;
     let provider = Arc::new(aws_lc_rs::default_provider());
-    let verifier = WebPkiClientVerifier::builder_with_provider(
-        Arc::new(root_store(ca)?),
-        Arc::clone(&provider),
-    )
-    .build()
-    .map_err(crypto_error)?;
     let certificates =
         load_certificates(&credential_path(layout, &credentials.server_certificate)?)?;
     let key = load_private_key(&credential_path(layout, &credentials.server_private_key)?)?;
     let config = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(crypto_error)?
-        .with_client_cert_verifier(verifier)
+        .with_no_client_auth()
         .with_single_cert(certificates, key)
         .map_err(crypto_error)?;
     Ok(Arc::new(config))
@@ -804,6 +1163,24 @@ fn build_client_config(
         .into_iter()
         .next()
         .ok_or_else(|| CollectorError::Runtime("collector CA certificate is empty".into()))?;
+    let config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(crypto_error)?
+        .with_root_certificates(root_store(ca)?)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+fn build_legacy_client_config(
+    layout: &InstalledLayout,
+    credentials: &LegacyCredentialMetadataV2Mtls,
+) -> Result<Arc<ClientConfig>, CollectorError> {
+    let ca = load_certificates(&credential_path(layout, &credentials.ca_certificate)?)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            CollectorError::Runtime("legacy collector CA certificate is empty".into())
+        })?;
     let certificates =
         load_certificates(&credential_path(layout, &credentials.client_certificate)?)?;
     let key = load_private_key(&credential_path(layout, &credentials.client_private_key)?)?;
@@ -835,6 +1212,7 @@ struct CollectorState {
 #[derive(Clone, Debug)]
 struct AppState {
     collector: Arc<Mutex<CollectorState>>,
+    auth_token: Arc<str>,
     report_refresh_scheduled: Arc<AtomicBool>,
     report_refresh_requested: Arc<AtomicU64>,
     #[cfg(test)]
@@ -869,6 +1247,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
             generation: options.generation.clone(),
             port: options.port,
             transport: COLLECTOR_TRANSPORT.into(),
+            auth_token: options.auth_token.clone(),
             credentials: options.credentials.clone(),
         },
     )?;
@@ -913,6 +1292,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     }));
     let state = AppState {
         collector,
+        auth_token: Arc::from(options.auth_token),
         report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
         report_refresh_requested: Arc::new(AtomicU64::new(0)),
         #[cfg(test)]
@@ -959,10 +1339,46 @@ fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(ingest)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_request,
+        ))
         .layer(DefaultBodyLimit::max(
             usize::try_from(MAX_HANDOFF_BYTES).expect("handoff bound fits usize"),
         ))
         .with_state(state)
+}
+
+async fn authenticate_request(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if !token_matches(request.headers(), &state.auth_token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    next.run(request).await
+}
+
+fn token_matches(headers: &HeaderMap, expected: &str) -> bool {
+    let mut values = headers.get_all(AUTH_HEADER_NAME).iter();
+    let Some(actual) = values.next().map(axum::http::HeaderValue::as_bytes) else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    let expected = expected.as_bytes();
+    if actual.len() != expected.len() {
+        return false;
+    }
+    actual
+        .iter()
+        .zip(expected)
+        .fold(0_u8, |difference, (actual, expected)| {
+            difference | (actual ^ expected)
+        })
+        == 0
 }
 
 async fn serve_transport(
@@ -996,6 +1412,10 @@ struct TransportListener {
     handshake_timeout: Duration,
     header_read_timeout: Duration,
     connection_slots: Arc<Semaphore>,
+    completed_handshakes:
+        mpsc::Receiver<(TlsStream<TokioTcpStream>, OwnedSemaphorePermit, SocketAddr)>,
+    completed_handshake_sender:
+        mpsc::Sender<(TlsStream<TokioTcpStream>, OwnedSemaphorePermit, SocketAddr)>,
 }
 
 impl TransportListener {
@@ -1006,12 +1426,15 @@ impl TransportListener {
         max_connections: usize,
     ) -> Self {
         assert!(max_connections > 0, "collector must admit a connection");
+        let (completed_handshake_sender, completed_handshakes) = mpsc::channel(max_connections);
         Self {
             listener,
             acceptor: TlsAcceptor::from(tls_config),
             handshake_timeout: header_read_timeout,
             header_read_timeout,
             connection_slots: Arc::new(Semaphore::new(max_connections)),
+            completed_handshakes,
+            completed_handshake_sender,
         }
     }
 }
@@ -1022,21 +1445,34 @@ impl Listener for TransportListener {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            let (stream, address) = Listener::accept(&mut self.listener).await;
-            let Ok(permit) = Arc::clone(&self.connection_slots).try_acquire_owned() else {
-                drop(stream);
-                continue;
-            };
-            let handshake =
-                tokio::time::timeout(self.handshake_timeout, self.acceptor.accept(stream)).await;
-            let Ok(Ok(stream)) = handshake else {
-                drop(permit);
-                continue;
-            };
-            return (
-                ProtectedIo::new(stream, permit, self.header_read_timeout),
-                address,
-            );
+            tokio::select! {
+                biased;
+                Some((stream, permit, address)) = self.completed_handshakes.recv() => {
+                    return (
+                        ProtectedIo::new(stream, permit, self.header_read_timeout),
+                        address,
+                    );
+                }
+                (stream, address) = Listener::accept(&mut self.listener) => {
+                    let Ok(permit) = Arc::clone(&self.connection_slots).try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
+                    let acceptor = self.acceptor.clone();
+                    let handshake_timeout = self.handshake_timeout;
+                    let completed = self.completed_handshake_sender.clone();
+                    tokio::spawn(async move {
+                        let handshake = tokio::time::timeout(
+                            handshake_timeout,
+                            acceptor.accept(stream),
+                        )
+                        .await;
+                        if let Ok(Ok(stream)) = handshake {
+                            let _ = completed.send((stream, permit, address)).await;
+                        }
+                    });
+                }
+            }
         }
     }
 
@@ -1325,7 +1761,7 @@ fn ingest_notify_locked(
     };
     let now = current_unix_ms()?;
     let cursor = next_cursor(state)?;
-    let batch = parse_notify_json(
+    let batch = parse_projected_notify_json(
         body,
         &state.source_generation,
         state.last_cursor.as_deref(),
@@ -1775,6 +2211,48 @@ struct AuthenticatedResponse {
     body: Vec<u8>,
 }
 
+struct DeadlineStream {
+    stream: TcpStream,
+    deadline: StdInstant,
+}
+
+impl DeadlineStream {
+    fn new(stream: TcpStream, deadline: StdInstant) -> Self {
+        Self { stream, deadline }
+    }
+
+    fn remaining(&self) -> std::io::Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since(StdInstant::now());
+        if remaining.is_zero() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "collector foreground request timed out",
+            ))
+        } else {
+            Ok(remaining)
+        }
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(buffer)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.flush()
+    }
+}
+
 fn authenticated_request(
     root: &Path,
     method: &str,
@@ -1783,16 +2261,22 @@ fn authenticated_request(
     connect_timeout: Duration,
     io_timeout: Duration,
 ) -> Result<AuthenticatedResponse, CollectorError> {
+    let deadline = StdInstant::now() + connect_timeout + io_timeout;
     let settings = load_settings(root)?;
     let layout = install(root).map_err(runtime_error)?;
     let config = build_client_config(&layout, &settings.credentials)?;
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), settings.port);
-    let stream = TcpStream::connect_timeout(&address, connect_timeout)?;
-    stream.set_read_timeout(Some(io_timeout))?;
-    stream.set_write_timeout(Some(io_timeout))?;
+    let remaining = deadline.saturating_duration_since(StdInstant::now());
+    if remaining.is_zero() {
+        return Err(CollectorError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "collector foreground request timed out",
+        )));
+    }
+    let stream = TcpStream::connect_timeout(&address, connect_timeout.min(remaining))?;
     let server_name = ServerName::try_from("127.0.0.1").map_err(crypto_error)?;
     let connection = ClientConnection::new(config, server_name).map_err(crypto_error)?;
-    let mut tls = StreamOwned::new(connection, stream);
+    let mut tls = StreamOwned::new(connection, DeadlineStream::new(stream, deadline));
     let body = body.unwrap_or_default();
     let content_headers = if body.is_empty() {
         String::new()
@@ -1803,7 +2287,8 @@ fn authenticated_request(
         )
     };
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{content_headers}Connection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{AUTH_HEADER_NAME}: {}\r\n{content_headers}Connection: close\r\n\r\n",
+        settings.auth_token,
     );
     tls.write_all(request.as_bytes())?;
     if !body.is_empty() {
@@ -1935,6 +2420,11 @@ fn validate_options(options: &CollectorOptions) -> Result<(), CollectorError> {
             .generation
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
+        || options.auth_token.len() != 64
+        || !options
+            .auth_token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
         || !options.root.is_absolute()
         || options.credentials.expires_at_unix_ms <= current_unix_ms()?
     {
@@ -1990,15 +2480,15 @@ fn runtime_error(error: impl std::fmt::Display) -> CollectorError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome,
-        OtlpRequestCorrelationState, REPORT_FILE_NAME, admit_request, build_client_config,
-        build_server_config, enforce_batch_policy, ingest_locked, ingest_notify_locked,
-        install_settings, is_json, load_certificates, load_private_key, load_settings, open_store,
+        AUTH_HEADER_NAME, AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome,
+        OtlpRequestCorrelationState, REPORT_FILE_NAME, admit_request, authenticated_request,
+        build_client_config, build_server_config, enforce_batch_policy, ingest_locked,
+        ingest_notify_locked, install_settings, is_json, load_settings, open_store,
         parse_complete_http_response, project_report, read_private_snapshot,
         reconcile_report_state, recover_occupied_persisted_port, refresh_report_from_root,
         report_dirty_path, router, schedule_report_refresh, settings_path, submit_notify,
-        timestamp_from_unix_ms, watch_report_authority, write_private, write_private_json,
-        write_private_json_if_unchanged,
+        timestamp_from_unix_ms, token_matches, watch_report_authority, write_private,
+        write_private_json, write_private_json_if_unchanged,
     };
     use agent_observability_adapter_codex::{MAX_HANDOFF_BYTES, parse_otlp_http_json};
     use agent_observability_local_runtime::{
@@ -2028,6 +2518,30 @@ mod tests {
             "agent-observability-collector-{name}-{}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn authentication_requires_exactly_one_matching_header() {
+        let expected = "a".repeat(64);
+        let matching = HeaderValue::from_str(&expected).unwrap();
+        let wrong = HeaderValue::from_static("wrong");
+
+        let mut headers = HeaderMap::new();
+        assert!(!token_matches(&headers, &expected));
+        headers.append(super::AUTH_HEADER_NAME, matching.clone());
+        assert!(token_matches(&headers, &expected));
+        headers.append(super::AUTH_HEADER_NAME, wrong.clone());
+        assert!(!token_matches(&headers, &expected));
+
+        let mut reversed = HeaderMap::new();
+        reversed.append(super::AUTH_HEADER_NAME, wrong);
+        reversed.append(super::AUTH_HEADER_NAME, matching.clone());
+        assert!(!token_matches(&reversed, &expected));
+
+        let mut duplicated = HeaderMap::new();
+        duplicated.append(super::AUTH_HEADER_NAME, matching.clone());
+        duplicated.append(super::AUTH_HEADER_NAME, matching);
+        assert!(!token_matches(&duplicated, &expected));
     }
 
     fn collector_state(root: &Path) -> CollectorState {
@@ -2072,8 +2586,10 @@ mod tests {
     }
 
     fn app_state(root: &Path) -> AppState {
+        let auth_token = install_settings(root).unwrap().auth_token;
         AppState {
             collector: Arc::new(Mutex::new(collector_state(root))),
+            auth_token: Arc::from(auth_token),
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
             report_refresh_requested: Arc::new(AtomicU64::new(0)),
             report_refresh_attempts: Arc::new(AtomicU64::new(0)),
@@ -2228,9 +2744,9 @@ mod tests {
             "type": "agent-turn-complete",
             "thread-id": thread,
             "turn-id": turn,
-            "cwd": "/RAW_CWD_SENTINEL",
-            "input-messages": ["RAW_PROMPT_SENTINEL"],
-            "last-assistant-message": "RAW_ASSISTANT_SENTINEL",
+            "cwd": "/RAW_PATH_SECRET",
+            "input-messages": ["RAW_INPUT_SECRET"],
+            "last-assistant-message": "RAW_OUTPUT_SECRET",
         }))
         .unwrap()
     }
@@ -2275,38 +2791,11 @@ mod tests {
         rustls::StreamOwned::new(connection, stream)
     }
 
-    fn client_config_with_identity(
-        trust_root: &Path,
-        certificate: Option<&Path>,
-        private_key: Option<&Path>,
-    ) -> Arc<rustls::ClientConfig> {
-        let ca = load_certificates(trust_root)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(super::root_store(ca).unwrap());
-        Arc::new(match (certificate, private_key) {
-            (Some(certificate), Some(private_key)) => builder
-                .with_client_auth_cert(
-                    load_certificates(certificate).unwrap(),
-                    load_private_key(private_key).unwrap(),
-                )
-                .unwrap(),
-            (None, None) => builder.with_no_client_auth(),
-            _ => panic!("certificate and private key must be provided together"),
-        })
-    }
-
     fn attempt_tls_http(
         port: u16,
         config: Arc<rustls::ClientConfig>,
         server_name: &str,
+        token: Option<&str>,
     ) -> std::io::Result<Vec<u8>> {
         let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))?;
         let timeout = Some(Duration::from_secs(1));
@@ -2319,7 +2808,13 @@ mod tests {
         )
         .map_err(std::io::Error::other)?;
         let mut tls = rustls::StreamOwned::new(connection, stream);
-        tls.write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")?;
+        let auth = token.map_or_else(String::new, |token| {
+            format!("{AUTH_HEADER_NAME}: {token}\r\n")
+        });
+        tls.write_all(
+            format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Connection: close\r\n\r\n")
+                .as_bytes(),
+        )?;
         let mut response = Vec::new();
         tls.read_to_end(&mut response)?;
         Ok(response)
@@ -2328,6 +2823,7 @@ mod tests {
     async fn post(
         port: u16,
         config: Arc<rustls::ClientConfig>,
+        token: String,
         content_type: Option<&str>,
         body: Vec<u8>,
     ) -> StatusCode {
@@ -2337,7 +2833,7 @@ mod tests {
 
             let mut stream = tls_stream(port, config);
             let mut request = format!(
-                "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n",
+                "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\n{AUTH_HEADER_NAME}: {token}\r\nContent-Length: {}\r\nConnection: close\r\n",
                 body.len()
             );
             if let Some(content_type) = content_type {
@@ -2475,7 +2971,6 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-
         runtime.block_on(async {
             let (server_config, client_config) = test_tls_configs(&root);
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -2584,7 +3079,55 @@ mod tests {
     }
 
     #[test]
-    fn mtls_rejects_missing_or_wrong_identity_ca_san_and_eku_before_http() {
+    fn stalled_tls_handshake_does_not_delay_an_authenticated_client() {
+        let root = test_root("concurrent-tls-handshakes");
+        let _ = fs::remove_dir_all(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let (server_config, client_config) = test_tls_configs(&root);
+            let auth_token = install_settings(&root).unwrap().auth_token;
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport = super::TransportListener::new(
+                listener,
+                server_config,
+                Duration::from_millis(600),
+                2,
+            );
+            let slots = Arc::clone(&transport.connection_slots);
+            let app = router(app_state(&root));
+            let server = tokio::spawn(async move { axum::serve(transport, app).await });
+
+            let mut stalled = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+            stalled.write_all(&[0x16, 0x03, 0x03]).unwrap();
+            wait_for_available_permits(&slots, 1).await;
+            let started = Instant::now();
+            let response = tokio::task::spawn_blocking(move || {
+                attempt_tls_http(port, client_config, "127.0.0.1", Some(&auth_token)).unwrap()
+            })
+            .await
+            .unwrap();
+            let elapsed = started.elapsed();
+
+            assert_eq!(response_status(&response), StatusCode::OK);
+            assert!(
+                elapsed < Duration::from_millis(300),
+                "authenticated client waited for stalled handshake: {elapsed:?}"
+            );
+            drop(stalled);
+            server.abort();
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn private_ca_https_rejects_wrong_server_trust_and_unauthenticated_requests() {
         let root = test_root("mtls-rejections");
         let rogue = test_root("mtls-rejections-rogue");
         let _ = fs::remove_dir_all(&root);
@@ -2593,34 +3136,6 @@ mod tests {
         let layout = install(&root).unwrap();
         let rogue_settings = install_settings(&rogue).unwrap();
         let rogue_layout = install(&rogue).unwrap();
-        let ca = layout.runtime.join(&settings.credentials.ca_certificate);
-        let missing_client = client_config_with_identity(&ca, None, None);
-        let wrong_client = client_config_with_identity(
-            &ca,
-            Some(
-                &rogue_layout
-                    .runtime
-                    .join(&rogue_settings.credentials.client_certificate),
-            ),
-            Some(
-                &rogue_layout
-                    .runtime
-                    .join(&rogue_settings.credentials.client_private_key),
-            ),
-        );
-        let wrong_eku = client_config_with_identity(
-            &ca,
-            Some(
-                &layout
-                    .runtime
-                    .join(&settings.credentials.server_certificate),
-            ),
-            Some(
-                &layout
-                    .runtime
-                    .join(&settings.credentials.server_private_key),
-            ),
-        );
         let wrong_ca = build_client_config(&rogue_layout, &rogue_settings.credentials).unwrap();
         let valid = build_client_config(&layout, &settings.credentials).unwrap();
         let server_config = build_server_config(&layout, &settings.credentials).unwrap();
@@ -2640,27 +3155,31 @@ mod tests {
             let app = router(state.clone());
             let server = tokio::spawn(async move { axum::serve(transport, app).await });
 
-            for (config, server_name) in [
-                (missing_client, "127.0.0.1"),
-                (wrong_client, "127.0.0.1"),
-                (wrong_ca, "127.0.0.1"),
-                (Arc::clone(&valid), "localhost"),
-                (wrong_eku, "127.0.0.1"),
-            ] {
+            for (config, server_name) in
+                [(wrong_ca, "127.0.0.1"), (Arc::clone(&valid), "localhost")]
+            {
                 let result = tokio::task::spawn_blocking(move || {
-                    attempt_tls_http(port, config, server_name)
+                    attempt_tls_http(port, config, server_name, None)
                 })
                 .await
                 .unwrap();
                 assert!(result.is_err(), "invalid TLS peer reached HTTP: {result:?}");
             }
 
+            let unauthenticated = Arc::clone(&valid);
+            let response = tokio::task::spawn_blocking(move || {
+                attempt_tls_http(port, unauthenticated, "127.0.0.1", None).unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(response_status(&response), StatusCode::UNAUTHORIZED);
+
             let collector = state.collector.lock().await;
             assert_eq!(collector.accepted_requests, 0);
             assert_eq!(collector.rejected_requests, 0);
             drop(collector);
             let response = tokio::task::spawn_blocking(move || {
-                attempt_tls_http(port, valid, "127.0.0.1").unwrap()
+                attempt_tls_http(port, valid, "127.0.0.1", Some(&settings.auth_token)).unwrap()
             })
             .await
             .unwrap();
@@ -2672,6 +3191,43 @@ mod tests {
     }
 
     #[test]
+    fn token_authentication_does_not_require_a_client_identity() {
+        let root = test_root("token-without-client-identity");
+        let _ = fs::remove_dir_all(&root);
+        let settings = install_settings(&root).unwrap();
+        let layout = install(&root).unwrap();
+        let no_identity = build_client_config(&layout, &settings.credentials).unwrap();
+        let server_config = build_server_config(&layout, &settings.credentials).unwrap();
+        let state = app_state(&root);
+        let auth_token = settings.auth_token;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport =
+                super::TransportListener::new(listener, server_config, Duration::from_secs(1), 4);
+            let app = router(state.clone());
+            let server = tokio::spawn(async move { axum::serve(transport, app).await });
+
+            let response = tokio::task::spawn_blocking(move || {
+                attempt_tls_http(port, no_identity, "127.0.0.1", Some(&auth_token)).unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(response_status(&response), StatusCode::OK);
+            assert_eq!(state.collector.lock().await.accepted_requests, 0);
+            server.abort();
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn transport_times_out_an_incomplete_request_body() {
         let root = test_root("request-lifetime-timeout");
         let _ = fs::remove_dir_all(&root);
@@ -2679,6 +3235,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let auth_token = install_settings(&root).unwrap().auth_token;
 
         runtime.block_on(async {
             let (server_config, client_config) = test_tls_configs(&root);
@@ -2699,9 +3256,12 @@ mod tests {
             let server = tokio::spawn(async move { axum::serve(transport, app).await });
             let response = tokio::task::spawn_blocking(move || {
                 let mut stream = tls_stream(port, client_config);
-                stream
-                    .write_all(b"POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{")
-                    .unwrap();
+                stream.write_all(
+                    format!(
+                        "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\n{AUTH_HEADER_NAME}: {auth_token}\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{{",
+                    )
+                    .as_bytes(),
+                ).unwrap();
                 let mut response = Vec::new();
                 stream.read_to_end(&mut response).unwrap();
                 response
@@ -2725,6 +3285,7 @@ mod tests {
 
         runtime.block_on(async {
             let (server_config, client_config) = test_tls_configs(&root);
+            let auth_token = install_settings(&root).unwrap().auth_token;
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
                 .unwrap();
@@ -2744,7 +3305,7 @@ mod tests {
             let invalid_media = tokio::task::spawn_blocking(move || {
                 let mut stream = tls_stream(port, client_config);
                 let request = format!(
-                    "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: text/plain\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{{"
+                    "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\n{AUTH_HEADER_NAME}: {auth_token}\r\nContent-Type: text/plain\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{{"
                 );
                 stream.write_all(request.as_bytes()).unwrap();
                 let mut response = Vec::new();
@@ -2774,6 +3335,7 @@ mod tests {
 
         runtime.block_on(async {
             let (server_config, client_config) = test_tls_configs(&root);
+            let auth_token = install_settings(&root).unwrap().auth_token;
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
                 .unwrap();
@@ -2822,8 +3384,9 @@ mod tests {
             wait_for_available_permits(&slots, 1).await;
             let response = tokio::task::spawn_blocking(move || {
                 let mut stream = tls_stream(port, client_config);
-                let request =
-                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+                let request = format!(
+                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{AUTH_HEADER_NAME}: {auth_token}\r\nConnection: close\r\n\r\n"
+                );
                 stream.write_all(request.as_bytes()).unwrap();
                 let mut response = Vec::new();
                 stream.read_to_end(&mut response).unwrap();
@@ -2838,7 +3401,7 @@ mod tests {
     }
 
     #[test]
-    fn http_receiver_enforces_media_type_json_and_transport_body_bound_over_mtls() {
+    fn https_receiver_enforces_auth_media_type_and_transport_body_bound() {
         let root = test_root("http-contract");
         let _ = fs::remove_dir_all(&root);
         let layout = install(&root).unwrap();
@@ -2855,6 +3418,7 @@ mod tests {
 
         runtime.block_on(async {
             let (server_config, client_config) = test_tls_configs(&root);
+            let auth_token = install_settings(&root).unwrap().auth_token;
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
                 .unwrap();
@@ -2865,13 +3429,21 @@ mod tests {
                 axum::serve(transport, app).await.unwrap();
             });
             assert_eq!(
-                post(port, Arc::clone(&client_config), None, b"{}".to_vec()).await,
+                post(
+                    port,
+                    Arc::clone(&client_config),
+                    auth_token.clone(),
+                    None,
+                    b"{}".to_vec(),
+                )
+                .await,
                 StatusCode::UNSUPPORTED_MEDIA_TYPE
             );
             assert_eq!(
                 post(
                     port,
                     Arc::clone(&client_config),
+                    auth_token.clone(),
                     Some("text/plain"),
                     b"{}".to_vec(),
                 )
@@ -2882,6 +3454,7 @@ mod tests {
                 post(
                     port,
                     Arc::clone(&client_config),
+                    auth_token.clone(),
                     Some("application/json"),
                     b"{".to_vec(),
                 )
@@ -2897,6 +3470,7 @@ mod tests {
                 post(
                     port,
                     Arc::clone(&client_config),
+                    auth_token.clone(),
                     Some("application/json; charset=utf-8"),
                     exact,
                 )
@@ -2907,6 +3481,7 @@ mod tests {
                 post(
                     port,
                     client_config,
+                    auth_token,
                     Some("application/json"),
                     vec![b' '; usize::try_from(MAX_HANDOFF_BYTES + 1).unwrap()],
                 )
@@ -2974,7 +3549,7 @@ mod tests {
     }
 
     #[test]
-    fn notify_projects_before_io_and_uses_only_authenticated_mtls() {
+    fn notify_projects_before_io_and_uses_only_authenticated_https() {
         let missing = test_root("notify-missing");
         let _ = fs::remove_dir_all(&missing);
         assert_eq!(submit_notify(&missing, b"{}"), NotifyOutcome::Rejected);
@@ -3018,9 +3593,9 @@ mod tests {
         let captured = captured_rx.recv().unwrap();
         for forbidden in [
             b"HTTP/1.1".as_slice(),
-            b"RAW_CWD_SENTINEL".as_slice(),
-            b"RAW_PROMPT_SENTINEL".as_slice(),
-            b"RAW_ASSISTANT_SENTINEL".as_slice(),
+            b"RAW_PATH_SECRET".as_slice(),
+            b"RAW_INPUT_SECRET".as_slice(),
+            b"RAW_OUTPUT_SECRET".as_slice(),
             b"x-agent-observability-token".as_slice(),
         ] {
             assert!(
@@ -3061,6 +3636,110 @@ mod tests {
         }
     }
 
+    #[test]
+    fn authenticated_notify_endpoint_rejects_raw_codex_payload() {
+        let root = test_root("notify-endpoint-projected-only");
+        let _ = fs::remove_dir_all(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (server_config, _) = test_tls_configs(&root);
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            configure_port(&root, listener.local_addr().unwrap().port());
+            let transport =
+                super::TransportListener::new(listener, server_config, Duration::from_secs(1), 2);
+            let state = app_state(&root);
+            let app = router(state.clone());
+            let server = tokio::spawn(async move { axum::serve(transport, app).await });
+
+            let request_root = root.clone();
+            let response = tokio::task::spawn_blocking(move || {
+                authenticated_request(
+                    &request_root,
+                    "POST",
+                    "/v1/notify",
+                    Some(&raw_notify("RAW_THREAD_SECRET", "RAW_TURN_SECRET")),
+                    Duration::from_millis(250),
+                    Duration::from_secs(1),
+                )
+                .unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY.as_u16());
+            assert_eq!(
+                state.collector.lock().await.store.record_count().unwrap(),
+                0
+            );
+            server.abort();
+            let _ = server.await;
+        });
+        assert_tree_excludes(
+            &root,
+            &[
+                b"RAW_THREAD_SECRET",
+                b"RAW_TURN_SECRET",
+                b"RAW_PATH_SECRET",
+                b"RAW_INPUT_SECRET",
+                b"RAW_OUTPUT_SECRET",
+            ],
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn foreground_deadline_is_absolute_against_slow_drip_responses() {
+        let root = test_root("foreground-absolute-deadline");
+        let _ = fs::remove_dir_all(&root);
+        let settings = install_settings(&root).unwrap();
+        let layout = install(&root).unwrap();
+        let server_config = build_server_config(&layout, &settings.credentials).unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        configure_port(&root, port);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let connection = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(connection, stream);
+            let mut request = [0_u8; 4096];
+            let _ = tls.read(&mut request);
+            for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}" {
+                if tls.write_all(&[*byte]).is_err() || tls.flush().is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        });
+
+        let started = Instant::now();
+        let result = super::authenticated_request(
+            &root,
+            "GET",
+            "/health",
+            None,
+            Duration::from_millis(50),
+            Duration::from_millis(120),
+        );
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "slow-drip response escaped deadline");
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "foreground request exceeded absolute deadline: {elapsed:?}"
+        );
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn collector_settings_are_private_and_idempotent() {
@@ -3099,8 +3778,6 @@ mod tests {
             names,
             [
                 super::CA_CERTIFICATE_NAME,
-                super::CLIENT_CERTIFICATE_NAME,
-                super::CLIENT_PRIVATE_KEY_NAME,
                 super::SERVER_CERTIFICATE_NAME,
                 super::SERVER_PRIVATE_KEY_NAME,
             ]
@@ -3148,7 +3825,7 @@ mod tests {
         write_private_test_file(
             &layout
                 .runtime
-                .join(&settings.credentials.client_private_key),
+                .join(&settings.credentials.server_private_key),
             &vec![b'x'; usize::try_from(super::MAX_CREDENTIAL_BYTES + 1).unwrap()],
         );
         assert!(load_settings(&oversized_credential).is_err());
@@ -3168,13 +3845,13 @@ mod tests {
         let _ = fs::remove_dir_all(&symlinked_credential);
         let settings = install_settings(&symlinked_credential).unwrap();
         let layout = install(&symlinked_credential).unwrap();
-        let client_key = layout
+        let server_key = layout
             .runtime
-            .join(&settings.credentials.client_private_key);
-        fs::remove_file(&client_key).unwrap();
+            .join(&settings.credentials.server_private_key);
+        fs::remove_file(&server_key).unwrap();
         symlink(
             layout.runtime.join(&settings.credentials.ca_certificate),
-            &client_key,
+            &server_key,
         )
         .unwrap();
         assert!(load_settings(&symlinked_credential).is_err());
@@ -3198,8 +3875,48 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn write_legacy_v2_mtls_settings(root: &Path) -> String {
+        let current = install_settings(root).unwrap();
+        let layout = install(root).unwrap();
+        let generation_dir = layout
+            .runtime
+            .join(super::TLS_DIRECTORY)
+            .join(&current.generation);
+        let client_certificate = generation_dir.join(super::LEGACY_CLIENT_CERTIFICATE_NAME);
+        let client_private_key = generation_dir.join(super::LEGACY_CLIENT_PRIVATE_KEY_NAME);
+        write_private_test_file(
+            &client_certificate,
+            &fs::read(layout.runtime.join(&current.credentials.server_certificate)).unwrap(),
+        );
+        write_private_test_file(
+            &client_private_key,
+            &fs::read(layout.runtime.join(&current.credentials.server_private_key)).unwrap(),
+        );
+        let prefix = format!("{}/{}/", super::TLS_DIRECTORY, current.generation);
+        let legacy = serde_json::json!({
+            "schema_version": "local_collector.v2",
+            "generation": current.generation,
+            "port": current.port,
+            "transport": "mtls",
+            "credentials": {
+                "ca_certificate": format!("{prefix}{}", super::CA_CERTIFICATE_NAME),
+                "server_certificate": format!("{prefix}{}", super::SERVER_CERTIFICATE_NAME),
+                "server_private_key": format!("{prefix}{}", super::SERVER_PRIVATE_KEY_NAME),
+                "client_certificate": format!("{prefix}{}", super::LEGACY_CLIENT_CERTIFICATE_NAME),
+                "client_private_key": format!("{prefix}{}", super::LEGACY_CLIENT_PRIVATE_KEY_NAME),
+                "expires_at_unix_ms": current.credentials.expires_at_unix_ms,
+            }
+        });
+        write_private_test_file(
+            &settings_path(&layout),
+            &serde_json::to_vec(&legacy).unwrap(),
+        );
+        legacy["generation"].as_str().unwrap().to_owned()
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn install_migrates_only_exact_v1_and_renews_only_recognized_expired_v2() {
+    fn install_migrates_exact_v1_and_v2_mtls_and_renews_only_current_expired_v3() {
         let legacy_root = test_root("legacy-migration");
         let _ = fs::remove_dir_all(&legacy_root);
         let legacy_layout = install(&legacy_root).unwrap();
@@ -3211,6 +3928,35 @@ mod tests {
         assert_eq!(migrated.schema_version, super::COLLECTOR_SETTINGS_VERSION);
         assert_eq!(migrated.transport, super::COLLECTOR_TRANSPORT);
         assert_ne!(migrated.generation, super::SOURCE_GENERATION);
+
+        let legacy_v2_root = test_root("legacy-v2-mtls-migration");
+        let _ = fs::remove_dir_all(&legacy_v2_root);
+        let legacy_v2_generation = write_legacy_v2_mtls_settings(&legacy_v2_root);
+        let migrated_v2 = install_settings(&legacy_v2_root).unwrap();
+        assert_eq!(
+            migrated_v2.schema_version,
+            super::COLLECTOR_SETTINGS_VERSION
+        );
+        assert_eq!(migrated_v2.transport, super::COLLECTOR_TRANSPORT);
+        assert_eq!(migrated_v2.auth_token.len(), 64);
+        assert_ne!(migrated_v2.generation, legacy_v2_generation);
+        assert!(
+            legacy_v2_root
+                .join("runtime")
+                .join(super::TLS_DIRECTORY)
+                .join(&legacy_v2_generation)
+                .exists()
+        );
+        assert!(super::settings_migration_path(&install(&legacy_v2_root).unwrap()).exists());
+        super::commit_settings_migration(&legacy_v2_root).unwrap();
+        assert!(
+            !legacy_v2_root
+                .join("runtime")
+                .join(super::TLS_DIRECTORY)
+                .join(legacy_v2_generation)
+                .exists()
+        );
+        assert_eq!(load_settings(&legacy_v2_root).unwrap(), migrated_v2);
 
         let expired_root = test_root("expired-renewal");
         let _ = fs::remove_dir_all(&expired_root);
@@ -3242,8 +3988,8 @@ mod tests {
                 br#"{"schema_version":"local_collector.v1","port":4318}"#,
             ),
             (
-                "unknown-v3",
-                br#"{"schema_version":"local_collector.v3","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#,
+                "unknown-v4",
+                br#"{"schema_version":"local_collector.v4","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#,
             ),
         ] {
             let root = test_root(name);
@@ -3255,7 +4001,202 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(legacy_root);
+        let _ = fs::remove_dir_all(legacy_v2_root);
         let _ = fs::remove_dir_all(expired_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_v2_migration_restores_exact_settings_and_credentials() {
+        let root = test_root("legacy-v2-mtls-rollback");
+        let _ = fs::remove_dir_all(&root);
+        let previous_generation = write_legacy_v2_mtls_settings(&root);
+        let layout = install(&root).unwrap();
+        let previous =
+            super::read_private_snapshot(&super::settings_path(&layout), super::MAX_SETTINGS_BYTES)
+                .unwrap();
+        let replacement = install_settings(&root).unwrap();
+
+        super::rollback_settings_migration(&root).unwrap();
+
+        assert_eq!(
+            super::read_private_snapshot(
+                &super::settings_path(&layout),
+                super::MAX_SETTINGS_BYTES,
+            )
+            .unwrap(),
+            previous
+        );
+        assert!(
+            layout
+                .runtime
+                .join(super::TLS_DIRECTORY)
+                .join(previous_generation)
+                .exists()
+        );
+        assert!(
+            !layout
+                .runtime
+                .join(super::TLS_DIRECTORY)
+                .join(replacement.generation)
+                .exists()
+        );
+        assert!(!super::settings_migration_path(&layout).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_migration_before_settings_publish_recovers_and_retries() {
+        let root = test_root("legacy-v2-mtls-prepublish-crash");
+        let _ = fs::remove_dir_all(&root);
+        let previous_generation = write_legacy_v2_mtls_settings(&root);
+        let layout = install(&root).unwrap();
+        let previous =
+            super::read_private_snapshot(&super::settings_path(&layout), super::MAX_SETTINGS_BYTES)
+                .unwrap();
+        let abandoned = super::generate_settings(&layout).unwrap();
+        let migration = super::SettingsMigrationV1 {
+            schema_version: super::SETTINGS_MIGRATION_VERSION.into(),
+            phase: super::SettingsMigrationPhase::Pending,
+            previous_settings: previous.bytes.clone(),
+            previous_mode: previous.mode,
+            previous_generation: Some(previous_generation.clone()),
+            replacement_generation: abandoned.generation.clone(),
+        };
+        super::write_private_json(&super::settings_migration_path(&layout), &migration).unwrap();
+
+        let resumed = install_settings(&root).unwrap();
+
+        assert_ne!(resumed.generation, abandoned.generation);
+        assert!(super::settings_migration_path(&layout).exists());
+        assert!(
+            layout
+                .runtime
+                .join(super::TLS_DIRECTORY)
+                .join(previous_generation)
+                .exists()
+        );
+        assert!(
+            !layout
+                .runtime
+                .join(super::TLS_DIRECTORY)
+                .join(abandoned.generation)
+                .exists()
+        );
+        super::rollback_settings_migration(&root).unwrap();
+        assert_eq!(
+            super::read_private_snapshot(
+                &super::settings_path(&layout),
+                super::MAX_SETTINGS_BYTES,
+            )
+            .unwrap(),
+            previous
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_migration_resumes_cleanup_without_rolling_back() {
+        let root = test_root("legacy-v2-mtls-published-crash");
+        let _ = fs::remove_dir_all(&root);
+        let previous_generation = write_legacy_v2_mtls_settings(&root);
+        let replacement = install_settings(&root).unwrap();
+
+        let layout = install(&root).unwrap();
+        let path = super::settings_migration_path(&layout);
+        let snapshot =
+            super::read_private_snapshot(&path, super::MAX_SETTINGS_MIGRATION_BYTES).unwrap();
+        let mut migration = super::load_settings_migration(&layout).unwrap().unwrap();
+        migration.phase = super::SettingsMigrationPhase::IntegrationCommitted;
+        super::write_private_json_if_unchanged(
+            &path,
+            &migration,
+            &snapshot,
+            super::MAX_SETTINGS_MIGRATION_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(install_settings(&root).unwrap(), replacement);
+        assert_eq!(load_settings(&root).unwrap(), replacement);
+        assert!(!path.exists());
+        assert!(
+            !layout
+                .runtime
+                .join(super::TLS_DIRECTORY)
+                .join(&previous_generation)
+                .exists()
+        );
+
+        let previous_generation = write_legacy_v2_mtls_settings(&root);
+        let replacement = install_settings(&root).unwrap();
+        let snapshot =
+            super::read_private_snapshot(&path, super::MAX_SETTINGS_MIGRATION_BYTES).unwrap();
+        let mut migration = super::load_settings_migration(&layout).unwrap().unwrap();
+        migration.phase = super::SettingsMigrationPhase::IntegrationCommitted;
+        super::write_private_json_if_unchanged(
+            &path,
+            &migration,
+            &snapshot,
+            super::MAX_SETTINGS_MIGRATION_BYTES,
+        )
+        .unwrap();
+        super::cleanup_credential_generation(&layout, &previous_generation).unwrap();
+        super::rollback_settings_migration(&root).unwrap();
+
+        assert_eq!(load_settings(&root).unwrap(), replacement);
+        assert!(!path.exists());
+        assert!(
+            !layout
+                .runtime
+                .join(super::TLS_DIRECTORY)
+                .join(previous_generation)
+                .exists()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_rollback_cleanup_resumes_from_restored_settings() {
+        let root = test_root("legacy-v2-mtls-partial-rollback");
+        let _ = fs::remove_dir_all(&root);
+        write_legacy_v2_mtls_settings(&root);
+        let layout = install(&root).unwrap();
+        let previous =
+            super::read_private_snapshot(&super::settings_path(&layout), super::MAX_SETTINGS_BYTES)
+                .unwrap();
+        let replacement = install_settings(&root).unwrap();
+        let current =
+            super::read_private_snapshot(&super::settings_path(&layout), super::MAX_SETTINGS_BYTES)
+                .unwrap();
+        super::write_private_bytes_if_unchanged(
+            &super::settings_path(&layout),
+            &previous,
+            &current,
+        )
+        .unwrap();
+
+        super::rollback_settings_migration(&root).unwrap();
+
+        assert!(!super::settings_migration_path(&layout).exists());
+        assert!(
+            !layout
+                .runtime
+                .join(super::TLS_DIRECTORY)
+                .join(replacement.generation)
+                .exists()
+        );
+        assert_eq!(
+            super::read_private_snapshot(
+                &super::settings_path(&layout),
+                super::MAX_SETTINGS_BYTES,
+            )
+            .unwrap(),
+            previous
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -3274,12 +4215,28 @@ mod tests {
         write_private_json(&path, &concurrent).unwrap();
         let mut replacement = original.clone();
         replacement.port = replacement.port.saturating_add(2).max(1);
-        assert!(write_private_json_if_unchanged(&path, &replacement, &expected).is_err());
+        assert!(
+            write_private_json_if_unchanged(
+                &path,
+                &replacement,
+                &expected,
+                super::MAX_SETTINGS_BYTES,
+            )
+            .is_err()
+        );
         assert_eq!(load_settings(&root).unwrap(), concurrent);
 
         let expected = read_private_snapshot(&path, super::MAX_SETTINGS_BYTES).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
-        assert!(write_private_json_if_unchanged(&path, &replacement, &expected).is_err());
+        assert!(
+            write_private_json_if_unchanged(
+                &path,
+                &replacement,
+                &expected,
+                super::MAX_SETTINGS_BYTES,
+            )
+            .is_err()
+        );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(load_settings(&root).unwrap(), concurrent);
         assert!(fs::read_dir(&layout.runtime).unwrap().all(|entry| {
@@ -3910,6 +4867,7 @@ mod tests {
         restarted.report_degraded = true;
         let state = AppState {
             collector: Arc::new(Mutex::new(restarted)),
+            auth_token: Arc::from("a".repeat(64)),
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
             report_refresh_requested: Arc::new(AtomicU64::new(0)),
             report_refresh_attempts: Arc::new(AtomicU64::new(0)),
@@ -4022,7 +4980,7 @@ mod tests {
     fn full_runtime_tree_excludes_raw_otlp_and_notify_content() {
         let root = test_root("privacy-tree");
         let _ = fs::remove_dir_all(&root);
-        let _ = install_settings(&root).unwrap();
+        let settings = install_settings(&root).unwrap();
         let mut state = collector_state(&root);
         let otlp = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
           {"attributes":[
@@ -4033,11 +4991,36 @@ mod tests {
           ]}
         ]}]}]}"#;
         ingest_locked(&mut state, otlp).unwrap();
-        ingest_notify_locked(
-            &mut state,
-            &projected_notify("RAW_THREAD_SECRET", "RAW_TURN_SECRET"),
-        )
-        .unwrap();
+        drop(state);
+
+        let layout = install(&root).unwrap();
+        let server_config = build_server_config(&layout, &settings.credentials).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            configure_port(&root, listener.local_addr().unwrap().port());
+            let transport =
+                super::TransportListener::new(listener, server_config, Duration::from_secs(1), 2);
+            let app = router(app_state(&root));
+            let server = tokio::spawn(async move { axum::serve(transport, app).await });
+            let notify_root = root.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                submit_notify(
+                    &notify_root,
+                    &raw_notify("RAW_THREAD_SECRET", "RAW_TURN_SECRET"),
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(outcome, NotifyOutcome::Accepted);
+            server.abort();
+            let _ = server.await;
+        });
         refresh_report_from_root(&root).unwrap();
 
         assert_tree_excludes(
@@ -4049,7 +5032,7 @@ mod tests {
                 b"RAW_THREAD_SECRET",
                 b"RAW_TURN_SECRET",
                 b"RAW_PATH_SECRET",
-                b"RAW_PROMPT_SECRET",
+                b"RAW_INPUT_SECRET",
                 b"RAW_OUTPUT_SECRET",
             ],
         );
