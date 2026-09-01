@@ -82,6 +82,11 @@ become a released capability until native receiver, foreground
 notify, privacy, restart and performance evidence is complete. Cross-version/OS/profile execution remains a
 future promotion gate.
 
+The automatic-path performance gate is
+`cargo run -p xtask -- perf automatic --profile release --check`. Its versioned protocol is
+`crates/contracts/performance/automatic-local-performance-v1.yaml`; the older `perf local` workload does not
+substitute for collector or foreground-notify evidence.
+
 | Scenario | Required evidence |
 | --- | --- |
 | session and turn | stable boundaries, restart, terminal lifecycle, timestamp ordering, and either explicit interrupt support or a verified interrupt gap |

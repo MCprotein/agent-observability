@@ -283,10 +283,18 @@ v4 trace/span/time index before validation.
 ~~~bash
 cargo run -p xtask -- perf local --profile smoke --check
 cargo run -p xtask -- perf local --profile release --check
+cargo run -p xtask -- perf automatic --profile smoke --check
+cargo run -p xtask -- perf automatic --profile release --check
 ~~~
 
-smoke is non-normative and deletes its temporary output. release uses the protocol in
-crates/contracts/performance/local-performance-v1.yaml, writes sanitized evidence under
+The `local` workload measures the fixed-capacity manual-ingress runtime against
+`crates/contracts/performance/local-performance-v1.yaml`. The `automatic` workload launches the built
+collector and foreground `codex-notify` commands, then measures authenticated response latency, collector
+idle/active CPU, RSS, allocated disk and loopback-only network behavior against
+`crates/contracts/performance/automatic-local-performance-v1.yaml`. This keeps automatic-path evidence
+separate from the older internal-ingress benchmark.
+
+smoke is non-normative and deletes its temporary output. release writes sanitized evidence under
 docs/evidence/local/performance/, and exits nonzero for missing or breached latency, CPU, RSS,
 disk, network, or queue-admission evidence. Enabled runs permit at most 1% explicit fail-open
 rejections and, after graceful fixture shutdown, must reconcile every enqueued event with one durable

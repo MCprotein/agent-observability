@@ -1,0 +1,54 @@
+schema_version: automatic_local_performance.v1
+version: v1.0.0
+protocol_revision: v1.0.0-codex-notify-subprocess
+purpose: normative performance evidence for the shipped Codex automatic local path
+profiles:
+  release:
+    build: cargo build --locked -p agent-observability-cli --release
+    warmup_seconds: 60
+    idle_seconds: 900
+    foreground_events: 10000
+    foreground_inter_event_ms: 3
+    runs: 5
+    sample_interval_seconds: 1
+    active_timeout_seconds: 300
+  smoke:
+    build: cargo build --locked -p agent-observability-cli
+    normative: false
+    release_check: false
+    foreground_events: 25
+    runs: 1
+    active_timeout_seconds: 15
+workload:
+  foreground_boundary: built agent-observability codex-notify process through authenticated loopback response
+  collector_boundary: built agent-observability collector-serve subprocess
+  payload: bounded valid agent-turn-complete notify with synthetic opaque identifiers
+  readiness: accepted foreground notify within a bounded startup deadline
+  collector_shutdown: bounded child termination and wait
+metrics:
+  foreground:
+    required_quantiles: [p95, p99]
+    p95_ms_max: 20
+    p99_ms_max: 50
+    command_timeout_seconds: 1
+  collector_cpu:
+    idle_average_percent_max: 0.5
+    active_integrated_percent_max: 100
+    normalization: percent of one logical core
+  collector_rss:
+    peak_mib_max: 96
+  disk:
+    allocated_tree_bytes_max: 1073741824
+  network:
+    allowed_transport: authenticated IPv4 loopback only
+    evidence: process socket endpoint scans plus static product surface validation
+    external_network_bytes_required: 0
+execution:
+  build_timeout_seconds: 600
+  startup_timeout_seconds: 10
+  cleanup_timeout_seconds: 5
+  fail_closed: missing metrics, rejected foreground calls, non-loopback endpoints, timeout, or threshold breach produce non-zero exit
+evidence:
+  output: docs/evidence/local/performance/automatic-<run>/manifest.yaml
+  exact_source: full git commit, locked build command, package version, profile, and protocol revision
+  sanitized_paths: run-relative runtime and protocol paths only; token, port, host path, payload, and raw collector output are forbidden
