@@ -84,7 +84,7 @@ gate를 통과해 추가한다.
 | v1.3.2 | Released | Package publication path correction | Run `33416302530` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
 | v1.4.0 | Released | Local onboarding and documentation usability | Release workflow `33422477557` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
 | v1.5.0 | Released | Local visual configuration console | Release workflow `33478394514` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
-| v1.6.0 | In Progress | Integrity-checked one-command installer | Release-hosted installer checks the universal archive checksum, installs into `~/.local/bin`, registers an idempotent shell-profile PATH block, and passes isolated install/reinstall fixtures plus independent review |
+| v1.6.0 | Released | Integrity-checked one-command installer | Release-hosted installer checks the universal archive checksum, preserves private directory/profile modes, atomically registers an idempotent shell-profile PATH block, and passes exact-head CI plus independent code/documentation review; publication evidence pending tag workflow |
 
 ## Branch Strategy
 
