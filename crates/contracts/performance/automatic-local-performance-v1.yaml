@@ -1,10 +1,11 @@
 schema_version: automatic_local_performance.v1
-version: v1.0.0
-protocol_revision: v1.0.0-codex-notify-subprocess
+version: v1.2.0
+protocol_revision: v1.2.0-primary-otlp-lifecycle-network-tail-per-run
 purpose: normative performance evidence for the shipped Codex automatic local path
 profiles:
   release:
     build: cargo build --locked -p agent-observability-cli --release
+    required_os: macos
     warmup_seconds: 60
     idle_seconds: 900
     foreground_events: 10000
@@ -20,7 +21,12 @@ profiles:
     runs: 1
     active_timeout_seconds: 15
 workload:
-  foreground_boundary: built agent-observability codex-notify process through authenticated loopback response
+  lifecycle_preflight: bounded built-binary no-argument setup --no-open under isolated HOME and CODEX_HOME
+  lifecycle_seed: exact private Codex config bytes and permission mode
+  lifecycle_assertions: connected config, ready or degraded collector, installed LaunchAgent plist, accepted authenticated primary OTLP request with a durable report record, accepted notify supplement, forced launchd kickstart recovery, disconnected config, exact config restoration, and removed plist and service
+  lifecycle_cleanup: best-effort bounded disconnect, bootout, exact seed restoration, plist removal, and isolated directory removal on success or error
+  primary_boundary: authenticated Codex OTLP/HTTP logs request through the installed LaunchAgent collector and durable report authority
+  foreground_boundary: built agent-observability codex-notify supplement process through authenticated loopback response
   collector_boundary: built agent-observability collector-serve subprocess
   payload: bounded valid agent-turn-complete notify with synthetic opaque identifiers
   readiness: accepted foreground notify within a bounded startup deadline
@@ -28,6 +34,7 @@ workload:
 metrics:
   foreground:
     required_quantiles: [p95, p99]
+    validation_scope: every run independently
     p95_ms_max: 20
     p99_ms_max: 50
     command_timeout_seconds: 1
@@ -41,8 +48,9 @@ metrics:
     allocated_tree_bytes_max: 1073741824
   network:
     allowed_transport: authenticated IPv4 loopback only
-    evidence: process socket endpoint scans plus static product surface validation
-    external_network_bytes_required: 0
+    bytes: measured collector process bytes from the existing platform NetworkMonitor and reported without classifying loopback traffic as external
+    endpoints: every observed collector endpoint must be IPv4 loopback
+    evidence: process NetworkMonitor plus independent socket endpoint scans plus static product surface validation
 execution:
   build_timeout_seconds: 600
   startup_timeout_seconds: 10

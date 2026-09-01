@@ -1038,6 +1038,7 @@ version = "1.8.0"
 dependencies = [
  "agent-observability-contracts",
  "agent-observability-domain",
+ "agent-observability-local-collector",
  "agent-observability-local-runtime",
  "agent-observability-local-store",
 ]

@@ -10,6 +10,7 @@ publish = false
 agent-observability-contracts = { path = "../crates/contracts" }
 agent-observability-domain = { path = "../crates/domain" }
 agent-observability-local-runtime = { path = "../crates/local-runtime" }
+agent-observability-local-collector = { path = "../crates/local-collector" }
 agent-observability-local-store = { path = "../crates/local-store" }
 
 [lints]
