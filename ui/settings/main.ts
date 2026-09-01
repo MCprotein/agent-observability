@@ -1,10 +1,14 @@
 import {
   Activity,
   Archive,
+  Cable,
   Check,
   Database,
+  ExternalLink,
   Gauge,
   HeartPulse,
+  MonitorUp,
+  Power,
   RefreshCw,
   RotateCcw,
   Save,
@@ -34,7 +38,15 @@ type Envelope = {
   config: LocalRuntimeConfigV2;
   defaults: LocalRuntimeConfigV2;
   revision: string;
-  collection_mode: "manual_import";
+  collection_mode: "automatic_codex" | "manual_import";
+};
+
+type IntegrationStatus = {
+  config: "connected" | "disconnected" | "conflict";
+  collector: "ready" | "unavailable";
+  endpoint?: string;
+  service?: string;
+  data_retained: boolean;
 };
 
 type ApiError = { code?: string; message?: string };
@@ -166,6 +178,7 @@ let persisted: LocalRuntimeConfigV2 | null = null;
 let draft: LocalRuntimeConfigV2 | null = null;
 let defaults: LocalRuntimeConfigV2 | null = null;
 let revision = "";
+let integration: IntegrationStatus | null = null;
 let busy = false;
 let conflicted = false;
 let heartbeatTimer: number | undefined;
@@ -193,7 +206,12 @@ async function bootstrap(): Promise<void> {
     return;
   }
   try {
-    applyEnvelope(await api<Envelope>("/api/config"));
+    const [envelope, integrationStatus] = await Promise.all([
+      api<Envelope>("/api/config"),
+      api<IntegrationStatus>("/api/integrations/codex"),
+    ]);
+    applyEnvelope(envelope);
+    integration = integrationStatus;
     renderSettings();
     heartbeatTimer = window.setInterval(() => void heartbeat(), 20_000);
   } catch (error) {
@@ -243,6 +261,7 @@ function renderSettings(focusTarget?: string): void {
     <header class="topbar">
       <div class="brand"><span class="brand-mark"><i data-lucide="settings-2"></i></span><span>Agent Observability</span></div>
       <div class="topbar-actions">
+        <button class="button monitor-button" id="open-dashboard" type="button"><i data-lucide="monitor-up"></i>모니터링</button>
         <span class="session-badge"><i data-lucide="shield-check"></i>로컬 전용 · 세션 활성</span>
         <button class="icon-button" id="close-session" type="button" title="설정 세션 닫기" aria-label="설정 세션 닫기"><i data-lucide="x"></i></button>
       </div>
@@ -254,7 +273,7 @@ function renderSettings(focusTarget?: string): void {
         <a href="#collection"><i data-lucide="activity"></i>수집</a>
         <a href="#storage"><i data-lucide="database"></i>저장소</a>
         <a href="#retention"><i data-lucide="archive"></i>보관</a>
-        <div class="nav-note"><strong>입력 방식</strong><span>수동 private handoff</span><span>자동 producer 미포함</span></div>
+        <div class="nav-note"><strong>Codex</strong><span>${integration?.config === "connected" ? "자동 수집 연결됨" : "자동 수집 연결 안 됨"}</span><span>${integration?.collector === "ready" ? "collector 실행 중" : "collector 중지됨"}</span></div>
       </nav>
       <main class="settings-main">
         <form id="settings-form" novalidate>
@@ -301,6 +320,7 @@ function overviewSection(config: LocalRuntimeConfigV2): string {
     <div class="section-heading"><div><p class="eyebrow">Standalone</p><h1 id="overview-title">로컬 수집 정책</h1><p>정적 리포트와 독립적으로 저장·보관 한도를 관리합니다.</p></div>
       <label class="collection-toggle"><span><strong>수집 허용</strong><small id="enabled-copy">${config.enabled ? "private handoff를 처리합니다" : "설정값을 유지한 채 처리를 중지합니다"}</small></span><input type="checkbox" id="enabled" ${config.enabled ? "checked" : ""}><span class="toggle-track" aria-hidden="true"><span></span></span></label>
     </div>
+    ${integrationPanel()}
     <div class="policy-strip" aria-label="정책 요약">
       ${summaryItem("activity", "확인 주기", formatDuration(config.collection.file_reconcile_interval_ms))}
       ${summaryItem("sliders-horizontal", "배치 상한", `${formatNumber(config.collection.max_batch_records)}개`)}
@@ -309,6 +329,26 @@ function overviewSection(config: LocalRuntimeConfigV2): string {
     </div>
     <div class="policy-notice"><i data-lucide="shield-check"></i><div><strong>이 화면은 로컬 정책만 변경합니다.</strong><span>외부 전송 없이 Rust가 검증한 뒤 private config에 원자적으로 저장합니다.</span></div></div>
   </section>`;
+}
+
+function integrationPanel(): string {
+  const connected = integration?.config === "connected";
+  const ready = integration?.collector === "ready";
+  const conflicted = integration?.config === "conflict";
+  const state = connected && ready ? "수집 중" : conflicted ? "설정 충돌" : "연결 안 됨";
+  const detail = connected && ready
+    ? "Codex 이벤트를 private local runtime에 반영합니다."
+    : conflicted
+      ? "Codex 설정이 연결 후 변경되어 자동 복원을 중단했습니다."
+      : "Codex 자동 수집을 연결하면 다음 작업부터 기록합니다.";
+  const action = connected
+    ? `<button class="button secondary" id="toggle-integration" type="button"><i data-lucide="power"></i>연결 해제</button>`
+    : `<button class="button primary" id="toggle-integration" type="button"><i data-lucide="cable"></i>Codex 연결</button>`;
+  return `<div class="integration-panel" data-state="${ready ? "ready" : conflicted ? "conflict" : "idle"}">
+    <div class="integration-identity"><span class="integration-icon"><i data-lucide="activity"></i></span><div><span>Codex</span><strong>${state}</strong><small>${detail}</small></div></div>
+    <div class="integration-meta"><span><b>수집기</b>${ready ? "정상" : "중지"}</span><span><b>저장</b>로컬 전용</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
+    <div class="integration-actions">${action}<button class="button monitor-button" id="overview-dashboard" type="button"><i data-lucide="external-link"></i>리포트 열기</button></div>
+  </div>`;
 }
 
 function collectionSection(config: LocalRuntimeConfigV2): string {
@@ -423,6 +463,9 @@ function bindEvents(): void {
   document.querySelector("#close-session")?.addEventListener("click", requestCloseSession);
   document.querySelector("#cancel-close")?.addEventListener("click", closeCloseDialog);
   document.querySelector("#confirm-close")?.addEventListener("click", () => void closeSession());
+  document.querySelector("#toggle-integration")?.addEventListener("click", () => void toggleIntegration());
+  document.querySelector("#open-dashboard")?.addEventListener("click", () => void openDashboard());
+  document.querySelector("#overview-dashboard")?.addEventListener("click", () => void openDashboard());
   document.querySelectorAll<HTMLDialogElement>("dialog").forEach((dialog) => {
     dialog.addEventListener("keydown", trapDialogFocus);
   });
@@ -442,6 +485,33 @@ function bindEvents(): void {
   document
     .querySelectorAll(".settings-section")
     .forEach((section) => navigationObserver?.observe(section));
+}
+
+async function toggleIntegration(): Promise<void> {
+  if (busy || !integration) return;
+  setBusy(true);
+  try {
+    const method = integration.config === "connected" ? "DELETE" : "POST";
+    integration = await api<IntegrationStatus>("/api/integrations/codex", { method });
+    renderSettings("toggle-integration");
+    showToast(
+      integration.config === "connected" ? "Codex 자동 수집을 연결했습니다." : "Codex 자동 수집을 해제했습니다.",
+      "success",
+    );
+  } catch (error) {
+    setBusy(false);
+    showToast(messageOf(error), "error");
+  }
+}
+
+async function openDashboard(): Promise<void> {
+  if (busy) return;
+  try {
+    await api<void>("/api/dashboard/open", { method: "POST" });
+    showToast("모니터링 리포트를 열었습니다.", "success");
+  } catch (error) {
+    showToast(messageOf(error), "error");
+  }
 }
 
 function trapDialogFocus(event: KeyboardEvent): void {
@@ -830,10 +900,14 @@ function mountIcons(): void {
     icons: {
       Activity,
       Archive,
+      Cable,
       Check,
       Database,
+      ExternalLink,
       Gauge,
       HeartPulse,
+      MonitorUp,
+      Power,
       RefreshCw,
       RotateCcw,
       Save,
@@ -894,6 +968,17 @@ function formatDecimal(value: number): string {
 function setText(id: string, value: string): void {
   const element = document.querySelector<HTMLElement>(`#${id}`);
   if (element) element.textContent = value;
+}
+
+function escapeHtml(value: string): string {
+  const entities: Record<string, string> = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  };
+  return value.replace(/[&<>"']/g, (character) => entities[character] ?? character);
 }
 
 function setDisabled(id: string, value: boolean): void {
