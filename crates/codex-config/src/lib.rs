@@ -1038,15 +1038,14 @@ fn hex_decode(input: &str) -> Option<Vec<u8>> {
     if !input.len().is_multiple_of(2) {
         return None;
     }
-    input
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = char::from(pair[0]).to_digit(16)?;
-            let low = char::from(pair[1]).to_digit(16)?;
-            u8::try_from((high << 4) | low).ok()
-        })
-        .collect()
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len() / 2);
+    for index in (0..bytes.len()).step_by(2) {
+        let high = char::from(bytes[index]).to_digit(16)?;
+        let low = char::from(bytes[index + 1]).to_digit(16)?;
+        decoded.push(u8::try_from((high << 4) | low).ok()?);
+    }
+    Some(decoded)
 }
 
 #[cfg(test)]
