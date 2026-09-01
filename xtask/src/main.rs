@@ -19,8 +19,8 @@ use agent_observability_domain::{
     TokenUsage, TraceId,
 };
 use agent_observability_local_collector::{
-    CollectorSettings, HealthOutcome, check_health, install_settings, load_settings,
-    submit_otlp_json,
+    CollectorSettings, HealthOutcome, OtlpSubmissionOutcome, check_health, install_settings,
+    load_settings, submit_otlp_json_outcome,
 };
 use agent_observability_local_runtime::{
     Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressMessage, IngressOutcome, LocalRuntimeConfigV2,
@@ -2357,10 +2357,12 @@ fn submit_automatic_synthetic_otlp(root: &Path, run: usize, event: usize) -> Res
     ]}]}]}"#
         .replace("$RUN", &run.to_string())
         .replace("$EVENT", &event.to_string());
-    if submit_otlp_json(root, body.as_bytes()).map_err(|error| error.to_string())? {
-        Ok(())
-    } else {
-        Err("automatic lifecycle synthetic collector OTLP request was rejected".into())
+    match submit_otlp_json_outcome(root, body.as_bytes()).map_err(|error| error.to_string())? {
+        OtlpSubmissionOutcome::Accepted => Ok(()),
+        OtlpSubmissionOutcome::Rejected { status, category } => Err(format!(
+            "automatic synthetic collector OTLP request was rejected: run={run} event={event} status={status} category={}",
+            category.as_str()
+        )),
     }
 }
 

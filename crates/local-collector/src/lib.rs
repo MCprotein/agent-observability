@@ -103,6 +103,45 @@ pub struct CredentialMetadata {
     pub expires_at_unix_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OtlpSubmissionOutcome {
+    Accepted,
+    Rejected {
+        status: u16,
+        category: OtlpRejectionCategory,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OtlpRejectionCategory {
+    Unauthorized,
+    Policy,
+    MediaType,
+    Invalid,
+    Busy,
+    Pressure,
+    Storage,
+    Internal,
+    Other,
+}
+
+impl OtlpRejectionCategory {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::Policy => "policy",
+            Self::MediaType => "media-type",
+            Self::Invalid => "invalid",
+            Self::Busy => "busy",
+            Self::Pressure => "pressure",
+            Self::Storage => "storage",
+            Self::Internal => "internal",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyCollectorSettingsV1 {
@@ -2192,18 +2231,51 @@ pub fn check_health(root: &Path) -> HealthOutcome {
 
 /// Sends bounded OTLP JSON through the same authenticated direct-loopback client.
 pub fn submit_otlp_json(root: &Path, payload: &[u8]) -> Result<bool, CollectorError> {
+    submit_otlp_json_outcome(root, payload)
+        .map(|outcome| matches!(outcome, OtlpSubmissionOutcome::Accepted))
+}
+
+/// Sends bounded OTLP JSON and returns a content-free rejection classification.
+pub fn submit_otlp_json_outcome(
+    root: &Path,
+    payload: &[u8],
+) -> Result<OtlpSubmissionOutcome, CollectorError> {
     if payload.len() > usize::try_from(MAX_HANDOFF_BYTES).unwrap_or(usize::MAX) {
-        return Ok(false);
+        return Ok(OtlpSubmissionOutcome::Rejected {
+            status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+            category: OtlpRejectionCategory::Policy,
+        });
     }
-    authenticated_request(
+    let response = authenticated_request(
         root,
         "POST",
         "/v1/logs",
         Some(payload),
         Duration::from_millis(250),
         Duration::from_secs(1),
-    )
-    .map(|response| response.status == 200)
+    )?;
+    if response.status == StatusCode::OK.as_u16() {
+        return Ok(OtlpSubmissionOutcome::Accepted);
+    }
+    let category = classify_otlp_rejection(response.status, &response.body);
+    Ok(OtlpSubmissionOutcome::Rejected {
+        status: response.status,
+        category,
+    })
+}
+
+fn classify_otlp_rejection(status: u16, body: &[u8]) -> OtlpRejectionCategory {
+    match status {
+        401 => OtlpRejectionCategory::Unauthorized,
+        413 => OtlpRejectionCategory::Policy,
+        415 => OtlpRejectionCategory::MediaType,
+        422 => OtlpRejectionCategory::Invalid,
+        503 if body == b"busy" => OtlpRejectionCategory::Busy,
+        503 => OtlpRejectionCategory::Pressure,
+        507 => OtlpRejectionCategory::Storage,
+        500 => OtlpRejectionCategory::Internal,
+        _ => OtlpRejectionCategory::Other,
+    }
 }
 
 struct AuthenticatedResponse {
@@ -2481,14 +2553,15 @@ fn runtime_error(error: impl std::fmt::Display) -> CollectorError {
 mod tests {
     use super::{
         AUTH_HEADER_NAME, AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome,
-        OtlpRequestCorrelationState, REPORT_FILE_NAME, admit_request, authenticated_request,
-        build_client_config, build_server_config, enforce_batch_policy, ingest_locked,
+        OtlpRejectionCategory, OtlpRequestCorrelationState, OtlpSubmissionOutcome,
+        REPORT_FILE_NAME, admit_request, authenticated_request, build_client_config,
+        build_server_config, classify_otlp_rejection, enforce_batch_policy, ingest_locked,
         ingest_notify_locked, install_settings, is_json, load_settings, open_store,
         parse_complete_http_response, project_report, read_private_snapshot,
         reconcile_report_state, recover_occupied_persisted_port, refresh_report_from_root,
         report_dirty_path, router, schedule_report_refresh, settings_path, submit_notify,
-        timestamp_from_unix_ms, token_matches, watch_report_authority, write_private,
-        write_private_json, write_private_json_if_unchanged,
+        submit_otlp_json_outcome, timestamp_from_unix_ms, token_matches, watch_report_authority,
+        write_private, write_private_json, write_private_json_if_unchanged,
     };
     use agent_observability_adapter_codex::{MAX_HANDOFF_BYTES, parse_otlp_http_json};
     use agent_observability_local_runtime::{
@@ -2542,6 +2615,36 @@ mod tests {
         duplicated.append(super::AUTH_HEADER_NAME, matching.clone());
         duplicated.append(super::AUTH_HEADER_NAME, matching);
         assert!(!token_matches(&duplicated, &expected));
+    }
+
+    #[test]
+    fn otlp_submission_rejections_are_content_free_and_exactly_classified() {
+        assert_eq!(
+            classify_otlp_rejection(503, b"busy"),
+            OtlpRejectionCategory::Busy
+        );
+        assert_eq!(
+            classify_otlp_rejection(503, b"anything else"),
+            OtlpRejectionCategory::Pressure
+        );
+        assert_eq!(
+            classify_otlp_rejection(422, b"RAW_RESPONSE_SECRET"),
+            OtlpRejectionCategory::Invalid
+        );
+        assert_eq!(
+            classify_otlp_rejection(599, b"RAW_RESPONSE_SECRET"),
+            OtlpRejectionCategory::Other
+        );
+
+        let root = test_root("oversized-submission-outcome");
+        let oversized = vec![0_u8; usize::try_from(MAX_HANDOFF_BYTES).unwrap() + 1];
+        assert_eq!(
+            submit_otlp_json_outcome(&root, &oversized).unwrap(),
+            OtlpSubmissionOutcome::Rejected {
+                status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                category: OtlpRejectionCategory::Policy,
+            }
+        );
     }
 
     fn collector_state(root: &Path) -> CollectorState {
