@@ -1,6 +1,6 @@
 schema_version: automatic_local_performance.v1
-version: v1.2.0
-protocol_revision: v1.2.0-primary-otlp-lifecycle-network-tail-per-run
+version: v1.3.0
+protocol_revision: v1.3.0-sustained-primary-otlp-crash-lifecycle-scenarios
 purpose: normative performance evidence for the shipped Codex automatic local path
 profiles:
   release:
@@ -8,8 +8,8 @@ profiles:
     required_os: macos
     warmup_seconds: 60
     idle_seconds: 900
-    foreground_events: 10000
-    foreground_inter_event_ms: 3
+    primary_otlp_requests: 10000
+    primary_otlp_inter_request_ms: 3
     runs: 5
     sample_interval_seconds: 1
     active_timeout_seconds: 300
@@ -17,22 +17,22 @@ profiles:
     build: cargo build --locked -p agent-observability-cli
     normative: false
     release_check: false
-    foreground_events: 25
+    primary_otlp_requests: 25
     runs: 1
     active_timeout_seconds: 15
 workload:
   lifecycle_preflight: bounded built-binary no-argument setup --no-open under isolated HOME and CODEX_HOME
   lifecycle_seed: exact private Codex config bytes and permission mode
-  lifecycle_assertions: connected config, ready or degraded collector, installed LaunchAgent plist, accepted authenticated primary OTLP request with a durable report record, accepted notify supplement, forced launchd kickstart recovery, disconnected config, exact config restoration, and removed plist and service
+  lifecycle_assertions: connected config, ready or degraded collector, installed LaunchAgent plist, pre-failure authenticated primary OTLP and notify durability, unexpected SIGKILL service termination and bounded launchd kickstart recovery, post-recovery authenticated primary OTLP and notify durability, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service
   lifecycle_cleanup: best-effort bounded disconnect, bootout, exact seed restoration, plist removal, and isolated directory removal on success or error
-  primary_boundary: authenticated Codex OTLP/HTTP logs request through the installed LaunchAgent collector and durable report authority
-  foreground_boundary: built agent-observability codex-notify supplement process through authenticated loopback response
+  primary_boundary: sustained authenticated Codex OTLP/HTTP /v1/logs requests through the built collector and durable report authority
+  notify_boundary: separately verified built agent-observability codex-notify supplement through authenticated loopback response
   collector_boundary: built agent-observability collector-serve subprocess
-  payload: bounded valid agent-turn-complete notify with synthetic opaque identifiers
-  readiness: accepted foreground notify within a bounded startup deadline
+  payload: bounded valid Codex OTLP log pairs with synthetic opaque identifiers; one bounded notify supplement per measured run
+  readiness: accepted authenticated primary OTLP request within a bounded startup deadline
   collector_shutdown: bounded child termination and wait
 metrics:
-  foreground:
+  primary_otlp:
     required_quantiles: [p95, p99]
     validation_scope: every run independently
     p95_ms_max: 20
@@ -55,7 +55,7 @@ execution:
   build_timeout_seconds: 600
   startup_timeout_seconds: 10
   cleanup_timeout_seconds: 5
-  fail_closed: missing metrics, rejected foreground calls, non-loopback endpoints, timeout, or threshold breach produce non-zero exit
+  fail_closed: missing or invalid metrics, rejected primary OTLP requests, missing notify supplement evidence, non-loopback endpoints, timeout, or threshold breach produce non-zero exit
 evidence:
   output: docs/evidence/local/performance/automatic-<run>/manifest.yaml
   exact_source: full git commit, locked build command, package version, profile, and protocol revision

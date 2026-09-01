@@ -53,6 +53,8 @@ jobs:
           rustup component add clippy
       - name: Run macOS tests
         run: cargo test --workspace --no-fail-fast
+      - name: Run automatic performance smoke
+        run: cargo run -p xtask -- perf automatic --profile smoke --check
       - name: Run macOS Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
