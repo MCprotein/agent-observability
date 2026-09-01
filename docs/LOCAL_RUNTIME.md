@@ -1,13 +1,14 @@
 # Local Runtime
 
 v1.0.0 introduced the standalone local-only Rust runtime boundary. v1.2.0 added bounded local
-retention and private archive export; v1.4.0 adds one-command setup, an isolated built-in demo,
-dashboard open, and atomic CLI configuration updates without adding a server, daemon, identity,
-automatic producer, or network path.
+retention and private archive export; v1.4.0 added one-command setup, an isolated built-in demo,
+dashboard open, and atomic CLI configuration updates. v1.5.0 adds an explicit, ephemeral loopback
+settings UI without adding a resident server, daemon, identity, automatic producer, or external network path.
 It installs private local state,
 validates a closed configuration, admits writes against a hard storage budget, and keeps foreground
 handoff bounded. It contains no endpoint, email, team identity, envelope, outbox, or network client.
-It is a library plus one-shot CLI composition boundary, not a resident server or IPC daemon.
+The only endpoint is created by the foreground `ui` command on `127.0.0.1:0`, uses a private browser
+session, and expires after inactivity. It is not a resident server or IPC daemon.
 
 ## Install and validate
 
@@ -17,6 +18,7 @@ documented in the repository README. The package is only a transport for the Rus
 ~~~bash
 agent-observability demo
 agent-observability setup
+agent-observability ui
 agent-observability config show
 agent-observability config set retention-days 90
 agent-observability dashboard
@@ -30,6 +32,8 @@ agent-observability report ~/.agent-observability /path/to/private-rate-table.js
 
 `setup` composes private install, store initialization, report generation, and macOS browser open.
 `demo` uses an isolated default root and embedded content-free fixture; it never reads an agent log.
+`ui` acquires the runtime singleton, embeds the generated TypeScript application, and delegates all
+configuration validation and atomic save behavior back to Rust.
 The lower-level `init` command remains available for automation. Install creates the root, logs,
 queue, state, and runtime directories with mode 0700 and creates config.json with mode 0600.
 Existing configuration is validated and preserved. Broad permissions,

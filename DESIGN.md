@@ -253,7 +253,8 @@ Accessibility checks require automated rules plus manual keyboard, screen-reader
 - Local settings saving/saved: disable duplicate submission, announce completion and render the canonical
   configuration returned by Rust.
 - Local settings invalid: preserve edits, focus the first invalid control and show bounded field errors.
-- Local settings conflict: reload the latest file before another save; never overwrite an external edit silently.
+- Local settings conflict: reload the latest file, reapply only locally changed fields and require another explicit
+  save; never overwrite an external edit silently.
 - Local settings expired: disable mutation controls and provide the exact CLI command to start a fresh session.
 - Loading: preserve component dimensions and display which scope is loading.
 - Empty: distinguish no source enrolled, no data in range and filter with no match.

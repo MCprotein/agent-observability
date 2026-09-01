@@ -1,9 +1,26 @@
 # Configuration
 
-`agent-observability config`는 `config.json`을 직접 편집하지 않고도 local runtime option을
-조회하고 변경하는 인터페이스다. 기본 runtime은 `~/.agent-observability`다.
+기본 설정 인터페이스는 local-only web UI다. `config.json`을 직접 편집하지 않고도 모든
+runtime option을 조회하고 변경할 수 있다. 기본 runtime은 `~/.agent-observability`다.
 
 ## 사용법
+
+```bash
+agent-observability ui
+```
+
+별도 runtime은 root를 지정한다. 브라우저를 자동으로 열 수 없는 환경에서는 출력된 URL을 직접 연다.
+
+```bash
+agent-observability ui /private/runtime
+agent-observability ui /private/runtime --no-open
+```
+
+UI는 `127.0.0.1`의 임의 port에만 bind하고 URL fragment의 session capability를 private header로
+옮긴다. API는 정확한 Host, Origin과 session을 확인하며 CORS를 허용하지 않는다. 설정 화면은
+외부 request를 만들지 않고, 화면 연결이 10분 동안 끊기면 종료된다. 정적 report에는 영향을 주지 않는다.
+
+자동화와 headless 환경에서는 CLI를 사용한다.
 
 ```bash
 agent-observability config show
@@ -44,7 +61,7 @@ symlink는 기존 config를 바꾸지 않고 거부한다.
 
 현재 one-shot/manual import 제품 경로에서 직접 체감되는 option은 `enabled`, `storage-bytes`,
 retention과 archive 범위다. reconcile, flush, batch, heartbeat option은 동일한 bounded runtime
-contract를 사용하는 producer embedding을 위한 값이며, 자동 producer가 없는 v1.4.0 CLI가 background
+contract를 사용하는 producer embedding을 위한 값이며, 자동 producer가 없는 v1.5.0 CLI가 background
 schedule을 시작한다는 뜻이 아니다.
 
 ## 자주 쓰는 변경
