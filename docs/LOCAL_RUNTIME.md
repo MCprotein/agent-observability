@@ -83,10 +83,11 @@ otherwise `~/.codex/config.toml`, and manages only top-level `notify`, the local
 `otel.log_user_prompt=false`, and `otel.environment="local"`. Notify is exactly the canonical absolute installed executable path,
 `codex-notify`, and absolute runtime root. The exporter contains only the configured local `/v1/logs` endpoint,
 JSON protocol and private token header. The endpoint port is an OS-assigned available loopback port persisted in
-private collector settings. If that port is occupied after restart, the collector rotates only to another
-OS-assigned loopback port; the next explicit `connect codex` reloads the persisted endpoint and crash-safely
-rotates the values it already owns. `status` reports the stale owned endpoint as a conflict until convergence.
-Connect refuses pre-existing unmanaged values unless they match exactly.
+private collector settings. If that port is occupied after restart, autonomous collector startup fails closed
+without changing settings. The next explicit `connect codex` verifies the unavailable owned endpoint, rotates
+only the persisted port to another OS-assigned loopback port, and crash-safely reconnects the LaunchAgent.
+`status` reports the unavailable owned endpoint as degraded until that explicit recovery succeeds.
+Connect refuses conflicting pre-existing managed values unless they match exactly.
 Before changing the file, it stores the exact prior and connected bytes, hashes, existence, permission modes
 and transaction phase in `runtime/integrations/codex/codex-config-ownership-v1.json` with private permissions.
 A private mutation lock, exact-state comparison, temp-file fsync and atomic rename preserve supported concurrent
@@ -94,9 +95,10 @@ edits without ever displacing the canonical file. Prepared and restoring snapsho
 the next lifecycle command after a process crash.
 
 `status codex [root]` reports config ownership and authenticated collector health. `disconnect codex [root]`
-first confirms that the LaunchAgent stopped and its plist was removed. It then restores the exact prior bytes
-and mode, or removes the config if connect created it, only while the complete current bytes and mode equal the
-recorded connected state. Any intervening edit fails closed and is preserved. SQLite, JSONL and HTML data remain.
+first restores the exact pre-connect LaunchAgent plist and loaded state; it stops and removes only a service
+created by connect. It then restores the exact prior config bytes and mode, or removes the config if connect
+created it, only while the complete current bytes and mode equal the recorded connected state. Any intervening
+edit fails closed and is preserved. SQLite, JSONL and HTML data remain.
 
 The raw OTLP and notify request can exist transiently in bounded process memory while JSON is decoded. Only
 explicitly allowlisted scalar identifiers, model/tool categories, decisions, timing, token counts and success
@@ -295,11 +297,14 @@ idle/active CPU, RSS, allocated disk and loopback-only network behavior against
 separate from the older internal-ingress benchmark.
 
 smoke is non-normative and deletes its temporary output. release writes sanitized evidence under
-docs/evidence/local/performance/, and exits nonzero for missing or breached latency, CPU, RSS,
-disk, network, or queue-admission evidence. Enabled runs permit at most 1% explicit fail-open
-rejections and, after graceful fixture shutdown, must reconcile every enqueued event with one durable
-observation. Foreground enqueue does not itself imply durability. Both profiles
-delete measured durable stores after validation; release retains only the sanitized manifest. A
+docs/evidence/local/performance/ and exits nonzero when required evidence is missing or a budget is breached.
+For `perf local`, enabled runs permit at most 1% explicit fail-open rejection and must reconcile every enqueued
+event with one durable observation after graceful fixture shutdown; foreground enqueue does not itself imply
+durability. For `perf automatic`, every foreground notify must be accepted and each run independently enforces
+the response-latency, collector CPU/RSS, allocated-disk and loopback-only network rules in the automatic
+protocol. Its isolated lifecycle preflight also sends an authenticated Codex OTLP request through the installed
+LaunchAgent collector and requires a durable report record; notify remains a separately verified supplement.
+Both profiles delete measured durable stores after validation; release retains only the sanitized manifest. A
 release run also requires a clean worktree and records the full source commit SHA. A retained failed
 release manifest therefore has to be reviewed and committed before another release-profile attempt;
 smoke remains available while the diagnostic commit is being prepared.

@@ -91,8 +91,9 @@ agentobs status codex
 agentobs disconnect codex
 ```
 
-`disconnect`는 LaunchAgent 종료를 먼저 확인하고 Codex 설정을 연결 전의 정확한 bytes와 permission으로
-복원한다. 기존 설정이 없었다면 생성했던 설정 파일을 제거한다. 연결 뒤 어떤 설정이든 바뀌어 현재
+`disconnect`는 collector service를 연결 전의 정확한 plist와 loaded 상태로 되돌린 뒤 Codex 설정을
+연결 전의 정확한 bytes와 permission으로 복원한다. connect가 새로 만든 service/config만 종료하고
+제거한다. 연결 뒤 어떤 설정이든 바뀌어 현재
 전체 bytes 또는 mode가 기록된 connected state와 다르면 편집을 덮어쓰지 않고 중단한다. 이미 수집된
 local data는 유지된다.
 

@@ -135,8 +135,8 @@ serialized compare/replace transaction으로 교체한다. 중간 crash는 snaps
 Disconnect는 현재 config의 전체 bytes와 mode가 snapshot의 exact connected state와 같을 때만 prior
 bytes와 mode를 복원한다. 연결 전 config가 없었다면 생성한 file을 제거한다. User 또는 다른 tool이
 managed value가 아닌 설정만 바꾼 경우에도 conflict로 중단하고 그 편집을 보존한다. Successful
-disconnect는 LaunchAgent 종료와 plist 제거를 먼저 확인한 뒤 config를 복원하며 local observation,
-SQLite와 dashboard는 보존한다.
+disconnect는 연결 전 LaunchAgent plist와 loaded 상태를 먼저 복원한다. Connect가 새로 만든 service만
+종료·제거하며, 그 뒤 config를 복원한다. Local observation, SQLite와 dashboard는 보존한다.
 
 ## 자주 쓰는 변경
 
