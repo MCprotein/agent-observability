@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
-use agent_observability_local_runtime::{LocalRuntimeConfigV2, Singleton, install, load, save};
+use agent_observability_local_runtime::{
+    ConfigError, InstalledLayout, LocalRuntimeConfigV2, Singleton, SingletonError, load,
+    revision as runtime_revision, save_if_revision,
+};
 use axum::{
     Json, Router,
     body::Body,
@@ -12,7 +15,6 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -23,6 +25,7 @@ use tokio::{net::TcpListener, sync::Notify};
 const SESSION_HEADER: &str = "x-agent-observability-session";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_mins(10);
+const MAX_SESSION_LIFETIME: Duration = Duration::from_hours(1);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const SETTINGS_SHELL: &str = include_str!("generated/settings-shell.html");
 const SETTINGS_SCRIPT: &str = include_str!("generated/settings-ui.js");
@@ -60,7 +63,7 @@ pub struct PreparedUi {
     url: String,
     shutdown: Arc<Notify>,
     last_seen: Arc<Mutex<Instant>>,
-    _singleton: Singleton,
+    _ui_singleton: Singleton,
 }
 
 impl PreparedUi {
@@ -81,6 +84,7 @@ impl PreparedUi {
 #[derive(Clone, Debug)]
 struct AppState {
     config_path: PathBuf,
+    runtime_path: PathBuf,
     host: String,
     origin: String,
     token: String,
@@ -147,10 +151,9 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub async fn prepare(root: &Path) -> Result<PreparedUi, UiError> {
-    let layout = install(root).map_err(|error| UiError::Runtime(error.to_string()))?;
-    let singleton =
-        Singleton::acquire(&layout.runtime).map_err(|error| UiError::Runtime(error.to_string()))?;
+pub async fn prepare(layout: &InstalledLayout) -> Result<PreparedUi, UiError> {
+    let ui_singleton = Singleton::acquire(&layout.runtime.join("settings-ui"))
+        .map_err(|error| UiError::Runtime(error.to_string()))?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let address = listener.local_addr()?;
     let host = address.to_string();
@@ -159,7 +162,8 @@ pub async fn prepare(root: &Path) -> Result<PreparedUi, UiError> {
     let shutdown = Arc::new(Notify::new());
     let last_seen = Arc::new(Mutex::new(Instant::now()));
     let state = AppState {
-        config_path: layout.config,
+        config_path: layout.config.clone(),
+        runtime_path: layout.runtime.clone(),
         host,
         origin: origin.clone(),
         token: token.clone(),
@@ -174,7 +178,7 @@ pub async fn prepare(root: &Path) -> Result<PreparedUi, UiError> {
         url: format!("{origin}/#session={token}"),
         shutdown,
         last_seen,
-        _singleton: singleton,
+        _ui_singleton: ui_singleton,
     })
 }
 
@@ -238,14 +242,6 @@ async fn put_config(
     let Json(update) = Json::<UpdateRequest>::from_request(request, &state)
         .await
         .map_err(|error| map_json_rejection(&error))?;
-    let current = load_config(&state.config_path)?;
-    if revision(&current)? != update.revision {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "config_conflict",
-            "설정 파일이 다른 프로세스에서 변경되었습니다. 최신 값을 다시 불러오세요.",
-        ));
-    }
     update.config.validate().map_err(|error| {
         ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -253,12 +249,32 @@ async fn put_config(
             error.to_string(),
         )
     })?;
-    save(&state.config_path, &update.config).map_err(|error| {
-        ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "save_failed",
+    let _runtime = Singleton::acquire(&state.runtime_path).map_err(|error| match error {
+        SingletonError::AlreadyRunning => ApiError::new(
+            StatusCode::CONFLICT,
+            "runtime_busy",
+            "다른 로컬 작업이 실행 중입니다. 잠시 후 다시 저장하세요.",
+        ),
+        _ => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime_lock_failed",
             error.to_string(),
-        )
+        ),
+    })?;
+    save_if_revision(&state.config_path, &update.revision, &update.config).map_err(|error| {
+        if matches!(error, ConfigError::Conflict) {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "config_conflict",
+                "설정 파일이 다른 프로세스에서 변경되었습니다. 최신 값을 다시 불러오세요.",
+            )
+        } else {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "save_failed",
+                error.to_string(),
+            )
+        }
     })?;
     envelope(&state.config_path).map(Json)
 }
@@ -361,12 +377,22 @@ fn authorize(state: &AppState, headers: &HeaderMap, mutation: bool) -> Result<()
 
 fn envelope(path: &Path) -> Result<ConfigEnvelope, ApiError> {
     let config = load_config(path)?;
-    let revision = revision(&config)?;
+    let revision = config_revision(&config)?;
     Ok(ConfigEnvelope {
         config,
         defaults: LocalRuntimeConfigV2::default(),
         revision,
         collection_mode: "manual_import",
+    })
+}
+
+fn config_revision(config: &LocalRuntimeConfigV2) -> Result<String, ApiError> {
+    runtime_revision(config).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "revision_failed",
+            error.to_string(),
+        )
     })
 }
 
@@ -378,18 +404,6 @@ fn load_config(path: &Path) -> Result<LocalRuntimeConfigV2, ApiError> {
             error.to_string(),
         )
     })
-}
-
-fn revision(config: &LocalRuntimeConfigV2) -> Result<String, ApiError> {
-    let body = serde_json::to_vec(config).map_err(|error| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "revision_failed",
-            error.to_string(),
-        )
-    })?;
-    let digest = Sha256::digest(body);
-    Ok(hex(&digest))
 }
 
 fn session_token() -> Result<String, UiError> {
@@ -441,18 +455,20 @@ fn map_json_rejection(error: &JsonRejection) -> ApiError {
 }
 
 async fn shutdown_signal(shutdown: Arc<Notify>, last_seen: Arc<Mutex<Instant>>) {
+    let started_at = Instant::now();
     tokio::select! {
         () = shutdown.notified() => {}
-        () = idle_expiry(last_seen) => {}
+        () = idle_expiry(last_seen, started_at) => {}
     }
 }
 
-async fn idle_expiry(last_seen: Arc<Mutex<Instant>>) {
+async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
     loop {
         tokio::time::sleep(IDLE_POLL_INTERVAL).await;
-        let expired = last_seen
-            .lock()
-            .map_or(true, |instant| instant.elapsed() >= IDLE_TIMEOUT);
+        let expired = started_at.elapsed() >= MAX_SESSION_LIFETIME
+            || last_seen
+                .lock()
+                .map_or(true, |instant| instant.elapsed() >= IDLE_TIMEOUT);
         if expired {
             return;
         }
@@ -461,8 +477,8 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, constant_time_equal, revision, router, session_token};
-    use agent_observability_local_runtime::{LocalRuntimeConfigV2, install};
+    use super::{AppState, constant_time_equal, router, session_token};
+    use agent_observability_local_runtime::{LocalRuntimeConfigV2, install, revision};
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
@@ -513,6 +529,7 @@ mod tests {
                 let layout = install(&root).unwrap();
                 let state = AppState {
                     config_path: layout.config,
+                    runtime_path: layout.runtime,
                     host: "127.0.0.1:43191".into(),
                     origin: "http://127.0.0.1:43191".into(),
                     token: "test-session".into(),

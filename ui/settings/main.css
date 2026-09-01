@@ -45,6 +45,8 @@ input:focus-visible {
   outline-offset: 2px;
 }
 
+#save-title:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+
 svg { width: 18px; height: 18px; flex: 0 0 auto; }
 
 .topbar {
@@ -420,6 +422,8 @@ h3 { margin-bottom: 4px; font-size: 14px; line-height: 20px; }
 .button.primary:hover:not(:disabled) { background: #0b635d; }
 .button.secondary { border-color: var(--line-strong); background: var(--surface); color: var(--text); }
 .button.ghost { background: transparent; color: var(--muted); }
+.button.danger { border-color: var(--error); background: var(--error); color: white; }
+.button.danger:hover:not(:disabled) { background: #8f1c14; }
 .button:hover:not(:disabled) { border-color: var(--line-strong); }
 .button:disabled { cursor: not-allowed; opacity: 0.45; }
 
@@ -490,6 +494,7 @@ dialog::backdrop { background: rgb(24 32 38 / 45%); }
   .section-nav .nav-note { display: none; }
   .section-nav a { flex: 0 0 auto; min-height: 38px; }
   .section-grid { grid-template-columns: 1fr; }
+  .settings-section { scroll-margin-top: 124px; }
   .policy-visual { padding: 20px 0 0; border-top: 1px solid var(--line); border-left: 0; }
   .visual-stack .policy-visual:first-child { padding-top: 20px; }
 }
@@ -510,8 +515,8 @@ dialog::backdrop { background: rgb(24 32 38 / 45%); }
   .summary-item:nth-child(-n + 2) { border-bottom: 1px solid var(--line); }
   .field-grid { grid-template-columns: 1fr; }
   .field-grid.single { grid-template-columns: 1fr; }
-  .number-control { min-height: 44px; }
-  .number-control input { height: 42px; }
+  .number-control { min-height: 46px; }
+  .number-control input { height: 44px; }
   .save-band { align-items: stretch; flex-direction: column; gap: 8px; min-height: 118px; padding: 10px 16px; }
   .save-actions { display: grid; grid-template-columns: repeat(3, 1fr); }
   .button { min-height: 44px; padding: 0 10px; }

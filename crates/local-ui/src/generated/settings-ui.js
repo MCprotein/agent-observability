@@ -745,7 +745,7 @@
       description: "\uD558\uB098\uC758 private archive\uC5D0 \uB2F4\uC744 \uCD5C\uB300 \uB808\uCF54\uB4DC \uC218",
       min: 1,
       max: 1e5,
-      step: 100,
+      step: 1,
       unit: "records",
       format: (value) => `${formatNumber(value)}\uAC1C`
     },
@@ -772,6 +772,13 @@
   var busy = false;
   var conflicted = false;
   var heartbeatTimer;
+  var navigationObserver;
+  var lastUserActivity = Date.now();
+  for (const eventName of ["pointerdown", "keydown", "input", "scroll"]) {
+    document.addEventListener(eventName, () => {
+      lastUserActivity = Date.now();
+    }, { passive: true });
+  }
   void bootstrap();
   async function bootstrap() {
     renderLoading();
@@ -815,7 +822,7 @@
   </main>`;
     mountIcons();
   }
-  function renderSettings() {
+  function renderSettings(focusTarget) {
     if (!draft) return;
     app.innerHTML = `<div class="app-shell">
     <header class="topbar">
@@ -828,7 +835,7 @@
     <div class="workspace">
       <nav class="section-nav" aria-label="\uC124\uC815 \uC601\uC5ED">
         <p class="nav-label">\uC124\uC815</p>
-        <a href="#overview" class="active"><i data-lucide="gauge"></i>\uAC1C\uC694</a>
+        <a href="#overview" class="active" aria-current="page"><i data-lucide="gauge"></i>\uAC1C\uC694</a>
         <a href="#collection"><i data-lucide="activity"></i>\uC218\uC9D1</a>
         <a href="#storage"><i data-lucide="database"></i>\uC800\uC7A5\uC18C</a>
         <a href="#retention"><i data-lucide="archive"></i>\uBCF4\uAD00</a>
@@ -844,7 +851,7 @@
       </main>
     </div>
     <div class="save-band" id="save-band">
-      <div class="save-state"><span class="state-dot"></span><strong id="save-title">\uC800\uC7A5\uB428</strong><span id="save-detail">\uD604\uC7AC \uC124\uC815\uACFC \uAC19\uC2B5\uB2C8\uB2E4.</span></div>
+      <div class="save-state"><span class="state-dot"></span><strong id="save-title" tabindex="-1">\uC800\uC7A5\uB428</strong><span id="save-detail">\uD604\uC7AC \uC124\uC815\uACFC \uAC19\uC2B5\uB2C8\uB2E4.</span></div>
       <div class="save-actions">
         <button class="button ghost" id="discard" type="button" disabled>\uBCC0\uACBD \uCDE8\uC18C</button>
         <button class="button secondary" id="reset" type="button"><i data-lucide="rotate-ccw"></i>\uAE30\uBCF8\uAC12</button>
@@ -856,11 +863,18 @@
       <div class="dialog-heading"><i data-lucide="rotate-ccw"></i><div><h2 id="reset-title">\uAE30\uBCF8\uAC12\uC73C\uB85C \uBCF5\uC6D0</h2><p>\uC218\uC9D1, \uC800\uC7A5\uC18C, \uBCF4\uAD00 \uC815\uCC45\uC758 \uD3B8\uC9D1\uAC12\uC744 \uCD08\uAE30\uAC12\uC73C\uB85C \uBC14\uAFC9\uB2C8\uB2E4.</p></div></div>
       <div class="dialog-actions"><button class="button ghost" id="cancel-reset" type="button">\uCDE8\uC18C</button><button class="button primary" id="confirm-reset" type="button">\uD3B8\uC9D1\uAC12 \uBCF5\uC6D0</button></div>
     </dialog>
+    <dialog id="close-dialog" aria-labelledby="close-title">
+      <div class="dialog-heading"><i data-lucide="x-circle"></i><div><h2 id="close-title">\uC800\uC7A5\uD558\uC9C0 \uC54A\uC740 \uBCC0\uACBD \uB2EB\uAE30</h2><p>\uD604\uC7AC \uD3B8\uC9D1\uAC12\uC740 \uC800\uC7A5\uB418\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4. \uC124\uC815 \uC138\uC158\uC744 \uC885\uB8CC\uD558\uBA74 \uBCC0\uACBD\uC744 \uC783\uC2B5\uB2C8\uB2E4.</p></div></div>
+      <div class="dialog-actions"><button class="button ghost" id="cancel-close" type="button">\uACC4\uC18D \uD3B8\uC9D1</button><button class="button danger" id="confirm-close" type="button">\uBCC0\uACBD \uBC84\uB9AC\uACE0 \uB2EB\uAE30</button></div>
+    </dialog>
   </div>`;
     bindEvents();
     updateAllVisuals();
     updateDirtyState();
     mountIcons();
+    if (focusTarget) {
+      requestAnimationFrame(() => document.querySelector(`#${focusTarget}`)?.focus());
+    }
   }
   function overviewSection(config) {
     const storage = fields["collection.local_storage_budget_bytes"].format(
@@ -902,7 +916,7 @@
         <div class="visual-stack">
           ${singleRuler("batch-records-visual", "\uBC30\uCE58 \uB808\uCF54\uB4DC \uC0C1\uD55C", fields["collection.max_batch_records"], "1", "500")}
           ${singleRuler("batch-bytes-visual", "\uBC30\uCE58 \uD06C\uAE30 \uC0C1\uD55C", fields["collection.max_batch_bytes"], "16 KiB", "2 MiB")}
-          ${dualTimeline("heartbeat-visual", "Heartbeat \uAC04\uACA9", "\uD65C\uC131", fields["collection.active_heartbeat_interval_ms"], "\uC720\uD734", fields["collection.idle_heartbeat_interval_ms"], "30\uCD08", "15\uBD84", true)}
+          ${dualTimeline("heartbeat-visual", "Heartbeat \uAC04\uACA9", "\uD65C\uC131", fields["collection.active_heartbeat_interval_ms"], "\uC720\uD734", fields["collection.idle_heartbeat_interval_ms"], "30\uCD08", "15\uBD84", true, 3e4, 9e5)}
         </div>
       </div>
     </div>
@@ -943,7 +957,7 @@
     return `<div class="field" data-field="${field.path}">
     <label for="${id}">${field.label}<span class="changed-label" aria-hidden="true">\uBCC0\uACBD\uB428</span></label>
     <p id="${id}-help">${field.description}</p>
-    <div class="number-control"><input id="${id}" name="${field.path}" data-path="${field.path}" type="number" value="${value}" min="${field.min}" max="${field.max}" step="${field.step}" inputmode="numeric" aria-describedby="${id}-help ${id}-readout"><span>${field.unit}</span></div>
+    <div class="number-control"><input id="${id}" name="${field.path}" data-path="${field.path}" type="number" value="${value}" min="${field.min}" max="${field.max}" step="${field.step}" inputmode="numeric" required aria-describedby="${id}-help ${id}-readout"><span>${field.unit}</span></div>
     <output id="${id}-readout" for="${id}">${field.format(value)}</output>
     <span class="field-error" id="${id}-error"></span>
   </div>`;
@@ -956,8 +970,9 @@
     <p>${caption}</p>
   </figure>`;
   }
-  function dualTimeline(id, title, firstLabel, first, secondLabel, second, min, max, logarithmic = false) {
-    return `<figure class="policy-visual timeline" id="${id}" data-log="${logarithmic}">
+  function dualTimeline(id, title, firstLabel, first, secondLabel, second, min, max, logarithmic = false, sharedMin, sharedMax) {
+    const sharedScale = sharedMin === void 0 || sharedMax === void 0 ? "" : ` data-min="${sharedMin}" data-max="${sharedMax}"`;
+    return `<figure class="policy-visual timeline" id="${id}" data-log="${logarithmic}"${sharedScale}>
     <figcaption><span>${title}</span><strong data-dual-value></strong></figcaption>
     <div class="timeline-track" aria-hidden="true">
       <span class="timeline-marker first" data-marker data-path="${first.path}"><b>${firstLabel}</b></span>
@@ -979,13 +994,23 @@
     document.querySelector("#reset")?.addEventListener("click", openResetDialog);
     document.querySelector("#cancel-reset")?.addEventListener("click", closeResetDialog);
     document.querySelector("#confirm-reset")?.addEventListener("click", resetDefaults);
-    document.querySelector("#close-session")?.addEventListener("click", () => void closeSession());
+    document.querySelector("#close-session")?.addEventListener("click", requestCloseSession);
+    document.querySelector("#cancel-close")?.addEventListener("click", closeCloseDialog);
+    document.querySelector("#confirm-close")?.addEventListener("click", () => void closeSession());
     document.querySelectorAll(".section-nav a").forEach((link) => {
       link.addEventListener("click", () => {
-        document.querySelectorAll(".section-nav a").forEach((item) => item.classList.remove("active"));
-        link.classList.add("active");
+        setActiveNavigation(link.hash);
       });
     });
+    navigationObserver?.disconnect();
+    navigationObserver = new IntersectionObserver(
+      (entries) => {
+        const visible = entries.find((entry) => entry.isIntersecting);
+        if (visible) setActiveNavigation(`#${visible.target.id}`);
+      },
+      { rootMargin: "-32% 0px -60% 0px", threshold: 0 }
+    );
+    document.querySelectorAll(".settings-section").forEach((section) => navigationObserver?.observe(section));
   }
   function handleInput(event) {
     const input = event.target;
@@ -1020,7 +1045,9 @@
       const path = marker.dataset.path ?? owner?.dataset.path;
       if (!path) return;
       const field = fields[path];
-      marker.style.left = `${position(getValue(draft, path), field.min, field.max, owner?.dataset.log === "true")}%`;
+      const minimum = Number(owner?.dataset.min ?? field.min);
+      const maximum = Number(owner?.dataset.max ?? field.max);
+      marker.style.left = `${position(getValue(draft, path), minimum, maximum, owner?.dataset.log === "true")}%`;
     });
     document.querySelectorAll("[data-dual-value]").forEach((output) => {
       const visual = output.closest(".policy-visual");
@@ -1066,6 +1093,12 @@
   async function saveDraft() {
     if (!draft || busy || conflicted) return;
     clearErrors();
+    const form = document.querySelector("#settings-form");
+    if (form && !form.checkValidity()) {
+      form.reportValidity();
+      showToast("\uBE44\uC5B4 \uC788\uAC70\uB098 \uD5C8\uC6A9 \uBC94\uC704\uB97C \uBC97\uC5B4\uB09C \uAC12\uC744 \uD655\uC778\uD558\uC138\uC694.", "error");
+      return;
+    }
     if (!validate_local_runtime_config_v2_default(draft)) {
       const errors = validate_local_runtime_config_v2_default.errors ?? [];
       for (const error of errors) {
@@ -1085,7 +1118,7 @@
         body: JSON.stringify({ config: draft, revision })
       });
       applyEnvelope(envelope);
-      renderSettings();
+      renderSettings("save-title");
       showToast("\uC124\uC815\uC744 \uC800\uC7A5\uD588\uC2B5\uB2C8\uB2E4.", "success");
     } catch (error) {
       const apiError = error;
@@ -1117,13 +1150,13 @@
     for (const path of changed) setValue(draft, path, getValue(localDraft, path));
     if (enabledChanged) draft.enabled = localDraft.enabled;
     conflicted = false;
-    renderSettings();
+    renderSettings("save-title");
   }
   function discardChanges() {
     if (!persisted) return;
     draft = structuredClone(persisted);
     conflicted = false;
-    renderSettings();
+    renderSettings("save-title");
     showToast("\uC800\uC7A5\uD558\uC9C0 \uC54A\uC740 \uBCC0\uACBD\uC744 \uCDE8\uC18C\uD588\uC2B5\uB2C8\uB2E4.", "neutral");
   }
   function openResetDialog() {
@@ -1137,7 +1170,7 @@
     if (!defaults) return;
     draft = structuredClone(defaults);
     closeResetDialog();
-    renderSettings();
+    renderSettings("reset");
     showToast("\uAE30\uBCF8\uAC12\uC744 \uD3B8\uC9D1\uAC12\uC5D0 \uC801\uC6A9\uD588\uC2B5\uB2C8\uB2E4. \uC800\uC7A5\uD574\uC57C \uBC18\uC601\uB429\uB2C8\uB2E4.", "neutral");
   }
   async function closeSession() {
@@ -1149,7 +1182,19 @@
     token = "";
     renderExpired();
   }
+  function requestCloseSession() {
+    if (isDirty()) {
+      document.querySelector("#close-dialog")?.showModal();
+    } else {
+      void closeSession();
+    }
+  }
+  function closeCloseDialog() {
+    document.querySelector("#close-dialog")?.close();
+    document.querySelector("#close-session")?.focus();
+  }
   async function heartbeat() {
+    if (Date.now() - lastUserActivity >= 6e4) return;
     try {
       await api("/api/heartbeat", { method: "POST" });
     } catch {
@@ -1157,6 +1202,19 @@
       token = "";
       renderExpired();
     }
+  }
+  function setActiveNavigation(hash) {
+    document.querySelectorAll(".section-nav a").forEach((item) => {
+      const active = item.hash === hash;
+      item.classList.toggle("active", active);
+      if (active) item.setAttribute("aria-current", "page");
+      else item.removeAttribute("aria-current");
+    });
+  }
+  function isDirty() {
+    return Boolean(
+      draft && persisted && (draft.enabled !== persisted.enabled || changedPaths(draft, persisted).length > 0)
+    );
   }
   async function api(path, init = {}) {
     const headers = new Headers(init.headers);

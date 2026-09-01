@@ -155,12 +155,13 @@ fn run_ui_command(arguments: &[String]) -> Option<Result<(), String>> {
 }
 
 fn settings_ui(root: &Path, open: bool) -> Result<(), String> {
+    let layout = install(root).map_err(|error| error.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| format!("settings runtime failed: {error}"))?;
     runtime.block_on(async {
-        let ui = agent_observability_local_ui::prepare(root)
+        let ui = agent_observability_local_ui::prepare(&layout)
             .await
             .map_err(|error| error.to_string())?;
         announce_settings_ui(&ui, open)?;
@@ -169,16 +170,25 @@ fn settings_ui(root: &Path, open: bool) -> Result<(), String> {
 }
 
 fn announce_settings_ui(ui: &PreparedUi, open: bool) -> Result<(), String> {
-    println!(
-        "status=settings_ready\nurl={}\nopened={open}\ncollection=manual_import",
-        ui.url()
-    );
+    let opened = if open {
+        match open_settings_url(ui.url()) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("{error}");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    println!("status=settings_ready");
+    if !opened {
+        println!("url={}", ui.url());
+    }
+    println!("opened={opened}\ncollection=manual_import");
     std::io::stdout()
         .flush()
         .map_err(|error| format!("settings output failed: {error}"))?;
-    if open {
-        open_settings_url(ui.url())?;
-    }
     Ok(())
 }
 

@@ -45,7 +45,8 @@ agent-observability ui
 
 수집 허용, 확인·반영 주기, batch, heartbeat, 저장 한도, 보관 기간과 archive 한도를 한 화면에서
 바꿀 수 있다. 설정할 때만 임의의 `127.0.0.1` port를 사용하며 browser tab의 session token,
-Host와 Origin을 모두 확인한다. 화면을 닫거나 10분 동안 연결이 끊기면 process가 종료된다.
+Host와 Origin을 모두 확인한다. 사용자가 1분 이상 화면을 조작하지 않으면 heartbeat를 멈추고,
+연결이 10분 동안 끊기거나 실행 후 1시간이 지나면 process가 종료된다.
 
 ### 4. 실제 runtime 준비
 
@@ -157,6 +158,8 @@ flowchart LR
 - SQLite가 로컬 권위 저장소이며 JSONL archive와 HTML은 다시 만들 수 있는 projection이다.
 - TypeScript UI는 원본 agent payload가 아니라 Rust가 검증한 report DTO만 받는다.
 - report는 endpoint 없이 `file://`로 열리고, 설정 endpoint는 `ui` process 수명 동안 loopback에만 존재한다.
+- 설정 화면은 별도 UI instance lock만 유지한다. 저장할 때만 runtime lock을 짧게 획득하므로 열린
+  화면이 ingest, report, CLI 설정 변경을 계속 막지 않으며 외부 변경은 revision conflict로 병합한다.
 - standalone 경로에는 login, collector, 외부 network request가 없다.
 
 상세 책임 경계는 [Architecture](docs/ARCHITECTURE.md), 전체 처리 순서는

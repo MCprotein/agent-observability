@@ -137,7 +137,7 @@ const fields: Record<FieldPath, Field> = {
     description: "하나의 private archive에 담을 최대 레코드 수",
     min: 1,
     max: 100_000,
-    step: 100,
+    step: 1,
     unit: "records",
     format: (value) => `${formatNumber(value)}개`,
   },
@@ -166,6 +166,14 @@ let revision = "";
 let busy = false;
 let conflicted = false;
 let heartbeatTimer: number | undefined;
+let navigationObserver: IntersectionObserver | undefined;
+let lastUserActivity = Date.now();
+
+for (const eventName of ["pointerdown", "keydown", "input", "scroll"]) {
+  document.addEventListener(eventName, () => {
+    lastUserActivity = Date.now();
+  }, { passive: true });
+}
 
 void bootstrap();
 
@@ -215,7 +223,7 @@ function renderExpired(): void {
   mountIcons();
 }
 
-function renderSettings(): void {
+function renderSettings(focusTarget?: string): void {
   if (!draft) return;
   app.innerHTML = `<div class="app-shell">
     <header class="topbar">
@@ -228,7 +236,7 @@ function renderSettings(): void {
     <div class="workspace">
       <nav class="section-nav" aria-label="설정 영역">
         <p class="nav-label">설정</p>
-        <a href="#overview" class="active"><i data-lucide="gauge"></i>개요</a>
+        <a href="#overview" class="active" aria-current="page"><i data-lucide="gauge"></i>개요</a>
         <a href="#collection"><i data-lucide="activity"></i>수집</a>
         <a href="#storage"><i data-lucide="database"></i>저장소</a>
         <a href="#retention"><i data-lucide="archive"></i>보관</a>
@@ -244,7 +252,7 @@ function renderSettings(): void {
       </main>
     </div>
     <div class="save-band" id="save-band">
-      <div class="save-state"><span class="state-dot"></span><strong id="save-title">저장됨</strong><span id="save-detail">현재 설정과 같습니다.</span></div>
+      <div class="save-state"><span class="state-dot"></span><strong id="save-title" tabindex="-1">저장됨</strong><span id="save-detail">현재 설정과 같습니다.</span></div>
       <div class="save-actions">
         <button class="button ghost" id="discard" type="button" disabled>변경 취소</button>
         <button class="button secondary" id="reset" type="button"><i data-lucide="rotate-ccw"></i>기본값</button>
@@ -256,11 +264,18 @@ function renderSettings(): void {
       <div class="dialog-heading"><i data-lucide="rotate-ccw"></i><div><h2 id="reset-title">기본값으로 복원</h2><p>수집, 저장소, 보관 정책의 편집값을 초기값으로 바꿉니다.</p></div></div>
       <div class="dialog-actions"><button class="button ghost" id="cancel-reset" type="button">취소</button><button class="button primary" id="confirm-reset" type="button">편집값 복원</button></div>
     </dialog>
+    <dialog id="close-dialog" aria-labelledby="close-title">
+      <div class="dialog-heading"><i data-lucide="x-circle"></i><div><h2 id="close-title">저장하지 않은 변경 닫기</h2><p>현재 편집값은 저장되지 않았습니다. 설정 세션을 종료하면 변경을 잃습니다.</p></div></div>
+      <div class="dialog-actions"><button class="button ghost" id="cancel-close" type="button">계속 편집</button><button class="button danger" id="confirm-close" type="button">변경 버리고 닫기</button></div>
+    </dialog>
   </div>`;
   bindEvents();
   updateAllVisuals();
   updateDirtyState();
   mountIcons();
+  if (focusTarget) {
+    requestAnimationFrame(() => document.querySelector<HTMLElement>(`#${focusTarget}`)?.focus());
+  }
 }
 
 function overviewSection(config: LocalRuntimeConfigV2): string {
@@ -304,7 +319,7 @@ function collectionSection(config: LocalRuntimeConfigV2): string {
         <div class="visual-stack">
           ${singleRuler("batch-records-visual", "배치 레코드 상한", fields["collection.max_batch_records"], "1", "500")}
           ${singleRuler("batch-bytes-visual", "배치 크기 상한", fields["collection.max_batch_bytes"], "16 KiB", "2 MiB")}
-          ${dualTimeline("heartbeat-visual", "Heartbeat 간격", "활성", fields["collection.active_heartbeat_interval_ms"], "유휴", fields["collection.idle_heartbeat_interval_ms"], "30초", "15분", true)}
+          ${dualTimeline("heartbeat-visual", "Heartbeat 간격", "활성", fields["collection.active_heartbeat_interval_ms"], "유휴", fields["collection.idle_heartbeat_interval_ms"], "30초", "15분", true, 30000, 900000)}
         </div>
       </div>
     </div>
@@ -350,7 +365,7 @@ function fieldControl(field: Field, config: LocalRuntimeConfigV2): string {
   return `<div class="field" data-field="${field.path}">
     <label for="${id}">${field.label}<span class="changed-label" aria-hidden="true">변경됨</span></label>
     <p id="${id}-help">${field.description}</p>
-    <div class="number-control"><input id="${id}" name="${field.path}" data-path="${field.path}" type="number" value="${value}" min="${field.min}" max="${field.max}" step="${field.step}" inputmode="numeric" aria-describedby="${id}-help ${id}-readout"><span>${field.unit}</span></div>
+    <div class="number-control"><input id="${id}" name="${field.path}" data-path="${field.path}" type="number" value="${value}" min="${field.min}" max="${field.max}" step="${field.step}" inputmode="numeric" required aria-describedby="${id}-help ${id}-readout"><span>${field.unit}</span></div>
     <output id="${id}-readout" for="${id}">${field.format(value)}</output>
     <span class="field-error" id="${id}-error"></span>
   </div>`;
@@ -365,8 +380,9 @@ function singleRuler(id: string, title: string, field: Field, min: string, max: 
   </figure>`;
 }
 
-function dualTimeline(id: string, title: string, firstLabel: string, first: Field, secondLabel: string, second: Field, min: string, max: string, logarithmic = false): string {
-  return `<figure class="policy-visual timeline" id="${id}" data-log="${logarithmic}">
+function dualTimeline(id: string, title: string, firstLabel: string, first: Field, secondLabel: string, second: Field, min: string, max: string, logarithmic = false, sharedMin?: number, sharedMax?: number): string {
+  const sharedScale = sharedMin === undefined || sharedMax === undefined ? "" : ` data-min="${sharedMin}" data-max="${sharedMax}"`;
+  return `<figure class="policy-visual timeline" id="${id}" data-log="${logarithmic}"${sharedScale}>
     <figcaption><span>${title}</span><strong data-dual-value></strong></figcaption>
     <div class="timeline-track" aria-hidden="true">
       <span class="timeline-marker first" data-marker data-path="${first.path}"><b>${firstLabel}</b></span>
@@ -389,13 +405,25 @@ function bindEvents(): void {
   document.querySelector("#reset")?.addEventListener("click", openResetDialog);
   document.querySelector("#cancel-reset")?.addEventListener("click", closeResetDialog);
   document.querySelector("#confirm-reset")?.addEventListener("click", resetDefaults);
-  document.querySelector("#close-session")?.addEventListener("click", () => void closeSession());
+  document.querySelector("#close-session")?.addEventListener("click", requestCloseSession);
+  document.querySelector("#cancel-close")?.addEventListener("click", closeCloseDialog);
+  document.querySelector("#confirm-close")?.addEventListener("click", () => void closeSession());
   document.querySelectorAll<HTMLAnchorElement>(".section-nav a").forEach((link) => {
     link.addEventListener("click", () => {
-      document.querySelectorAll(".section-nav a").forEach((item) => item.classList.remove("active"));
-      link.classList.add("active");
+      setActiveNavigation(link.hash);
     });
   });
+  navigationObserver?.disconnect();
+  navigationObserver = new IntersectionObserver(
+    (entries) => {
+      const visible = entries.find((entry) => entry.isIntersecting);
+      if (visible) setActiveNavigation(`#${visible.target.id}`);
+    },
+    { rootMargin: "-32% 0px -60% 0px", threshold: 0 },
+  );
+  document
+    .querySelectorAll(".settings-section")
+    .forEach((section) => navigationObserver?.observe(section));
 }
 
 function handleInput(event: Event): void {
@@ -433,7 +461,9 @@ function updateAllVisuals(): void {
     const path = (marker.dataset.path ?? owner?.dataset.path) as FieldPath | undefined;
     if (!path) return;
     const field = fields[path];
-    marker.style.left = `${position(getValue(draft!, path), field.min, field.max, owner?.dataset.log === "true")}%`;
+    const minimum = Number(owner?.dataset.min ?? field.min);
+    const maximum = Number(owner?.dataset.max ?? field.max);
+    marker.style.left = `${position(getValue(draft!, path), minimum, maximum, owner?.dataset.log === "true")}%`;
   });
   document.querySelectorAll<HTMLElement>("[data-dual-value]").forEach((output) => {
     const visual = output.closest<HTMLElement>(".policy-visual");
@@ -482,6 +512,12 @@ function updateDirtyState(): void {
 async function saveDraft(): Promise<void> {
   if (!draft || busy || conflicted) return;
   clearErrors();
+  const form = document.querySelector<HTMLFormElement>("#settings-form");
+  if (form && !form.checkValidity()) {
+    form.reportValidity();
+    showToast("비어 있거나 허용 범위를 벗어난 값을 확인하세요.", "error");
+    return;
+  }
   if (!validateConfig(draft)) {
     const errors = validateConfig.errors ?? [];
     for (const error of errors) {
@@ -501,7 +537,7 @@ async function saveDraft(): Promise<void> {
       body: JSON.stringify({ config: draft, revision }),
     });
     applyEnvelope(envelope);
-    renderSettings();
+    renderSettings("save-title");
     showToast("설정을 저장했습니다.", "success");
   } catch (error) {
     const apiError = error as Error & { code?: string };
@@ -534,14 +570,14 @@ async function rebaseDraftOnLatest(): Promise<void> {
   for (const path of changed) setValue(draft, path, getValue(localDraft, path));
   if (enabledChanged) draft.enabled = localDraft.enabled;
   conflicted = false;
-  renderSettings();
+  renderSettings("save-title");
 }
 
 function discardChanges(): void {
   if (!persisted) return;
   draft = structuredClone(persisted);
   conflicted = false;
-  renderSettings();
+  renderSettings("save-title");
   showToast("저장하지 않은 변경을 취소했습니다.", "neutral");
 }
 
@@ -558,7 +594,7 @@ function resetDefaults(): void {
   if (!defaults) return;
   draft = structuredClone(defaults);
   closeResetDialog();
-  renderSettings();
+  renderSettings("reset");
   showToast("기본값을 편집값에 적용했습니다. 저장해야 반영됩니다.", "neutral");
 }
 
@@ -573,7 +609,21 @@ async function closeSession(): Promise<void> {
   renderExpired();
 }
 
+function requestCloseSession(): void {
+  if (isDirty()) {
+    document.querySelector<HTMLDialogElement>("#close-dialog")?.showModal();
+  } else {
+    void closeSession();
+  }
+}
+
+function closeCloseDialog(): void {
+  document.querySelector<HTMLDialogElement>("#close-dialog")?.close();
+  document.querySelector<HTMLButtonElement>("#close-session")?.focus();
+}
+
 async function heartbeat(): Promise<void> {
+  if (Date.now() - lastUserActivity >= 60_000) return;
   try {
     await api<void>("/api/heartbeat", { method: "POST" });
   } catch {
@@ -581,6 +631,22 @@ async function heartbeat(): Promise<void> {
     token = "";
     renderExpired();
   }
+}
+
+function setActiveNavigation(hash: string): void {
+  document.querySelectorAll<HTMLAnchorElement>(".section-nav a").forEach((item) => {
+    const active = item.hash === hash;
+    item.classList.toggle("active", active);
+    if (active) item.setAttribute("aria-current", "page");
+    else item.removeAttribute("aria-current");
+  });
+}
+
+function isDirty(): boolean {
+  return Boolean(
+    draft && persisted &&
+      (draft.enabled !== persisted.enabled || changedPaths(draft, persisted).length > 0),
+  );
 }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {

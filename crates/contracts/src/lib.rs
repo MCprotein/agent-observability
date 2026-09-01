@@ -1525,6 +1525,10 @@ impl ContractManifest {
             "local_runtime_config_schema",
             "contracts/local-runtime-config-v2.schema.json",
         )?;
+        self.expect(
+            "local_runtime_config_fixture",
+            "contracts/local-runtime-config-v2.fixture.json",
+        )?;
         self.expect("team_ingest", "disabled")?;
         Ok(())
     }
@@ -1614,8 +1618,8 @@ impl Error for ContractError {}
 mod tests {
     use super::{
         ADAPTER_CAPABILITY_V1, AdapterCapabilityManifestV1, CONTRACT_MANIFEST, ContractManifest,
-        DURABLE_RECORD_SCHEMA, RATE_TABLE_SCHEMA, REPORT_DTO_SCHEMA, RETENTION_ARCHIVE_SCHEMA,
-        redact_sensitive_text,
+        DURABLE_RECORD_SCHEMA, LOCAL_RUNTIME_CONFIG_SCHEMA, RATE_TABLE_SCHEMA, REPORT_DTO_SCHEMA,
+        RETENTION_ARCHIVE_SCHEMA, redact_sensitive_text,
     };
 
     #[test]
@@ -1629,6 +1633,7 @@ mod tests {
             REPORT_DTO_SCHEMA,
             RATE_TABLE_SCHEMA,
             RETENTION_ARCHIVE_SCHEMA,
+            LOCAL_RUNTIME_CONFIG_SCHEMA,
         ] {
             assert!(schema.contains("\"additionalProperties\": false"));
         }

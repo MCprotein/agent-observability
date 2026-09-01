@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { access, chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { access, chmod, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { promisify } from "node:util";
 import { chromium } from "playwright-core";
+
+const execute = promisify(execFile);
 
 const executablePath = chromium.executablePath();
 await access(executablePath).catch(() => {
@@ -74,14 +77,26 @@ try {
       assert.equal(await page.locator("#save").isEnabled(), true);
       assert.match(await page.locator("#batch-records-visual [data-visual-value]").textContent(), /125/);
       await page.locator("#save").click();
-      await page.locator("#toast").filter({ hasText: "설정을 저장했습니다" }).waitFor();
+      await page.locator("#toast.visible").waitFor();
+      assert.match(await page.locator("#toast").textContent(), /설정을 저장했습니다/);
       assert.equal(await page.locator("#save").isDisabled(), true);
+      await page.waitForFunction(() => document.activeElement?.id === "save-title");
       const configPath = join(runtimeRoot, "config.json");
       const config = JSON.parse(await readFile(configPath, "utf8"));
       assert.equal(config.collection.max_batch_records, 125);
-      config.retention.max_record_age_days = 45;
-      await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+      await page.locator("#collection-max_batch_records").fill("");
       await page.locator("#collection-flush_interval_ms").fill("6000");
+      await page.locator("#save").click();
+      await page.locator("#toast").filter({ hasText: "비어 있거나 허용 범위" }).waitFor();
+      assert.equal(await page.evaluate(() => document.activeElement?.id), "collection-max_batch_records");
+      assert.equal(
+        JSON.parse(await readFile(configPath, "utf8")).collection.flush_interval_ms,
+        5000,
+      );
+      await page.locator("#collection-max_batch_records").fill("125");
+      await execute(binary, ["config", "set", runtimeRoot, "retention-days", "45"], {
+        timeout: 10_000,
+      });
       await page.locator("#save").click();
       await page
         .locator("#toast")
@@ -97,17 +112,34 @@ try {
       assert.equal(rebased.collection.flush_interval_ms, 6000);
       await page.locator("#reset").click();
       assert.equal(await page.locator("#reset-dialog").getAttribute("open"), "");
-      await page.locator("#cancel-reset").click();
+      await page.locator("#confirm-reset").click();
+      await page.locator("#reset").waitFor();
+      await page.waitForFunction(() => document.activeElement?.id === "reset");
+      assert.equal(await page.locator("#save").isEnabled(), true);
+      await page.locator("#discard").click();
     } else {
       const controlHeights = await page
-        .locator("button, .section-nav a, .number-control")
+        .locator("button, .section-nav a, input[type=number]")
         .evaluateAll((elements) =>
           elements
             .map((element) => element.getBoundingClientRect().height)
             .filter((height) => height > 0),
         );
-      assert.equal(controlHeights.every((height) => height >= 40), true);
+      assert.equal(controlHeights.every((height) => height >= 44), true);
       assert.equal(await page.locator("#collection-max_batch_records").inputValue(), "125");
+      await page.locator('.section-nav a[href="#storage"]').click();
+      await page.waitForTimeout(150);
+      const anchorPosition = await page.evaluate(() => ({
+        heading: document.querySelector("#storage-title")?.getBoundingClientRect().top ?? -1,
+        navigation: document.querySelector(".section-nav")?.getBoundingClientRect().bottom ?? -1,
+      }));
+      assert.equal(anchorPosition.heading >= anchorPosition.navigation, true);
+      await page.locator("#collection-active_heartbeat_interval_ms").fill("300000");
+      await page.locator("#collection-idle_heartbeat_interval_ms").fill("120000");
+      const heartbeatMarkers = await page.locator("#heartbeat-visual [data-marker]").evaluateAll(
+        (markers) => markers.map((marker) => Number.parseFloat(marker.style.left)),
+      );
+      assert.equal(heartbeatMarkers[0] > heartbeatMarkers[1], true);
     }
 
     const screenshotPath = join(screenshotDirectory, `settings-${testCase.name}.png`);
@@ -126,6 +158,11 @@ try {
     });
 
     if (testCase.name === "mobile") {
+      await page.locator("#close-session").click();
+      assert.equal(await page.locator("#close-dialog").getAttribute("open"), "");
+      await page.locator("#cancel-close").click();
+      assert.equal(await page.evaluate(() => document.activeElement?.id), "close-session");
+      await page.locator("#discard").click();
       await page.locator("#close-session").click();
       await page.locator("text=설정 세션이 종료되었습니다").waitFor();
     }

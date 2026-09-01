@@ -18,7 +18,9 @@ agent-observability ui /private/runtime --no-open
 
 UI는 `127.0.0.1`의 임의 port에만 bind하고 URL fragment의 session capability를 private header로
 옮긴다. API는 정확한 Host, Origin과 session을 확인하며 CORS를 허용하지 않는다. 설정 화면은
-외부 request를 만들지 않고, 화면 연결이 10분 동안 끊기면 종료된다. 정적 report에는 영향을 주지 않는다.
+외부 request를 만들지 않는다. 사용자가 1분 이상 화면을 조작하지 않으면 browser heartbeat를
+멈추며, 화면 연결이 10분 동안 끊기거나 process 실행 후 1시간이 지나면 종료된다. 정적 report에는
+영향을 주지 않는다.
 
 자동화와 headless 환경에서는 CLI를 사용한다.
 
@@ -38,6 +40,11 @@ agent-observability config set /private/runtime retention-days 90
 변경값은 먼저 전체 config bounds로 검증된다. 성공한 config만 mode `0600` 임시 파일에 기록한
 뒤 원자적으로 교체되며 다음 command부터 적용된다. 잘못된 값, unknown option, broad permission,
 symlink는 기존 config를 바꾸지 않고 거부한다.
+
+UI process는 UI 중복 실행만 막는 전용 lock을 유지한다. 실제 저장은 전역 runtime lock을 짧게
+획득한 뒤 browser가 읽은 revision을 다시 확인한다. 따라서 UI를 열어 둔 동안에도 ingest, report,
+CLI 설정 명령을 실행할 수 있고, 동시에 바뀐 설정을 UI가 조용히 덮어쓰지 않는다. 충돌이 나면
+최신 설정 위에 browser에서 바꾼 필드만 다시 적용하고 사용자가 재검토 후 저장한다.
 
 ## Options
 

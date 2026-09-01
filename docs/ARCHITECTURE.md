@@ -38,7 +38,9 @@ TypeScript UI는 브라우저에서 직접 원본 event log를 읽지 않고 Rus
 versioned config DTO만 사용한다. report는 self-contained static HTML이며 runtime web server를
 요구하지 않는다. 설정 UI는 CLI가 명시적으로 시작한 동안에만 `127.0.0.1:0`에 bind하는 ephemeral
 inbound adapter를 사용한다. token, exact Host/Origin, body bound, no-store와 optimistic revision을
-검증하며 persistent daemon이나 외부 network 경로를 만들지 않는다.
+검증하며 persistent daemon이나 외부 network 경로를 만들지 않는다. CLI composition root가 private
+runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui는 UI instance lock만 유지하고
+설정 mutation 동안에만 shared runtime lock과 revision compare-and-replace를 사용한다.
 
 ## Deployment profiles
 
@@ -105,7 +107,8 @@ inbound adapters는 제품별 source precedence/correlation/dedupe를, local-sto
 projection을, static-report는 generated UI asset의 self-contained artifact 조립과 private atomic write를,
 local-ui는 authenticated loopback 설정 inbound adapter와 embedded generated asset을, CLI는 composition
 root를 소유한다.
-`contracts/*.schema.json`은 closed wire contract이고 `contracts/contract-manifest.v1`은 현재
+`contracts/*.schema.json`은 closed wire contract이고 versioned config fixture가 Rust default/validation과
+생성된 TypeScript validator의 parity를 잠근다. `contracts/contract-manifest.v1`은 현재
 활성 schema path/version과 `team_ingest=disabled` 경계를 runtime 중립적으로 고정한다.
 
 ```text

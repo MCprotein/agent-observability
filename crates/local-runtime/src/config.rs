@@ -1,5 +1,6 @@
 use crate::policy::{CollectionPolicyV1, PolicyError, RetentionPolicyV1};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -118,6 +119,7 @@ pub enum ConfigError {
     InvalidPath,
     Symlink,
     UnsupportedPlatform,
+    Conflict,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -135,6 +137,7 @@ impl std::fmt::Display for ConfigError {
             Self::UnsupportedPlatform => {
                 formatter.write_str("private local runtime paths are unsupported on this platform")
             }
+            Self::Conflict => formatter.write_str("local runtime configuration changed"),
         }
     }
 }
@@ -206,12 +209,27 @@ pub fn load(path: &Path) -> Result<LocalRuntimeConfigV2, ConfigError> {
 }
 
 pub fn save(path: &Path, config: &LocalRuntimeConfigV2) -> Result<(), ConfigError> {
-    save_with_hook(path, config, |_| Ok(()))
+    save_with_hook(path, config, None, |_| Ok(()))
+}
+
+pub fn save_if_revision(
+    path: &Path,
+    expected_revision: &str,
+    config: &LocalRuntimeConfigV2,
+) -> Result<(), ConfigError> {
+    save_with_hook(path, config, Some(expected_revision), |_| Ok(()))
+}
+
+pub fn revision(config: &LocalRuntimeConfigV2) -> Result<String, ConfigError> {
+    let body = serde_json::to_vec(config).map_err(ConfigError::Json)?;
+    let digest = Sha256::digest(body);
+    Ok(hex(&digest))
 }
 
 fn save_with_hook(
     path: &Path,
     config: &LocalRuntimeConfigV2,
+    expected_revision: Option<&str>,
     mut before: impl FnMut(SaveStage) -> io::Result<()>,
 ) -> Result<(), ConfigError> {
     config.validate()?;
@@ -219,6 +237,7 @@ fn save_with_hook(
     let parent = path.parent().ok_or(ConfigError::InvalidPath)?;
     private_dir(parent, false)?;
     let _ = open_private_read(path)?;
+    ensure_revision(path, expected_revision)?;
 
     let body = serde_json::to_vec_pretty(config).map_err(ConfigError::Json)?;
     let (temporary, mut file) = private_update_file(parent)?;
@@ -230,6 +249,7 @@ fn save_with_hook(
         file.sync_all()?;
         private_open_file(&file)?;
         before(SaveStage::Rename)?;
+        ensure_revision(path, expected_revision)?;
         fs::rename(&temporary, path)?;
         before(SaveStage::ParentSync)?;
         File::open(parent)?.sync_all()?;
@@ -239,6 +259,27 @@ fn save_with_hook(
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn ensure_revision(path: &Path, expected: Option<&str>) -> Result<(), ConfigError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if revision(&load(path)?)? == expected {
+        Ok(())
+    } else {
+        Err(ConfigError::Conflict)
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut text, byte| {
+            use std::fmt::Write as _;
+            write!(text, "{byte:02x}").expect("writing to a String cannot fail");
+            text
+        })
 }
 
 fn private_update_file(parent: &Path) -> Result<(PathBuf, File), ConfigError> {
@@ -400,6 +441,28 @@ mod tests {
         assert_eq!(legacy.retention, RetentionPolicyV1::default());
     }
 
+    #[test]
+    fn versioned_fixture_matches_the_rust_default_and_bounds() {
+        let fixture = include_str!("../../../contracts/local-runtime-config-v2.fixture.json");
+        assert_eq!(
+            LocalRuntimeConfigV2::from_json(fixture).unwrap(),
+            LocalRuntimeConfigV2::default()
+        );
+        for invalid in [
+            fixture.replace(
+                "\"file_reconcile_interval_ms\": 5000",
+                "\"file_reconcile_interval_ms\": 999",
+            ),
+            fixture.replace(
+                "\"max_record_age_days\": 30",
+                "\"max_record_age_days\": 3651",
+            ),
+            fixture.replace("\"local_runtime.v2\"", "\"local_runtime.v3\""),
+        ] {
+            assert!(LocalRuntimeConfigV2::from_json(&invalid).is_err());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn install_is_private_idempotent_and_non_overwriting() {
@@ -460,6 +523,38 @@ mod tests {
             fs::metadata(&layout.config).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        assert!(fs::read_dir(&layout.root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".update.")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revision_save_rechecks_immediately_before_replace() {
+        let root = root("save-revision-conflict");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let expected = revision(&load(&layout.config).unwrap()).unwrap();
+        let mut update = LocalRuntimeConfigV2::default();
+        update.retention.max_record_age_days = 90;
+        let mut external = LocalRuntimeConfigV2::default();
+        external.retention.max_record_age_days = 45;
+        let mut external_bytes = serde_json::to_vec_pretty(&external).unwrap();
+        external_bytes.push(b'\n');
+
+        let result = save_with_hook(&layout.config, &update, Some(&expected), |stage| {
+            if stage == SaveStage::Rename {
+                fs::write(&layout.config, &external_bytes)?;
+            }
+            Ok(())
+        });
+        assert!(matches!(result, Err(ConfigError::Conflict)));
+        assert_eq!(load(&layout.config).unwrap(), external);
         assert!(fs::read_dir(&layout.root).unwrap().all(|entry| {
             !entry
                 .unwrap()
@@ -585,7 +680,7 @@ mod tests {
         config.retention.max_record_age_days = 90;
 
         for failed_stage in [SaveStage::Write, SaveStage::FileSync, SaveStage::Rename] {
-            let result = save_with_hook(&layout.config, &config, |stage| {
+            let result = save_with_hook(&layout.config, &config, None, |stage| {
                 if stage == failed_stage {
                     Err(io::Error::other("injected save failure"))
                 } else {
@@ -614,7 +709,7 @@ mod tests {
         let mut config = LocalRuntimeConfigV2::default();
         config.retention.max_record_age_days = 90;
 
-        let result = save_with_hook(&layout.config, &config, |stage| {
+        let result = save_with_hook(&layout.config, &config, None, |stage| {
             if stage == SaveStage::ParentSync {
                 Err(io::Error::other("injected parent sync failure"))
             } else {
