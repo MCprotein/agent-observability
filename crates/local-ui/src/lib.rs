@@ -22,7 +22,7 @@ use tokio::{net::TcpListener, sync::Notify};
 
 const SESSION_HEADER: &str = "x-agent-observability-session";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const SETTINGS_SHELL: &str = include_str!("generated/settings-shell.html");
 const SETTINGS_SCRIPT: &str = include_str!("generated/settings-ui.js");
@@ -237,7 +237,7 @@ async fn put_config(
     touch(&state)?;
     let Json(update) = Json::<UpdateRequest>::from_request(request, &state)
         .await
-        .map_err(map_json_rejection)?;
+        .map_err(|error| map_json_rejection(&error))?;
     let current = load_config(&state.config_path)?;
     if revision(&current)? != update.revision {
         return Err(ApiError::new(
@@ -432,7 +432,7 @@ fn touch(state: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn map_json_rejection(error: JsonRejection) -> ApiError {
+fn map_json_rejection(error: &JsonRejection) -> ApiError {
     ApiError::new(
         StatusCode::BAD_REQUEST,
         "invalid_request",
@@ -498,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn api_enforces_loopback_session_and_optimistic_revision() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -604,7 +605,7 @@ mod tests {
                 assert_eq!(saved_envelope["config"]["enabled"], false);
                 assert_ne!(saved_envelope["revision"], stale_revision);
 
-                let stale = app
+                let conflict_response = app
                     .oneshot(api_request(
                         "PUT",
                         "/api/config",
@@ -614,7 +615,7 @@ mod tests {
                     ))
                     .await
                     .unwrap();
-                assert_eq!(stale.status(), StatusCode::CONFLICT);
+                assert_eq!(conflict_response.status(), StatusCode::CONFLICT);
                 let _ = fs::remove_dir_all(root);
             });
     }
