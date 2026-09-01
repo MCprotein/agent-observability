@@ -22,10 +22,11 @@ use axum::{
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
