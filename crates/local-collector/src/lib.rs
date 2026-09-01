@@ -13,11 +13,13 @@ use agent_observability_local_store::{LocalStore, StoreBatchItem};
 use agent_observability_static_report::write_private;
 use axum::{
     Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode, header},
-    response::IntoResponse,
+    http::{HeaderMap, Request, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
+    serve::Listener,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -25,13 +27,20 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream as TokioTcpStream},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    time::Sleep,
+};
 
 pub const TOKEN_HEADER: &str = "x-agent-observability-token";
 pub const REPORT_FILE_NAME: &str = "agent-observability-report.html";
@@ -39,6 +48,12 @@ pub const COLLECTOR_SETTINGS_VERSION: &str = "local_collector.v1";
 const REPORT_DIRTY_FILE_NAME: &str = "report-dirty";
 const REPORT_RETRY_LIMIT: u32 = 4;
 const REPORT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
+const REPORT_DEBOUNCE_DELAY: Duration = Duration::from_millis(200);
+const REPORT_MAX_COALESCE_DELAY: Duration = Duration::from_secs(2);
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_LIFETIME: Duration = Duration::from_secs(30);
+const MAX_CONNECTIONS: usize = 64;
+const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -244,6 +259,9 @@ struct CollectorState {
 struct AppState {
     collector: Arc<Mutex<CollectorState>>,
     report_refresh_scheduled: Arc<AtomicBool>,
+    report_refresh_requested: Arc<AtomicU64>,
+    #[cfg(test)]
+    report_refresh_attempts: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -271,11 +289,9 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let last_cursor = store
         .cursor("codex", &options.source_generation)
         .map_err(runtime_error)?;
-    let listener = TcpListener::bind(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        options.port,
-    ))
-    .await?;
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), options.port);
+    let initial_bind = TcpListener::bind(address).await;
+    let listener = bind_or_rotate_port(&layout, &options, initial_bind).await?;
     let collector = Arc::new(Mutex::new(CollectorState {
         layout,
         store,
@@ -293,41 +309,248 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let state = AppState {
         collector,
         report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
+        report_refresh_requested: Arc::new(AtomicU64::new(0)),
+        #[cfg(test)]
+        report_refresh_attempts: Arc::new(AtomicU64::new(0)),
     };
     let app = router(state.clone());
     if report_wakeup {
         schedule_report_refresh(&state);
     }
-    let result = axum::serve(listener, app).await;
+    let result = serve_transport(
+        listener,
+        app,
+        HEADER_READ_TIMEOUT,
+        REQUEST_LIFETIME,
+        MAX_CONNECTIONS,
+    )
+    .await;
     drop(singleton);
-    result.map_err(CollectorError::Io)
+    result
+}
+
+async fn bind_or_rotate_port(
+    layout: &InstalledLayout,
+    options: &CollectorOptions,
+    initial_bind: std::io::Result<TcpListener>,
+) -> Result<TcpListener, CollectorError> {
+    match initial_bind {
+        Ok(listener) => Ok(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+            let port = listener.local_addr()?.port();
+            let settings = CollectorSettings {
+                schema_version: COLLECTOR_SETTINGS_VERSION.into(),
+                port,
+                token: options.token.clone(),
+                source_generation: options.source_generation.clone(),
+            };
+            write_private_json(&settings_path(layout), &settings)?;
+            Ok(listener)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let ingest = Router::new()
         .route("/v1/logs", post(ingest_logs))
         .route("/v1/notify", post(ingest_notify))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            ingest_preflight,
+        ));
+    Router::new()
+        .route("/health", get(health))
+        .merge(ingest)
         .layer(DefaultBodyLimit::max(
             usize::try_from(MAX_HANDOFF_BYTES).expect("handoff bound fits usize"),
         ))
         .with_state(state)
 }
 
-async fn ingest_notify(
+async fn serve_transport(
+    listener: TcpListener,
+    app: Router,
+    header_read_timeout: Duration,
+    request_lifetime: Duration,
+    max_connections: usize,
+) -> Result<(), CollectorError> {
+    let app = protect_request_lifetime(app, request_lifetime);
+    let listener = TransportListener::new(listener, header_read_timeout, max_connections);
+    axum::serve(listener, app).await.map_err(CollectorError::Io)
+}
+
+fn protect_request_lifetime(app: Router, request_lifetime: Duration) -> Router {
+    app.layer(middleware::from_fn(
+        move |request: Request<Body>, next: Next| async move {
+            match tokio::time::timeout(request_lifetime, next.run(request)).await {
+                Ok(response) => response,
+                Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+            }
+        },
+    ))
+}
+
+#[derive(Debug)]
+struct TransportListener {
+    listener: TcpListener,
+    header_read_timeout: Duration,
+    connection_slots: Arc<Semaphore>,
+}
+
+impl TransportListener {
+    fn new(listener: TcpListener, header_read_timeout: Duration, max_connections: usize) -> Self {
+        assert!(max_connections > 0, "collector must admit a connection");
+        Self {
+            listener,
+            header_read_timeout,
+            connection_slots: Arc::new(Semaphore::new(max_connections)),
+        }
+    }
+}
+
+impl Listener for TransportListener {
+    type Io = ProtectedIo;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, address) = Listener::accept(&mut self.listener).await;
+            let Ok(permit) = Arc::clone(&self.connection_slots).try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
+            return (
+                ProtectedIo::new(stream, permit, self.header_read_timeout),
+                address,
+            );
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
+
+#[derive(Debug)]
+struct ProtectedIo {
+    stream: TokioTcpStream,
+    _permit: OwnedSemaphorePermit,
+    header_read_timeout: Duration,
+    header_deadline: Pin<Box<Sleep>>,
+    header_match: usize,
+    reading_headers: bool,
+}
+
+impl ProtectedIo {
+    fn new(
+        stream: TokioTcpStream,
+        permit: OwnedSemaphorePermit,
+        header_read_timeout: Duration,
+    ) -> Self {
+        Self {
+            stream,
+            _permit: permit,
+            header_read_timeout,
+            header_deadline: Box::pin(tokio::time::sleep(header_read_timeout)),
+            header_match: 0,
+            reading_headers: true,
+        }
+    }
+
+    fn observe_read(&mut self, bytes: &[u8]) {
+        if !self.reading_headers {
+            return;
+        }
+        for &byte in bytes {
+            if byte == HEADER_TERMINATOR[self.header_match] {
+                self.header_match += 1;
+                if self.header_match == HEADER_TERMINATOR.len() {
+                    self.reading_headers = false;
+                    self.header_match = 0;
+                    break;
+                }
+            } else {
+                self.header_match = usize::from(byte == HEADER_TERMINATOR[0]);
+            }
+        }
+    }
+
+    fn rearm_header_deadline(&mut self) {
+        if !self.reading_headers {
+            self.reading_headers = true;
+            self.header_match = 0;
+            self.header_deadline
+                .as_mut()
+                .reset(tokio::time::Instant::now() + self.header_read_timeout);
+        }
+    }
+}
+
+impl AsyncRead for ProtectedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.reading_headers && self.header_deadline.as_mut().poll(context).is_ready() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "collector request headers timed out",
+            )));
+        }
+        let filled_before = buffer.filled().len();
+        match Pin::new(&mut self.stream).poll_read(context, buffer) {
+            Poll::Ready(Ok(())) => {
+                self.observe_read(&buffer.filled()[filled_before..]);
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+}
+
+impl AsyncWrite for ProtectedIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        this.rearm_header_deadline();
+        Pin::new(&mut this.stream).poll_write(context, buffer)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(context)
+    }
+}
+
+async fn ingest_preflight(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
+    request: Request<Body>,
+    next: Next,
+) -> Response {
     let mut collector = state.collector.lock().await;
-    if !authorized(&headers, &collector.token) {
+    if !authorized(request.headers(), &collector.token) {
         collector.rejected_requests = collector.rejected_requests.saturating_add(1);
-        return StatusCode::UNAUTHORIZED;
+        return StatusCode::UNAUTHORIZED.into_response();
     }
-    if !is_json(&headers) {
+    if !is_json(request.headers()) {
         collector.rejected_requests = collector.rejected_requests.saturating_add(1);
-        return StatusCode::UNSUPPORTED_MEDIA_TYPE;
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
+    drop(collector);
+    next.run(request).await
+}
+
+async fn ingest_notify(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
+    let mut collector = state.collector.lock().await;
     let (outcome, committed) = match ingest_notify_locked(&mut collector, &body) {
         Ok(IngestOutcome::Committed) => {
             collector.accepted_requests = collector.accepted_requests.saturating_add(1);
@@ -370,20 +593,8 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
     .into_response()
 }
 
-async fn ingest_logs(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
+async fn ingest_logs(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
     let mut collector = state.collector.lock().await;
-    if !authorized(&headers, &collector.token) {
-        collector.rejected_requests = collector.rejected_requests.saturating_add(1);
-        return StatusCode::UNAUTHORIZED;
-    }
-    if !is_json(&headers) {
-        collector.rejected_requests = collector.rejected_requests.saturating_add(1);
-        return StatusCode::UNSUPPORTED_MEDIA_TYPE;
-    }
     let (outcome, committed) = match ingest_locked(&mut collector, &body) {
         Ok(IngestOutcome::Committed) => {
             collector.accepted_requests = collector.accepted_requests.saturating_add(1);
@@ -628,6 +839,27 @@ fn commit_batch(
 }
 
 fn schedule_report_refresh(state: &AppState) {
+    schedule_report_refresh_with_timing(
+        state,
+        ReportRefreshTiming {
+            debounce: REPORT_DEBOUNCE_DELAY,
+            max_coalesce: REPORT_MAX_COALESCE_DELAY,
+            retry_initial: REPORT_RETRY_INITIAL_DELAY,
+        },
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReportRefreshTiming {
+    debounce: Duration,
+    max_coalesce: Duration,
+    retry_initial: Duration,
+}
+
+fn schedule_report_refresh_with_timing(state: &AppState, timing: ReportRefreshTiming) {
+    state
+        .report_refresh_requested
+        .fetch_add(1, Ordering::Release);
     if state
         .report_refresh_scheduled
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -637,13 +869,23 @@ fn schedule_report_refresh(state: &AppState) {
     }
     let state = state.clone();
     tokio::spawn(async move {
-        let mut delay = REPORT_RETRY_INITIAL_DELAY;
-        for attempt in 1..=REPORT_RETRY_LIMIT {
-            tokio::time::sleep(delay).await;
+        let mut failure_attempts = 0;
+        let mut retry_delay = timing.retry_initial;
+        loop {
+            if failure_attempts == 0 {
+                await_report_debounce(&state, timing).await;
+            } else {
+                tokio::time::sleep(retry_delay).await;
+            }
+            let attempt_epoch = state.report_refresh_requested.load(Ordering::Acquire);
             let root = {
                 let collector = state.collector.lock().await;
                 collector.layout.root.clone()
             };
+            #[cfg(test)]
+            state
+                .report_refresh_attempts
+                .fetch_add(1, Ordering::Release);
             let refresh = tokio::task::spawn_blocking(move || refresh_report_from_root(&root))
                 .await
                 .ok()
@@ -656,36 +898,72 @@ fn schedule_report_refresh(state: &AppState) {
             collector.report_dirty = pending;
             let completed = refresh.is_some() && !pending;
             if completed {
-                let _ = clear_report_dirty(&collector.layout);
                 collector.report_degraded = false;
                 collector.report_refresh_failures = 0;
                 state
                     .report_refresh_scheduled
                     .store(false, Ordering::Release);
+                let requested_after_clear = state.report_refresh_requested.load(Ordering::Acquire);
+                let pending_after_clear = collector
+                    .store
+                    .report_status()
+                    .map_or(true, agent_observability_local_store::ReportStatus::pending);
+                collector.report_dirty = pending_after_clear;
+                if !pending_after_clear {
+                    let _ = clear_report_dirty(&collector.layout);
+                }
+                let retry_latest = requested_after_clear != attempt_epoch || pending_after_clear;
+                drop(collector);
+                if retry_latest {
+                    schedule_report_refresh_with_timing(&state, timing);
+                }
                 return;
             }
             if refresh.is_some() {
-                delay = REPORT_RETRY_INITIAL_DELAY;
+                collector.report_refresh_failures = 0;
+                failure_attempts = 0;
+                retry_delay = timing.retry_initial;
             } else {
                 collector.report_refresh_failures =
                     collector.report_refresh_failures.saturating_add(1);
-                delay = delay.saturating_mul(2);
+                failure_attempts += 1;
             }
-            if attempt == REPORT_RETRY_LIMIT {
+            if failure_attempts == REPORT_RETRY_LIMIT {
                 collector.report_degraded = true;
                 state
                     .report_refresh_scheduled
                     .store(false, Ordering::Release);
-                let retry_latest = refresh.is_some() && pending;
+                let retry_latest =
+                    state.report_refresh_requested.load(Ordering::Acquire) != attempt_epoch;
                 drop(collector);
                 if retry_latest {
-                    schedule_report_refresh(&state);
+                    schedule_report_refresh_with_timing(&state, timing);
                 }
                 return;
             }
             drop(collector);
+            if refresh.is_none() {
+                retry_delay = retry_delay.saturating_mul(2);
+            }
         }
     });
+}
+
+async fn await_report_debounce(state: &AppState, timing: ReportRefreshTiming) {
+    let started = tokio::time::Instant::now();
+    let maximum = started + timing.max_coalesce;
+    let mut quiet_until = started + timing.debounce;
+    let mut observed = state.report_refresh_requested.load(Ordering::Acquire);
+    loop {
+        tokio::time::sleep_until(quiet_until.min(maximum)).await;
+        let now = tokio::time::Instant::now();
+        let latest = state.report_refresh_requested.load(Ordering::Acquire);
+        if latest == observed || now >= maximum {
+            return;
+        }
+        observed = latest;
+        quiet_until = now + timing.debounce;
+    }
 }
 
 fn report_dirty_path(layout: &InstalledLayout) -> PathBuf {
@@ -942,7 +1220,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
         thread,
         time::{Duration, Instant},
@@ -980,6 +1258,8 @@ mod tests {
         AppState {
             collector: Arc::new(Mutex::new(collector_state(root))),
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
+            report_refresh_requested: Arc::new(AtomicU64::new(0)),
+            report_refresh_attempts: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1031,6 +1311,39 @@ mod tests {
         })
             .await
             .unwrap()
+    }
+
+    async fn wait_for_available_permits(slots: &Arc<tokio::sync::Semaphore>, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while slots.available_permits() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "expected {expected} available permits, found {}",
+                slots.available_permits()
+            )
+        });
+    }
+
+    fn response_status(response: &[u8]) -> StatusCode {
+        let status = String::from_utf8_lossy(response)
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing HTTP status in {response:?}"))
+            .parse::<u16>()
+            .unwrap();
+        StatusCode::from_u16(status).unwrap()
+    }
+
+    fn fast_report_timing() -> super::ReportRefreshTiming {
+        super::ReportRefreshTiming {
+            debounce: Duration::from_millis(20),
+            max_coalesce: Duration::from_millis(80),
+            retry_initial: Duration::from_millis(10),
+        }
     }
 
     fn configure_port(root: &Path, port: u16) {
@@ -1165,6 +1478,240 @@ mod tests {
             HeaderValue::from_static("application/json; charset=utf-8"),
         );
         assert!(is_json(&headers));
+    }
+
+    #[test]
+    fn transport_closes_partial_headers_at_the_read_deadline() {
+        let root = test_root("partial-header-timeout");
+        let _ = fs::remove_dir_all(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport = super::TransportListener::new(listener, Duration::from_millis(50), 1);
+            let slots = Arc::clone(&transport.connection_slots);
+            let app =
+                super::protect_request_lifetime(router(app_state(&root)), Duration::from_secs(1));
+            let server = tokio::spawn(async move { axum::serve(transport, app).await });
+            let mut stream = tokio::task::spawn_blocking(move || {
+                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                stream
+                    .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1")
+                    .unwrap();
+                stream
+            })
+            .await
+            .unwrap();
+            wait_for_available_permits(&slots, 0).await;
+
+            let result = tokio::task::spawn_blocking(move || {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut byte = [0_u8; 1];
+                stream.read(&mut byte)
+            })
+            .await
+            .unwrap();
+            assert!(
+                result.as_ref().is_ok_and(|bytes| *bytes == 0)
+                    || result.as_ref().is_err_and(|error| matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    )),
+                "partial header connection remained open: {result:?}"
+            );
+            wait_for_available_permits(&slots, 1).await;
+            server.abort();
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transport_times_out_an_incomplete_request_body() {
+        let root = test_root("request-lifetime-timeout");
+        let _ = fs::remove_dir_all(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport = super::TransportListener::new(listener, Duration::from_secs(1), 1);
+            let app = super::protect_request_lifetime(
+                router(app_state(&root)),
+                Duration::from_millis(50),
+            );
+            let server = tokio::spawn(async move { axum::serve(transport, app).await });
+            let response = tokio::task::spawn_blocking(move || {
+                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                stream
+                    .write_all(
+                        format!(
+                            "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\n{TOKEN_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{{",
+                            "a".repeat(64)
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).unwrap();
+                response
+            })
+            .await
+            .unwrap();
+            assert_eq!(response_status(&response), StatusCode::REQUEST_TIMEOUT);
+            server.abort();
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ingest_preflight_rejects_before_buffering_large_partial_bodies() {
+        let root = test_root("ingest-preflight-partial-body");
+        let _ = fs::remove_dir_all(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport = super::TransportListener::new(listener, Duration::from_secs(1), 2);
+            let state = app_state(&root);
+            let app =
+                super::protect_request_lifetime(router(state.clone()), Duration::from_secs(1));
+            let server = tokio::spawn(async move { axum::serve(transport, app).await });
+            let content_length = MAX_HANDOFF_BYTES + 1;
+
+            let unauthorized = tokio::task::spawn_blocking(move || {
+                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                let request = format!(
+                    "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{{"
+                );
+                stream.write_all(request.as_bytes()).unwrap();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).unwrap();
+                response
+            })
+            .await
+            .unwrap();
+            assert_eq!(response_status(&unauthorized), StatusCode::UNAUTHORIZED);
+
+            let invalid_media = tokio::task::spawn_blocking(move || {
+                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                let request = format!(
+                    "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\n{TOKEN_HEADER}: {}\r\nContent-Type: text/plain\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{{",
+                    "a".repeat(64)
+                );
+                stream.write_all(request.as_bytes()).unwrap();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).unwrap();
+                response
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                response_status(&invalid_media),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE
+            );
+            assert_eq!(state.collector.lock().await.rejected_requests, 2);
+            server.abort();
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transport_admits_only_the_configured_connection_count() {
+        let root = test_root("connection-saturation");
+        let _ = fs::remove_dir_all(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport = super::TransportListener::new(listener, Duration::from_secs(2), 1);
+            let slots = Arc::clone(&transport.connection_slots);
+            let app =
+                super::protect_request_lifetime(router(app_state(&root)), Duration::from_secs(1));
+            let server = tokio::spawn(async move { axum::serve(transport, app).await });
+            let first = tokio::task::spawn_blocking(move || {
+                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                stream
+                    .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1")
+                    .unwrap();
+                stream
+            })
+            .await
+            .unwrap();
+            wait_for_available_permits(&slots, 0).await;
+
+            let saturated_read = tokio::task::spawn_blocking(move || {
+                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                let request = format!(
+                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{TOKEN_HEADER}: {}\r\nConnection: close\r\n\r\n",
+                    "a".repeat(64)
+                );
+                stream.write_all(request.as_bytes()).unwrap();
+                let mut byte = [0_u8; 1];
+                stream.read(&mut byte)
+            })
+            .await
+            .unwrap();
+            assert!(
+                saturated_read.as_ref().is_ok_and(|bytes| *bytes == 0)
+                    || saturated_read.as_ref().is_err_and(|error| matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    )),
+                "saturated connection remained admitted: {saturated_read:?}"
+            );
+
+            drop(first);
+            wait_for_available_permits(&slots, 1).await;
+            let response = tokio::task::spawn_blocking(move || {
+                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                let request = format!(
+                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{TOKEN_HEADER}: {}\r\nConnection: close\r\n\r\n",
+                    "a".repeat(64)
+                );
+                stream.write_all(request.as_bytes()).unwrap();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).unwrap();
+                response
+            })
+            .await
+            .unwrap();
+            assert_eq!(response_status(&response), StatusCode::OK);
+            server.abort();
+        });
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1404,6 +1951,120 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn occupied_persisted_port_rotates_privately_and_serves() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("occupied-persisted-port");
+        let _ = fs::remove_dir_all(&root);
+        let original = install_settings(&root).unwrap();
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, original.port)).unwrap();
+        let options = original.options(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let server = tokio::spawn(super::serve(options));
+            let rotated = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(settings) = load_settings(&root)
+                        && settings.port != original.port
+                    {
+                        break settings;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(rotated.token, original.token);
+            assert_eq!(rotated.source_generation, original.source_generation);
+            assert_ne!(rotated.port, original.port);
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let health_root = root.clone();
+                    let health =
+                        tokio::task::spawn_blocking(move || super::check_health(&health_root))
+                            .await
+                            .unwrap();
+                    if health == super::HealthOutcome::Ready {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let notify_root = root.clone();
+                    let notify = tokio::task::spawn_blocking(move || {
+                        submit_notify(
+                            &notify_root,
+                            br#"{"type":"agent-turn-complete","thread-id":"thread","turn-id":"turn"}"#,
+                        )
+                    })
+                    .await
+                    .unwrap();
+                    if notify == NotifyOutcome::Accepted {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+
+            server.abort();
+            let _ = server.await;
+        });
+        drop(occupied);
+        assert_eq!(
+            fs::metadata(settings_path(&install(&root).unwrap()))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn non_address_in_use_bind_failure_does_not_rotate_settings() {
+        let root = test_root("bind-failure-no-rotation");
+        let _ = fs::remove_dir_all(&root);
+        let settings = install_settings(&root).unwrap();
+        let layout = install(&root).unwrap();
+        let options = settings.options(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let error = runtime
+            .block_on(super::bind_or_rotate_port(
+                &layout,
+                &options,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected bind failure",
+                )),
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            super::CollectorError::Io(ref error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(load_settings(&root).unwrap(), settings);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn otlp_batch_commits_and_refreshes_private_report() {
         let root = std::env::temp_dir().join(format!(
@@ -1454,7 +2115,7 @@ mod tests {
         refresh_report_from_root(&layout.root).unwrap();
 
         assert_eq!(state.last_cursor.as_deref(), Some("3"));
-        assert_eq!(state.store.counts().unwrap().0, 3);
+        assert_eq!(state.store.counts().unwrap().0, 2);
         let report = layout.logs.join(REPORT_FILE_NAME);
         assert!(report.is_file());
         let html = fs::read_to_string(report).unwrap();
@@ -1490,20 +2151,20 @@ mod tests {
 
         let (batch, cursor) = parse_otlp_http_json(body, "codex-test", None, 1, 0).unwrap();
         super::commit_batch(&mut state, &batch, cursor.clone(), 1).unwrap();
-        assert_eq!(state.store.observation_count().unwrap(), 2);
-        assert_eq!(state.store.disposition_count().unwrap(), 1);
+        assert_eq!(state.store.observation_count().unwrap(), 1);
+        assert_eq!(state.store.disposition_count().unwrap(), 2);
         assert_eq!(state.last_cursor.as_deref(), Some("3"));
         assert!(report_dirty_path(&state.layout).is_file());
 
         super::commit_batch(&mut state, &batch, cursor, 2).unwrap();
-        assert_eq!(state.store.observation_count().unwrap(), 2);
-        assert_eq!(state.store.disposition_count().unwrap(), 1);
+        assert_eq!(state.store.observation_count().unwrap(), 1);
+        assert_eq!(state.store.disposition_count().unwrap(), 2);
         assert_eq!(state.last_cursor.as_deref(), Some("3"));
 
         let (replayed, cursor) = parse_otlp_http_json(body, "codex-test", Some("3"), 4, 3).unwrap();
         super::commit_batch(&mut state, &replayed, cursor, 3).unwrap();
-        assert_eq!(state.store.observation_count().unwrap(), 4);
-        assert_eq!(state.store.disposition_count().unwrap(), 2);
+        assert_eq!(state.store.observation_count().unwrap(), 2);
+        assert_eq!(state.store.disposition_count().unwrap(), 4);
         assert_eq!(state.last_cursor.as_deref(), Some("6"));
         assert_tree_excludes(&root, &[b"SECRET_PROMPT"]);
         let _ = fs::remove_dir_all(root);
@@ -1524,6 +2185,115 @@ mod tests {
 
         assert_eq!(state.store.record_count().unwrap(), 1);
         assert!(state.store.report_status().unwrap().pending());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_refresh_coalesces_a_burst_into_one_rebuild() {
+        let root = test_root("report-refresh-coalescing");
+        let _ = fs::remove_dir_all(&root);
+        let state = app_state(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            {
+                let mut collector = state.collector.lock().await;
+                ingest_notify_locked(
+                    &mut collector,
+                    br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+                )
+                .unwrap();
+            }
+            for _ in 0..20 {
+                super::schedule_report_refresh_with_timing(&state, fast_report_timing());
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while state.report_refresh_scheduled.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 1);
+            assert!(
+                !state
+                    .collector
+                    .lock()
+                    .await
+                    .store
+                    .report_status()
+                    .unwrap()
+                    .pending()
+            );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_refresh_does_not_lose_an_inflight_wakeup() {
+        let root = test_root("report-refresh-lost-wakeup");
+        let _ = fs::remove_dir_all(&root);
+        let state = app_state(&root);
+        let render_guard = {
+            let collector = state.collector.blocking_lock();
+            let config = load(&collector.layout.config).unwrap();
+            let store = open_store(&collector.layout, &config).unwrap();
+            drop(collector);
+            store.acquire_report_render_guard().unwrap()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            {
+                let mut collector = state.collector.lock().await;
+                ingest_notify_locked(
+                    &mut collector,
+                    br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+                )
+                .unwrap();
+            }
+            super::schedule_report_refresh_with_timing(&state, fast_report_timing());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while state.report_refresh_attempts.load(Ordering::Acquire) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            {
+                let mut collector = state.collector.lock().await;
+                ingest_notify_locked(
+                    &mut collector,
+                    br#"{"type":"agent-turn-complete","thread-id":"thread-2","turn-id":"turn-2"}"#,
+                )
+                .unwrap();
+            }
+            super::schedule_report_refresh_with_timing(&state, fast_report_timing());
+            drop(render_guard);
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while state.report_refresh_scheduled.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let collector = state.collector.lock().await;
+            assert!(!collector.store.report_status().unwrap().pending());
+            assert_eq!(collector.store.record_count().unwrap(), 2);
+        });
+
+        let html = fs::read_to_string(root.join("logs").join(REPORT_FILE_NAME)).unwrap();
+        assert!(html.contains(r#""generatedSpans":2"#));
+        assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 2);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1664,6 +2434,8 @@ mod tests {
         let state = AppState {
             collector: Arc::new(Mutex::new(restarted)),
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
+            report_refresh_requested: Arc::new(AtomicU64::new(0)),
+            report_refresh_attempts: Arc::new(AtomicU64::new(0)),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
