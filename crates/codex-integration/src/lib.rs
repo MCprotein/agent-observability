@@ -8,7 +8,7 @@ use agent_observability_local_collector::{
     CollectorError, CollectorSettings, HealthOutcome, check_health, install_settings,
     load_settings, recover_occupied_persisted_port,
 };
-use agent_observability_local_runtime::{ConfigMutationGuard, InstalledLayout, install};
+use agent_observability_local_runtime::{InstalledLayout, MutationGuard, install};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -523,10 +523,17 @@ fn runtime_error(error: impl fmt::Display) -> IntegrationError {
     IntegrationError::Runtime(error.to_string())
 }
 
-fn acquire_lifecycle_lock(
-    layout: &InstalledLayout,
-) -> Result<ConfigMutationGuard, IntegrationError> {
-    ConfigMutationGuard::acquire(layout).map_err(|error| {
+fn acquire_lifecycle_lock(layout: &InstalledLayout) -> Result<MutationGuard, IntegrationError> {
+    let lock_dir = layout.runtime.join("integrations/codex/lifecycle");
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&lock_dir)?;
+    MutationGuard::try_acquire(&lock_dir).map_err(|error| {
         IntegrationError::Runtime(format!("Codex integration lifecycle is busy: {error}"))
     })
 }
@@ -1256,7 +1263,9 @@ fn apply_launch_agent_desired_with(
         launchctl.bootstrap(domain, &service.plist)?;
         transaction.phase = LaunchAgentPhase::Bootstrapped;
         save_launch_agent_transaction(service, transaction)?;
-        launchctl.kickstart(&service.target)?;
+        if !launchctl.is_loaded(&service.target)? {
+            launchctl.kickstart(&service.target)?;
+        }
         if !launchctl.is_loaded(&service.target)? {
             return Err(IntegrationError::Runtime(format!(
                 "LaunchAgent start unconfirmed for {}",
@@ -1752,7 +1761,7 @@ impl Launchctl for SystemLaunchctl {
 
     fn kickstart(&self, target: &str) -> Result<(), IntegrationError> {
         command_success(
-            Command::new("launchctl").args(["kickstart", "-k", target]),
+            Command::new("launchctl").args(["kickstart", target]),
             "LaunchAgent start",
         )
     }
@@ -1814,7 +1823,7 @@ mod tests {
     };
     use agent_observability_codex_config::{CodexConfigManager, MutualTlsPaths};
     use agent_observability_local_collector::{HealthOutcome, install_settings, load_settings};
-    use agent_observability_local_runtime::{ConfigServiceError, LocalConfigService};
+    use agent_observability_local_runtime::LocalConfigService;
     #[cfg(target_os = "macos")]
     use std::collections::VecDeque;
     use std::{
@@ -2205,7 +2214,7 @@ mod tests {
     }
 
     #[test]
-    fn root_lifecycle_lock_rejects_concurrent_interleaving_through_rollback() {
+    fn lifecycle_lock_rejects_peer_interleaving_without_blocking_runtime_config() {
         const CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
 
         let root = temporary_root("lifecycle-lock");
@@ -2255,7 +2264,7 @@ mod tests {
             entered.is_ok(),
             "worker did not enter lifecycle: {entered:?}"
         );
-        assert!(matches!(config_save, Some(Err(ConfigServiceError::Busy))));
+        assert!(matches!(config_save, Some(Ok(_))));
         assert!(matches!(
             &contender,
             Some(Err(error)) if error.to_string().contains("lifecycle is busy")
@@ -2871,6 +2880,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     struct FakeLaunchctl {
         loaded: Cell<bool>,
+        bootstrap_marks_loaded: Cell<bool>,
         bootstrap_results: RefCell<VecDeque<Result<(), &'static str>>>,
         kickstart_results: RefCell<VecDeque<Result<(), &'static str>>>,
         bootout_results: RefCell<VecDeque<Result<bool, &'static str>>>,
@@ -2882,6 +2892,7 @@ mod tests {
         fn new(loaded: bool) -> Self {
             Self {
                 loaded: Cell::new(loaded),
+                bootstrap_marks_loaded: Cell::new(true),
                 bootstrap_results: RefCell::new(VecDeque::new()),
                 kickstart_results: RefCell::new(VecDeque::new()),
                 bootout_results: RefCell::new(VecDeque::new()),
@@ -2917,7 +2928,7 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or(Ok(()));
-            if result.is_ok() {
+            if result.is_ok() && self.bootstrap_marks_loaded.get() {
                 self.loaded.set(true);
             }
             result.map_err(|message| IntegrationError::Runtime(message.into()))
@@ -2925,11 +2936,15 @@ mod tests {
 
         fn kickstart(&self, _target: &str) -> Result<(), IntegrationError> {
             self.events.borrow_mut().push("kickstart");
-            self.kickstart_results
+            let result = self
+                .kickstart_results
                 .borrow_mut()
                 .pop_front()
-                .unwrap_or(Ok(()))
-                .map_err(|message| IntegrationError::Runtime(message.into()))
+                .unwrap_or(Ok(()));
+            if result.is_ok() {
+                self.loaded.set(true);
+            }
+            result.map_err(|message| IntegrationError::Runtime(message.into()))
         }
     }
 
@@ -3032,6 +3047,7 @@ mod tests {
         let root = temporary_root("fresh-kickstart-failure");
         let service = test_service(&root);
         let launchctl = FakeLaunchctl::new(false);
+        launchctl.bootstrap_marks_loaded.set(false);
         launchctl
             .kickstart_results
             .borrow_mut()
@@ -3075,6 +3091,7 @@ mod tests {
         .unwrap();
         commit_collector_service_install(&service).unwrap();
         let previous = fs::read(&service.plist).unwrap();
+        launchctl.bootstrap_marks_loaded.set(false);
         launchctl
             .kickstart_results
             .borrow_mut()
@@ -3211,7 +3228,7 @@ mod tests {
                 "bootout",
                 "is-loaded",
                 "bootstrap",
-                "kickstart",
+                "is-loaded",
                 "is-loaded"
             ]
         );

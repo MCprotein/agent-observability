@@ -2626,7 +2626,7 @@ fn wait_for_automatic_ready(root: &Path, collector: &mut ChildGuard) -> Result<(
 
 fn automatic_notify_payload(run: usize, event: usize) -> String {
     format!(
-        "{{\"type\":\"agent-turn-complete\",\"thread-id\":\"automatic-perf-{run}\",\"turn-id\":\"turn-{event}\"}}"
+        "{{\"type\":\"agent-turn-complete\",\"thread-id\":\"automatic-perf-{run}\",\"turn-id\":\"turn-{event}\",\"cwd\":\"/AUTOMATIC_RAW_CWD_SENTINEL\",\"input-messages\":[\"AUTOMATIC_RAW_PROMPT_SENTINEL\"],\"last-assistant-message\":\"AUTOMATIC_RAW_ASSISTANT_SENTINEL\"}}"
     )
 }
 
