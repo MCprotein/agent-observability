@@ -1,4 +1,7 @@
-use crate::policy::{CollectionPolicyV1, PolicyError, RetentionPolicyV1};
+use crate::{
+    lock::{Singleton, SingletonError},
+    policy::{CollectionPolicyV1, PolicyError, RetentionPolicyV1},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -149,6 +152,19 @@ pub struct InstalledLayout {
     pub runtime: PathBuf,
 }
 
+#[derive(Debug)]
+pub struct ConfigMutationGuard {
+    _singleton: Singleton,
+}
+
+impl ConfigMutationGuard {
+    pub fn acquire(runtime_path: &Path) -> Result<Self, SingletonError> {
+        Singleton::acquire(runtime_path).map(|singleton| Self {
+            _singleton: singleton,
+        })
+    }
+}
+
 impl InstalledLayout {
     fn at(root: &Path) -> Self {
         Self {
@@ -261,11 +277,16 @@ pub fn load(path: &Path) -> Result<LocalRuntimeConfigV2, ConfigError> {
     LocalRuntimeConfigV2::from_json(&body)
 }
 
-pub fn save(path: &Path, config: &LocalRuntimeConfigV2) -> Result<(), ConfigError> {
+pub fn save(
+    _guard: &ConfigMutationGuard,
+    path: &Path,
+    config: &LocalRuntimeConfigV2,
+) -> Result<(), ConfigError> {
     save_with_hook(path, config, None, |_| Ok(()))
 }
 
 pub fn save_if_revision(
+    _guard: &ConfigMutationGuard,
     path: &Path,
     expected_revision: &str,
     config: &LocalRuntimeConfigV2,
@@ -593,7 +614,7 @@ mod tests {
         let layout = install(&root).unwrap();
         let mut config = load(&layout.config).unwrap();
         config.retention.max_record_age_days = 90;
-        save(&layout.config, &config).unwrap();
+        save_with_hook(&layout.config, &config, None, |_| Ok(())).unwrap();
 
         assert_eq!(load(&layout.config).unwrap(), config);
         assert_eq!(
@@ -607,6 +628,24 @@ mod tests {
                 .to_string_lossy()
                 .contains(".update.")
         }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_mutation_guard_serializes_supported_writers() {
+        let root = root("config-mutation-guard");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+
+        let first = ConfigMutationGuard::acquire(&layout.runtime).unwrap();
+        assert!(matches!(
+            ConfigMutationGuard::acquire(&layout.runtime),
+            Err(SingletonError::AlreadyRunning)
+        ));
+        drop(first);
+        ConfigMutationGuard::acquire(&layout.runtime).unwrap();
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -652,7 +691,7 @@ mod tests {
         let mut config = load(&layout.config).unwrap();
         config.retention.max_record_age_days = 0;
 
-        assert!(save(&layout.config, &config).is_err());
+        assert!(save_with_hook(&layout.config, &config, None, |_| Ok(())).is_err());
         assert_eq!(fs::read(&layout.config).unwrap(), original);
         let _ = fs::remove_dir_all(root);
     }
@@ -669,7 +708,12 @@ mod tests {
         fs::rename(&layout.config, &backup).unwrap();
         symlink(&backup, &layout.config).unwrap();
         assert!(matches!(
-            save(&layout.config, &LocalRuntimeConfigV2::default()),
+            save_with_hook(
+                &layout.config,
+                &LocalRuntimeConfigV2::default(),
+                None,
+                |_| Ok(())
+            ),
             Err(ConfigError::Symlink)
         ));
 
@@ -677,7 +721,12 @@ mod tests {
         fs::rename(&backup, &layout.config).unwrap();
         fs::set_permissions(&layout.root, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(
-            save(&layout.config, &LocalRuntimeConfigV2::default()),
+            save_with_hook(
+                &layout.config,
+                &LocalRuntimeConfigV2::default(),
+                None,
+                |_| Ok(())
+            ),
             Err(ConfigError::InsecurePermissions)
         ));
         fs::set_permissions(&layout.root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -701,7 +750,7 @@ mod tests {
                 let mut config = LocalRuntimeConfigV2::default();
                 config.retention.max_record_age_days = days;
                 barrier.wait();
-                save(&path, &config)
+                save_with_hook(&path, &config, None, |_| Ok(()))
             })
         });
         barrier.wait();
@@ -740,7 +789,7 @@ mod tests {
             .unwrap();
         let mut config = LocalRuntimeConfigV2::default();
         config.retention.max_record_age_days = 90;
-        save(&layout.config, &config).unwrap();
+        save_with_hook(&layout.config, &config, None, |_| Ok(())).unwrap();
         assert_eq!(load(&layout.config).unwrap(), config);
         assert!(stale.exists());
         let _ = fs::remove_dir_all(root);

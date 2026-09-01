@@ -137,7 +137,7 @@ try {
         dirtyReloadDialog = true;
         await dialog.dismiss();
       });
-      await page.reload({ waitUntil: "domcontentloaded", timeout: 2_000 }).catch(() => undefined);
+      await page.evaluate(() => location.reload()).catch(() => undefined);
       assert.equal(dirtyReloadDialog, true);
       assert.equal(await page.locator("#collection-max_batch_records").inputValue(), "126");
       await page.locator("#discard").click();
@@ -172,12 +172,7 @@ try {
     assert.deepEqual(consoleErrors, []);
     assert.equal(expectedConflictErrors.length, testCase.name === "desktop" ? 1 : 0);
     assert.deepEqual(externalRequests, []);
-    assert.deepEqual(
-      failedRequests.filter(
-        (requestUrl) => !(dirtyReloadDialog && requestUrl.endsWith("/api/heartbeat")),
-      ),
-      [],
-    );
+    assert.deepEqual(failedRequests, []);
     results.push({
       name: testCase.name,
       screenshot: basename(screenshotPath),

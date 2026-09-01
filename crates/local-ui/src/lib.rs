@@ -2,8 +2,8 @@
 #![allow(clippy::missing_errors_doc)]
 
 use agent_observability_local_runtime::{
-    ConfigError, InstalledLayout, LocalRuntimeConfigV2, Singleton, SingletonError, load,
-    revision as runtime_revision, save_if_revision,
+    ConfigError, ConfigMutationGuard, InstalledLayout, LocalRuntimeConfigV2, Singleton,
+    SingletonError, load, revision as runtime_revision, save_if_revision,
 };
 use axum::{
     Json, Router,
@@ -249,19 +249,26 @@ async fn put_config(
             error.to_string(),
         )
     })?;
-    let _runtime = Singleton::acquire(&state.runtime_path).map_err(|error| match error {
-        SingletonError::AlreadyRunning => ApiError::new(
-            StatusCode::CONFLICT,
-            "runtime_busy",
-            "다른 로컬 작업이 실행 중입니다. 잠시 후 다시 저장하세요.",
-        ),
-        _ => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "runtime_lock_failed",
-            error.to_string(),
-        ),
-    })?;
-    save_if_revision(&state.config_path, &update.revision, &update.config).map_err(|error| {
+    let mutation =
+        ConfigMutationGuard::acquire(&state.runtime_path).map_err(|error| match error {
+            SingletonError::AlreadyRunning => ApiError::new(
+                StatusCode::CONFLICT,
+                "runtime_busy",
+                "다른 로컬 작업이 실행 중입니다. 잠시 후 다시 저장하세요.",
+            ),
+            _ => ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime_lock_failed",
+                error.to_string(),
+            ),
+        })?;
+    save_if_revision(
+        &mutation,
+        &state.config_path,
+        &update.revision,
+        &update.config,
+    )
+    .map_err(|error| {
         if matches!(error, ConfigError::Conflict) {
             ApiError::new(
                 StatusCode::CONFLICT,

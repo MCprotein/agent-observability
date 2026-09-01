@@ -101,8 +101,9 @@ does not affect the static report or collection runtime. Rust remains authoritat
 atomic persistence and file permissions. The browser stops heartbeat after one minute without real user
 activity; the process expires after ten minutes without heartbeat and always stops within one hour. Keeping
 the settings screen open holds only its own instance lock. Config mutation acquires the shared runtime lock
-briefly and uses optimistic revision control so ingest/report commands remain available and external edits are
-never silently overwritten.
+briefly and uses optimistic revision control so ingest/report commands remain available. Every supported CLI
+and UI writer uses the same mutation guard, so revision conflicts between supported writers are never silently
+overwritten. Direct config file editing is outside the supported interface.
 
 Hosted team uses server routes:
 
@@ -258,7 +259,7 @@ Accessibility checks require automated rules plus manual keyboard, screen-reader
   configuration returned by Rust.
 - Local settings invalid: preserve edits, focus the first invalid control and show bounded field errors.
 - Local settings conflict: reload the latest file, reapply only locally changed fields and require another explicit
-  save; never overwrite an external edit silently.
+  save; never overwrite a conflicting update from another supported writer silently.
 - Local settings close with edits: require an explicit discard confirmation and return focus to the close control
   when the user keeps editing.
 - Local settings expired: disable mutation controls and provide the exact CLI command to start a fresh session.

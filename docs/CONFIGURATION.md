@@ -37,14 +37,16 @@ agent-observability config show /private/runtime
 agent-observability config set /private/runtime retention-days 90
 ```
 
-변경값은 먼저 전체 config bounds로 검증된다. 성공한 config만 mode `0600` 임시 파일에 기록한
+변경값은 먼저 전체 config bounds로 검증된다. `config.json` 직접 편집은 지원 인터페이스가 아니다.
+성공한 config만 mode `0600` 임시 파일에 기록한
 뒤 원자적으로 교체되며 다음 command부터 적용된다. 잘못된 값, unknown option, broad permission,
 symlink는 기존 config를 바꾸지 않고 거부한다.
 
 UI process는 UI 중복 실행만 막는 전용 lock을 유지한다. 실제 저장은 전역 runtime lock을 짧게
-획득한 뒤 browser가 읽은 revision을 다시 확인한다. 따라서 UI를 열어 둔 동안에도 ingest, report,
-CLI 설정 명령을 실행할 수 있고, 동시에 바뀐 설정을 UI가 조용히 덮어쓰지 않는다. 충돌이 나면
-최신 설정 위에 browser에서 바꾼 필드만 다시 적용하고 사용자가 재검토 후 저장한다.
+획득한 뒤 browser가 읽은 revision을 다시 확인한다. 모든 지원 CLI/UI writer는 타입으로 강제된
+동일 mutation guard를 사용한다. 따라서 UI를 열어 둔 동안에도 ingest, report, CLI 설정 명령을
+실행할 수 있고, 지원 writer끼리 동시에 바뀐 설정을 조용히 덮어쓰지 않는다. 충돌이 나면 최신
+설정 위에 browser에서 바꾼 필드만 다시 적용하고 사용자가 재검토 후 저장한다.
 
 ## Options
 

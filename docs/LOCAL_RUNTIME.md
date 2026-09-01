@@ -34,9 +34,10 @@ agent-observability report ~/.agent-observability /path/to/private-rate-table.js
 `demo` uses an isolated default root and embedded content-free fixture; it never reads an agent log.
 `ui` holds only a settings-UI instance singleton, embeds the generated TypeScript application, and
 delegates all configuration validation and atomic save behavior back to Rust. A save acquires the
-shared runtime singleton only for the mutation, verifies the browser revision immediately before the
-atomic replace, and releases the singleton before serving the next request. The process stops after
-10 minutes without an active browser heartbeat and has an absolute one-hour lifetime.
+shared runtime singleton only for the mutation. Every supported CLI/UI writer is required to hold the
+typed mutation guard, then verifies the browser revision immediately before the atomic replace and
+releases the singleton before serving the next request. Direct config file editing is unsupported.
+The process stops after 10 minutes without an active browser heartbeat and has an absolute one-hour lifetime.
 The lower-level `init` command remains available for automation. Install creates the root, logs,
 queue, state, and runtime directories with mode 0700 and creates config.json with mode 0600.
 Existing configuration is validated and preserved. Broad permissions,

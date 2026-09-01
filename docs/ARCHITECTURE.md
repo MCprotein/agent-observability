@@ -40,7 +40,8 @@ versioned config DTO만 사용한다. report는 self-contained static HTML이며
 inbound adapter를 사용한다. token, exact Host/Origin, body bound, no-store와 optimistic revision을
 검증하며 persistent daemon이나 외부 network 경로를 만들지 않는다. CLI composition root가 private
 runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui는 UI instance lock만 유지하고
-설정 mutation 동안에만 shared runtime lock과 revision compare-and-replace를 사용한다.
+모든 지원 CLI/UI writer는 설정 mutation 동안 타입으로 강제된 shared guard를 획득한 뒤 그 안에서
+revision 확인과 atomic replace를 순서대로 수행한다. `config.json` 직접 편집은 지원 경계 밖이다.
 
 ## Deployment profiles
 
