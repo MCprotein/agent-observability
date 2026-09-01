@@ -45,6 +45,6 @@ function viewSpan(status: CostStatus, estimatedCost: number | undefined, metrics
     attributes: {},
     metrics,
     cost: { status, rate_table: {}, cost: { assumption: "fixture" } },
-    estimatedCost,
+    ...(estimatedCost === undefined ? {} : { estimatedCost }),
   };
 }

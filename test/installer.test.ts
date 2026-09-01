@@ -110,6 +110,71 @@ test("checksum failure preserves an existing installation and profile", (t) => {
   assert.equal(readFileSync(join(fixture.home, ".zshrc"), "utf8"), "existing profile\n");
 });
 
+test("unmanaged agentobs command blocks installation without replacing either command", (t) => {
+  const fixture = makeFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  const binDir = join(fixture.home, ".local", "bin");
+  const binary = join(binDir, "agent-observability");
+  const alias = join(binDir, "agentobs");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(binary, "existing binary\n");
+  writeFileSync(alias, "unrelated command\n");
+
+  const result = spawnSync("sh", [installer], { encoding: "utf8", env: fixture.env });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /command alias is not managed by this installer/);
+  assert.equal(readFileSync(binary, "utf8"), "existing binary\n");
+  assert.equal(readFileSync(alias, "utf8"), "unrelated command\n");
+});
+
+test("agentobs directory collision blocks installation before replacing the binary", (t) => {
+  const fixture = makeFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  const binDir = join(fixture.home, ".local", "bin");
+  const binary = join(binDir, "agent-observability");
+  mkdirSync(join(binDir, "agentobs"), { recursive: true });
+  writeFileSync(binary, "existing binary\n");
+
+  const result = spawnSync("sh", [installer], { encoding: "utf8", env: fixture.env });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /command alias is not managed by this installer/);
+  assert.equal(readFileSync(binary, "utf8"), "existing binary\n");
+});
+
+test("alias publication failure rolls back the primary command", (t) => {
+  const fixture = makeFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  const binDir = join(fixture.home, ".local", "bin");
+  const binary = join(binDir, "agent-observability");
+  const alias = join(binDir, "agentobs");
+  const stubDir = join(fixture.root, "stub-bin");
+  mkdirSync(binDir, { recursive: true });
+  mkdirSync(stubDir);
+  writeFileSync(binary, "existing binary\n");
+  writeFileSync(
+    join(stubDir, "mv"),
+    `#!/bin/sh
+for last do :; done
+case "$last" in
+  */agentobs) exit 73 ;;
+esac
+exec /bin/mv "$@"
+`,
+  );
+  chmodSync(join(stubDir, "mv"), 0o755);
+
+  const result = spawnSync("sh", [installer], {
+    encoding: "utf8",
+    env: { ...fixture.env, PATH: `${stubDir}:${fixture.env.PATH}` },
+  });
+  assert.equal(result.status, 73);
+  assert.equal(readFileSync(binary, "utf8"), "existing binary\n");
+  assert.equal(lstatSync(alias, { throwIfNoEntry: false }), undefined);
+});
+
 test("custom install and profile paths remain valid shell syntax", (t) => {
   const fixture = makeFixture();
   t.after(() => rmSync(fixture.root, { recursive: true, force: true }));

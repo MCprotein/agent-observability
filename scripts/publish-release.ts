@@ -176,7 +176,7 @@ function main(): void {
   if (command === "draft" && value) return ensureDraft(value);
   if (command === "package" && value) return publishPackage(value);
   if (command === "finalize" && value) return finalizeRelease(value);
-  throw new Error("usage: publish-release.mjs <draft TAG|package VERSION|finalize TAG>");
+  throw new Error("usage: tsx scripts/publish-release.ts <draft TAG|package VERSION|finalize TAG>");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

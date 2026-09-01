@@ -44,8 +44,10 @@ try {
   await bootstrapFailurePage.locator("text=설정 세션이 종료되었습니다").waitFor();
   assert.equal(await bootstrapFailurePage.evaluate(() => sessionStorage.length), 0);
   assert.equal(bootstrapFailures.length, 1);
-  assert.equal(bootstrapFailures[0].url(), `${origin}/api/config`);
-  assert.equal(bootstrapFailures[0].method(), "GET");
+  const bootstrapFailure = bootstrapFailures[0];
+  assert.ok(bootstrapFailure);
+  assert.equal(bootstrapFailure.url(), `${origin}/api/config`);
+  assert.equal(bootstrapFailure.method(), "GET");
   assert.deepEqual(bootstrapPageErrors, []);
   await bootstrapFailurePage.close();
 
@@ -116,7 +118,9 @@ try {
       const defaultCadenceMarkers = await page.locator("#cadence-visual [data-marker]").evaluateAll(
         (markers) => markers.map((marker) => marker.getBoundingClientRect()),
       );
-      assert.equal(rectanglesOverlap(defaultCadenceMarkers[0], defaultCadenceMarkers[1]), false);
+      const [firstCadenceMarker, secondCadenceMarker] = defaultCadenceMarkers;
+      assert.ok(firstCadenceMarker && secondCadenceMarker);
+      assert.equal(rectanglesOverlap(firstCadenceMarker, secondCadenceMarker), false);
     }
 
     if (testCase.name === "desktop") {
@@ -242,7 +246,11 @@ try {
       const heartbeatMarkers = await page.locator("#heartbeat-visual [data-marker]").evaluateAll(
         (markers) => markers.map((marker) => Number.parseFloat(marker.style.left)),
       );
-      assert.equal(heartbeatMarkers[0] > heartbeatMarkers[1], true);
+      const [activeHeartbeat, idleHeartbeat] = heartbeatMarkers;
+      if (activeHeartbeat === undefined || idleHeartbeat === undefined) {
+        throw new Error("heartbeat visualization markers are missing");
+      }
+      assert.equal(activeHeartbeat > idleHeartbeat, true);
       if (testCase.name === "compact") {
         const navigationWidth = await page.locator(".section-nav").evaluate((navigation) => ({
           client: navigation.clientWidth,
@@ -332,9 +340,10 @@ function readUrl(process: SettingsProcess): Promise<string> {
     process.stdout.on("data", (chunk: string) => {
       stdout += chunk;
       const match = stdout.match(/^url=(.+)$/m);
-      if (match) {
+      const matchedUrl = match?.[1];
+      if (matchedUrl) {
         clearTimeout(timeout);
-        resolve(match[1].trim());
+        resolve(matchedUrl.trim());
       }
     });
     process.once("exit", (code) => {

@@ -152,6 +152,12 @@ jobs:
           test "$(stage/package/bin/agent-observability --version)" = "$version"
           rm -rf stage/package
 
+          package_prefix="$RUNNER_TEMP/agent-observability-npm-prefix"
+          npm install --global --prefix "$package_prefix" \
+            "./dist/mcprotein-agent-observability-$version.tgz"
+          test "$("$package_prefix/bin/agentobs" --version)" = "$version"
+          test "$("$package_prefix/bin/agent-observability" --version)" = "$version"
+
           (
             cd dist
             shasum -a 256 -- *.tar.gz *.tgz install.sh > SHA256SUMS
