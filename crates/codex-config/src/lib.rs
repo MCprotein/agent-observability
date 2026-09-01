@@ -469,8 +469,11 @@ impl CodexConfigManager {
             return Ok(None);
         };
         validate_private_dir_metadata(&self.state_dir, &state_metadata)?;
-        let _lock = self.lock()?;
         let snapshot_path = self.snapshot_path();
+        if checked_metadata(&snapshot_path)?.is_none() {
+            return Ok(None);
+        }
+        let _lock = self.lock()?;
         let Some(metadata) = checked_metadata(&snapshot_path)? else {
             return Ok(None);
         };
@@ -1937,6 +1940,22 @@ mod tests {
             ConnectionStatus::Disconnected
         );
         assert_eq!(fs::read(root.join("config.toml")).unwrap(), unrelated);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ownership_status_without_snapshot_does_not_require_codex_home() {
+        let root = root("ownership-status-without-codex-home");
+        prepare(&root);
+        let state = root.join("state");
+        fs::create_dir(&state).unwrap();
+        set_mode(&state, 0o700).unwrap();
+        let codex_home = root.join("missing-codex-home");
+        let recovery =
+            CodexConfigManager::from_ownership_snapshot(codex_home.join("config.toml"), state);
+
+        assert_eq!(recovery.ownership_status().unwrap(), None);
+        assert!(!codex_home.exists());
         let _ = fs::remove_dir_all(root);
     }
 
