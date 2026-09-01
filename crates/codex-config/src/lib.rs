@@ -447,17 +447,29 @@ impl CodexConfigManager {
     }
 
     fn lock(&self) -> Result<MutationLock, ConfigError> {
+        // Creation can race another supported writer. Revalidate the winning directory before
+        // opening its lock file; never chmod a directory created by somebody else.
+        validate_private_dir(&self.state_dir)?;
         MutationLock::acquire(&self.state_dir.join(LOCK_FILE))
     }
 
     fn ensure_private_state_dir(&self) -> Result<(), ConfigError> {
-        if let Some(metadata) = checked_metadata(&self.state_dir)? {
-            validate_private_dir_metadata(&self.state_dir, &metadata)
-        } else {
-            fs::create_dir_all(&self.state_dir)?;
-            set_mode(&self.state_dir, 0o700)?;
-            validate_private_dir(&self.state_dir)
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
         }
+        match builder.create(&self.state_dir) {
+            Ok(()) => {
+                if let Some(parent) = self.state_dir.parent() {
+                    sync_dir(parent)?;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        validate_private_dir(&self.state_dir)
     }
 
     fn managed_values(&self) -> ManagedValues {
@@ -600,17 +612,6 @@ impl<'a> FileExpectation<'a> {
             Self::Missing => !file.existed,
             Self::Present { bytes, mode } => file.matches(bytes, mode),
         }
-    }
-
-    fn matches_metadata(self, path: &Path) -> Result<bool, ConfigError> {
-        let metadata = checked_metadata(path)?;
-        Ok(match (self, metadata) {
-            (Self::Missing, None) => true,
-            (Self::Present { mode, .. }, Some(metadata)) => {
-                metadata.is_file() && unix_mode(&metadata) == mode
-            }
-            _ => false,
-        })
     }
 }
 
@@ -866,6 +867,23 @@ fn atomic_replace(
     bytes: &[u8],
     mode: u32,
 ) -> Result<(), ConfigError> {
+    atomic_replace_with(path, expected, bytes, mode, |_| Ok(()))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtomicReplaceBoundary {
+    TempSynced,
+    ExpectationChecked,
+    Renamed,
+}
+
+fn atomic_replace_with(
+    path: &Path,
+    expected: FileExpectation<'_>,
+    bytes: &[u8],
+    mode: u32,
+    mut boundary: impl FnMut(AtomicReplaceBoundary) -> Result<(), ConfigError>,
+) -> Result<(), ConfigError> {
     let parent = path
         .parent()
         .ok_or(ConfigError::InvalidArgument("configuration path"))?;
@@ -880,44 +898,28 @@ fn atomic_replace(
         }
         let mut file = options.open(&temp)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
         set_mode(&temp, mode)?;
-        match expected {
-            FileExpectation::Missing => install_without_replace(&temp, path)?,
-            FileExpectation::Present { .. } => {
-                let displaced = unique_sibling(path, "displaced");
-                match fs::rename(path, &displaced) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        return Err(ConfigError::Conflict);
-                    }
-                    Err(error) => return Err(error.into()),
-                }
+        file.sync_all()?;
+        boundary(AtomicReplaceBoundary::TempSynced)?;
 
-                if !expected.matches_metadata(&displaced)? {
-                    restore_displaced(&displaced, path)?;
-                    return Err(ConfigError::Conflict);
-                }
-                let displaced_file = read_optional_private_file(&displaced)?;
-                if !expected.matches(&displaced_file) {
-                    restore_displaced(&displaced, path)?;
-                    return Err(ConfigError::Conflict);
-                }
-                if let Err(error) = install_without_replace(&temp, path) {
-                    restore_displaced(&displaced, path)?;
-                    return Err(error);
-                }
-
-                let installed = read_optional_private_file(path)?;
-                let displaced_after = read_optional_private_file(&displaced)?;
-                if !installed.matches(bytes, mode) || !expected.matches(&displaced_after) {
-                    return Err(ConfigError::Conflict);
-                }
-                fs::remove_file(&displaced)?;
-            }
+        let current = read_optional_private_file(path)?;
+        if !expected.matches(&current) {
+            return Err(ConfigError::Conflict);
         }
-        fs::remove_file(&temp)?;
+        boundary(AtomicReplaceBoundary::ExpectationChecked)?;
+
+        // Supported writers share the private lock held by the caller. A filesystem has no
+        // portable compare-and-swap that can exclude arbitrary non-cooperating open-FD writes
+        // between this exact bytes/mode check and rename. Keeping the canonical name in place
+        // until this atomic rename means a crash can expose only the complete old or new file.
+        fs::rename(&temp, path)?;
+        boundary(AtomicReplaceBoundary::Renamed)?;
         sync_dir(parent)?;
+
+        let installed = read_optional_private_file(path)?;
+        if !installed.matches(bytes, mode) {
+            return Err(ConfigError::Conflict);
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -926,52 +928,17 @@ fn atomic_replace(
     result
 }
 
-fn install_without_replace(source: &Path, destination: &Path) -> Result<(), ConfigError> {
-    match fs::hard_link(source, destination) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(ConfigError::Conflict),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn restore_displaced(displaced: &Path, path: &Path) -> Result<(), ConfigError> {
-    install_without_replace(displaced, path)?;
-    fs::remove_file(displaced)?;
-    if let Some(parent) = path.parent() {
-        sync_dir(parent)?;
-    }
-    Ok(())
-}
-
 fn remove_checked(path: &Path, expected: FileExpectation<'_>) -> Result<(), ConfigError> {
-    if matches!(expected, FileExpectation::Missing) {
-        return if checked_metadata(path)?.is_none() {
-            Ok(())
-        } else {
-            Err(ConfigError::Conflict)
-        };
-    }
     let parent = path
         .parent()
         .ok_or(ConfigError::InvalidArgument("configuration path"))?;
-    let displaced = unique_sibling(path, "removed");
-    match fs::rename(path, &displaced) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(ConfigError::Conflict);
-        }
-        Err(error) => return Err(error.into()),
-    }
-    if !expected.matches_metadata(&displaced)? {
-        restore_displaced(&displaced, path)?;
+    let current = read_optional_private_file(path)?;
+    if !expected.matches(&current) {
         return Err(ConfigError::Conflict);
     }
-    let displaced_file = read_optional_private_file(&displaced)?;
-    if !expected.matches(&displaced_file) {
-        restore_displaced(&displaced, path)?;
-        return Err(ConfigError::Conflict);
+    if current.existed {
+        fs::remove_file(path)?;
     }
-    fs::remove_file(displaced)?;
     sync_dir(parent)?;
     Ok(())
 }
@@ -1053,6 +1020,7 @@ mod tests {
     use super::*;
     use std::{
         cell::Cell,
+        io::{Seek, SeekFrom},
         sync::{Arc, Barrier},
         thread,
         time::{SystemTime, UNIX_EPOCH},
@@ -1540,6 +1508,82 @@ mod tests {
     }
 
     #[test]
+    fn atomic_replace_crash_boundaries_never_strand_the_canonical_file() {
+        for boundary in [
+            AtomicReplaceBoundary::TempSynced,
+            AtomicReplaceBoundary::ExpectationChecked,
+            AtomicReplaceBoundary::Renamed,
+        ] {
+            let root = root(&format!("replace-crash-{boundary:?}"));
+            prepare(&root);
+            let path = root.join("config.toml");
+            let old = b"model = 'old'\n";
+            let new = b"model = 'new'\n";
+            fs::write(&path, old).unwrap();
+            set_mode(&path, 0o400).unwrap();
+
+            let result = atomic_replace_with(
+                &path,
+                FileExpectation::present_bytes(old, 0o400),
+                new,
+                0o600,
+                |reached| {
+                    if reached == boundary {
+                        Err(ConfigError::Io(io::Error::other("simulated crash")))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+
+            assert!(matches!(result, Err(ConfigError::Io(_))));
+            assert!(path.exists(), "canonical path missing at {boundary:?}");
+            if boundary == AtomicReplaceBoundary::Renamed {
+                assert_eq!(fs::read(&path).unwrap(), new);
+                assert_eq!(unix_mode(&fs::metadata(&path).unwrap()), 0o600);
+            } else {
+                assert_eq!(fs::read(&path).unwrap(), old);
+                assert_eq!(unix_mode(&fs::metadata(&path).unwrap()), 0o400);
+            }
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn non_cooperating_open_fd_write_cannot_be_portably_cased() {
+        let root = root("open-fd-cas-limit");
+        prepare(&root);
+        let path = root.join("config.toml");
+        let old = b"model = 'old'\n";
+        let new = b"model = 'new'\n";
+        fs::write(&path, old).unwrap();
+        set_mode(&path, 0o600).unwrap();
+        let mut external = OpenOptions::new().write(true).open(&path).unwrap();
+
+        atomic_replace_with(
+            &path,
+            FileExpectation::present_bytes(old, 0o600),
+            new,
+            0o600,
+            |boundary| {
+                if boundary == AtomicReplaceBoundary::ExpectationChecked {
+                    external.seek(SeekFrom::Start(0))?;
+                    external.write_all(b"non-cooperating write\n")?;
+                    external.set_len(22)?;
+                    external.sync_all()?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        // There is no portable content-CAS rename against an arbitrary writer. The supported
+        // writer still never removes the canonical name: its complete replacement wins here.
+        assert_eq!(fs::read(&path).unwrap(), new);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn concurrent_supported_mutations_are_serialized() {
         let root = root("serialized-mutations");
         prepare(&root);
@@ -1561,6 +1605,47 @@ mod tests {
         assert_eq!(manager.status().unwrap(), ConnectionStatus::Connected);
         manager.disconnect().unwrap();
         assert!(!manager.config_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_state_dir_initialization_is_atomic_and_private() {
+        let root = root("state-dir-init");
+        prepare(&root);
+        let manager = Arc::new(manager(&root));
+        let start = Arc::new(Barrier::new(17));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let manager = Arc::clone(&manager);
+            let start = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                manager.ensure_private_state_dir()
+            }));
+        }
+        start.wait();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(unix_mode(&fs::metadata(&manager.state_dir).unwrap()), 0o700);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_dir_initialization_revalidates_an_existing_race_winner() {
+        let root = root("state-dir-race-winner");
+        prepare(&root);
+        let manager = manager(&root);
+        fs::create_dir(&manager.state_dir).unwrap();
+        set_mode(&manager.state_dir, 0o755).unwrap();
+
+        assert!(matches!(
+            manager.ensure_private_state_dir(),
+            Err(ConfigError::InsecurePermissions(path)) if path == manager.state_dir
+        ));
+        assert_eq!(unix_mode(&fs::metadata(&manager.state_dir).unwrap()), 0o755);
         let _ = fs::remove_dir_all(root);
     }
 
