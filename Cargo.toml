@@ -31,3 +31,9 @@ missing_debug_implementations = "deny"
 [workspace.lints.clippy]
 all = "deny"
 pedantic = "deny"
+
+[workspace.dependencies]
+rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = { version = "=0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
+time = "=0.3.44"

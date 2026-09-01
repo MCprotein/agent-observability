@@ -187,7 +187,7 @@ fn validate_capability_entry(entry: &AdapterCapabilityEntryV1) -> Result<(), Con
 fn validate_codex_automatic_local_capability(
     capability: &CodexAutomaticLocalCapabilityV1,
 ) -> Result<(), ContractError> {
-    if capability.capability_version != "codex_automatic_local.v1"
+    if capability.capability_version != "codex_automatic_local.v2"
         || capability.adapter_family != "codex"
         || capability.support_status != "supported"
         || capability.platforms != ["macos"]
@@ -198,7 +198,7 @@ fn validate_codex_automatic_local_capability(
         || capability.official_references.iter().any(|reference| {
             !reference.starts_with(concat!("https", "://developers.openai.com/codex/"))
         })
-        || capability.receiver_boundary != "authenticated_ipv4_loopback_otlp_http_json_v1"
+        || capability.receiver_boundary != "mutual_tls_ipv4_loopback_otlp_http_json_v2"
         || capability.source_generation != "codex-otel-v1"
         || capability.manual_ingest_boundary != "private_canonical_handoff_v1"
         || capability.team_ingest != "disabled"
@@ -216,7 +216,7 @@ fn validate_codex_automatic_local_capability(
     let primary = &capability.source_surfaces[0];
     if primary.id != "codex_otlp_http_json_logs_v1"
         || primary.role != "primary"
-        || primary.transport != "ipv4_loopback_http_json"
+        || primary.transport != "ipv4_loopback_https_mtls_json"
         || primary.endpoint != "/v1/logs"
         || primary.events
             != [
@@ -232,7 +232,7 @@ fn validate_codex_automatic_local_capability(
     let supplement = &capability.source_surfaces[1];
     if supplement.id != "codex_notify_agent_turn_complete_v1"
         || supplement.role != "supplement"
-        || supplement.transport != "ipv4_loopback_http_json"
+        || supplement.transport != "ipv4_loopback_https_mtls_json_projected"
         || supplement.endpoint != "/v1/notify"
         || supplement.events != ["agent-turn-complete"]
     {
@@ -1776,12 +1776,12 @@ mod tests {
             .automatic_local_capabilities
             .first()
             .expect("Codex automatic local capability exists");
-        assert_eq!(automatic.capability_version, "codex_automatic_local.v1");
+        assert_eq!(automatic.capability_version, "codex_automatic_local.v2");
         assert_eq!(automatic.product_version, "0.151.0");
         assert_eq!(automatic.verified_at, "2026-09-02");
         assert_eq!(
             automatic.receiver_boundary,
-            "authenticated_ipv4_loopback_otlp_http_json_v1"
+            "mutual_tls_ipv4_loopback_otlp_http_json_v2"
         );
         assert_eq!(automatic.source_generation, "codex-otel-v1");
         assert_eq!(automatic.manual_ingest_boundary, codex.ingest_boundary);

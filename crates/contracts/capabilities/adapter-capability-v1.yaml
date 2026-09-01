@@ -208,7 +208,7 @@
   ],
   "automatic_local_capabilities": [
     {
-      "capability_version": "codex_automatic_local.v1",
+      "capability_version": "codex_automatic_local.v2",
       "adapter_family": "codex",
       "support_status": "supported",
       "platforms": ["macos"],
@@ -219,13 +219,13 @@
         "https://developers.openai.com/codex/config-advanced",
         "https://developers.openai.com/codex/config-reference"
       ],
-      "receiver_boundary": "authenticated_ipv4_loopback_otlp_http_json_v1",
+      "receiver_boundary": "mutual_tls_ipv4_loopback_otlp_http_json_v2",
       "source_generation": "codex-otel-v1",
       "source_surfaces": [
         {
           "id": "codex_otlp_http_json_logs_v1",
           "role": "primary",
-          "transport": "ipv4_loopback_http_json",
+          "transport": "ipv4_loopback_https_mtls_json",
           "endpoint": "/v1/logs",
           "events": [
             "codex.conversation_starts",
@@ -238,7 +238,7 @@
         {
           "id": "codex_notify_agent_turn_complete_v1",
           "role": "supplement",
-          "transport": "ipv4_loopback_http_json",
+          "transport": "ipv4_loopback_https_mtls_json_projected",
           "endpoint": "/v1/notify",
           "events": ["agent-turn-complete"]
         }

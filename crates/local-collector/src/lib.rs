@@ -3,7 +3,7 @@
 
 use agent_observability_adapter_codex::{
     AdapterBatch, AdapterItem, MAX_HANDOFF_BYTES, OtlpRequestCorrelationState, parse_notify_json,
-    parse_otlp_http_json_with_state,
+    parse_otlp_http_json_with_state, project_notify_json,
 };
 use agent_observability_application::project_report;
 use agent_observability_local_runtime::{
@@ -22,6 +22,16 @@ use axum::{
     routing::{get, post},
     serve::Listener,
 };
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, SanType,
+};
+use rustls::{
+    ClientConfig, ClientConnection, RootCertStore, ServerConfig, StreamOwned,
+    crypto::aws_lc_rs,
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject},
+    server::WebPkiClientVerifier,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -36,16 +46,30 @@ use std::{
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use time::OffsetDateTime;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream as TokioTcpStream},
     sync::{Mutex, OwnedSemaphorePermit, Semaphore},
     time::Sleep,
 };
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
-pub const TOKEN_HEADER: &str = "x-agent-observability-token";
 pub const REPORT_FILE_NAME: &str = "agent-observability-report.html";
-pub const COLLECTOR_SETTINGS_VERSION: &str = "local_collector.v1";
+pub const COLLECTOR_SETTINGS_VERSION: &str = "local_collector.v2";
+pub const COLLECTOR_TRANSPORT: &str = "mtls";
+const TLS_DIRECTORY: &str = "integrations/codex/tls";
+const CA_CERTIFICATE_NAME: &str = "ca-certificate.pem";
+const SERVER_CERTIFICATE_NAME: &str = "server-certificate.pem";
+const SERVER_PRIVATE_KEY_NAME: &str = "server-private-key.pem";
+const CLIENT_CERTIFICATE_NAME: &str = "client-certificate.pem";
+const CLIENT_PRIVATE_KEY_NAME: &str = "client-private-key.pem";
+const CREDENTIAL_LIFETIME: Duration = Duration::from_hours(8_760);
+const SOURCE_GENERATION: &str = "codex-otel-v1";
+const MAX_SETTINGS_BYTES: u64 = 16 * 1024;
+const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
+const MAX_CREDENTIAL_PATH_BYTES: usize = 256;
+static SETTINGS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const REPORT_DIRTY_FILE_NAME: &str = "report-dirty";
 const REPORT_RETRY_LIMIT: u32 = 4;
 const REPORT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
@@ -61,15 +85,42 @@ const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 #[serde(deny_unknown_fields)]
 pub struct CollectorSettings {
     pub schema_version: String,
+    pub generation: String,
     pub port: u16,
-    pub token: String,
-    pub source_generation: String,
+    pub transport: String,
+    pub credentials: CredentialMetadata,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialMetadata {
+    pub ca_certificate: String,
+    pub server_certificate: String,
+    pub server_private_key: String,
+    pub client_certificate: String,
+    pub client_private_key: String,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCollectorSettingsV1 {
+    schema_version: String,
+    port: u16,
+    token: String,
+    source_generation: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PrivateFileSnapshot {
+    bytes: Vec<u8>,
+    mode: u32,
 }
 
 impl CollectorSettings {
     #[must_use]
     pub fn endpoint(&self) -> String {
-        format!("http://127.0.0.1:{}/v1/logs", self.port)
+        format!("https://127.0.0.1:{}/v1/logs", self.port)
     }
 
     #[must_use]
@@ -77,8 +128,8 @@ impl CollectorSettings {
         CollectorOptions {
             root: root.to_path_buf(),
             port: self.port,
-            token: self.token.clone(),
-            source_generation: self.source_generation.clone(),
+            generation: self.generation.clone(),
+            credentials: self.credentials.clone(),
         }
     }
 }
@@ -87,8 +138,8 @@ impl CollectorSettings {
 pub struct CollectorOptions {
     pub root: PathBuf,
     pub port: u16,
-    pub token: String,
-    pub source_generation: String,
+    pub generation: String,
+    pub credentials: CredentialMetadata,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,27 +165,92 @@ pub enum CollectorError {
 pub fn install_settings(root: &Path) -> Result<CollectorSettings, CollectorError> {
     let layout = install(root).map_err(runtime_error)?;
     let path = settings_path(&layout);
-    if path.exists() {
-        return load_settings(root);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let snapshot = read_private_snapshot(&path, MAX_SETTINGS_BYTES)?;
+            if let Ok(settings) = parse_owned_settings(&snapshot.bytes) {
+                if settings.credentials.expires_at_unix_ms > current_unix_ms()? {
+                    validate_owned_credentials(&layout, &settings)?;
+                    return Ok(settings);
+                }
+                validate_owned_credentials(&layout, &settings)?;
+                return replace_settings(&layout, Some(&snapshot));
+            }
+            validate_legacy_settings_for_migration(&snapshot.bytes)?;
+            replace_settings(&layout, Some(&snapshot))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => rotate_settings(&layout),
+        Err(error) => Err(error.into()),
     }
+}
+
+fn validate_legacy_settings_for_migration(bytes: &[u8]) -> Result<(), CollectorError> {
+    let legacy: LegacyCollectorSettingsV1 = serde_json::from_slice(bytes)
+        .map_err(|_| CollectorError::Runtime("invalid legacy collector settings".into()))?;
+    if legacy.schema_version != "local_collector.v1"
+        || legacy.port == 0
+        || legacy.token.len() != 64
+        || !legacy.token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || legacy.source_generation != SOURCE_GENERATION
+    {
+        return Err(CollectorError::Runtime(
+            "invalid legacy collector settings".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn rotate_settings(layout: &InstalledLayout) -> Result<CollectorSettings, CollectorError> {
+    replace_settings(layout, None)
+}
+
+fn replace_settings(
+    layout: &InstalledLayout,
+    expected: Option<&PrivateFileSnapshot>,
+) -> Result<CollectorSettings, CollectorError> {
     let mut random = [0_u8; 32];
     getrandom::fill(&mut random)
         .map_err(|error| CollectorError::Runtime(format!("collector entropy failed: {error}")))?;
-    let token = random
+    let generation = random
         .iter()
-        .fold(String::with_capacity(64), |mut token, byte| {
+        .fold(String::with_capacity(64), |mut value, byte| {
             use std::fmt::Write as _;
-            write!(token, "{byte:02x}").expect("writing to String cannot fail");
-            token
+            write!(value, "{byte:02x}").expect("writing to String cannot fail");
+            value
         });
+    let credentials = match generate_credentials(layout, &generation) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            cleanup_credential_generation(layout, &generation);
+            return Err(error);
+        }
+    };
     let settings = CollectorSettings {
         schema_version: COLLECTOR_SETTINGS_VERSION.into(),
+        generation,
         port: available_port()?,
-        token,
-        source_generation: "codex-otel-v1".into(),
+        transport: COLLECTOR_TRANSPORT.into(),
+        credentials,
     };
-    write_private_json(&path, &settings)?;
+    let write_result = match expected {
+        Some(expected) => {
+            write_private_json_if_unchanged(&settings_path(layout), &settings, expected)
+        }
+        None => write_private_json(&settings_path(layout), &settings),
+    };
+    if let Err(error) = write_result {
+        cleanup_credential_generation(layout, &settings.generation);
+        return Err(error);
+    }
     Ok(settings)
+}
+
+fn cleanup_credential_generation(layout: &InstalledLayout, generation: &str) {
+    let tls_root = layout.runtime.join(TLS_DIRECTORY);
+    let _ = fs::remove_dir_all(tls_root.join(generation));
+    if let Ok(directory) = File::open(tls_root) {
+        let _ = directory.sync_all();
+    }
 }
 
 fn available_port() -> Result<u16, CollectorError> {
@@ -149,18 +265,26 @@ fn available_port() -> Result<u16, CollectorError> {
 pub fn load_settings(root: &Path) -> Result<CollectorSettings, CollectorError> {
     let layout = install(root).map_err(runtime_error)?;
     let path = settings_path(&layout);
-    let mut file = open_private_read(&path)?;
-    let metadata = file.metadata()?;
-    if metadata.len() > 64 * 1024 {
+    let snapshot = read_private_snapshot(&path, MAX_SETTINGS_BYTES)?;
+    let settings = parse_current_settings(&snapshot.bytes)?;
+    validate_owned_credentials(&layout, &settings)?;
+    Ok(settings)
+}
+
+fn parse_current_settings(bytes: &[u8]) -> Result<CollectorSettings, CollectorError> {
+    let settings = parse_owned_settings(bytes)?;
+    if settings.credentials.expires_at_unix_ms <= current_unix_ms()? {
         return Err(CollectorError::Runtime(
-            "collector settings exceed 64 KiB".into(),
+            "local collector credentials expired; reconnect to renew".into(),
         ));
     }
-    let mut body = String::new();
-    file.read_to_string(&mut body)?;
-    let settings: CollectorSettings = serde_json::from_str(&body)
+    Ok(settings)
+}
+
+fn parse_owned_settings(bytes: &[u8]) -> Result<CollectorSettings, CollectorError> {
+    let settings: CollectorSettings = serde_json::from_slice(bytes)
         .map_err(|_| CollectorError::Runtime("invalid collector settings".into()))?;
-    validate_settings(&settings)?;
+    validate_settings_shape(&settings)?;
     Ok(settings)
 }
 
@@ -202,48 +326,199 @@ fn settings_path(layout: &InstalledLayout) -> PathBuf {
     layout.runtime.join("collector.json")
 }
 
-fn validate_settings(settings: &CollectorSettings) -> Result<(), CollectorError> {
+fn validate_settings_shape(settings: &CollectorSettings) -> Result<(), CollectorError> {
     if settings.schema_version != COLLECTOR_SETTINGS_VERSION
         || settings.port == 0
-        || settings.token.len() != 64
-        || !settings.token.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || settings.source_generation.is_empty()
+        || settings.transport != COLLECTOR_TRANSPORT
+        || settings.generation.len() != 64
+        || !settings
+            .generation
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || settings.credentials.expires_at_unix_ms == 0
     {
         return Err(CollectorError::Runtime(
             "invalid local collector settings".into(),
         ));
     }
+    let expected_prefix = format!("{TLS_DIRECTORY}/{}/", settings.generation);
+    for (path, name) in [
+        (&settings.credentials.ca_certificate, CA_CERTIFICATE_NAME),
+        (
+            &settings.credentials.server_certificate,
+            SERVER_CERTIFICATE_NAME,
+        ),
+        (
+            &settings.credentials.server_private_key,
+            SERVER_PRIVATE_KEY_NAME,
+        ),
+        (
+            &settings.credentials.client_certificate,
+            CLIENT_CERTIFICATE_NAME,
+        ),
+        (
+            &settings.credentials.client_private_key,
+            CLIENT_PRIVATE_KEY_NAME,
+        ),
+    ] {
+        if path.len() > MAX_CREDENTIAL_PATH_BYTES || path != &format!("{expected_prefix}{name}") {
+            return Err(CollectorError::Runtime(
+                "invalid local collector credential path".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
-fn write_private_json(path: &Path, settings: &CollectorSettings) -> Result<(), CollectorError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| CollectorError::Runtime("collector settings have no parent".into()))?;
-    let temporary = parent.join(format!(".collector.json.tmp.{}", std::process::id()));
-    let _ = fs::remove_file(&temporary);
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
+fn validate_owned_credentials(
+    layout: &InstalledLayout,
+    settings: &CollectorSettings,
+) -> Result<(), CollectorError> {
+    let generation_dir = layout
+        .runtime
+        .join(TLS_DIRECTORY)
+        .join(&settings.generation);
+    validate_private_directory_tree(&layout.runtime, &generation_dir)?;
+    for relative in [
+        &settings.credentials.ca_certificate,
+        &settings.credentials.server_certificate,
+        &settings.credentials.server_private_key,
+        &settings.credentials.client_certificate,
+        &settings.credentials.client_private_key,
+    ] {
+        read_private_bounded(&credential_path(layout, relative)?, MAX_CREDENTIAL_BYTES)?;
+    }
+    build_server_config(layout, &settings.credentials)?;
+    build_client_config(layout, &settings.credentials)?;
+    Ok(())
+}
+
+fn generate_credentials(
+    layout: &InstalledLayout,
+    generation: &str,
+) -> Result<CredentialMetadata, CollectorError> {
+    let tls_root = layout.runtime.join(TLS_DIRECTORY);
+    ensure_private_directory_tree(&layout.runtime, &tls_root)?;
+    let generation_dir = tls_root.join(generation);
+    create_private_directory(&generation_dir)?;
+
+    let now = OffsetDateTime::now_utc();
+    let not_after = now
+        + time::Duration::try_from(CREDENTIAL_LIFETIME)
+            .map_err(|_| CollectorError::Runtime("credential lifetime is invalid".into()))?;
+    let mut ca_params = CertificateParams::default();
+    ca_params.not_before = now - time::Duration::minutes(1);
+    ca_params.not_after = not_after;
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    ca_params.distinguished_name = distinguished_name("agent-observability local CA");
+    let ca_key = KeyPair::generate().map_err(crypto_error)?;
+    let ca_certificate = ca_params.self_signed(&ca_key).map_err(crypto_error)?;
+    let issuer = Issuer::from_params(&ca_params, &ca_key);
+
+    let server_key = KeyPair::generate().map_err(crypto_error)?;
+    let mut server_params = CertificateParams::default();
+    server_params.not_before = ca_params.not_before;
+    server_params.not_after = ca_params.not_after;
+    server_params.subject_alt_names = vec![SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST))];
+    server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    server_params.distinguished_name = distinguished_name("agent-observability local server");
+    let server_certificate = server_params
+        .signed_by(&server_key, &issuer)
+        .map_err(crypto_error)?;
+
+    let client_key = KeyPair::generate().map_err(crypto_error)?;
+    let mut client_params = CertificateParams::default();
+    client_params.not_before = ca_params.not_before;
+    client_params.not_after = ca_params.not_after;
+    client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    client_params.distinguished_name = distinguished_name("agent-observability local client");
+    let client_certificate = client_params
+        .signed_by(&client_key, &issuer)
+        .map_err(crypto_error)?;
+
+    for (name, bytes) in [
+        (CA_CERTIFICATE_NAME, ca_certificate.pem().into_bytes()),
+        (
+            SERVER_CERTIFICATE_NAME,
+            server_certificate.pem().into_bytes(),
+        ),
+        (
+            SERVER_PRIVATE_KEY_NAME,
+            server_key.serialize_pem().into_bytes(),
+        ),
+        (
+            CLIENT_CERTIFICATE_NAME,
+            client_certificate.pem().into_bytes(),
+        ),
+        (
+            CLIENT_PRIVATE_KEY_NAME,
+            client_key.serialize_pem().into_bytes(),
+        ),
+    ] {
+        write_private_file(&generation_dir.join(name), &bytes)?;
+    }
+    File::open(&generation_dir)?.sync_all()?;
+    File::open(&tls_root)?.sync_all()?;
+
+    let prefix = format!("{TLS_DIRECTORY}/{generation}");
+    Ok(CredentialMetadata {
+        ca_certificate: format!("{prefix}/{CA_CERTIFICATE_NAME}"),
+        server_certificate: format!("{prefix}/{SERVER_CERTIFICATE_NAME}"),
+        server_private_key: format!("{prefix}/{SERVER_PRIVATE_KEY_NAME}"),
+        client_certificate: format!("{prefix}/{CLIENT_CERTIFICATE_NAME}"),
+        client_private_key: format!("{prefix}/{CLIENT_PRIVATE_KEY_NAME}"),
+        expires_at_unix_ms: u64::try_from(not_after.unix_timestamp())
+            .map_err(|_| CollectorError::Runtime("credential expiry is invalid".into()))?
+            .saturating_mul(1_000),
+    })
+}
+
+fn distinguished_name(common_name: &str) -> DistinguishedName {
+    let mut name = DistinguishedName::new();
+    name.push(DnType::CommonName, common_name);
+    name
+}
+
+fn crypto_error(error: impl std::fmt::Display) -> CollectorError {
+    CollectorError::Runtime(format!("collector credential generation failed: {error}"))
+}
+
+fn ensure_private_directory_tree(base: &Path, target: &Path) -> Result<(), CollectorError> {
+    let relative = target
+        .strip_prefix(base)
+        .map_err(|_| CollectorError::Runtime("credential directory escaped runtime".into()))?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        if current.exists() {
+            validate_private_directory(&current)?;
+        } else {
+            create_private_directory(&current)?;
+        }
+    }
+    Ok(())
+}
+
+fn create_private_directory(path: &Path) -> Result<(), CollectorError> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(false);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
     }
-    let mut file = options.open(&temporary)?;
-    serde_json::to_writer_pretty(&mut file, settings)
-        .map_err(|_| CollectorError::Runtime("collector settings serialization failed".into()))?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
+    builder.create(path)?;
+    validate_private_directory(path)
 }
 
-fn open_private_read(path: &Path) -> Result<File, CollectorError> {
+fn validate_private_directory(path: &Path) -> Result<(), CollectorError> {
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(CollectorError::Runtime(
-            "collector settings must be a private regular file".into(),
+            "collector credential directory must be private and regular".into(),
         ));
     }
     #[cfg(unix)]
@@ -251,11 +526,205 @@ fn open_private_read(path: &Path) -> Result<File, CollectorError> {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(CollectorError::Runtime(
-                "collector settings permissions are too broad".into(),
+                "collector credential directory permissions are too broad".into(),
             ));
         }
     }
-    OpenOptions::new().read(true).open(path).map_err(Into::into)
+    Ok(())
+}
+
+fn validate_private_directory_tree(base: &Path, target: &Path) -> Result<(), CollectorError> {
+    let relative = target
+        .strip_prefix(base)
+        .map_err(|_| CollectorError::Runtime("credential directory escaped runtime".into()))?;
+    validate_private_directory(base)?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(CollectorError::Runtime(
+                "collector credential directory path is invalid".into(),
+            ));
+        };
+        current.push(component);
+        validate_private_directory(&current)?;
+    }
+    Ok(())
+}
+
+fn settings_temporary_path(parent: &Path) -> PathBuf {
+    let sequence = SETTINGS_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        ".collector.json.tmp.{}.{}",
+        std::process::id(),
+        sequence
+    ))
+}
+
+fn write_private_json_temporary(
+    path: &Path,
+    settings: &CollectorSettings,
+) -> Result<File, CollectorError> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    serde_json::to_writer_pretty(&mut file, settings)
+        .map_err(|_| CollectorError::Runtime("collector settings serialization failed".into()))?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(file)
+}
+
+fn write_private_json(path: &Path, settings: &CollectorSettings) -> Result<(), CollectorError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CollectorError::Runtime("collector settings have no parent".into()))?;
+    validate_private_directory(parent)?;
+    let temporary = settings_temporary_path(parent);
+    let result = (|| {
+        let file = write_private_json_temporary(&temporary, settings)?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
+fn write_private_json_if_unchanged(
+    path: &Path,
+    settings: &CollectorSettings,
+    expected: &PrivateFileSnapshot,
+) -> Result<(), CollectorError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CollectorError::Runtime("collector settings have no parent".into()))?;
+    validate_private_directory(parent)?;
+    let temporary = settings_temporary_path(parent);
+    let result = (|| {
+        let file = write_private_json_temporary(&temporary, settings)?;
+        drop(file);
+        let current = read_private_snapshot(path, MAX_SETTINGS_BYTES)?;
+        if current != *expected {
+            return Err(CollectorError::Runtime(
+                "collector settings changed during credential replacement".into(),
+            ));
+        }
+        fs::rename(&temporary, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), CollectorError> {
+    if bytes.len() > usize::try_from(MAX_CREDENTIAL_BYTES).expect("credential bound fits usize") {
+        return Err(CollectorError::Runtime(
+            "collector credential exceeds size bound".into(),
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| CollectorError::Runtime("collector credential has no parent".into()))?;
+    validate_private_directory(parent)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn open_private_read(path: &Path) -> Result<File, CollectorError> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(CollectorError::Runtime(
+            "collector file must be a private regular file".into(),
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(CollectorError::Runtime(
+            "collector file must be a private regular file".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(CollectorError::Runtime(
+                "collector file permissions are too broad".into(),
+            ));
+        }
+    }
+    Ok(file)
+}
+
+fn read_private_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, CollectorError> {
+    Ok(read_private_snapshot(path, maximum)?.bytes)
+}
+
+fn read_private_snapshot(path: &Path, maximum: u64) -> Result<PrivateFileSnapshot, CollectorError> {
+    let file = open_private_read(path)?;
+    let metadata = file.metadata()?;
+    if metadata.len() > maximum {
+        return Err(CollectorError::Runtime(
+            "collector file exceeds size bound".into(),
+        ));
+    }
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode()
+    };
+    #[cfg(not(unix))]
+    let mode = u32::from(metadata.permissions().readonly());
+    let mut bytes = Vec::new();
+    file.take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum {
+        return Err(CollectorError::Runtime(
+            "collector file exceeds size bound".into(),
+        ));
+    }
+    Ok(PrivateFileSnapshot { bytes, mode })
+}
+
+fn credential_path(layout: &InstalledLayout, relative: &str) -> Result<PathBuf, CollectorError> {
+    if relative.len() > MAX_CREDENTIAL_PATH_BYTES {
+        return Err(CollectorError::Runtime(
+            "collector credential path exceeds size bound".into(),
+        ));
+    }
+    let relative = Path::new(relative);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(CollectorError::Runtime(
+            "collector credential path is invalid".into(),
+        ));
+    }
+    Ok(layout.runtime.join(relative))
 }
 
 impl std::fmt::Display for CollectorError {
@@ -275,12 +744,82 @@ impl From<std::io::Error> for CollectorError {
     }
 }
 
+fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, CollectorError> {
+    let bytes = read_private_bounded(path, MAX_CREDENTIAL_BYTES)?;
+    let certificates = CertificateDer::pem_slice_iter(&bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(crypto_error)?;
+    if certificates.is_empty() {
+        return Err(CollectorError::Runtime(
+            "collector certificate file is empty".into(),
+        ));
+    }
+    Ok(certificates)
+}
+
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, CollectorError> {
+    let bytes = read_private_bounded(path, MAX_CREDENTIAL_BYTES)?;
+    PrivateKeyDer::from_pem_slice(&bytes).map_err(crypto_error)
+}
+
+fn root_store(certificate: CertificateDer<'static>) -> Result<RootCertStore, CollectorError> {
+    let mut roots = RootCertStore::empty();
+    roots.add(certificate).map_err(crypto_error)?;
+    Ok(roots)
+}
+
+fn build_server_config(
+    layout: &InstalledLayout,
+    credentials: &CredentialMetadata,
+) -> Result<Arc<ServerConfig>, CollectorError> {
+    let ca = load_certificates(&credential_path(layout, &credentials.ca_certificate)?)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CollectorError::Runtime("collector CA certificate is empty".into()))?;
+    let provider = Arc::new(aws_lc_rs::default_provider());
+    let verifier = WebPkiClientVerifier::builder_with_provider(
+        Arc::new(root_store(ca)?),
+        Arc::clone(&provider),
+    )
+    .build()
+    .map_err(crypto_error)?;
+    let certificates =
+        load_certificates(&credential_path(layout, &credentials.server_certificate)?)?;
+    let key = load_private_key(&credential_path(layout, &credentials.server_private_key)?)?;
+    let config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(crypto_error)?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certificates, key)
+        .map_err(crypto_error)?;
+    Ok(Arc::new(config))
+}
+
+fn build_client_config(
+    layout: &InstalledLayout,
+    credentials: &CredentialMetadata,
+) -> Result<Arc<ClientConfig>, CollectorError> {
+    let ca = load_certificates(&credential_path(layout, &credentials.ca_certificate)?)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CollectorError::Runtime("collector CA certificate is empty".into()))?;
+    let certificates =
+        load_certificates(&credential_path(layout, &credentials.client_certificate)?)?;
+    let key = load_private_key(&credential_path(layout, &credentials.client_private_key)?)?;
+    let config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(crypto_error)?
+        .with_root_certificates(root_store(ca)?)
+        .with_client_auth_cert(certificates, key)
+        .map_err(crypto_error)?;
+    Ok(Arc::new(config))
+}
+
 #[derive(Debug)]
 struct CollectorState {
     layout: InstalledLayout,
     store: LocalStore,
     source_generation: String,
-    token: String,
     last_cursor: Option<String>,
     request_correlation: OtlpRequestCorrelationState,
     accepted_requests: u64,
@@ -316,6 +855,17 @@ struct Health {
 pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     validate_options(&options)?;
     let layout = install(&options.root).map_err(runtime_error)?;
+    validate_owned_credentials(
+        &layout,
+        &CollectorSettings {
+            schema_version: COLLECTOR_SETTINGS_VERSION.into(),
+            generation: options.generation.clone(),
+            port: options.port,
+            transport: COLLECTOR_TRANSPORT.into(),
+            credentials: options.credentials.clone(),
+        },
+    )?;
+    let tls_config = build_server_config(&layout, &options.credentials)?;
     let singleton = Singleton::acquire(&layout.runtime.join("collector")).map_err(runtime_error)?;
     let mutation = try_collector_mutation(&layout.runtime)?;
     let config = load(&layout.config).map_err(runtime_error)?;
@@ -324,12 +874,13 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let report_missing = !layout.logs.join(REPORT_FILE_NAME).is_file();
     let report_wakeup = reconcile_report_state(&layout, report_status.pending() || report_missing);
     let report_dirty = report_status.pending() || report_missing;
+    let source_generation = SOURCE_GENERATION.to_owned();
     let last_cursor = store
-        .cursor("codex", &options.source_generation)
+        .cursor("codex", &source_generation)
         .map_err(runtime_error)?;
     let now = current_unix_ms()?;
     let request_correlation = store
-        .codex_request_correlation_state(&options.source_generation)
+        .codex_request_correlation_state(&source_generation)
         .map_err(runtime_error)?
         .map(|snapshot| OtlpRequestCorrelationState::from_persisted_json(&snapshot, now))
         .transpose()
@@ -342,8 +893,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let collector = Arc::new(Mutex::new(CollectorState {
         layout,
         store,
-        source_generation: options.source_generation,
-        token: options.token,
+        source_generation,
         last_cursor,
         request_correlation,
         accepted_requests: 0,
@@ -372,6 +922,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     ));
     let result = serve_transport(
         listener,
+        tls_config,
         app,
         HEADER_READ_TIMEOUT,
         REQUEST_LIFETIME,
@@ -409,13 +960,15 @@ fn router(state: AppState) -> Router {
 
 async fn serve_transport(
     listener: TcpListener,
+    tls_config: Arc<ServerConfig>,
     app: Router,
     header_read_timeout: Duration,
     request_lifetime: Duration,
     max_connections: usize,
 ) -> Result<(), CollectorError> {
     let app = protect_request_lifetime(app, request_lifetime);
-    let listener = TransportListener::new(listener, header_read_timeout, max_connections);
+    let listener =
+        TransportListener::new(listener, tls_config, header_read_timeout, max_connections);
     axum::serve(listener, app).await.map_err(CollectorError::Io)
 }
 
@@ -430,18 +983,26 @@ fn protect_request_lifetime(app: Router, request_lifetime: Duration) -> Router {
     ))
 }
 
-#[derive(Debug)]
 struct TransportListener {
     listener: TcpListener,
+    acceptor: TlsAcceptor,
+    handshake_timeout: Duration,
     header_read_timeout: Duration,
     connection_slots: Arc<Semaphore>,
 }
 
 impl TransportListener {
-    fn new(listener: TcpListener, header_read_timeout: Duration, max_connections: usize) -> Self {
+    fn new(
+        listener: TcpListener,
+        tls_config: Arc<ServerConfig>,
+        header_read_timeout: Duration,
+        max_connections: usize,
+    ) -> Self {
         assert!(max_connections > 0, "collector must admit a connection");
         Self {
             listener,
+            acceptor: TlsAcceptor::from(tls_config),
+            handshake_timeout: header_read_timeout,
             header_read_timeout,
             connection_slots: Arc::new(Semaphore::new(max_connections)),
         }
@@ -459,6 +1020,12 @@ impl Listener for TransportListener {
                 drop(stream);
                 continue;
             };
+            let handshake =
+                tokio::time::timeout(self.handshake_timeout, self.acceptor.accept(stream)).await;
+            let Ok(Ok(stream)) = handshake else {
+                drop(permit);
+                continue;
+            };
             return (
                 ProtectedIo::new(stream, permit, self.header_read_timeout),
                 address,
@@ -473,7 +1040,7 @@ impl Listener for TransportListener {
 
 #[derive(Debug)]
 struct ProtectedIo {
-    stream: TokioTcpStream,
+    stream: TlsStream<TokioTcpStream>,
     _permit: OwnedSemaphorePermit,
     header_read_timeout: Duration,
     header_deadline: Pin<Box<Sleep>>,
@@ -483,7 +1050,7 @@ struct ProtectedIo {
 
 impl ProtectedIo {
     fn new(
-        stream: TokioTcpStream,
+        stream: TlsStream<TokioTcpStream>,
         permit: OwnedSemaphorePermit,
         header_read_timeout: Duration,
     ) -> Self {
@@ -575,10 +1142,6 @@ async fn ingest_preflight(
     next: Next,
 ) -> Response {
     let mut collector = state.collector.lock().await;
-    if !authorized(request.headers(), &collector.token) {
-        collector.rejected_requests = collector.rejected_requests.saturating_add(1);
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
     if !is_json(request.headers()) {
         collector.rejected_requests = collector.rejected_requests.saturating_add(1);
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
@@ -610,11 +1173,8 @@ async fn ingest_notify(State(state): State<AppState>, body: Bytes) -> impl IntoR
     outcome
 }
 
-async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let mut collector = state.collector.lock().await;
-    if !authorized(&headers, &collector.token) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
     let report_pending = collector
         .store
         .report_status()
@@ -659,31 +1219,12 @@ async fn ingest_logs(State(state): State<AppState>, body: Bytes) -> impl IntoRes
     outcome
 }
 
-fn authorized(headers: &HeaderMap, expected: &str) -> bool {
-    headers
-        .get(TOKEN_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| constant_time_equal(value.as_bytes(), expected.as_bytes()))
-}
-
 fn is_json(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
-}
-
-fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1154,80 +1695,112 @@ fn refresh_report_from_root(root: &Path) -> Result<bool, CollectorError> {
     refresh_report(&layout, &store, current_unix_ms()?)
 }
 
-/// Sends the raw notify argument to the local receiver with bounded foreground deadlines.
-/// Receiver failure is represented as an outcome so the CLI helper can always fail open.
+/// Projects and sends a raw notify argument with bounded foreground deadlines.
+/// Projection happens before any settings or network I/O.
 #[must_use]
 pub fn submit_notify(root: &Path, payload: &[u8]) -> NotifyOutcome {
-    let Ok(settings) = load_settings(root) else {
-        return NotifyOutcome::Unavailable;
-    };
-    if payload.len() > 64 * 1024 {
+    let Ok(projected) = project_notify_json(payload) else {
         return NotifyOutcome::Rejected;
-    }
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), settings.port);
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(10)) else {
-        return NotifyOutcome::Unavailable;
     };
-    let deadline = Some(Duration::from_millis(40));
-    if stream.set_write_timeout(deadline).is_err() || stream.set_read_timeout(deadline).is_err() {
-        return NotifyOutcome::Unavailable;
-    }
-    let head = format!(
-        "POST /v1/notify HTTP/1.1\r\nHost: 127.0.0.1\r\n{TOKEN_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        settings.token,
-        payload.len()
-    );
-    if stream.write_all(head.as_bytes()).is_err()
-        || stream.write_all(payload).is_err()
-        || stream.flush().is_err()
-    {
-        return NotifyOutcome::Unavailable;
-    }
-    let mut response = [0_u8; 128];
-    let Ok(bytes) = stream.read(&mut response) else {
-        return NotifyOutcome::Unavailable;
+    let Ok(body) = serde_json::to_vec(&projected) else {
+        return NotifyOutcome::Rejected;
     };
-    let status = std::str::from_utf8(&response[..bytes]).unwrap_or_default();
-    if status.starts_with("HTTP/1.1 200") {
-        NotifyOutcome::Accepted
-    } else {
-        NotifyOutcome::Rejected
+    match authenticated_request(
+        root,
+        "POST",
+        "/v1/notify",
+        Some(&body),
+        Duration::from_millis(50),
+        Duration::from_millis(250),
+    ) {
+        Ok(200) => NotifyOutcome::Accepted,
+        Ok(_) => NotifyOutcome::Rejected,
+        Err(_) => NotifyOutcome::Unavailable,
     }
 }
 
 /// Performs a bounded authenticated health probe against the local collector.
 #[must_use]
 pub fn check_health(root: &Path) -> HealthOutcome {
-    let Ok(settings) = load_settings(root) else {
-        return HealthOutcome::Unavailable;
-    };
-    let request = format!(
-        "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{TOKEN_HEADER}: {}\r\nConnection: close\r\n\r\n",
-        settings.token
-    );
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), settings.port);
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(50)) else {
-        return HealthOutcome::Unavailable;
-    };
-    let timeout = Some(Duration::from_millis(100));
-    if stream.set_write_timeout(timeout).is_err()
-        || stream.set_read_timeout(timeout).is_err()
-        || stream.write_all(request.as_bytes()).is_err()
-        || stream.flush().is_err()
-    {
-        return HealthOutcome::Unavailable;
-    }
-    let mut response = [0_u8; 128];
-    match stream.read(&mut response) {
-        Ok(bytes)
-            if std::str::from_utf8(&response[..bytes])
-                .unwrap_or_default()
-                .starts_with("HTTP/1.1 200") =>
-        {
-            HealthOutcome::Ready
-        }
+    match authenticated_request(
+        root,
+        "GET",
+        "/health",
+        None,
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    ) {
+        Ok(200) => HealthOutcome::Ready,
         _ => HealthOutcome::Unavailable,
     }
+}
+
+/// Sends bounded OTLP JSON through the same authenticated direct-loopback client.
+pub fn submit_otlp_json(root: &Path, payload: &[u8]) -> Result<bool, CollectorError> {
+    if payload.len() > usize::try_from(MAX_HANDOFF_BYTES).unwrap_or(usize::MAX) {
+        return Ok(false);
+    }
+    authenticated_request(
+        root,
+        "POST",
+        "/v1/logs",
+        Some(payload),
+        Duration::from_millis(250),
+        Duration::from_secs(1),
+    )
+    .map(|status| status == 200)
+}
+
+fn authenticated_request(
+    root: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+) -> Result<u16, CollectorError> {
+    let settings = load_settings(root)?;
+    let layout = install(root).map_err(runtime_error)?;
+    let config = build_client_config(&layout, &settings.credentials)?;
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), settings.port);
+    let stream = TcpStream::connect_timeout(&address, connect_timeout)?;
+    stream.set_read_timeout(Some(io_timeout))?;
+    stream.set_write_timeout(Some(io_timeout))?;
+    let server_name = ServerName::try_from("127.0.0.1").map_err(crypto_error)?;
+    let connection = ClientConnection::new(config, server_name).map_err(crypto_error)?;
+    let mut tls = StreamOwned::new(connection, stream);
+    let body = body.unwrap_or_default();
+    let content_headers = if body.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+    };
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{content_headers}Connection: close\r\n\r\n"
+    );
+    tls.write_all(request.as_bytes())?;
+    if !body.is_empty() {
+        tls.write_all(body)?;
+    }
+    tls.flush()?;
+    let mut response = [0_u8; 512];
+    let bytes = tls.read(&mut response)?;
+    parse_http_status(&response[..bytes])
+}
+
+fn parse_http_status(response: &[u8]) -> Result<u16, CollectorError> {
+    let response = std::str::from_utf8(response)
+        .map_err(|_| CollectorError::Runtime("collector response is not UTF-8".into()))?;
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse().ok())
+        .ok_or_else(|| CollectorError::Runtime("collector response is invalid".into()))?;
+    Ok(status)
 }
 
 fn refresh_report(
@@ -1265,9 +1838,13 @@ fn open_store(
 
 fn validate_options(options: &CollectorOptions) -> Result<(), CollectorError> {
     if options.port == 0
-        || options.token.len() < 32
-        || options.source_generation.is_empty()
+        || options.generation.len() != 64
+        || !options
+            .generation
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
         || !options.root.is_absolute()
+        || options.credentials.expires_at_unix_ms <= current_unix_ms()?
     {
         return Err(CollectorError::Runtime(
             "invalid local collector options".into(),
@@ -1322,12 +1899,13 @@ fn runtime_error(error: impl std::fmt::Display) -> CollectorError {
 mod tests {
     use super::{
         AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome,
-        OtlpRequestCorrelationState, REPORT_FILE_NAME, TOKEN_HEADER, admit_request,
-        constant_time_equal, enforce_batch_policy, ingest_locked, ingest_notify_locked,
-        install_settings, is_json, load_settings, open_store, project_report,
-        reconcile_report_state, recover_occupied_persisted_port, refresh_report_from_root,
-        report_dirty_path, router, schedule_report_refresh, settings_path, submit_notify,
-        timestamp_from_unix_ms, watch_report_authority, write_private, write_private_json,
+        OtlpRequestCorrelationState, REPORT_FILE_NAME, admit_request, build_client_config,
+        build_server_config, enforce_batch_policy, ingest_locked, ingest_notify_locked,
+        install_settings, is_json, load_certificates, load_private_key, load_settings, open_store,
+        project_report, read_private_snapshot, reconcile_report_state,
+        recover_occupied_persisted_port, refresh_report_from_root, report_dirty_path, router,
+        schedule_report_refresh, settings_path, submit_notify, timestamp_from_unix_ms,
+        watch_report_authority, write_private, write_private_json, write_private_json_if_unchanged,
     };
     use agent_observability_adapter_codex::{MAX_HANDOFF_BYTES, parse_otlp_http_json};
     use agent_observability_local_runtime::{
@@ -1339,7 +1917,7 @@ mod tests {
         response::IntoResponse,
     };
     use std::{
-        fs,
+        fs::{self, OpenOptions},
         io::{Read, Write},
         net::{Ipv4Addr, TcpListener, TcpStream},
         path::{Path, PathBuf},
@@ -1380,7 +1958,6 @@ mod tests {
             layout,
             store,
             source_generation,
-            token: "a".repeat(64),
             last_cursor,
             request_correlation,
             accepted_requests: 0,
@@ -1438,10 +2015,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let mut state = collector_state(&root);
         let guard = MutationGuard::acquire(&state.layout.runtime).unwrap();
-        let result = ingest_notify_locked(
-            &mut state,
-            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-        );
+        let result = ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1"));
         assert!(matches!(result, Err(IngestError::Busy)));
         assert_eq!(state.store.record_count().unwrap(), 0);
         drop(guard);
@@ -1488,10 +2062,7 @@ mod tests {
         let mut state = collector_state(&root);
         let layout = state.layout.clone();
         let guard = ConfigMutationGuard::acquire(&layout).unwrap();
-        let busy = ingest_notify_locked(
-            &mut state,
-            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-        );
+        let busy = ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1"));
         assert!(matches!(busy, Err(IngestError::Busy)));
 
         let mut config = load(&layout.config).unwrap();
@@ -1499,10 +2070,7 @@ mod tests {
         save(&guard, &config).unwrap();
         drop(guard);
 
-        let retry = ingest_notify_locked(
-            &mut state,
-            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-        );
+        let retry = ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1"));
         assert_eq!(retry.unwrap(), IngestOutcome::Disabled);
         assert_eq!(state.store.record_count().unwrap(), 0);
         let _ = fs::remove_dir_all(root);
@@ -1516,10 +2084,7 @@ mod tests {
         let layout = state.layout.clone();
         inflate_allocated_accounting(&root);
         let guard = ConfigMutationGuard::acquire(&layout).unwrap();
-        let busy = ingest_notify_locked(
-            &mut state,
-            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-        );
+        let busy = ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1"));
         assert!(matches!(busy, Err(IngestError::Busy)));
 
         let mut config = load(&layout.config).unwrap();
@@ -1527,37 +2092,139 @@ mod tests {
         save(&guard, &config).unwrap();
         drop(guard);
 
-        let retry = ingest_notify_locked(
-            &mut state,
-            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-        );
+        let retry = ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1"));
         assert!(matches!(retry, Err(IngestError::Storage)));
         assert_eq!(state.store.record_count().unwrap(), 0);
         let _ = fs::remove_dir_all(root);
     }
 
+    fn projected_notify(thread: &str, turn: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": "codex_projected_notify.v1",
+            "event_name": "agent-turn-complete",
+            "thread_id": thread,
+            "turn_id": turn,
+        }))
+        .unwrap()
+    }
+
+    fn raw_notify(thread: &str, turn: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "type": "agent-turn-complete",
+            "thread-id": thread,
+            "turn-id": turn,
+            "cwd": "/RAW_CWD_SENTINEL",
+            "input-messages": ["RAW_PROMPT_SENTINEL"],
+            "last-assistant-message": "RAW_ASSISTANT_SENTINEL",
+        }))
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn write_private_test_file(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn test_tls_configs(root: &Path) -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
+        let settings = install_settings(root).unwrap();
+        let layout = install(root).unwrap();
+        (
+            build_server_config(&layout, &settings.credentials).unwrap(),
+            build_client_config(&layout, &settings.credentials).unwrap(),
+        )
+    }
+
+    fn tls_stream(
+        port: u16,
+        config: Arc<rustls::ClientConfig>,
+    ) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let timeout = Some(Duration::from_secs(2));
+        stream.set_write_timeout(timeout).unwrap();
+        stream.set_read_timeout(timeout).unwrap();
+        let connection = rustls::ClientConnection::new(
+            config,
+            rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap(),
+        )
+        .unwrap();
+        rustls::StreamOwned::new(connection, stream)
+    }
+
+    fn client_config_with_identity(
+        trust_root: &Path,
+        certificate: Option<&Path>,
+        private_key: Option<&Path>,
+    ) -> Arc<rustls::ClientConfig> {
+        let ca = load_certificates(trust_root)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(super::root_store(ca).unwrap());
+        Arc::new(match (certificate, private_key) {
+            (Some(certificate), Some(private_key)) => builder
+                .with_client_auth_cert(
+                    load_certificates(certificate).unwrap(),
+                    load_private_key(private_key).unwrap(),
+                )
+                .unwrap(),
+            (None, None) => builder.with_no_client_auth(),
+            _ => panic!("certificate and private key must be provided together"),
+        })
+    }
+
+    fn attempt_tls_http(
+        port: u16,
+        config: Arc<rustls::ClientConfig>,
+        server_name: &str,
+    ) -> std::io::Result<Vec<u8>> {
+        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))?;
+        let timeout = Some(Duration::from_secs(1));
+        stream.set_write_timeout(timeout)?;
+        stream.set_read_timeout(timeout)?;
+        let connection = rustls::ClientConnection::new(
+            config,
+            rustls::pki_types::ServerName::try_from(server_name.to_owned())
+                .map_err(std::io::Error::other)?,
+        )
+        .map_err(std::io::Error::other)?;
+        let mut tls = rustls::StreamOwned::new(connection, stream);
+        tls.write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")?;
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response)?;
+        Ok(response)
+    }
+
     async fn post(
         port: u16,
-        token: Option<&str>,
+        config: Arc<rustls::ClientConfig>,
         content_type: Option<&str>,
         body: Vec<u8>,
     ) -> StatusCode {
-        let token = token.map(str::to_owned);
         let content_type = content_type.map(str::to_owned);
         tokio::task::spawn_blocking(move || {
             use std::fmt::Write as _;
 
-            let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-            let timeout = Some(Duration::from_secs(2));
-            stream.set_write_timeout(timeout).unwrap();
-            stream.set_read_timeout(timeout).unwrap();
+            let mut stream = tls_stream(port, config);
             let mut request = format!(
                 "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n",
                 body.len()
             );
-            if let Some(token) = token {
-                write!(request, "{TOKEN_HEADER}: {token}\r\n").unwrap();
-            }
             if let Some(content_type) = content_type {
                 write!(request, "Content-Type: {content_type}\r\n").unwrap();
             }
@@ -1618,59 +2285,6 @@ mod tests {
         write_private_json(&settings_path(&layout), &settings).unwrap();
     }
 
-    fn spawn_response_server(response: Option<&'static [u8]>) -> (u16, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
-            if let Some(response) = response {
-                stream.write_all(response).unwrap();
-            } else {
-                thread::sleep(Duration::from_millis(250));
-            }
-        });
-        (port, handle)
-    }
-
-    fn spawn_consuming_response_server(response: &'static [u8]) -> (u16, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            let mut expected = None;
-            loop {
-                let read = stream.read(&mut buffer).unwrap();
-                request.extend_from_slice(&buffer[..read]);
-                if expected.is_none()
-                    && let Some(header_end) =
-                        request.windows(4).position(|part| part == b"\r\n\r\n")
-                {
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.strip_prefix("Content-Length: ")
-                                .and_then(|value| value.parse::<usize>().ok())
-                        })
-                        .unwrap();
-                    expected = Some(header_end + 4 + length);
-                }
-                if read == 0 || expected.is_some_and(|length| request.len() >= length) {
-                    break;
-                }
-            }
-            stream.write_all(response).unwrap();
-        });
-        (port, handle)
-    }
-
     fn otlp_start_records(count: usize) -> Vec<u8> {
         let records = (0..count)
             .map(|index| {
@@ -1718,13 +2332,6 @@ mod tests {
     }
 
     #[test]
-    fn token_comparison_rejects_length_and_content_mismatch() {
-        assert!(constant_time_equal(b"same", b"same"));
-        assert!(!constant_time_equal(b"same", b"diff"));
-        assert!(!constant_time_equal(b"same", b"shorter"));
-    }
-
-    #[test]
     fn report_timestamp_is_content_free_and_stable() {
         assert_eq!(
             timestamp_from_unix_ms(946_684_800_123).unwrap(),
@@ -1755,17 +2362,23 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
+            let (server_config, client_config) = test_tls_configs(&root);
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
                 .unwrap();
             let port = listener.local_addr().unwrap().port();
-            let transport = super::TransportListener::new(listener, Duration::from_millis(50), 1);
+            let transport = super::TransportListener::new(
+                listener,
+                server_config,
+                Duration::from_millis(50),
+                1,
+            );
             let slots = Arc::clone(&transport.connection_slots);
             let app =
                 super::protect_request_lifetime(router(app_state(&root)), Duration::from_secs(1));
             let server = tokio::spawn(async move { axum::serve(transport, app).await });
             let mut stream = tokio::task::spawn_blocking(move || {
-                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                let mut stream = tls_stream(port, client_config);
                 stream
                     .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1")
                     .unwrap();
@@ -1777,6 +2390,7 @@ mod tests {
 
             let result = tokio::task::spawn_blocking(move || {
                 stream
+                    .sock
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
                 let mut byte = [0_u8; 1];
@@ -1788,7 +2402,9 @@ mod tests {
                 result.as_ref().is_ok_and(|bytes| *bytes == 0)
                     || result.as_ref().is_err_and(|error| matches!(
                         error.kind(),
-                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::UnexpectedEof
                     )),
                 "partial header connection remained open: {result:?}"
             );
@@ -1796,6 +2412,148 @@ mod tests {
             server.abort();
         });
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transport_bounds_an_incomplete_tls_handshake() {
+        let root = test_root("partial-tls-handshake");
+        let _ = fs::remove_dir_all(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let (server_config, _) = test_tls_configs(&root);
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport = super::TransportListener::new(
+                listener,
+                server_config,
+                Duration::from_millis(50),
+                1,
+            );
+            let slots = Arc::clone(&transport.connection_slots);
+            let app = router(app_state(&root));
+            let server = tokio::spawn(async move { axum::serve(transport, app).await });
+            let started = Instant::now();
+            let result = tokio::task::spawn_blocking(move || {
+                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                stream.write_all(&[0x16, 0x03, 0x03]).unwrap();
+                let mut byte = [0_u8; 1];
+                stream.read(&mut byte)
+            })
+            .await
+            .unwrap();
+            let elapsed = started.elapsed();
+            assert!(
+                result.as_ref().is_ok_and(|bytes| *bytes == 0)
+                    || result.as_ref().is_err_and(|error| matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::UnexpectedEof
+                    )),
+                "incomplete TLS handshake remained open: {result:?}"
+            );
+            assert!(elapsed < Duration::from_millis(500), "elapsed={elapsed:?}");
+            wait_for_available_permits(&slots, 1).await;
+            server.abort();
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mtls_rejects_missing_or_wrong_identity_ca_san_and_eku_before_http() {
+        let root = test_root("mtls-rejections");
+        let rogue = test_root("mtls-rejections-rogue");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&rogue);
+        let settings = install_settings(&root).unwrap();
+        let layout = install(&root).unwrap();
+        let rogue_settings = install_settings(&rogue).unwrap();
+        let rogue_layout = install(&rogue).unwrap();
+        let ca = layout.runtime.join(&settings.credentials.ca_certificate);
+        let missing_client = client_config_with_identity(&ca, None, None);
+        let wrong_client = client_config_with_identity(
+            &ca,
+            Some(
+                &rogue_layout
+                    .runtime
+                    .join(&rogue_settings.credentials.client_certificate),
+            ),
+            Some(
+                &rogue_layout
+                    .runtime
+                    .join(&rogue_settings.credentials.client_private_key),
+            ),
+        );
+        let wrong_eku = client_config_with_identity(
+            &ca,
+            Some(
+                &layout
+                    .runtime
+                    .join(&settings.credentials.server_certificate),
+            ),
+            Some(
+                &layout
+                    .runtime
+                    .join(&settings.credentials.server_private_key),
+            ),
+        );
+        let wrong_ca = build_client_config(&rogue_layout, &rogue_settings.credentials).unwrap();
+        let valid = build_client_config(&layout, &settings.credentials).unwrap();
+        let server_config = build_server_config(&layout, &settings.credentials).unwrap();
+        let state = app_state(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport =
+                super::TransportListener::new(listener, server_config, Duration::from_secs(1), 8);
+            let app = router(state.clone());
+            let server = tokio::spawn(async move { axum::serve(transport, app).await });
+
+            for (config, server_name) in [
+                (missing_client, "127.0.0.1"),
+                (wrong_client, "127.0.0.1"),
+                (wrong_ca, "127.0.0.1"),
+                (Arc::clone(&valid), "localhost"),
+                (wrong_eku, "127.0.0.1"),
+            ] {
+                let result = tokio::task::spawn_blocking(move || {
+                    attempt_tls_http(port, config, server_name)
+                })
+                .await
+                .unwrap();
+                assert!(result.is_err(), "invalid TLS peer reached HTTP: {result:?}");
+            }
+
+            let collector = state.collector.lock().await;
+            assert_eq!(collector.accepted_requests, 0);
+            assert_eq!(collector.rejected_requests, 0);
+            drop(collector);
+            let response = tokio::task::spawn_blocking(move || {
+                attempt_tls_http(port, valid, "127.0.0.1").unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(response_status(&response), StatusCode::OK);
+            server.abort();
+        });
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(rogue);
     }
 
     #[test]
@@ -1808,29 +2566,26 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
+            let (server_config, client_config) = test_tls_configs(&root);
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
                 .unwrap();
             let port = listener.local_addr().unwrap().port();
-            let transport = super::TransportListener::new(listener, Duration::from_secs(1), 1);
+            let transport = super::TransportListener::new(
+                listener,
+                server_config,
+                Duration::from_secs(1),
+                1,
+            );
             let app = super::protect_request_lifetime(
                 router(app_state(&root)),
                 Duration::from_millis(50),
             );
             let server = tokio::spawn(async move { axum::serve(transport, app).await });
             let response = tokio::task::spawn_blocking(move || {
-                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                let mut stream = tls_stream(port, client_config);
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
-                stream
-                    .write_all(
-                        format!(
-                            "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\n{TOKEN_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{{",
-                            "a".repeat(64)
-                        )
-                        .as_bytes(),
-                    )
+                    .write_all(b"POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{")
                     .unwrap();
                 let mut response = Vec::new();
                 stream.read_to_end(&mut response).unwrap();
@@ -1854,38 +2609,27 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
+            let (server_config, client_config) = test_tls_configs(&root);
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
                 .unwrap();
             let port = listener.local_addr().unwrap().port();
-            let transport = super::TransportListener::new(listener, Duration::from_secs(1), 2);
+            let transport = super::TransportListener::new(
+                listener,
+                server_config,
+                Duration::from_secs(1),
+                2,
+            );
             let state = app_state(&root);
             let app =
                 super::protect_request_lifetime(router(state.clone()), Duration::from_secs(1));
             let server = tokio::spawn(async move { axum::serve(transport, app).await });
             let content_length = MAX_HANDOFF_BYTES + 1;
 
-            let unauthorized = tokio::task::spawn_blocking(move || {
-                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-                let request = format!(
-                    "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{{"
-                );
-                stream.write_all(request.as_bytes()).unwrap();
-                let mut response = Vec::new();
-                stream.read_to_end(&mut response).unwrap();
-                response
-            })
-            .await
-            .unwrap();
-            assert_eq!(response_status(&unauthorized), StatusCode::UNAUTHORIZED);
-
             let invalid_media = tokio::task::spawn_blocking(move || {
-                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                let mut stream = tls_stream(port, client_config);
                 let request = format!(
-                    "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\n{TOKEN_HEADER}: {}\r\nContent-Type: text/plain\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{{",
-                    "a".repeat(64)
+                    "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: text/plain\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{{"
                 );
                 stream.write_all(request.as_bytes()).unwrap();
                 let mut response = Vec::new();
@@ -1898,7 +2642,7 @@ mod tests {
                 response_status(&invalid_media),
                 StatusCode::UNSUPPORTED_MEDIA_TYPE
             );
-            assert_eq!(state.collector.lock().await.rejected_requests, 2);
+            assert_eq!(state.collector.lock().await.rejected_requests, 1);
             server.abort();
         });
         let _ = fs::remove_dir_all(root);
@@ -1914,17 +2658,20 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
+            let (server_config, client_config) = test_tls_configs(&root);
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
                 .unwrap();
             let port = listener.local_addr().unwrap().port();
-            let transport = super::TransportListener::new(listener, Duration::from_secs(2), 1);
+            let transport =
+                super::TransportListener::new(listener, server_config, Duration::from_secs(2), 1);
             let slots = Arc::clone(&transport.connection_slots);
             let app =
                 super::protect_request_lifetime(router(app_state(&root)), Duration::from_secs(1));
             let server = tokio::spawn(async move { axum::serve(transport, app).await });
+            let first_client_config = Arc::clone(&client_config);
             let first = tokio::task::spawn_blocking(move || {
-                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                let mut stream = tls_stream(port, first_client_config);
                 stream
                     .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1")
                     .unwrap();
@@ -1936,11 +2683,11 @@ mod tests {
 
             let saturated_read = tokio::task::spawn_blocking(move || {
                 let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-                let request = format!(
-                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{TOKEN_HEADER}: {}\r\nConnection: close\r\n\r\n",
-                    "a".repeat(64)
-                );
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let request =
+                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
                 stream.write_all(request.as_bytes()).unwrap();
                 let mut byte = [0_u8; 1];
                 stream.read(&mut byte)
@@ -1951,8 +2698,7 @@ mod tests {
                 saturated_read.as_ref().is_ok_and(|bytes| *bytes == 0)
                     || saturated_read.as_ref().is_err_and(|error| matches!(
                         error.kind(),
-                        std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::ConnectionAborted
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
                     )),
                 "saturated connection remained admitted: {saturated_read:?}"
             );
@@ -1960,12 +2706,9 @@ mod tests {
             drop(first);
             wait_for_available_permits(&slots, 1).await;
             let response = tokio::task::spawn_blocking(move || {
-                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-                let request = format!(
-                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{TOKEN_HEADER}: {}\r\nConnection: close\r\n\r\n",
-                    "a".repeat(64)
-                );
+                let mut stream = tls_stream(port, client_config);
+                let request =
+                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
                 stream.write_all(request.as_bytes()).unwrap();
                 let mut response = Vec::new();
                 stream.read_to_end(&mut response).unwrap();
@@ -1980,7 +2723,7 @@ mod tests {
     }
 
     #[test]
-    fn http_receiver_enforces_auth_media_type_json_and_transport_body_bound() {
+    fn http_receiver_enforces_media_type_json_and_transport_body_bound_over_mtls() {
         let root = test_root("http-contract");
         let _ = fs::remove_dir_all(&root);
         let layout = install(&root).unwrap();
@@ -1996,35 +2739,24 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
+            let (server_config, client_config) = test_tls_configs(&root);
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
                 .unwrap();
             let port = listener.local_addr().unwrap().port();
+            let transport =
+                super::TransportListener::new(listener, server_config, Duration::from_secs(1), 4);
             let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
+                axum::serve(transport, app).await.unwrap();
             });
             assert_eq!(
-                post(port, None, Some("application/json"), b"{}".to_vec()).await,
-                StatusCode::UNAUTHORIZED
-            );
-            assert_eq!(
-                post(
-                    port,
-                    Some(&"b".repeat(64)),
-                    Some("application/json"),
-                    b"{}".to_vec(),
-                )
-                .await,
-                StatusCode::UNAUTHORIZED
-            );
-            assert_eq!(
-                post(port, Some(&"a".repeat(64)), None, b"{}".to_vec()).await,
+                post(port, Arc::clone(&client_config), None, b"{}".to_vec()).await,
                 StatusCode::UNSUPPORTED_MEDIA_TYPE
             );
             assert_eq!(
                 post(
                     port,
-                    Some(&"a".repeat(64)),
+                    Arc::clone(&client_config),
                     Some("text/plain"),
                     b"{}".to_vec(),
                 )
@@ -2034,7 +2766,7 @@ mod tests {
             assert_eq!(
                 post(
                     port,
-                    Some(&"a".repeat(64)),
+                    Arc::clone(&client_config),
                     Some("application/json"),
                     b"{".to_vec(),
                 )
@@ -2049,7 +2781,7 @@ mod tests {
             assert_eq!(
                 post(
                     port,
-                    Some(&"a".repeat(64)),
+                    Arc::clone(&client_config),
                     Some("application/json; charset=utf-8"),
                     exact,
                 )
@@ -2059,7 +2791,7 @@ mod tests {
             assert_eq!(
                 post(
                     port,
-                    Some(&"a".repeat(64)),
+                    client_config,
                     Some("application/json"),
                     vec![b' '; usize::try_from(MAX_HANDOFF_BYTES + 1).unwrap()],
                 )
@@ -2127,10 +2859,10 @@ mod tests {
     }
 
     #[test]
-    fn notify_is_fail_open_for_missing_refused_stalled_oversized_and_rejected_receivers() {
+    fn notify_projects_before_io_and_uses_only_authenticated_mtls() {
         let missing = test_root("notify-missing");
         let _ = fs::remove_dir_all(&missing);
-        assert_eq!(submit_notify(&missing, b"{}"), NotifyOutcome::Unavailable);
+        assert_eq!(submit_notify(&missing, b"{}"), NotifyOutcome::Rejected);
 
         let refused = test_root("notify-refused");
         let _ = fs::remove_dir_all(&refused);
@@ -2140,55 +2872,76 @@ mod tests {
             .unwrap()
             .port();
         configure_port(&refused, refused_port);
-        assert_eq!(submit_notify(&refused, b"{}"), NotifyOutcome::Unavailable);
+        assert_eq!(
+            submit_notify(&refused, &raw_notify("thread-1", "turn-1")),
+            NotifyOutcome::Unavailable
+        );
 
         let oversized = vec![b'x'; 64 * 1024 + 1];
         assert_eq!(submit_notify(&refused, &oversized), NotifyOutcome::Rejected);
 
-        let rejected = test_root("notify-rejected");
-        let _ = fs::remove_dir_all(&rejected);
-        let (port, server) = spawn_response_server(Some(
-            b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        ));
-        configure_port(&rejected, port);
-        assert_eq!(submit_notify(&rejected, b"{}"), NotifyOutcome::Rejected);
-        server.join().unwrap();
+        let rogue = test_root("notify-rogue-plaintext");
+        let _ = fs::remove_dir_all(&rogue);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        configure_port(&rogue, port);
+        let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+        let rogue_server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut captured = [0_u8; 4096];
+            let bytes = stream.read(&mut captured).unwrap_or_default();
+            captured_tx.send(captured[..bytes].to_vec()).unwrap();
+        });
+        assert_eq!(
+            submit_notify(&rogue, &raw_notify("thread-rogue", "turn-rogue")),
+            NotifyOutcome::Unavailable
+        );
+        rogue_server.join().unwrap();
+        let captured = captured_rx.recv().unwrap();
+        for forbidden in [
+            b"HTTP/1.1".as_slice(),
+            b"RAW_CWD_SENTINEL".as_slice(),
+            b"RAW_PROMPT_SENTINEL".as_slice(),
+            b"RAW_ASSISTANT_SENTINEL".as_slice(),
+            b"x-agent-observability-token".as_slice(),
+        ] {
+            assert!(
+                !captured
+                    .windows(forbidden.len())
+                    .any(|part| part == forbidden)
+            );
+        }
 
         let accepted = test_root("notify-accepted");
         let _ = fs::remove_dir_all(&accepted);
-        let (port, server) = spawn_response_server(Some(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        ));
-        configure_port(&accepted, port);
-        assert_eq!(submit_notify(&accepted, b"{}"), NotifyOutcome::Accepted);
-        server.join().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (server_config, _) = test_tls_configs(&accepted);
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            configure_port(&accepted, listener.local_addr().unwrap().port());
+            let transport =
+                super::TransportListener::new(listener, server_config, Duration::from_secs(1), 2);
+            let app = router(app_state(&accepted));
+            let server = tokio::spawn(async move { axum::serve(transport, app).await });
+            let root = accepted.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                submit_notify(&root, &raw_notify("thread-ok", "turn-ok"))
+            })
+            .await
+            .unwrap();
+            assert_eq!(outcome, NotifyOutcome::Accepted);
+            server.abort();
+        });
 
-        let exact = test_root("notify-exact-bound");
-        let _ = fs::remove_dir_all(&exact);
-        let (port, server) = spawn_consuming_response_server(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        );
-        configure_port(&exact, port);
-        let mut exact_payload = br#"{"type":"agent-turn-complete"}"#.to_vec();
-        exact_payload.resize(64 * 1024, b' ');
-        assert_eq!(
-            submit_notify(&exact, &exact_payload),
-            NotifyOutcome::Accepted
-        );
-        server.join().unwrap();
-
-        let stalled = test_root("notify-stalled");
-        let _ = fs::remove_dir_all(&stalled);
-        let (port, server) = spawn_response_server(None);
-        configure_port(&stalled, port);
-        let started = Instant::now();
-        assert_eq!(submit_notify(&stalled, b"{}"), NotifyOutcome::Unavailable);
-        let elapsed = started.elapsed();
-        assert!(elapsed >= Duration::from_millis(20), "elapsed={elapsed:?}");
-        assert!(elapsed < Duration::from_millis(500), "elapsed={elapsed:?}");
-        server.join().unwrap();
-
-        for root in [refused, rejected, accepted, exact, stalled] {
+        for root in [refused, rogue, accepted] {
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -2207,13 +2960,230 @@ mod tests {
         let second = install_settings(&root).unwrap();
         assert_eq!(first, second);
         assert_eq!(load_settings(&root).unwrap(), first);
-        assert_eq!(first.token.len(), 64);
+        assert_eq!(first.generation.len(), 64);
+        assert_eq!(first.transport, super::COLLECTOR_TRANSPORT);
         let path = root.join("runtime/collector.json");
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let generation = root
+            .join("runtime")
+            .join(super::TLS_DIRECTORY)
+            .join(&first.generation);
+        assert_eq!(
+            fs::metadata(&generation).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let mut names = fs::read_dir(&generation)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                super::CA_CERTIFICATE_NAME,
+                super::CLIENT_CERTIFICATE_NAME,
+                super::CLIENT_PRIVATE_KEY_NAME,
+                super::SERVER_CERTIFICATE_NAME,
+                super::SERVER_PRIVATE_KEY_NAME,
+            ]
+        );
+        for name in &names {
+            assert_eq!(
+                fs::metadata(generation.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let ca = fs::read_to_string(generation.join(super::CA_CERTIFICATE_NAME)).unwrap();
+        assert!(ca.contains("BEGIN CERTIFICATE"));
+        assert!(!ca.contains("PRIVATE KEY"));
+        let remaining = first.credentials.expires_at_unix_ms - super::current_unix_ms().unwrap();
+        let minimum = u64::try_from(Duration::from_hours(8_736).as_millis()).unwrap();
+        let maximum = u64::try_from(Duration::from_hours(8_784).as_millis()).unwrap();
+        assert!(remaining > minimum);
+        assert!(remaining <= maximum);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_and_credentials_require_private_bounded_regular_files_and_directories() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let oversized_settings = test_root("oversized-settings");
+        let _ = fs::remove_dir_all(&oversized_settings);
+        let _ = install_settings(&oversized_settings).unwrap();
+        let oversized_settings_path = settings_path(&install(&oversized_settings).unwrap());
+        write_private_test_file(
+            &oversized_settings_path,
+            &vec![b'x'; usize::try_from(super::MAX_SETTINGS_BYTES + 1).unwrap()],
+        );
+        assert!(load_settings(&oversized_settings).is_err());
+
+        let oversized_credential = test_root("oversized-credential");
+        let _ = fs::remove_dir_all(&oversized_credential);
+        let settings = install_settings(&oversized_credential).unwrap();
+        let layout = install(&oversized_credential).unwrap();
+        write_private_test_file(
+            &layout
+                .runtime
+                .join(&settings.credentials.client_private_key),
+            &vec![b'x'; usize::try_from(super::MAX_CREDENTIAL_BYTES + 1).unwrap()],
+        );
+        assert!(load_settings(&oversized_credential).is_err());
+
+        let broad_directory = test_root("broad-credential-directory");
+        let _ = fs::remove_dir_all(&broad_directory);
+        let settings = install_settings(&broad_directory).unwrap();
+        let layout = install(&broad_directory).unwrap();
+        let generation = layout
+            .runtime
+            .join(super::TLS_DIRECTORY)
+            .join(&settings.generation);
+        fs::set_permissions(&generation, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(load_settings(&broad_directory).is_err());
+
+        let symlinked_credential = test_root("symlinked-credential");
+        let _ = fs::remove_dir_all(&symlinked_credential);
+        let settings = install_settings(&symlinked_credential).unwrap();
+        let layout = install(&symlinked_credential).unwrap();
+        let client_key = layout
+            .runtime
+            .join(&settings.credentials.client_private_key);
+        fs::remove_file(&client_key).unwrap();
+        symlink(
+            layout.runtime.join(&settings.credentials.ca_certificate),
+            &client_key,
+        )
+        .unwrap();
+        assert!(load_settings(&symlinked_credential).is_err());
+
+        let broad_settings = test_root("broad-settings");
+        let _ = fs::remove_dir_all(&broad_settings);
+        let _ = install_settings(&broad_settings).unwrap();
+        let path = settings_path(&install(&broad_settings).unwrap());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_settings(&broad_settings).is_err());
+
+        for root in [
+            oversized_settings,
+            oversized_credential,
+            broad_directory,
+            symlinked_credential,
+            broad_settings,
+        ] {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_migrates_only_exact_v1_and_renews_only_recognized_expired_v2() {
+        let legacy_root = test_root("legacy-migration");
+        let _ = fs::remove_dir_all(&legacy_root);
+        let legacy_layout = install(&legacy_root).unwrap();
+        write_private_test_file(
+            &settings_path(&legacy_layout),
+            br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#,
+        );
+        let migrated = install_settings(&legacy_root).unwrap();
+        assert_eq!(migrated.schema_version, super::COLLECTOR_SETTINGS_VERSION);
+        assert_eq!(migrated.transport, super::COLLECTOR_TRANSPORT);
+        assert_ne!(migrated.generation, super::SOURCE_GENERATION);
+
+        let expired_root = test_root("expired-renewal");
+        let _ = fs::remove_dir_all(&expired_root);
+        let mut expired = install_settings(&expired_root).unwrap();
+        let expired_generation = expired.generation.clone();
+        expired.credentials.expires_at_unix_ms = 1;
+        let expired_layout = install(&expired_root).unwrap();
+        write_private_json(&settings_path(&expired_layout), &expired).unwrap();
+        assert!(load_settings(&expired_root).is_err());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(
+            runtime
+                .block_on(super::serve(expired.options(&expired_root)))
+                .is_err()
+        );
+        let renewed = install_settings(&expired_root).unwrap();
+        assert_ne!(renewed.generation, expired_generation);
+        assert_eq!(renewed.schema_version, super::COLLECTOR_SETTINGS_VERSION);
+        assert!(renewed.credentials.expires_at_unix_ms > super::current_unix_ms().unwrap());
+        assert_eq!(super::SOURCE_GENERATION, "codex-otel-v1");
+
+        for (name, bytes) in [
+            ("corrupt", b"{".as_slice()),
+            (
+                "partial-v1",
+                br#"{"schema_version":"local_collector.v1","port":4318}"#,
+            ),
+            (
+                "unknown-v3",
+                br#"{"schema_version":"local_collector.v3","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#,
+            ),
+        ] {
+            let root = test_root(name);
+            let _ = fs::remove_dir_all(&root);
+            let layout = install(&root).unwrap();
+            write_private_test_file(&settings_path(&layout), bytes);
+            assert!(install_settings(&root).is_err(), "accepted {name}");
+            let _ = fs::remove_dir_all(root);
+        }
+
+        let _ = fs::remove_dir_all(legacy_root);
+        let _ = fs::remove_dir_all(expired_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_replacement_detects_exact_content_or_mode_conflicts_and_cleans_temporary_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = test_root("settings-conflict");
+        let _ = fs::remove_dir_all(&root);
+        let original = install_settings(&root).unwrap();
+        let layout = install(&root).unwrap();
+        let path = settings_path(&layout);
+        let expected = read_private_snapshot(&path, super::MAX_SETTINGS_BYTES).unwrap();
+        let mut concurrent = original.clone();
+        concurrent.port = concurrent.port.saturating_add(1).max(1);
+        write_private_json(&path, &concurrent).unwrap();
+        let mut replacement = original.clone();
+        replacement.port = replacement.port.saturating_add(2).max(1);
+        assert!(write_private_json_if_unchanged(&path, &replacement, &expected).is_err());
+        assert_eq!(load_settings(&root).unwrap(), concurrent);
+
+        let expected = read_private_snapshot(&path, super::MAX_SETTINGS_BYTES).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(write_private_json_if_unchanged(&path, &replacement, &expected).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(load_settings(&root).unwrap(), concurrent);
+        assert!(fs::read_dir(&layout.runtime).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".collector.json.tmp.")
+        }));
+
+        let symlink_root = test_root("settings-symlink");
+        let _ = fs::remove_dir_all(&symlink_root);
+        let layout = install(&symlink_root).unwrap();
+        let target = layout.runtime.join("missing-target.json");
+        symlink(&target, settings_path(&layout)).unwrap();
+        assert!(install_settings(&symlink_root).is_err());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(symlink_root);
     }
 
     #[test]
@@ -2227,8 +3197,8 @@ mod tests {
 
         assert_ne!(recovered.port, original.port);
         assert_eq!(recovered.schema_version, original.schema_version);
-        assert_eq!(recovered.token, original.token);
-        assert_eq!(recovered.source_generation, original.source_generation);
+        assert_eq!(recovered.generation, original.generation);
+        assert_eq!(recovered.credentials, original.credentials);
         assert_eq!(load_settings(&root).unwrap(), recovered);
         drop(occupied);
         let _ = fs::remove_dir_all(root);
@@ -2252,6 +3222,8 @@ mod tests {
 
     #[test]
     fn explicit_port_recovery_failure_preserves_settings() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = test_root("port-recovery-failure");
         let _ = fs::remove_dir_all(&root);
         let original = install_settings(&root).unwrap();
@@ -2259,16 +3231,13 @@ mod tests {
         let path = settings_path(&layout);
         let original_bytes = fs::read(&path).unwrap();
         let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, original.port)).unwrap();
-        let temporary = layout
-            .runtime
-            .join(format!(".collector.json.tmp.{}", std::process::id()));
-        fs::create_dir(&temporary).unwrap();
+        fs::set_permissions(&layout.runtime, fs::Permissions::from_mode(0o500)).unwrap();
 
         assert!(recover_occupied_persisted_port(&root, &original).is_err());
         assert_eq!(fs::read(&path).unwrap(), original_bytes);
         assert_eq!(load_settings(&root).unwrap(), original);
 
-        fs::remove_dir(temporary).unwrap();
+        fs::set_permissions(&layout.runtime, fs::Permissions::from_mode(0o700)).unwrap();
         drop(occupied);
         let _ = fs::remove_dir_all(root);
     }
@@ -2332,7 +3301,6 @@ mod tests {
             layout: layout.clone(),
             store,
             source_generation: "codex-test".into(),
-            token: "x".repeat(32),
             last_cursor: None,
             request_correlation: OtlpRequestCorrelationState::default(),
             accepted_requests: 0,
@@ -2361,11 +3329,7 @@ mod tests {
         ]}]}]}"#;
 
         ingest_locked(&mut state, body).unwrap();
-        ingest_notify_locked(
-            &mut state,
-            br#"{"type":"agent-turn-complete","thread-id":"conversation-1","turn-id":"turn-1","cwd":"/private/SECRET_PATH","input-messages":["SECRET_PROMPT"],"last-assistant-message":"SECRET_OUTPUT"}"#,
-        )
-        .unwrap();
+        ingest_notify_locked(&mut state, &projected_notify("conversation-1", "turn-1")).unwrap();
         refresh_report_from_root(&layout.root).unwrap();
 
         assert_eq!(state.last_cursor.as_deref(), Some("3"));
@@ -2544,11 +3508,7 @@ mod tests {
         let mut state = collector_state(&root);
         fs::create_dir(report_dirty_path(&state.layout)).unwrap();
 
-        ingest_notify_locked(
-            &mut state,
-            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-        )
-        .unwrap();
+        ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1")).unwrap();
 
         assert_eq!(state.store.record_count().unwrap(), 1);
         assert!(state.store.report_status().unwrap().pending());
@@ -2568,11 +3528,8 @@ mod tests {
         runtime.block_on(async {
             {
                 let mut collector = state.collector.lock().await;
-                ingest_notify_locked(
-                    &mut collector,
-                    br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-                )
-                .unwrap();
+                ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1"))
+                    .unwrap();
             }
             for _ in 0..20 {
                 super::schedule_report_refresh_with_timing(&state, fast_report_timing());
@@ -2620,11 +3577,8 @@ mod tests {
         runtime.block_on(async {
             {
                 let mut collector = state.collector.lock().await;
-                ingest_notify_locked(
-                    &mut collector,
-                    br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-                )
-                .unwrap();
+                ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1"))
+                    .unwrap();
             }
             super::schedule_report_refresh_with_timing(&state, fast_report_timing());
             tokio::time::timeout(Duration::from_secs(1), async {
@@ -2637,11 +3591,8 @@ mod tests {
 
             {
                 let mut collector = state.collector.lock().await;
-                ingest_notify_locked(
-                    &mut collector,
-                    br#"{"type":"agent-turn-complete","thread-id":"thread-2","turn-id":"turn-2"}"#,
-                )
-                .unwrap();
+                ingest_notify_locked(&mut collector, &projected_notify("thread-2", "turn-2"))
+                    .unwrap();
             }
             super::schedule_report_refresh_with_timing(&state, fast_report_timing());
             drop(render_guard);
@@ -2679,11 +3630,8 @@ mod tests {
         runtime.block_on(async {
             {
                 let mut collector = state.collector.lock().await;
-                ingest_notify_locked(
-                    &mut collector,
-                    br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-                )
-                .unwrap();
+                ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1"))
+                    .unwrap();
             }
             schedule_report_refresh(&state);
             tokio::time::sleep(Duration::from_millis(120)).await;
@@ -2691,11 +3639,8 @@ mod tests {
 
             {
                 let mut collector = state.collector.lock().await;
-                ingest_notify_locked(
-                    &mut collector,
-                    br#"{"type":"agent-turn-complete","thread-id":"thread-2","turn-id":"turn-2"}"#,
-                )
-                .unwrap();
+                ingest_notify_locked(&mut collector, &projected_notify("thread-2", "turn-2"))
+                    .unwrap();
             }
             schedule_report_refresh(&state);
             fs::remove_dir(&report).unwrap();
@@ -2743,7 +3688,7 @@ mod tests {
             let mut external = collector_state(&root);
             ingest_notify_locked(
                 &mut external,
-                br#"{"type":"agent-turn-complete","thread-id":"external-thread","turn-id":"external-turn"}"#,
+                &projected_notify("external-thread", "external-turn"),
             )
             .unwrap();
 
@@ -2762,14 +3707,16 @@ mod tests {
             .unwrap();
             watcher.abort();
             let _ = watcher.await;
-            assert!(!state
-                .collector
-                .lock()
-                .await
-                .store
-                .report_status()
-                .unwrap()
-                .pending());
+            assert!(
+                !state
+                    .collector
+                    .lock()
+                    .await
+                    .store
+                    .report_status()
+                    .unwrap()
+                    .pending()
+            );
         });
         let html = fs::read_to_string(root.join("logs").join(REPORT_FILE_NAME)).unwrap();
         assert!(html.contains(r#""generatedSpans":1"#));
@@ -2781,11 +3728,7 @@ mod tests {
         let root = test_root("report-concurrent-ingest");
         let _ = fs::remove_dir_all(&root);
         let mut collector = collector_state(&root);
-        ingest_notify_locked(
-            &mut collector,
-            br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-        )
-        .unwrap();
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
 
         let config = load(&collector.layout.config).unwrap();
         let renderer = open_store_for_test(&collector.layout, &config);
@@ -2816,11 +3759,7 @@ mod tests {
         };
 
         snapshot_ready.wait();
-        ingest_notify_locked(
-            &mut collector,
-            br#"{"type":"agent-turn-complete","thread-id":"thread-2","turn-id":"turn-2"}"#,
-        )
-        .unwrap();
+        ingest_notify_locked(&mut collector, &projected_notify("thread-2", "turn-2")).unwrap();
         ingest_finished.wait();
         assert!(!render_handle.join().unwrap());
         assert!(collector.store.report_status().unwrap().pending());
@@ -2846,11 +3785,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         {
             let mut crashed = collector_state(&root);
-            ingest_notify_locked(
-                &mut crashed,
-                br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-            )
-            .unwrap();
+            ingest_notify_locked(&mut crashed, &projected_notify("thread-1", "turn-1")).unwrap();
             assert!(report_dirty_path(&crashed.layout).is_file());
         }
 
@@ -2899,11 +3834,8 @@ mod tests {
         runtime.block_on(async {
             {
                 let mut collector = state.collector.lock().await;
-                ingest_notify_locked(
-                    &mut collector,
-                    br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
-                )
-                .unwrap();
+                ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1"))
+                    .unwrap();
             }
             schedule_report_refresh(&state);
             for _ in 0..100 {
@@ -2919,14 +3851,7 @@ mod tests {
             assert_eq!(collector.report_refresh_failures, super::REPORT_RETRY_LIMIT);
             drop(collector);
 
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                TOKEN_HEADER,
-                HeaderValue::from_str(&"a".repeat(64)).unwrap(),
-            );
-            let response = super::health(State(state.clone()), headers.clone())
-                .await
-                .into_response();
+            let response = super::health(State(state.clone())).await.into_response();
             let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
                 .await
                 .unwrap();
@@ -2965,9 +3890,7 @@ mod tests {
             watcher.abort();
             let _ = watcher.await;
 
-            let response = super::health(State(state.clone()), headers)
-                .await
-                .into_response();
+            let response = super::health(State(state.clone())).await.into_response();
             let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
                 .await
                 .unwrap();
@@ -2997,7 +3920,7 @@ mod tests {
         ingest_locked(&mut state, otlp).unwrap();
         ingest_notify_locked(
             &mut state,
-            br#"{"type":"agent-turn-complete","thread-id":"RAW_THREAD_SECRET","turn-id":"RAW_TURN_SECRET","cwd":"/private/RAW_PATH_SECRET","input-messages":["RAW_PROMPT_SECRET"],"last-assistant-message":"RAW_OUTPUT_SECRET"}"#,
+            &projected_notify("RAW_THREAD_SECRET", "RAW_TURN_SECRET"),
         )
         .unwrap();
         refresh_report_from_root(&root).unwrap();
@@ -3032,7 +3955,6 @@ mod tests {
             layout: layout.clone(),
             store,
             source_generation: "codex-test".into(),
-            token: "x".repeat(32),
             last_cursor: None,
             request_correlation: OtlpRequestCorrelationState::default(),
             accepted_requests: 0,
@@ -3049,11 +3971,8 @@ mod tests {
         save(&guard, &disabled).unwrap();
         drop(guard);
 
-        let outcome = ingest_notify_locked(
-            &mut state,
-            br#"{"type":"agent-turn-complete","thread-id":"thread","turn-id":"turn","input-messages":["SECRET_PROMPT"]}"#,
-        )
-        .unwrap();
+        let outcome =
+            ingest_notify_locked(&mut state, &projected_notify("thread", "turn")).unwrap();
 
         assert_eq!(outcome, IngestOutcome::Disabled);
         assert_eq!(state.store.counts().unwrap().0, 0);
