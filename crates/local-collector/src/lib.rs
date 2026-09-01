@@ -561,7 +561,7 @@ fn enforce_batch_policy(
     batch: &AdapterBatch,
     config: &LocalRuntimeConfigV2,
 ) -> Result<(), IngestError> {
-    if batch.observations().count() > usize::from(config.collection.max_batch_records) {
+    if batch.items.len() > usize::from(config.collection.max_batch_records) {
         return Err(IngestError::Policy);
     }
     Ok(())
@@ -1038,6 +1038,43 @@ mod tests {
         (port, handle)
     }
 
+    fn spawn_consuming_response_server(response: &'static [u8]) -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let mut expected = None;
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                if expected.is_none()
+                    && let Some(header_end) =
+                        request.windows(4).position(|part| part == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length: ")
+                                .and_then(|value| value.parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    expected = Some(header_end + 4 + length);
+                }
+                if read == 0 || expected.is_some_and(|length| request.len() >= length) {
+                    break;
+                }
+            }
+            stream.write_all(response).unwrap();
+        });
+        (port, handle)
+    }
+
     fn otlp_start_records(count: usize) -> Vec<u8> {
         let records = (0..count)
             .map(|index| {
@@ -1047,6 +1084,17 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join(",");
+        format!(r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{records}]}}]}}]}}"#)
+            .into_bytes()
+    }
+
+    fn otlp_disposition_records(count: usize) -> Vec<u8> {
+        let records = std::iter::repeat_n(
+            r#"{"attributes":[{"key":"event.name","value":{"stringValue":"codex.user_prompt"}}]}"#,
+            count,
+        )
+        .collect::<Vec<_>>()
+        .join(",");
         format!(r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{records}]}}]}}]}}"#)
             .into_bytes()
     }
@@ -1219,6 +1267,32 @@ mod tests {
             enforce_batch_policy(&over, &record_config),
             Err(IngestError::Policy)
         ));
+
+        let exact_dispositions =
+            parse_otlp_http_json(&otlp_disposition_records(500), "codex-test", None, 1, 0)
+                .unwrap()
+                .0;
+        let over_dispositions =
+            parse_otlp_http_json(&otlp_disposition_records(501), "codex-test", None, 1, 0)
+                .unwrap()
+                .0;
+        assert!(enforce_batch_policy(&exact_dispositions, &record_config).is_ok());
+        assert!(matches!(
+            enforce_batch_policy(&over_dispositions, &record_config),
+            Err(IngestError::Policy)
+        ));
+
+        let mut mixed =
+            parse_otlp_http_json(&otlp_disposition_records(499), "codex-test", None, 1, 0)
+                .unwrap()
+                .0;
+        mixed.items.push(exact.items.into_iter().next().unwrap());
+        assert!(enforce_batch_policy(&mixed, &record_config).is_ok());
+        mixed.items.push(over.items.into_iter().next().unwrap());
+        assert!(matches!(
+            enforce_batch_policy(&mixed, &record_config),
+            Err(IngestError::Policy)
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1259,6 +1333,20 @@ mod tests {
         assert_eq!(submit_notify(&accepted, b"{}"), NotifyOutcome::Accepted);
         server.join().unwrap();
 
+        let exact = test_root("notify-exact-bound");
+        let _ = fs::remove_dir_all(&exact);
+        let (port, server) = spawn_consuming_response_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        configure_port(&exact, port);
+        let mut exact_payload = br#"{"type":"agent-turn-complete"}"#.to_vec();
+        exact_payload.resize(64 * 1024, b' ');
+        assert_eq!(
+            submit_notify(&exact, &exact_payload),
+            NotifyOutcome::Accepted
+        );
+        server.join().unwrap();
+
         let stalled = test_root("notify-stalled");
         let _ = fs::remove_dir_all(&stalled);
         let (port, server) = spawn_response_server(None);
@@ -1270,7 +1358,7 @@ mod tests {
         assert!(elapsed < Duration::from_millis(500), "elapsed={elapsed:?}");
         server.join().unwrap();
 
-        for root in [refused, rejected, accepted, stalled] {
+        for root in [refused, rejected, accepted, exact, stalled] {
             let _ = fs::remove_dir_all(root);
         }
     }

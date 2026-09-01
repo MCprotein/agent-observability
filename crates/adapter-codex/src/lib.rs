@@ -968,8 +968,8 @@ fn stable_id(prefix: &str, components: &[&str]) -> String {
 mod tests {
     use super::{
         AdapterError, AdapterItem, DiagnosticCode, MAX_HANDOFF_BYTES, MAX_HANDOFF_LINE_BYTES,
-        MAX_HANDOFF_LINES, parse_handoff_jsonl, parse_notify_json, parse_otlp_http_json,
-        read_handoff_file,
+        MAX_HANDOFF_LINES, MAX_OTLP_LOG_RECORDS, parse_handoff_jsonl, parse_notify_json,
+        parse_otlp_http_json, read_handoff_file,
     };
     use agent_observability_contracts::ObservationEvent;
     use agent_observability_domain::LifecycleState;
@@ -1219,6 +1219,26 @@ mod tests {
         assert!(parse_handoff_jsonl(&exact_records).is_ok());
         assert!(matches!(
             parse_handoff_jsonl(&(exact_records + "\n")),
+            Err(AdapterError::TooManyRecords)
+        ));
+    }
+
+    #[test]
+    fn otlp_record_bound_accepts_exact_limit_and_rejects_next_record() {
+        let record =
+            r#"{"attributes":[{"key":"event.name","value":{"stringValue":"codex.user_prompt"}}]}"#;
+        let records = std::iter::repeat_n(record, MAX_OTLP_LOG_RECORDS)
+            .collect::<Vec<_>>()
+            .join(",");
+        let exact =
+            format!(r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{records}]}}]}}]}}"#);
+        assert!(parse_otlp_http_json(exact.as_bytes(), "codex-test", None, 1, 0).is_ok());
+
+        let over = format!(
+            r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{records},{record}]}}]}}]}}"#
+        );
+        assert!(matches!(
+            parse_otlp_http_json(over.as_bytes(), "codex-test", None, 1, 0),
             Err(AdapterError::TooManyRecords)
         ));
     }
