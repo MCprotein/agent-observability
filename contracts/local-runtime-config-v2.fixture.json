@@ -1,0 +1,18 @@
+{
+  "schema_version": "local_runtime.v2",
+  "enabled": true,
+  "collection": {
+    "file_reconcile_interval_ms": 5000,
+    "flush_interval_ms": 5000,
+    "max_batch_records": 100,
+    "max_batch_bytes": 524288,
+    "active_heartbeat_interval_ms": 60000,
+    "idle_heartbeat_interval_ms": 300000,
+    "local_storage_budget_bytes": 1073741824
+  },
+  "retention": {
+    "max_record_age_days": 30,
+    "max_archive_records": 10000,
+    "max_archive_bytes": 16777216
+  }
+}

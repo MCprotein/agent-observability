@@ -4,7 +4,7 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.4.0 범위:** one-command local setup, 내장 demo, 수동 private handoff import를 지원한다.
+> **v1.5.0 범위:** one-command local setup, 내장 demo, 시각적 로컬 설정, 수동 private handoff import를 지원한다.
 > agent 원본 로그를 자동으로 읽는 연결 기능은 아직 제공하지 않는다.
 
 ## 빠른 시작
@@ -14,13 +14,13 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 Apple Silicon과 Intel Mac을 모두 지원하는 universal binary를 설치한다.
 
 ```bash
-gh release download v1.4.0 \
+gh release download v1.5.0 \
   --repo MCprotein/agent-observability \
-  --pattern 'agent-observability-1.4.0-darwin-universal2.tar.gz'
-tar -xzf agent-observability-1.4.0-darwin-universal2.tar.gz
+  --pattern 'agent-observability-1.5.0-darwin-universal2.tar.gz'
+tar -xzf agent-observability-1.5.0-darwin-universal2.tar.gz
 install -d ~/.local/bin
 install -m 0755 \
-  agent-observability-1.4.0-darwin-universal2/agent-observability \
+  agent-observability-1.5.0-darwin-universal2/agent-observability \
   ~/.local/bin/agent-observability
 export PATH="$HOME/.local/bin:$PATH"
 ```
@@ -37,7 +37,21 @@ agent-observability demo
 self-contained HTML 대시보드를 생성해 기본 브라우저에서 연다. 실제 데이터나 계정은 사용하지
 않는다.
 
-### 3. 실제 runtime 준비
+### 3. 설정 화면 열기
+
+```bash
+agent-observability ui
+```
+
+수집 허용, 확인·반영 주기, batch, heartbeat, 저장 한도, 보관 기간과 archive 한도를 한 화면에서
+바꿀 수 있다. 설정할 때만 임의의 `127.0.0.1` port를 사용하며 browser tab의 session token,
+Host와 Origin을 모두 확인한다. token은 같은 tab의 새로고침에서만 복구되며 세션 종료 시 삭제된다.
+사용자가 1분 이상 화면을 조작하지 않으면 heartbeat를 멈추고,
+연결이 10분 동안 끊기거나 설정 server가 시작된 후 1시간이 지나면 종료를 요청한다. 이 deadline은
+로컬 executor와 filesystem이 응답하는 동안 적용된다. 불완전한 HTTP header는
+5초 안에 닫고, 동시 연결은 64개로 제한하며, 종료 시 연결 정리는 최대 1초로 제한한다.
+
+### 4. 실제 runtime 준비
 
 ```bash
 agent-observability setup
@@ -50,6 +64,7 @@ agent-observability setup
 | 현재 경로 | 상태 | 의미 |
 | --- | --- | --- |
 | 로컬 runtime과 HTML 대시보드 | 지원 | 서버, login, web daemon 없이 `file://`로 실행 |
+| 로컬 설정 UI | 지원 | `ui` 실행 중에만 인증된 loopback process 사용 |
 | 내장 sample 체험 | 지원 | 외부 파일 없이 `demo` 한 명령으로 확인 |
 | Canonical handoff import | 지원 | 검증된 private JSONL을 agent별 명령으로 가져옴 |
 | Agent 자동 연결 | 준비 중 | 원본 hook/log 자동 감시와 producer는 아직 미포함 |
@@ -87,8 +102,14 @@ handoff 생성 규격과 허용 source는 [Adapter Compatibility](docs/ADAPTER_C
 
 ## 설정 변경
 
-설정은 설치 후에도 CLI로 변경할 수 있다. 변경은 검증된 새 config를 private 임시 파일에 쓴 뒤
-원자적으로 교체하며, 다음 command부터 적용된다.
+설정은 설치 후 언제든 browser에서 변경할 수 있다. 값의 허용 범위와 서로 다른 주기를
+시각적으로 비교하고 저장하면 Rust가 전체 config를 다시 검증해 원자적으로 교체한다.
+
+```bash
+agent-observability ui
+```
+
+headless 환경이나 자동화에서는 같은 계약을 CLI로 사용할 수 있다.
 
 ```bash
 # 현재 설정
@@ -129,14 +150,22 @@ flowchart LR
     E --> F["Privacy and cost projection"]
     F --> G["Self-contained HTML"]
     G --> H["Local browser"]
+    I["ui command"] --> J["Authenticated loopback settings"]
+    J --> K["Rust config validation"]
+    K --> L["Private config"]
 ```
 
 - 점선은 현재 release가 제공하지 않는 agent별 producer 경계다.
-- 실선은 `v1.4.0` CLI가 구현하고 검증하는 local-only 경로다.
+- 실선은 `v1.5.0` CLI가 구현하고 검증하는 local-only 경로다.
 - agent별 차이는 adapter에서 끝나고 이후 저장·비용·UI contract는 하나다.
 - SQLite가 로컬 권위 저장소이며 JSONL archive와 HTML은 다시 만들 수 있는 projection이다.
 - TypeScript UI는 원본 agent payload가 아니라 Rust가 검증한 report DTO만 받는다.
-- standalone 경로에는 endpoint, login, collector, 외부 network request가 없다.
+- report는 endpoint 없이 `file://`로 열리고, 설정 endpoint는 `ui` process 수명 동안 loopback에만 존재한다.
+- 설정 화면은 별도 UI instance lock만 유지한다. 저장할 때만 runtime lock을 짧게 획득하므로 열린
+  화면이 ingest, report, CLI 설정 변경을 계속 막지 않는다. 지원되는 다른 설정 명령과 revision이
+  충돌하면 최신 값 위에 화면의 변경만 다시 적용하고 재확인을 요구한다. `config.json` 직접 편집은
+  지원 인터페이스가 아니다.
+- standalone 경로에는 login, collector, 외부 network request가 없다.
 
 상세 책임 경계는 [Architecture](docs/ARCHITECTURE.md), 전체 처리 순서는
 [Collection Flow](docs/COLLECTION_FLOW.md)에 있다.
@@ -180,7 +209,7 @@ Crash recovery와 replay 규칙은 [Local Runtime](docs/LOCAL_RUNTIME.md#retenti
 | Runtime directory | `0700`만 허용 |
 | Config, archive, report | `0600`으로 기록 |
 | Unknown field와 schema | 추측하지 않고 거부 |
-| Network | standalone에서는 사용하지 않음 |
+| External network | standalone outbound 경로 없음; 설정 화면은 실행 중 인증된 loopback만 사용 |
 
 ## 다른 설치 방법
 
@@ -218,6 +247,7 @@ cargo run -p agent-observability-cli -- demo
 | `demo [root] [--no-open]` | 격리된 sample 대시보드 생성 |
 | `setup [root] [--no-open]` | 실제 private runtime 초기화 |
 | `dashboard [root] [--no-open]` | 최신 report를 만들고 필요하면 브라우저에서 열기 |
+| `ui [root] [--no-open]` | 임시 local-only 설정 화면 열기 |
 | `config show [root]` | 현재 설정 확인 |
 | `config set [root] <option> <value>` | 검증 후 설정 원자 교체 |
 | `<agent>-ingest <root> <handoff>` | private canonical handoff import |

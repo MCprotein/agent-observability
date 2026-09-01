@@ -15,16 +15,18 @@ use agent_observability_contracts::{
 };
 use agent_observability_contracts::{CONTRACT_MANIFEST, ContractManifest};
 use agent_observability_local_runtime::{
-    Admission, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION, LocalRuntimeConfigV2, PressureSample,
-    RuntimeControl, Singleton, StorageBudget, install, load, save,
+    Admission, ConfigMutationGuard, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION,
+    LocalRuntimeConfigV2, PressureSample, RuntimeControl, Singleton, StorageBudget, install, load,
+    save,
 };
 use agent_observability_local_store::{
     IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore, RetentionPlan,
 };
+use agent_observability_local_ui::PreparedUi;
 use agent_observability_static_report::write_private;
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
@@ -37,6 +39,7 @@ Quick start:
   agent-observability demo [root] [--no-open]
   agent-observability setup [root] [--no-open]
   agent-observability dashboard [root] [--no-open]
+  agent-observability ui [root] [--no-open]
 
 Configuration:
   agent-observability config show [root]
@@ -115,7 +118,17 @@ impl IngestResult {
 }
 
 fn main() -> ExitCode {
-    match run(env::args().skip(1)) {
+    let arguments: Vec<String> = env::args().skip(1).collect();
+    if let Some(result) = run_ui_command(&arguments) {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("{message}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    match run(arguments.into_iter()) {
         Ok(output) => {
             println!("{output}");
             ExitCode::SUCCESS
@@ -125,6 +138,76 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_ui_command(arguments: &[String]) -> Option<Result<(), String>> {
+    let result = match arguments {
+        [command] if command == "ui" => default_root().and_then(|root| settings_ui(&root, true)),
+        [command, flag] if command == "ui" && flag == "--no-open" => {
+            default_root().and_then(|root| settings_ui(&root, false))
+        }
+        [command, root] if command == "ui" => settings_ui(Path::new(root), true),
+        [command, root, flag] if command == "ui" && flag == "--no-open" => {
+            settings_ui(Path::new(root), false)
+        }
+        _ => return None,
+    };
+    Some(result)
+}
+
+fn settings_ui(root: &Path, open: bool) -> Result<(), String> {
+    let layout = install(root).map_err(|error| error.to_string())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("settings runtime failed: {error}"))?;
+    runtime.block_on(async {
+        let ui = agent_observability_local_ui::prepare(&layout)
+            .await
+            .map_err(|error| error.to_string())?;
+        announce_settings_ui(&ui, open)?;
+        ui.serve().await.map_err(|error| error.to_string())
+    })
+}
+
+fn announce_settings_ui(ui: &PreparedUi, open: bool) -> Result<(), String> {
+    let opened = if open {
+        match open_settings_url(ui.url()) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("{error}");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    println!("status=settings_ready");
+    if !opened {
+        println!("url={}", ui.url());
+    }
+    println!("opened={opened}\ncollection=manual_import");
+    std::io::stdout()
+        .flush()
+        .map_err(|error| format!("settings output failed: {error}"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_settings_url(url: &str) -> Result<(), String> {
+    let mut child = Command::new("open")
+        .arg(url)
+        .spawn()
+        .map_err(|error| format!("settings UI open failed: {error}"))?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_settings_url(_url: &str) -> Result<(), String> {
+    Err("automatic settings UI open is supported on macOS; use ui --no-open and open the reported URL".into())
 }
 
 fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
@@ -405,10 +488,10 @@ fn show_config(root: &Path) -> Result<String, String> {
 
 fn update_config(root: &Path, key: &str, value: &str) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let mutation = ConfigMutationGuard::acquire(&layout).map_err(|error| error.to_string())?;
     let mut config = load(&layout.config).map_err(|error| error.to_string())?;
     set_config_value(&mut config, key, value)?;
-    save(&layout.config, &config).map_err(|error| error.to_string())?;
+    save(&mutation, &config).map_err(|error| error.to_string())?;
     Ok(format!(
         "updated={key}\n{}",
         config_output(&layout, &config)

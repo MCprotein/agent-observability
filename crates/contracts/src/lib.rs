@@ -15,6 +15,8 @@ pub const REPORT_DTO_SCHEMA: &str = include_str!("../../../contracts/report-dto-
 pub const RATE_TABLE_SCHEMA: &str = include_str!("../../../contracts/rate-table-v1.schema.json");
 pub const RETENTION_ARCHIVE_SCHEMA: &str =
     include_str!("../../../contracts/retention-archive-entry-v1.schema.json");
+pub const LOCAL_RUNTIME_CONFIG_SCHEMA: &str =
+    include_str!("../../../contracts/local-runtime-config-v2.schema.json");
 pub const ADAPTER_CAPABILITY_V1: &str = include_str!("../capabilities/adapter-capability-v1.yaml");
 pub const DURABLE_RECORD_VERSION: &str = "agent_observability.v1";
 pub const REPORT_DTO_VERSION: &str = "agent_observability.report.v1";
@@ -1511,12 +1513,25 @@ impl ContractManifest {
             "retention_archive",
             "agent_observability.retention_archive.v1",
         )?;
+        self.expect("local_runtime_config", "local_runtime.v2")?;
         self.expect("durable_schema", "contracts/durable-record-v1.schema.json")?;
         self.expect("report_schema", "contracts/report-dto-v1.schema.json")?;
         self.expect("rate_table_schema", "contracts/rate-table-v1.schema.json")?;
         self.expect(
             "retention_archive_schema",
             "contracts/retention-archive-entry-v1.schema.json",
+        )?;
+        self.expect(
+            "local_runtime_config_schema",
+            "contracts/local-runtime-config-v2.schema.json",
+        )?;
+        self.expect(
+            "local_runtime_config_fixture",
+            "contracts/local-runtime-config-v2.fixture.json",
+        )?;
+        self.expect(
+            "local_runtime_config_parity",
+            "contracts/local-runtime-config-v2.parity.json",
         )?;
         self.expect("team_ingest", "disabled")?;
         Ok(())
@@ -1607,8 +1622,8 @@ impl Error for ContractError {}
 mod tests {
     use super::{
         ADAPTER_CAPABILITY_V1, AdapterCapabilityManifestV1, CONTRACT_MANIFEST, ContractManifest,
-        DURABLE_RECORD_SCHEMA, RATE_TABLE_SCHEMA, REPORT_DTO_SCHEMA, RETENTION_ARCHIVE_SCHEMA,
-        redact_sensitive_text,
+        DURABLE_RECORD_SCHEMA, LOCAL_RUNTIME_CONFIG_SCHEMA, RATE_TABLE_SCHEMA, REPORT_DTO_SCHEMA,
+        RETENTION_ARCHIVE_SCHEMA, redact_sensitive_text,
     };
 
     #[test]
@@ -1622,6 +1637,7 @@ mod tests {
             REPORT_DTO_SCHEMA,
             RATE_TABLE_SCHEMA,
             RETENTION_ARCHIVE_SCHEMA,
+            LOCAL_RUNTIME_CONFIG_SCHEMA,
         ] {
             assert!(schema.contains("\"additionalProperties\": false"));
         }

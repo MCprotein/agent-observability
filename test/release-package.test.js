@@ -54,19 +54,19 @@ test("release retry state distinguishes absence from lookup failure", () => {
 
 test("package retry state publishes only after an explicit not-found", () => {
   assert.equal(
-    classifyPackageView({ status: 0, stdout: '"1.4.0"\n', stderr: "" }, "1.4.0"),
+    classifyPackageView({ status: 0, stdout: '"1.5.0"\n', stderr: "" }, "1.5.0"),
     "published",
   );
   assert.equal(
-    classifyPackageView({ status: 1, stdout: "", stderr: "npm error code E404" }, "1.4.0"),
+    classifyPackageView({ status: 1, stdout: "", stderr: "npm error code E404" }, "1.5.0"),
     "missing",
   );
   assert.equal(
-    classifyPackageView({ status: 1, stdout: "", stderr: "npm error code E401" }, "1.4.0"),
+    classifyPackageView({ status: 1, stdout: "", stderr: "npm error code E401" }, "1.5.0"),
     "error",
   );
   assert.equal(
-    classifyPackageView({ status: 1, stdout: "", stderr: "network timeout" }, "1.4.0"),
+    classifyPackageView({ status: 1, stdout: "", stderr: "network timeout" }, "1.5.0"),
     "error",
   );
 });
@@ -100,7 +100,7 @@ const failure = (stderr) => ({ status: 1, stdout: "", stderr });
 
 test("draft transition creates, refreshes, and skips the expected release states", () => {
   const missing = scriptedExecutor([failure("release not found"), success()]);
-  ensureDraft("v1.4.0", {
+  ensureDraft("v1.5.0", {
     execute: missing.execute,
     files: ["dist/a.tgz"],
     write() {},
@@ -110,29 +110,29 @@ test("draft transition creates, refreshes, and skips the expected release states
     [
       "release",
       "create",
-      "v1.4.0",
+      "v1.5.0",
       "dist/a.tgz",
       "--draft",
       "--verify-tag",
       "--generate-notes",
       "--title",
-      "v1.4.0",
+      "v1.5.0",
     ],
   ]);
 
   const draft = scriptedExecutor([success("true\n"), success()]);
-  ensureDraft("v1.4.0", {
+  ensureDraft("v1.5.0", {
     execute: draft.execute,
     files: ["dist/a.tgz"],
     write() {},
   });
   assert.deepEqual(draft.calls[1], [
     "gh",
-    ["release", "upload", "v1.4.0", "dist/a.tgz", "--clobber"],
+    ["release", "upload", "v1.5.0", "dist/a.tgz", "--clobber"],
   ]);
 
   const published = scriptedExecutor([success("false\n")]);
-  ensureDraft("v1.4.0", {
+  ensureDraft("v1.5.0", {
     execute: published.execute,
     files: ["dist/a.tgz"],
     write() {},
@@ -142,38 +142,38 @@ test("draft transition creates, refreshes, and skips the expected release states
 
 test("package transition publishes only a missing version and skips an existing one", () => {
   const missing = scriptedExecutor([failure("npm error code E404"), success()]);
-  publishPackage("1.4.0", { execute: missing.execute, write() {} });
+  publishPackage("1.5.0", { execute: missing.execute, write() {} });
   assert.deepEqual(missing.calls[1], [
     "npm",
-    ["publish", "./dist/mcprotein-agent-observability-1.4.0.tgz"],
+    ["publish", "./dist/mcprotein-agent-observability-1.5.0.tgz"],
   ]);
 
-  const published = scriptedExecutor([success('"1.4.0"\n')]);
-  publishPackage("1.4.0", { execute: published.execute, write() {} });
+  const published = scriptedExecutor([success('"1.5.0"\n')]);
+  publishPackage("1.5.0", { execute: published.execute, write() {} });
   assert.equal(published.calls.length, 1);
 
   const unauthorized = scriptedExecutor([failure("npm error code E401")]);
   assert.throws(
-    () => publishPackage("1.4.0", { execute: unauthorized.execute, write() {} }),
+    () => publishPackage("1.5.0", { execute: unauthorized.execute, write() {} }),
     /package lookup failed/,
   );
 });
 
 test("finalize transition publishes a draft and treats publication as idempotent", () => {
   const draft = scriptedExecutor([success("true\n"), success()]);
-  finalizeRelease("v1.4.0", { execute: draft.execute, write() {} });
+  finalizeRelease("v1.5.0", { execute: draft.execute, write() {} });
   assert.deepEqual(draft.calls[1], [
     "gh",
-    ["release", "edit", "v1.4.0", "--draft=false", "--latest"],
+    ["release", "edit", "v1.5.0", "--draft=false", "--latest"],
   ]);
 
   const published = scriptedExecutor([success("false\n")]);
-  finalizeRelease("v1.4.0", { execute: published.execute, write() {} });
+  finalizeRelease("v1.5.0", { execute: published.execute, write() {} });
   assert.equal(published.calls.length, 1);
 
   const missing = scriptedExecutor([failure("release not found")]);
   assert.throws(
-    () => finalizeRelease("v1.4.0", { execute: missing.execute, write() {} }),
+    () => finalizeRelease("v1.5.0", { execute: missing.execute, write() {} }),
     /release finalization lookup failed/,
   );
 });

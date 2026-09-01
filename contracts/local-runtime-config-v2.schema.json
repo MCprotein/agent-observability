@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "local_runtime.v2",
+  "title": "LocalRuntimeConfigV2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "enabled", "collection", "retention"],
+  "properties": {
+    "schema_version": { "const": "local_runtime.v2" },
+    "enabled": { "type": "boolean" },
+    "collection": { "$ref": "#/$defs/collection" },
+    "retention": { "$ref": "#/$defs/retention" }
+  },
+  "$defs": {
+    "collection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file_reconcile_interval_ms",
+        "flush_interval_ms",
+        "max_batch_records",
+        "max_batch_bytes",
+        "active_heartbeat_interval_ms",
+        "idle_heartbeat_interval_ms",
+        "local_storage_budget_bytes"
+      ],
+      "properties": {
+        "file_reconcile_interval_ms": { "type": "integer", "minimum": 1000, "maximum": 60000 },
+        "flush_interval_ms": { "type": "integer", "minimum": 1000, "maximum": 60000 },
+        "max_batch_records": { "type": "integer", "minimum": 1, "maximum": 500 },
+        "max_batch_bytes": { "type": "integer", "minimum": 16384, "maximum": 2097152 },
+        "active_heartbeat_interval_ms": { "type": "integer", "minimum": 30000, "maximum": 300000 },
+        "idle_heartbeat_interval_ms": { "type": "integer", "minimum": 120000, "maximum": 900000 },
+        "local_storage_budget_bytes": { "type": "integer", "minimum": 268435456, "maximum": 21474836480 }
+      }
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_record_age_days", "max_archive_records", "max_archive_bytes"],
+      "properties": {
+        "max_record_age_days": { "type": "integer", "minimum": 1, "maximum": 3650 },
+        "max_archive_records": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "max_archive_bytes": { "type": "integer", "minimum": 65536, "maximum": 268435456 }
+      }
+    }
+  }
+}

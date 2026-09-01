@@ -2,9 +2,9 @@
 
 ## Source of truth
 
-Status: Draft
-Date: 2026-08-28
-Product surfaces: standalone static report, team hosted operations console, team administration
+Status: Active
+Date: 2026-09-01
+Product surfaces: standalone static report, standalone loopback settings console, team hosted operations console, team administration
 
 Evidence reviewed:
 
@@ -47,6 +47,7 @@ Goals:
 - make ingestion freshness, partial data and privacy state visible beside the affected report
 - let authorized users manage membership, policies, retention, quota, sources, exports and audit
 - share analysis components and `ReportDtoVx` semantics across standalone and team
+- configure standalone collection, storage, retention and cadence through a visual local-only surface
 
 Non-goals:
 
@@ -54,7 +55,7 @@ Non-goals:
 - raw prompt/output viewer
 - general-purpose log search or arbitrary query language
 - model request gateway administration
-- remote control of standalone local files
+- remote control of standalone local files; the same-user loopback settings console is explicitly local-only
 
 Success signals:
 
@@ -86,6 +87,26 @@ Standalone file-open uses hash navigation or internal view state so it works fro
 
 - `#/overview`, `#/activity`, `#/traces`, `#/traces/:traceId`
 - `#/projects`, `#/costs`, `#/privacy`, `#/exports`
+
+Standalone settings use an ephemeral loopback route opened by `agent-observability ui`:
+
+- `/` renders overview, collection, storage and retention controls in one responsive workspace
+- `/api/config` reads and atomically replaces the Rust-validated local configuration
+- the browser receives a one-time session capability through the URL fragment, removes it from the visible URL,
+  keeps it only in same-tab session storage for reload recovery, sends it only in a private request header and
+  removes it after a confirmed explicit close or an invalid-session/network failure during bootstrap,
+  heartbeat, or config mutation. A failed shutdown request retains it only so the user can retry closing.
+
+The settings process binds an operating-system-selected port on `127.0.0.1`, rejects non-loopback host and
+origin values, sends no CORS permission, makes no external request and expires after inactivity. Closing it
+does not affect the static report or collection runtime. Rust remains authoritative for defaults, validation,
+atomic persistence and file permissions. The browser stops heartbeat after one minute without real user
+activity. The server requests shutdown after ten minutes without heartbeat and applies a one-hour session
+deadline while its local executor and filesystem remain responsive. Keeping
+the settings screen open holds only its own instance lock. Config mutation acquires the shared runtime lock
+briefly and uses optimistic revision control so ingest/report commands remain available. Every supported CLI
+and UI writer uses the same mutation guard, so revision conflicts between supported writers are never silently
+overwritten. Direct config file editing is outside the supported interface.
 
 Hosted team uses server routes:
 
@@ -174,6 +195,17 @@ Shared analysis components consume only `ReportDtoVx` or dedicated sanitized man
 - `EmptyState`, `LoadingState`, `PartialState`, `OfflineState`, `QuotaState`
 - `ExportDialog`, `FieldManifest`
 
+Standalone settings components consume only a versioned sanitized configuration DTO:
+
+- `LocalSettingsShell`, `SettingsNavigation`, `SessionStatus`
+- `CollectionSwitch`, `CadenceTimeline`, `BatchCapacityPlot`
+- `StorageBudgetGauge`, `RetentionWindow`, `ArchiveLimitEditor`
+- `StickySaveBar`, `ValidationSummary`, `ResetDefaultsDialog`
+
+Visualizations explain policy relationships; they do not invent runtime telemetry. Gauges and timelines label
+configured limits as policy, not current usage. Every numeric control keeps a direct text input and unit label,
+so the visualization never becomes the only editing mechanism.
+
 Team management components:
 
 - `SourceTable`, `EnrollmentDialog`, `CredentialRotationDialog`
@@ -225,6 +257,15 @@ Accessibility checks require automated rules plus manual keyboard, screen-reader
 
 ## Interaction states
 
+- Local settings clean/dirty: changed fields and the persistent save bar are visible without moving layout.
+- Local settings saving/saved: disable duplicate submission, announce completion and render the canonical
+  configuration returned by Rust.
+- Local settings invalid: preserve edits, focus the first invalid control and show bounded field errors.
+- Local settings conflict: reload the latest file, reapply only locally changed fields and require another explicit
+  save; never overwrite a conflicting update from another supported writer silently.
+- Local settings close with edits: require an explicit discard confirmation and return focus to the close control
+  when the user keeps editing.
+- Local settings expired: disable mutation controls and provide the exact CLI command to start a fresh session.
 - Loading: preserve component dimensions and display which scope is loading.
 - Empty: distinguish no source enrolled, no data in range and filter with no match.
 - Partial: list missing source/time range and affected metrics; never silently total incomplete data.
@@ -267,7 +308,8 @@ implementation tutorials and keyboard-shortcut copy inside the main product surf
 - Browser support target is the latest two stable major versions of major evergreen desktop browsers; exact
   support becomes a release contract at the TypeScript UI milestone.
 - Verification includes typecheck, unit/contract tests, file-open smoke, browser screenshots at desktop/mobile,
-  keyboard/a11y checks, long-text overflow and empty/partial/offline/quota fixtures.
+  320px reflow, clean and dirty reload recovery, keyboard/a11y checks, long-text overflow and
+  empty/partial/offline/quota fixtures.
 - v0.12 provisions the Chromium revision paired with lockfile-pinned `playwright-core` in `npm test` pretest,
   then runs file-open browser checks without a local server. It asserts desktop/mobile overflow, 44px mobile
   controls, headings/landmarks, first-tab focus, filter/trace state, console errors and external network requests.

@@ -1,13 +1,14 @@
 # Local Runtime
 
 v1.0.0 introduced the standalone local-only Rust runtime boundary. v1.2.0 added bounded local
-retention and private archive export; v1.4.0 adds one-command setup, an isolated built-in demo,
-dashboard open, and atomic CLI configuration updates without adding a server, daemon, identity,
-automatic producer, or network path.
+retention and private archive export; v1.4.0 added one-command setup, an isolated built-in demo,
+dashboard open, and atomic CLI configuration updates. v1.5.0 adds an explicit, ephemeral loopback
+settings UI without adding a resident server, daemon, identity, automatic producer, or external network path.
 It installs private local state,
 validates a closed configuration, admits writes against a hard storage budget, and keeps foreground
-handoff bounded. It contains no endpoint, email, team identity, envelope, outbox, or network client.
-It is a library plus one-shot CLI composition boundary, not a resident server or IPC daemon.
+handoff bounded. It contains no external or team endpoint, email, team identity, envelope, outbox, or
+network client. The only local endpoint is created by the foreground `ui` command on `127.0.0.1:0`,
+uses a private browser session, and expires after inactivity. It is not a resident server or IPC daemon.
 
 ## Install and validate
 
@@ -17,6 +18,7 @@ documented in the repository README. The package is only a transport for the Rus
 ~~~bash
 agent-observability demo
 agent-observability setup
+agent-observability ui
 agent-observability config show
 agent-observability config set retention-days 90
 agent-observability dashboard
@@ -30,6 +32,20 @@ agent-observability report ~/.agent-observability /path/to/private-rate-table.js
 
 `setup` composes private install, store initialization, report generation, and macOS browser open.
 `demo` uses an isolated default root and embedded content-free fixture; it never reads an agent log.
+`ui` holds only a settings-UI instance singleton, embeds the generated TypeScript application, and
+delegates all configuration validation and atomic save behavior back to Rust. A save acquires the
+shared runtime singleton only for the mutation. Every supported CLI/UI writer is required to hold the
+typed mutation guard. The CLI reads and writes while holding that guard; the UI additionally verifies the
+browser revision immediately before the atomic replace. Both release the guard before the next operation.
+Direct config file editing is unsupported.
+The fragment capability is retained only in same-tab session storage for reload recovery and is removed
+after explicit close, an invalid session, or a bootstrap/heartbeat network failure; it is never placed in a
+cookie or local storage.
+The server requests shutdown after 10 minutes without an active browser heartbeat and enforces a one-hour
+settings-session deadline while its local executor and filesystem remain responsive.
+HTTP/1 header reads are limited to five seconds, and graceful connection draining is limited to one second,
+with at most 64 concurrent connections, so partial or repeated requests cannot grow foreground connection
+tasks without a fixed bound. Config filesystem work runs on the blocking executor instead of the server loop.
 The lower-level `init` command remains available for automation. Install creates the root, logs,
 queue, state, and runtime directories with mode 0700 and creates config.json with mode 0600.
 Existing configuration is validated and preserved. Broad permissions,

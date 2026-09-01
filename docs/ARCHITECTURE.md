@@ -6,7 +6,7 @@
 
 ## Current and target stack
 
-현재 `v1.4.0` Rust 경로는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
+현재 `v1.5.0` Rust 경로는 Node.js 20+ ESM JavaScript 구현을 migration baseline으로
 보존하면서 macOS standalone private handoff import 범위의 Rust Codex, Claude Code와 Cursor adapter,
 TypeScript static report UI, strict local config와 bounded runtime policy를 제공한다. Rust 경로는 closed contract,
 deterministic lifecycle reduction, topology validation, pricing/report projection, bounded product handoff와
@@ -20,7 +20,7 @@ stable observation, current reduced record, adapter disposition과 profile-neutr
 | Area | Target | Responsibility |
 | --- | --- | --- |
 | Domain, application, adapters, storage, export, CLI, optional collector/query API | Rust | canonical schema, lifecycle reduction, privacy, cost, ingestion, local/team artifacts |
-| Static report web UI | TypeScript | sanitized report DTO 조회, filtering, visualization, interaction |
+| Static report and local settings web UI | TypeScript | sanitized report/config DTO 조회, filtering, policy visualization, interaction |
 | Rust-TypeScript boundary | Versioned JSON schema | generated or validated types, compatibility fixtures |
 
 새 core/runtime 기능을 기존 JavaScript 구조에 계속 추가하지 않는다. 먼저 현재 동작을
@@ -34,8 +34,19 @@ report DTO parity가 확인되면 완성된 수직 기능 단위를 release boun
 가리키며 JavaScript launcher, daemon, collector 또는 runtime dependency를 추가하지 않는다.
 배포 형식은 transport일 뿐 domain/application/runtime 책임을 소유하지 않는다.
 
-TypeScript UI는 브라우저에서 직접 원본 event log를 읽지 않고 Rust가 만든 sanitized report
-DTO만 사용한다. report는 self-contained static HTML이며 runtime web server를 요구하지 않는다.
+TypeScript UI는 브라우저에서 직접 원본 event log를 읽지 않고 Rust가 만든 sanitized report 또는
+versioned config DTO만 사용한다. report는 self-contained static HTML이며 runtime web server를
+요구하지 않는다. 설정 UI는 CLI가 명시적으로 시작한 동안에만 `127.0.0.1:0`에 bind하는 ephemeral
+inbound adapter를 사용한다. token, exact Host/Origin, body bound, no-store와 optimistic revision을
+검증한다. HTTP/1 header read는 5초, 동시 연결은 64개, 종료 drain은 1초로 제한해 불완전한
+network 연결이 connection task와 drain을 무한히 늘리지 못하게 한다. token은 같은 tab의 reload
+복구를 위한 session storage에만 유지한다. 확인된 명시적 종료, invalid session,
+bootstrap/heartbeat/config mutation network failure에는 삭제하고 종료 요청 실패에는 재시도를 위해 유지한다.
+persistent daemon이나 외부 network 경로를 만들지 않는다. CLI composition root가 private
+runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui는 UI instance lock만 유지하고
+모든 지원 CLI/UI writer는 설정 mutation 동안 타입으로 강제된 shared guard를 획득한 뒤 그 안에서
+읽기와 atomic replace를 수행한다. UI는 추가로 browser revision을 atomic replace 직전에 확인한다.
+`config.json` 직접 편집은 지원 경계 밖이다.
 
 ## Deployment profiles
 
@@ -43,7 +54,7 @@ DTO만 사용한다. report는 self-contained static HTML이며 runtime web serv
 
 | Profile | Required runtime | Storage | UI |
 | --- | --- | --- | --- |
-| `standalone` | Rust CLI only | private embedded transactional state + JSONL/snapshot projections | embedded TypeScript asset + `ReportDtoVx`를 담은 self-contained HTML |
+| `standalone` | Rust CLI only | private embedded transactional state + JSONL/snapshot projections | self-contained report + ephemeral loopback settings UI |
 | `team` | local Rust CLI/forwarder + optional collector | same local state/outbox + tenant/workspace-scoped central store | 같은 TypeScript UI를 hosted report 또는 self-contained export로 제공 |
 
 `standalone`은 기본이자 완전한 제품 경로다. login, network, collector, central database가 없어도
@@ -92,16 +103,20 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
-v1.4.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
+v1.5.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
 `crates/adapter-claude-code`, `crates/adapter-cursor`,
-`crates/application`, `crates/local-store`, `crates/local-runtime`, `crates/static-report`, `crates/cli`와 release
+`crates/application`, `crates/local-store`, `crates/local-runtime`, `crates/local-ui`, `crates/static-report`, `crates/cli`와 release
 evidence runner인 `xtask`로 나뉜다. domain은 외부 형식을
 모르고, contracts는 transient
 source와 durable/report DTO 경계를 소유한다. application은 pricing과 report projection을,
 inbound adapters는 제품별 source precedence/correlation/dedupe를, local-store는 SQLite transaction과 JSONL
 projection을, static-report는 generated UI asset의 self-contained artifact 조립과 private atomic write를,
-CLI는 composition root를 소유한다.
-`contracts/*.schema.json`은 closed wire contract이고 `contracts/contract-manifest.v1`은 현재
+local-ui는 authenticated loopback 설정 inbound adapter와 embedded generated asset을, local-runtime은
+blocking config I/O를 캡슐화한 standalone config use-case를, CLI는 composition root를 소유한다.
+local-ui handler는 이 use-case를 blocking executor에서 호출하고 HTTP 연결 task는 최대 64개로 제한한다.
+`contracts/*.schema.json`은 closed wire contract이고 versioned config fixture와 전체 bounds parity
+corpus가 strict Rust wire DTO와 생성된 TypeScript validator의 required/default/min/max/unknown-field
+일치를 잠근다. `contracts/contract-manifest.v1`은 현재
 활성 schema path/version과 `team_ingest=disabled` 경계를 runtime 중립적으로 고정한다.
 
 ```text
