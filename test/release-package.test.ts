@@ -16,6 +16,7 @@ const releasePackage = JSON.parse(
   readFileSync("distribution/npm/package.json", "utf8"),
 );
 const releaseWorkflow = readFileSync(".github/workflows/release.yml", "utf8");
+const ciWorkflow = readFileSync(".github/workflows/ci.yml", "utf8");
 const cargoMetadata = JSON.parse(
   execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
     encoding: "utf8",
@@ -97,13 +98,28 @@ test("release workflow pins actions and uses the tested publication state machin
   );
   assert.match(
     releaseWorkflow,
+    /test "\$\(git rev-parse "\$GITHUB_SHA\^\{tree\}"\)" = "\$\(git rev-parse "\$second_parent\^\{tree\}"\)"/,
+  );
+  assert.match(
+    releaseWorkflow,
     /artifact="automatic-release-evidence-\$SOURCE_REVISION"/,
   );
   assert.match(releaseWorkflow, /source_revision: \$SOURCE_REVISION/);
   assert.match(
     releaseWorkflow,
+    /-f head_sha="\$SOURCE_REVISION"[\s\S]*-f event=workflow_dispatch[\s\S]*-f status=success/,
+  );
+  assert.match(
+    releaseWorkflow,
     /publish:[\s\S]*needs:[\s\S]*- build[\s\S]*- automatic-release-evidence/,
   );
+  assert.match(ciWorkflow, /if: github\.event_name == 'workflow_dispatch'/);
+  assert.match(ciWorkflow, /source_revision: \$GITHUB_SHA/);
+  assert.match(
+    ciWorkflow,
+    /name: automatic-release-evidence-\$\{\{ github\.sha \}\}/,
+  );
+  assert.match(ciWorkflow, /path: \$\{\{ steps\.evidence\.outputs\.manifest \}\}/);
 });
 
 interface CommandResult {

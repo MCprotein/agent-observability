@@ -3466,6 +3466,25 @@ mod tests {
         assert!(projection.is_file());
         let _ = fs::remove_dir_all(&dir);
 
+        let lightweight = temp_dir("current-open-skips-full-schema-audit");
+        let _ = fs::remove_dir_all(&lightweight);
+        let store = LocalStore::open(&lightweight).unwrap();
+        let database = store.database_path();
+        drop(store);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE report_consumer_probe(value INTEGER);")
+            .unwrap();
+        drop(connection);
+        let reopened = LocalStore::open_current(&lightweight).unwrap();
+        assert!(!reopened.report_status().unwrap().pending());
+        drop(reopened);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("DROP TABLE report_consumer_probe;")
+            .unwrap();
+        let _ = fs::remove_dir_all(&lightweight);
+
         let legacy = temp_dir("current-open-legacy");
         let _ = fs::remove_dir_all(&legacy);
         let store = LocalStore::open(&legacy).unwrap();

@@ -126,9 +126,12 @@ const AUTOMATIC_PEAK_RSS_MIB_MAX: f64 = 96.0;
 const AUTOMATIC_ALLOCATED_DISK_BYTES_MAX: u64 = 1_073_741_824;
 const AUTOMATIC_CONNECT_OUTPUT_MAX_BYTES: u64 = 4_096;
 const AUTOMATIC_LIFECYCLE_SEED_MODE: u32 = 0o600;
-const AUTOMATIC_CODEX_E2E_PROMPT: &str =
-    "AUTOMATIC_CODEX_E2E_RAW_PROMPT_SENTINEL Reply with the requested test value only.";
-const AUTOMATIC_CODEX_E2E_RESPONSE: &str = "AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL";
+const AUTOMATIC_CODEX_E2E_PROMPT_SENTINEL: &str = "AUTOMATIC_CODEX_E2E_RAW_PROMPT_SENTINEL";
+const AUTOMATIC_CODEX_E2E_PROMPT: &str = concat!(
+    "AUTOMATIC_CODEX_E2E_RAW_PROMPT_SENTINEL",
+    " Reply with the requested test value only."
+);
+const AUTOMATIC_CODEX_E2E_RESPONSE_SENTINEL: &str = "AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL";
 #[cfg(target_os = "macos")]
 const NETWORK_MONITOR_START_ATTEMPTS: usize = 3;
 #[cfg(target_os = "macos")]
@@ -1901,8 +1904,8 @@ fn verify_real_codex_e2e(
     assert_tree_excludes_bytes(
         root,
         &[
-            AUTOMATIC_CODEX_E2E_PROMPT.as_bytes(),
-            AUTOMATIC_CODEX_E2E_RESPONSE.as_bytes(),
+            AUTOMATIC_CODEX_E2E_PROMPT_SENTINEL.as_bytes(),
+            AUTOMATIC_CODEX_E2E_RESPONSE_SENTINEL.as_bytes(),
         ],
     )?;
     Ok(records)
@@ -4950,6 +4953,7 @@ fn render_automatic_manifest(
         optional_u64(collector_network),
         network_samples,
     );
+    manifest = manifest.replace("no-raw-prompt\n", "no-raw-prompt-or-response\n");
     for result in results {
         let mut run_latencies = result.synthetic_otlp_latencies_us.clone();
         run_latencies.sort_unstable();
@@ -4996,7 +5000,7 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
         "transport: private-ca-https-exact-private-random-request-header-not-mtls",
         "codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp",
         "observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity",
-        "real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt",
+        "real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response",
         "synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report",
         "notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan",
         "synthetic_collector_otlp_p95_us:",
@@ -6052,6 +6056,29 @@ mod tests {
         )
         .unwrap();
         assert!(assert_automatic_notify_sentinels_absent(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn automatic_codex_privacy_scan_rejects_each_isolated_sentinel() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("agent-observability-codex-scan-{stamp}"));
+        fs::create_dir_all(&root).unwrap();
+        for (index, sentinel) in [
+            AUTOMATIC_CODEX_E2E_PROMPT_SENTINEL.as_bytes(),
+            AUTOMATIC_CODEX_E2E_RESPONSE_SENTINEL.as_bytes(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = root.join(format!("leaked-{index}.bin"));
+            fs::write(&path, sentinel).unwrap();
+            assert!(assert_tree_excludes_bytes(&root, &[sentinel]).is_err());
+            fs::remove_file(path).unwrap();
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

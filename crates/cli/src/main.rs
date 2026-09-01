@@ -832,10 +832,7 @@ fn report_command(arguments: &[String]) -> Result<String, String> {
 fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let config = load(&layout.config).map_err(|error| error.to_string())?;
-    let store = open_store(&mutation, &layout, &config)?;
-    drop(mutation);
+    let store = open_report_store(&layout)?;
     let rate_table = rate_table_path
         .map(read_private_rate_table)
         .transpose()?
@@ -872,6 +869,12 @@ fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String>
         cost_status,
         output_path.display()
     ))
+}
+
+fn open_report_store(layout: &InstalledLayout) -> Result<LocalStore, String> {
+    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    open_store(&mutation, layout, &config)
 }
 
 fn read_private_rate_table(path: &Path) -> Result<String, String> {
@@ -1137,6 +1140,7 @@ mod tests {
     use agent_observability_codex_integration::{
         CodexIntegrationStatus, CollectorStatus, ConnectionStatus,
     };
+    use agent_observability_local_runtime::{MutationGuard, install};
     use std::fs;
     use std::path::Path;
     use std::time::Duration;
@@ -1328,6 +1332,23 @@ mod tests {
             prepare_dashboard_with(&root, true, |_| Err("opener failed".into())).unwrap_err();
         assert_eq!(error, "opener failed");
         assert!(root.join("logs").join(REPORT_FILE_NAME).is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_store_preparation_does_not_retain_the_mutation_guard() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-report-lock-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let store = super::open_report_store(&layout).unwrap();
+        let render = store.acquire_report_render_guard().unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        drop(mutation);
+        drop(render);
+        drop(store);
         let _ = fs::remove_dir_all(root);
     }
 

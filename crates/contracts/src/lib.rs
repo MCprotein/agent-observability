@@ -108,7 +108,14 @@ pub struct AutomaticLocalPrivacyV1 {
     pub content_fields_durable: bool,
     pub raw_identifiers_durable: bool,
     pub raw_request_bodies_durable: bool,
-    pub unknown_fields: String,
+    pub unknown_fields: AutomaticUnknownFieldPolicyV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AutomaticUnknownFieldPolicyV1 {
+    pub otlp_attributes: String,
+    pub notify_payload: String,
 }
 
 impl AdapterCapabilityManifestV1 {
@@ -206,7 +213,10 @@ fn validate_codex_automatic_local_capability(
         || capability.privacy.content_fields_durable
         || capability.privacy.raw_identifiers_durable
         || capability.privacy.raw_request_bodies_durable
-        || capability.privacy.unknown_fields != "discarded_by_allowlist_before_durable_boundary"
+        || capability.privacy.unknown_fields.otlp_attributes
+            != "discarded_by_allowlist_before_durable_boundary"
+        || capability.privacy.unknown_fields.notify_payload
+            != "rejected_by_closed_schema_before_transport"
     {
         return Err(ContractError::InvalidCapabilityManifest);
     }
@@ -1791,8 +1801,12 @@ mod tests {
         assert!(!automatic.privacy.raw_identifiers_durable);
         assert!(!automatic.privacy.raw_request_bodies_durable);
         assert_eq!(
-            automatic.privacy.unknown_fields,
+            automatic.privacy.unknown_fields.otlp_attributes,
             "discarded_by_allowlist_before_durable_boundary"
+        );
+        assert_eq!(
+            automatic.privacy.unknown_fields.notify_payload,
+            "rejected_by_closed_schema_before_transport"
         );
         assert!(
             automatic

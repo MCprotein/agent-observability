@@ -1249,11 +1249,18 @@ struct CollectorState {
     report_failure: Option<ReportFailure>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ReportFailure {
     Task,
-    Refresh,
+    Install,
+    OpenStore,
+    Clock,
+    RenderGuard,
+    Snapshot,
+    Projection,
+    Publish,
+    Acknowledge,
     Status,
 }
 
@@ -2048,7 +2055,7 @@ fn schedule_report_refresh_with_timing(state: &AppState, timing: ReportRefreshTi
             let (refresh, mut failure) =
                 match tokio::task::spawn_blocking(move || refresh_report_from_root(&root)).await {
                     Ok(Ok(refreshed)) => (Some(refreshed), None),
-                    Ok(Err(_)) => (None, Some(ReportFailure::Refresh)),
+                    Ok(Err(report_failure)) => (None, Some(report_failure)),
                     Err(_) => (None, Some(ReportFailure::Task)),
                 };
             let mut collector = state.collector.lock().await;
@@ -2191,10 +2198,12 @@ fn clear_report_dirty(layout: &InstalledLayout) -> Result<(), CollectorError> {
     }
 }
 
-fn refresh_report_from_root(root: &Path) -> Result<bool, CollectorError> {
-    let layout = install(root).map_err(runtime_error)?;
-    let store = LocalStore::open_current(layout.state.join("store")).map_err(runtime_error)?;
-    refresh_report(&layout, &store, current_unix_ms()?)
+fn refresh_report_from_root(root: &Path) -> Result<bool, ReportFailure> {
+    let layout = install(root).map_err(|_| ReportFailure::Install)?;
+    let store = LocalStore::open_current(layout.state.join("store"))
+        .map_err(|_| ReportFailure::OpenStore)?;
+    let now_unix_ms = current_unix_ms().map_err(|_| ReportFailure::Clock)?;
+    refresh_report(&layout, &store, now_unix_ms)
 }
 
 /// Projects and sends a raw notify argument with bounded foreground deadlines.
@@ -2476,20 +2485,25 @@ fn refresh_report(
     layout: &InstalledLayout,
     store: &LocalStore,
     now_unix_ms: u64,
-) -> Result<bool, CollectorError> {
-    let _render_guard = store.acquire_report_render_guard().map_err(runtime_error)?;
-    let snapshot = store.report_snapshot().map_err(runtime_error)?;
+) -> Result<bool, ReportFailure> {
+    let _render_guard = store
+        .acquire_report_render_guard()
+        .map_err(|_| ReportFailure::RenderGuard)?;
+    let snapshot = store
+        .report_snapshot()
+        .map_err(|_| ReportFailure::Snapshot)?;
     let report = project_report(
         &snapshot.records,
-        timestamp_from_unix_ms(now_unix_ms)?,
+        timestamp_from_unix_ms(now_unix_ms).map_err(|_| ReportFailure::Projection)?,
         "Agent Observability Report",
         None,
     )
-    .map_err(runtime_error)?;
-    write_private(&layout.logs.join(REPORT_FILE_NAME), &report).map_err(runtime_error)?;
+    .map_err(|_| ReportFailure::Projection)?;
+    write_private(&layout.logs.join(REPORT_FILE_NAME), &report)
+        .map_err(|_| ReportFailure::Publish)?;
     store
         .acknowledge_report_generation(snapshot.generation)
-        .map_err(runtime_error)
+        .map_err(|_| ReportFailure::Acknowledge)
 }
 
 fn open_store(
@@ -2577,7 +2591,7 @@ mod tests {
     use super::{
         AUTH_HEADER_NAME, AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome,
         OtlpRejectionCategory, OtlpRequestCorrelationState, OtlpSubmissionOutcome,
-        REPORT_FILE_NAME, admit_request, authenticated_request, build_client_config,
+        REPORT_FILE_NAME, ReportFailure, admit_request, authenticated_request, build_client_config,
         build_server_config, classify_otlp_rejection, enforce_batch_policy, ingest_locked,
         ingest_notify_locked, install_settings, is_json, load_settings, open_store,
         parse_complete_http_response, project_report, read_private_snapshot,
@@ -2608,6 +2622,24 @@ mod tests {
         time::{Duration, Instant},
     };
     use tokio::sync::Mutex;
+
+    #[test]
+    fn report_failure_health_codes_are_bounded_stage_names() {
+        for (failure, expected) in [
+            (ReportFailure::Task, "\"task\""),
+            (ReportFailure::Install, "\"install\""),
+            (ReportFailure::OpenStore, "\"open_store\""),
+            (ReportFailure::Clock, "\"clock\""),
+            (ReportFailure::RenderGuard, "\"render_guard\""),
+            (ReportFailure::Snapshot, "\"snapshot\""),
+            (ReportFailure::Projection, "\"projection\""),
+            (ReportFailure::Publish, "\"publish\""),
+            (ReportFailure::Acknowledge, "\"acknowledge\""),
+            (ReportFailure::Status, "\"status\""),
+        ] {
+            assert_eq!(serde_json::to_string(&failure).unwrap(), expected);
+        }
+    }
 
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

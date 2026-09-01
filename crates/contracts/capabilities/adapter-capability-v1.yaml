@@ -247,7 +247,10 @@
         "content_fields_durable": false,
         "raw_identifiers_durable": false,
         "raw_request_bodies_durable": false,
-        "unknown_fields": "discarded_by_allowlist_before_durable_boundary"
+        "unknown_fields": {
+          "otlp_attributes": "discarded_by_allowlist_before_durable_boundary",
+          "notify_payload": "rejected_by_closed_schema_before_transport"
+        }
       },
       "manual_ingest_boundary": "private_canonical_handoff_v1",
       "team_ingest": "disabled",
