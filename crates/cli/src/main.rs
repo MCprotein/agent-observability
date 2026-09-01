@@ -42,7 +42,8 @@ const USAGE: &str = "Agent Observability (`agentobs`, legacy alias: `agent-obser
 
 Quick start:
   agentobs demo [root] [--no-open]       Open the sample monitoring dashboard
-  agentobs setup [root] [--no-open]      One-click Codex setup and monitoring
+  agentobs setup [--no-open]             One-click Codex setup and monitoring
+  agentobs setup <root> [--no-open]      Initialize a manual-import runtime
   agentobs dashboard [root] [--no-open]  Refresh and open the monitoring dashboard
   agentobs ui [root] [--no-open]         Open settings only
 

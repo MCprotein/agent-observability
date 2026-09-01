@@ -1,13 +1,18 @@
 # Agent Observability
 
 Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, permission을 하나의
-로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 서버나 계정 없이 동작하며 데이터와
+로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 외부 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
 > **v1.8.0 상태: In Progress.** 기존 Codex, Claude Code, Cursor private handoff 수동 import는
 > daemon이나 network 없이 계속 동작한다. 선택적 Codex 자동 수집은 인증된 `127.0.0.1`
 > OTLP/HTTP JSON receiver, bounded notify supplement와 macOS LaunchAgent를 사용한다.
 > Claude Code/Cursor 자동 수집과 commercial team profile은 아직 TODO다.
+
+> **v1.7 이하에서 업그레이드할 때:** 인자 없는 `agentobs setup`은 v1.8부터 Codex 설정을 연결하고
+> persistent local LaunchAgent를 시작한다. 기존처럼 수동 import runtime과 dashboard만 준비하는
+> script는 `agentobs setup ~/.agent-observability --no-open`처럼 root를 명시한다. 자동 연결은 이후
+> `agentobs connect codex`로 언제든 추가할 수 있다.
 
 아래 automatic 명령은 v1.8.0 development build 기준이다. v1.8.0이 release되기 전에는 public installer의
 latest stable binary가 이 automatic slice를 포함하지 않을 수 있다.
@@ -179,7 +184,7 @@ v1.8.0 automatic release evidence는 아직 진행 중이다.
 
 | Agent | Verified version | 현재 지원 | 알려진 제한 |
 | --- | --- | --- | --- |
-| Codex | `0.150.1` | 수동 handoff + 자동 local OTLP/HTTP JSON/notify | 자동 경로는 macOS only, v1.8.0 In Progress |
+| Codex | 수동 `0.150.1`, 자동 `0.151.0` | 수동 handoff + 자동 local OTLP/HTTP JSON/notify | 자동 경로는 macOS only, v1.8.0 In Progress |
 | Claude Code | `2.1.248` | OTel/hook canonical handoff 수동 import | 자동 연결 TODO, user interrupt signal 미확인 |
 | Cursor | `3.17.21` | generic tool canonical handoff 수동 import | 자동 연결 TODO, 일부 shell/MCP/file event는 diagnostic-only |
 

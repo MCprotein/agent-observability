@@ -95,14 +95,16 @@ sequenceDiagram
     Report->>Store: acknowledge exact rendered generation
 ```
 
-`connect codex` starts the collector and verifies health before taking Codex config ownership. If config
-connection fails, it removes the just-installed service. `disconnect codex` first confirms LaunchAgent stop and
-plist removal, then restores the exact prior Codex config only while the complete connected bytes and mode still
-match. It retains local observations. Unacknowledged SQLite report generations survive crashes; startup reconciles
-them and bounded exponential retries expose an exhausted refresh as degraded health through CLI and UI.
+`connect codex` starts the collector and verifies health before taking Codex config ownership. A private
+LaunchAgent transaction records prior plist bytes/mode and loaded state; failure or crash restores that exact
+state instead of unconditionally removing a service. `disconnect codex` first converges the LaunchAgent to its
+recorded prior state, then restores the exact prior Codex config only while the complete connected bytes and mode
+still match. It retains local observations. Unacknowledged SQLite report generations survive crashes; startup
+reconciles them and bounded exponential retries expose an exhausted refresh as degraded health through CLI/UI.
 
 The receiver binds only `127.0.0.1`, requires `x-agent-observability-token` on health and ingest routes,
-accepts at most 1 MiB per OTLP request and 4096 log records, and writes no request body log. The notify helper
+admits at most 64 concurrent connections, closes incomplete headers after five seconds, bounds each request
+lifetime to 30 seconds, accepts at most 1 MiB per OTLP request and 4096 log records, and writes no request body log. The notify helper
 accepts at most 64 KiB, uses bounded local connect/read/write deadlines, and always returns success to Codex
 with an accepted, rejected or unavailable outcome. It supplements turn completion; OTLP remains primary for
 model, request, usage, tool and permission signals.

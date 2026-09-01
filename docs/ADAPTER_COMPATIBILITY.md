@@ -76,8 +76,9 @@ Each entry in `crates/contracts/capabilities/adapter-capability-v1.yaml` contain
 privacy closure. The Codex, Claude Code and Cursor adapter suites verify declared input/projection fixture hashes,
 exact replay output, bounded input, restart/idempotency and privacy behavior. Claude Code additionally locks permission,
 compaction, failed lifecycle, interrupt-gap and out-of-order timestamp fixtures. The published capability manifest
-remains restricted to macOS, standalone, `private_canonical_handoff_v1`, and the exact declared versions. The
-v1.8.0 Codex automatic implementation does not become a released capability until native receiver, foreground
+publishes separate manual `private_canonical_handoff_v1` entries and a macOS standalone
+`codex_automatic_local.v1` entry pinned to Codex `0.151.0`. The v1.8.0 Codex automatic implementation does not
+become a released capability until native receiver, foreground
 notify, privacy, restart and performance evidence is complete. Cross-version/OS/profile execution remains a
 future promotion gate.
 
@@ -105,7 +106,8 @@ shell/MCP/file hooks remain diagnostic-only, and raw transcript/content fields a
 
 The v1.8.0 code adds a Codex-only OTLP/HTTP JSON receiver, bounded notify helper, exact config ownership and
 macOS LaunchAgent. It does not add OTLP/gRPC, Claude Code automatic collection, Cursor automatic collection,
-file scraping or a team transport. Manual imports remain the stable shared boundary. Cross-version execution and
-full automatic-path performance evidence remain roadmap work, so v1.8.0 stays **In Progress**, not Released.
+file scraping or a team transport. Manual imports remain the stable shared boundary. The automatic capability is
+verified only for Codex `0.151.0`; cross-version execution and publication evidence remain release gates, so
+v1.8.0 stays **In Progress**, not Released.
 Other platforms fail closed for automatic setup until equivalent service, no-follow, identity, permission and
 execution evidence exists; manual private imports retain their existing supported boundary.

@@ -268,9 +268,11 @@ anti-corruption layer다.
 - The ephemeral settings UI exposes the same `codex-integration` status/connect/disconnect use cases and can
   open an existing private report. Integration mutations require the same private UI session plus exact Host
   and Origin checks as config mutation. Closing the UI does not disconnect a previously installed LaunchAgent.
-- LaunchAgent label은 runtime root hash로 분리하고 plist는 `~/Library/LaunchAgents`에 원자적으로
-  기록한다. `disconnect codex`는 LaunchAgent를 중지하고 plist를 제거하지만 local SQLite와 report는
-  보존한다. Automatic collection은 현재 macOS Codex만 지원한다.
+- LaunchAgent label은 runtime root hash로 분리한다. Private ownership transaction은 prior plist
+  bytes/mode, prior loaded state, desired state와 phase를 기록하고 reconnect·disconnect·crash recovery에서
+  정확한 이전 상태를 복원한다. 새 설치가 소유한 plist만 제거하며 inherited 또는 이전 정상 service를
+  역명령으로 파괴하지 않는다. Local SQLite와 report는 보존한다. Automatic collection은 현재 macOS
+  Codex만 지원한다.
 - Automatic collector는 source-ordered observation/disposition을 한 SQLite transaction에 commit한다.
   Ingest와 retention을 포함한 current-record mutation은 durable report generation을 같은 authority에서
   증가시킨다. Renderer는 generation-consistent snapshot을 쓰고 exact generation만 acknowledge한다. Private

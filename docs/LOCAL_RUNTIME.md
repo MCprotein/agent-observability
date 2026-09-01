@@ -74,16 +74,19 @@ The receiver binds only `127.0.0.1` and accepts OTLP/HTTP JSON at `/v1/logs`; th
 `runtime/collector.json` with mode `0600`, and compared without early byte mismatch exit.
 
 The LaunchAgent plist is written to `~/Library/LaunchAgents` with a label derived from the runtime root. It
-runs the current absolute `agentobs` executable as `collector-serve <root>`, starts at load, and is kept alive
+runs the canonical absolute installed executable as `collector-serve <root>`, starts at load, and is kept alive
 by launchd. Automatic collection currently supports macOS Codex only. It does not scrape Codex files,
 credentials, browser sessions or private APIs and does not connect to an external host.
 
 Codex config ownership is transactional. The manager uses `$CODEX_HOME/config.toml` when `CODEX_HOME` is set,
 otherwise `~/.codex/config.toml`, and manages only top-level `notify`, the local JSON `otel.exporter`,
-`otel.log_user_prompt=false`, and `otel.environment="local"`. Notify is exactly the absolute `agentobs` path,
+`otel.log_user_prompt=false`, and `otel.environment="local"`. Notify is exactly the canonical absolute installed executable path,
 `codex-notify`, and absolute runtime root. The exporter contains only the configured local `/v1/logs` endpoint,
 JSON protocol and private token header. The endpoint port is an OS-assigned available loopback port persisted in
-private collector settings. Connect refuses pre-existing managed values unless they match exactly.
+private collector settings. If that port is occupied after restart, the collector rotates only to another
+OS-assigned loopback port; the next explicit `connect codex` reloads the persisted endpoint and crash-safely
+rotates the values it already owns. `status` reports the stale owned endpoint as a conflict until convergence.
+Connect refuses pre-existing unmanaged values unless they match exactly.
 Before changing the file, it stores the exact prior and connected bytes, hashes, existence, permission modes
 and transaction phase in `runtime/integrations/codex/codex-config-ownership-v1.json` with private permissions.
 A private mutation lock, exact-state comparison, temp-file fsync and atomic rename preserve supported concurrent
@@ -106,7 +109,9 @@ a durable SQLite report generation. A renderer reads a generation-consistent sna
 exact generation written to `logs/agent-observability-report.html`; a private marker is only a best-effort wakeup.
 Startup reconciles every unacknowledged generation. Refresh uses bounded exponential retries and reports a
 degraded health state after exhaustion. CLI and UI preserve that state instead of presenting the report as
-current. A failure never turns raw input into a fallback log or file.
+current. Burst refresh is quiet-period coalesced and forced after at most two seconds of continuous ingest so
+HTML/projection fsync does not occupy the foreground notify path indefinitely. A failure never turns raw input
+into a fallback log or file.
 
 ## Manual imports
 

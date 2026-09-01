@@ -120,7 +120,7 @@ Codex config는 `$CODEX_HOME/config.toml` 또는 기본 `~/.codex/config.toml`�
 
 | Managed value | Required value |
 | --- | --- |
-| top-level `notify` | absolute `agentobs` path, `codex-notify`, absolute runtime root의 3-element command |
+| top-level `notify` | canonical absolute installed executable path, `codex-notify`, absolute runtime root의 3-element command |
 | `otel.exporter` | local `/v1/logs` endpoint, JSON protocol, private token header만 포함한 OTLP/HTTP exporter |
 | `otel.log_user_prompt` | `false` |
 | `otel.environment` | `local` |
