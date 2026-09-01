@@ -893,7 +893,7 @@
         <a href="#collection"><i data-lucide="activity"></i>\uC218\uC9D1</a>
         <a href="#storage"><i data-lucide="database"></i>\uC800\uC7A5\uC18C</a>
         <a href="#retention"><i data-lucide="archive"></i>\uBCF4\uAD00</a>
-        <div class="nav-note"><strong>Codex</strong><span>${integration?.config === "connected" ? "\uC790\uB3D9 \uC218\uC9D1 \uC5F0\uACB0\uB428" : "\uC790\uB3D9 \uC218\uC9D1 \uC5F0\uACB0 \uC548 \uB428"}</span><span>${integration?.collector === "ready" ? "collector \uC2E4\uD589 \uC911" : "collector \uC911\uC9C0\uB428"}</span></div>
+        <div class="nav-note"><strong>Codex</strong><span>${integration?.config === "connected" ? "\uC790\uB3D9 \uC218\uC9D1 \uC5F0\uACB0\uB428" : "\uC790\uB3D9 \uC218\uC9D1 \uC5F0\uACB0 \uC548 \uB428"}</span><span>${collectorNavigationStatus()}</span></div>
       </nav>
       <main class="settings-main">
         <form id="settings-form" novalidate>
@@ -952,15 +952,23 @@
   function integrationPanel() {
     const connected = integration?.config === "connected";
     const ready = integration?.collector === "ready";
+    const degraded = integration?.collector === "degraded";
     const conflicted2 = integration?.config === "conflict";
-    const state = connected && ready ? "\uC218\uC9D1 \uC911" : conflicted2 ? "\uC124\uC815 \uCDA9\uB3CC" : "\uC5F0\uACB0 \uC548 \uB428";
-    const detail = connected && ready ? "Codex \uC774\uBCA4\uD2B8\uB97C private local runtime\uC5D0 \uBC18\uC601\uD569\uB2C8\uB2E4." : conflicted2 ? "Codex \uC124\uC815\uC774 \uC5F0\uACB0 \uD6C4 \uBCC0\uACBD\uB418\uC5B4 \uC790\uB3D9 \uBCF5\uC6D0\uC744 \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD558\uBA74 \uB2E4\uC74C \uC791\uC5C5\uBD80\uD130 \uAE30\uB85D\uD569\uB2C8\uB2E4.";
+    const state = conflicted2 ? "\uC124\uC815 \uCDA9\uB3CC" : connected && degraded ? "\uB9AC\uD3EC\uD2B8 \uBC18\uC601 \uC9C0\uC5F0" : connected && ready ? "\uC218\uC9D1 \uC911" : connected ? "\uC218\uC9D1\uAE30 \uC751\uB2F5 \uC5C6\uC74C" : "\uC5F0\uACB0 \uC548 \uB428";
+    const detail = conflicted2 ? "Codex \uC124\uC815\uC774 \uC5F0\uACB0 \uD6C4 \uBCC0\uACBD\uB418\uC5B4 \uC790\uB3D9 \uBCF5\uC6D0\uC744 \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4." : connected && degraded ? "\uC774\uBCA4\uD2B8 \uC218\uC9D1\uC740 \uAC00\uB2A5\uD558\uC9C0\uB9CC \uBAA8\uB2C8\uD130\uB9C1 \uB9AC\uD3EC\uD2B8\uAC00 \uCD5C\uC2E0 \uC0C1\uD0DC\uAC00 \uC544\uB2D9\uB2C8\uB2E4." : connected && ready ? "Codex \uC774\uBCA4\uD2B8\uB97C private local runtime\uC5D0 \uBC18\uC601\uD569\uB2C8\uB2E4." : connected ? "Codex \uC5F0\uACB0\uC740 \uC720\uC9C0\uB418\uC9C0\uB9CC \uB85C\uCEEC \uC218\uC9D1\uAE30\uC5D0 \uC5F0\uACB0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD558\uBA74 \uB2E4\uC74C \uC791\uC5C5\uBD80\uD130 \uAE30\uB85D\uD569\uB2C8\uB2E4.";
     const action = connected ? `<button class="button secondary" id="toggle-integration" type="button"><i data-lucide="power"></i>\uC5F0\uACB0 \uD574\uC81C</button>` : `<button class="button primary" id="toggle-integration" type="button"><i data-lucide="cable"></i>Codex \uC5F0\uACB0</button>`;
-    return `<div class="integration-panel" data-state="${ready ? "ready" : conflicted2 ? "conflict" : "idle"}">
+    const panelState = conflicted2 ? "conflict" : degraded ? "degraded" : ready ? "ready" : "idle";
+    const collectorLabel = degraded ? "\uB9AC\uD3EC\uD2B8 \uC9C0\uC5F0" : ready ? "\uC815\uC0C1" : "\uC911\uC9C0";
+    return `<div class="integration-panel" data-state="${panelState}">
     <div class="integration-identity"><span class="integration-icon"><i data-lucide="activity"></i></span><div><span>Codex</span><strong>${state}</strong><small>${detail}</small></div></div>
-    <div class="integration-meta"><span><b>\uC218\uC9D1\uAE30</b>${ready ? "\uC815\uC0C1" : "\uC911\uC9C0"}</span><span><b>\uC800\uC7A5</b>\uB85C\uCEEC \uC804\uC6A9</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
+    <div class="integration-meta"><span><b>\uC218\uC9D1\uAE30</b>${collectorLabel}</span><span><b>\uC800\uC7A5</b>\uB85C\uCEEC \uC804\uC6A9</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
     <div class="integration-actions">${action}<button class="button monitor-button" id="overview-dashboard" type="button"><i data-lucide="external-link"></i>\uB9AC\uD3EC\uD2B8 \uC5F4\uAE30</button></div>
   </div>`;
+  }
+  function collectorNavigationStatus() {
+    if (integration?.collector === "ready") return "collector \uC2E4\uD589 \uC911";
+    if (integration?.collector === "degraded") return "collector \uC2E4\uD589 \uC911 \xB7 \uB9AC\uD3EC\uD2B8 \uC9C0\uC5F0";
+    return "collector \uC911\uC9C0\uB428";
   }
   function collectionSection(config) {
     return `<section class="settings-section" id="collection" aria-labelledby="collection-title">

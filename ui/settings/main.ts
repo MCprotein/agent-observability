@@ -43,7 +43,7 @@ type Envelope = {
 
 type IntegrationStatus = {
   config: "connected" | "disconnected" | "conflict";
-  collector: "ready" | "unavailable";
+  collector: "ready" | "degraded" | "unavailable";
   endpoint?: string;
   service?: string;
   data_retained: boolean;
@@ -273,7 +273,7 @@ function renderSettings(focusTarget?: string): void {
         <a href="#collection"><i data-lucide="activity"></i>수집</a>
         <a href="#storage"><i data-lucide="database"></i>저장소</a>
         <a href="#retention"><i data-lucide="archive"></i>보관</a>
-        <div class="nav-note"><strong>Codex</strong><span>${integration?.config === "connected" ? "자동 수집 연결됨" : "자동 수집 연결 안 됨"}</span><span>${integration?.collector === "ready" ? "collector 실행 중" : "collector 중지됨"}</span></div>
+        <div class="nav-note"><strong>Codex</strong><span>${integration?.config === "connected" ? "자동 수집 연결됨" : "자동 수집 연결 안 됨"}</span><span>${collectorNavigationStatus()}</span></div>
       </nav>
       <main class="settings-main">
         <form id="settings-form" novalidate>
@@ -334,21 +334,42 @@ function overviewSection(config: LocalRuntimeConfigV2): string {
 function integrationPanel(): string {
   const connected = integration?.config === "connected";
   const ready = integration?.collector === "ready";
+  const degraded = integration?.collector === "degraded";
   const conflicted = integration?.config === "conflict";
-  const state = connected && ready ? "수집 중" : conflicted ? "설정 충돌" : "연결 안 됨";
-  const detail = connected && ready
-    ? "Codex 이벤트를 private local runtime에 반영합니다."
-    : conflicted
-      ? "Codex 설정이 연결 후 변경되어 자동 복원을 중단했습니다."
-      : "Codex 자동 수집을 연결하면 다음 작업부터 기록합니다.";
+  const state = conflicted
+    ? "설정 충돌"
+    : connected && degraded
+      ? "리포트 반영 지연"
+      : connected && ready
+        ? "수집 중"
+        : connected
+          ? "수집기 응답 없음"
+          : "연결 안 됨";
+  const detail = conflicted
+    ? "Codex 설정이 연결 후 변경되어 자동 복원을 중단했습니다."
+    : connected && degraded
+      ? "이벤트 수집은 가능하지만 모니터링 리포트가 최신 상태가 아닙니다."
+      : connected && ready
+        ? "Codex 이벤트를 private local runtime에 반영합니다."
+        : connected
+          ? "Codex 연결은 유지되지만 로컬 수집기에 연결할 수 없습니다."
+          : "Codex 자동 수집을 연결하면 다음 작업부터 기록합니다.";
   const action = connected
     ? `<button class="button secondary" id="toggle-integration" type="button"><i data-lucide="power"></i>연결 해제</button>`
     : `<button class="button primary" id="toggle-integration" type="button"><i data-lucide="cable"></i>Codex 연결</button>`;
-  return `<div class="integration-panel" data-state="${ready ? "ready" : conflicted ? "conflict" : "idle"}">
+  const panelState = conflicted ? "conflict" : degraded ? "degraded" : ready ? "ready" : "idle";
+  const collectorLabel = degraded ? "리포트 지연" : ready ? "정상" : "중지";
+  return `<div class="integration-panel" data-state="${panelState}">
     <div class="integration-identity"><span class="integration-icon"><i data-lucide="activity"></i></span><div><span>Codex</span><strong>${state}</strong><small>${detail}</small></div></div>
-    <div class="integration-meta"><span><b>수집기</b>${ready ? "정상" : "중지"}</span><span><b>저장</b>로컬 전용</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
+    <div class="integration-meta"><span><b>수집기</b>${collectorLabel}</span><span><b>저장</b>로컬 전용</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
     <div class="integration-actions">${action}<button class="button monitor-button" id="overview-dashboard" type="button"><i data-lucide="external-link"></i>리포트 열기</button></div>
   </div>`;
+}
+
+function collectorNavigationStatus(): string {
+  if (integration?.collector === "ready") return "collector 실행 중";
+  if (integration?.collector === "degraded") return "collector 실행 중 · 리포트 지연";
+  return "collector 중지됨";
 }
 
 function collectionSection(config: LocalRuntimeConfigV2): string {

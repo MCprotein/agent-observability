@@ -5,22 +5,25 @@ use agent_observability_codex_config::{
     CodexConfigManager, ConfigError, ConnectionStatus as ConfigConnectionStatus,
 };
 use agent_observability_local_collector::{
-    CollectorError, CollectorSettings, HealthOutcome, check_health, install_settings, load_settings,
+    CollectorError, CollectorSettings, TOKEN_HEADER, install_settings, load_settings,
 };
-use agent_observability_local_runtime::{InstalledLayout, install};
-use serde::Serialize;
+use agent_observability_local_runtime::{ConfigMutationGuard, InstalledLayout, install};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     env, fmt, fs,
+    io::{Read, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     time::Duration,
 };
 #[cfg(target_os = "macos")]
 use std::{
-    fs::OpenOptions,
-    io::Write,
+    fs::{File, OpenOptions},
     process::{Command, Stdio},
 };
+
+const MAX_HEALTH_RESPONSE_BYTES: u64 = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -34,6 +37,7 @@ pub enum ConnectionStatus {
 #[serde(rename_all = "lowercase")]
 pub enum CollectorStatus {
     Ready,
+    Degraded,
     Unavailable,
 }
 
@@ -96,15 +100,17 @@ impl From<std::io::Error> for IntegrationError {
 
 pub fn connect(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, IntegrationError> {
     let layout = install(root).map_err(runtime_error)?;
-    let settings = install_settings(&layout.root)?;
-    let manager = codex_config_manager(&layout, executable, &settings)?;
-    connect_prepared(
-        &layout.root,
-        executable,
-        &settings.endpoint(),
-        &manager,
-        &SystemLifecycle,
-    )
+    with_lifecycle_lock(&layout, || {
+        let settings = install_settings(&layout.root)?;
+        let manager = codex_config_manager(&layout, executable, &settings)?;
+        connect_prepared(
+            &layout.root,
+            executable,
+            &settings.endpoint(),
+            &manager,
+            &SystemLifecycle,
+        )
+    })
 }
 
 fn connect_prepared(
@@ -115,16 +121,16 @@ fn connect_prepared(
     lifecycle: &impl CollectorLifecycle,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
     let service = lifecycle.install(root, executable)?;
-    if let Err(error) = lifecycle.wait_until_ready(root) {
-        return Err(rollback_service(lifecycle, &service, error));
-    }
+    let collector = lifecycle
+        .wait_until_ready(root)
+        .map_err(|error| rollback_service(lifecycle, &service, error))?;
     let config = match config.connect() {
         Ok(status) => status.into(),
         Err(error) => return Err(rollback_service(lifecycle, &service, error)),
     };
     Ok(CodexIntegrationStatus {
         config,
-        collector: CollectorStatus::Ready,
+        collector,
         endpoint: Some(endpoint.into()),
         service: Some(service.label),
         data_retained: true,
@@ -136,15 +142,17 @@ pub fn disconnect(
     executable: &Path,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
     let layout = install(root).map_err(runtime_error)?;
-    let settings = load_settings(&layout.root)?;
-    let manager = codex_config_manager(&layout, executable, &settings)?;
-    disconnect_prepared(
-        &layout.root,
-        executable,
-        &settings.endpoint(),
-        &manager,
-        &SystemLifecycle,
-    )
+    with_lifecycle_lock(&layout, || {
+        let settings = load_settings(&layout.root)?;
+        let manager = codex_config_manager(&layout, executable, &settings)?;
+        disconnect_prepared(
+            &layout.root,
+            executable,
+            &settings.endpoint(),
+            &manager,
+            &SystemLifecycle,
+        )
+    })
 }
 
 fn disconnect_prepared(
@@ -164,7 +172,7 @@ fn disconnect_prepared(
         Err(error) => {
             let reinstall = lifecycle
                 .install(root, executable)
-                .and_then(|_| lifecycle.wait_until_ready(root));
+                .and_then(|_| lifecycle.wait_until_ready(root).map(|_| ()));
             return match reinstall {
                 Ok(()) => Err(error),
                 Err(reinstall) => Err(rollback_error(&error, &reinstall)),
@@ -204,7 +212,7 @@ trait CollectorLifecycle {
     fn install(&self, root: &Path, executable: &Path)
     -> Result<CollectorService, IntegrationError>;
     fn service(&self, root: &Path) -> Result<CollectorService, IntegrationError>;
-    fn wait_until_ready(&self, root: &Path) -> Result<(), IntegrationError>;
+    fn wait_until_ready(&self, root: &Path) -> Result<CollectorStatus, IntegrationError>;
     fn uninstall(&self, service: &CollectorService) -> Result<(), IntegrationError>;
 }
 
@@ -223,7 +231,7 @@ impl CollectorLifecycle for SystemLifecycle {
         collector_service(root)
     }
 
-    fn wait_until_ready(&self, root: &Path) -> Result<(), IntegrationError> {
+    fn wait_until_ready(&self, root: &Path) -> Result<CollectorStatus, IntegrationError> {
         wait_for_collector(root)
     }
 
@@ -249,26 +257,28 @@ fn rollback_error(error: &IntegrationError, rollback: &IntegrationError) -> Inte
 
 pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, IntegrationError> {
     let layout = install(root).map_err(runtime_error)?;
-    let settings = match load_settings(&layout.root) {
-        Ok(settings) => settings,
-        Err(CollectorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(CodexIntegrationStatus {
-                config: ConnectionStatus::Disconnected,
-                collector: CollectorStatus::Unavailable,
-                endpoint: None,
-                service: None,
-                data_retained: true,
-            });
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let manager = codex_config_manager(&layout, executable, &settings)?;
-    Ok(CodexIntegrationStatus {
-        config: manager.status()?.into(),
-        collector: check_health(&layout.root).into(),
-        endpoint: Some(settings.endpoint()),
-        service: Some(service_label(&layout.root)),
-        data_retained: true,
+    with_lifecycle_lock(&layout, || {
+        let settings = match load_settings(&layout.root) {
+            Ok(settings) => settings,
+            Err(CollectorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(CodexIntegrationStatus {
+                    config: ConnectionStatus::Disconnected,
+                    collector: CollectorStatus::Unavailable,
+                    endpoint: None,
+                    service: None,
+                    data_retained: true,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let manager = codex_config_manager(&layout, executable, &settings)?;
+        Ok(CodexIntegrationStatus {
+            config: manager.status()?.into(),
+            collector: probe_health(&settings),
+            endpoint: Some(settings.endpoint()),
+            service: Some(service_label(&layout.root)),
+            data_retained: true,
+        })
     })
 }
 
@@ -282,17 +292,113 @@ impl From<ConfigConnectionStatus> for ConnectionStatus {
     }
 }
 
-impl From<HealthOutcome> for CollectorStatus {
-    fn from(status: HealthOutcome) -> Self {
-        match status {
-            HealthOutcome::Ready => Self::Ready,
-            HealthOutcome::Unavailable => Self::Unavailable,
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum HealthStatus {
+    Ready,
+    Degraded,
+}
+
+#[derive(Debug, Deserialize)]
+struct HealthResponse {
+    status: HealthStatus,
+    report_dirty: bool,
+}
+
+fn probe_health(settings: &CollectorSettings) -> CollectorStatus {
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{TOKEN_HEADER}: {}\r\nConnection: close\r\n\r\n",
+        settings.token,
+    );
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), settings.port);
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(50)) else {
+        return CollectorStatus::Unavailable;
+    };
+    let timeout = Some(Duration::from_millis(100));
+    if stream.set_write_timeout(timeout).is_err()
+        || stream.set_read_timeout(timeout).is_err()
+        || stream.write_all(request.as_bytes()).is_err()
+        || stream.flush().is_err()
+    {
+        return CollectorStatus::Unavailable;
+    }
+
+    let mut response = Vec::new();
+    if stream
+        .take(MAX_HEALTH_RESPONSE_BYTES + 1)
+        .read_to_end(&mut response)
+        .is_err()
+        || response.len() as u64 > MAX_HEALTH_RESPONSE_BYTES
+    {
+        return CollectorStatus::Unavailable;
+    }
+    parse_health_response(&response)
+}
+
+fn parse_health_response(response: &[u8]) -> CollectorStatus {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return CollectorStatus::Unavailable;
+    };
+    let (headers, body_with_separator) = response.split_at(header_end);
+    let body = &body_with_separator[4..];
+    let Ok(headers) = std::str::from_utf8(headers) else {
+        return CollectorStatus::Unavailable;
+    };
+    let mut lines = headers.split("\r\n");
+    if !lines
+        .next()
+        .is_some_and(|status| status.starts_with("HTTP/1.1 200 "))
+    {
+        return CollectorStatus::Unavailable;
+    }
+    let mut content_length = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return CollectorStatus::Unavailable;
+        };
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return CollectorStatus::Unavailable;
         }
+        if name.eq_ignore_ascii_case("content-length") {
+            let Ok(length) = value.trim().parse::<usize>() else {
+                return CollectorStatus::Unavailable;
+            };
+            if content_length.replace(length).is_some() {
+                return CollectorStatus::Unavailable;
+            }
+        }
+    }
+    if content_length != Some(body.len()) {
+        return CollectorStatus::Unavailable;
+    }
+    let Ok(health) = serde_json::from_slice::<HealthResponse>(body) else {
+        return CollectorStatus::Unavailable;
+    };
+    match (health.status, health.report_dirty) {
+        (HealthStatus::Ready, _) => CollectorStatus::Ready,
+        (HealthStatus::Degraded, true) => CollectorStatus::Degraded,
+        (HealthStatus::Degraded, false) => CollectorStatus::Unavailable,
     }
 }
 
 fn runtime_error(error: impl fmt::Display) -> IntegrationError {
     IntegrationError::Runtime(error.to_string())
+}
+
+fn acquire_lifecycle_lock(
+    layout: &InstalledLayout,
+) -> Result<ConfigMutationGuard, IntegrationError> {
+    ConfigMutationGuard::acquire(layout).map_err(|error| {
+        IntegrationError::Runtime(format!("Codex integration lifecycle is busy: {error}"))
+    })
+}
+
+fn with_lifecycle_lock<T>(
+    layout: &InstalledLayout,
+    operation: impl FnOnce() -> Result<T, IntegrationError>,
+) -> Result<T, IntegrationError> {
+    let _lifecycle = acquire_lifecycle_lock(layout)?;
+    operation()
 }
 
 fn codex_config_manager(
@@ -409,12 +515,16 @@ fn install_collector_service_with(
     fs::set_permissions(&service.plist, fs::Permissions::from_mode(0o644)).map_err(|error| {
         IntegrationError::Runtime(format!("LaunchAgent permissions failed: {error}"))
     })?;
+    File::open(&service.plist)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| IntegrationError::Runtime(format!("LaunchAgent sync failed: {error}")))?;
+    sync_launch_agent_parent(&service.plist, "install")?;
     let domain = service
         .target
         .rsplit_once('/')
         .map(|(domain, _)| domain)
         .ok_or_else(|| IntegrationError::Runtime("invalid LaunchAgent target".into()))?;
-    let _ = launchctl.bootout(&service.target);
+    stop_before_install(launchctl, &service)?;
     if let Err(error) = launchctl.bootstrap(domain, &service.plist) {
         return Err(cleanup_failed_install(launchctl, &service, error));
     }
@@ -456,11 +566,48 @@ fn uninstall_collector_service_with(
 #[cfg(target_os = "macos")]
 fn remove_service_plist(service: &CollectorService) -> Result<(), IntegrationError> {
     match fs::remove_file(&service.plist) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_launch_agent_parent(&service.plist, "removal"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(IntegrationError::Runtime(format!(
             "LaunchAgent removal failed: {error}"
         ))),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sync_launch_agent_parent(path: &Path, action: &str) -> Result<(), IntegrationError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| IntegrationError::Runtime("LaunchAgent path has no parent".into()))?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            IntegrationError::Runtime(format!("LaunchAgent {action} sync failed: {error}"))
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn stop_before_install(
+    launchctl: &impl Launchctl,
+    service: &CollectorService,
+) -> Result<(), IntegrationError> {
+    match launchctl.bootout(&service.target) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            if launchctl.is_loaded(&service.target)? {
+                Err(IntegrationError::Runtime(format!(
+                    "LaunchAgent stop failed for {}",
+                    service.target
+                )))
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => match launchctl.is_loaded(&service.target) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(error),
+            Err(status_error) => Err(rollback_error(&error, &status_error)),
+        },
     }
 }
 
@@ -500,10 +647,13 @@ fn uninstall_collector_service(_service: &CollectorService) -> Result<(), Integr
     ))
 }
 
-fn wait_for_collector(root: &Path) -> Result<(), IntegrationError> {
+fn wait_for_collector(root: &Path) -> Result<CollectorStatus, IntegrationError> {
     for _ in 0..40 {
-        if check_health(root) == HealthOutcome::Ready {
-            return Ok(());
+        if let Ok(settings) = load_settings(root) {
+            let status = probe_health(&settings);
+            if matches!(status, CollectorStatus::Ready | CollectorStatus::Degraded) {
+                return Ok(status);
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -623,16 +773,25 @@ mod tests {
     use super::{
         CodexIntegrationStatus, CollectorLifecycle, CollectorService, CollectorStatus,
         ConfigConnectionStatus, ConfigLifecycle, ConnectionStatus, IntegrationError,
-        connect_prepared, disconnect_prepared, launch_agent_body, service_label, status,
+        connect_prepared, disconnect_prepared, launch_agent_body, parse_health_response,
+        probe_health, service_label, status, with_lifecycle_lock,
     };
     #[cfg(target_os = "macos")]
     use super::{Launchctl, install_collector_service_with, uninstall_collector_service_with};
+    use agent_observability_local_collector::{
+        COLLECTOR_SETTINGS_VERSION, CollectorSettings, TOKEN_HEADER,
+    };
+    use agent_observability_local_runtime::{ConfigServiceError, LocalConfigService};
     #[cfg(target_os = "macos")]
     use std::collections::VecDeque;
     use std::{
         cell::{Cell, RefCell},
         fs,
+        io::{Read as _, Write as _},
+        net::TcpListener,
         path::{Path, PathBuf},
+        sync::{Arc, Barrier, Mutex},
+        thread,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -701,6 +860,7 @@ mod tests {
         wait_error: bool,
         uninstall_error: bool,
         install_error: Cell<bool>,
+        collector_status: CollectorStatus,
         events: RefCell<Vec<&'static str>>,
     }
 
@@ -710,6 +870,7 @@ mod tests {
                 wait_error: false,
                 uninstall_error: false,
                 install_error: Cell::new(false),
+                collector_status: CollectorStatus::Ready,
                 events: RefCell::new(Vec::new()),
             }
         }
@@ -741,12 +902,12 @@ mod tests {
             Ok(Self::service())
         }
 
-        fn wait_until_ready(&self, _root: &Path) -> Result<(), IntegrationError> {
+        fn wait_until_ready(&self, _root: &Path) -> Result<CollectorStatus, IntegrationError> {
             self.events.borrow_mut().push("health");
             if self.wait_error {
                 Err(IntegrationError::Runtime("health failed".into()))
             } else {
-                Ok(())
+                Ok(self.collector_status)
             }
         }
 
@@ -773,6 +934,142 @@ mod tests {
         assert_eq!(value["config"], "conflict");
         assert_eq!(value["collector"], "unavailable");
         assert_eq!(value["data_retained"], true);
+    }
+
+    #[test]
+    fn degraded_status_serializes_without_becoming_ready() {
+        let status = CodexIntegrationStatus {
+            config: ConnectionStatus::Connected,
+            collector: CollectorStatus::Degraded,
+            endpoint: None,
+            service: None,
+            data_retained: true,
+        };
+
+        let value = serde_json::to_value(status).unwrap();
+
+        assert_eq!(value["collector"], "degraded");
+    }
+
+    #[test]
+    fn health_parser_distinguishes_ready_degraded_and_invalid_payloads() {
+        assert_eq!(
+            parse_health_response(&health_response(
+                r#"{"status":"ready","report_dirty":false}"#
+            )),
+            CollectorStatus::Ready
+        );
+        assert_eq!(
+            parse_health_response(&health_response(
+                r#"{"status":"degraded","report_dirty":true}"#,
+            )),
+            CollectorStatus::Degraded
+        );
+        assert_eq!(
+            parse_health_response(&health_response(
+                r#"{"status":"degraded","report_dirty":false}"#,
+            )),
+            CollectorStatus::Unavailable
+        );
+        assert_eq!(
+            parse_health_response(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n{}"),
+            CollectorStatus::Unavailable
+        );
+        assert_eq!(
+            parse_health_response(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"),
+            CollectorStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn health_probe_is_authenticated_and_bounded() {
+        let (ready, ready_server) = serve_health_once(health_response(
+            r#"{"status":"ready","report_dirty":false,"accepted_requests":0}"#,
+        ));
+        assert_eq!(probe_health(&ready), CollectorStatus::Ready);
+        ready_server.join().unwrap();
+
+        let (oversized, oversized_server) = serve_health_once(vec![b'x'; 4 * 1024 + 1]);
+        assert_eq!(probe_health(&oversized), CollectorStatus::Unavailable);
+        oversized_server.join().unwrap();
+    }
+
+    #[test]
+    fn root_lifecycle_lock_rejects_concurrent_interleaving_through_rollback() {
+        let root = temporary_root("lifecycle-lock");
+        let layout = agent_observability_local_runtime::install(&root).unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let worker_layout = layout.clone();
+        let worker_entered = Arc::clone(&entered);
+        let worker_release = Arc::clone(&release);
+        let worker_events = Arc::clone(&events);
+        let worker = thread::spawn(move || {
+            with_lifecycle_lock(&worker_layout, || {
+                worker_events
+                    .lock()
+                    .unwrap()
+                    .extend(["service", "settings", "health", "config"]);
+                worker_entered.wait();
+                worker_release.wait();
+                worker_events.lock().unwrap().push("rollback");
+                Ok(())
+            })
+            .unwrap();
+        });
+
+        entered.wait();
+        let config = LocalConfigService::new(&layout);
+        let versioned = config.read().unwrap();
+        assert!(matches!(
+            config.save(&versioned.revision, &versioned.config),
+            Err(ConfigServiceError::Busy)
+        ));
+        let contender_events = Arc::clone(&events);
+        let error = with_lifecycle_lock(&layout, || {
+            contender_events.lock().unwrap().push("interleaved");
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("lifecycle is busy"));
+        release.wait();
+        worker.join().unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["service", "settings", "health", "config", "rollback"]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn health_response(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    fn serve_health_once(response: Vec<u8>) -> (CollectorSettings, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let bytes = stream.read(&mut request).unwrap();
+            let request = std::str::from_utf8(&request[..bytes]).unwrap();
+            assert!(request.contains(&format!("{TOKEN_HEADER}: test-token\r\n")));
+            stream.write_all(&response).unwrap();
+        });
+        (
+            CollectorSettings {
+                schema_version: COLLECTOR_SETTINGS_VERSION.into(),
+                port,
+                token: "test-token".into(),
+                source_generation: "test-generation".into(),
+            },
+            server,
+        )
     }
 
     #[test]
@@ -828,6 +1125,29 @@ mod tests {
         assert!(body.contains("/Applications/A&amp;B/agentobs"));
         assert!(body.contains("/tmp/&lt;runtime&gt;"));
         assert!(!body.contains("label<&"));
+    }
+
+    #[test]
+    fn connect_preserves_degraded_health_while_accepting_ingest_readiness() {
+        let config = FakeConfig::disconnected();
+        let lifecycle = FakeLifecycle {
+            collector_status: CollectorStatus::Degraded,
+            ..FakeLifecycle::ready()
+        };
+
+        let status = connect_prepared(
+            Path::new("/runtime"),
+            Path::new("/bin/agentobs"),
+            "http://127.0.0.1:43181/v1/logs",
+            &config,
+            &lifecycle,
+        )
+        .unwrap();
+
+        assert_eq!(status.config, ConnectionStatus::Connected);
+        assert_eq!(status.collector, CollectorStatus::Degraded);
+        assert_eq!(*lifecycle.events.borrow(), ["install", "health"]);
+        assert_eq!(*config.events.borrow(), ["config-connect"]);
     }
 
     #[test]
@@ -1073,12 +1393,80 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    struct FailedBootoutLaunchctl {
+        loaded: bool,
+        events: RefCell<Vec<&'static str>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Launchctl for FailedBootoutLaunchctl {
+        fn bootout(&self, _target: &str) -> Result<bool, IntegrationError> {
+            self.events.borrow_mut().push("bootout");
+            Err(IntegrationError::Runtime("bootout failed".into()))
+        }
+
+        fn is_loaded(&self, _target: &str) -> Result<bool, IntegrationError> {
+            self.events.borrow_mut().push("is-loaded");
+            Ok(self.loaded)
+        }
+
+        fn bootstrap(&self, _domain: &str, _plist: &Path) -> Result<(), IntegrationError> {
+            self.events.borrow_mut().push("bootstrap");
+            Ok(())
+        }
+
+        fn kickstart(&self, _target: &str) -> Result<(), IntegrationError> {
+            self.events.borrow_mut().push("kickstart");
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn test_service(root: &Path) -> CollectorService {
         CollectorService {
             label: "test-service".into(),
             plist: root.join("LaunchAgents/test-service.plist"),
             target: "gui/1/test-service".into(),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_continues_when_failed_bootout_is_verified_unloaded() {
+        let root = temporary_root("install-bootout-verified-unloaded");
+        let service = test_service(&root);
+        let launchctl = FailedBootoutLaunchctl {
+            loaded: false,
+            events: RefCell::new(Vec::new()),
+        };
+
+        install_collector_service_with(service, &root, Path::new("/bin/agentobs"), &launchctl)
+            .unwrap();
+
+        assert_eq!(
+            *launchctl.events.borrow(),
+            ["bootout", "is-loaded", "bootstrap", "kickstart"]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_stops_when_failed_bootout_is_still_loaded() {
+        let root = temporary_root("install-bootout-still-loaded");
+        let service = test_service(&root);
+        let launchctl = FailedBootoutLaunchctl {
+            loaded: true,
+            events: RefCell::new(Vec::new()),
+        };
+
+        let error =
+            install_collector_service_with(service, &root, Path::new("/bin/agentobs"), &launchctl)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("bootout failed"));
+        assert_eq!(*launchctl.events.borrow(), ["bootout", "is-loaded"]);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "macos")]

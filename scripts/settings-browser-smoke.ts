@@ -106,6 +106,17 @@ try {
   assert.equal(lifecycle.launchAgentRunning, true);
   assert.equal(await lifecyclePage.locator("#toggle-integration").innerText(), "연결 해제");
 
+  lifecycle.status = degradedStatus();
+  await lifecyclePage.reload({ waitUntil: "networkidle" });
+  await lifecyclePage.locator(".integration-panel[data-state='degraded']").waitFor();
+  assert.match(
+    await lifecyclePage.locator(".integration-identity strong").innerText(),
+    /리포트 반영 지연/,
+  );
+  assert.match(await lifecyclePage.locator(".integration-meta").innerText(), /리포트 지연/);
+  assert.doesNotMatch(await lifecyclePage.locator(".integration-meta").innerText(), /정상/);
+  assert.equal(await lifecyclePage.locator("#toggle-integration").innerText(), "연결 해제");
+
   await lifecyclePage.locator("#overview-dashboard").click();
   await lifecyclePage.locator("#toast").filter({ hasText: "injected report failure" }).waitFor();
   await lifecyclePage.locator("#open-dashboard").click();
@@ -455,7 +466,7 @@ function rectanglesOverlap(first: DOMRect, second: DOMRect): boolean {
 
 type IntegrationStatus = {
   config: "connected" | "disconnected" | "conflict";
-  collector: "ready" | "unavailable";
+  collector: "ready" | "degraded" | "unavailable";
   endpoint?: string;
   service?: string;
   data_retained: boolean;
@@ -516,6 +527,16 @@ function connectedStatus(): IntegrationStatus {
   return {
     config: "connected",
     collector: "ready",
+    endpoint: "http://127.0.0.1:4318/v1/traces",
+    service: "dev.agent-observability.collector",
+    data_retained: true,
+  };
+}
+
+function degradedStatus(): IntegrationStatus {
+  return {
+    config: "connected",
+    collector: "degraded",
     endpoint: "http://127.0.0.1:4318/v1/traces",
     service: "dev.agent-observability.collector",
     data_retained: true,

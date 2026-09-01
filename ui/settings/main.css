@@ -444,6 +444,7 @@ h3 { margin-bottom: 4px; font-size: 14px; line-height: 20px; }
 }
 
 .integration-panel[data-state="ready"] { border-left-color: var(--success); }
+.integration-panel[data-state="degraded"] { border-left-color: var(--warning); }
 .integration-panel[data-state="conflict"] { border-left-color: var(--warning); }
 .integration-identity { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .integration-icon { display: inline-flex; align-items: center; justify-content: center; width: 38px; height: 38px; border-radius: 6px; background: var(--surface-strong); color: var(--accent); }
