@@ -3,12 +3,15 @@
 v1.0.0 introduced the standalone local-only Rust runtime boundary. v1.2.0 added bounded local
 retention and private archive export; v1.4.0 added one-command setup, an isolated built-in demo,
 dashboard open, and atomic CLI configuration updates. v1.5.0 adds an explicit, ephemeral loopback
-settings UI without adding a resident server, daemon, identity, automatic producer, or external network path.
-It installs private local state,
+settings UI. v1.8.0 is **In Progress** and adds optional Codex automatic local collection through an
+authenticated IPv4 loopback receiver and macOS LaunchAgent. Manual Codex, Claude Code and Cursor imports remain
+fully functional without a daemon, receiver, login or network. The automatic path makes no external request.
+The runtime installs private local state,
 validates a closed configuration, admits writes against a hard storage budget, and keeps foreground
 handoff bounded. It contains no external or team endpoint, email, team identity, envelope, outbox, or
-network client. The only local endpoint is created by the foreground `ui` command on `127.0.0.1:0`,
-uses a private browser session, and expires after inactivity. It is not a resident server or IPC daemon.
+network client. The optional Codex collector binds a configured `127.0.0.1` port and persists only while
+connected. The settings UI uses a separate ephemeral `127.0.0.1:0` endpoint, a private browser session,
+and expires after inactivity.
 
 ## Install and validate
 
@@ -18,6 +21,9 @@ documented in the repository README. The package is only a transport for the Rus
 ~~~bash
 agentobs demo
 agentobs setup
+agentobs connect codex
+agentobs status codex
+agentobs disconnect codex
 agentobs ui
 agentobs config show
 agentobs config set retention-days 90
@@ -30,7 +36,10 @@ agentobs cursor-ingest ~/.agent-observability /path/to/private-handoff.jsonl
 agentobs report ~/.agent-observability /path/to/private-rate-table.json
 ~~~
 
-`setup` composes private install, store initialization, report generation, and macOS browser open.
+`setup` without an explicit root composes private install, store initialization, Codex automatic connection,
+report generation, and macOS browser open for `~/.agent-observability`. `setup --no-open` performs the same
+work without opening a browser. `setup <root> [--no-open]` initializes an explicit root in manual-import mode;
+run `connect codex <root>` separately to enable automatic Codex collection there.
 `demo` uses an isolated default root and embedded content-free fixture; it never reads an agent log.
 `ui` holds only a settings-UI instance singleton, embeds the generated TypeScript application, and
 delegates all configuration validation and atomic save behavior back to Rust. A save acquires the
@@ -38,6 +47,9 @@ shared runtime singleton only for the mutation. Every supported CLI/UI writer is
 typed mutation guard. The CLI reads and writes while holding that guard; the UI additionally verifies the
 browser revision immediately before the atomic replace. Both release the guard before the next operation.
 Direct config file editing is unsupported.
+The same authenticated UI exposes Codex status/connect/disconnect and opens an existing report through Rust
+handlers. Integration mutations require the private session, exact Host and Origin, and run on the blocking
+executor. Closing the ephemeral UI does not stop a LaunchAgent that the user connected.
 The fragment capability is retained only in same-tab session storage for reload recovery and is removed
 after explicit close, an invalid session, or a bootstrap/heartbeat network failure; it is never placed in a
 cookie or local storage.
@@ -51,6 +63,52 @@ queue, state, and runtime directories with mode 0700 and creates config.json wit
 Existing configuration is validated and preserved. Broad permissions,
 symlinks, wrong file types, unsupported schema versions, unknown fields, and values outside policy
 bounds fail closed.
+
+## Codex automatic collection
+
+`connect codex [root]` creates or loads private collector settings, installs a root-specific LaunchAgent,
+waits for an authenticated health response, and then takes ownership of the exact Codex settings it needs.
+The receiver binds only `127.0.0.1` and accepts OTLP/HTTP JSON at `/v1/logs`; the bounded notify helper posts
+`agent-turn-complete` to `/v1/notify`. `/health` and both ingest routes require the private
+`x-agent-observability-token`. The token is 32 random bytes encoded as 64 hex characters, stored in
+`runtime/collector.json` with mode `0600`, and compared without early byte mismatch exit.
+
+The LaunchAgent plist is written to `~/Library/LaunchAgents` with a label derived from the runtime root. It
+runs the current absolute `agentobs` executable as `collector-serve <root>`, starts at load, and is kept alive
+by launchd. Automatic collection currently supports macOS Codex only. It does not scrape Codex files,
+credentials, browser sessions or private APIs and does not connect to an external host.
+
+Codex config ownership is transactional. The manager uses `$CODEX_HOME/config.toml` when `CODEX_HOME` is set,
+otherwise `~/.codex/config.toml`, and manages only top-level `notify`, the local JSON `otel.exporter`,
+`otel.log_user_prompt=false`, and `otel.environment="local"`. Notify is exactly the absolute `agentobs` path,
+`codex-notify`, and absolute runtime root. The exporter contains only the configured local `/v1/logs` endpoint,
+JSON protocol and private token header. The endpoint port comes from private collector settings; `43181` is the
+current default. Connect refuses pre-existing managed values unless they match exactly.
+Before changing the file, it stores the exact prior bytes, hash, existence and permission mode in
+`runtime/integrations/codex/codex-config-ownership-v1.json` with private permissions. Atomic compare-before-replace
+prevents concurrent edits from being overwritten.
+
+`status codex [root]` reports config ownership and authenticated collector health. `disconnect codex [root]`
+restores the exact prior bytes and mode, or removes the config if connect created it, only while the managed
+values and ownership fingerprint remain unchanged. A conflict fails closed. Successful disconnect stops the
+LaunchAgent, removes its plist and retains SQLite, JSONL and HTML data.
+
+The raw OTLP and notify request can exist transiently in bounded process memory while JSON is decoded. Only
+explicitly allowlisted scalar identifiers, model/tool categories, decisions, timing, token counts and success
+state cross into the adapter. Raw prompt/response, tool arguments/output, command, cwd, path, account identity,
+unknown attributes and request bodies are never persisted, logged, projected, reported or exported.
+
+The collector commits accepted canonical observations through the same SQLite authority as manual import,
+repairs the JSONL projection, and refreshes
+`logs/agent-observability-report.html` as a private self-contained file. A report refresh failure does not turn
+the raw input into a fallback log or file.
+
+## Manual imports
+
+The three `<agent>-ingest` commands remain independent of the automatic collector. They open a private bounded
+handoff file, normalize it with the agent adapter, commit it under the runtime singleton and rebuild projections.
+They do not require a LaunchAgent, local HTTP receiver, login or network access. Disconnecting Codex automatic
+collection does not disable or remove this path.
 
 The installed configuration is intentionally small:
 
@@ -82,6 +140,9 @@ Invalid updates leave the previous bytes unchanged. User-facing names, defaults,
 
 ## Runtime bounds
 
+- Codex automatic OTLP/HTTP JSON request: at most 1 MiB and 4096 log records.
+- Codex notify payload: at most 64 KiB. The helper uses a 10 ms loopback connect timeout and 40 ms read/write
+  timeouts, then returns a fail-open accepted, rejected or unavailable outcome without waiting for report work.
 - Raw foreground input: at most 1 MiB.
 - Privacy-projected local message: at most 64 KiB.
 - In-process ingress channel: 64 messages, one normalization writer, nonblocking admission. The
@@ -123,7 +184,8 @@ nonce. PID metadata alone never proves ownership.
   requires three 10-second windows below 70%.
 - One-shot ingest evaluates disk pressure before writing and rejects protected writes with a bounded
   outcome. The full scheduler state machine and foreground channel are reusable embedding APIs and
-  are exercised by the normative subprocess fixture; v1.0 does not install a resident daemon.
+  are exercised by the normative subprocess fixture. The optional v1.8 Codex collector is a separate
+  authenticated local receiver; manual import does not depend on it.
 
 Storage admission remains fail-closed at the configured disk budget. Retention is an explicit
 operator command rather than an ingest-side implicit delete: pressure never silently overwrites

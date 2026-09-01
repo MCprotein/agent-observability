@@ -4,10 +4,13 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.7.0 범위:** one-command checksum-checked install, `agentobs` short command, local setup,
-> 내장 demo, 시각적 로컬 설정,
-> 수동 private handoff import를 지원한다.
-> agent 원본 로그를 자동으로 읽는 연결 기능은 아직 제공하지 않는다.
+> **v1.8.0 상태: In Progress.** 기존 Codex, Claude Code, Cursor private handoff 수동 import는
+> daemon이나 network 없이 계속 동작한다. 선택적 Codex 자동 수집은 인증된 `127.0.0.1`
+> OTLP/HTTP JSON receiver, bounded notify supplement와 macOS LaunchAgent를 사용한다.
+> Claude Code/Cursor 자동 수집과 commercial team profile은 아직 TODO다.
+
+아래 automatic 명령은 v1.8.0 development build 기준이다. v1.8.0이 release되기 전에는 public installer의
+latest stable binary가 이 automatic slice를 포함하지 않을 수 있다.
 
 ## 빠른 시작
 
@@ -49,23 +52,43 @@ self-contained HTML 대시보드를 생성해 기본 브라우저에서 연다. 
 agentobs ui
 ```
 
-수집 허용, 확인·반영 주기, batch, heartbeat, 저장 한도, 보관 기간과 archive 한도를 한 화면에서
-바꿀 수 있다. 설정할 때만 임의의 `127.0.0.1` port를 사용하며 browser tab의 session token,
+Codex automatic 연결/해제와 상태 확인, report 열기, 수집 허용, 확인·반영 주기, batch, heartbeat,
+저장 한도, 보관 기간과 archive 한도를 한 화면에서 관리한다. UI 자체는 실행 중에만 임의의
+`127.0.0.1` port를 사용하며 browser tab의 session token,
 Host와 Origin을 모두 확인한다. token은 같은 tab의 새로고침에서만 복구되며 세션 종료 시 삭제된다.
 사용자가 1분 이상 화면을 조작하지 않으면 heartbeat를 멈추고,
 연결이 10분 동안 끊기거나 설정 server가 시작된 후 1시간이 지나면 종료를 요청한다. 이 deadline은
 로컬 executor와 filesystem이 응답하는 동안 적용된다. 불완전한 HTTP header는
 5초 안에 닫고, 동시 연결은 64개로 제한하며, 종료 시 연결 정리는 최대 1초로 제한한다.
 
-### 4. 실제 runtime 준비
+### 4. Codex 자동 수집 시작
 
 ```bash
 agentobs setup
 ```
 
-기본 위치 `~/.agent-observability`에 private config와 SQLite 저장소를 만들고 대시보드를 연다.
-처음에는 수집된 데이터가 없으므로 빈 화면이 정상이다. 브라우저를 열지 않는 자동화 환경에서는
-`agentobs setup --no-open`을 사용한다.
+이 한 명령은 기본 위치 `~/.agent-observability`에 private runtime과 SQLite 저장소를 만들고,
+Codex 설정을 연결하고, local collector LaunchAgent를 시작한 뒤 대시보드를 연다. 브라우저를 열지
+않는 환경에서는 `agentobs setup --no-open`을 사용한다. 처음에는 수집된 데이터가 없으므로 빈
+화면이 정상이다.
+
+대시보드는 다음 private file에 생성된다.
+
+```text
+~/.agent-observability/logs/agent-observability-report.html
+```
+
+Codex 연결만 따로 관리할 수도 있다.
+
+```bash
+agentobs connect codex
+agentobs status codex
+agentobs disconnect codex
+```
+
+`disconnect`는 LaunchAgent를 멈추고 agent-observability가 소유한 Codex 설정을 연결 전의 정확한
+bytes와 permission으로 복원한다. 기존 설정이 없었다면 생성했던 설정 파일을 제거한다. 연결 뒤
+관리 필드가 바뀌어 ownership이 충돌하면 덮어쓰지 않고 중단한다. 이미 수집된 local data는 유지된다.
 
 사용자 문서의 권장 명령은 `agentobs`다. 모니터링 화면은 `agentobs dashboard`, 설정 화면은
 `agentobs ui`로 연다. 배포 파일명인 `agent-observability`도 호환 명령으로 계속 제공한다.
@@ -73,11 +96,12 @@ agentobs setup
 | 현재 경로 | 상태 | 의미 |
 | --- | --- | --- |
 | 로컬 runtime과 HTML 대시보드 | 지원 | 서버, login, web daemon 없이 `file://`로 실행 |
-| 로컬 설정 UI | 지원 | `ui` 실행 중에만 인증된 loopback process 사용 |
+| 로컬 설정 UI | 지원 | UI server는 `ui` 실행 중에만 존재하며 Codex 연결과 runtime config 관리 제공 |
 | 내장 sample 체험 | 지원 | 외부 파일 없이 `demo` 한 명령으로 확인 |
-| Canonical handoff import | 지원 | 검증된 private JSONL을 agent별 명령으로 가져옴 |
-| Agent 자동 연결 | 준비 중 | 원본 hook/log 자동 감시와 producer는 아직 미포함 |
-| Team collector | TODO | 현재 제품 경로에는 network 전송이 없음 |
+| Canonical handoff 수동 import | 지원 | 세 agent 모두 daemon과 network 없이 private JSONL import 가능 |
+| Codex 자동 연결 | v1.8.0 In Progress | macOS LaunchAgent와 인증된 loopback OTLP/HTTP JSON + notify 사용 |
+| Claude Code/Cursor 자동 연결 | TODO | 현재 자동 receiver/config 연결은 Codex만 지원 |
+| Commercial team profile | TODO | G0-G4 승인과 evidence 전에는 완료로 간주하지 않음 |
 
 ## 무엇을 볼 수 있나
 
@@ -95,9 +119,22 @@ agentobs setup
 
 ## 실제 데이터 가져오기
 
-현재 release는 agent 원본 파일을 직접 읽지 않는다. 별도 producer가 만든 private canonical
-handoff를 아래 명령으로 가져온다. 이 제한은 설정 실수로 원문 prompt, output, path가 durable
-storage로 넘어가는 것을 막기 위한 현재 release 경계다.
+### Codex 자동 수집
+
+`agentobs setup` 또는 `agentobs connect codex`가 `$CODEX_HOME/config.toml`을 연결한다.
+`CODEX_HOME`이 없으면 `~/.codex/config.toml`을 사용한다. Codex telemetry는 token header가 있는
+OTLP/HTTP JSON으로 `127.0.0.1` receiver에 들어오고, `agent-turn-complete` notify는 bounded local
+supplement로 turn 완료만 보완한다. 어느 경로도 외부 network를 사용하지 않는다.
+
+Receiver가 받은 raw notify payload와 raw OTLP/tool field는 bounded parsing 동안 process memory에
+일시적으로 들어올 수 있다. Adapter boundary를 통과하는 값은 명시적으로 허용된 scalar뿐이다.
+Prompt, response, tool arguments/output, command, cwd, path, account identity와 unknown field는
+persist, log, projection 또는 export 전에 버려진다.
+
+### 수동 import
+
+수동 import 경로는 그대로 지원한다. 별도 producer가 만든 private canonical handoff를 아래
+명령으로 가져오며 resident collector, LaunchAgent, login 또는 network가 필요하지 않다.
 
 ```bash
 agentobs codex-ingest ~/.agent-observability /path/to/codex-handoff.jsonl
@@ -107,7 +144,7 @@ agentobs dashboard
 ```
 
 handoff 생성 규격과 허용 source는 [Adapter Compatibility](docs/ADAPTER_COMPATIBILITY.md)를
-따른다. 자동 연결이 추가되기 전까지 이 단계는 advanced/manual workflow다.
+따른다. Claude Code와 Cursor의 현재 실제-data 경로는 이 수동 import다.
 
 ## 설정 변경
 
@@ -136,45 +173,51 @@ agentobs config set storage-bytes 2147483648
 
 ## Agent 지원 범위
 
-`Verified`는 해당 버전의 canonical handoff를 안전하게 정규화한다는 뜻이다. 자동 설치나 원본
-로그 자동 수집을 의미하지 않는다.
+`Verified version`은 capability manifest가 해당 버전의 canonical source 의미를 검증한다는 뜻이다.
+v1.8.0 automatic release evidence는 아직 진행 중이다.
 
 | Agent | Verified version | 현재 지원 | 알려진 제한 |
 | --- | --- | --- | --- |
-| Codex | `0.150.1` | OTel/notify canonical handoff import | 자동 producer와 receiver 미포함 |
-| Claude Code | `2.1.248` | OTel/hook canonical handoff import | user interrupt signal 미확인 |
-| Cursor | `3.17.21` | generic tool canonical handoff import | 일부 shell/MCP/file event는 diagnostic-only |
+| Codex | `0.150.1` | 수동 handoff + 자동 local OTLP/HTTP JSON/notify | 자동 경로는 macOS only, v1.8.0 In Progress |
+| Claude Code | `2.1.248` | OTel/hook canonical handoff 수동 import | 자동 연결 TODO, user interrupt signal 미확인 |
+| Cursor | `3.17.21` | generic tool canonical handoff 수동 import | 자동 연결 TODO, 일부 shell/MCP/file event는 diagnostic-only |
 
 버전별 source와 fallback 정책은 [Adapter Compatibility](docs/ADAPTER_COMPATIBILITY.md)가 정본이다.
 
 ## 동작 구조
 
 ```mermaid
-flowchart LR
-    A["Coding agents"] -.-> P["Separate producer<br/>TODO in this repository"]
-    P -.-> B["Private canonical handoff"]
-    B --> C["Rust adapters"]
-    C --> D["Shared trace and span model"]
-    D --> E["Local SQLite"]
-    E --> F["Privacy and cost projection"]
-    F --> G["Self-contained HTML"]
-    G --> H["Local browser"]
-    I["ui command"] --> J["Authenticated loopback settings"]
-    J --> K["Rust config validation"]
-    K --> L["Private config"]
+flowchart TB
+    Codex["Codex"] -->|"OTLP HTTP JSON with token"| Receiver["Local receiver on 127.0.0.1"]
+    Codex -->|"bounded notify supplement"| Receiver
+    Manual["Private canonical handoff files"] --> Adapters["Rust adapters"]
+    Receiver --> Allowlist["Codex scalar allowlist"]
+    Allowlist --> Adapters
+    Adapters --> Domain["Shared trace and span model"]
+    Domain --> Store[("Local SQLite authority")]
+    Store --> Report["Privacy and cost projection"]
+    Report --> HTML["Self-contained private HTML"]
+    HTML --> Browser["Local browser via file"]
+    Connect["connect codex"] --> LaunchAgent["macOS LaunchAgent"]
+    Connect --> Ownership["Exact Codex config ownership"]
+    LaunchAgent --> Receiver
+    Ownership --> Codex
+    Settings["ui command"] --> Config["Authenticated ephemeral settings UI"]
 ```
 
-- 점선은 현재 release가 제공하지 않는 agent별 producer 경계다.
-- 실선은 `v1.7.0` CLI가 구현하고 검증하는 local-only 경로다.
+- Codex automatic path와 manual handoff path는 같은 adapter, domain, store와 report contract로 합류한다.
+- Claude Code와 Cursor automatic producer/receiver는 아직 이 그림의 구현 범위가 아니다.
 - agent별 차이는 adapter에서 끝나고 이후 저장·비용·UI contract는 하나다.
 - SQLite가 로컬 권위 저장소이며 JSONL archive와 HTML은 다시 만들 수 있는 projection이다.
 - TypeScript UI는 원본 agent payload가 아니라 Rust가 검증한 report DTO만 받는다.
-- report는 endpoint 없이 `file://`로 열리고, 설정 endpoint는 `ui` process 수명 동안 loopback에만 존재한다.
+- report는 endpoint 없이 `file://`로 열린다. 자동 collector와 설정 UI는 서로 다른 인증된 loopback
+  endpoint이며 외부 interface에 bind하지 않는다.
 - 설정 화면은 별도 UI instance lock만 유지한다. 저장할 때만 runtime lock을 짧게 획득하므로 열린
   화면이 ingest, report, CLI 설정 변경을 계속 막지 않는다. 지원되는 다른 설정 명령과 revision이
   충돌하면 최신 값 위에 화면의 변경만 다시 적용하고 재확인을 요구한다. `config.json` 직접 편집은
   지원 인터페이스가 아니다.
-- standalone 경로에는 login, collector, 외부 network request가 없다.
+- 수동 standalone 경로에는 login, daemon, collector, network request가 없다. 선택한 Codex automatic
+  경로만 local LaunchAgent와 `127.0.0.1` receiver를 추가하며 외부 network request는 만들지 않는다.
 
 상세 책임 경계는 [Architecture](docs/ARCHITECTURE.md), 전체 처리 순서는
 [Collection Flow](docs/COLLECTION_FLOW.md)에 있다.
@@ -215,10 +258,11 @@ Crash recovery와 replay 규칙은 [Local Runtime](docs/LOCAL_RUNTIME.md#retenti
 | --- | --- |
 | Prompt, response, tool output | durable storage와 report에 저장하지 않음 |
 | Command, cwd, path, raw email | allowlist contract 밖에서는 저장하지 않음 |
+| Raw notify/OTLP/tool field | bounded parse 동안 memory에만 일시 존재할 수 있고 persist/log/project/export하지 않음 |
 | Runtime directory | `0700`만 허용 |
 | Config, archive, report | `0600`으로 기록 |
 | Unknown field와 schema | 추측하지 않고 거부 |
-| External network | standalone outbound 경로 없음; 설정 화면은 실행 중 인증된 loopback만 사용 |
+| External network | standalone outbound 경로 없음; 자동 collector와 설정 화면은 인증된 loopback만 사용 |
 
 ## 다른 설치 방법
 
@@ -254,7 +298,11 @@ cargo run -p agent-observability-cli -- demo
 | Command | 용도 |
 | --- | --- |
 | `demo [root] [--no-open]` | 격리된 sample 대시보드 생성 |
-| `setup [root] [--no-open]` | 실제 private runtime 초기화 |
+| `setup [--no-open]` | 기본 runtime 초기화, Codex 자동 연결, 대시보드 생성 |
+| `setup <root> [--no-open]` | 별도 runtime을 수동-import mode로 초기화 |
+| `connect codex [root]` | Codex 설정과 local collector 연결 |
+| `status codex [root]` | Codex config ownership과 collector health 확인 |
+| `disconnect codex [root]` | Codex 설정 복원, collector 중지, local data 유지 |
 | `dashboard [root] [--no-open]` | 최신 report를 만들고 필요하면 브라우저에서 열기 |
 | `ui [root] [--no-open]` | 임시 local-only 설정 화면 열기 |
 | `config show [root]` | 현재 설정 확인 |
