@@ -2170,9 +2170,13 @@ fn clear_report_dirty(layout: &InstalledLayout) -> Result<(), CollectorError> {
 
 fn refresh_report_from_root(root: &Path) -> Result<bool, CollectorError> {
     let layout = install(root).map_err(runtime_error)?;
-    let mutation = try_collector_mutation(&layout.runtime)?;
-    let config = load(&layout.config).map_err(runtime_error)?;
-    let store = open_store(&mutation, &layout, &config)?;
+    let store = {
+        let mutation = try_collector_mutation(&layout.runtime)?;
+        let config = load(&layout.config).map_err(runtime_error)?;
+        let store = open_store(&mutation, &layout, &config)?;
+        drop(mutation);
+        store
+    };
     store.rebuild_projection().map_err(runtime_error)?;
     refresh_report(&layout, &store, current_unix_ms()?)
 }
@@ -4948,6 +4952,57 @@ mod tests {
         assert!(!collector.store.report_status().unwrap().pending());
         assert!(
             fs::read_to_string(&report_path)
+                .unwrap()
+                .contains(r#""generatedSpans":2"#)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_render_wait_does_not_reject_concurrent_ingest_as_busy() {
+        let root = test_root("report-render-ingest-lock-boundary");
+        let _ = fs::remove_dir_all(&root);
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+
+        let config = load(&collector.layout.config).unwrap();
+        let blocker = open_store_for_test(&collector.layout, &config);
+        let render_guard = blocker.acquire_report_render_guard().unwrap();
+        let projection = collector.layout.state.join("store/observations.jsonl");
+        let _ = fs::remove_file(&projection);
+        let refresh_root = root.clone();
+        let refresh = thread::spawn(move || refresh_report_from_root(&refresh_root));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !projection.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            projection.is_file(),
+            "report refresh did not rebuild projection"
+        );
+        loop {
+            match MutationGuard::try_acquire(&collector.layout.runtime) {
+                Ok(mutation) => {
+                    drop(mutation);
+                    break;
+                }
+                Err(agent_observability_local_runtime::SingletonError::AlreadyRunning)
+                    if Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("report refresh retained mutation lock: {error}"),
+            }
+        }
+        ingest_notify_locked(&mut collector, &projected_notify("thread-2", "turn-2")).unwrap();
+
+        drop(render_guard);
+        assert!(refresh.join().unwrap().unwrap());
+        assert_eq!(collector.store.record_count().unwrap(), 2);
+        assert!(!collector.store.report_status().unwrap().pending());
+        assert!(
+            fs::read_to_string(collector.layout.logs.join(REPORT_FILE_NAME))
                 .unwrap()
                 .contains(r#""generatedSpans":2"#)
         );
