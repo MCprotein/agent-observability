@@ -272,8 +272,10 @@ anti-corruption layer다.
   기록한다. `disconnect codex`는 LaunchAgent를 중지하고 plist를 제거하지만 local SQLite와 report는
   보존한다. Automatic collection은 현재 macOS Codex만 지원한다.
 - Automatic collector는 source-ordered observation/disposition을 한 SQLite transaction에 commit한다.
-  Commit 전에 private report-dirty marker를 기록하고 성공한 bounded report refresh 뒤 제거한다. Startup은
-  marker를 재조정하며 retry exhaustion은 authenticated health에 degraded 상태로 나타난다.
+  Ingest와 retention을 포함한 current-record mutation은 durable report generation을 같은 authority에서
+  증가시킨다. Renderer는 generation-consistent snapshot을 쓰고 exact generation만 acknowledge한다. Private
+  marker는 wakeup hint일 뿐이며 startup은 미확인 generation을 재조정한다. Retry exhaustion은 authenticated
+  health와 CLI/UI에 degraded 상태로 나타난다.
 - composition root는 `setup`에서 private install layout, collection policy, singleton lock,
   SQLite authority, storage admission, first report와 local browser open을 결합한다. `demo`는
   별도 runtime과 embedded content-free fixture만 사용한다. `config set`은 local-runtime의

@@ -86,8 +86,9 @@ JSON protocol and private token header. The endpoint port is an OS-assigned avai
 private collector settings. Connect refuses pre-existing managed values unless they match exactly.
 Before changing the file, it stores the exact prior and connected bytes, hashes, existence, permission modes
 and transaction phase in `runtime/integrations/codex/codex-config-ownership-v1.json` with private permissions.
-A private mutation lock and displaced-file compare/replace preserve conflicting edits. Prepared and restoring
-snapshots recover deterministically on the next lifecycle command after a process crash.
+A private mutation lock, exact-state comparison, temp-file fsync and atomic rename preserve supported concurrent
+edits without ever displacing the canonical file. Prepared and restoring snapshots recover deterministically on
+the next lifecycle command after a process crash.
 
 `status codex [root]` reports config ownership and authenticated collector health. `disconnect codex [root]`
 first confirms that the LaunchAgent stopped and its plist was removed. It then restores the exact prior bytes
@@ -100,10 +101,12 @@ state cross into the adapter. Raw prompt/response, tool arguments/output, comman
 unknown attributes and request bodies are never persisted, logged, projected, reported or exported.
 
 The collector transactionally commits source-ordered canonical observations and content-free dispositions
-through the same SQLite authority as manual import. It records a private durable report-dirty marker before the
-commit and refreshes `logs/agent-observability-report.html` as a private self-contained file. Startup reconciles
-a surviving marker. Refresh uses bounded exponential retries, leaves the marker for a later retry, and reports a
-degraded health state after exhaustion. A failure never turns raw input into a fallback log or file.
+through the same SQLite authority as manual import. Every current-record mutation, including retention, advances
+a durable SQLite report generation. A renderer reads a generation-consistent snapshot and acknowledges only the
+exact generation written to `logs/agent-observability-report.html`; a private marker is only a best-effort wakeup.
+Startup reconciles every unacknowledged generation. Refresh uses bounded exponential retries and reports a
+degraded health state after exhaustion. CLI and UI preserve that state instead of presenting the report as
+current. A failure never turns raw input into a fallback log or file.
 
 ## Manual imports
 

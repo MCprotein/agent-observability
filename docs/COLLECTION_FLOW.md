@@ -90,15 +90,16 @@ sequenceDiagram
     Receiver->>Adapter: copy allowlisted scalars only
     Note over Receiver,Adapter: raw content may exist transiently in memory only
     Adapter->>Store: source-ordered observations and dispositions
-    Store->>Store: commit durable report-dirty marker
-    Store->>Report: bounded private report refresh
+    Store->>Store: advance durable report generation
+    Store->>Report: render generation-consistent snapshot
+    Report->>Store: acknowledge exact rendered generation
 ```
 
 `connect codex` starts the collector and verifies health before taking Codex config ownership. If config
 connection fails, it removes the just-installed service. `disconnect codex` first confirms LaunchAgent stop and
 plist removal, then restores the exact prior Codex config only while the complete connected bytes and mode still
-match. It retains local observations. A dirty report marker survives crashes; startup reconciles it and bounded
-exponential retries expose an exhausted refresh as degraded health.
+match. It retains local observations. Unacknowledged SQLite report generations survive crashes; startup reconciles
+them and bounded exponential retries expose an exhausted refresh as degraded health through CLI and UI.
 
 The receiver binds only `127.0.0.1`, requires `x-agent-observability-token` on health and ingest routes,
 accepts at most 1 MiB per OTLP request and 4096 log records, and writes no request body log. The notify helper
