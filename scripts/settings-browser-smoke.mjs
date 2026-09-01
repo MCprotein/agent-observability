@@ -36,21 +36,28 @@ try {
   for (const testCase of [
     { name: "desktop", viewport: { width: 1440, height: 900 } },
     { name: "mobile", viewport: { width: 390, height: 844 } },
+    { name: "compact", viewport: { width: 320, height: 800 } },
   ]) {
     const page = await browser.newPage({ viewport: testCase.viewport });
     const consoleErrors = [];
-    const expectedConflictErrors = [];
+    const expectedApiErrors = [];
+    const pageErrors = [];
     const externalRequests = [];
     const failedRequests = [];
     let dirtyReloadDialog = false;
     page.on("console", (message) => {
       if (message.type() !== "error") return;
-      if (testCase.name === "desktop" && message.text().includes("409 (Conflict)")) {
-        expectedConflictErrors.push(message.text());
+      if (
+        testCase.name === "desktop" &&
+        (message.text().includes("409 (Conflict)") ||
+          message.text().includes("500 (Internal Server Error)"))
+      ) {
+        expectedApiErrors.push(message.text());
       } else {
         consoleErrors.push(message.text());
       }
     });
+    page.on("pageerror", (error) => pageErrors.push(error.message));
     page.on("request", (request) => {
       if (!request.url().startsWith(origin)) externalRequests.push(request.url());
     });
@@ -73,6 +80,10 @@ try {
     );
 
     if (testCase.name === "desktop") {
+      assert.equal(await page.evaluate(() => sessionStorage.length), 1);
+      await page.reload({ waitUntil: "networkidle" });
+      await page.locator("#overview-title").waitFor();
+      assert.equal(await page.evaluate(() => location.hash), "");
       assert.equal(await page.locator("#cadence-visual [data-dual-value]").textContent(), "확인 5초 · 반영 5초");
       const defaultCadenceMarkers = await page.locator("#cadence-visual [data-marker]").evaluateAll(
         (markers) => markers.map((marker) => marker.getBoundingClientRect()),
@@ -109,6 +120,30 @@ try {
       await execute(binary, ["config", "set", runtimeRoot, "retention-days", "45"], {
         timeout: 10_000,
       });
+      let failNextConfigRead = true;
+      await page.route(`${origin}/api/config`, async (route) => {
+        if (failNextConfigRead && route.request().method() === "GET") {
+          failNextConfigRead = false;
+          await route.fulfill({
+            status: 500,
+            contentType: "application/json",
+            body: JSON.stringify({
+              code: "config_unavailable",
+              message: "injected config reload failure",
+            }),
+          });
+        } else {
+          await route.continue();
+        }
+      });
+      await page.locator("#save").click();
+      await page
+        .locator("#toast")
+        .filter({ hasText: "최신 설정을 불러오지 못했습니다" })
+        .waitFor();
+      assert.equal(await page.locator("#collection-flush_interval_ms").inputValue(), "6000");
+      assert.equal(await page.locator("#save").isEnabled(), true);
+      await page.unroute(`${origin}/api/config`);
       await page.locator("#save").click();
       await page
         .locator("#toast")
@@ -141,6 +176,17 @@ try {
       assert.equal(dirtyReloadDialog, true);
       assert.equal(await page.locator("#collection-max_batch_records").inputValue(), "126");
       await page.locator("#discard").click();
+      await page.locator("#collection-max_batch_records").fill("127");
+      let confirmedReloadDialog = false;
+      page.once("dialog", async (dialog) => {
+        assert.equal(dialog.type(), "beforeunload");
+        confirmedReloadDialog = true;
+        await dialog.accept();
+      });
+      await page.reload({ waitUntil: "networkidle" });
+      await page.locator("#overview-title").waitFor();
+      assert.equal(confirmedReloadDialog, true);
+      assert.equal(await page.locator("#collection-max_batch_records").inputValue(), "125");
     } else {
       const controlHeights = await page
         .locator("button, .section-nav a, input[type=number]")
@@ -164,13 +210,28 @@ try {
         (markers) => markers.map((marker) => Number.parseFloat(marker.style.left)),
       );
       assert.equal(heartbeatMarkers[0] > heartbeatMarkers[1], true);
+      if (testCase.name === "compact") {
+        const navigationWidth = await page.locator(".section-nav").evaluate((navigation) => ({
+          client: navigation.clientWidth,
+          scroll: navigation.scrollWidth,
+        }));
+        assert.equal(navigationWidth.scroll <= navigationWidth.client, true);
+      }
     }
 
     const screenshotPath = join(screenshotDirectory, `settings-${testCase.name}.png`);
     await page.screenshot({ path: screenshotPath, fullPage: true });
     assert.equal((await stat(screenshotPath)).size > 10_000, true);
     assert.deepEqual(consoleErrors, []);
-    assert.equal(expectedConflictErrors.length, testCase.name === "desktop" ? 1 : 0);
+    assert.equal(
+      expectedApiErrors.filter((message) => message.includes("409 (Conflict)")).length,
+      testCase.name === "desktop" ? 2 : 0,
+    );
+    assert.equal(
+      expectedApiErrors.filter((message) => message.includes("500 (Internal Server Error)")).length,
+      testCase.name === "desktop" ? 1 : 0,
+    );
+    assert.deepEqual(pageErrors, []);
     assert.deepEqual(externalRequests, []);
     assert.deepEqual(failedRequests, []);
     results.push({
@@ -181,7 +242,7 @@ try {
       externalRequests: 0,
     });
 
-    if (testCase.name === "mobile") {
+    if (testCase.name === "compact") {
       await page.locator("#close-session").click();
       assert.equal(await page.locator("#close-dialog").getAttribute("open"), "");
       await page.locator("#cancel-close").click();
@@ -189,6 +250,7 @@ try {
       await page.locator("#discard").click();
       await page.locator("#close-session").click();
       await page.locator("text=설정 세션이 종료되었습니다").waitFor();
+      assert.equal(await page.evaluate(() => sessionStorage.length), 0);
     }
     await page.close();
   }

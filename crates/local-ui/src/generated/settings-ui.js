@@ -763,7 +763,10 @@
   var rootElement = document.querySelector("#app");
   if (!(rootElement instanceof HTMLDivElement)) throw new Error("settings root is missing");
   var app = rootElement;
-  var token = new URLSearchParams(location.hash.slice(1)).get("session") ?? "";
+  var SESSION_TOKEN_KEY = "agent-observability.settings.session.v1";
+  var fragmentToken = new URLSearchParams(location.hash.slice(1)).get("session") ?? "";
+  var token = fragmentToken || readSessionToken();
+  if (fragmentToken) writeSessionToken(fragmentToken);
   history.replaceState(null, "", `${location.pathname}${location.search}`);
   var persisted = null;
   var draft = null;
@@ -796,7 +799,12 @@
       renderSettings();
       heartbeatTimer = window.setInterval(() => void heartbeat(), 2e4);
     } catch (error) {
-      renderUnavailable(messageOf(error));
+      const apiError = error;
+      if (apiError.code === "invalid_session") {
+        expireSession();
+      } else {
+        renderUnavailable(messageOf(error));
+      }
     }
   }
   function renderLoading() {
@@ -1129,11 +1137,19 @@
     } catch (error) {
       const apiError = error;
       if (apiError.code === "config_conflict") {
-        await rebaseDraftOnLatest();
-        showToast("\uCD5C\uC2E0 \uC124\uC815\uC744 \uBD88\uB7EC\uC640 \uB0B4 \uBCC0\uACBD\uB9CC \uB2E4\uC2DC \uC801\uC6A9\uD588\uC2B5\uB2C8\uB2E4. \uAC80\uD1A0 \uD6C4 \uC800\uC7A5\uD558\uC138\uC694.", "error");
+        try {
+          await rebaseDraftOnLatest();
+          showToast("\uCD5C\uC2E0 \uC124\uC815\uC744 \uBD88\uB7EC\uC640 \uB0B4 \uBCC0\uACBD\uB9CC \uB2E4\uC2DC \uC801\uC6A9\uD588\uC2B5\uB2C8\uB2E4. \uAC80\uD1A0 \uD6C4 \uC800\uC7A5\uD558\uC138\uC694.", "error");
+        } catch (rebaseError) {
+          const rebaseApiError = rebaseError;
+          if (rebaseApiError.code === "invalid_session") {
+            expireSession();
+            return;
+          }
+          showToast("\uCD5C\uC2E0 \uC124\uC815\uC744 \uBD88\uB7EC\uC624\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. \uD3B8\uC9D1\uAC12\uC740 \uC720\uC9C0\uB429\uB2C8\uB2E4. \uB2E4\uC2DC \uC800\uC7A5\uD574 \uC7AC\uC2DC\uB3C4\uD558\uC138\uC694.", "error");
+        }
       } else if (apiError.code === "invalid_session") {
-        token = "";
-        renderExpired();
+        expireSession();
         return;
       } else {
         showToast(messageOf(error), "error");
@@ -1185,8 +1201,7 @@
       await api("/api/shutdown", { method: "POST" });
     } catch {
     }
-    token = "";
-    renderExpired();
+    expireSession();
   }
   function requestCloseSession() {
     if (isDirty()) {
@@ -1204,9 +1219,32 @@
     try {
       await api("/api/heartbeat", { method: "POST" });
     } catch {
-      window.clearInterval(heartbeatTimer);
-      token = "";
-      renderExpired();
+      expireSession();
+    }
+  }
+  function expireSession() {
+    window.clearInterval(heartbeatTimer);
+    token = "";
+    clearSessionToken();
+    renderExpired();
+  }
+  function readSessionToken() {
+    try {
+      return sessionStorage.getItem(SESSION_TOKEN_KEY) ?? "";
+    } catch {
+      return "";
+    }
+  }
+  function writeSessionToken(value) {
+    try {
+      sessionStorage.setItem(SESSION_TOKEN_KEY, value);
+    } catch {
+    }
+  }
+  function clearSessionToken() {
+    try {
+      sessionStorage.removeItem(SESSION_TOKEN_KEY);
+    } catch {
     }
   }
   function setActiveNavigation(hash) {

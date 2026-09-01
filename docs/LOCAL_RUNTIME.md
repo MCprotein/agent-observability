@@ -37,6 +37,8 @@ delegates all configuration validation and atomic save behavior back to Rust. A 
 shared runtime singleton only for the mutation. Every supported CLI/UI writer is required to hold the
 typed mutation guard, then verifies the browser revision immediately before the atomic replace and
 releases the singleton before serving the next request. Direct config file editing is unsupported.
+The fragment capability is retained only in same-tab session storage for reload recovery and is removed
+after explicit close or an invalid-session/network failure; it is never placed in a cookie or local storage.
 The process stops after 10 minutes without an active browser heartbeat and has an absolute one-hour lifetime.
 The lower-level `init` command remains available for automation. Install creates the root, logs,
 queue, state, and runtime directories with mode 0700 and creates config.json with mode 0600.

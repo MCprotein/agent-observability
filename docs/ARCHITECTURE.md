@@ -38,7 +38,9 @@ TypeScript UI는 브라우저에서 직접 원본 event log를 읽지 않고 Rus
 versioned config DTO만 사용한다. report는 self-contained static HTML이며 runtime web server를
 요구하지 않는다. 설정 UI는 CLI가 명시적으로 시작한 동안에만 `127.0.0.1:0`에 bind하는 ephemeral
 inbound adapter를 사용한다. token, exact Host/Origin, body bound, no-store와 optimistic revision을
-검증하며 persistent daemon이나 외부 network 경로를 만들지 않는다. CLI composition root가 private
+검증한다. token은 같은 tab의 reload 복구를 위한 session storage에만 유지하고 명시적 종료 또는
+invalid-session/network failure 시 삭제한다.
+persistent daemon이나 외부 network 경로를 만들지 않는다. CLI composition root가 private
 runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui는 UI instance lock만 유지하고
 모든 지원 CLI/UI writer는 설정 mutation 동안 타입으로 강제된 shared guard를 획득한 뒤 그 안에서
 revision 확인과 atomic replace를 순서대로 수행한다. `config.json` 직접 편집은 지원 경계 밖이다.

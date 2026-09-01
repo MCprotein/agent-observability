@@ -526,6 +526,19 @@ dialog::backdrop { background: rgb(24 32 38 / 45%); }
 
 @media (max-width: 479px) {
   .session-badge { max-width: 140px; }
+  .section-nav {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 2px;
+    overflow-x: visible;
+  }
+  .section-nav a {
+    justify-content: center;
+    min-width: 0;
+    gap: 4px;
+    padding: 0 4px;
+  }
+  .section-nav a svg { width: 16px; height: 16px; }
   .save-actions { grid-template-columns: repeat(2, 1fr); }
   .save-actions .primary { grid-column: 1 / -1; grid-row: 1; }
   .policy-notice { align-items: flex-start; }

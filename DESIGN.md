@@ -93,7 +93,8 @@ Standalone settings use an ephemeral loopback route opened by `agent-observabili
 - `/` renders overview, collection, storage and retention controls in one responsive workspace
 - `/api/config` reads and atomically replaces the Rust-validated local configuration
 - the browser receives a one-time session capability through the URL fragment, removes it from the visible URL,
-  and sends it only in a private request header
+  keeps it only in same-tab session storage for reload recovery, sends it only in a private request header and
+  removes it after explicit close or an invalid-session/network failure
 
 The settings process binds an operating-system-selected port on `127.0.0.1`, rejects non-loopback host and
 origin values, sends no CORS permission, makes no external request and expires after inactivity. Closing it
@@ -305,7 +306,8 @@ implementation tutorials and keyboard-shortcut copy inside the main product surf
 - Browser support target is the latest two stable major versions of major evergreen desktop browsers; exact
   support becomes a release contract at the TypeScript UI milestone.
 - Verification includes typecheck, unit/contract tests, file-open smoke, browser screenshots at desktop/mobile,
-  keyboard/a11y checks, long-text overflow and empty/partial/offline/quota fixtures.
+  320px reflow, clean and dirty reload recovery, keyboard/a11y checks, long-text overflow and
+  empty/partial/offline/quota fixtures.
 - v0.12 provisions the Chromium revision paired with lockfile-pinned `playwright-core` in `npm test` pretest,
   then runs file-open browser checks without a local server. It asserts desktop/mobile overflow, 44px mobile
   controls, headings/landmarks, first-tab focus, filter/trace state, console errors and external network requests.

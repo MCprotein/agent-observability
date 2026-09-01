@@ -45,7 +45,8 @@ agent-observability ui
 
 수집 허용, 확인·반영 주기, batch, heartbeat, 저장 한도, 보관 기간과 archive 한도를 한 화면에서
 바꿀 수 있다. 설정할 때만 임의의 `127.0.0.1` port를 사용하며 browser tab의 session token,
-Host와 Origin을 모두 확인한다. 사용자가 1분 이상 화면을 조작하지 않으면 heartbeat를 멈추고,
+Host와 Origin을 모두 확인한다. token은 같은 tab의 새로고침에서만 복구되며 세션 종료 시 삭제된다.
+사용자가 1분 이상 화면을 조작하지 않으면 heartbeat를 멈추고,
 연결이 10분 동안 끊기거나 실행 후 1시간이 지나면 process가 종료된다.
 
 ### 4. 실제 runtime 준비

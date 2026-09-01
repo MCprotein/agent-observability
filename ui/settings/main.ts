@@ -157,7 +157,10 @@ const rootElement = document.querySelector("#app");
 if (!(rootElement instanceof HTMLDivElement)) throw new Error("settings root is missing");
 const app = rootElement;
 
-let token = new URLSearchParams(location.hash.slice(1)).get("session") ?? "";
+const SESSION_TOKEN_KEY = "agent-observability.settings.session.v1";
+const fragmentToken = new URLSearchParams(location.hash.slice(1)).get("session") ?? "";
+let token = fragmentToken || readSessionToken();
+if (fragmentToken) writeSessionToken(fragmentToken);
 history.replaceState(null, "", `${location.pathname}${location.search}`);
 let persisted: LocalRuntimeConfigV2 | null = null;
 let draft: LocalRuntimeConfigV2 | null = null;
@@ -194,7 +197,12 @@ async function bootstrap(): Promise<void> {
     renderSettings();
     heartbeatTimer = window.setInterval(() => void heartbeat(), 20_000);
   } catch (error) {
-    renderUnavailable(messageOf(error));
+    const apiError = error as Error & { code?: string };
+    if (apiError.code === "invalid_session") {
+      expireSession();
+    } else {
+      renderUnavailable(messageOf(error));
+    }
   }
 }
 
@@ -551,11 +559,19 @@ async function saveDraft(): Promise<void> {
   } catch (error) {
     const apiError = error as Error & { code?: string };
     if (apiError.code === "config_conflict") {
-      await rebaseDraftOnLatest();
-      showToast("최신 설정을 불러와 내 변경만 다시 적용했습니다. 검토 후 저장하세요.", "error");
+      try {
+        await rebaseDraftOnLatest();
+        showToast("최신 설정을 불러와 내 변경만 다시 적용했습니다. 검토 후 저장하세요.", "error");
+      } catch (rebaseError) {
+        const rebaseApiError = rebaseError as Error & { code?: string };
+        if (rebaseApiError.code === "invalid_session") {
+          expireSession();
+          return;
+        }
+        showToast("최신 설정을 불러오지 못했습니다. 편집값은 유지됩니다. 다시 저장해 재시도하세요.", "error");
+      }
     } else if (apiError.code === "invalid_session") {
-      token = "";
-      renderExpired();
+      expireSession();
       return;
     } else {
       showToast(messageOf(error), "error");
@@ -614,8 +630,7 @@ async function closeSession(): Promise<void> {
   } catch {
     // The process may close before the empty response reaches the browser.
   }
-  token = "";
-  renderExpired();
+  expireSession();
 }
 
 function requestCloseSession(): void {
@@ -636,9 +651,38 @@ async function heartbeat(): Promise<void> {
   try {
     await api<void>("/api/heartbeat", { method: "POST" });
   } catch {
-    window.clearInterval(heartbeatTimer);
-    token = "";
-    renderExpired();
+    expireSession();
+  }
+}
+
+function expireSession(): void {
+  window.clearInterval(heartbeatTimer);
+  token = "";
+  clearSessionToken();
+  renderExpired();
+}
+
+function readSessionToken(): string {
+  try {
+    return sessionStorage.getItem(SESSION_TOKEN_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeSessionToken(value: string): void {
+  try {
+    sessionStorage.setItem(SESSION_TOKEN_KEY, value);
+  } catch {
+    // In-memory use remains available when browser storage is disabled.
+  }
+}
+
+function clearSessionToken(): void {
+  try {
+    sessionStorage.removeItem(SESSION_TOKEN_KEY);
+  } catch {
+    // The in-memory token is already cleared.
   }
 }
 
