@@ -151,6 +151,25 @@ jobs:
             cd dist
             shasum -a 256 -- *.tar.gz *.tgz install.sh > SHA256SUMS
           )
+      - name: Smoke test release installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          fixture="$RUNNER_TEMP/agent-observability-releases/download/$GITHUB_REF_NAME"
+          home="$RUNNER_TEMP/agent-observability-installer-home"
+          mkdir -p "$fixture" "$home"
+          cp "dist/agent-observability-$version-darwin-universal2.tar.gz" \
+            dist/SHA256SUMS "$fixture/"
+
+          HOME="$home" \
+          SHELL=/bin/zsh \
+          AGENT_OBSERVABILITY_VERSION="$version" \
+          AGENT_OBSERVABILITY_RELEASE_BASE_URL="file://$RUNNER_TEMP/agent-observability-releases" \
+            sh dist/install.sh
+
+          test "$("$home/.local/bin/agent-observability" --version)" = "$version"
+          grep -Fxq '# >>> agent-observability PATH >>>' "$home/.zshrc"
       - name: Attest release artifacts
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:

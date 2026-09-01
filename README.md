@@ -4,7 +4,7 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.6.0 범위:** one-command verified install, local setup, 내장 demo, 시각적 로컬 설정,
+> **v1.6.0 범위:** one-command checksum-checked install, local setup, 내장 demo, 시각적 로컬 설정,
 > 수동 private handoff import를 지원한다.
 > agent 원본 로그를 자동으로 읽는 연결 기능은 아직 제공하지 않는다.
 
@@ -17,12 +17,20 @@ checksum과 실행 파일 버전을 확인한 뒤 `~/.local/bin`에 원자적으
 profile에 PATH 블록을 한 번만 등록한다.
 
 ```bash
-curl -fsSL https://github.com/MCprotein/agent-observability/releases/latest/download/install.sh | sh
+(
+  set -eu
+  installer="$(mktemp)"
+  trap 'rm -f "$installer"' 0
+  curl -fsSL https://github.com/MCprotein/agent-observability/releases/latest/download/install.sh -o "$installer"
+  sh "$installer"
+)
 ```
 
 새 terminal부터 별도 설정 없이 사용할 수 있다. 현재 terminal의 PATH에 설치 경로가 없으면
-설치기가 출력하는 `. ~/.zshrc` 명령을 한 번 실행한다. 설치 위치와 profile은 각각
+설치기가 출력하는 `. <선택된 profile>` 명령(기본 zsh는 `. ~/.zshrc`)을 한 번 실행한다. 설치 위치와 profile은 각각
 `AGENT_OBSERVABILITY_INSTALL_DIR`, `AGENT_OBSERVABILITY_SHELL_PROFILE`로 변경할 수 있다.
+checksum은 다운로드 무결성을 확인한다. 릴리스 자산의 repository/workflow provenance는 GitHub
+artifact attestation으로 별도 게시된다.
 
 ### 2. 대시보드 체험
 

@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -125,4 +128,60 @@ test("custom install and profile paths remain valid shell syntax", (t) => {
     { encoding: "utf8", env: fixture.env },
   );
   assert.equal(output.trim(), "1.6.0");
+});
+
+test("reinstalling to a new directory replaces the managed PATH block", (t) => {
+  const fixture = makeFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  const firstDir = join(fixture.home, "first-bin");
+  const secondDir = join(fixture.home, "second-bin");
+  execFileSync("sh", [installer], {
+    env: { ...fixture.env, AGENT_OBSERVABILITY_INSTALL_DIR: firstDir },
+  });
+  execFileSync("sh", [installer], {
+    env: { ...fixture.env, AGENT_OBSERVABILITY_INSTALL_DIR: secondDir },
+  });
+
+  const profile = readFileSync(join(fixture.home, ".zshrc"), "utf8");
+  assert.doesNotMatch(profile, /first-bin/);
+  assert.match(profile, /second-bin/);
+  assert.equal(profile.match(/>>> agent-observability PATH >>>/g)?.length, 1);
+});
+
+test("installer preserves permissions on existing private directories", (t) => {
+  const fixture = makeFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  const installDir = join(fixture.home, "private-bin");
+  const profileDir = join(fixture.home, "private-shell");
+  mkdirSync(installDir, { mode: 0o700 });
+  mkdirSync(profileDir, { mode: 0o700 });
+  execFileSync("sh", [installer], {
+    env: {
+      ...fixture.env,
+      AGENT_OBSERVABILITY_INSTALL_DIR: installDir,
+      AGENT_OBSERVABILITY_SHELL_PROFILE: join(profileDir, "profile"),
+    },
+  });
+
+  assert.equal(statSync(installDir).mode & 0o777, 0o700);
+  assert.equal(statSync(profileDir).mode & 0o777, 0o700);
+});
+
+test("atomic profile updates preserve a profile symlink and target mode", (t) => {
+  const fixture = makeFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  const targetDir = join(fixture.home, "shell");
+  const target = join(targetDir, "profile");
+  mkdirSync(targetDir);
+  writeFileSync(target, "existing profile\n", { mode: 0o600 });
+  symlinkSync("shell/profile", join(fixture.home, ".zshrc"));
+
+  execFileSync("sh", [installer], { env: fixture.env });
+
+  assert.equal(lstatSync(join(fixture.home, ".zshrc")).isSymbolicLink(), true);
+  assert.match(readFileSync(target, "utf8"), /agent-observability PATH/);
+  assert.equal(statSync(target).mode & 0o777, 0o600);
 });

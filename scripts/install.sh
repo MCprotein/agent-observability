@@ -23,7 +23,7 @@ case "$platform" in
   *) fail "macOS is required (detected $platform)" ;;
 esac
 
-for command_name in awk chmod curl grep install mkdir mktemp mv rm sed shasum tar; do
+for command_name in awk cat chmod cp curl install mkdir mktemp mv readlink rm sed shasum tar; do
   require_command "$command_name"
 done
 
@@ -67,10 +67,14 @@ download_base="$release_base_url/download/$tag"
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/agent-observability-install.XXXXXX") ||
   fail "could not create a temporary directory"
 pending_binary=""
+pending_profile=""
 cleanup() {
   rm -rf "$work_dir"
   if [ -n "$pending_binary" ]; then
     rm -f "$pending_binary"
+  fi
+  if [ -n "$pending_profile" ]; then
+    rm -f "$pending_profile"
   fi
 }
 trap cleanup EXIT HUP INT TERM
@@ -97,7 +101,10 @@ chmod 0755 "$source_binary"
 [ "$("$source_binary" --version)" = "$version" ] ||
   fail "downloaded executable version does not match $version"
 
-install -d -m 0755 "$install_dir"
+if [ ! -d "$install_dir" ]; then
+  [ ! -e "$install_dir" ] || fail "install path is not a directory: $install_dir"
+  install -d -m 0755 "$install_dir"
+fi
 pending_binary="$install_dir/.agent-observability.install.$$"
 install -m 0755 "$source_binary" "$pending_binary"
 mv -f "$pending_binary" "$install_dir/agent-observability"
@@ -113,34 +120,89 @@ if [ -z "$profile" ]; then
 fi
 
 case "$profile" in
+  /*) ;;
+  *) fail "shell profile must be an absolute path: $profile" ;;
+esac
+case "$profile" in
   *'
 '*) fail "shell profile path must not contain a newline" ;;
+esac
+
+profile_target=$profile
+link_depth=0
+while [ -L "$profile_target" ]; do
+  link_depth=$((link_depth + 1))
+  [ "$link_depth" -le 16 ] || fail "shell profile symlink chain is too deep"
+  link_target=$(readlink "$profile_target") || fail "could not read shell profile symlink"
+  case "$link_target" in
+    /*) profile_target=$link_target ;;
+    *) profile_target=${profile_target%/*}/$link_target ;;
+  esac
+done
+case "$profile_target" in
+  *'
+'*) fail "shell profile target must not contain a newline" ;;
 esac
 marker_start="# >>> agent-observability PATH >>>"
 marker_end="# <<< agent-observability PATH <<<"
 quoted_profile=$(printf '%s' "$profile" | sed "s/'/'\\\\''/g")
-has_marker_start=false
-has_marker_end=false
-if [ -f "$profile" ]; then
-  grep -Fxq "$marker_start" "$profile" && has_marker_start=true
-  grep -Fxq "$marker_end" "$profile" && has_marker_end=true
+marker_start_count=0
+marker_end_count=0
+if [ -f "$profile_target" ]; then
+  marker_start_count=$(awk -v marker="$marker_start" '$0 == marker { count++ } END { print count + 0 }' "$profile_target")
+  marker_end_count=$(awk -v marker="$marker_end" '$0 == marker { count++ } END { print count + 0 }' "$profile_target")
 fi
-[ "$has_marker_start" = "$has_marker_end" ] ||
-  fail "shell profile contains an incomplete agent-observability PATH block"
-if [ "$has_marker_start" = false ]; then
-  profile_dir=${profile%/*}
-  [ "$profile_dir" = "$profile" ] || install -d -m 0755 "$profile_dir"
-  quoted_install_dir=$(printf '%s' "$install_dir" | sed "s/'/'\\\\''/g")
-  {
-    [ ! -s "$profile" ] || printf '\n'
-    printf '%s\n' "$marker_start"
-    printf 'case ":$PATH:" in\n'
-    printf "  *:'%s':*) ;;\n" "$quoted_install_dir"
-    printf '  *) export PATH='"'"'%s'"'"':"$PATH" ;;\n' "$quoted_install_dir"
-    printf 'esac\n'
-    printf '%s\n' "$marker_end"
-  } >> "$profile"
+case "$marker_start_count:$marker_end_count" in
+  0:0|1:1) ;;
+  *) fail "shell profile contains an invalid agent-observability PATH block" ;;
+esac
+
+profile_dir=${profile_target%/*}
+if [ "$profile_dir" != "$profile_target" ] && [ ! -d "$profile_dir" ]; then
+  [ ! -e "$profile_dir" ] || fail "shell profile parent is not a directory: $profile_dir"
+  install -d -m 0755 "$profile_dir"
 fi
+quoted_install_dir=$(printf '%s' "$install_dir" | sed "s/'/'\\\\''/g")
+path_block="$work_dir/path-block"
+{
+  printf '%s\n' "$marker_start"
+  printf 'case ":$PATH:" in\n'
+  printf "  *:'%s':*) ;;\n" "$quoted_install_dir"
+  printf '  *) export PATH='"'"'%s'"'"':"$PATH" ;;\n' "$quoted_install_dir"
+  printf 'esac\n'
+  printf '%s\n' "$marker_end"
+} > "$path_block"
+
+profile_update="$work_dir/profile-update"
+if [ "$marker_start_count" -eq 1 ]; then
+  awk -v start="$marker_start" -v end="$marker_end" -v block="$path_block" '
+    $0 == start {
+      while ((getline line < block) > 0) print line
+      close(block)
+      managed = 1
+      next
+    }
+    managed && $0 == end { managed = 0; next }
+    !managed { print }
+  ' "$profile_target" > "$profile_update"
+else
+  if [ -f "$profile_target" ]; then
+    cat "$profile_target" > "$profile_update"
+  fi
+  [ ! -s "$profile_update" ] || printf '\n' >> "$profile_update"
+  cat "$path_block" >> "$profile_update"
+fi
+
+pending_profile=$(mktemp "$profile_dir/.agent-observability-profile.XXXXXX") ||
+  fail "could not create a shell profile update"
+if [ -e "$profile_target" ]; then
+  cp -p "$profile_target" "$pending_profile"
+  cat "$profile_update" > "$pending_profile"
+else
+  install -m 0600 "$profile_update" "$pending_profile"
+fi
+mv -f "$pending_profile" "$profile_target"
+pending_profile=""
 
 printf 'Installed agent-observability %s to %s\n' "$version" "$install_dir/agent-observability"
 case ":$PATH:" in
