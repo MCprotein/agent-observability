@@ -86,7 +86,7 @@ gate를 통과해 추가한다.
 | v1.4.0 | Released | Local onboarding and documentation usability | Release workflow `33422477557` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
 | v1.5.0 | Released | Local visual configuration console | Release workflow `33478394514` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
 | v1.6.0 | Released | Integrity-checked one-command installer | Release workflow `33481569104` published the Package, public Release, and attested installer; downloaded checksums, universal `x86_64 arm64` version, fresh public install, and all five artifact attestations verified independently |
-| v1.7.0 | In progress | TypeScript tooling completion and short CLI alias | Authored JavaScript removed, strict TypeScript build/test/release tooling, `agentobs` plus compatibility alias, explicit monitoring/settings commands, package/install smoke and independent review |
+| v1.7.0 | Released | TypeScript tooling completion and short CLI alias | Release workflow `33486442683` published the Package and public Release; downloaded checksums, universal `x86_64 arm64` version, both installed command aliases, and all five artifact attestations verified independently |
 
 ## Branch Strategy
 
