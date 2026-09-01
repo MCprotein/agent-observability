@@ -6,9 +6,9 @@ dashboard open, and atomic CLI configuration updates. v1.5.0 adds an explicit, e
 settings UI without adding a resident server, daemon, identity, automatic producer, or external network path.
 It installs private local state,
 validates a closed configuration, admits writes against a hard storage budget, and keeps foreground
-handoff bounded. It contains no endpoint, email, team identity, envelope, outbox, or network client.
-The only endpoint is created by the foreground `ui` command on `127.0.0.1:0`, uses a private browser
-session, and expires after inactivity. It is not a resident server or IPC daemon.
+handoff bounded. It contains no external or team endpoint, email, team identity, envelope, outbox, or
+network client. The only local endpoint is created by the foreground `ui` command on `127.0.0.1:0`,
+uses a private browser session, and expires after inactivity. It is not a resident server or IPC daemon.
 
 ## Install and validate
 
@@ -35,8 +35,9 @@ agent-observability report ~/.agent-observability /path/to/private-rate-table.js
 `ui` holds only a settings-UI instance singleton, embeds the generated TypeScript application, and
 delegates all configuration validation and atomic save behavior back to Rust. A save acquires the
 shared runtime singleton only for the mutation. Every supported CLI/UI writer is required to hold the
-typed mutation guard, then verifies the browser revision immediately before the atomic replace and
-releases the singleton before serving the next request. Direct config file editing is unsupported.
+typed mutation guard. The CLI reads and writes while holding that guard; the UI additionally verifies the
+browser revision immediately before the atomic replace. Both release the guard before the next operation.
+Direct config file editing is unsupported.
 The fragment capability is retained only in same-tab session storage for reload recovery and is removed
 after explicit close or an invalid-session/network failure; it is never placed in a cookie or local storage.
 The process stops after 10 minutes without an active browser heartbeat and has an absolute one-hour lifetime.

@@ -155,12 +155,14 @@ pub struct InstalledLayout {
 #[derive(Debug)]
 pub struct ConfigMutationGuard {
     _singleton: Singleton,
+    config_path: PathBuf,
 }
 
 impl ConfigMutationGuard {
-    pub fn acquire(runtime_path: &Path) -> Result<Self, SingletonError> {
-        Singleton::acquire(runtime_path).map(|singleton| Self {
+    pub fn acquire(layout: &InstalledLayout) -> Result<Self, SingletonError> {
+        Singleton::acquire(&layout.runtime).map(|singleton| Self {
             _singleton: singleton,
+            config_path: layout.config.clone(),
         })
     }
 }
@@ -277,21 +279,18 @@ pub fn load(path: &Path) -> Result<LocalRuntimeConfigV2, ConfigError> {
     LocalRuntimeConfigV2::from_json(&body)
 }
 
-pub fn save(
-    _guard: &ConfigMutationGuard,
-    path: &Path,
-    config: &LocalRuntimeConfigV2,
-) -> Result<(), ConfigError> {
-    save_with_hook(path, config, None, |_| Ok(()))
+pub fn save(guard: &ConfigMutationGuard, config: &LocalRuntimeConfigV2) -> Result<(), ConfigError> {
+    save_with_hook(&guard.config_path, config, None, |_| Ok(()))
 }
 
 pub fn save_if_revision(
-    _guard: &ConfigMutationGuard,
-    path: &Path,
+    guard: &ConfigMutationGuard,
     expected_revision: &str,
     config: &LocalRuntimeConfigV2,
 ) -> Result<(), ConfigError> {
-    save_with_hook(path, config, Some(expected_revision), |_| Ok(()))
+    save_with_hook(&guard.config_path, config, Some(expected_revision), |_| {
+        Ok(())
+    })
 }
 
 pub fn revision(config: &LocalRuntimeConfigV2) -> Result<String, ConfigError> {
@@ -638,15 +637,40 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let layout = install(&root).unwrap();
 
-        let first = ConfigMutationGuard::acquire(&layout.runtime).unwrap();
+        let first = ConfigMutationGuard::acquire(&layout).unwrap();
         assert!(matches!(
-            ConfigMutationGuard::acquire(&layout.runtime),
+            ConfigMutationGuard::acquire(&layout),
             Err(SingletonError::AlreadyRunning)
         ));
         drop(first);
-        ConfigMutationGuard::acquire(&layout.runtime).unwrap();
+        ConfigMutationGuard::acquire(&layout).unwrap();
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_mutation_guard_binds_save_to_its_installed_layout() {
+        let first_root = root("config-mutation-bound-first");
+        let second_root = root("config-mutation-bound-second");
+        let _ = fs::remove_dir_all(&first_root);
+        let _ = fs::remove_dir_all(&second_root);
+        let first_layout = install(&first_root).unwrap();
+        let second_layout = install(&second_root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&first_layout).unwrap();
+        let mut update = LocalRuntimeConfigV2::default();
+        update.retention.max_record_age_days = 90;
+
+        save(&guard, &update).unwrap();
+
+        assert_eq!(load(&first_layout.config).unwrap(), update);
+        assert_eq!(
+            load(&second_layout.config).unwrap(),
+            LocalRuntimeConfigV2::default()
+        );
+        drop(guard);
+        let _ = fs::remove_dir_all(first_root);
+        let _ = fs::remove_dir_all(second_root);
     }
 
     #[cfg(unix)]

@@ -43,7 +43,8 @@ invalid-session/network failure 시 삭제한다.
 persistent daemon이나 외부 network 경로를 만들지 않는다. CLI composition root가 private
 runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui는 UI instance lock만 유지하고
 모든 지원 CLI/UI writer는 설정 mutation 동안 타입으로 강제된 shared guard를 획득한 뒤 그 안에서
-revision 확인과 atomic replace를 순서대로 수행한다. `config.json` 직접 편집은 지원 경계 밖이다.
+읽기와 atomic replace를 수행한다. UI는 추가로 browser revision을 atomic replace 직전에 확인한다.
+`config.json` 직접 편집은 지원 경계 밖이다.
 
 ## Deployment profiles
 

@@ -207,7 +207,7 @@ Crash recovery와 replay 규칙은 [Local Runtime](docs/LOCAL_RUNTIME.md#retenti
 | Runtime directory | `0700`만 허용 |
 | Config, archive, report | `0600`으로 기록 |
 | Unknown field와 schema | 추측하지 않고 거부 |
-| Network | standalone에서는 사용하지 않음 |
+| External network | standalone outbound 경로 없음; 설정 화면은 실행 중 인증된 loopback만 사용 |
 
 ## 다른 설치 방법
 

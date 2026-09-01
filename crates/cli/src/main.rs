@@ -489,11 +489,10 @@ fn show_config(root: &Path) -> Result<String, String> {
 
 fn update_config(root: &Path, key: &str, value: &str) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let mutation =
-        ConfigMutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let mutation = ConfigMutationGuard::acquire(&layout).map_err(|error| error.to_string())?;
     let mut config = load(&layout.config).map_err(|error| error.to_string())?;
     set_config_value(&mut config, key, value)?;
-    save(&mutation, &layout.config, &config).map_err(|error| error.to_string())?;
+    save(&mutation, &config).map_err(|error| error.to_string())?;
     Ok(format!(
         "updated={key}\n{}",
         config_output(&layout, &config)

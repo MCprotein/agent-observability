@@ -16,7 +16,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -83,8 +83,7 @@ impl PreparedUi {
 
 #[derive(Clone, Debug)]
 struct AppState {
-    config_path: PathBuf,
-    runtime_path: PathBuf,
+    layout: InstalledLayout,
     host: String,
     origin: String,
     token: String,
@@ -162,8 +161,7 @@ pub async fn prepare(layout: &InstalledLayout) -> Result<PreparedUi, UiError> {
     let shutdown = Arc::new(Notify::new());
     let last_seen = Arc::new(Mutex::new(Instant::now()));
     let state = AppState {
-        config_path: layout.config.clone(),
-        runtime_path: layout.runtime.clone(),
+        layout: layout.clone(),
         host,
         origin: origin.clone(),
         token: token.clone(),
@@ -229,7 +227,7 @@ async fn get_config(
 ) -> Result<Json<ConfigEnvelope>, ApiError> {
     authorize(&state, &headers, false)?;
     touch(&state)?;
-    envelope(&state.config_path).map(Json)
+    envelope(&state.layout.config).map(Json)
 }
 
 async fn put_config(
@@ -249,26 +247,19 @@ async fn put_config(
             error.to_string(),
         )
     })?;
-    let mutation =
-        ConfigMutationGuard::acquire(&state.runtime_path).map_err(|error| match error {
-            SingletonError::AlreadyRunning => ApiError::new(
-                StatusCode::CONFLICT,
-                "runtime_busy",
-                "다른 로컬 작업이 실행 중입니다. 잠시 후 다시 저장하세요.",
-            ),
-            _ => ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "runtime_lock_failed",
-                error.to_string(),
-            ),
-        })?;
-    save_if_revision(
-        &mutation,
-        &state.config_path,
-        &update.revision,
-        &update.config,
-    )
-    .map_err(|error| {
+    let mutation = ConfigMutationGuard::acquire(&state.layout).map_err(|error| match error {
+        SingletonError::AlreadyRunning => ApiError::new(
+            StatusCode::CONFLICT,
+            "runtime_busy",
+            "다른 로컬 작업이 실행 중입니다. 잠시 후 다시 저장하세요.",
+        ),
+        _ => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime_lock_failed",
+            error.to_string(),
+        ),
+    })?;
+    save_if_revision(&mutation, &update.revision, &update.config).map_err(|error| {
         if matches!(error, ConfigError::Conflict) {
             ApiError::new(
                 StatusCode::CONFLICT,
@@ -283,7 +274,7 @@ async fn put_config(
             )
         }
     })?;
-    envelope(&state.config_path).map(Json)
+    envelope(&state.layout.config).map(Json)
 }
 
 async fn heartbeat(
@@ -535,8 +526,7 @@ mod tests {
                 let _ = fs::remove_dir_all(&root);
                 let layout = install(&root).unwrap();
                 let state = AppState {
-                    config_path: layout.config,
-                    runtime_path: layout.runtime,
+                    layout,
                     host: "127.0.0.1:43191".into(),
                     origin: "http://127.0.0.1:43191".into(),
                     token: "test-session".into(),
