@@ -2,11 +2,11 @@
 #![allow(clippy::missing_errors_doc)]
 
 use agent_observability_codex_config::{
-    CodexConfigManager, ConfigError, ConnectionStatus as ConfigConnectionStatus,
+    CodexConfigManager, ConfigError, ConnectionStatus as ConfigConnectionStatus, MutualTlsPaths,
 };
 use agent_observability_local_collector::{
-    CollectorError, CollectorSettings, TOKEN_HEADER, install_settings, load_settings,
-    recover_occupied_persisted_port,
+    CollectorError, CollectorSettings, HealthOutcome, check_health, install_settings,
+    load_settings, recover_occupied_persisted_port,
 };
 use agent_observability_local_runtime::{ConfigMutationGuard, InstalledLayout, install};
 use serde::{Deserialize, Serialize};
@@ -14,8 +14,7 @@ use sha2::{Digest, Sha256};
 use std::{
     env, fmt, fs,
     io::{Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 #[cfg(target_os = "macos")]
@@ -25,7 +24,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-const MAX_HEALTH_RESPONSE_BYTES: u64 = 4 * 1024;
 const COLLECTOR_READY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "macos")]
 const LAUNCH_AGENT_OWNERSHIP_VERSION: &str = "agent-observability.launch-agent-ownership.v1";
@@ -139,10 +137,15 @@ fn recover_connect_settings(
     root: &Path,
     settings: &CollectorSettings,
 ) -> Result<(CollectorSettings, bool), IntegrationError> {
-    if matches!(
-        probe_health(settings),
-        CollectorStatus::Ready | CollectorStatus::Degraded
-    ) {
+    recover_connect_settings_with(root, settings, check_health)
+}
+
+fn recover_connect_settings_with(
+    root: &Path,
+    settings: &CollectorSettings,
+    health: impl FnOnce(&Path) -> HealthOutcome,
+) -> Result<(CollectorSettings, bool), IntegrationError> {
+    if matches!(health(root), HealthOutcome::Ready | HealthOutcome::Degraded) {
         return Ok((settings.clone(), false));
     }
     let recovered = recover_occupied_persisted_port(root, settings)?;
@@ -448,7 +451,7 @@ pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, 
         reconcile_collector_service(&layout.root, config)?;
         Ok(CodexIntegrationStatus {
             config: config.into(),
-            collector: probe_health(&settings),
+            collector: collector_status(check_health(&layout.root)),
             endpoint: Some(settings.endpoint()),
             service: Some(service_label(&layout.root)),
             data_retained: true,
@@ -508,92 +511,11 @@ impl From<ConfigConnectionStatus> for ConnectionStatus {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum HealthStatus {
-    Ready,
-    Degraded,
-}
-
-#[derive(Debug, Deserialize)]
-struct HealthResponse {
-    status: HealthStatus,
-    report_dirty: bool,
-}
-
-fn probe_health(settings: &CollectorSettings) -> CollectorStatus {
-    let request = format!(
-        "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{TOKEN_HEADER}: {}\r\nConnection: close\r\n\r\n",
-        settings.token,
-    );
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), settings.port);
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(50)) else {
-        return CollectorStatus::Unavailable;
-    };
-    let timeout = Some(Duration::from_millis(100));
-    if stream.set_write_timeout(timeout).is_err()
-        || stream.set_read_timeout(timeout).is_err()
-        || stream.write_all(request.as_bytes()).is_err()
-        || stream.flush().is_err()
-    {
-        return CollectorStatus::Unavailable;
-    }
-
-    let mut response = Vec::new();
-    if stream
-        .take(MAX_HEALTH_RESPONSE_BYTES + 1)
-        .read_to_end(&mut response)
-        .is_err()
-        || response.len() as u64 > MAX_HEALTH_RESPONSE_BYTES
-    {
-        return CollectorStatus::Unavailable;
-    }
-    parse_health_response(&response)
-}
-
-fn parse_health_response(response: &[u8]) -> CollectorStatus {
-    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return CollectorStatus::Unavailable;
-    };
-    let (headers, body_with_separator) = response.split_at(header_end);
-    let body = &body_with_separator[4..];
-    let Ok(headers) = std::str::from_utf8(headers) else {
-        return CollectorStatus::Unavailable;
-    };
-    let mut lines = headers.split("\r\n");
-    if !lines
-        .next()
-        .is_some_and(|status| status.starts_with("HTTP/1.1 200 "))
-    {
-        return CollectorStatus::Unavailable;
-    }
-    let mut content_length = None;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            return CollectorStatus::Unavailable;
-        };
-        if name.eq_ignore_ascii_case("transfer-encoding") {
-            return CollectorStatus::Unavailable;
-        }
-        if name.eq_ignore_ascii_case("content-length") {
-            let Ok(length) = value.trim().parse::<usize>() else {
-                return CollectorStatus::Unavailable;
-            };
-            if content_length.replace(length).is_some() {
-                return CollectorStatus::Unavailable;
-            }
-        }
-    }
-    if content_length != Some(body.len()) {
-        return CollectorStatus::Unavailable;
-    }
-    let Ok(health) = serde_json::from_slice::<HealthResponse>(body) else {
-        return CollectorStatus::Unavailable;
-    };
-    match (health.status, health.report_dirty) {
-        (HealthStatus::Ready, _) => CollectorStatus::Ready,
-        (HealthStatus::Degraded, true) => CollectorStatus::Degraded,
-        (HealthStatus::Degraded, false) => CollectorStatus::Unavailable,
+fn collector_status(health: HealthOutcome) -> CollectorStatus {
+    match health {
+        HealthOutcome::Ready => CollectorStatus::Ready,
+        HealthOutcome::Degraded => CollectorStatus::Degraded,
+        HealthOutcome::Unavailable => CollectorStatus::Unavailable,
     }
 }
 
@@ -627,13 +549,39 @@ fn codex_config_manager(
         .parent()
         .ok_or_else(|| IntegrationError::Runtime("Codex config path has no parent".into()))?;
     ensure_codex_home(codex_home)?;
+    let tls = mutual_tls_paths(layout, settings)?;
     CodexConfigManager::new(
         config_path,
         layout.runtime.join("integrations/codex"),
         executable,
         &layout.root,
         settings.port,
-        &settings.token,
+        tls,
+    )
+    .map_err(Into::into)
+}
+
+fn mutual_tls_paths(
+    layout: &InstalledLayout,
+    settings: &CollectorSettings,
+) -> Result<MutualTlsPaths, IntegrationError> {
+    let absolute = |relative: &str| {
+        let relative = Path::new(relative);
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(IntegrationError::Runtime(
+                "invalid local collector credential path".into(),
+            ));
+        }
+        Ok(layout.runtime.join(relative))
+    };
+    MutualTlsPaths::new(
+        absolute(&settings.credentials.ca_certificate)?,
+        absolute(&settings.credentials.client_certificate)?,
+        absolute(&settings.credentials.client_private_key)?,
     )
     .map_err(Into::into)
 }
@@ -1721,11 +1669,9 @@ fn uninstall_collector_service(_service: &CollectorService) -> Result<(), Integr
 fn wait_for_collector(root: &Path) -> Result<CollectorStatus, IntegrationError> {
     let started = std::time::Instant::now();
     loop {
-        if let Ok(settings) = load_settings(root) {
-            let status = probe_health(&settings);
-            if matches!(status, CollectorStatus::Ready | CollectorStatus::Degraded) {
-                return Ok(status);
-            }
+        let status = collector_status(check_health(root));
+        if matches!(status, CollectorStatus::Ready | CollectorStatus::Degraded) {
+            return Ok(status);
         }
         if started.elapsed() >= COLLECTOR_READY_TIMEOUT {
             break;
@@ -1850,10 +1796,11 @@ mod tests {
     use super::{
         CodexIntegrationStatus, CollectorLifecycle, CollectorService, CollectorStatus,
         ConfigConnectionStatus, ConfigLifecycle, ConnectionStatus, IntegrationError,
-        LaunchAgentOwnershipStatus, connect_prepared, connect_with_reloaded_settings,
-        disconnect_owned_prepared, disconnect_prepared, ensure_codex_home, launch_agent_body,
-        missing_settings_status, parse_health_response, probe_health, recover_connect_settings,
-        service_label, status, with_lifecycle_lock,
+        LaunchAgentOwnershipStatus, collector_status, connect_prepared,
+        connect_with_reloaded_settings, disconnect_owned_prepared, disconnect_prepared,
+        ensure_codex_home, launch_agent_body, missing_settings_status, mutual_tls_paths,
+        recover_connect_settings, recover_connect_settings_with, service_label, status,
+        with_lifecycle_lock,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -1865,18 +1812,14 @@ mod tests {
         recover_launch_agent_transaction, save_launch_agent_transaction,
         uninstall_collector_service_with,
     };
-    use agent_observability_codex_config::CodexConfigManager;
-    use agent_observability_local_collector::{
-        COLLECTOR_SETTINGS_VERSION, CollectorSettings, TOKEN_HEADER, install_settings,
-        load_settings,
-    };
+    use agent_observability_codex_config::{CodexConfigManager, MutualTlsPaths};
+    use agent_observability_local_collector::{HealthOutcome, install_settings, load_settings};
     use agent_observability_local_runtime::{ConfigServiceError, LocalConfigService};
     #[cfg(target_os = "macos")]
     use std::collections::VecDeque;
     use std::{
         cell::{Cell, RefCell},
         fs,
-        io::{Read as _, Write as _},
         net::TcpListener,
         path::{Path, PathBuf},
         sync::{Arc, Mutex, mpsc},
@@ -1893,6 +1836,46 @@ mod tests {
             "agentobs-codex-integration-{name}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    fn test_tls_paths(root: &Path) -> MutualTlsPaths {
+        MutualTlsPaths::new(
+            root.join("ca-certificate.pem"),
+            root.join("client-certificate.pem"),
+            root.join("client-private-key.pem"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mutual_tls_paths_are_absolute_and_reject_traversal() {
+        let root = temporary_root("mutual-tls-paths");
+        let layout = agent_observability_local_runtime::install(&root).unwrap();
+        let settings = install_settings(&root).unwrap();
+        let config_path = root.join("codex-config.toml");
+        let manager = CodexConfigManager::new(
+            &config_path,
+            layout.runtime.join("integrations/codex-test"),
+            root.join("bin/agentobs"),
+            &root,
+            settings.port,
+            mutual_tls_paths(&layout, &settings).unwrap(),
+        )
+        .unwrap();
+        manager.connect().unwrap();
+        let config = fs::read_to_string(&config_path).unwrap();
+        for relative in [
+            &settings.credentials.ca_certificate,
+            &settings.credentials.client_certificate,
+            &settings.credentials.client_private_key,
+        ] {
+            assert!(config.contains(&layout.runtime.join(relative).display().to_string()));
+        }
+
+        let mut traversal = settings;
+        traversal.credentials.client_private_key = "../client-private-key.pem".into();
+        assert!(mutual_tls_paths(&layout, &traversal).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -2126,46 +2109,19 @@ mod tests {
     }
 
     #[test]
-    fn health_parser_distinguishes_ready_degraded_and_invalid_payloads() {
+    fn collector_health_outcome_maps_to_public_status() {
         assert_eq!(
-            parse_health_response(&health_response(
-                r#"{"status":"ready","report_dirty":false}"#
-            )),
+            collector_status(HealthOutcome::Ready),
             CollectorStatus::Ready
         );
         assert_eq!(
-            parse_health_response(&health_response(
-                r#"{"status":"degraded","report_dirty":true}"#,
-            )),
+            collector_status(HealthOutcome::Degraded),
             CollectorStatus::Degraded
         );
         assert_eq!(
-            parse_health_response(&health_response(
-                r#"{"status":"degraded","report_dirty":false}"#,
-            )),
+            collector_status(HealthOutcome::Unavailable),
             CollectorStatus::Unavailable
         );
-        assert_eq!(
-            parse_health_response(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n{}"),
-            CollectorStatus::Unavailable
-        );
-        assert_eq!(
-            parse_health_response(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"),
-            CollectorStatus::Unavailable
-        );
-    }
-
-    #[test]
-    fn health_probe_is_authenticated_and_bounded() {
-        let (ready, ready_server) = serve_health_once(health_response(
-            r#"{"status":"ready","report_dirty":false,"accepted_requests":0}"#,
-        ));
-        assert_eq!(probe_health(&ready), CollectorStatus::Ready);
-        ready_server.join().unwrap();
-
-        let (oversized, oversized_server) = serve_health_once(vec![b'x'; 4 * 1024 + 1]);
-        assert_eq!(probe_health(&oversized), CollectorStatus::Unavailable);
-        oversized_server.join().unwrap();
     }
 
     #[test]
@@ -2173,19 +2129,11 @@ mod tests {
         let root = temporary_root("healthy-no-port-recovery");
         let original = install_settings(&root).unwrap();
         let original_bytes = fs::read(root.join("runtime/collector.json")).unwrap();
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, original.port)).unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).unwrap();
-            stream
-                .write_all(&health_response(
-                    r#"{"status":"ready","report_dirty":false}"#,
-                ))
-                .unwrap();
-        });
-
-        let (settings, restart) = recover_connect_settings(&root, &original).unwrap();
+        let (settings, restart) = recover_connect_settings_with(&root, &original, |probe_root| {
+            assert_eq!(probe_root, root);
+            HealthOutcome::Ready
+        })
+        .unwrap();
 
         assert_eq!(settings, original);
         assert!(!restart);
@@ -2193,7 +2141,23 @@ mod tests {
             fs::read(root.join("runtime/collector.json")).unwrap(),
             original_bytes
         );
-        server.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_connect_recovery_does_not_rotate_a_degraded_collector() {
+        let root = temporary_root("degraded-no-port-recovery");
+        let original = install_settings(&root).unwrap();
+        let original_bytes = fs::read(root.join("runtime/collector.json")).unwrap();
+        let (settings, restart) =
+            recover_connect_settings_with(&root, &original, |_| HealthOutcome::Degraded).unwrap();
+
+        assert_eq!(settings, original);
+        assert!(!restart);
+        assert_eq!(
+            fs::read(root.join("runtime/collector.json")).unwrap(),
+            original_bytes
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2210,6 +2174,32 @@ mod tests {
         assert_eq!(
             fs::read(root.join("runtime/collector.json")).unwrap(),
             original_bytes
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_connect_preserves_renewed_credentials_while_selecting_restart() {
+        let root = temporary_root("renewed-restart");
+        let original = install_settings(&root).unwrap();
+        let mut expired = original.clone();
+        expired.credentials.expires_at_unix_ms = 1;
+        fs::write(
+            root.join("runtime/collector.json"),
+            serde_json::to_vec(&expired).unwrap(),
+        )
+        .unwrap();
+
+        let renewed = install_settings(&root).unwrap();
+        let renewed_bytes = fs::read(root.join("runtime/collector.json")).unwrap();
+        let (recovered, restart) = recover_connect_settings(&root, &renewed).unwrap();
+
+        assert!(restart);
+        assert_eq!(recovered, renewed);
+        assert_ne!(recovered.generation, original.generation);
+        assert_eq!(
+            fs::read(root.join("runtime/collector.json")).unwrap(),
+            renewed_bytes
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -2281,36 +2271,6 @@ mod tests {
         );
     }
 
-    fn health_response(body: &str) -> Vec<u8> {
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .into_bytes()
-    }
-
-    fn serve_health_once(response: Vec<u8>) -> (CollectorSettings, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1024];
-            let bytes = stream.read(&mut request).unwrap();
-            let request = std::str::from_utf8(&request[..bytes]).unwrap();
-            assert!(request.contains(&format!("{TOKEN_HEADER}: test-token\r\n")));
-            stream.write_all(&response).unwrap();
-        });
-        (
-            CollectorSettings {
-                schema_version: COLLECTOR_SETTINGS_VERSION.into(),
-                port,
-                token: "test-token".into(),
-                source_generation: "test-generation".into(),
-            },
-            server,
-        )
-    }
-
     #[test]
     fn disconnected_status_does_not_invent_endpoint_or_service() {
         let root = std::env::temp_dir().join(format!(
@@ -2377,7 +2337,7 @@ mod tests {
         let status = connect_prepared(
             Path::new("/runtime"),
             Path::new("/bin/agentobs"),
-            "http://127.0.0.1:43181/v1/logs",
+            "https://127.0.0.1:43181/v1/logs",
             &config,
             &lifecycle,
         )
@@ -2391,21 +2351,19 @@ mod tests {
 
     #[test]
     fn connect_builds_config_from_settings_reloaded_after_collector_ready() {
+        let root = temporary_root("reloaded-settings");
+        let mut renewed = install_settings(&root).unwrap();
+        renewed.port = 49_321;
         let lifecycle = FakeLifecycle::ready();
         let manager_port = Cell::new(0);
         let status = connect_with_reloaded_settings(
-            Path::new("/runtime"),
+            &root,
             Path::new("/bin/agentobs"),
             &lifecycle,
             false,
             || {
                 assert_eq!(*lifecycle.events.borrow(), ["install", "health"]);
-                Ok(CollectorSettings {
-                    schema_version: COLLECTOR_SETTINGS_VERSION.into(),
-                    port: 49_321,
-                    token: "rotated-token".into(),
-                    source_generation: "rotated-generation".into(),
-                })
+                Ok(renewed)
             },
             |settings| {
                 manager_port.set(settings.port);
@@ -2417,9 +2375,10 @@ mod tests {
         assert_eq!(manager_port.get(), 49_321);
         assert_eq!(
             status.endpoint.as_deref(),
-            Some("http://127.0.0.1:49321/v1/logs")
+            Some("https://127.0.0.1:49321/v1/logs")
         );
         assert_eq!(status.config, ConnectionStatus::Connected);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -2449,13 +2408,14 @@ mod tests {
             restart,
             || load_settings(&root).map_err(Into::into),
             |settings| {
+                let tls = mutual_tls_paths(&layout, settings)?;
                 CodexConfigManager::new(
                     &config_path,
                     layout.runtime.join("integrations/codex"),
                     Path::new("/bin/agentobs"),
                     &root,
                     settings.port,
-                    &settings.token,
+                    tls,
                 )
                 .map_err(Into::into)
             },
@@ -2471,14 +2431,25 @@ mod tests {
                 .unwrap()
                 .contains(&recovered.endpoint())
         );
+        let connected_config = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            connected_config.contains(
+                &layout
+                    .runtime
+                    .join(&recovered.credentials.ca_certificate)
+                    .display()
+                    .to_string()
+            )
+        );
 
+        let tls = mutual_tls_paths(&layout, &recovered).unwrap();
         let manager = CodexConfigManager::new(
             &config_path,
             layout.runtime.join("integrations/codex"),
             Path::new("/bin/agentobs"),
             &root,
             recovered.port,
-            &recovered.token,
+            tls,
         )
         .unwrap();
         let disconnected = disconnect_prepared(
@@ -2514,7 +2485,7 @@ mod tests {
             Path::new("/bin/agentobs"),
             &root,
             43_181,
-            "private-token",
+            test_tls_paths(&root),
         )
         .unwrap()
         .connect()
@@ -2558,7 +2529,7 @@ mod tests {
             Path::new("/bin/agentobs"),
             &root,
             43_181,
-            "private-token",
+            test_tls_paths(&root),
         )
         .unwrap()
         .connect()
@@ -2612,8 +2583,8 @@ mod tests {
         );
         let persisted = load_settings(&root).unwrap();
         assert_eq!(persisted, recovered);
-        assert_eq!(persisted.token, settings.token);
-        assert_eq!(persisted.source_generation, settings.source_generation);
+        assert_eq!(persisted.generation, settings.generation);
+        assert_eq!(persisted.credentials, settings.credentials);
         drop(occupied);
         let _ = fs::remove_dir_all(root);
     }
@@ -2630,13 +2601,14 @@ mod tests {
         fs::write(&config_path, original).unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o400)).unwrap();
         let original_settings = install_settings(&root).unwrap();
+        let tls = mutual_tls_paths(&layout, &original_settings).unwrap();
         CodexConfigManager::new(
             &config_path,
             layout.runtime.join("integrations/codex"),
             Path::new("/bin/agentobs"),
             &root,
             original_settings.port,
-            &original_settings.token,
+            tls,
         )
         .unwrap()
         .connect()

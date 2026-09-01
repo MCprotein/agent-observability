@@ -152,6 +152,7 @@ pub enum NotifyOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HealthOutcome {
     Ready,
+    Degraded,
     Unavailable,
 }
 
@@ -849,6 +850,12 @@ struct Health {
     last_ingest_unix_ms: Option<u64>,
     report_dirty: bool,
     report_refresh_failures: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct HealthProbe {
+    status: String,
+    report_dirty: bool,
 }
 
 /// Runs the authenticated OTLP/HTTP receiver until the process is terminated.
@@ -1713,7 +1720,7 @@ pub fn submit_notify(root: &Path, payload: &[u8]) -> NotifyOutcome {
         Duration::from_millis(50),
         Duration::from_millis(250),
     ) {
-        Ok(200) => NotifyOutcome::Accepted,
+        Ok(response) if response.status == 200 => NotifyOutcome::Accepted,
         Ok(_) => NotifyOutcome::Rejected,
         Err(_) => NotifyOutcome::Unavailable,
     }
@@ -1730,7 +1737,19 @@ pub fn check_health(root: &Path) -> HealthOutcome {
         Duration::from_millis(50),
         Duration::from_millis(100),
     ) {
-        Ok(200) => HealthOutcome::Ready,
+        Ok(response) if response.status == 200 => {
+            match serde_json::from_slice::<HealthProbe>(&response.body) {
+                Ok(HealthProbe {
+                    status,
+                    report_dirty: false,
+                }) if status == "ready" => HealthOutcome::Ready,
+                Ok(HealthProbe {
+                    status,
+                    report_dirty: true,
+                }) if status == "degraded" => HealthOutcome::Degraded,
+                _ => HealthOutcome::Unavailable,
+            }
+        }
         _ => HealthOutcome::Unavailable,
     }
 }
@@ -1748,7 +1767,12 @@ pub fn submit_otlp_json(root: &Path, payload: &[u8]) -> Result<bool, CollectorEr
         Duration::from_millis(250),
         Duration::from_secs(1),
     )
-    .map(|status| status == 200)
+    .map(|response| response.status == 200)
+}
+
+struct AuthenticatedResponse {
+    status: u16,
+    body: Vec<u8>,
 }
 
 fn authenticated_request(
@@ -1758,7 +1782,7 @@ fn authenticated_request(
     body: Option<&[u8]>,
     connect_timeout: Duration,
     io_timeout: Duration,
-) -> Result<u16, CollectorError> {
+) -> Result<AuthenticatedResponse, CollectorError> {
     let settings = load_settings(root)?;
     let layout = install(root).map_err(runtime_error)?;
     let config = build_client_config(&layout, &settings.credentials)?;
@@ -1786,21 +1810,89 @@ fn authenticated_request(
         tls.write_all(body)?;
     }
     tls.flush()?;
-    let mut response = [0_u8; 512];
-    let bytes = tls.read(&mut response)?;
-    parse_http_status(&response[..bytes])
+    read_bounded_http_response(&mut tls)
 }
 
-fn parse_http_status(response: &[u8]) -> Result<u16, CollectorError> {
-    let response = std::str::from_utf8(response)
-        .map_err(|_| CollectorError::Runtime("collector response is not UTF-8".into()))?;
-    let status = response
-        .lines()
+fn read_bounded_http_response(
+    stream: &mut impl Read,
+) -> Result<AuthenticatedResponse, CollectorError> {
+    const MAX_RESPONSE_BYTES: usize = 4 * 1024;
+    let mut response = Vec::with_capacity(512);
+    let mut chunk = [0_u8; 512];
+    loop {
+        let bytes = stream.read(&mut chunk)?;
+        if bytes == 0 {
+            break;
+        }
+        if response.len().saturating_add(bytes) > MAX_RESPONSE_BYTES {
+            return Err(CollectorError::Runtime(
+                "collector response is oversized".into(),
+            ));
+        }
+        response.extend_from_slice(&chunk[..bytes]);
+        if let Some(parsed) = parse_complete_http_response(&response)? {
+            return Ok(parsed);
+        }
+    }
+    Err(CollectorError::Runtime(
+        "collector response is incomplete".into(),
+    ))
+}
+
+fn parse_complete_http_response(
+    response: &[u8],
+) -> Result<Option<AuthenticatedResponse>, CollectorError> {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Ok(None);
+    };
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|_| CollectorError::Runtime("collector response headers are not UTF-8".into()))?;
+    let mut lines = headers.split("\r\n");
+    let status = lines
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|status| status.parse().ok())
         .ok_or_else(|| CollectorError::Runtime("collector response is invalid".into()))?;
-    Ok(status)
+    let mut content_length = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(CollectorError::Runtime(
+                "collector response header is invalid".into(),
+            ));
+        };
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(CollectorError::Runtime(
+                "collector response transfer encoding is unsupported".into(),
+            ));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            let length = value.trim().parse::<usize>().map_err(|_| {
+                CollectorError::Runtime("collector response content length is invalid".into())
+            })?;
+            if content_length.replace(length).is_some() {
+                return Err(CollectorError::Runtime(
+                    "collector response has duplicate content length".into(),
+                ));
+            }
+        }
+    }
+    let content_length = content_length.ok_or_else(|| {
+        CollectorError::Runtime("collector response has no content length".into())
+    })?;
+    let body_start = header_end + 4;
+    let expected = body_start.saturating_add(content_length);
+    if response.len() < expected {
+        return Ok(None);
+    }
+    if response.len() != expected {
+        return Err(CollectorError::Runtime(
+            "collector response has trailing bytes".into(),
+        ));
+    }
+    Ok(Some(AuthenticatedResponse {
+        status,
+        body: response[body_start..].to_vec(),
+    }))
 }
 
 fn refresh_report(
@@ -1902,10 +1994,11 @@ mod tests {
         OtlpRequestCorrelationState, REPORT_FILE_NAME, admit_request, build_client_config,
         build_server_config, enforce_batch_policy, ingest_locked, ingest_notify_locked,
         install_settings, is_json, load_certificates, load_private_key, load_settings, open_store,
-        project_report, read_private_snapshot, reconcile_report_state,
-        recover_occupied_persisted_port, refresh_report_from_root, report_dirty_path, router,
-        schedule_report_refresh, settings_path, submit_notify, timestamp_from_unix_ms,
-        watch_report_authority, write_private, write_private_json, write_private_json_if_unchanged,
+        parse_complete_http_response, project_report, read_private_snapshot,
+        reconcile_report_state, recover_occupied_persisted_port, refresh_report_from_root,
+        report_dirty_path, router, schedule_report_refresh, settings_path, submit_notify,
+        timestamp_from_unix_ms, watch_report_authority, write_private, write_private_json,
+        write_private_json_if_unchanged,
     };
     use agent_observability_adapter_codex::{MAX_HANDOFF_BYTES, parse_otlp_http_json};
     use agent_observability_local_runtime::{
@@ -2007,6 +2100,28 @@ mod tests {
             fs::hard_link(&source, root.join(format!("allocated-budget-link-{index}"))).unwrap();
         }
         panic!("failed to inflate storage accounting above the reduced budget");
+    }
+
+    #[test]
+    fn authenticated_response_parser_requires_one_bounded_content_length_body() {
+        let complete = b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nready";
+        assert!(
+            parse_complete_http_response(&complete[..complete.len() - 1])
+                .unwrap()
+                .is_none()
+        );
+        let parsed = parse_complete_http_response(complete).unwrap().unwrap();
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.body, b"ready");
+
+        for invalid in [
+            b"HTTP/1.1 200 OK\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\ncontent-length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\ntrailing".as_slice(),
+        ] {
+            assert!(parse_complete_http_response(invalid).is_err());
+        }
     }
 
     #[test]
