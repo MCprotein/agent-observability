@@ -42,6 +42,7 @@ try {
     const expectedConflictErrors = [];
     const externalRequests = [];
     const failedRequests = [];
+    let dirtyReloadDialog = false;
     page.on("console", (message) => {
       if (message.type() !== "error") return;
       if (testCase.name === "desktop" && message.text().includes("409 (Conflict)")) {
@@ -72,6 +73,14 @@ try {
     );
 
     if (testCase.name === "desktop") {
+      assert.equal(await page.locator("#cadence-visual [data-dual-value]").textContent(), "확인 5초 · 반영 5초");
+      const defaultCadenceMarkers = await page.locator("#cadence-visual [data-marker]").evaluateAll(
+        (markers) => markers.map((marker) => marker.getBoundingClientRect()),
+      );
+      assert.equal(rectanglesOverlap(defaultCadenceMarkers[0], defaultCadenceMarkers[1]), false);
+    }
+
+    if (testCase.name === "desktop") {
       const input = page.locator("#collection-max_batch_records");
       await input.fill("125");
       assert.equal(await page.locator("#save").isEnabled(), true);
@@ -94,6 +103,9 @@ try {
         5000,
       );
       await page.locator("#collection-max_batch_records").fill("125");
+      await execute(binary, ["config", "set", runtimeRoot, "file-reconcile-ms", "1500"], {
+        timeout: 10_000,
+      });
       await execute(binary, ["config", "set", runtimeRoot, "retention-days", "45"], {
         timeout: 10_000,
       });
@@ -102,12 +114,14 @@ try {
         .locator("#toast")
         .filter({ hasText: "최신 설정을 불러와 내 변경만 다시 적용했습니다" })
         .waitFor();
+      assert.equal(await page.locator("#collection-file_reconcile_interval_ms").inputValue(), "1500");
       assert.equal(await page.locator("#retention-max_record_age_days").inputValue(), "45");
       assert.equal(await page.locator("#collection-flush_interval_ms").inputValue(), "6000");
       assert.equal(await page.locator("#save").isEnabled(), true);
       await page.locator("#save").click();
       await page.locator("#toast").filter({ hasText: "설정을 저장했습니다" }).waitFor();
       const rebased = JSON.parse(await readFile(configPath, "utf8"));
+      assert.equal(rebased.collection.file_reconcile_interval_ms, 1500);
       assert.equal(rebased.retention.max_record_age_days, 45);
       assert.equal(rebased.collection.flush_interval_ms, 6000);
       await page.locator("#reset").click();
@@ -116,6 +130,16 @@ try {
       await page.locator("#reset").waitFor();
       await page.waitForFunction(() => document.activeElement?.id === "reset");
       assert.equal(await page.locator("#save").isEnabled(), true);
+      await page.locator("#discard").click();
+      await page.locator("#collection-max_batch_records").fill("126");
+      page.once("dialog", async (dialog) => {
+        assert.equal(dialog.type(), "beforeunload");
+        dirtyReloadDialog = true;
+        await dialog.dismiss();
+      });
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 2_000 }).catch(() => undefined);
+      assert.equal(dirtyReloadDialog, true);
+      assert.equal(await page.locator("#collection-max_batch_records").inputValue(), "126");
       await page.locator("#discard").click();
     } else {
       const controlHeights = await page
@@ -148,7 +172,12 @@ try {
     assert.deepEqual(consoleErrors, []);
     assert.equal(expectedConflictErrors.length, testCase.name === "desktop" ? 1 : 0);
     assert.deepEqual(externalRequests, []);
-    assert.deepEqual(failedRequests, []);
+    assert.deepEqual(
+      failedRequests.filter(
+        (requestUrl) => !(dirtyReloadDialog && requestUrl.endsWith("/api/heartbeat")),
+      ),
+      [],
+    );
     results.push({
       name: testCase.name,
       screenshot: basename(screenshotPath),
@@ -215,4 +244,13 @@ function waitForExit(process) {
       resolve(code);
     });
   });
+}
+
+function rectanglesOverlap(first, second) {
+  return !(
+    first.right <= second.left ||
+    second.right <= first.left ||
+    first.bottom <= second.top ||
+    second.bottom <= first.top
+  );
 }

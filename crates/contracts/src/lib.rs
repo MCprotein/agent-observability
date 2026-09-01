@@ -1529,6 +1529,10 @@ impl ContractManifest {
             "local_runtime_config_fixture",
             "contracts/local-runtime-config-v2.fixture.json",
         )?;
+        self.expect(
+            "local_runtime_config_parity",
+            "contracts/local-runtime-config-v2.parity.json",
+        )?;
         self.expect("team_ingest", "disabled")?;
         Ok(())
     }

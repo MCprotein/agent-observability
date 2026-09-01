@@ -57,7 +57,7 @@ const fields: Record<FieldPath, Field> = {
     description: "새 handoff 파일을 다시 확인하는 간격",
     min: 1_000,
     max: 60_000,
-    step: 1_000,
+    step: 1,
     unit: "ms",
     format: formatDuration,
   },
@@ -67,7 +67,7 @@ const fields: Record<FieldPath, Field> = {
     description: "허용된 배치를 durable storage에 반영하는 간격",
     min: 1_000,
     max: 60_000,
-    step: 1_000,
+    step: 1,
     unit: "ms",
     format: formatDuration,
   },
@@ -87,7 +87,7 @@ const fields: Record<FieldPath, Field> = {
     description: "한 번에 처리할 최대 byte 크기",
     min: 16_384,
     max: 2_097_152,
-    step: 16_384,
+    step: 1,
     unit: "bytes",
     format: formatBytes,
   },
@@ -97,7 +97,7 @@ const fields: Record<FieldPath, Field> = {
     description: "작업 중 source 상태를 확인하는 간격",
     min: 30_000,
     max: 300_000,
-    step: 10_000,
+    step: 1,
     unit: "ms",
     format: formatDuration,
   },
@@ -107,7 +107,7 @@ const fields: Record<FieldPath, Field> = {
     description: "작업이 없을 때 source 상태를 확인하는 간격",
     min: 120_000,
     max: 900_000,
-    step: 30_000,
+    step: 1,
     unit: "ms",
     format: formatDuration,
   },
@@ -117,7 +117,7 @@ const fields: Record<FieldPath, Field> = {
     description: "수집 데이터가 사용할 수 있는 최대 디스크 예산",
     min: 268_435_456,
     max: 21_474_836_480,
-    step: 268_435_456,
+    step: 1,
     unit: "bytes",
     format: formatBytes,
   },
@@ -147,7 +147,7 @@ const fields: Record<FieldPath, Field> = {
     description: "하나의 private archive에 담을 최대 크기",
     min: 65_536,
     max: 268_435_456,
-    step: 65_536,
+    step: 1,
     unit: "bytes",
     format: formatBytes,
   },
@@ -174,6 +174,12 @@ for (const eventName of ["pointerdown", "keydown", "input", "scroll"]) {
     lastUserActivity = Date.now();
   }, { passive: true });
 }
+
+window.addEventListener("beforeunload", (event) => {
+  if (!isDirty()) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
 
 void bootstrap();
 
@@ -382,7 +388,7 @@ function singleRuler(id: string, title: string, field: Field, min: string, max: 
 
 function dualTimeline(id: string, title: string, firstLabel: string, first: Field, secondLabel: string, second: Field, min: string, max: string, logarithmic = false, sharedMin?: number, sharedMax?: number): string {
   const sharedScale = sharedMin === undefined || sharedMax === undefined ? "" : ` data-min="${sharedMin}" data-max="${sharedMax}"`;
-  return `<figure class="policy-visual timeline" id="${id}" data-log="${logarithmic}"${sharedScale}>
+  return `<figure class="policy-visual timeline" id="${id}" data-log="${logarithmic}" data-first-label="${firstLabel}" data-second-label="${secondLabel}"${sharedScale}>
     <figcaption><span>${title}</span><strong data-dual-value></strong></figcaption>
     <div class="timeline-track" aria-hidden="true">
       <span class="timeline-marker first" data-marker data-path="${first.path}"><b>${firstLabel}</b></span>
@@ -470,7 +476,10 @@ function updateAllVisuals(): void {
     const paths = Array.from(visual?.querySelectorAll<HTMLElement>("[data-path]") ?? []).map(
       (item) => item.dataset.path as FieldPath,
     );
-    output.textContent = paths.map((path) => fields[path].format(getValue(draft!, path))).join(" / ");
+    const labels = [visual?.dataset.firstLabel ?? "첫 번째", visual?.dataset.secondLabel ?? "두 번째"];
+    output.textContent = paths
+      .map((path, index) => `${labels[index]} ${fields[path].format(getValue(draft!, path))}`)
+      .join(" · ");
   });
   (Object.keys(fields) as FieldPath[]).forEach((path) => {
     const id = path.replaceAll(".", "-");

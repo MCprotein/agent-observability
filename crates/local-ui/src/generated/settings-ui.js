@@ -665,7 +665,7 @@
       description: "\uC0C8 handoff \uD30C\uC77C\uC744 \uB2E4\uC2DC \uD655\uC778\uD558\uB294 \uAC04\uACA9",
       min: 1e3,
       max: 6e4,
-      step: 1e3,
+      step: 1,
       unit: "ms",
       format: formatDuration
     },
@@ -675,7 +675,7 @@
       description: "\uD5C8\uC6A9\uB41C \uBC30\uCE58\uB97C durable storage\uC5D0 \uBC18\uC601\uD558\uB294 \uAC04\uACA9",
       min: 1e3,
       max: 6e4,
-      step: 1e3,
+      step: 1,
       unit: "ms",
       format: formatDuration
     },
@@ -695,7 +695,7 @@
       description: "\uD55C \uBC88\uC5D0 \uCC98\uB9AC\uD560 \uCD5C\uB300 byte \uD06C\uAE30",
       min: 16384,
       max: 2097152,
-      step: 16384,
+      step: 1,
       unit: "bytes",
       format: formatBytes
     },
@@ -705,7 +705,7 @@
       description: "\uC791\uC5C5 \uC911 source \uC0C1\uD0DC\uB97C \uD655\uC778\uD558\uB294 \uAC04\uACA9",
       min: 3e4,
       max: 3e5,
-      step: 1e4,
+      step: 1,
       unit: "ms",
       format: formatDuration
     },
@@ -715,7 +715,7 @@
       description: "\uC791\uC5C5\uC774 \uC5C6\uC744 \uB54C source \uC0C1\uD0DC\uB97C \uD655\uC778\uD558\uB294 \uAC04\uACA9",
       min: 12e4,
       max: 9e5,
-      step: 3e4,
+      step: 1,
       unit: "ms",
       format: formatDuration
     },
@@ -725,7 +725,7 @@
       description: "\uC218\uC9D1 \uB370\uC774\uD130\uAC00 \uC0AC\uC6A9\uD560 \uC218 \uC788\uB294 \uCD5C\uB300 \uB514\uC2A4\uD06C \uC608\uC0B0",
       min: 268435456,
       max: 21474836480,
-      step: 268435456,
+      step: 1,
       unit: "bytes",
       format: formatBytes
     },
@@ -755,7 +755,7 @@
       description: "\uD558\uB098\uC758 private archive\uC5D0 \uB2F4\uC744 \uCD5C\uB300 \uD06C\uAE30",
       min: 65536,
       max: 268435456,
-      step: 65536,
+      step: 1,
       unit: "bytes",
       format: formatBytes
     }
@@ -779,6 +779,11 @@
       lastUserActivity = Date.now();
     }, { passive: true });
   }
+  window.addEventListener("beforeunload", (event) => {
+    if (!isDirty()) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
   void bootstrap();
   async function bootstrap() {
     renderLoading();
@@ -972,7 +977,7 @@
   }
   function dualTimeline(id, title, firstLabel, first, secondLabel, second, min, max, logarithmic = false, sharedMin, sharedMax) {
     const sharedScale = sharedMin === void 0 || sharedMax === void 0 ? "" : ` data-min="${sharedMin}" data-max="${sharedMax}"`;
-    return `<figure class="policy-visual timeline" id="${id}" data-log="${logarithmic}"${sharedScale}>
+    return `<figure class="policy-visual timeline" id="${id}" data-log="${logarithmic}" data-first-label="${firstLabel}" data-second-label="${secondLabel}"${sharedScale}>
     <figcaption><span>${title}</span><strong data-dual-value></strong></figcaption>
     <div class="timeline-track" aria-hidden="true">
       <span class="timeline-marker first" data-marker data-path="${first.path}"><b>${firstLabel}</b></span>
@@ -1054,7 +1059,8 @@
       const paths = Array.from(visual?.querySelectorAll("[data-path]") ?? []).map(
         (item) => item.dataset.path
       );
-      output.textContent = paths.map((path) => fields[path].format(getValue(draft, path))).join(" / ");
+      const labels = [visual?.dataset.firstLabel ?? "\uCCAB \uBC88\uC9F8", visual?.dataset.secondLabel ?? "\uB450 \uBC88\uC9F8"];
+      output.textContent = paths.map((path, index) => `${labels[index]} ${fields[path].format(getValue(draft, path))}`).join(" \xB7 ");
     });
     Object.keys(fields).forEach((path) => {
       const id = path.replaceAll(".", "-");

@@ -20,16 +20,69 @@ enum SaveStage {
     ParentSync,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct LocalRuntimeConfigV2 {
     pub schema_version: String,
-    #[serde(default = "enabled_by_default")]
     pub enabled: bool,
-    #[serde(default)]
     pub collection: CollectionPolicyV1,
-    #[serde(default)]
     pub retention: RetentionPolicyV1,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictLocalRuntimeConfigV2 {
+    schema_version: String,
+    enabled: bool,
+    collection: StrictCollectionPolicyV1,
+    retention: StrictRetentionPolicyV1,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictCollectionPolicyV1 {
+    file_reconcile_interval_ms: u32,
+    flush_interval_ms: u32,
+    max_batch_records: u16,
+    max_batch_bytes: u32,
+    active_heartbeat_interval_ms: u32,
+    idle_heartbeat_interval_ms: u32,
+    local_storage_budget_bytes: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)]
+struct StrictRetentionPolicyV1 {
+    max_record_age_days: u16,
+    max_archive_records: u32,
+    max_archive_bytes: u64,
+}
+
+impl<'de> Deserialize<'de> for LocalRuntimeConfigV2 {
+    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
+    where
+        Deserializer: serde::Deserializer<'de>,
+    {
+        let strict = StrictLocalRuntimeConfigV2::deserialize(deserializer)?;
+        Ok(Self {
+            schema_version: strict.schema_version,
+            enabled: strict.enabled,
+            collection: CollectionPolicyV1 {
+                file_reconcile_interval_ms: strict.collection.file_reconcile_interval_ms,
+                flush_interval_ms: strict.collection.flush_interval_ms,
+                max_batch_records: strict.collection.max_batch_records,
+                max_batch_bytes: strict.collection.max_batch_bytes,
+                active_heartbeat_interval_ms: strict.collection.active_heartbeat_interval_ms,
+                idle_heartbeat_interval_ms: strict.collection.idle_heartbeat_interval_ms,
+                local_storage_budget_bytes: strict.collection.local_storage_budget_bytes,
+            },
+            retention: RetentionPolicyV1 {
+                max_record_age_days: strict.retention.max_record_age_days,
+                max_archive_records: strict.retention.max_archive_records,
+                max_archive_bytes: strict.retention.max_archive_bytes,
+            },
+        })
+    }
 }
 
 impl Default for LocalRuntimeConfigV2 {
@@ -448,18 +501,42 @@ mod tests {
             LocalRuntimeConfigV2::from_json(fixture).unwrap(),
             LocalRuntimeConfigV2::default()
         );
-        for invalid in [
-            fixture.replace(
-                "\"file_reconcile_interval_ms\": 5000",
-                "\"file_reconcile_interval_ms\": 999",
-            ),
-            fixture.replace(
-                "\"max_record_age_days\": 30",
-                "\"max_record_age_days\": 3651",
-            ),
-            fixture.replace("\"local_runtime.v2\"", "\"local_runtime.v3\""),
-        ] {
-            assert!(LocalRuntimeConfigV2::from_json(&invalid).is_err());
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/local-runtime-config-v2.parity.json"
+        ))
+        .unwrap();
+        for case in cases.as_array().unwrap() {
+            let mut document: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            apply_parity_case(&mut document, case);
+            let accepted = LocalRuntimeConfigV2::from_json(&document.to_string()).is_ok();
+            assert_eq!(
+                accepted,
+                case["valid"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    fn apply_parity_case(document: &mut serde_json::Value, case: &serde_json::Value) {
+        let path = case["path"].as_array().unwrap();
+        if path.is_empty() {
+            return;
+        }
+        let mut parent = document;
+        for segment in &path[..path.len() - 1] {
+            parent = parent.get_mut(segment.as_str().unwrap()).unwrap();
+        }
+        let field = path.last().unwrap().as_str().unwrap();
+        let object = parent.as_object_mut().unwrap();
+        match case["operation"].as_str().unwrap() {
+            "set" => {
+                object.insert(field.into(), case["value"].clone());
+            }
+            "remove" => {
+                object.remove(field);
+            }
+            operation => panic!("unsupported parity operation: {operation}"),
         }
     }
 

@@ -6,22 +6,28 @@ import validateConfig from "../ui/settings/generated/validate-local-runtime-conf
 const fixture = JSON.parse(
   await readFile("contracts/local-runtime-config-v2.fixture.json", "utf8"),
 );
+const parityCases = JSON.parse(
+  await readFile("contracts/local-runtime-config-v2.parity.json", "utf8"),
+);
 
 test("generated settings validator accepts the Rust default fixture", () => {
   assert.equal(validateConfig(structuredClone(fixture)), true, JSON.stringify(validateConfig.errors));
 });
 
-test("generated settings validator locks bounds, version, and unknown fields", () => {
-  const cases = [
-    (config) => { config.collection.file_reconcile_interval_ms = 999; },
-    (config) => { config.collection.local_storage_budget_bytes = 21_474_836_481; },
-    (config) => { config.retention.max_record_age_days = 3_651; },
-    (config) => { config.schema_version = "local_runtime.v3"; },
-    (config) => { config.unknown = true; },
-  ];
-  for (const mutate of cases) {
-    const config = structuredClone(fixture);
-    mutate(config);
-    assert.equal(validateConfig(config), false);
+test("generated settings validator matches the shared Rust parity corpus", () => {
+  for (const parityCase of parityCases) {
+    const document = structuredClone(fixture);
+    applyParityCase(document, parityCase);
+    assert.equal(validateConfig(document), parityCase.valid, parityCase.name);
   }
 });
+
+function applyParityCase(document, parityCase) {
+  if (parityCase.path.length === 0) return;
+  let parent = document;
+  for (const segment of parityCase.path.slice(0, -1)) parent = parent[segment];
+  const field = parityCase.path.at(-1);
+  if (parityCase.operation === "set") parent[field] = parityCase.value;
+  else if (parityCase.operation === "remove") delete parent[field];
+  else throw new Error(`unsupported parity operation: ${parityCase.operation}`);
+}

@@ -107,8 +107,9 @@ inbound adapters는 제품별 source precedence/correlation/dedupe를, local-sto
 projection을, static-report는 generated UI asset의 self-contained artifact 조립과 private atomic write를,
 local-ui는 authenticated loopback 설정 inbound adapter와 embedded generated asset을, CLI는 composition
 root를 소유한다.
-`contracts/*.schema.json`은 closed wire contract이고 versioned config fixture가 Rust default/validation과
-생성된 TypeScript validator의 parity를 잠근다. `contracts/contract-manifest.v1`은 현재
+`contracts/*.schema.json`은 closed wire contract이고 versioned config fixture와 전체 bounds parity
+corpus가 strict Rust wire DTO와 생성된 TypeScript validator의 required/default/min/max/unknown-field
+일치를 잠근다. `contracts/contract-manifest.v1`은 현재
 활성 schema path/version과 `team_ingest=disabled` 경계를 runtime 중립적으로 고정한다.
 
 ```text

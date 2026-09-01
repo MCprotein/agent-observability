@@ -6,7 +6,7 @@
   --text: #182026;
   --muted: #66727d;
   --line: #d9e0e6;
-  --line-strong: #b7c1ca;
+  --line-strong: #8795a1;
   --accent: #0f766e;
   --accent-soft: #d7f2ed;
   --focus: #2563eb;
@@ -351,7 +351,7 @@ h3 { margin-bottom: 4px; font-size: 14px; line-height: 20px; }
   position: absolute;
   inset: 3px 4%;
   height: 2px;
-  background: #9aa6b1;
+  background: #73808c;
 }
 
 .ruler-marker,
@@ -370,11 +370,12 @@ h3 { margin-bottom: 4px; font-size: 14px; line-height: 20px; }
 .ruler-labels { display: flex; justify-content: space-between; margin-top: 7px; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 
 .timeline { padding-top: 2px; }
-.timeline-track { height: 38px; margin-top: 28px; background: transparent; }
-.timeline-track::before { top: 18px; }
-.timeline-marker { top: 19px; }
-.timeline-marker.second { background: #2563eb; box-shadow: 0 0 0 1px #2563eb; }
+.timeline-track { height: 50px; margin-top: 28px; background: transparent; }
+.timeline-track::before { top: 24px; }
+.timeline-marker.first { top: 14px; }
+.timeline-marker.second { top: 36px; background: #2563eb; box-shadow: 0 0 0 1px #2563eb; }
 .timeline-marker b { position: absolute; bottom: 19px; left: 50%; color: var(--muted); font-size: 10px; font-weight: 700; white-space: nowrap; translate: -50% 0; }
+.timeline-marker.second b { top: 19px; bottom: auto; }
 
 .visual-stack { display: grid; gap: 28px; }
 .subsection { margin-top: 32px; padding-top: 28px; border-top: 1px dashed var(--line); }

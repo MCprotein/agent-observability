@@ -12,4 +12,5 @@ rate_table_schema=contracts/rate-table-v1.schema.json
 retention_archive_schema=contracts/retention-archive-entry-v1.schema.json
 local_runtime_config_schema=contracts/local-runtime-config-v2.schema.json
 local_runtime_config_fixture=contracts/local-runtime-config-v2.fixture.json
+local_runtime_config_parity=contracts/local-runtime-config-v2.parity.json
 team_ingest=disabled
