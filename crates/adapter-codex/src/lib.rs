@@ -325,7 +325,7 @@ pub fn parse_otlp_http_json(
                     .get("timeUnixNano")
                     .and_then(otlp_u64)
                     .map_or(fallback_received_at_unix_ms, |value| value / 1_000_000);
-                let canonical = canonical_otlp_attributes(&event_name, &attributes, &cursor)?;
+                let canonical = canonical_otlp_attributes(&event_name, &attributes)?;
                 records.push(HandoffRecord {
                     schema_version: HANDOFF_SCHEMA_VERSION.into(),
                     source_generation: source_generation.into(),
@@ -340,6 +340,7 @@ pub fn parse_otlp_http_json(
             }
         }
     }
+    correlate_otlp_request_pairs(&mut records)?;
     let mut jsonl = String::new();
     for record in &records {
         jsonl.push_str(&serde_json::to_string(record).map_err(|_| AdapterError::InvalidJson)?);
@@ -442,7 +443,6 @@ fn otlp_u64(value: &Value) -> Option<u64> {
 fn canonical_otlp_attributes(
     event_name: &str,
     source: &BTreeMap<String, Value>,
-    cursor: &str,
 ) -> Result<BTreeMap<String, Value>, AdapterError> {
     let mut output = BTreeMap::new();
     copy_string(source, &mut output, "conversation.id", "conversation_id")?;
@@ -470,12 +470,7 @@ fn canonical_otlp_attributes(
     copy_u64(source, &mut output, "tool_token_count", "total_tokens")?;
 
     if matches!(event_name, "codex.api_request" | "codex.sse_event") {
-        let request_id = source
-            .get("auth.request_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map_or_else(|| format!("otlp-{cursor}"), str::to_owned);
-        output.insert("request_id".into(), Value::String(request_id));
+        copy_string(source, &mut output, "auth.request_id", "request_id")?;
     }
     let success = source
         .get("success")
@@ -484,6 +479,57 @@ fn canonical_otlp_attributes(
         .unwrap_or_else(|| !source.contains_key("error.message"));
     output.insert("success".into(), Value::Bool(success));
     Ok(output)
+}
+
+fn correlate_otlp_request_pairs(records: &mut [HandoffRecord]) -> Result<(), AdapterError> {
+    let mut pending = BTreeMap::<(String, String), usize>::new();
+    for index in 0..records.len() {
+        let event_name = records[index].event_name.as_str();
+        let is_completed = event_name == "codex.sse_event"
+            && optional_string(&records[index].attributes, "kind")?.as_deref()
+                == Some("response.completed");
+        if event_name != "codex.api_request" && !is_completed {
+            continue;
+        }
+        let Some(key) = otlp_request_pair_key(&records[index].attributes)? else {
+            continue;
+        };
+        if event_name == "codex.api_request" {
+            pending.insert(key, index);
+            continue;
+        }
+        let Some(api_index) = pending.remove(&key) else {
+            continue;
+        };
+        let api_request_id = optional_string(&records[api_index].attributes, "request_id")?;
+        let completed_request_id = optional_string(&records[index].attributes, "request_id")?;
+        let request_id = match (api_request_id, completed_request_id) {
+            (Some(api), Some(completed)) if api == completed => Some(api),
+            (Some(api), None) => Some(api),
+            (None, Some(completed)) => Some(completed),
+            (None, None) | (Some(_), Some(_)) => None,
+        };
+        if let Some(request_id) = request_id {
+            records[api_index]
+                .attributes
+                .insert("request_id".into(), Value::String(request_id.clone()));
+            records[index]
+                .attributes
+                .insert("request_id".into(), Value::String(request_id));
+        } else {
+            records[api_index].attributes.remove("request_id");
+            records[index].attributes.remove("request_id");
+        }
+    }
+    Ok(())
+}
+
+fn otlp_request_pair_key(
+    attributes: &BTreeMap<String, Value>,
+) -> Result<Option<(String, String)>, AdapterError> {
+    let conversation_id = optional_string(attributes, "conversation_id")?;
+    let model = optional_string(attributes, "model")?;
+    Ok(conversation_id.zip(model))
 }
 
 fn copy_string(
@@ -993,6 +1039,15 @@ mod tests {
               {"key":"user.email","value":{"stringValue":"SECRET_EMAIL@example.com"}}
             ]},
             {"timeUnixNano":"1787875200100000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
+              {"key":"attempt","value":{"intValue":"1"}},
+              {"key":"http.response.status_code","value":{"intValue":"200"}},
+              {"key":"duration_ms","value":{"stringValue":"100"}},
+              {"key":"auth.request_id","value":{"stringValue":"request-native-1"}}
+            ]},
+            {"timeUnixNano":"1787875200200000000","attributes":[
               {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
               {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
               {"key":"event.kind","value":{"stringValue":"response.completed"}},
@@ -1003,7 +1058,7 @@ mod tests {
               {"key":"reasoning_token_count","value":{"intValue":"5"}},
               {"key":"tool_token_count","value":{"stringValue":"125"}}
             ]},
-            {"timeUnixNano":"1787875200200000000","attributes":[
+            {"timeUnixNano":"1787875200300000000","attributes":[
               {"key":"event.name","value":{"stringValue":"codex.tool_result"}},
               {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
               {"key":"tool_name","value":{"stringValue":"exec_command"}},
@@ -1015,17 +1070,37 @@ mod tests {
           ]}]}]
         }"#;
         let (batch, cursor) = parse_otlp_http_json(input, "codex-0.151.0", None, 1, 0).unwrap();
-        assert_eq!(cursor.as_deref(), Some("3"));
-        assert_eq!(batch.observations().count(), 3);
+        assert_eq!(cursor.as_deref(), Some("4"));
+        assert_eq!(batch.observations().count(), 4);
         assert_eq!(batch.diagnostics().count(), 0);
-        let request = batch
+        let requests = batch
             .observations()
-            .find(|observation| matches!(observation.event, ObservationEvent::ModelRequest { .. }))
-            .unwrap();
-        assert_eq!(request.token_usage.input, Some(100));
-        assert_eq!(request.token_usage.output, Some(25));
-        assert_eq!(request.token_usage.total, Some(125));
-        assert!(request.correlation.turn_id.is_none());
+            .filter(|observation| {
+                matches!(observation.event, ObservationEvent::ModelRequest { .. })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].correlation.request_id,
+            requests[1].correlation.request_id
+        );
+        assert_eq!(
+            requests[0]
+                .correlation
+                .request_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "request-native-1"
+        );
+        assert_eq!(requests[1].token_usage.input, Some(100));
+        assert_eq!(requests[1].token_usage.output, Some(25));
+        assert_eq!(requests[1].token_usage.total, Some(125));
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.correlation.turn_id.is_none())
+        );
         let debug = format!("{batch:?}");
         for secret in [
             "SECRET_EMAIL@example.com",
@@ -1034,6 +1109,47 @@ mod tests {
         ] {
             assert!(!debug.contains(secret));
         }
+    }
+
+    #[test]
+    fn native_request_pair_without_official_request_id_is_diagnosed() {
+        let input = br#"{
+          "resourceLogs": [{"scopeLogs": [{"logRecords": [
+            {"timeUnixNano":"1787875200000000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
+              {"key":"attempt","value":{"intValue":"1"}},
+              {"key":"http.response.status_code","value":{"intValue":"200"}},
+              {"key":"duration_ms","value":{"stringValue":"100"}},
+              {"key":"error.message","value":{"stringValue":"RAW_API_ERROR_SECRET"}}
+            ]},
+            {"timeUnixNano":"1787875200100000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"event.kind","value":{"stringValue":"response.completed"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
+              {"key":"input_token_count","value":{"stringValue":"100"}},
+              {"key":"output_token_count","value":{"stringValue":"25"}},
+              {"key":"response.body","value":{"stringValue":"RAW_RESPONSE_SECRET"}}
+            ]}
+          ]}]}]
+        }"#;
+        let (batch, cursor) = parse_otlp_http_json(input, "codex-0.151.0", None, 41, 0).unwrap();
+        assert_eq!(cursor.as_deref(), Some("42"));
+        assert_eq!(batch.observations().count(), 0);
+        let diagnostics = batch.diagnostics().collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == DiagnosticCode::MissingCorrelation)
+        );
+        let debug = format!("{batch:?}");
+        assert!(!debug.contains("otlp-41"));
+        assert!(!debug.contains("otlp-42"));
+        assert!(!debug.contains("RAW_API_ERROR_SECRET"));
+        assert!(!debug.contains("RAW_RESPONSE_SECRET"));
     }
 
     #[test]
