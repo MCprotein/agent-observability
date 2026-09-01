@@ -185,3 +185,57 @@ test("atomic profile updates preserve a profile symlink and target mode", (t) =>
   assert.match(readFileSync(target, "utf8"), /agent-observability PATH/);
   assert.equal(statSync(target).mode & 0o777, 0o600);
 });
+
+test("reversed managed markers fail without changing the profile", (t) => {
+  const fixture = makeFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  const profile = join(fixture.home, ".zshrc");
+  const original = [
+    "existing profile",
+    "# <<< agent-observability PATH <<<",
+    "# >>> agent-observability PATH >>>",
+    "",
+  ].join("\n");
+  writeFileSync(profile, original);
+
+  const result = spawnSync("sh", [installer], {
+    encoding: "utf8",
+    env: fixture.env,
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /invalid agent-observability PATH block/);
+  assert.equal(readFileSync(profile, "utf8"), original);
+});
+
+test("latest release URL selects the redirected semantic version", (t) => {
+  const fixture = makeFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  const stubDir = join(fixture.root, "stub-bin");
+  const curlStub = join(stubDir, "curl");
+  mkdirSync(stubDir);
+  writeFileSync(
+    curlStub,
+    `#!/usr/bin/env node
+import { copyFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+const args = process.argv.slice(2);
+if (args.includes("-w")) {
+  process.stdout.write("https://github.com/MCprotein/agent-observability/releases/tag/v1.6.0");
+  process.exit(0);
+}
+const outputIndex = args.indexOf("-o");
+copyFileSync(fileURLToPath(args[outputIndex - 1]), args[outputIndex + 1]);
+`,
+  );
+  chmodSync(curlStub, 0o755);
+
+  const env = {
+    ...fixture.env,
+    PATH: `${stubDir}:${fixture.env.PATH}`,
+  };
+  delete env.AGENT_OBSERVABILITY_VERSION;
+  const output = execFileSync("sh", [installer], { encoding: "utf8", env });
+  assert.match(output, /Installed agent-observability 1\.6\.0/);
+});

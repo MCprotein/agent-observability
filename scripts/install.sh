@@ -146,14 +146,28 @@ esac
 marker_start="# >>> agent-observability PATH >>>"
 marker_end="# <<< agent-observability PATH <<<"
 quoted_profile=$(printf '%s' "$profile" | sed "s/'/'\\\\''/g")
-marker_start_count=0
-marker_end_count=0
+marker_state=absent
 if [ -f "$profile_target" ]; then
-  marker_start_count=$(awk -v marker="$marker_start" '$0 == marker { count++ } END { print count + 0 }' "$profile_target")
-  marker_end_count=$(awk -v marker="$marker_end" '$0 == marker { count++ } END { print count + 0 }' "$profile_target")
+  marker_state=$(awk -v start="$marker_start" -v end="$marker_end" '
+    $0 == start {
+      if (managed || seen) invalid = 1
+      managed = 1
+      seen = 1
+      next
+    }
+    $0 == end {
+      if (!managed) invalid = 1
+      managed = 0
+    }
+    END {
+      if (managed || invalid) print "invalid"
+      else if (seen) print "complete"
+      else print "absent"
+    }
+  ' "$profile_target")
 fi
-case "$marker_start_count:$marker_end_count" in
-  0:0|1:1) ;;
+case "$marker_state" in
+  absent|complete) ;;
   *) fail "shell profile contains an invalid agent-observability PATH block" ;;
 esac
 
@@ -174,7 +188,7 @@ path_block="$work_dir/path-block"
 } > "$path_block"
 
 profile_update="$work_dir/profile-update"
-if [ "$marker_start_count" -eq 1 ]; then
+if [ "$marker_state" = complete ]; then
   awk -v start="$marker_start" -v end="$marker_end" -v block="$path_block" '
     $0 == start {
       while ((getline line < block) > 0) print line
