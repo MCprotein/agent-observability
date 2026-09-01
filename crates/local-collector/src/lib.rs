@@ -930,7 +930,13 @@ async fn watch_report_authority(state: AppState, mut observed_generation: u64, i
         collector.report_dirty = status.pending();
         let changed = status.generation != observed_generation;
         observed_generation = status.generation;
-        if !status.pending() || !changed {
+        if !status.pending() {
+            collector.report_degraded = false;
+            collector.report_refresh_failures = 0;
+            let _ = clear_report_dirty(&collector.layout);
+            continue;
+        }
+        if !changed {
             continue;
         }
         let _ = mark_report_dirty(&collector.layout);
@@ -1299,7 +1305,7 @@ mod tests {
     };
     use agent_observability_adapter_codex::{MAX_HANDOFF_BYTES, parse_otlp_http_json};
     use agent_observability_local_runtime::{
-        ConfigMutationGuard, MutationGuard, install, load, save,
+        ConfigMutationGuard, MutationGuard, StorageBudget, install, load, save,
     };
     use axum::{
         extract::State,
@@ -1378,6 +1384,20 @@ mod tests {
         padded
     }
 
+    fn inflate_allocated_accounting(root: &Path) {
+        let source = root.join("allocated-budget-fixture");
+        fs::write(&source, vec![0_u8; 1024 * 1024]).unwrap();
+        let reduced = StorageBudget::calculate(256 * 1024 * 1024, false).unwrap();
+        for index in 0..300 {
+            let allocated = StorageBudget::allocated_tree_bytes(root).unwrap();
+            if allocated + 512 * 1024 > reduced.writable_limit() {
+                return;
+            }
+            fs::hard_link(&source, root.join(format!("allocated-budget-link-{index}"))).unwrap();
+        }
+        panic!("failed to inflate storage accounting above the reduced budget");
+    }
+
     #[test]
     fn collector_ingest_waits_for_the_shared_runtime_mutation_guard() {
         let root = test_root("shared-mutation-guard");
@@ -1396,6 +1416,69 @@ mod tests {
         assert!(received.recv_timeout(Duration::from_millis(30)).is_err());
         drop(guard);
         assert!(received.recv_timeout(Duration::from_secs(1)).unwrap());
+        handle.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_disable_blocks_automatic_ingest_before_admission() {
+        let root = test_root("concurrent-disable");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        let layout = state.layout.clone();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut state = state;
+            let outcome = ingest_notify_locked(
+                &mut state,
+                br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+            );
+            sent.send((outcome, state.store.record_count().unwrap()))
+                .unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(30)).is_err());
+
+        let mut config = load(&layout.config).unwrap();
+        config.enabled = false;
+        save(&guard, &config).unwrap();
+        drop(guard);
+
+        let (outcome, records) = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(outcome.unwrap(), IngestOutcome::Disabled);
+        assert_eq!(records, 0);
+        handle.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_budget_reduction_blocks_automatic_ingest_before_commit() {
+        let root = test_root("concurrent-budget");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        let layout = state.layout.clone();
+        inflate_allocated_accounting(&root);
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut state = state;
+            let outcome = ingest_notify_locked(
+                &mut state,
+                br#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1"}"#,
+            );
+            sent.send((outcome, state.store.record_count().unwrap()))
+                .unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(30)).is_err());
+
+        let mut config = load(&layout.config).unwrap();
+        config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+        save(&guard, &config).unwrap();
+        drop(guard);
+
+        let (outcome, records) = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(outcome, Err(IngestError::Storage)));
+        assert_eq!(records, 0);
         handle.join().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -2750,7 +2833,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_report_failure_exhausts_retries_and_degrades_health_state() {
+    fn external_report_ack_recovers_health_after_retry_exhaustion() {
         let root = test_root("report-persistent-failure");
         let _ = fs::remove_dir_all(&root);
         let state = app_state(&root);
@@ -2788,7 +2871,7 @@ mod tests {
                 TOKEN_HEADER,
                 HeaderValue::from_str(&"a".repeat(64)).unwrap(),
             );
-            let response = super::health(State(state.clone()), headers)
+            let response = super::health(State(state.clone()), headers.clone())
                 .await
                 .into_response();
             let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
@@ -2798,8 +2881,49 @@ mod tests {
             assert_eq!(health["status"], "degraded");
             assert_eq!(health["report_dirty"], true);
             assert_eq!(health["report_refresh_failures"], super::REPORT_RETRY_LIMIT);
+
+            let generation = state
+                .collector
+                .lock()
+                .await
+                .store
+                .report_status()
+                .unwrap()
+                .generation;
+            let watcher = tokio::spawn(watch_report_authority(
+                state.clone(),
+                generation,
+                Duration::from_millis(10),
+            ));
+            fs::remove_dir(&report).unwrap();
+            assert!(refresh_report_from_root(&root).unwrap());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let collector = state.collector.lock().await;
+                    if !collector.report_degraded && collector.report_refresh_failures == 0 {
+                        break;
+                    }
+                    drop(collector);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            watcher.abort();
+            let _ = watcher.await;
+
+            let response = super::health(State(state.clone()), headers)
+                .await
+                .into_response();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(health["status"], "ready");
+            assert_eq!(health["report_dirty"], false);
+            assert_eq!(health["report_refresh_failures"], 0);
         });
-        assert!(report_dirty_path(&install(&root).unwrap()).is_file());
+        assert!(!report_dirty_path(&install(&root).unwrap()).exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2870,6 +2994,7 @@ mod tests {
         let mut disabled = initial;
         disabled.enabled = false;
         save(&guard, &disabled).unwrap();
+        drop(guard);
 
         let outcome = ingest_notify_locked(
             &mut state,

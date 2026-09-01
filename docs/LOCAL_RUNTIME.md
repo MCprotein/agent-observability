@@ -42,9 +42,9 @@ work without opening a browser. `setup <root> [--no-open]` initializes an explic
 run `connect codex <root>` separately to enable automatic Codex collection there.
 `demo` uses an isolated default root and embedded content-free fixture; it never reads an agent log.
 `ui` holds only a settings-UI instance singleton, embeds the generated TypeScript application, and
-delegates all configuration validation and atomic save behavior back to Rust. A save acquires the
-shared runtime singleton only for the mutation. Every supported CLI/UI writer is required to hold the
-typed mutation guard. The CLI reads and writes while holding that guard; the UI additionally verifies the
+delegates all configuration validation and atomic save behavior back to Rust. Every supported CLI/UI writer
+and installed-root ingest path acquires the same cross-process mutation lock. The CLI reads and writes while
+holding its typed guard; the UI additionally verifies the
 browser revision immediately before the atomic replace. Both release the guard before the next operation.
 Direct config file editing is unsupported.
 The same authenticated UI exposes Codex status/connect/disconnect and opens an existing report through Rust
@@ -86,7 +86,8 @@ JSON protocol and private token header. The endpoint port is an OS-assigned avai
 private collector settings. If that port is occupied after restart, autonomous collector startup fails closed
 without changing settings. The next explicit `connect codex` verifies the unavailable owned endpoint, rotates
 only the persisted port to another OS-assigned loopback port, and crash-safely reconnects the LaunchAgent.
-`status` reports the unavailable owned endpoint as degraded until that explicit recovery succeeds.
+`status` reports an unreachable owned endpoint as unavailable. Degraded is reserved for an authenticated
+collector whose durable report is pending or whose bounded report refresh retries were exhausted.
 Connect refuses conflicting pre-existing managed values unless they match exactly.
 Before changing the file, it stores the exact prior and connected bytes, hashes, existence, permission modes
 and transaction phase in `runtime/integrations/codex/codex-config-ownership-v1.json` with private permissions.
@@ -186,8 +187,8 @@ Invalid updates leave the previous bytes unchanged. User-facing names, defaults,
   network.
 - One process owns the private runtime directory through an OS-held file lock and random boot
 nonce. PID metadata alone never proves ownership.
-- Installed-root ingest loads this configuration and holds the singleton through admission, durable
-  write, and projection repair. Ingest arguments are runtime roots; direct store-directory config
+- Installed-root ingest acquires the cross-process mutation lock before loading this configuration and holds
+  it through admission, durable write, and projection repair. Ingest arguments are runtime roots; direct store-directory config
   bypass is not supported.
 - Storage accounting walks allocated filesystem blocks, rejects symlinks, and stops after 4,096
   entries. Admission reserves the worst-case batch against the configured hard cap.

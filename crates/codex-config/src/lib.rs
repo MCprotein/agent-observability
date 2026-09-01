@@ -1596,6 +1596,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn rotation_config_write_failure_then_snapshot_disconnect_restores_exact_prior() {
+        let root = root("rotate-write-failure-disconnect");
+        prepare(&root);
+        let original = b"# exact prior\nmodel = 'before'\n";
+        fs::write(root.join("config.toml"), original).unwrap();
+        set_mode(&root.join("config.toml"), 0o400).unwrap();
+        manager_with_port(&root, 4318).connect().unwrap();
+        let rotated = manager_with_port(&root, 5318);
+
+        assert!(matches!(
+            rotated.connect_with(&FaultMutations::new(&[(2, false)])),
+            Err(ConfigError::Io(_))
+        ));
+        let recovery = CodexConfigManager::from_ownership_snapshot(
+            root.join("config.toml"),
+            root.join("state"),
+        );
+        assert_eq!(
+            recovery.disconnect().unwrap(),
+            ConnectionStatus::Disconnected
+        );
+        assert_eq!(fs::read(root.join("config.toml")).unwrap(), original);
+        assert_eq!(
+            unix_mode(&fs::metadata(root.join("config.toml")).unwrap()),
+            0o400
+        );
+        assert!(!recovery.snapshot_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rejects_symlinks_and_insecure_modes() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         let root = root("security");

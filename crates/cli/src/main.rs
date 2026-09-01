@@ -984,15 +984,16 @@ fn ingest_items<'a>(
     let paths = ingest_paths(Path::new(directory))?;
     let _mutation =
         MutationGuard::acquire(&paths.runtime_directory).map_err(|error| error.to_string())?;
-    let mut control = RuntimeControl::new(&paths.config).map_err(|error| error.to_string())?;
+    let config = load(&paths.config_path).map_err(|error| error.to_string())?;
+    let mut control = RuntimeControl::new(&config).map_err(|error| error.to_string())?;
     let items = items.collect::<Vec<_>>();
-    if !paths.config.enabled {
+    if !config.enabled {
         return Ok(IngestResult::blocked(
             source,
             IngestBlock::CollectionDisabled,
         ));
     }
-    if items.len() > usize::from(paths.config.collection.max_batch_records) {
+    if items.len() > usize::from(config.collection.max_batch_records) {
         return Ok(IngestResult::blocked(source, IngestBlock::Policy));
     }
     let allocated = StorageBudget::allocated_tree_bytes(&paths.accounting_root)
@@ -1013,7 +1014,7 @@ fn ingest_items<'a>(
             &paths.accounting_root,
             ingest_reservation_bytes(
                 &paths.store_directory,
-                u64::from(paths.config.collection.max_batch_bytes),
+                u64::from(config.collection.max_batch_bytes),
             )?,
         )
         .map_err(|error| error.to_string())?
@@ -1088,7 +1089,7 @@ fn ingest_reservation_bytes(store_directory: &Path, batch_bytes: u64) -> Result<
 }
 
 struct IngestPaths {
-    config: LocalRuntimeConfigV2,
+    config_path: PathBuf,
     accounting_root: PathBuf,
     runtime_directory: PathBuf,
     store_directory: PathBuf,
@@ -1096,9 +1097,8 @@ struct IngestPaths {
 
 fn ingest_paths(path: &Path) -> Result<IngestPaths, String> {
     let layout = install(path).map_err(|error| error.to_string())?;
-    let config = load(&layout.config).map_err(|error| error.to_string())?;
     Ok(IngestPaths {
-        config,
+        config_path: layout.config,
         accounting_root: layout.root,
         runtime_directory: layout.runtime,
         store_directory: layout.state.join("store"),

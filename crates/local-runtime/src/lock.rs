@@ -134,6 +134,14 @@ impl Drop for Singleton {
 
 impl MutationGuard {
     pub fn acquire(runtime_dir: &Path) -> Result<Self, SingletonError> {
+        Self::acquire_with(runtime_dir, false)
+    }
+
+    pub fn try_acquire(runtime_dir: &Path) -> Result<Self, SingletonError> {
+        Self::acquire_with(runtime_dir, true)
+    }
+
+    fn acquire_with(runtime_dir: &Path, nonblocking: bool) -> Result<Self, SingletonError> {
         private_runtime_dir(runtime_dir)?;
         let lock_path = runtime_dir.join("mutation.lock");
         reject_symlink(&lock_path)?;
@@ -146,7 +154,17 @@ impl MutationGuard {
         }
         let file = options.open(&lock_path)?;
         private_open_file(&file)?;
-        file.lock_exclusive().map_err(SingletonError::Io)?;
+        if nonblocking {
+            file.try_lock_exclusive().map_err(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    SingletonError::AlreadyRunning
+                } else {
+                    SingletonError::Io(error)
+                }
+            })?;
+        } else {
+            file.lock_exclusive().map_err(SingletonError::Io)?;
+        }
         Ok(Self { file })
     }
 }

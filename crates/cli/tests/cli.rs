@@ -1,12 +1,62 @@
+use agent_observability_local_runtime::{ConfigMutationGuard, StorageBudget, install, load, save};
 use agent_observability_local_store::LocalStore;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 #[cfg(unix)]
 use std::fs;
 
 fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_agent-observability"))
+}
+
+#[cfg(unix)]
+fn private_codex_handoff(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let handoff = root.join("codex-handoff.jsonl");
+    fs::write(
+        &handoff,
+        include_str!("../../adapter-codex/tests/fixtures/codex-handoff.jsonl"),
+    )
+    .unwrap();
+    fs::set_permissions(&handoff, fs::Permissions::from_mode(0o600)).unwrap();
+    handoff
+}
+
+#[cfg(unix)]
+fn spawn_codex_ingest(root: &Path, handoff: &Path) -> Child {
+    binary()
+        .args([
+            "codex-ingest",
+            root.to_str().unwrap(),
+            handoff.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn assert_ingest_waits(child: &mut Child) {
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().unwrap().is_none());
+}
+
+#[cfg(unix)]
+fn inflate_allocated_accounting(root: &Path) {
+    let source = root.join("allocated-budget-fixture");
+    fs::write(&source, vec![0_u8; 1024 * 1024]).unwrap();
+    let reduced = StorageBudget::calculate(256 * 1024 * 1024, false).unwrap();
+    for index in 0..300 {
+        let allocated = StorageBudget::allocated_tree_bytes(root).unwrap();
+        if allocated + 512 * 1024 > reduced.writable_limit() {
+            return;
+        }
+        fs::hard_link(&source, root.join(format!("allocated-budget-link-{index}"))).unwrap();
+    }
+    panic!("failed to inflate storage accounting above the reduced budget");
 }
 
 #[test]
@@ -490,6 +540,59 @@ fn installed_runtime_config_disables_ingest_without_creating_a_store() {
         .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("collection_disabled=1"));
+    assert!(!root.join("state/store/local-store.sqlite3").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_disable_blocks_manual_ingest_before_admission() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-concurrent-disable-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let layout = install(&root).unwrap();
+    let handoff = private_codex_handoff(&root);
+    let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+    let mut ingest = spawn_codex_ingest(&root, &handoff);
+    assert_ingest_waits(&mut ingest);
+
+    let mut config = load(&layout.config).unwrap();
+    config.enabled = false;
+    save(&guard, &config).unwrap();
+    drop(guard);
+
+    let output = ingest.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("collection_disabled=1"));
+    assert!(!root.join("state/store/local-store.sqlite3").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_budget_reduction_blocks_manual_ingest_before_commit() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-concurrent-budget-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let layout = install(&root).unwrap();
+    let handoff = private_codex_handoff(&root);
+    inflate_allocated_accounting(&root);
+    let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+    let mut ingest = spawn_codex_ingest(&root, &handoff);
+    assert_ingest_waits(&mut ingest);
+
+    let mut config = load(&layout.config).unwrap();
+    config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+    save(&guard, &config).unwrap();
+    drop(guard);
+
+    let output = ingest.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("storage_blocked=1"));
     assert!(!root.join("state/store/local-store.sqlite3").exists());
     let _ = fs::remove_dir_all(root);
 }

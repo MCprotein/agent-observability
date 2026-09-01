@@ -207,21 +207,28 @@ pub fn disconnect(
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
     let layout = install(root).map_err(runtime_error)?;
     with_lifecycle_lock(&layout, || match load_settings(&layout.root) {
-        Ok(settings) => {
-            let manager = codex_config_manager(&layout, executable, &settings)?;
-            disconnect_prepared(
-                &layout.root,
-                executable,
-                &settings.endpoint(),
-                &manager,
-                &SystemLifecycle,
-            )
-        }
+        Ok(settings) => disconnect_with_settings(&layout, executable, &settings, &SystemLifecycle),
         Err(CollectorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             disconnect_without_settings(&layout, executable, &SystemLifecycle)
         }
         Err(error) => Err(error.into()),
     })
+}
+
+fn disconnect_with_settings(
+    layout: &InstalledLayout,
+    executable: &Path,
+    settings: &CollectorSettings,
+    lifecycle: &impl CollectorLifecycle,
+) -> Result<CodexIntegrationStatus, IntegrationError> {
+    let manager = codex_config_ownership_manager(layout)?;
+    disconnect_prepared(
+        &layout.root,
+        executable,
+        &settings.endpoint(),
+        &manager,
+        lifecycle,
+    )
 }
 
 fn disconnect_without_settings(
@@ -2328,6 +2335,77 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recovered_connect_restart_failure_then_disconnect_restores_prior_ownership() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("recovered-restart-failure-disconnect");
+        let layout = agent_observability_local_runtime::install(&root).unwrap();
+        let config_path = root.join("config.toml");
+        let original = b"# exact prior\nmodel = 'before'\n";
+        fs::write(&config_path, original).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o400)).unwrap();
+        let original_settings = install_settings(&root).unwrap();
+        CodexConfigManager::new(
+            &config_path,
+            layout.runtime.join("integrations/codex"),
+            Path::new("/bin/agentobs"),
+            &root,
+            original_settings.port,
+            &original_settings.token,
+        )
+        .unwrap()
+        .connect()
+        .unwrap();
+        let occupied =
+            TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, original_settings.port)).unwrap();
+        let (recovered, restart) = recover_connect_settings(&root, &original_settings).unwrap();
+        assert!(restart);
+        assert_ne!(recovered.port, original_settings.port);
+        let recovery = CodexConfigManager::from_ownership_snapshot(
+            &config_path,
+            layout.runtime.join("integrations/codex"),
+        );
+        let lifecycle = FakeLifecycle::ready();
+        lifecycle.install_error.set(true);
+
+        assert!(
+            connect_with_reloaded_settings(
+                &root,
+                Path::new("/bin/agentobs"),
+                &lifecycle,
+                restart,
+                || load_settings(&root).map_err(Into::into),
+                |_| Ok(FakeConfig::disconnected()),
+            )
+            .is_err()
+        );
+        lifecycle.install_error.set(false);
+        let disconnected = disconnect_prepared(
+            &root,
+            Path::new("/bin/agentobs"),
+            &recovered.endpoint(),
+            &recovery,
+            &lifecycle,
+        )
+        .unwrap();
+
+        assert_eq!(disconnected.config, ConnectionStatus::Disconnected);
+        assert_eq!(disconnected.endpoint, Some(recovered.endpoint()));
+        assert_eq!(fs::read(&config_path).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(
+            *lifecycle.events.borrow(),
+            ["restart", "service", "uninstall"]
+        );
+        drop(occupied);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn connect_health_failure_uninstalls_service_before_config_mutation() {
         let config = FakeConfig::disconnected();
@@ -2722,10 +2800,16 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn reconnect_failure_restores_previous_owned_service() {
+    fn reconnect_failure_then_disconnect_restores_exact_prior_service() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = temporary_root("reconnect-failure");
         let service = test_service(&root);
-        let launchctl = FakeLaunchctl::new(false);
+        fs::create_dir_all(service.plist.parent().unwrap()).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&service.plist, b"inherited plist").unwrap();
+        fs::set_permissions(&service.plist, fs::Permissions::from_mode(0o640)).unwrap();
+        let launchctl = FakeLaunchctl::new(true);
         install_collector_service_with(
             service.clone(),
             &root,
@@ -2756,6 +2840,17 @@ mod tests {
         let transaction = load_launch_agent_transaction(&service).unwrap().unwrap();
         assert_eq!(transaction.phase, LaunchAgentPhase::Owned);
         assert_eq!(transaction.desired_plist.bytes, previous);
+
+        uninstall_collector_service_with(&service, &launchctl).unwrap();
+        commit_collector_service_uninstall(&service).unwrap();
+
+        assert_eq!(fs::read(&service.plist).unwrap(), b"inherited plist");
+        assert_eq!(
+            fs::metadata(&service.plist).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(launchctl.loaded.get());
+        assert!(!service.ownership.exists());
         let _ = fs::remove_dir_all(root);
     }
 
