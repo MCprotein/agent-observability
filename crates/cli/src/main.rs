@@ -33,28 +33,28 @@ use std::process::Command;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "Agent Observability
+const USAGE: &str = "Agent Observability (`agentobs`, legacy alias: `agent-observability`)
 
 Quick start:
-  agent-observability demo [root] [--no-open]
-  agent-observability setup [root] [--no-open]
-  agent-observability dashboard [root] [--no-open]
-  agent-observability ui [root] [--no-open]
+  agentobs demo [root] [--no-open]       Open the sample monitoring dashboard
+  agentobs setup [root] [--no-open]      Initialize a runtime and open monitoring
+  agentobs dashboard [root] [--no-open]  Refresh and open the monitoring dashboard
+  agentobs ui [root] [--no-open]         Open settings only
 
 Configuration:
-  agent-observability config show [root]
-  agent-observability config set [root] <option> <value>
+  agentobs config show [root]
+  agentobs config set [root] <option> <value>
 
 Import and report:
-  agent-observability <codex|claude-code|cursor>-ingest <root> <handoff-jsonl>
-  agent-observability report <root> [rate-table-json]
+  agentobs <codex|claude-code|cursor>-ingest <root> <handoff-jsonl>
+  agentobs report <root> [rate-table-json]
 
 Maintenance:
-  agent-observability retention-plan <root>
-  agent-observability retention-apply <root> <plan-id> <private-archive-jsonl>
-  agent-observability init|runtime-check|storage-check <root>
-  agent-observability config-check <config-json>
-  agent-observability contracts|version|help";
+  agentobs retention-plan <root>
+  agentobs retention-apply <root> <plan-id> <private-archive-jsonl>
+  agentobs init|runtime-check|storage-check <root>
+  agentobs config-check <config-json>
+  agentobs contracts|version|help";
 const REPORT_FILE_NAME: &str = "agent-observability-report.html";
 const MAX_RATE_TABLE_BYTES: u64 = 1_048_576;
 const DEFAULT_ROOT_NAME: &str = ".agent-observability";

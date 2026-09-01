@@ -8,7 +8,9 @@ import {
   parseSavedFilters,
   sameDimensions,
   serializeSavedFilters,
-} from "../ui/report/generated/view-state.js";
+  type DimensionFilters,
+} from "../ui/report/view-state.ts";
+import type { Span, Trace } from "../ui/report/generated/report-dto-v1.js";
 
 test("keeps large local report view work and rendered slices bounded", () => {
   const spans = Array.from({ length: 4_096 }, (_, index) => spanFixture(index));
@@ -93,7 +95,7 @@ test("rejects sensitive-looking values at the saved-view sink", () => {
     { repo: "user@example.com" },
     { agent: "raw prompt content" },
     { session: "session-plain-text" },
-  ]) {
+  ] as unknown as DimensionFilters[]) {
     assert.equal(isPersistableDimensions(filters), false);
     assert.throws(() => serializeSavedFilters([filters]), /non-persistable/);
   }
@@ -105,7 +107,7 @@ test("rejects sensitive-looking values at the saved-view sink", () => {
   }), true);
 });
 
-function spanFixture(index) {
+function spanFixture(index: number): Span {
   const traceIndex = index % 256;
   return {
     schemaVersion: "agent_observability.v1",
@@ -126,7 +128,7 @@ function spanFixture(index) {
   };
 }
 
-function traceFixture(index) {
+function traceFixture(index: number): Trace {
   return {
     traceId: `trace-${index}`,
     repo: "repo-a",

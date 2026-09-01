@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { aggregateCostStatus, summarizeVisible } from "../ui/report/generated/view-summary.js";
+import { aggregateCostStatus, summarizeVisible, type CostStatus } from "../ui/report/view-summary.ts";
+import type { Metrics, Span } from "../ui/report/generated/report-dto-v1.js";
 
 const fixture = JSON.parse(
   await readFile(new URL("../contracts/report-view-reduction-v1.fixture.json", import.meta.url), "utf8"),
@@ -28,12 +29,22 @@ test("reduces only already-priced billable span scalars", () => {
   assert.equal(summary.outputTokens, 3);
 });
 
-function viewSpan(status, estimatedCost, metrics) {
+function viewSpan(status: CostStatus, estimatedCost: number | undefined, metrics: Metrics): Span {
   return {
+    schemaVersion: "agent_observability.v1",
+    traceId: "trace-1",
+    spanId: "span-1",
+    parentSpanId: null,
     kind: "llm.request",
+    name: "Model request",
     status: "ok",
+    startTimeUnixMs: 1,
+    endTimeUnixMs: 2,
+    repo: "agent-observability",
+    agent: { name: "codex", model: "gpt-test" },
+    attributes: {},
     metrics,
-    cost: { status },
+    cost: { status, rate_table: {}, cost: { assumption: "fixture" } },
     estimatedCost,
   };
 }

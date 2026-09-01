@@ -84,7 +84,7 @@ version and rerun when an official surface or schema changes.
 
 ## Current planning assumptions
 
-The JavaScript baseline retains partial Codex and Claude Code file/hook adapters. Rust Codex, Claude Code and
+Historical v0.6 fixtures retain partial Codex and Claude Code source examples. Rust Codex, Claude Code and
 Cursor adapters implement bounded canonical handoff parsers, fixed source precedence, content-free dispositions,
 fixture hash validation and CLI-to-private-store replay. Claude Code uses documented OTel events as primary and
 hooks only for lifecycle. Cursor uses generic tool hooks as primary and lifecycle hooks as supplement; specific

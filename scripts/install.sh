@@ -23,7 +23,7 @@ case "$platform" in
   *) fail "macOS is required (detected $platform)" ;;
 esac
 
-for command_name in awk cat chmod cp curl install mkdir mktemp mv readlink rm sed shasum tar; do
+for command_name in awk cat chmod cp curl install ln mkdir mktemp mv readlink rm sed shasum tar; do
   require_command "$command_name"
 done
 
@@ -67,11 +67,15 @@ download_base="$release_base_url/download/$tag"
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/agent-observability-install.XXXXXX") ||
   fail "could not create a temporary directory"
 pending_binary=""
+pending_alias=""
 pending_profile=""
 cleanup() {
   rm -rf "$work_dir"
   if [ -n "$pending_binary" ]; then
     rm -f "$pending_binary"
+  fi
+  if [ -n "$pending_alias" ]; then
+    rm -f "$pending_alias"
   fi
   if [ -n "$pending_profile" ]; then
     rm -f "$pending_profile"
@@ -109,6 +113,11 @@ pending_binary="$install_dir/.agent-observability.install.$$"
 install -m 0755 "$source_binary" "$pending_binary"
 mv -f "$pending_binary" "$install_dir/agent-observability"
 pending_binary=""
+[ ! -d "$install_dir/agentobs" ] || fail "command alias path is a directory: $install_dir/agentobs"
+pending_alias="$install_dir/.agentobs.install.$$"
+ln -s agent-observability "$pending_alias"
+mv -f "$pending_alias" "$install_dir/agentobs"
+pending_alias=""
 
 profile=${AGENT_OBSERVABILITY_SHELL_PROFILE:-}
 if [ -z "$profile" ]; then
@@ -218,7 +227,7 @@ fi
 mv -f "$pending_profile" "$profile_target"
 pending_profile=""
 
-printf 'Installed agent-observability %s to %s\n' "$version" "$install_dir/agent-observability"
+printf 'Installed agentobs %s (alias: agent-observability) to %s\n' "$version" "$install_dir"
 case ":$PATH:" in
   *":$install_dir:"*) ;;
   *) printf "Activate it in this terminal: . '%s'\n" "$quoted_profile" ;;

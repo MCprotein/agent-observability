@@ -1,4 +1,5 @@
 /* Generated from contracts/report-dto-v1.schema.json. Do not edit. */
+"use strict";
 (() => {
   // ui/report/generated/validate-report-dto-v1.js
   var validate_report_dto_v1_default = validate20;

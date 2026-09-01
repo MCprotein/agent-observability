@@ -4,7 +4,7 @@ import { access, chmod, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
-import { chromium } from "playwright-core";
+import { chromium, type Request } from "playwright-core";
 
 const execute = promisify(execFile);
 
@@ -20,6 +20,7 @@ const binary = join(process.cwd(), "target", "debug", "agent-observability");
 const child = spawn(binary, ["ui", runtimeRoot, "--no-open"], {
   stdio: ["ignore", "pipe", "pipe"],
 });
+type SettingsProcess = typeof child;
 const browser = await chromium.launch({ executablePath, headless: true });
 let stderr = "";
 child.stderr.setEncoding("utf8");
@@ -30,12 +31,12 @@ child.stderr.on("data", (chunk) => {
 try {
   const url = await readUrl(child);
   const origin = new URL(url).origin;
-  const results = [];
+  const results: Array<Record<string, string | number | boolean>> = [];
   const screenshotDirectory = process.env.SETTINGS_SCREENSHOT_DIR ?? directory;
 
   const bootstrapFailurePage = await browser.newPage({ viewport: { width: 800, height: 600 } });
-  const bootstrapFailures = [];
-  const bootstrapPageErrors = [];
+  const bootstrapFailures: Request[] = [];
+  const bootstrapPageErrors: string[] = [];
   bootstrapFailurePage.on("requestfailed", (request) => bootstrapFailures.push(request));
   bootstrapFailurePage.on("pageerror", (error) => bootstrapPageErrors.push(error.message));
   await bootstrapFailurePage.route(`${origin}/api/config`, (route) => route.abort("connectionfailed"));
@@ -66,11 +67,11 @@ try {
     { name: "compact", viewport: { width: 320, height: 800 } },
   ]) {
     const page = await browser.newPage({ viewport: testCase.viewport });
-    const consoleErrors = [];
-    const expectedApiErrors = [];
-    const pageErrors = [];
-    const externalRequests = [];
-    const failedRequests = [];
+    const consoleErrors: string[] = [];
+    const expectedApiErrors: string[] = [];
+    const pageErrors: string[] = [];
+    const externalRequests: string[] = [];
+    const failedRequests: string[] = [];
     let dirtyReloadDialog = false;
     page.on("console", (message) => {
       if (message.type() !== "error") return;
@@ -122,10 +123,10 @@ try {
       const input = page.locator("#collection-max_batch_records");
       await input.fill("125");
       assert.equal(await page.locator("#save").isEnabled(), true);
-      assert.match(await page.locator("#batch-records-visual [data-visual-value]").textContent(), /125/);
+      assert.match((await page.locator("#batch-records-visual [data-visual-value]").textContent()) ?? "", /125/);
       await page.locator("#save").click();
       await page.locator("#toast.visible").waitFor();
-      assert.match(await page.locator("#toast").textContent(), /설정을 저장했습니다/);
+      assert.match((await page.locator("#toast").textContent()) ?? "", /설정을 저장했습니다/);
       assert.equal(await page.locator("#save").isDisabled(), true);
       await page.waitForFunction(() => document.activeElement?.id === "save-title");
       const configPath = join(runtimeRoot, "config.json");
@@ -322,13 +323,13 @@ try {
   }
 }
 
-function readUrl(process) {
-  return new Promise((resolve, reject) => {
+function readUrl(process: SettingsProcess): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
     let stdout = "";
     const timeout = setTimeout(() => reject(new Error(`settings URL timed out: ${stderr}`)), 20_000);
     process.once("error", reject);
     process.stdout.setEncoding("utf8");
-    process.stdout.on("data", (chunk) => {
+    process.stdout.on("data", (chunk: string) => {
       stdout += chunk;
       const match = stdout.match(/^url=(.+)$/m);
       if (match) {
@@ -345,9 +346,9 @@ function readUrl(process) {
   });
 }
 
-function waitForExit(process) {
+function waitForExit(process: SettingsProcess): Promise<number | null> {
   if (process.exitCode !== null) return Promise.resolve(process.exitCode);
-  return new Promise((resolve, reject) => {
+  return new Promise<number | null>((resolve, reject) => {
     const timeout = setTimeout(() => {
       process.kill("SIGTERM");
       reject(new Error("settings process did not stop"));
@@ -359,7 +360,7 @@ function waitForExit(process) {
   });
 }
 
-function rectanglesOverlap(first, second) {
+function rectanglesOverlap(first: DOMRect, second: DOMRect): boolean {
   return !(
     first.right <= second.left ||
     second.right <= first.left ||

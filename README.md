@@ -4,7 +4,8 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.6.0 범위:** one-command checksum-checked install, local setup, 내장 demo, 시각적 로컬 설정,
+> **v1.7.0 범위:** one-command checksum-checked install, `agentobs` short command, local setup,
+> 내장 demo, 시각적 로컬 설정,
 > 수동 private handoff import를 지원한다.
 > agent 원본 로그를 자동으로 읽는 연결 기능은 아직 제공하지 않는다.
 
@@ -35,7 +36,7 @@ artifact attestation으로 별도 게시된다.
 ### 2. 대시보드 체험
 
 ```bash
-agent-observability demo
+agentobs demo
 ```
 
 이 명령 하나가 content-free sample을 별도 `~/.agent-observability-demo` runtime에 넣고,
@@ -45,7 +46,7 @@ self-contained HTML 대시보드를 생성해 기본 브라우저에서 연다. 
 ### 3. 설정 화면 열기
 
 ```bash
-agent-observability ui
+agentobs ui
 ```
 
 수집 허용, 확인·반영 주기, batch, heartbeat, 저장 한도, 보관 기간과 archive 한도를 한 화면에서
@@ -59,12 +60,15 @@ Host와 Origin을 모두 확인한다. token은 같은 tab의 새로고침에서
 ### 4. 실제 runtime 준비
 
 ```bash
-agent-observability setup
+agentobs setup
 ```
 
 기본 위치 `~/.agent-observability`에 private config와 SQLite 저장소를 만들고 대시보드를 연다.
 처음에는 수집된 데이터가 없으므로 빈 화면이 정상이다. 브라우저를 열지 않는 자동화 환경에서는
-`agent-observability setup --no-open`을 사용한다.
+`agentobs setup --no-open`을 사용한다.
+
+모니터링 화면은 `agentobs dashboard`, 설정 화면은 `agentobs ui`다. 긴 이름인
+`agent-observability`도 호환 별칭으로 계속 제공한다.
 
 | 현재 경로 | 상태 | 의미 |
 | --- | --- | --- |
@@ -96,10 +100,10 @@ handoff를 아래 명령으로 가져온다. 이 제한은 설정 실수로 원�
 storage로 넘어가는 것을 막기 위한 현재 release 경계다.
 
 ```bash
-agent-observability codex-ingest ~/.agent-observability /path/to/codex-handoff.jsonl
-agent-observability claude-code-ingest ~/.agent-observability /path/to/claude-handoff.jsonl
-agent-observability cursor-ingest ~/.agent-observability /path/to/cursor-handoff.jsonl
-agent-observability dashboard
+agentobs codex-ingest ~/.agent-observability /path/to/codex-handoff.jsonl
+agentobs claude-code-ingest ~/.agent-observability /path/to/claude-handoff.jsonl
+agentobs cursor-ingest ~/.agent-observability /path/to/cursor-handoff.jsonl
+agentobs dashboard
 ```
 
 handoff 생성 규격과 허용 source는 [Adapter Compatibility](docs/ADAPTER_COMPATIBILITY.md)를
@@ -111,20 +115,20 @@ handoff 생성 규격과 허용 source는 [Adapter Compatibility](docs/ADAPTER_C
 시각적으로 비교하고 저장하면 Rust가 전체 config를 다시 검증해 원자적으로 교체한다.
 
 ```bash
-agent-observability ui
+agentobs ui
 ```
 
 headless 환경이나 자동화에서는 같은 계약을 CLI로 사용할 수 있다.
 
 ```bash
 # 현재 설정
-agent-observability config show
+agentobs config show
 
 # 데이터를 90일 보관
-agent-observability config set retention-days 90
+agentobs config set retention-days 90
 
 # 로컬 저장 공간을 2 GiB로 제한
-agent-observability config set storage-bytes 2147483648
+agentobs config set storage-bytes 2147483648
 ```
 
 별도 runtime을 사용한다면 `config set <root> <option> <value>` 형식으로 root를 지정한다.
@@ -161,7 +165,7 @@ flowchart LR
 ```
 
 - 점선은 현재 release가 제공하지 않는 agent별 producer 경계다.
-- 실선은 `v1.6.0` CLI가 구현하고 검증하는 local-only 경로다.
+- 실선은 `v1.7.0` CLI가 구현하고 검증하는 local-only 경로다.
 - agent별 차이는 adapter에서 끝나고 이후 저장·비용·UI contract는 하나다.
 - SQLite가 로컬 권위 저장소이며 JSONL archive와 HTML은 다시 만들 수 있는 projection이다.
 - TypeScript UI는 원본 agent payload가 아니라 Rust가 검증한 report DTO만 받는다.
@@ -189,9 +193,9 @@ flowchart LR
 ```
 
 ```bash
-agent-observability config set retention-days 90
-agent-observability retention-plan ~/.agent-observability
-agent-observability retention-apply \
+agentobs config set retention-days 90
+agentobs retention-plan ~/.agent-observability
+agentobs retention-apply \
   ~/.agent-observability PLAN_ID /private/path/expired-traces.jsonl
 ```
 
@@ -259,7 +263,7 @@ cargo run -p agent-observability-cli -- demo
 | `retention-plan <root>` | read-only cleanup 계획 |
 | `retention-apply <root> <plan-id> <archive>` | archive 후 만료 trace 정리 |
 
-전체 명령은 `agent-observability help`에서 확인한다.
+전체 명령은 `agentobs help`에서 확인한다. `agent-observability help`도 동일하게 동작한다.
 
 ## 문서
 

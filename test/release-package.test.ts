@@ -9,7 +9,7 @@ import {
   ensureDraft,
   finalizeRelease,
   publishPackage,
-} from "../scripts/publish-release.mjs";
+} from "../scripts/publish-release.ts";
 
 const rootPackage = JSON.parse(readFileSync("package.json", "utf8"));
 const releasePackage = JSON.parse(
@@ -20,10 +20,11 @@ const cargoMetadata = JSON.parse(
   execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
     encoding: "utf8",
   }),
-);
+) as { packages: Array<{ name: string; version: string }> };
 const workspaceVersion = cargoMetadata.packages.find(
-  ({ name }) => name === "agent-observability-cli",
-).version;
+  ({ name }: { name: string }) => name === "agent-observability-cli",
+)?.version;
+assert.ok(workspaceVersion);
 
 test("release metadata has one synchronized Apache-2.0 version", () => {
   assert.equal(rootPackage.version, workspaceVersion);
@@ -36,6 +37,7 @@ test("GitHub package exposes only the universal native macOS CLI", () => {
   assert.deepEqual(releasePackage.os, ["darwin"]);
   assert.deepEqual(releasePackage.cpu, ["arm64", "x64"]);
   assert.deepEqual(releasePackage.bin, {
+    agentobs: "bin/agent-observability",
     "agent-observability": "bin/agent-observability",
   });
   assert.equal(releasePackage.publishConfig.registry, "https://npm.pkg.github.com");
@@ -77,9 +79,10 @@ test("release workflow pins actions and uses the tested publication state machin
     releaseWorkflow,
     /lipo stage\/agent-observability -verify_arch arm64 x86_64/,
   );
-  assert.match(releaseWorkflow, /publish-release\.mjs draft/);
-  assert.match(releaseWorkflow, /publish-release\.mjs package/);
-  assert.match(releaseWorkflow, /publish-release\.mjs finalize/);
+  assert.match(releaseWorkflow, /publish-release\.ts draft/);
+  assert.match(releaseWorkflow, /publish-release\.ts package/);
+  assert.match(releaseWorkflow, /publish-release\.ts finalize/);
+  assert.match(releaseWorkflow, /Install release tooling[\s\S]*npm ci/);
   assert.match(releaseWorkflow, /install -m 0755 scripts\/install\.sh dist\/install\.sh/);
   assert.match(releaseWorkflow, /\*\.tar\.gz \*\.tgz install\.sh > SHA256SUMS/);
   assert.match(releaseWorkflow, /dist\/install\.sh/);
@@ -87,11 +90,17 @@ test("release workflow pins actions and uses the tested publication state machin
   assert.match(releaseWorkflow, /AGENT_OBSERVABILITY_RELEASE_BASE_URL=/);
 });
 
-function scriptedExecutor(results) {
-  const calls = [];
+interface CommandResult {
+  status: number;
+  stdout: string;
+  stderr: string;
+}
+
+function scriptedExecutor(results: CommandResult[]) {
+  const calls: Array<[string, string[]]> = [];
   return {
     calls,
-    execute(command, args) {
+    execute(command: string, args: string[]): CommandResult {
       calls.push([command, args]);
       const result = results.shift();
       assert.ok(result, `unexpected command: ${command} ${args.join(" ")}`);
@@ -100,8 +109,8 @@ function scriptedExecutor(results) {
   };
 }
 
-const success = (stdout = "") => ({ status: 0, stdout, stderr: "" });
-const failure = (stderr) => ({ status: 1, stdout: "", stderr });
+const success = (stdout = ""): CommandResult => ({ status: 0, stdout, stderr: "" });
+const failure = (stderr: string): CommandResult => ({ status: 1, stdout: "", stderr });
 
 test("draft transition creates, refreshes, and skips the expected release states", () => {
   const missing = scriptedExecutor([failure("release not found"), success()]);

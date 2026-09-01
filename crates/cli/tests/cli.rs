@@ -21,6 +21,18 @@ fn version_flags_report_the_package_version() {
     }
 }
 
+#[test]
+fn help_distinguishes_monitoring_from_settings() {
+    let output = binary().arg("help").output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("agentobs dashboard"));
+    assert!(stdout.contains("monitoring dashboard"));
+    assert!(stdout.contains("agentobs ui"));
+    assert!(stdout.contains("settings only"));
+    assert!(stdout.contains("legacy alias: `agent-observability`"));
+}
+
 fn installed_store(root: &Path) -> PathBuf {
     root.join("state/store")
 }

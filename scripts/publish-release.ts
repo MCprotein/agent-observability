@@ -1,20 +1,24 @@
 import { readdirSync, statSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
-function commandResult(command, args) {
+type CommandResult = Pick<SpawnSyncReturns<string>, "status" | "stdout" | "stderr">;
+type Execute = (command: string, args: string[]) => CommandResult;
+type Write = (message: string) => void;
+
+function commandResult(command: string, args: string[]): CommandResult {
   return spawnSync(command, args, {
     encoding: "utf8",
     env: process.env,
   });
 }
 
-function failure(result, context) {
+function failure(result: CommandResult, context: string): Error {
   const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
   return new Error(`${context} failed with exit ${result.status}: ${detail}`);
 }
 
-function run(execute, command, args, context = command) {
+function run(execute: Execute, command: string, args: string[], context = command): string {
   const result = execute(command, args);
   if (result.status !== 0) {
     throw failure(result, context);
@@ -22,7 +26,7 @@ function run(execute, command, args, context = command) {
   return result.stdout.trim();
 }
 
-export function classifyReleaseView(result) {
+export function classifyReleaseView(result: CommandResult): "draft" | "published" | "invalid" | "missing" | "error" {
   if (result.status === 0) {
     const draft = result.stdout.trim();
     if (draft === "true") return "draft";
@@ -33,7 +37,7 @@ export function classifyReleaseView(result) {
   return /release not found|HTTP 404|Not Found/i.test(detail) ? "missing" : "error";
 }
 
-export function classifyPackageView(result, version) {
+export function classifyPackageView(result: CommandResult, version: string): "published" | "invalid" | "missing" | "error" {
   if (result.status === 0) {
     let found;
     try {
@@ -47,7 +51,7 @@ export function classifyPackageView(result, version) {
   return /\bE404\b|404 Not Found/i.test(detail) ? "missing" : "error";
 }
 
-function releaseView(execute, tag) {
+function releaseView(execute: Execute, tag: string): CommandResult {
   return execute("gh", [
     "release",
     "view",
@@ -59,7 +63,7 @@ function releaseView(execute, tag) {
   ]);
 }
 
-function distributionFiles() {
+function distributionFiles(): string[] {
   return readdirSync("dist")
     .map((name) => `dist/${name}`)
     .filter((path) => statSync(path).isFile())
@@ -67,13 +71,13 @@ function distributionFiles() {
 }
 
 export function ensureDraft(
-  tag,
+  tag: string,
   {
     execute = commandResult,
     files = distributionFiles(),
-    write = (message) => process.stdout.write(message),
-  } = {},
-) {
+    write = (message: string) => { process.stdout.write(message); },
+  }: { execute?: Execute; files?: string[]; write?: Write } = {},
+): void {
   const view = releaseView(execute, tag);
   const state = classifyReleaseView(view);
   if (state === "error" || state === "invalid") {
@@ -108,12 +112,12 @@ export function ensureDraft(
 }
 
 export function publishPackage(
-  version,
+  version: string,
   {
     execute = commandResult,
-    write = (message) => process.stdout.write(message),
-  } = {},
-) {
+    write = (message: string) => { process.stdout.write(message); },
+  }: { execute?: Execute; write?: Write } = {},
+): void {
   const packageName = "@mcprotein/agent-observability";
   const registry = "https://npm.pkg.github.com";
   const view = execute("npm", [
@@ -143,12 +147,12 @@ export function publishPackage(
 }
 
 export function finalizeRelease(
-  tag,
+  tag: string,
   {
     execute = commandResult,
-    write = (message) => process.stdout.write(message),
-  } = {},
-) {
+    write = (message: string) => { process.stdout.write(message); },
+  }: { execute?: Execute; write?: Write } = {},
+): void {
   const view = releaseView(execute, tag);
   const state = classifyReleaseView(view);
   if (state === "published") {
@@ -167,7 +171,7 @@ export function finalizeRelease(
   write("release=published\n");
 }
 
-function main() {
+function main(): void {
   const [command, value] = process.argv.slice(2);
   if (command === "draft" && value) return ensureDraft(value);
   if (command === "package" && value) return publishPackage(value);
@@ -179,7 +183,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   try {
     main();
   } catch (error) {
-    process.stderr.write(`${error.message}\n`);
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
   }
 }

@@ -42,7 +42,7 @@ function makeFixture(version = "1.6.0") {
   }).split(/\s+/)[0];
   writeFileSync(join(downloadDir, "SHA256SUMS"), `${checksum}  ${archiveName}\n`);
 
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     AGENT_OBSERVABILITY_PLATFORM: "Darwin",
     AGENT_OBSERVABILITY_RELEASE_BASE_URL: pathToFileURL(releaseRoot).href,
@@ -68,9 +68,12 @@ test("installer verifies, installs, and registers PATH idempotently", (t) => {
   });
 
   const binary = join(fixture.home, ".local", "bin", "agent-observability");
+  const alias = join(fixture.home, ".local", "bin", "agentobs");
   assert.equal(execFileSync(binary, { encoding: "utf8" }).trim(), "1.6.0");
+  assert.equal(lstatSync(alias).isSymbolicLink(), true);
+  assert.equal(execFileSync(alias, { encoding: "utf8" }).trim(), "1.6.0");
   assert.match(first, /Activate it in this terminal: \. '.*\.zshrc'/);
-  assert.match(second, /Installed agent-observability 1\.6\.0/);
+  assert.match(second, /Installed agentobs 1\.6\.0 \(alias: agent-observability\)/);
 
   const profile = readFileSync(join(fixture.home, ".zshrc"), "utf8");
   assert.match(profile, /^existing profile\n/);
@@ -231,11 +234,11 @@ copyFileSync(fileURLToPath(args[outputIndex - 1]), args[outputIndex + 1]);
   );
   chmodSync(curlStub, 0o755);
 
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...fixture.env,
     PATH: `${stubDir}:${fixture.env.PATH}`,
   };
   delete env.AGENT_OBSERVABILITY_VERSION;
   const output = execFileSync("sh", [installer], { encoding: "utf8", env });
-  assert.match(output, /Installed agent-observability 1\.6\.0/);
+  assert.match(output, /Installed agentobs 1\.6\.0/);
 });

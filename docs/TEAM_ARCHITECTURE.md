@@ -533,7 +533,7 @@ Contract source and planned evidence locations:
 - `crates/contracts/tests/compat/team-ingest/`: current/previous supported-version replay fixtures
 - `cargo test -p contracts team_ingest_v1`: schema, canonicalization and compatibility gate
 
-이 경로는 G1에서 생성되어야 하는 artifact 계약이며 현재 JavaScript baseline에 존재한다고
+이 경로는 G1에서 생성되어야 하는 artifact 계약이며 현재 Rust/TypeScript 제품 경로에 존재한다고
 주장하지 않는다.
 
 ### End-to-end privacy evidence
