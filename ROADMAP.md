@@ -83,7 +83,7 @@ gate를 통과해 추가한다.
 | v1.3.1 | Superseded | Distribution publication correction | Universal assembly, attestation, and draft Release succeeded, but run `33414142455` stopped before Package/public Release because npm interpreted `dist/*.tgz` as a repository shorthand; immutable tag and draft remain as failure evidence |
 | v1.3.2 | Released | Package publication path correction | Run `33416302530` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
 | v1.4.0 | Released | Local onboarding and documentation usability | Release workflow `33422477557` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
-| v1.5.0 | Released | Local visual configuration console | Ephemeral bounded loopback settings process, Rust-authoritative atomic configuration use-case, TypeScript responsive policy visualizations, security/browser/accessibility smoke, exact-head CI, and independent code/architecture/design review clear; publication evidence pending tag workflow |
+| v1.5.0 | Released | Local visual configuration console | Release workflow `33478394514` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
 
 ## Branch Strategy
 
