@@ -67,8 +67,8 @@ agentobs setup
 처음에는 수집된 데이터가 없으므로 빈 화면이 정상이다. 브라우저를 열지 않는 자동화 환경에서는
 `agentobs setup --no-open`을 사용한다.
 
-모니터링 화면은 `agentobs dashboard`, 설정 화면은 `agentobs ui`다. 긴 이름인
-`agent-observability`도 호환 별칭으로 계속 제공한다.
+사용자 문서의 권장 명령은 `agentobs`다. 모니터링 화면은 `agentobs dashboard`, 설정 화면은
+`agentobs ui`로 연다. 배포 파일명인 `agent-observability`도 호환 명령으로 계속 제공한다.
 
 | 현재 경로 | 상태 | 의미 |
 | --- | --- | --- |

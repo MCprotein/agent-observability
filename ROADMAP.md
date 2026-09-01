@@ -38,7 +38,8 @@ gate를 통과해 추가한다.
 - web UI는 TypeScript로 구현한다.
 - domain, application, agent adapters, storage, export, CLI는 Rust로 구현한다.
 - v0.6 JavaScript 제품 구현은 v1.7.0에서 제거됐다. compatibility fixture는 유지하고,
-  사용자 작성 제품·빌드·테스트·릴리스 코드는 Rust 또는 strict TypeScript만 허용한다.
+  사용자 작성 JavaScript는 허용하지 않는다. 제품 소스는 Rust/TypeScript로 제한하고,
+  빌드·테스트·릴리스 로직은 strict TypeScript를 사용하되 얇은 Shell/YAML 배포 glue는 허용한다.
 - architecture와 engineering rule의 정본은 `docs/ARCHITECTURE.md`다.
 - standalone은 collector, login, network 없이 완전하게 동작해야 한다. team profile은 같은
   domain 의미와 report contract를 사용하되 별도 strict ingest contract를 가지며 local 경로를

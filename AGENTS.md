@@ -3,13 +3,12 @@
 이 저장소의 제품 코드와 설계 변경은 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)를
 정본으로 따른다. team profile은 [docs/TEAM_ARCHITECTURE.md](docs/TEAM_ARCHITECTURE.md)와
 [docs/TEAM_CONTRACTS.md](docs/TEAM_CONTRACTS.md), 제품·UI는 [DESIGN.md](DESIGN.md)의 더
-구체적인 계약을 함께 따른다. 아래 규칙은 새 코드와 Rust/TypeScript migration target에 즉시
-적용한다.
-기존 JavaScript v0.6 경로의 위반은 `v0.6.1`에서 고정할 migration blocker다.
+구체적인 계약을 함께 따른다. 아래 규칙은 새 코드와 Rust/TypeScript 경로에 즉시 적용한다.
+v0.6 JavaScript 제품 구현은 v1.7.0에서 제거됐고 compatibility fixture만 남아 있다.
 
-- 목표 기술 스택은 web UI의 TypeScript와 그 외 제품 코드의 Rust다. 기존
-  JavaScript v0.6 구현은 migration baseline이며, 새 runtime/core 기능을 JavaScript로
-  확장하지 않는다.
+- 목표 기술 스택은 web UI의 TypeScript와 그 외 제품 코드의 Rust다. 사용자 작성 JavaScript
+  제품 코드는 허용하지 않으며 browser/Rust embed용 JavaScript는 TypeScript 또는 schema에서
+  생성된 artifact만 허용한다.
 - 제품은 `standalone`과 `team` deployment profile을 지원하는 구조로 설계한다. standalone은
   server, login, collector 없이 완전하게 동작해야 하며, team 기능이 local path의 필수
   dependency가 되면 안 된다.

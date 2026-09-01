@@ -14,7 +14,8 @@ invariants:
   - id: target-product-stack
     severity: must
     rule: Implement the web UI in TypeScript and all other product code in Rust;
-      treat the existing JavaScript v0.6 implementation only as a migration baseline.
+      retain v0.6 only as historical compatibility fixtures and allow JavaScript product artifacts
+      only when generated from TypeScript or schema sources.
   - id: standalone-and-team-profiles
     severity: must
     rule: Keep standalone fully functional without network, login, or collector while allowing
@@ -76,7 +77,7 @@ invariants:
     severity: must
     rule: Require every new or migrated durable sink and external transmission to use an
       allowlisted privacy contract for logs, snapshots, queues, reports, exports, diagnostics,
-      and collector payloads; treat the current v0.6 fail-open path as a migration blocker.
+      and collector payloads; never reintroduce the removed v0.6 fail-open implementation path.
   - id: protect-secrets
     severity: must
     rule: Do not quote, expose, commit, or summarize secret values from .env files,
