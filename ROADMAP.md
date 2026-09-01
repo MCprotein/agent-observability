@@ -53,7 +53,7 @@ gate를 통과해 추가한다.
 | v0.x | Completed | Local-only PoC를 작은 minor release로 쪼개 검증했다. |
 | v1.x | Active | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
 
-## Active Train: v0.1.0-v1.5.0
+## Active Train: v0.1.0-v1.6.0
 
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
@@ -84,6 +84,7 @@ gate를 통과해 추가한다.
 | v1.3.2 | Released | Package publication path correction | Run `33416302530` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
 | v1.4.0 | Released | Local onboarding and documentation usability | Release workflow `33422477557` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
 | v1.5.0 | Released | Local visual configuration console | Release workflow `33478394514` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
+| v1.6.0 | In Progress | Verified one-command installer | Release-hosted installer verifies the universal archive checksum, installs into `~/.local/bin`, registers an idempotent shell-profile PATH block, and passes isolated install/reinstall fixtures plus independent review |
 
 ## Branch Strategy
 

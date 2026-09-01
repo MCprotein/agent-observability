@@ -4,7 +4,8 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.5.0 범위:** one-command local setup, 내장 demo, 시각적 로컬 설정, 수동 private handoff import를 지원한다.
+> **v1.6.0 범위:** one-command verified install, local setup, 내장 demo, 시각적 로컬 설정,
+> 수동 private handoff import를 지원한다.
 > agent 원본 로그를 자동으로 읽는 연결 기능은 아직 제공하지 않는다.
 
 ## 빠른 시작
