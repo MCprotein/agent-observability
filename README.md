@@ -86,9 +86,10 @@ agentobs status codex
 agentobs disconnect codex
 ```
 
-`disconnect`는 LaunchAgent를 멈추고 agent-observability가 소유한 Codex 설정을 연결 전의 정확한
-bytes와 permission으로 복원한다. 기존 설정이 없었다면 생성했던 설정 파일을 제거한다. 연결 뒤
-관리 필드가 바뀌어 ownership이 충돌하면 덮어쓰지 않고 중단한다. 이미 수집된 local data는 유지된다.
+`disconnect`는 LaunchAgent 종료를 먼저 확인하고 Codex 설정을 연결 전의 정확한 bytes와 permission으로
+복원한다. 기존 설정이 없었다면 생성했던 설정 파일을 제거한다. 연결 뒤 어떤 설정이든 바뀌어 현재
+전체 bytes 또는 mode가 기록된 connected state와 다르면 편집을 덮어쓰지 않고 중단한다. 이미 수집된
+local data는 유지된다.
 
 사용자 문서의 권장 명령은 `agentobs`다. 모니터링 화면은 `agentobs dashboard`, 설정 화면은
 `agentobs ui`로 연다. 배포 파일명인 `agent-observability`도 호환 명령으로 계속 제공한다.

@@ -259,18 +259,21 @@ anti-corruption layer다.
   bytes의 hex encoding이며 HTTP header에서 constant-time 비교한다. Receiver는 IPv4 loopback에만
   bind하고 `/health`, `/v1/logs`, `/v1/notify` 모두 token을 요구한다. 외부 network client는 없다.
 - `connect codex`는 collector LaunchAgent를 준비하고 health를 확인한 뒤 Codex config를 변경한다.
-  `$CODEX_HOME/config.toml` 또는 기본 `~/.codex/config.toml`의 exact prior bytes, hash와 mode를 private
-  ownership snapshot에 보존한다. 관리하는 값은 top-level `notify`, `otel.exporter`,
+  `$CODEX_HOME/config.toml` 또는 기본 `~/.codex/config.toml`의 exact prior/connected bytes, hash, mode와
+  transaction phase를 private ownership snapshot에 보존한다. 관리하는 값은 top-level `notify`, `otel.exporter`,
   `otel.log_user_prompt=false`, `otel.environment="local"`뿐이다. 기존 값이 다르면 connect는 conflict로
-  중단한다. `disconnect codex`는 관리 값과 fingerprint가 그대로일 때만 이전 bytes/mode를 원자적으로
-  복원하거나 연결 전 파일이 없었다면 제거한다. Conflict와 rollback failure는 사용자 설정을 임의로
-  덮어쓰지 않는다.
+  중단한다. `disconnect codex`는 LaunchAgent 종료를 먼저 확인하고 현재 전체 bytes/mode가 snapshot의
+  connected state와 같을 때만 이전 bytes/mode를 복원하거나 연결 전 파일이 없었다면 제거한다. Crash
+  phase는 다음 lifecycle command에서 복구하며 conflict와 rollback failure는 사용자 설정을 덮어쓰지 않는다.
 - The ephemeral settings UI exposes the same `codex-integration` status/connect/disconnect use cases and can
   open an existing private report. Integration mutations require the same private UI session plus exact Host
   and Origin checks as config mutation. Closing the UI does not disconnect a previously installed LaunchAgent.
 - LaunchAgent label은 runtime root hash로 분리하고 plist는 `~/Library/LaunchAgents`에 원자적으로
   기록한다. `disconnect codex`는 LaunchAgent를 중지하고 plist를 제거하지만 local SQLite와 report는
   보존한다. Automatic collection은 현재 macOS Codex만 지원한다.
+- Automatic collector는 source-ordered observation/disposition을 한 SQLite transaction에 commit한다.
+  Commit 전에 private report-dirty marker를 기록하고 성공한 bounded report refresh 뒤 제거한다. Startup은
+  marker를 재조정하며 retry exhaustion은 authenticated health에 degraded 상태로 나타난다.
 - composition root는 `setup`에서 private install layout, collection policy, singleton lock,
   SQLite authority, storage admission, first report와 local browser open을 결합한다. `demo`는
   별도 runtime과 embedded content-free fixture만 사용한다. `config set`은 local-runtime의

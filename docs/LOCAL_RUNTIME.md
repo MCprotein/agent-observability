@@ -84,24 +84,26 @@ otherwise `~/.codex/config.toml`, and manages only top-level `notify`, the local
 `codex-notify`, and absolute runtime root. The exporter contains only the configured local `/v1/logs` endpoint,
 JSON protocol and private token header. The endpoint port comes from private collector settings; `43181` is the
 current default. Connect refuses pre-existing managed values unless they match exactly.
-Before changing the file, it stores the exact prior bytes, hash, existence and permission mode in
-`runtime/integrations/codex/codex-config-ownership-v1.json` with private permissions. Atomic compare-before-replace
-prevents concurrent edits from being overwritten.
+Before changing the file, it stores the exact prior and connected bytes, hashes, existence, permission modes
+and transaction phase in `runtime/integrations/codex/codex-config-ownership-v1.json` with private permissions.
+A private mutation lock and displaced-file compare/replace preserve conflicting edits. Prepared and restoring
+snapshots recover deterministically on the next lifecycle command after a process crash.
 
 `status codex [root]` reports config ownership and authenticated collector health. `disconnect codex [root]`
-restores the exact prior bytes and mode, or removes the config if connect created it, only while the managed
-values and ownership fingerprint remain unchanged. A conflict fails closed. Successful disconnect stops the
-LaunchAgent, removes its plist and retains SQLite, JSONL and HTML data.
+first confirms that the LaunchAgent stopped and its plist was removed. It then restores the exact prior bytes
+and mode, or removes the config if connect created it, only while the complete current bytes and mode equal the
+recorded connected state. Any intervening edit fails closed and is preserved. SQLite, JSONL and HTML data remain.
 
 The raw OTLP and notify request can exist transiently in bounded process memory while JSON is decoded. Only
 explicitly allowlisted scalar identifiers, model/tool categories, decisions, timing, token counts and success
 state cross into the adapter. Raw prompt/response, tool arguments/output, command, cwd, path, account identity,
 unknown attributes and request bodies are never persisted, logged, projected, reported or exported.
 
-The collector commits accepted canonical observations through the same SQLite authority as manual import,
-repairs the JSONL projection, and refreshes
-`logs/agent-observability-report.html` as a private self-contained file. A report refresh failure does not turn
-the raw input into a fallback log or file.
+The collector transactionally commits source-ordered canonical observations and content-free dispositions
+through the same SQLite authority as manual import. It records a private durable report-dirty marker before the
+commit and refreshes `logs/agent-observability-report.html` as a private self-contained file. Startup reconciles
+a surviving marker. Refresh uses bounded exponential retries, leaves the marker for a later retry, and reports a
+degraded health state after exhaustion. A failure never turns raw input into a fallback log or file.
 
 ## Manual imports
 

@@ -125,16 +125,18 @@ Codex config는 `$CODEX_HOME/config.toml` 또는 기본 `~/.codex/config.toml`�
 | `otel.log_user_prompt` | `false` |
 | `otel.environment` | `local` |
 
-Connect는 기존 managed value가 없거나 정확히 같은 경우에만 진행한다. 연결 전 config의 존재 여부,
-exact bytes, SHA-256와 permission mode를
+Connect는 기존 managed value가 없거나 정확히 같은 경우에만 진행한다. 연결 전과 연결 직후 config의
+존재 여부, exact bytes, SHA-256와 permission mode를
 `<root>/runtime/integrations/codex/codex-config-ownership-v1.json`에 private snapshot으로 보존한 뒤
-compare-before-replace 방식으로 원자 교체한다. 기존 다른 notify/exporter/privacy/environment 값을
+serialized compare/replace transaction으로 교체한다. 중간 crash는 snapshot phase와 현재 file을 비교해
+다음 lifecycle command에서 결정적으로 복구한다. 기존 다른 notify/exporter/privacy/environment 값을
 병합하거나 덮어쓰지 않고 conflict로 중단한다.
 
-Disconnect는 현재 managed value와 snapshot fingerprint가 그대로일 때만 prior bytes와 mode를 정확히
-복원한다. 연결 전 config가 없었다면 생성한 file을 제거한다. User 또는 다른 tool이 managed value를
-바꿨거나 snapshot이 손상된 경우 fail closed하며 현재 config를 임의로 복원하지 않는다. Successful
-disconnect는 LaunchAgent를 제거하지만 local observation, SQLite와 dashboard는 보존한다.
+Disconnect는 현재 config의 전체 bytes와 mode가 snapshot의 exact connected state와 같을 때만 prior
+bytes와 mode를 복원한다. 연결 전 config가 없었다면 생성한 file을 제거한다. User 또는 다른 tool이
+managed value가 아닌 설정만 바꾼 경우에도 conflict로 중단하고 그 편집을 보존한다. Successful
+disconnect는 LaunchAgent 종료와 plist 제거를 먼저 확인한 뒤 config를 복원하며 local observation,
+SQLite와 dashboard는 보존한다.
 
 ## 자주 쓰는 변경
 
