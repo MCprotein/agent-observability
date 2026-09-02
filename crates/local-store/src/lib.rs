@@ -27,6 +27,7 @@ use std::time::Duration;
 
 const DB_NAME: &str = "local-store.sqlite3";
 const PROJECTION_NAME: &str = "observations.jsonl";
+const STORE_OPEN_LOCK_NAME: &str = ".store-open.lock";
 const REPORT_RENDER_LOCK_NAME: &str = ".report-render.lock";
 pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v4";
 const REPORT_GENERATION_KEY: &str = "report_generation";
@@ -442,6 +443,7 @@ impl LocalStore {
     ) -> Result<Self, StoreError> {
         private_dir(dir)?;
         let dir = fs::canonicalize(dir)?;
+        let _open_guard = acquire_private_lock(&dir, STORE_OPEN_LOCK_NAME)?;
         let db_path = dir.join(DB_NAME);
         match private_create_new(&db_path) {
             Ok(file) => file.sync_all()?,
@@ -1255,22 +1257,7 @@ impl LocalStore {
     ///
     /// Returns [`StoreError`] when the private render lock cannot be safely acquired.
     pub fn acquire_report_render_guard(&self) -> Result<ReportRenderGuard, StoreError> {
-        let path = self.dir.join(REPORT_RENDER_LOCK_NAME);
-        if let Ok(metadata) = fs::symlink_metadata(&path)
-            && metadata.file_type().is_symlink()
-        {
-            return Err(StoreError::Symlink);
-        }
-        let mut options = OpenOptions::new();
-        options.create(true).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(no_follow_flag());
-        }
-        let file = options.open(path)?;
-        private_open_file(&file)?;
-        file.lock_exclusive()?;
+        let file = acquire_private_lock(&self.dir, REPORT_RENDER_LOCK_NAME)?;
         Ok(ReportRenderGuard { _file: file })
     }
 
@@ -1975,6 +1962,26 @@ fn lock_archive_directory(parent: &Path) -> Result<File, StoreError> {
     let file = options.open(path)?;
     private_open_file(&file)?;
     file.try_lock_exclusive()?;
+    Ok(file)
+}
+
+fn acquire_private_lock(parent: &Path, name: &str) -> Result<File, StoreError> {
+    let path = parent.join(name);
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(StoreError::Symlink);
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(no_follow_flag());
+    }
+    let file = options.open(path)?;
+    private_open_file(&file)?;
+    file.lock_exclusive()?;
     Ok(file)
 }
 
@@ -4347,24 +4354,26 @@ mod tests {
 
     #[test]
     fn concurrent_first_open_initializes_schema_once() {
-        let dir = temp_dir("concurrent-first-open");
-        let _ = fs::remove_dir_all(&dir);
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(20));
-        let handles = (0..20)
-            .map(|_| {
-                let dir = dir.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    LocalStore::open(dir).map(|store| store.counts().unwrap())
+        for round in 0..8 {
+            let dir = temp_dir(&format!("concurrent-first-open-{round}"));
+            let _ = fs::remove_dir_all(&dir);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(20));
+            let handles = (0..20)
+                .map(|_| {
+                    let dir = dir.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        LocalStore::open(dir).map(|store| store.counts().unwrap())
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        for handle in handles {
-            assert_eq!(handle.join().unwrap().unwrap(), (0, 0, 0));
+                .collect::<Vec<_>>();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap().unwrap(), (0, 0, 0));
+            }
+            LocalStore::open(&dir).unwrap();
+            let _ = fs::remove_dir_all(&dir);
         }
-        LocalStore::open(&dir).unwrap();
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -4397,6 +4406,14 @@ mod tests {
         );
         assert_eq!(
             fs::metadata(store.projection_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(dir.join(STORE_OPEN_LOCK_NAME))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -4459,6 +4476,16 @@ mod tests {
             LocalStore::open(&store_dir),
             Err(StoreError::Symlink)
         ));
+
+        let lock_store = root.join("lock-store");
+        fs::create_dir(&lock_store).unwrap();
+        fs::set_permissions(&lock_store, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&target_file, lock_store.join(STORE_OPEN_LOCK_NAME)).unwrap();
+        let lock_result = LocalStore::open(&lock_store);
+        assert!(
+            matches!(&lock_result, Err(StoreError::Symlink)),
+            "{lock_result:?}"
+        );
 
         let projection_store = root.join("projection-store");
         let store = LocalStore::open(&projection_store).unwrap();
