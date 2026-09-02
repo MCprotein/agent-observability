@@ -3,7 +3,7 @@
 기본 설정 인터페이스는 local-only web UI다. `config.json`을 직접 편집하지 않고도 모든
 runtime option을 조회하고 변경할 수 있다. 기본 runtime은 `~/.agent-observability`다.
 
-v1.8.0은 **In Progress**다. 이 문서의 `config.json` option은 기존 standalone runtime policy다.
+v1.8.0은 **Released**다. 이 문서의 `config.json` option은 standalone runtime policy다.
 Optional Codex automatic connection은 별도의 private collector settings와 exact Codex config ownership을
 사용하며 `connect`, `status`, `disconnect` 명령 또는 같은 local UI로 관리한다. Manual imports는 이
 연결 없이도 모두 동작한다.

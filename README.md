@@ -4,7 +4,7 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 외부 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.8.0 상태: In Progress.** 기존 Codex, Claude Code, Cursor private handoff 수동 import는
+> **v1.8.0 Released.** 기존 Codex, Claude Code, Cursor private handoff 수동 import는
 > daemon이나 network 없이 계속 동작한다. 선택적 Codex 자동 수집은 private CA HTTPS와
 > exact private random request header로 보호한 `127.0.0.1` OTLP/HTTP JSON receiver, bounded notify
 > supplement와 macOS LaunchAgent를 사용한다. 이 transport는 mTLS가 아니다.
@@ -15,8 +15,7 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 > script는 `agentobs setup ~/.agent-observability --no-open`처럼 root를 명시한다. 자동 연결은 이후
 > `agentobs connect codex`로 언제든 추가할 수 있다.
 
-아래 automatic 명령과 설치 경로는 v1.8.0 기준이다. release 전에는 고정 버전 installer가 아직
-게시되지 않았으므로 이 branch를 source에서 검증한다.
+아래 automatic 명령과 설치 경로는 게시된 v1.8.0 기준이다.
 
 ## 빠른 시작
 
@@ -26,18 +25,7 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 release checksum과 실행 파일 버전을 확인한 뒤 `~/.local/bin`에 원자적으로 설치하고, 현재 shell의
 profile에 PATH 블록을 한 번만 등록한다.
 
-`v1.8.0` tag가 게시되기 전 이 release branch를 검증할 때는 checkout 안에서 현재 Mac architecture용
-Rust `1.97.0` native release binary를 직접 실행한다. 이 경로는 기존 설치 파일을 덮어쓰지 않는다.
-이 경우 아래 빠른 시작의 `agentobs` 명령도 모두 `target/release/agent-observability`로 실행해야 하며,
-전역 PATH에 남아 있는 이전 버전을 섞어 사용하지 않는다.
-
-```bash
-cargo +1.97.0 build --release --locked -p agent-observability-cli
-target/release/agent-observability --version
-target/release/agent-observability setup ~/.agent-observability --no-open
-```
-
-`v1.8.0`이 게시된 뒤에는 검증된 installer를 사용한다.
+검증된 v1.8.0 installer를 사용한다.
 
 ```bash
 (
@@ -121,7 +109,7 @@ local data는 유지된다.
 | 로컬 설정 UI | 지원 | UI server는 `ui` 실행 중에만 존재하며 Codex 연결과 runtime config 관리 제공 |
 | 내장 sample 체험 | 지원 | 외부 파일 없이 `demo` 한 명령으로 확인 |
 | Canonical handoff 수동 import | 지원 | 세 agent 모두 daemon과 network 없이 private JSONL import 가능 |
-| Codex 자동 연결 | v1.8.0 In Progress | macOS LaunchAgent와 private-CA HTTPS + exact private random header를 사용한 loopback OTLP/HTTP JSON + projected notify |
+| Codex 자동 연결 | 지원 (v1.8.0) | macOS LaunchAgent와 private-CA HTTPS + exact private random header를 사용한 loopback OTLP/HTTP JSON + projected notify |
 | Claude Code/Cursor 자동 연결 | TODO | 현재 자동 receiver/config 연결은 Codex만 지원 |
 | Commercial team profile | TODO | G0-G4 승인과 evidence 전에는 완료로 간주하지 않음 |
 
@@ -204,13 +192,12 @@ Codex `0.151.0` strict config load는 config parsing만 검증하며 exporter co
 telemetry delivery를 검증하지 않는다. macOS에서 client identity field가 있는 이전 config는
 exporter construction에 실패했다. 보정된 transport에서 실제 Codex process가 content-free loopback
 Responses fixture를 호출해 native telemetry를 collector와 durable report까지 전달하는 local e2e와
-구현 SHA `272783ff2e5bb6c7a10b224aa7821e571d6ca8f3`의 exact-revision 5-run evidence가 통과해 automatic
-capability entry는 `supported`다. 승격 commit의 exact-revision gate와 v1.8.0 tag, package, Release 게시
-검증은 아직 남아 있다.
+최종 source `2d2dcc004fbdf2bc7aaa487ea408ac9100456e1e`의 exact-revision 5-run evidence가 통과해 automatic
+capability entry는 `supported`다. v1.8.0 tag, Package와 public Release도 게시 검증을 마쳤다.
 
 | Agent | Pinned / verified version | 현재 지원 | 알려진 제한 |
 | --- | --- | --- | --- |
-| Codex | 수동 verified `0.150.1`; 자동 pinned `0.151.0` (implementation SHA evidence passed) | 수동 handoff + 자동 local OTLP/HTTP JSON/notify | 자동 경로는 macOS only, promotion SHA gate와 v1.8.0 publication pending |
+| Codex | 수동 verified `0.150.1`; 자동 pinned `0.151.0` (exact-source evidence passed) | 수동 handoff + 자동 local OTLP/HTTP JSON/notify | 자동 경로는 macOS only |
 | Claude Code | `2.1.248` | OTel/hook canonical handoff 수동 import | 자동 연결 TODO, user interrupt signal 미확인 |
 | Cursor | `3.17.21` | generic tool canonical handoff 수동 import | 자동 연결 TODO, 일부 shell/MCP/file event는 diagnostic-only |
 
@@ -308,7 +295,7 @@ Private CA server certificate는 정상 client가 신뢰하지 않는 loopback l
 <details>
 <summary>GitHub Packages</summary>
 
-이 경로는 `v1.8.0` package가 게시된 뒤 사용한다. GitHub Packages는 `read:packages` 권한이 있는
+GitHub Packages 설치에는 `read:packages` 권한이 있는
 personal access token(classic)이 필요하다.
 
 ```bash
