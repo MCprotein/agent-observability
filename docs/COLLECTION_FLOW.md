@@ -109,9 +109,9 @@ sequenceDiagram
     end
 ```
 
-`setup` prepares and optionally opens the private dashboard, detects a real local Codex home or executable without
-creating either as detection evidence, and only then starts the
-collector and verifies health before taking the non-conflicting Codex OTEL config
+`setup` first detects a real local Codex home or executable without creating either as detection evidence, then
+prepares and optionally opens the private dashboard. Only a detected installation starts the collector and
+verifies health before taking the non-conflicting Codex OTEL config
 ownership. A private
 LaunchAgent transaction records prior plist bytes/mode and loaded state; failure or crash restores that exact
 state instead of unconditionally removing a service. `disconnect codex` first converges the LaunchAgent to its

@@ -37,9 +37,9 @@ agentobs cursor-ingest ~/.agent-observability /path/to/private-handoff.jsonl
 agentobs report ~/.agent-observability /path/to/private-rate-table.json
 ~~~
 
-`setup` without an explicit root composes private install, store initialization, report generation and macOS
-browser open, then read-only detection of a real Codex home or executable. A detected Codex installation is
-connected automatically for `~/.agent-observability`; otherwise setup reports `codex=not_detected` without
+`setup` without an explicit root first performs read-only detection of a real Codex home or executable, then
+composes private install, store initialization, report generation and macOS browser open. A detected Codex
+installation is connected automatically for `~/.agent-observability`; otherwise setup reports `codex=not_detected` without
 creating a Codex home, config, or collector service. Dashboard preparation failure stops
 before integration mutation; connection failure can leave the already-open private dashboard in place.
 `setup --no-open` performs the same
