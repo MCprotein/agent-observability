@@ -3,7 +3,7 @@
 use agent_observability_contracts::{ContractError, ReportDtoV1};
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -65,22 +65,9 @@ impl From<io::Error> for ReportArtifactError {
 ///
 /// Returns [`ReportArtifactError`] when the DTO or embedded shell is invalid.
 pub fn render(report: &ReportDtoV1) -> Result<String, ReportArtifactError> {
-    report.validate().map_err(ReportArtifactError::Contract)?;
-    if SHELL.matches(TITLE_TOKEN).count() != 2
-        || SHELL.matches(GENERATED_AT_TOKEN).count() != 1
-        || SHELL.matches(DATA_TOKEN).count() != 1
-    {
-        return Err(ReportArtifactError::InvalidTemplate);
-    }
-    let data = serde_json::to_string(report)
-        .map_err(ReportArtifactError::Json)?
-        .replace('&', "\\u0026")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e");
-    Ok(SHELL
-        .replace(TITLE_TOKEN, &escape_html(&report.title))
-        .replace(GENERATED_AT_TOKEN, &escape_html(&report.generated_at))
-        .replace(DATA_TOKEN, &data))
+    let mut html = Vec::new();
+    write_rendered(&mut html, report)?;
+    String::from_utf8(html).map_err(|_| ReportArtifactError::InvalidTemplate)
 }
 
 /// Atomically writes one private report file inside an existing private directory.
@@ -92,24 +79,118 @@ pub fn write_private(path: &Path, report: &ReportDtoV1) -> Result<u64, ReportArt
     let parent = path.parent().ok_or(ReportArtifactError::InvalidPath)?;
     private_directory(parent)?;
     reject_output_path(path)?;
-    let html = render(report)?;
     let temporary = temporary_path(path)?;
     let mut file = private_create_new(&temporary)?;
-    if let Err(error) = (|| -> Result<(), io::Error> {
-        file.write_all(html.as_bytes())?;
+    let result = (|| -> Result<u64, ReportArtifactError> {
+        let mut writer = BufWriter::new(&mut file);
+        let bytes = write_rendered(&mut writer, report)?;
+        writer.flush()?;
+        drop(writer);
         file.sync_all()?;
-        Ok(())
-    })() {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
+        Ok(bytes)
+    })();
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
     if let Err(error) = fs::rename(&temporary, path) {
         let _ = fs::remove_file(&temporary);
         return Err(error.into());
     }
     private_file(path)?;
     File::open(parent)?.sync_all()?;
-    u64::try_from(html.len()).map_err(|_| ReportArtifactError::InvalidTemplate)
+    Ok(bytes)
+}
+
+fn write_rendered(
+    mut output: impl Write,
+    report: &ReportDtoV1,
+) -> Result<u64, ReportArtifactError> {
+    report.validate().map_err(ReportArtifactError::Contract)?;
+    if SHELL.matches(TITLE_TOKEN).count() != 2
+        || SHELL.matches(GENERATED_AT_TOKEN).count() != 1
+        || SHELL.matches(DATA_TOKEN).count() != 1
+    {
+        return Err(ReportArtifactError::InvalidTemplate);
+    }
+    let title = escape_html(&report.title);
+    let generated_at = escape_html(&report.generated_at);
+    let mut remaining = SHELL;
+    let mut bytes = 0_u64;
+    while !remaining.is_empty() {
+        let next = [TITLE_TOKEN, GENERATED_AT_TOKEN, DATA_TOKEN]
+            .into_iter()
+            .filter_map(|token| remaining.find(token).map(|offset| (offset, token)))
+            .min_by_key(|(offset, _)| *offset);
+        let Some((offset, token)) = next else {
+            write_counted(&mut output, remaining.as_bytes(), &mut bytes)?;
+            break;
+        };
+        write_counted(&mut output, &remaining.as_bytes()[..offset], &mut bytes)?;
+        match token {
+            TITLE_TOKEN => write_counted(&mut output, title.as_bytes(), &mut bytes)?,
+            GENERATED_AT_TOKEN => {
+                write_counted(&mut output, generated_at.as_bytes(), &mut bytes)?;
+            }
+            DATA_TOKEN => {
+                let mut escaped = JsonScriptWriter::new(&mut output, &mut bytes);
+                serde_json::to_writer(&mut escaped, report).map_err(ReportArtifactError::Json)?;
+            }
+            _ => return Err(ReportArtifactError::InvalidTemplate),
+        }
+        remaining = &remaining[offset + token.len()..];
+    }
+    Ok(bytes)
+}
+
+fn write_counted(output: &mut impl Write, value: &[u8], bytes: &mut u64) -> Result<(), io::Error> {
+    output.write_all(value)?;
+    *bytes = bytes.saturating_add(value.len() as u64);
+    Ok(())
+}
+
+struct JsonScriptWriter<'a, W> {
+    output: &'a mut W,
+    bytes: &'a mut u64,
+}
+
+impl<'a, W> JsonScriptWriter<'a, W> {
+    fn new(output: &'a mut W, bytes: &'a mut u64) -> Self {
+        Self { output, bytes }
+    }
+}
+
+impl<W: Write> Write for JsonScriptWriter<'_, W> {
+    fn write(&mut self, value: &[u8]) -> io::Result<usize> {
+        let mut start = 0;
+        for (index, byte) in value.iter().enumerate() {
+            let escaped: &[u8] = match byte {
+                b'&' => b"\\u0026",
+                b'<' => b"\\u003c",
+                b'>' => b"\\u003e",
+                _ => continue,
+            };
+            if start < index {
+                self.output.write_all(&value[start..index])?;
+                *self.bytes = self.bytes.saturating_add((index - start) as u64);
+            }
+            self.output.write_all(escaped)?;
+            *self.bytes = self.bytes.saturating_add(escaped.len() as u64);
+            start = index + 1;
+        }
+        if start < value.len() {
+            self.output.write_all(&value[start..])?;
+            *self.bytes = self.bytes.saturating_add((value.len() - start) as u64);
+        }
+        Ok(value.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
 }
 
 fn temporary_path(path: &Path) -> Result<PathBuf, ReportArtifactError> {
@@ -233,14 +314,43 @@ mod tests {
 
     #[test]
     fn render_embeds_validated_data_without_script_breakout() {
-        let html = render(&report("Stable </script><title> report")).unwrap();
+        let report = report("Stable </script><title> & \"report\"");
+        let html = render(&report).unwrap();
+        let legacy = {
+            let data = serde_json::to_string(&report)
+                .unwrap()
+                .replace('&', "\\u0026")
+                .replace('<', "\\u003c")
+                .replace('>', "\\u003e");
+            SHELL
+                .replace(TITLE_TOKEN, &escape_html(&report.title))
+                .replace(GENERATED_AT_TOKEN, &escape_html(&report.generated_at))
+                .replace(DATA_TOKEN, &data)
+        };
+        assert_eq!(html, legacy, "streamed renderer changed report bytes");
         assert!(html.starts_with("<!doctype html>"));
-        assert!(html.contains("Stable &lt;/script&gt;&lt;title&gt; report"));
-        assert!(html.contains("Stable \\u003c/script\\u003e\\u003ctitle\\u003e report"));
+        assert!(html.contains("Stable &lt;/script&gt;&lt;title&gt; &amp; &quot;report&quot;"));
+        assert!(
+            html.contains("Stable \\u003c/script\\u003e\\u003ctitle\\u003e \\u0026 \\\"report\\\"")
+        );
         assert!(!html.contains(TITLE_TOKEN));
         assert!(!html.contains(DATA_TOKEN));
         assert!(!html.contains("http://"));
         assert!(!html.contains("https://"));
+    }
+
+    #[test]
+    fn render_treats_template_token_text_in_values_as_literal_data() {
+        let title = format!("{TITLE_TOKEN} {GENERATED_AT_TOKEN} {DATA_TOKEN}");
+        let html = render(&report(&title)).unwrap();
+
+        for token in [TITLE_TOKEN, GENERATED_AT_TOKEN, DATA_TOKEN] {
+            assert_eq!(
+                html.matches(token).count(),
+                3,
+                "report data containing {token} was interpreted as template syntax"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -256,7 +366,13 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let output = root.join("report.html");
-        assert!(write_private(&output, &report("Private report")).unwrap() > 0);
+        let private_report = report("Private report");
+        let expected = render(&private_report).unwrap();
+        assert_eq!(
+            write_private(&output, &private_report).unwrap(),
+            expected.len() as u64
+        );
+        assert_eq!(fs::read_to_string(&output).unwrap(), expected);
         assert_eq!(
             fs::metadata(&output).unwrap().permissions().mode() & 0o777,
             0o600

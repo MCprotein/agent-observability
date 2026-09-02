@@ -8,28 +8,31 @@ use agent_observability_adapter_codex::{
 use agent_observability_adapter_cursor::{
     AdapterItem as CursorAdapterItem, read_handoff_file as read_cursor_handoff_file,
 };
-use agent_observability_application::{parse_rate_table_json, project_report};
+use agent_observability_application::{ReportProjector, parse_rate_table_json};
+use agent_observability_codex_integration::{
+    CodexIntegrationStatus, CollectorStatus, ConnectionStatus, connect as connect_integration,
+    disconnect as disconnect_integration, status as integration_status,
+};
 use agent_observability_contracts::{
     AdapterDispositionCode, AdapterDispositionKind, REPORT_DTO_VERSION, SourceCheckpoint,
     SourceObservation,
 };
 use agent_observability_contracts::{CONTRACT_MANIFEST, ContractManifest};
+use agent_observability_local_collector::{NotifyOutcome, load_settings, serve, submit_notify};
 use agent_observability_local_runtime::{
     Admission, ConfigMutationGuard, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION,
-    LocalRuntimeConfigV2, PressureSample, RuntimeControl, Singleton, StorageBudget, install, load,
-    save,
+    LocalRuntimeConfigV2, MutationGuard, PressureSample, RuntimeControl, Singleton, StorageBudget,
+    install, load, save,
 };
 use agent_observability_local_store::{
     IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore, RetentionPlan,
 };
-use agent_observability_local_ui::PreparedUi;
+use agent_observability_local_ui::{PlatformOpenError, PreparedUi, open_local_target};
 use agent_observability_static_report::write_private;
 use std::env;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -37,9 +40,15 @@ const USAGE: &str = "Agent Observability (`agentobs`, legacy alias: `agent-obser
 
 Quick start:
   agentobs demo [root] [--no-open]       Open the sample monitoring dashboard
-  agentobs setup [root] [--no-open]      Initialize a runtime and open monitoring
+  agentobs setup [--no-open]             One-click Codex setup and monitoring
+  agentobs setup <root> [--no-open]      Initialize a manual-import runtime
   agentobs dashboard [root] [--no-open]  Refresh and open the monitoring dashboard
   agentobs ui [root] [--no-open]         Open settings only
+
+Automatic collection:
+  agentobs connect codex [root]
+  agentobs status codex [root]
+  agentobs disconnect codex [root]
 
 Configuration:
   agentobs config show [root]
@@ -56,6 +65,7 @@ Maintenance:
   agentobs config-check <config-json>
   agentobs contracts|version|help";
 const REPORT_FILE_NAME: &str = "agent-observability-report.html";
+const REPORT_RENDER_RETRY_LIMIT: u32 = 4;
 const MAX_RATE_TABLE_BYTES: u64 = 1_048_576;
 const DEFAULT_ROOT_NAME: &str = ".agent-observability";
 const DEFAULT_DEMO_ROOT_NAME: &str = ".agent-observability-demo";
@@ -119,6 +129,19 @@ impl IngestResult {
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
+    if let Some(result) = run_collector_command(&arguments) {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("{message}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(output) = run_notify_command(&arguments) {
+        println!("{output}");
+        return ExitCode::SUCCESS;
+    }
     if let Some(result) = run_ui_command(&arguments) {
         return match result {
             Ok(()) => ExitCode::SUCCESS,
@@ -140,6 +163,46 @@ fn main() -> ExitCode {
     }
 }
 
+fn run_collector_command(arguments: &[String]) -> Option<Result<(), String>> {
+    let [command, root] = arguments else {
+        return None;
+    };
+    if command != "collector-serve" {
+        return None;
+    }
+    let root = Path::new(root);
+    let settings = match load_settings(root) {
+        Ok(settings) => settings,
+        Err(error) => return Some(Err(error.to_string())),
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return Some(Err(format!("collector runtime failed: {error}"))),
+    };
+    Some(
+        runtime
+            .block_on(serve(settings.options(root)))
+            .map_err(|error| error.to_string()),
+    )
+}
+
+fn run_notify_command(arguments: &[String]) -> Option<&'static str> {
+    let [command, root, payload] = arguments else {
+        return None;
+    };
+    if command != "codex-notify" {
+        return None;
+    }
+    Some(match submit_notify(Path::new(root), payload.as_bytes()) {
+        NotifyOutcome::Accepted => "notify=accepted",
+        NotifyOutcome::Rejected => "notify=rejected",
+        NotifyOutcome::Unavailable => "notify=unavailable",
+    })
+}
+
 fn run_ui_command(arguments: &[String]) -> Option<Result<(), String>> {
     let result = match arguments {
         [command] if command == "ui" => default_root().and_then(|root| settings_ui(&root, true)),
@@ -156,6 +219,7 @@ fn run_ui_command(arguments: &[String]) -> Option<Result<(), String>> {
 }
 
 fn settings_ui(root: &Path, open: bool) -> Result<(), String> {
+    let _ = prepare_dashboard(root, false)?;
     let layout = install(root).map_err(|error| error.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -186,28 +250,22 @@ fn announce_settings_ui(ui: &PreparedUi, open: bool) -> Result<(), String> {
     if !opened {
         println!("url={}", ui.url());
     }
-    println!("opened={opened}\ncollection=manual_import");
+    println!("opened={opened}\ncollection=automatic_codex_available");
     std::io::stdout()
         .flush()
         .map_err(|error| format!("settings output failed: {error}"))?;
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn open_settings_url(url: &str) -> Result<(), String> {
-    let mut child = Command::new("open")
-        .arg(url)
-        .spawn()
-        .map_err(|error| format!("settings UI open failed: {error}"))?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
+    open_settings_url_with(url, |target| open_local_target(target))
 }
 
-#[cfg(not(target_os = "macos"))]
-fn open_settings_url(_url: &str) -> Result<(), String> {
-    Err("automatic settings UI open is supported on macOS; use ui --no-open and open the reported URL".into())
+fn open_settings_url_with(
+    url: &str,
+    opener: impl FnOnce(&str) -> Result<(), PlatformOpenError>,
+) -> Result<(), String> {
+    opener(url).map_err(|error| format!("settings UI {error}"))
 }
 
 fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
@@ -321,13 +379,31 @@ fn run_onboarding(arguments: &[String]) -> Option<Result<String, String>> {
         [command, root, flag] if command == "demo" && flag == "--no-open" => {
             demo(Path::new(root), false)
         }
-        [command] if command == "setup" => default_root().and_then(|root| setup(&root, true)),
+        [command] if command == "setup" => default_root().and_then(|root| setup(&root, true, true)),
         [command, flag] if command == "setup" && flag == "--no-open" => {
-            default_root().and_then(|root| setup(&root, false))
+            default_root().and_then(|root| setup(&root, false, true))
         }
-        [command, root] if command == "setup" => setup(Path::new(root), true),
+        [command, root] if command == "setup" => setup(Path::new(root), true, false),
         [command, root, flag] if command == "setup" && flag == "--no-open" => {
-            setup(Path::new(root), false)
+            setup(Path::new(root), false, false)
+        }
+        [command, source] if command == "connect" && source == "codex" => {
+            default_root().and_then(|root| connect_codex(&root))
+        }
+        [command, source, root] if command == "connect" && source == "codex" => {
+            connect_codex(Path::new(root))
+        }
+        [command, source] if command == "disconnect" && source == "codex" => {
+            default_root().and_then(|root| disconnect_codex(&root))
+        }
+        [command, source, root] if command == "disconnect" && source == "codex" => {
+            disconnect_codex(Path::new(root))
+        }
+        [command, source] if command == "status" && source == "codex" => {
+            default_root().and_then(|root| codex_status(&root))
+        }
+        [command, source, root] if command == "status" && source == "codex" => {
+            codex_status(Path::new(root))
         }
         [command] if command == "dashboard" => {
             default_root().and_then(|root| dashboard(&root, true))
@@ -415,14 +491,93 @@ fn require_demo_ingest(ingest: &IngestResult) -> Result<(), String> {
     }
 }
 
-fn setup(root: &Path, open: bool) -> Result<String, String> {
+fn setup(root: &Path, open: bool, automatic: bool) -> Result<String, String> {
+    setup_with(root, open, automatic, prepare_dashboard, connect_codex)
+}
+
+fn setup_with(
+    root: &Path,
+    open: bool,
+    automatic: bool,
+    prepare: impl FnOnce(&Path, bool) -> Result<PathBuf, String>,
+    connect: impl FnOnce(&Path) -> Result<String, String>,
+) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let dashboard = prepare_dashboard(&layout.root, open)?;
+    let dashboard = prepare(&layout.root, open)?;
+    let connection = automatic.then(|| connect(&layout.root)).transpose()?;
     Ok(format!(
-        "status=ready\nroot={}\ndashboard={}\ncollection=manual_import\nopened={open}",
+        "status=ready\nroot={}\ndashboard={}\ncollection={}\nopened={open}{}",
         layout.root.display(),
-        dashboard.display()
+        dashboard.display(),
+        if automatic {
+            "automatic_codex"
+        } else {
+            "manual_import"
+        },
+        connection.map_or_else(String::new, |output| format!("\n{output}"))
     ))
+}
+
+fn connect_codex(root: &Path) -> Result<String, String> {
+    let status =
+        connect_integration(root, &installed_executable()?).map_err(|error| error.to_string())?;
+    Ok(format!(
+        "integration=codex\nconfig={}\ncollector={}\nendpoint={}\nservice={}\nmanual_import=available",
+        connection_status(status.config),
+        collector_status(status.collector),
+        status.endpoint.as_deref().unwrap_or_default(),
+        status.service.as_deref().unwrap_or_default()
+    ))
+}
+
+fn disconnect_codex(root: &Path) -> Result<String, String> {
+    let status = disconnect_integration(root, &installed_executable()?)
+        .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "integration=codex\nconfig={}\ncollector=stopped\ndata=retained",
+        connection_status(status.config)
+    ))
+}
+
+fn codex_status(root: &Path) -> Result<String, String> {
+    let status =
+        integration_status(root, &installed_executable()?).map_err(|error| error.to_string())?;
+    Ok(format_codex_status(&status))
+}
+
+fn format_codex_status(status: &CodexIntegrationStatus) -> String {
+    let mut output = format!(
+        "integration=codex\nconfig={}\ncollector={}",
+        connection_status(status.config),
+        collector_status(status.collector),
+    );
+    if let Some(endpoint) = &status.endpoint {
+        output.push_str("\nendpoint=");
+        output.push_str(endpoint);
+    }
+    output
+}
+
+fn installed_executable() -> Result<PathBuf, String> {
+    env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|error| format!("cannot resolve the installed agentobs executable: {error}"))
+}
+
+const fn connection_status(status: ConnectionStatus) -> &'static str {
+    match status {
+        ConnectionStatus::Connected => "connected",
+        ConnectionStatus::Disconnected => "disconnected",
+        ConnectionStatus::Conflict => "conflict",
+    }
+}
+
+const fn collector_status(status: CollectorStatus) -> &'static str {
+    match status {
+        CollectorStatus::Ready => "ready",
+        CollectorStatus::Degraded => "degraded",
+        CollectorStatus::Unavailable => "unavailable",
+    }
 }
 
 fn dashboard(root: &Path, open: bool) -> Result<String, String> {
@@ -450,34 +605,25 @@ fn prepare_dashboard_with(
 
 fn current_record_count(root: &Path) -> Result<usize, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let config = load(&layout.config).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let store = open_store(&layout, &config)?;
+    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let store = open_store(&mutation, &layout, &config)?;
     store
         .current_records()
         .map(|records| records.len())
         .map_err(|error| error.to_string())
 }
 
-#[cfg(target_os = "macos")]
 fn open_dashboard(path: &Path) -> Result<(), String> {
-    let status = Command::new("open")
-        .arg(path)
-        .status()
-        .map_err(|error| format!("dashboard open failed: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("dashboard open failed with status {status}"))
-    }
+    open_dashboard_with(path, |target| open_local_target(target))
 }
 
-#[cfg(not(target_os = "macos"))]
-fn open_dashboard(_path: &Path) -> Result<(), String> {
-    Err(
-        "dashboard open is supported on macOS; use setup --no-open and open the reported file"
-            .into(),
-    )
+fn open_dashboard_with(
+    path: &Path,
+    opener: impl FnOnce(&Path) -> Result<(), PlatformOpenError>,
+) -> Result<(), String> {
+    opener(path).map_err(|error| format!("dashboard {error}"))
 }
 
 fn show_config(root: &Path) -> Result<String, String> {
@@ -549,9 +695,10 @@ fn config_output(layout: &InstalledLayout, config: &LocalRuntimeConfigV2) -> Str
 
 fn storage_check(root: &Path) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let config = load(&layout.config).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let store = open_store(&layout, &config)?;
+    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let store = open_store(&mutation, &layout, &config)?;
     let (observations, records, outcomes) = store.counts().map_err(|error| error.to_string())?;
     Ok(format!(
         "store_schema={LOCAL_STORE_SCHEMA_VERSION}\nobservations={observations}\nrecords={records}\ndelivery_outcomes={outcomes}\nteam_ingest=disabled"
@@ -559,6 +706,7 @@ fn storage_check(root: &Path) -> Result<String, String> {
 }
 
 fn open_store(
+    _mutation: &MutationGuard,
     layout: &InstalledLayout,
     config: &LocalRuntimeConfigV2,
 ) -> Result<LocalStore, String> {
@@ -575,9 +723,10 @@ fn retention(root: &Path, apply: Option<(&str, &Path)>) -> Result<String, String
     let apply = apply
         .map(|(plan_id, path)| normalize_archive_path(&layout.root, plan_id, path))
         .transpose()?;
-    let config = load(&layout.config).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let store = open_store(&layout, &config)?;
+    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let store = open_store(&mutation, &layout, &config)?;
     let now_unix_ms = current_unix_ms()?;
     let retention_ms = u64::from(config.retention.max_record_age_days)
         .checked_mul(86_400_000)
@@ -664,30 +813,63 @@ fn report_command(arguments: &[String]) -> Result<String, String> {
 
 fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let config = load(&layout.config).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let store = open_store(&layout, &config)?;
-    let records = store.current_records().map_err(|error| error.to_string())?;
+    let store = open_report_store(&layout)?;
     let rate_table = rate_table_path
         .map(read_private_rate_table)
         .transpose()?
         .map(|body| parse_rate_table_json(&body).map_err(|error| error.to_string()))
         .transpose()?;
-    let report = project_report(
-        &records,
-        current_timestamp()?,
-        "Agent Observability Report",
-        rate_table.as_ref(),
-    )
-    .map_err(|error| error.to_string())?;
     let output_path = layout.logs.join(REPORT_FILE_NAME);
-    let bytes = write_private(&output_path, &report).map_err(|error| error.to_string())?;
+    let _render_guard = store
+        .acquire_report_render_guard()
+        .map_err(|error| error.to_string())?;
+    let mut rendered = None;
+    for _ in 0..REPORT_RENDER_RETRY_LIMIT {
+        let capacity = usize::try_from(store.record_count().map_err(|error| error.to_string())?)
+            .map_err(|_| "report record count exceeds this platform".to_string())?;
+        let mut projector = ReportProjector::new(capacity, rate_table.as_ref());
+        let mut projection_error = None;
+        let visit = match store.visit_report_snapshot(|index, record| {
+            if projection_error.is_none()
+                && let Err(error) = projector.push_owned(index, record)
+            {
+                projection_error = Some(error);
+            }
+        }) {
+            Ok(visit) => visit,
+            Err(agent_observability_local_store::StoreError::ReportSnapshotChanged) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if let Some(error) = projection_error {
+            return Err(error.to_string());
+        }
+        let report = projector
+            .finish(current_timestamp()?, "Agent Observability Report")
+            .map_err(|error| error.to_string())?;
+        let bytes = write_private(&output_path, &report).map_err(|error| error.to_string())?;
+        if store
+            .acknowledge_report_generation(visit.generation)
+            .map_err(|error| error.to_string())?
+        {
+            rendered = Some((visit.records, report.cost.status, bytes));
+            break;
+        }
+    }
+    let (record_count, cost_status, bytes) = rendered
+        .ok_or_else(|| "report authority changed during every render attempt".to_string())?;
     Ok(format!(
         "report_schema={REPORT_DTO_VERSION}\nrecords={}\ncost_status={}\nreport={}\nbytes={bytes}\nteam_ingest=disabled",
-        records.len(),
-        report.cost.status,
+        record_count,
+        cost_status,
         output_path.display()
     ))
+}
+
+fn open_report_store(layout: &InstalledLayout) -> Result<LocalStore, String> {
+    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    open_store(&mutation, layout, &config)
 }
 
 fn read_private_rate_table(path: &Path) -> Result<String, String> {
@@ -785,9 +967,10 @@ fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 
 fn runtime_check(root: &Path) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let config = load(&layout.config).map_err(|error| error.to_string())?;
     let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let store = open_store(&layout, &config)?;
+    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let store = open_store(&mutation, &layout, &config)?;
     drop(store);
     let allocated =
         StorageBudget::allocated_tree_bytes(&layout.root).map_err(|error| error.to_string())?;
@@ -819,17 +1002,18 @@ fn ingest_items<'a>(
     items: impl Iterator<Item = IngestItem<'a>>,
 ) -> Result<IngestResult, String> {
     let paths = ingest_paths(Path::new(directory))?;
-    let _singleton =
-        Singleton::acquire(&paths.runtime_directory).map_err(|error| error.to_string())?;
-    let mut control = RuntimeControl::new(&paths.config).map_err(|error| error.to_string())?;
+    let _mutation =
+        MutationGuard::acquire(&paths.runtime_directory).map_err(|error| error.to_string())?;
+    let config = load(&paths.config_path).map_err(|error| error.to_string())?;
+    let mut control = RuntimeControl::new(&config).map_err(|error| error.to_string())?;
     let items = items.collect::<Vec<_>>();
-    if !paths.config.enabled {
+    if !config.enabled {
         return Ok(IngestResult::blocked(
             source,
             IngestBlock::CollectionDisabled,
         ));
     }
-    if items.len() > usize::from(paths.config.collection.max_batch_records) {
+    if items.len() > usize::from(config.collection.max_batch_records) {
         return Ok(IngestResult::blocked(source, IngestBlock::Policy));
     }
     let allocated = StorageBudget::allocated_tree_bytes(&paths.accounting_root)
@@ -850,7 +1034,7 @@ fn ingest_items<'a>(
             &paths.accounting_root,
             ingest_reservation_bytes(
                 &paths.store_directory,
-                u64::from(paths.config.collection.max_batch_bytes),
+                u64::from(config.collection.max_batch_bytes),
             )?,
         )
         .map_err(|error| error.to_string())?
@@ -925,7 +1109,7 @@ fn ingest_reservation_bytes(store_directory: &Path, batch_bytes: u64) -> Result<
 }
 
 struct IngestPaths {
-    config: LocalRuntimeConfigV2,
+    config_path: PathBuf,
     accounting_root: PathBuf,
     runtime_directory: PathBuf,
     store_directory: PathBuf,
@@ -933,9 +1117,8 @@ struct IngestPaths {
 
 fn ingest_paths(path: &Path) -> Result<IngestPaths, String> {
     let layout = install(path).map_err(|error| error.to_string())?;
-    let config = load(&layout.config).map_err(|error| error.to_string())?;
     Ok(IngestPaths {
-        config,
+        config_path: layout.config,
         accounting_root: layout.root,
         runtime_directory: layout.runtime,
         store_directory: layout.state.join("store"),
@@ -946,8 +1129,14 @@ fn ingest_paths(path: &Path) -> Result<IngestPaths, String> {
 mod tests {
     use super::{
         IngestBlock, IngestResult, LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME,
-        prepare_dashboard_with, require_demo_ingest, run, timestamp_from_duration,
+        format_codex_status, open_dashboard_with, open_settings_url_with, prepare_dashboard_with,
+        require_demo_ingest, run, setup_with, timestamp_from_duration,
     };
+    use agent_observability_codex_integration::{
+        CodexIntegrationStatus, CollectorStatus, ConnectionStatus,
+    };
+    use agent_observability_local_runtime::{MutationGuard, install};
+    use agent_observability_local_ui::PlatformOpenError;
     use std::fs;
     use std::path::Path;
     use std::time::Duration;
@@ -963,6 +1152,22 @@ mod tests {
     fn unknown_command_fails_closed() {
         assert!(run(["serve".into()].into_iter()).is_err());
         assert!(run(["storage-check".into()].into_iter()).is_err());
+    }
+
+    #[test]
+    fn codex_status_preserves_conflict_and_degraded_without_an_endpoint() {
+        let output = format_codex_status(&CodexIntegrationStatus {
+            config: ConnectionStatus::Conflict,
+            collector: CollectorStatus::Degraded,
+            endpoint: None,
+            service: None,
+            data_retained: true,
+        });
+
+        assert_eq!(
+            output,
+            "integration=codex\nconfig=conflict\ncollector=degraded"
+        );
     }
 
     #[cfg(unix)]
@@ -1010,6 +1215,53 @@ mod tests {
             fs::metadata(dashboard).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn automatic_setup_connects_only_after_dashboard_preparation_succeeds() {
+        use std::cell::RefCell;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-setup-order-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let events = RefCell::new(Vec::new());
+        let error = setup_with(
+            &root,
+            false,
+            true,
+            |_, _| {
+                events.borrow_mut().push("dashboard");
+                Err("dashboard failed".into())
+            },
+            |_| {
+                events.borrow_mut().push("connect");
+                Ok("connected".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "dashboard failed");
+        assert_eq!(*events.borrow(), ["dashboard"]);
+
+        let dashboard = root.join("logs").join(REPORT_FILE_NAME);
+        let output = setup_with(
+            &root,
+            false,
+            true,
+            |_, _| {
+                events.borrow_mut().push("dashboard");
+                Ok(dashboard.clone())
+            },
+            |_| {
+                events.borrow_mut().push("connect");
+                Ok("connected".into())
+            },
+        )
+        .unwrap();
+        assert!(output.contains("collection=automatic_codex"));
+        assert_eq!(*events.borrow(), ["dashboard", "dashboard", "connect"]);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1079,6 +1331,23 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn report_store_preparation_does_not_retain_the_mutation_guard() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-report-lock-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let store = super::open_report_store(&layout).unwrap();
+        let render = store.acquire_report_render_guard().unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        drop(mutation);
+        drop(render);
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn dashboard_invokes_opener_with_the_generated_report_path() {
@@ -1098,6 +1367,46 @@ mod tests {
         .unwrap();
         assert_eq!(opened.into_inner().as_deref(), Some(dashboard.as_path()));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_open_wrappers_preserve_targets_and_content_free_errors() {
+        let settings = open_settings_url_with("http://127.0.0.1:3000/settings", |url| {
+            assert_eq!(url, "http://127.0.0.1:3000/settings");
+            Err(PlatformOpenError::TimedOut)
+        })
+        .unwrap_err();
+        assert_eq!(settings, "settings UI automatic open timed out");
+
+        let report = Path::new("/private/AUTOMATIC_PRIVATE_TARGET_SENTINEL.html");
+        let dashboard = open_dashboard_with(report, |path| {
+            assert_eq!(path, report);
+            Err(PlatformOpenError::ExitFailed)
+        })
+        .unwrap_err();
+        assert_eq!(dashboard, "dashboard automatic open failed");
+        assert!(!dashboard.contains("AUTOMATIC_PRIVATE_TARGET_SENTINEL"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn cli_open_wrappers_report_unsupported_platform_without_target_content() {
+        let settings = super::open_settings_url("AUTOMATIC_PRIVATE_SETTINGS_SENTINEL").unwrap_err();
+        assert_eq!(
+            settings,
+            "settings UI automatic open is unsupported on this platform"
+        );
+        assert!(!settings.contains("AUTOMATIC_PRIVATE_SETTINGS_SENTINEL"));
+
+        let dashboard = super::open_dashboard(Path::new(
+            "/private/AUTOMATIC_PRIVATE_DASHBOARD_SENTINEL.html",
+        ))
+        .unwrap_err();
+        assert_eq!(
+            dashboard,
+            "dashboard automatic open is unsupported on this platform"
+        );
+        assert!(!dashboard.contains("AUTOMATIC_PRIVATE_DASHBOARD_SENTINEL"));
     }
 
     #[cfg(unix)]

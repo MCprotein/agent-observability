@@ -5,9 +5,12 @@ members = [
     "crates/adapter-cursor",
     "crates/application",
     "crates/cli",
+    "crates/codex-config",
+    "crates/codex-integration",
     "crates/contracts",
     "crates/domain",
     "crates/local-runtime",
+    "crates/local-collector",
     "crates/local-store",
     "crates/local-ui",
     "crates/static-report",
@@ -16,7 +19,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.97"
@@ -28,3 +31,9 @@ missing_debug_implementations = "deny"
 [workspace.lints.clippy]
 all = "deny"
 pedantic = "deny"
+
+[workspace.dependencies]
+rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = { version = "=0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
+time = "=0.3.47"

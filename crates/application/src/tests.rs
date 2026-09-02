@@ -224,6 +224,37 @@ fn report_projection_rejects_any_invalid_input_record() {
 }
 
 #[test]
+fn owned_report_projection_matches_borrowed_projection() {
+    let mut first = full("gpt-test");
+    first.trace_id = "trace-a".into();
+    first.span_id = "span-a".into();
+    first.attributes.session_id = Some(ScalarValueV1::String("session-a".into()));
+    first.content.prompt = Some(agent_observability_contracts::JsonValue::String(
+        "OWNED_RAW_SENTINEL".into(),
+    ));
+    let mut second = full("gpt-incomplete");
+    second.trace_id = "trace-b".into();
+    second.span_id = "span-b".into();
+    second.start_time_unix_ms = 1.0;
+    let records = vec![first, second];
+
+    let borrowed = project_report(&records, "generated", "title", Some(&table())).unwrap();
+    let rates = table();
+    let mut owned_projector = ReportProjector::new(0, Some(&rates));
+    for (index, record) in records.into_iter().enumerate() {
+        owned_projector.push_owned(index, record).unwrap();
+    }
+    let owned = owned_projector.finish("generated", "title").unwrap();
+
+    assert_eq!(owned, borrowed);
+    assert!(
+        !serde_json::to_string(&owned)
+            .unwrap()
+            .contains("OWNED_RAW_SENTINEL")
+    );
+}
+
+#[test]
 fn report_projection_rejects_fractional_summary_metrics() {
     let mut record = span("gpt-test", MetricsV1::default());
     record.metrics.latency_ms = Some(1.5);

@@ -4,7 +4,7 @@ import { access, chmod, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
-import { chromium, type Request } from "playwright-core";
+import { chromium, type Page, type Request } from "playwright-core";
 
 const execute = promisify(execFile);
 
@@ -35,6 +35,7 @@ try {
   const screenshotDirectory = process.env.SETTINGS_SCREENSHOT_DIR ?? directory;
 
   const bootstrapFailurePage = await browser.newPage({ viewport: { width: 800, height: 600 } });
+  await mockCodexApi(bootstrapFailurePage);
   const bootstrapFailures: Request[] = [];
   const bootstrapPageErrors: string[] = [];
   bootstrapFailurePage.on("requestfailed", (request) => bootstrapFailures.push(request));
@@ -51,7 +52,22 @@ try {
   assert.deepEqual(bootstrapPageErrors, []);
   await bootstrapFailurePage.close();
 
+  const optionalIntegrationFailurePage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  await mockCodexApi(optionalIntegrationFailurePage, { failStatus: true });
+  await optionalIntegrationFailurePage.goto(url, { waitUntil: "networkidle" });
+  await optionalIntegrationFailurePage.locator("#settings-form").waitFor();
+  await optionalIntegrationFailurePage.locator(".integration-panel[data-state='unavailable']").waitFor();
+  assert.equal(
+    await optionalIntegrationFailurePage.locator(".integration-identity strong").innerText(),
+    "상태 확인 불가",
+  );
+  assert.equal(await optionalIntegrationFailurePage.locator("#save").isVisible(), true);
+  assert.equal(await optionalIntegrationFailurePage.locator("#refresh-integration").isVisible(), true);
+  assert.equal(await optionalIntegrationFailurePage.evaluate(() => sessionStorage.length), 1);
+  await optionalIntegrationFailurePage.close();
+
   const mutationFailurePage = await browser.newPage({ viewport: { width: 800, height: 600 } });
+  await mockCodexApi(mutationFailurePage);
   await mutationFailurePage.route(`${origin}/api/config`, (route) => {
     if (route.request().method() === "PUT") return route.abort("connectionfailed");
     return route.continue();
@@ -63,12 +79,121 @@ try {
   assert.equal(await mutationFailurePage.evaluate(() => sessionStorage.length), 0);
   await mutationFailurePage.close();
 
+  const lifecyclePage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+  const lifecycle = await mockCodexApi(lifecyclePage, {
+    startConflicted: true,
+    failConnect: true,
+    conflictDisconnect: true,
+  });
+  let dashboardFailures = 1;
+  let dashboardOpenCount = 0;
+  let settingsShutdownCount = 0;
+  await lifecyclePage.route(`${origin}/api/dashboard/open`, async (route) => {
+    dashboardOpenCount += 1;
+    if (dashboardFailures > 0) {
+      dashboardFailures -= 1;
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "report_unavailable", message: "injected report failure" }),
+      });
+      return;
+    }
+    await route.fulfill({ status: 204 });
+  });
+  await lifecyclePage.route(`${origin}/api/shutdown`, async (route) => {
+    settingsShutdownCount += 1;
+    await route.fulfill({ status: 204 });
+  });
+  await lifecyclePage.goto(url, { waitUntil: "networkidle" });
+  await lifecyclePage.locator(".integration-panel[data-state='conflict']").waitFor();
+  assert.match(await lifecyclePage.locator(".integration-identity strong").innerText(), /설정 충돌/);
+
+  await lifecyclePage.locator("#toggle-integration").click();
+  await lifecyclePage.locator("#toast").filter({ hasText: "injected connect failure" }).waitFor();
+  assert.equal(await lifecyclePage.locator("#toggle-integration").isEnabled(), true);
+  assert.equal(lifecycle.status.config, "conflict");
+
+  await lifecyclePage.locator("#toggle-integration").click();
+  await lifecyclePage.locator(".integration-panel[data-state='ready']").waitFor();
+  assert.match(await lifecyclePage.locator(".integration-identity strong").innerText(), /수집 중/);
+  assert.equal(lifecycle.launchAgentRunning, true);
+  assert.equal(await lifecyclePage.locator("#toggle-integration").innerText(), "연결 해제");
+
+  lifecycle.status = degradedStatus();
+  await lifecyclePage.reload({ waitUntil: "networkidle" });
+  await lifecyclePage.locator(".integration-panel[data-state='degraded']").waitFor();
+  assert.match(
+    await lifecyclePage.locator(".integration-identity strong").innerText(),
+    /리포트 반영 지연/,
+  );
+  assert.match(await lifecyclePage.locator(".integration-meta").innerText(), /리포트 지연/);
+  assert.doesNotMatch(await lifecyclePage.locator(".integration-meta").innerText(), /정상/);
+  assert.equal(await lifecyclePage.locator("#toggle-integration").innerText(), "연결 해제");
+
+  await lifecyclePage.locator("#overview-dashboard").click();
+  await lifecyclePage.locator("#toast").filter({ hasText: "injected report failure" }).waitFor();
+  await lifecyclePage.locator("#open-dashboard").click();
+  await lifecyclePage.locator("#toast").filter({ hasText: "모니터링 리포트를 열었습니다" }).waitFor();
+  assert.equal(dashboardOpenCount, 2);
+
+  await lifecyclePage.locator("#toggle-integration").click();
+  await lifecyclePage.locator("#toast").filter({ hasText: "injected disconnect conflict" }).waitFor();
+  assert.equal(lifecycle.status.config, "connected");
+  assert.equal(lifecycle.launchAgentRunning, true);
+  assert.equal(await lifecyclePage.locator("#toggle-integration").isEnabled(), true);
+  await lifecyclePage.locator("#toggle-integration").click();
+  await lifecyclePage.locator(".integration-panel[data-state='idle']").waitFor();
+  assert.equal(lifecycle.status.config, "disconnected");
+  assert.equal(lifecycle.launchAgentRunning, false);
+
+  await lifecyclePage.locator("#toggle-integration").click();
+  await lifecyclePage.locator(".integration-panel[data-state='ready']").waitFor();
+  assert.equal(lifecycle.launchAgentRunning, true);
+  const disconnectCountBeforeClose = lifecycle.methods.filter((method) => method === "DELETE").length;
+  await lifecyclePage.locator("#close-session").click();
+  await lifecyclePage.locator("text=설정 세션이 종료되었습니다").waitFor();
+  assert.equal(settingsShutdownCount, 1);
+  assert.equal(lifecycle.launchAgentRunning, true);
+  assert.equal(
+    lifecycle.methods.filter((method) => method === "DELETE").length,
+    disconnectCountBeforeClose,
+  );
+  assert.equal(await lifecyclePage.evaluate(() => sessionStorage.length), 0);
+  await lifecyclePage.close();
+
+  for (const lifecycleMethod of ["POST", "DELETE"] as const) {
+    const delayedLifecyclePage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+    const delayedLifecycle = await mockCodexApi(delayedLifecyclePage, {
+      startConnected: lifecycleMethod === "DELETE",
+      delayedMethod: lifecycleMethod,
+    });
+    await delayedLifecyclePage.route(`${origin}/api/shutdown`, async (route) => {
+      await route.fulfill({ status: 204 });
+    });
+    await delayedLifecyclePage.goto(url, { waitUntil: "networkidle" });
+    await delayedLifecyclePage.locator("#toggle-integration").click();
+    await delayedLifecycle.waitForStart();
+    await delayedLifecyclePage.locator("#close-session").click();
+    await delayedLifecyclePage.locator("text=설정 세션이 종료되었습니다").waitFor();
+    delayedLifecycle.complete();
+    await delayedLifecycle.waitForCompletion();
+    await delayedLifecyclePage.evaluate(() => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    }));
+    assert.equal(await delayedLifecyclePage.locator("text=설정 세션이 종료되었습니다").count(), 1);
+    assert.equal(await delayedLifecyclePage.locator("#overview-title").count(), 0);
+    assert.equal(await delayedLifecyclePage.evaluate(() => sessionStorage.length), 0);
+    await delayedLifecyclePage.close();
+  }
+
   for (const testCase of [
     { name: "desktop", viewport: { width: 1440, height: 900 } },
     { name: "mobile", viewport: { width: 390, height: 844 } },
     { name: "compact", viewport: { width: 320, height: 800 } },
   ]) {
     const page = await browser.newPage({ viewport: testCase.viewport });
+    await mockCodexApi(page);
     const consoleErrors: string[] = [];
     const expectedApiErrors: string[] = [];
     const pageErrors: string[] = [];
@@ -376,4 +501,134 @@ function rectanglesOverlap(first: DOMRect, second: DOMRect): boolean {
     first.bottom <= second.top ||
     second.bottom <= first.top
   );
+}
+
+type IntegrationStatus = {
+  config: "connected" | "disconnected" | "conflict";
+  collector: "ready" | "degraded" | "unavailable";
+  endpoint?: string;
+  service?: string;
+  data_retained: boolean;
+};
+
+type MockCodexOptions = {
+  startConflicted?: boolean;
+  startConnected?: boolean;
+  failConnect?: boolean;
+  conflictDisconnect?: boolean;
+  delayedMethod?: "POST" | "DELETE";
+  failStatus?: boolean;
+};
+
+async function mockCodexApi(page: Page, options: MockCodexOptions = {}) {
+  let startLifecycle: (() => void) | undefined;
+  const lifecycleStarted = new Promise<void>((resolve) => {
+    startLifecycle = resolve;
+  });
+  let completeLifecycle: (() => void) | undefined;
+  const lifecycleCompletion = new Promise<void>((resolve) => {
+    completeLifecycle = resolve;
+  });
+  let releaseLifecycle: (() => void) | undefined;
+  const lifecycleRelease = new Promise<void>((resolve) => {
+    releaseLifecycle = resolve;
+  });
+  const lifecycle = {
+    status: options.startConflicted
+      ? conflictStatus()
+      : options.startConnected
+        ? connectedStatus()
+        : disconnectedStatus(),
+    launchAgentRunning: options.startConnected ?? false,
+    methods: [] as string[],
+    waitForStart: () => lifecycleStarted,
+    complete: () => releaseLifecycle?.(),
+    waitForCompletion: () => lifecycleCompletion,
+  };
+  let failConnect = options.failConnect ?? false;
+  let conflictDisconnect = options.conflictDisconnect ?? false;
+  await page.route("**/api/integrations/codex", async (route) => {
+    const method = route.request().method();
+    lifecycle.methods.push(method);
+    if (method === "GET" && options.failStatus) {
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "integration_failed", message: "fixed integration failure" }),
+      });
+      return;
+    }
+    if (method === options.delayedMethod) {
+      startLifecycle?.();
+      await lifecycleRelease;
+    }
+    if (method === "POST" && failConnect) {
+      failConnect = false;
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "integration_failed", message: "injected connect failure" }),
+      });
+      return;
+    }
+    if (method === "DELETE" && conflictDisconnect) {
+      conflictDisconnect = false;
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "integration_conflict", message: "injected disconnect conflict" }),
+      });
+      return;
+    }
+    if (method === "POST") {
+      lifecycle.launchAgentRunning = true;
+      lifecycle.status = connectedStatus();
+    } else if (method === "DELETE") {
+      lifecycle.launchAgentRunning = false;
+      lifecycle.status = disconnectedStatus();
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(lifecycle.status),
+    });
+    if (method === options.delayedMethod) completeLifecycle?.();
+  });
+  return lifecycle;
+}
+
+function connectedStatus(): IntegrationStatus {
+  return {
+    config: "connected",
+    collector: "ready",
+    endpoint: "https://127.0.0.1:4318/v1/logs",
+    service: "dev.agent-observability.collector",
+    data_retained: true,
+  };
+}
+
+function degradedStatus(): IntegrationStatus {
+  return {
+    config: "connected",
+    collector: "degraded",
+    endpoint: "https://127.0.0.1:4318/v1/logs",
+    service: "dev.agent-observability.collector",
+    data_retained: true,
+  };
+}
+
+function disconnectedStatus(): IntegrationStatus {
+  return {
+    config: "disconnected",
+    collector: "unavailable",
+    data_retained: true,
+  };
+}
+
+function conflictStatus(): IntegrationStatus {
+  return {
+    config: "conflict",
+    collector: "unavailable",
+    data_retained: true,
+  };
 }

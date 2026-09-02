@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
+use agent_observability_codex_integration::{
+    CodexIntegrationStatus, IntegrationError, connect as connect_codex,
+    disconnect as disconnect_codex, status as codex_status,
+};
+use agent_observability_local_collector::REPORT_FILE_NAME;
 use agent_observability_local_runtime::{
     ConfigServiceError, InstalledLayout, LocalConfigService, LocalRuntimeConfigV2, Singleton,
     VersionedLocalConfig,
@@ -17,7 +22,13 @@ use axum::{
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
+#[cfg(any(target_os = "macos", test))]
+use std::process::{Child, Command, Stdio};
 use std::{
+    env,
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -35,6 +46,12 @@ const MAX_SESSION_LIFETIME: Duration = Duration::from_hours(1);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "macos")]
+const PLATFORM_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(target_os = "macos", test))]
+const PLATFORM_OPENER_PATH: &str = "/usr/bin/open";
+#[cfg(any(target_os = "macos", test))]
+const PLATFORM_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CONNECTIONS: usize = 64;
 const SETTINGS_SHELL: &str = include_str!("generated/settings-shell.html");
 const SETTINGS_SCRIPT: &str = include_str!("generated/settings-ui.js");
@@ -58,6 +75,35 @@ impl std::fmt::Display for UiError {
 }
 
 impl std::error::Error for UiError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformOpenError {
+    UnsupportedPlatform,
+    SpawnFailed,
+    ExitFailed,
+    WaitFailed,
+    TimedOut,
+    TerminateFailed,
+    ReapFailed,
+    ReapTimedOut,
+}
+
+impl std::fmt::Display for PlatformOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedPlatform => "automatic open is unsupported on this platform",
+            Self::TimedOut => "automatic open timed out",
+            Self::SpawnFailed
+            | Self::ExitFailed
+            | Self::WaitFailed
+            | Self::TerminateFailed
+            | Self::ReapFailed
+            | Self::ReapTimedOut => "automatic open failed",
+        })
+    }
+}
+
+impl std::error::Error for PlatformOpenError {}
 
 impl From<std::io::Error> for UiError {
     fn from(error: std::io::Error) -> Self {
@@ -163,6 +209,7 @@ impl PreparedUi {
 #[derive(Clone, Debug)]
 struct AppState {
     config: LocalConfigService,
+    root: PathBuf,
     host: String,
     origin: String,
     token: String,
@@ -241,6 +288,7 @@ pub async fn prepare(layout: &InstalledLayout) -> Result<PreparedUi, UiError> {
     let last_seen = Arc::new(Mutex::new(Instant::now()));
     let state = AppState {
         config: LocalConfigService::new(layout),
+        root: layout.root.clone(),
         host,
         origin: origin.clone(),
         token: token.clone(),
@@ -266,6 +314,13 @@ fn router(state: AppState) -> Router {
         .route("/assets/app.css", get(style))
         .route("/favicon.ico", get(empty))
         .route("/api/config", get(get_config).put(put_config))
+        .route(
+            "/api/integrations/codex",
+            get(get_codex_integration)
+                .post(connect_codex_integration)
+                .delete(disconnect_codex_integration),
+        )
+        .route("/api/dashboard/open", post(open_dashboard))
         .route("/api/heartbeat", post(heartbeat))
         .route("/api/shutdown", post(shutdown))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -325,6 +380,188 @@ async fn put_config(
         .map_err(|_| config_error(ConfigServiceError::Unavailable))?
         .map_err(config_error)?;
     Ok(Json(envelope(saved)))
+}
+
+async fn get_codex_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<CodexIntegrationStatus>, ApiError> {
+    authorize(&state, &headers, false)?;
+    touch(&state)?;
+    run_integration(state.root, codex_status).await.map(Json)
+}
+
+async fn connect_codex_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<CodexIntegrationStatus>, ApiError> {
+    authorize(&state, &headers, true)?;
+    touch(&state)?;
+    run_integration(state.root, connect_codex).await.map(Json)
+}
+
+async fn disconnect_codex_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<CodexIntegrationStatus>, ApiError> {
+    authorize(&state, &headers, true)?;
+    touch(&state)?;
+    run_integration(state.root, disconnect_codex)
+        .await
+        .map(Json)
+}
+
+async fn run_integration(
+    root: PathBuf,
+    operation: fn(&Path, &Path) -> Result<CodexIntegrationStatus, IntegrationError>,
+) -> Result<CodexIntegrationStatus, ApiError> {
+    let executable = env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|_| integration_error())?;
+    tokio::task::spawn_blocking(move || operation(&root, &executable))
+        .await
+        .map_err(|_| integration_error())?
+        .map_err(|_| integration_error())
+}
+
+async fn open_dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    authorize(&state, &headers, true)?;
+    touch(&state)?;
+    let report = state.root.join("logs").join(REPORT_FILE_NAME);
+    tokio::task::spawn_blocking(move || open_dashboard_file(&report))
+        .await
+        .map_err(|_| dashboard_error(DashboardOpenError::TaskFailed))?
+        .map_err(dashboard_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DashboardOpenError {
+    #[cfg(target_os = "macos")]
+    MissingReport,
+    Platform(PlatformOpenError),
+    TaskFailed,
+}
+
+#[cfg(target_os = "macos")]
+fn open_dashboard_file(path: &Path) -> Result<(), DashboardOpenError> {
+    if !path.is_file() {
+        return Err(DashboardOpenError::MissingReport);
+    }
+    open_local_target(path).map_err(DashboardOpenError::Platform)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_dashboard_file(_path: &Path) -> Result<(), DashboardOpenError> {
+    Err(DashboardOpenError::Platform(
+        PlatformOpenError::UnsupportedPlatform,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+pub fn open_local_target(target: impl AsRef<OsStr>) -> Result<(), PlatformOpenError> {
+    let mut command = platform_open_command(target.as_ref());
+    run_platform_opener(&mut command, PLATFORM_OPEN_TIMEOUT)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn open_local_target(_target: impl AsRef<OsStr>) -> Result<(), PlatformOpenError> {
+    Err(PlatformOpenError::UnsupportedPlatform)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn platform_open_command(target: &OsStr) -> Command {
+    let mut command = Command::new(PLATFORM_OPENER_PATH);
+    command.arg(target);
+    command
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn run_platform_opener(command: &mut Command, timeout: Duration) -> Result<(), PlatformOpenError> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| PlatformOpenError::SpawnFailed)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return status
+                    .success()
+                    .then_some(())
+                    .ok_or(PlatformOpenError::ExitFailed);
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                terminate_and_reap_platform_opener(child)?;
+                return Err(PlatformOpenError::TimedOut);
+            }
+            Err(_) => {
+                terminate_and_reap_platform_opener(child)?;
+                return Err(PlatformOpenError::WaitFailed);
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn terminate_and_reap_platform_opener(mut child: Child) -> Result<(), PlatformOpenError> {
+    let termination_failed = child.kill().is_err();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = result_tx.send(child.wait());
+    });
+    match result_rx.recv_timeout(PLATFORM_REAP_TIMEOUT) {
+        Ok(Ok(_)) if termination_failed => Err(PlatformOpenError::TerminateFailed),
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(_)) => Err(PlatformOpenError::ReapFailed),
+        Err(_) => Err(PlatformOpenError::ReapTimedOut),
+    }
+}
+
+fn integration_error() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "integration_failed",
+        "Codex 자동 수집 상태를 확인하거나 변경할 수 없습니다.",
+    )
+}
+
+fn dashboard_error(error: DashboardOpenError) -> ApiError {
+    let (code, message) = match error {
+        #[cfg(target_os = "macos")]
+        DashboardOpenError::MissingReport => (
+            "dashboard_missing",
+            "모니터링 리포트가 아직 생성되지 않았습니다.",
+        ),
+        DashboardOpenError::Platform(PlatformOpenError::UnsupportedPlatform) => (
+            "dashboard_unsupported",
+            "이 운영체제에서는 모니터링 리포트를 자동으로 열 수 없습니다.",
+        ),
+        DashboardOpenError::Platform(PlatformOpenError::TimedOut) => (
+            "dashboard_open_timeout",
+            "모니터링 리포트를 여는 시간이 초과되었습니다.",
+        ),
+        DashboardOpenError::Platform(
+            PlatformOpenError::SpawnFailed
+            | PlatformOpenError::ExitFailed
+            | PlatformOpenError::WaitFailed
+            | PlatformOpenError::TerminateFailed
+            | PlatformOpenError::ReapFailed
+            | PlatformOpenError::ReapTimedOut,
+        ) => ("dashboard_open_failed", "모니터링 리포트를 열 수 없습니다."),
+        DashboardOpenError::TaskFailed => {
+            ("dashboard_open_failed", "모니터링 리포트를 열 수 없습니다.")
+        }
+    };
+    ApiError::new(StatusCode::CONFLICT, code, message)
 }
 
 async fn heartbeat(
@@ -436,7 +673,7 @@ fn envelope(versioned: VersionedLocalConfig) -> ConfigEnvelope {
         config: versioned.config,
         defaults: LocalRuntimeConfigV2::default(),
         revision: versioned.revision,
-        collection_mode: "manual_import",
+        collection_mode: "automatic_codex",
     }
 }
 
@@ -537,16 +774,22 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, LocalConfigService, constant_time_equal, prepare, router, session_token,
+        AppState, DashboardOpenError, LocalConfigService, PlatformOpenError, constant_time_equal,
+        dashboard_error, platform_open_command, prepare, router, run_integration,
+        run_platform_opener, session_token,
     };
+    use agent_observability_codex_integration::{CodexIntegrationStatus, IntegrationError};
     use agent_observability_local_runtime::{LocalRuntimeConfigV2, install, revision};
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
+        response::IntoResponse,
     };
     use serde_json::Value;
     use std::{
         fs,
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
@@ -576,6 +819,197 @@ mod tests {
         second.enabled = false;
         assert_eq!(revision(&first).unwrap(), revision(&first).unwrap());
         assert_ne!(revision(&first).unwrap(), revision(&second).unwrap());
+    }
+
+    fn path_bearing_integration_failure(
+        _root: &Path,
+        _executable: &Path,
+    ) -> Result<CodexIntegrationStatus, IntegrationError> {
+        Err(IntegrationError::Runtime(
+            "/Users/private/AUTOMATIC_RAW_PROMPT_SENTINEL private-key.pem".into(),
+        ))
+    }
+
+    #[test]
+    fn integration_api_error_is_fixed_and_content_free() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let response =
+                    run_integration(PathBuf::from("unused"), path_bearing_integration_failure)
+                        .await
+                        .unwrap_err()
+                        .into_response();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                let error: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(error["code"], "integration_failed");
+                assert_eq!(
+                    error["message"],
+                    "Codex 자동 수집 상태를 확인하거나 변경할 수 없습니다."
+                );
+                for sentinel in [
+                    b"/Users/".as_slice(),
+                    b"AUTOMATIC_RAW_PROMPT_SENTINEL",
+                    b"private-key.pem",
+                ] {
+                    assert!(
+                        !body
+                            .windows(sentinel.len())
+                            .any(|window| window == sentinel)
+                    );
+                }
+            });
+    }
+
+    #[test]
+    fn dashboard_opener_failure_is_content_free() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "echo '/Users/private/AUTOMATIC_RAW_PROMPT_SENTINEL' >&2; exit 9",
+        ]);
+        assert!(run_platform_opener(&mut command, Duration::from_secs(1)).is_err());
+
+        let response = dashboard_error(DashboardOpenError::Platform(PlatformOpenError::ExitFailed))
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                let error: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(error["code"], "dashboard_open_failed");
+                assert_eq!(error["message"], "모니터링 리포트를 열 수 없습니다.");
+                assert!(
+                    !body
+                        .windows(b"/Users/".len())
+                        .any(|value| value == b"/Users/")
+                );
+                assert!(
+                    !body
+                        .windows(b"AUTOMATIC_RAW_PROMPT_SENTINEL".len())
+                        .any(|value| value == b"AUTOMATIC_RAW_PROMPT_SENTINEL")
+                );
+            });
+    }
+
+    #[test]
+    fn dashboard_opener_timeout_kills_and_reaps_the_process() {
+        let pid_path = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-opener-{}.pid",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&pid_path);
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "echo $$ > \"$1\"; exec /bin/sleep 30",
+                "dashboard-opener-test",
+            ])
+            .arg(&pid_path);
+        let started = Instant::now();
+
+        assert_eq!(
+            run_platform_opener(&mut command, Duration::from_millis(500)),
+            Err(PlatformOpenError::TimedOut)
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid = fs::read_to_string(&pid_path).unwrap();
+        let status = Command::new("/bin/sh")
+            .args(["-c", "kill -0 \"$1\"", "dashboard-opener-test", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        fs::remove_file(pid_path).unwrap();
+    }
+
+    #[test]
+    fn platform_opener_wires_the_trusted_binary_and_target() {
+        let target = std::ffi::OsStr::new("file:///private/report.html");
+        let command = platform_open_command(target);
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("/usr/bin/open"));
+        assert_eq!(command.get_args().collect::<Vec<_>>(), [target]);
+    }
+
+    #[test]
+    fn platform_opener_stdio_helper() {
+        if std::env::var_os("AGENTOBS_PLATFORM_STDIO_HELPER").is_none() {
+            return;
+        }
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "if IFS= read -r _; then exit 9; fi; printf 'AUTOMATIC_PLATFORM_STDOUT_SENTINEL'; printf 'AUTOMATIC_PLATFORM_STDERR_SENTINEL' >&2",
+        ]);
+        assert_eq!(
+            run_platform_opener(&mut command, Duration::from_secs(1)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn platform_opener_nulls_child_stdin_stdout_and_stderr() {
+        use std::io::Write;
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::platform_opener_stdio_helper",
+                "--nocapture",
+            ])
+            .env("AGENTOBS_PLATFORM_STDIO_HELPER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"AUTOMATIC_PLATFORM_STDIN_SENTINEL\n")
+            .unwrap();
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        for sentinel in [
+            b"AUTOMATIC_PLATFORM_STDOUT_SENTINEL".as_slice(),
+            b"AUTOMATIC_PLATFORM_STDERR_SENTINEL".as_slice(),
+        ] {
+            let leaked = [&output.stdout, &output.stderr].iter().any(|stream| {
+                stream
+                    .windows(sentinel.len())
+                    .any(|value| value == sentinel)
+            });
+            assert!(!leaked, "platform opener leaked a child standard stream");
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn unsupported_platform_open_is_typed_and_content_free() {
+        let error = super::open_local_target("AUTOMATIC_PRIVATE_TARGET_SENTINEL").unwrap_err();
+        assert_eq!(error, PlatformOpenError::UnsupportedPlatform);
+        assert_eq!(
+            error.to_string(),
+            "automatic open is unsupported on this platform"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("AUTOMATIC_PRIVATE_TARGET_SENTINEL")
+        );
+
+        let response = dashboard_error(DashboardOpenError::Platform(error)).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[test]
@@ -667,6 +1101,7 @@ mod tests {
                 let layout = install(&root).unwrap();
                 let state = AppState {
                     config: LocalConfigService::new(&layout),
+                    root: layout.root.clone(),
                     host: "127.0.0.1:43191".into(),
                     origin: "http://127.0.0.1:43191".into(),
                     token: "test-session".into(),

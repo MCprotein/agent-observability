@@ -6,35 +6,38 @@
 
 ## Scope Boundary
 
-| Boundary | v1.7.0 status |
+| Boundary | v1.8.0 status |
 | --- | --- |
 | Private canonical handoff parser | Implemented for Codex, Claude Code, Cursor |
 | One-shot local ingest CLI | Implemented |
+| Codex OTLP/HTTP JSON receiver | Supported for pinned Codex 0.151.0 on macOS through private-CA HTTPS on IPv4 loopback with exact private random request header |
+| Codex `agent-turn-complete` notify supplement | Implemented with bounded fail-open local delivery |
+| Codex config ownership and macOS LaunchAgent | Supported on the pinned macOS boundary with exact restore; v1.8.0 publication pending |
 | SQLite authority and JSONL projection | Implemented |
 | Static HTML report | Implemented |
 | Ephemeral loopback settings UI | Implemented |
 | Explicit retention/archive | Implemented |
-| Agent hook/log to canonical handoff producer | Not shipped |
-| Native telemetry receiver | Future TODO |
-| Resident daemon or background service | Future TODO |
-| Team collector and hosted query/UI | Future TODO |
+| Claude Code/Cursor automatic collection | Future TODO; manual imports remain implemented |
+| Commercial team collector and hosted query/UI | Future TODO; requires G0-G4 approvals and evidence |
 
-현재 release는 agent 제품이 직접 생성한 임의 payload를 바로 읽는다고 주장하지 않는다. 별도 producer가
-공식 surface를 versioned canonical handoff로 변환해야 하며, 현재 Rust adapter는 그 private file부터
-지원한다.
+수동 import는 별도 producer가 공식 surface를 versioned canonical handoff로 변환한 private file부터
+지원한다. Codex automatic path에서 raw notify는 foreground helper가 transport 전에 projection하고,
+receiver는 bounded raw OTLP만 decode해 allowlisted scalar로 즉시 축소한다. Raw payload와 unknown field는
+저장하거나 출력하지 않는다.
 
 ## System Context
 
 ```mermaid
 flowchart TB
-    subgraph AgentProducts["Coding agents"]
-        C[Codex]
-        H[Claude Code]
-        U[Cursor]
+    subgraph Sources["Local sources"]
+        Codex["Codex"]
+        Claude["Claude Code handoff"]
+        Cursor["Cursor handoff"]
     end
 
-    Producer["Canonical handoff producer<br/>Future TODO in this repository"]
-    Files["Private handoff files<br/>bounded + versioned"]
+    Receiver["Authenticated HTTPS Codex receiver on 127.0.0.1"]
+    Allowlist["Raw JSON to allowlisted scalars"]
+    Files["Private bounded handoff files"]
 
     subgraph Runtime["Local Rust runtime"]
         Adapters["Inbound adapters"]
@@ -49,18 +52,78 @@ flowchart TB
     Browser["Local browser"]
     Archive["Private archive outside runtime"]
 
-    C -.-> Producer
-    H -.-> Producer
-    U -.-> Producer
-    Producer -.-> Files
+    Codex -->|"private-CA HTTPS + exact private header"| Receiver
+    Codex -->|"raw notify callback"| Notify["codex-notify allowlist projector"]
+    Codex -->|"private canonical handoff manual import"| Files
+    Notify -->|"projected notify over authenticated HTTPS"| Receiver
+    Receiver --> Allowlist --> Adapters
+    Claude --> Files
+    Cursor --> Files
     Files --> Adapters --> Domain --> App --> Store
     Store --> Projection
     Store --> Retention --> Archive
     Store --> Report --> Browser
 ```
 
-점선 경로는 v1.7.0 repository가 제공하지 않는 upstream producer boundary다. 실선은 현재 Rust CLI가
-구현하고 테스트하는 local-only 경로다.
+모든 화살표는 local machine 안에 머문다. Claude Code와 Cursor automatic source 연결은 아직 없으며
+그 둘은 private handoff 수동 import만 지원한다. Manual path는 receiver나 LaunchAgent 없이 동작한다.
+
+## Codex Automatic Sequence
+
+```mermaid
+sequenceDiagram
+    actor Operator
+    participant CLI as agentobs
+    participant Config as Codex config manager
+    participant Launchd as macOS launchd
+    participant Receiver as Local receiver
+    participant Codex
+    participant Notify as codex-notify projector
+    participant Adapter as Codex adapter
+    participant Store as SQLite authority
+    participant Report as Private HTML report
+
+    Operator->>CLI: connect codex
+    CLI->>Launchd: install and start LaunchAgent
+    CLI->>Receiver: private-CA HTTPS + exact-header health check
+    Receiver-->>CLI: ready
+    CLI->>Config: connect with exact ownership snapshot
+    Config-->>Codex: local OTLP exporter and notify command
+    Codex->>Receiver: private-CA HTTPS + exact-header OTLP HTTP JSON
+    Codex->>Notify: raw notify callback
+    Notify->>Notify: strict allowlist projection
+    Notify->>Receiver: projected supplement over authenticated HTTPS
+    Receiver->>Adapter: copy allowlisted scalars only
+    Note over Receiver,Adapter: only bounded raw OTLP may exist transiently in receiver memory
+    Adapter->>Store: source-ordered observations and dispositions
+    Store->>Store: advance durable report generation
+    Store->>Report: visit generation-consistent records after ingest quiets
+    Report->>Report: project spans and stream private HTML atomically
+    Report->>Store: acknowledge exact rendered generation
+```
+
+`setup` prepares and optionally opens the private dashboard before entering this sequence through
+`connect codex`. The connect command starts the collector and verifies health before taking Codex config
+ownership. A private
+LaunchAgent transaction records prior plist bytes/mode and loaded state; failure or crash restores that exact
+state instead of unconditionally removing a service. `disconnect codex` first converges the LaunchAgent to its
+recorded prior state, then restores the exact prior Codex config only while the complete connected bytes and mode
+still match. It retains local observations. Unacknowledged SQLite report generations survive crashes; startup
+reconciles them and bounded exponential retries expose an exhausted refresh as degraded health through CLI/UI.
+Continuous ingest only advances the durable generation and refresh request epoch; it does not repeatedly rebuild
+the growing full report. After one quiet period, the renderer visits source records one at a time, retains only
+privacy-safe report spans, and streams the validated DTO into the atomic private HTML artifact. Each bounded read
+transaction closes before projection work; a generation change between batches rejects that render for retry.
+
+The receiver binds only `127.0.0.1`. Clients validate its private-CA server certificate and loopback IP SAN; every
+route requires the exact `x-agent-observability-token` header containing the runtime's private random 256-bit
+value. No client certificate or client private-key field is configured, so this is not mTLS. The receiver admits
+at most 64 concurrent connections, bounds incomplete TLS handshakes and headers, limits each request lifetime to
+30 seconds, accepts at most 1 MiB per OTLP request and 4096 log records, and writes no request body log. The notify
+helper accepts at most 64 KiB of raw input, creates a closed content-free projection before settings or socket
+access, uses bounded local connect/TLS/read/write deadlines, and always returns success to Codex with an accepted,
+rejected or unavailable outcome. It supplements turn completion; OTLP remains primary for model, request, usage,
+tool and permission signals.
 
 ## Ingest Sequence
 
@@ -124,6 +187,13 @@ session/turn/request, Claude Code의 prompt/tool use, Cursor의 conversation/gen
 `DurableRecordV1`로 만들며 prompt, output, command, path, cwd, raw email과 arbitrary metadata는
 durable boundary를 통과하지 않는다.
 
+Codex automatic parsing에서 raw notify payload는 foreground helper가 pre-transport projection하는 동안만
+존재하고, raw OTLP/tool attribute는 bounded request를 decode하는 동안 receiver memory에 일시적으로
+들어올 수 있다. `conversation.id`, `turn.id`, bounded model/tool/decision,
+request/call ID, duration, token counts와 success처럼 adapter가 소유한 scalar만 다음 단계로 복사된다.
+Raw body, prompt, response, tool arguments/output, command, cwd, path, account identity와 unknown field는
+persist, log, diagnostic, projection, report 또는 export되지 않는다.
+
 ## Runtime and Backpressure
 
 ```mermaid
@@ -136,9 +206,11 @@ stateDiagram-v2
     Probe --> Protected: pressure returns
 ```
 
-Foreground work는 bounded local handoff까지만 수행해야 한다. Full, oversized와 unavailable은 명시적
-결과이며 network, report render, full transcript scan이나 queue drain을 기다리지 않는다. Pressure가
-높아지면 Future team sync와 report refresh를 coding agent 작업보다 먼저 낮춰야 한다.
+Foreground notify work는 pre-transport projection과 bounded local private-CA HTTPS + exact-header handoff까지만
+수행한다. Rejected, oversized와 unavailable은
+명시적 fail-open 결과이며 external network, report render, full transcript scan이나 queue drain을 기다리지
+않는다. Manual imports는 이 foreground helper나 resident collector를 사용하지 않는다. Pressure가 높아지면
+Future team sync와 report refresh를 coding agent 작업보다 먼저 낮춰야 한다.
 
 구체적인 channel, batch, memory와 storage 상한은 [LOCAL_RUNTIME.md](LOCAL_RUNTIME.md#runtime-bounds)를
 따른다.
@@ -151,7 +223,7 @@ sequenceDiagram
     participant CLI as report command
     participant Store as SQLite authority
     participant App as Rust projector
-    participant Binary as static-report binary
+    participant Assembler as static-report library
     participant HTML as private report.html
     actor Browser
 
@@ -160,9 +232,9 @@ sequenceDiagram
     Store-->>App: privacy-safe durable records
     App->>App: sanitize + map + price + aggregate
     App-->>CLI: validated ReportDtoV1
-    Note over CLI,Binary: built TypeScript asset embedded at compile time
-    CLI->>Binary: validated DTO
-    Binary->>HTML: atomic 0600 assembly
+    Note over CLI,Assembler: built TypeScript asset embedded at compile time
+    CLI->>Assembler: validated DTO
+    Assembler->>HTML: atomic 0600 assembly
     Browser->>HTML: open with file://
     Note over Browser,HTML: no server and no external request
 ```
@@ -196,7 +268,7 @@ archive는 managed runtime 밖에 둔다.
 Team은 standalone을 대체하지 않고 같은 domain semantics 위에 선택적으로 추가한다.
 
 ```mermaid
-flowchart LR
+flowchart TB
     Domain["Domain / application state"]
     Projector["Strict team projector"]
     Outbox["Bounded encrypted outbox"]
@@ -210,11 +282,12 @@ flowchart LR
     Collector -.-> Central -.-> Hosted
 ```
 
-이 경로는 현재 구현이 아니다. Raw email, `SourceObservation`, full durable record, prompt/output/tool
-content는 team envelope에 들어가지 않는다. 인증, tenant isolation, RBAC, deletion, key rotation,
-audit, quota, restore와 SLO/DR evidence가 모두 G0-G4 gate를 통과해야 한다. Opaque event, identity와
-workspace reference는 pseudonymous personal data이므로 authorization, retention과 deletion 대상에서
-제외하지 않는다.
+이 경로는 현재 구현이 아니다. Local Codex receiver는 team collector가 아니며 commercial team 완료
+evidence로 사용할 수 없다. Raw email, `SourceObservation`, full durable record, prompt/output/tool content는
+team envelope에 들어가지 않는다. Business/legal/security 승인, 인증, tenant isolation, RBAC, deletion,
+key rotation, audit, quota, restore와 SLO/DR evidence가 모두 G0-G4 gate를 통과하기 전에는 team을 완료
+또는 출시로 표시하지 않는다. Opaque event, identity와 workspace reference는 pseudonymous personal
+data이므로 authorization, retention과 deletion 대상에서 제외하지 않는다.
 
 ## Related Contracts
 

@@ -1,0 +1,17 @@
+[package]
+name = "agent-observability-codex-integration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent-observability-codex-config = { path = "../codex-config" }
+agent-observability-local-collector = { path = "../local-collector" }
+agent-observability-local-runtime = { path = "../local-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.0"
+
+[lints]
+workspace = true

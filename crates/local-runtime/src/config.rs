@@ -1,5 +1,5 @@
 use crate::{
-    lock::{Singleton, SingletonError},
+    lock::{MutationGuard, SingletonError},
     policy::{CollectionPolicyV1, PolicyError, RetentionPolicyV1},
 };
 use serde::{Deserialize, Serialize};
@@ -205,15 +205,15 @@ impl LocalConfigService {
 
 #[derive(Debug)]
 pub struct ConfigMutationGuard {
-    _singleton: Singleton,
+    _mutation: MutationGuard,
     config_path: PathBuf,
 }
 
 impl ConfigMutationGuard {
     pub fn acquire(layout: &InstalledLayout) -> Result<Self, SingletonError> {
         let canonical = InstalledLayout::at(&layout.root);
-        Singleton::acquire(&canonical.runtime).map(|singleton| Self {
-            _singleton: singleton,
+        MutationGuard::try_acquire(&canonical.runtime).map(|mutation| Self {
+            _mutation: mutation,
             config_path: canonical.config,
         })
     }

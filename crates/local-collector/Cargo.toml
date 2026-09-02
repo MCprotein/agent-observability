@@ -1,22 +1,26 @@
 [package]
-name = "agent-observability-local-ui"
+name = "agent-observability-local-collector"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agent-observability-codex-integration = { path = "../codex-integration" }
-agent-observability-local-collector = { path = "../local-collector" }
+agent-observability-adapter-codex = { path = "../adapter-codex" }
+agent-observability-application = { path = "../application" }
 agent-observability-local-runtime = { path = "../local-runtime" }
+agent-observability-local-store = { path = "../local-store" }
+agent-observability-static-report = { path = "../static-report" }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 getrandom = "0.3"
-hyper = { version = "1", default-features = false, features = ["http1", "server"] }
-hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+libc = "0.2"
+rcgen.workspace = true
+rustls.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.53.1", features = ["io-util", "net", "rt", "sync", "time"] }
-tower = { version = "0.5", features = ["util"] }
+tokio-rustls.workspace = true
+time.workspace = true
 
 [lints]
 workspace = true

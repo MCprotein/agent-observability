@@ -6,13 +6,15 @@
 
 ## Current and target stack
 
-현재 `v1.7.0` 경로는 macOS standalone private handoff import 범위의 Rust Codex, Claude Code와 Cursor adapter,
-TypeScript static report UI, strict local config와 bounded runtime policy를 제공한다. Rust 경로는 closed contract,
-deterministic lifecycle reduction, topology validation, pricing/report projection, bounded product handoff와
-private embedded transaction, static HTML assembly와 CLI `report`를 구현한다. SQLite `local_state.v4`가 source cursor,
-stable observation, current reduced record, adapter disposition과 profile-neutral delivery outcome의
-정본이며 JSONL은 dirty-state에서만 재생성하는 projection이다. Team envelope, outbox와 network는
-활성 계약이 아니다.
+현재 `v1.8.0`은 **In Progress**다. macOS standalone은 Codex, Claude Code와 Cursor의 private
+handoff 수동 import를 daemon과 network 없이 계속 제공한다. 선택적 Codex automatic path는 private-CA
+HTTPS와 exact private random request header로 인증하는 `127.0.0.1` OTLP/HTTP JSON receiver,
+pre-transport projected notify supplement와 LaunchAgent를 추가한다. 이 transport는 mTLS가 아니다. Rust 경로는
+closed contract, deterministic lifecycle reduction, topology validation, pricing/report projection, bounded
+input과 private embedded transaction, static HTML assembly를 구현한다. SQLite `local_state.v4`가 source
+cursor, stable observation, current reduced record, adapter disposition과 profile-neutral delivery outcome의
+정본이며 JSONL과 HTML은 projection이다. Claude Code/Cursor automatic collection과 commercial team
+envelope, outbox, collector/network는 활성 계약이 아니다.
 
 목표 스택은 다음과 같다.
 
@@ -29,7 +31,8 @@ schema에서 생성된 추적 가능한 artifact만 허용하며 직접 편집�
 
 배포 경계도 같은 원칙을 따른다. GitHub Release archive와 GitHub Packages npm package는
 동일한 universal Rust executable을 운반한다. npm metadata의 `bin`은 실행 파일을 직접
-가리키며 JavaScript launcher, daemon, collector 또는 runtime dependency를 추가하지 않는다.
+가리키며 JavaScript launcher 또는 runtime dependency를 추가하지 않는다. Optional Codex automatic
+collection의 Rust collector는 같은 executable의 private `collector-serve` mode로 LaunchAgent가 실행한다.
 배포 형식은 transport일 뿐 domain/application/runtime 책임을 소유하지 않는다.
 
 TypeScript UI는 브라우저에서 직접 원본 event log를 읽지 않고 Rust가 만든 sanitized report 또는
@@ -50,16 +53,19 @@ runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui�
 
 제품은 하나의 core를 두 개의 독립된 composition root로 조립한다.
 
-| Profile | Required runtime | Storage | UI |
-| --- | --- | --- | --- |
-| `standalone` | Rust CLI only | private embedded transactional state + JSONL/snapshot projections | self-contained report + ephemeral loopback settings UI |
-| `team` | local Rust CLI/forwarder + optional collector | same local state/outbox + tenant/workspace-scoped central store | 같은 TypeScript UI를 hosted report 또는 self-contained export로 제공 |
+| Profile | Status | Required runtime | Storage | UI |
+| --- | --- | --- | --- | --- |
+| `standalone` | Implemented product profile | Rust CLI; optional macOS local collector for Codex automatic mode | private embedded transactional state + JSONL/snapshot projections | self-contained report + ephemeral loopback settings UI |
+| `team` | Future TODO target; not implemented | local Rust CLI/forwarder + optional collector | planned local state/outbox + tenant/workspace-scoped central store | planned hosted report or self-contained export using the shared TypeScript UI contract |
 
-`standalone`은 기본이자 완전한 제품 경로다. login, network, collector, central database가 없어도
-수집, 비용 추정, report 생성이 모두 동작해야 한다. team profile의 장애나 설정 부재가 local
-write와 local report를 막아서는 안 된다.
+`standalone`은 기본이자 완전한 제품 경로다. Manual handoff import, 비용 추정과 report 생성은 login,
+network, daemon, collector 또는 central database 없이 모두 동작한다. Codex automatic mode를 선택한
+경우에만 local LaunchAgent와 loopback receiver가 추가된다. 이 receiver는 외부 interface에 bind하거나
+외부 request를 만들지 않는다. Team profile의 장애나 설정 부재가 local write와 local report를
+막아서는 안 된다.
 
-`team`은 같은 domain 의미를 재사용하되 local durable contract와 전송 계약은 분리한다.
+아래 `team` 항목은 구현 현황이 아니라 Future TODO의 필수 설계 계약이다. Team 구현은 같은 domain
+의미를 재사용하되 local durable contract와 전송 계약을 분리해야 한다.
 
 - 전용 team projector가 domain/application state에서 허용된 관측 필드만 골라
   `TeamIngestEnvelopeV1`을 만든다. `DurableRecordVx`를 입력이나 envelope payload로 사용하지
@@ -101,43 +107,48 @@ readiness gate는 [TEAM_ARCHITECTURE.md](TEAM_ARCHITECTURE.md)를 정본으로 �
 
 기본 구조는 ports and adapters와 functional core / imperative shell의 조합이다.
 
-v1.7.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
+v1.8.0의 Rust 경로는 `crates/domain`, `crates/contracts`, `crates/adapter-codex`,
 `crates/adapter-claude-code`, `crates/adapter-cursor`,
-`crates/application`, `crates/local-store`, `crates/local-runtime`, `crates/local-ui`, `crates/static-report`, `crates/cli`와 release
+`crates/application`, `crates/codex-config`, `crates/codex-integration`, `crates/local-collector`, `crates/local-store`,
+`crates/local-runtime`, `crates/local-ui`, `crates/static-report`, `crates/cli`와 release
 evidence runner인 `xtask`로 나뉜다. domain은 외부 형식을
 모르고, contracts는 transient
 source와 durable/report DTO 경계를 소유한다. application은 pricing과 report projection을,
-inbound adapters는 제품별 source precedence/correlation/dedupe를, local-store는 SQLite transaction과 JSONL
+inbound adapters는 제품별 source precedence/correlation/dedupe와 raw-to-allowlisted-scalar projection을,
+codex-config는 user-level Codex 설정의 exact ownership/restore를, codex-integration은 config/LaunchAgent/
+health lifecycle을 하나의 CLI/UI use case로 조립한다. local-collector는 standalone automatic mode의
+별도 composition root로서 private-CA HTTPS + exact-header loopback 수신, durable commit과 report refresh를,
+local-store는 SQLite transaction과 JSONL
 projection을, static-report는 generated UI asset의 self-contained artifact 조립과 private atomic write를,
-local-ui는 authenticated loopback 설정 inbound adapter와 embedded generated asset을, local-runtime은
-blocking config I/O를 캡슐화한 standalone config use-case를, CLI는 composition root를 소유한다.
+local-ui는 authenticated loopback config/integration inbound adapter와 embedded generated asset을, local-runtime은
+blocking config I/O를 캡슐화한 standalone config use-case를 소유한다. CLI는 foreground/manual composition
+root를, local-collector는 automatic collector composition root를 소유한다.
 local-ui handler는 이 use-case를 blocking executor에서 호출하고 HTTP 연결 task는 최대 64개로 제한한다.
 `contracts/*.schema.json`은 closed wire contract이고 versioned config fixture와 전체 bounds parity
 corpus가 strict Rust wire DTO와 생성된 TypeScript validator의 required/default/min/max/unknown-field
 일치를 잠근다. `contracts/contract-manifest.v1`은 현재
 활성 schema path/version과 `team_ingest=disabled` 경계를 runtime 중립적으로 고정한다.
 
-```text
-Private canonical handoff files
-(upstream receiver/producer is not shipped)
-        |
-        v
-Bounded local handoff + inbound adapters (Rust)
-        |
-        v
-SourceObservation
-        |
-        v
-Domain lifecycle state + application use cases
-        |
-        +--> SQLite transaction --> source cursor + stable event + current record
-        |                              `--> DurableRecordVx --> JSONL / snapshot
-        +--> fixed-code disposition --> source cursor + bounded diagnostic/suppression ledger
-        +--> pricing + aggregation --> ReportDto projector --> TypeScript static UI
-        +--> topology validation --> diagnostic projector --> diagnostics
-
-Future TODO after promotion gate:
-domain/application state --> TeamIngestEnvelopeV1 --> bounded outbox --> optional collector
+```mermaid
+flowchart TB
+    Codex["Codex"] -->|"private-CA HTTPS + exact private header"| Receiver["Local Codex receiver"]
+    Codex -->|"raw notify callback"| Notify["codex-notify allowlist projector"]
+    Notify -->|"projected supplement over authenticated HTTPS"| Receiver
+    Manual["Private canonical handoff files"] --> Adapters["Rust inbound adapters"]
+    Receiver --> Allowlist["Codex scalar allowlist"]
+    Allowlist --> Adapters
+    Adapters --> Observation["SourceObservation"]
+    Observation --> Core["Domain reducer and application use cases"]
+    Core --> Store[("SQLite authority")]
+    Store --> Projection["DurableRecord projection"]
+    Store --> Report["ReportDto projection"]
+    Report --> UI["Self-contained TypeScript UI"]
+    Connect["connect codex"] --> Ownership["Codex config ownership"]
+    Connect --> LaunchAgent["macOS LaunchAgent"]
+    Settings["Ephemeral settings UI"] --> Connect
+    Ownership --> Codex
+    LaunchAgent --> Receiver
+    Core -.->|"Future after G0 promotion; commercial readiness after G4"| Team["Commercial team profile"]
 ```
 
 경계 계약은 이름과 소유권을 분리한다.
@@ -204,19 +215,30 @@ anti-corruption layer다.
 - downstream consumer가 agent별 ID prefix를 파싱하지 않도록 `session_id`, `turn_id`,
   `operation_id` 등을 명시적으로 채운다.
 - 원문 prompt, output, command, diff, file content를 canonical metadata로 가장하지 않는다.
+- Codex automatic notify helper는 raw notify를 settings/socket 접근 전에 closed content-free wire object로
+  축약한다. Receiver는 bounded raw OTLP JSON을 process memory에서 decode한 뒤 `conversation.id`,
+  `turn.id`, model, bounded tool category, request/call ID, decision, duration, token
+  counts와 success처럼 명시적으로 소유한 scalar만 canonical adapter에 복사한다. Raw body, prompt,
+  response, tool arguments/output, command, cwd, path, account identity와 unknown attribute는 persist,
+  log, diagnostic, projection 또는 export하지 않는다.
 - 같은 contract fixture suite를 모든 adapter에 적용한다.
 - Codex의 `api_request`와 `sse_event(response.completed)`는 같은 request ID로 correlate하되
   transport attempt와 completed response를 별도 span으로 유지한다. usage는 completed response에만
   두며, 동일 canonical span의 재전달만 adapter에서 억제한다.
 - unsupported, content-ignored와 duplicate-suppressed 입력도 raw payload 없이 fixed enum만
   `adapter_dispositions`에 기록하며 같은 transaction에서 cursor를 진행한다.
-- hook path는 bounded local handoff만 수행하고 network, full transcript parse, report render나 queue drain을
-  기다리지 않는다. File fallback은 persisted cursor와 source generation으로 incrementally reconcile한다.
+- Codex notify helper는 최대 64 KiB의 raw input을 받은 뒤 settings 또는 socket 접근 전에 더 작은 closed
+  content-free projection으로 축약한다. 이 projection만 private-CA HTTPS와 exact private request header로
+  loopback receiver에 전달하며 전체
+  connect/TLS/HTTP deadline 뒤 항상 fail open한다. 외부 network, full transcript parse, report render나
+  queue drain을 기다리지 않는다. Future file fallback은 persisted cursor와 source generation으로
+  incrementally reconcile한다.
 - 제품별 공식 source 우선순위와 지원 evidence는
   [`ADAPTER_COMPATIBILITY.md`](ADAPTER_COMPATIBILITY.md)를 따른다.
-- 현재 Rust adapter 입력은 private regular JSONL file로 제한하며 최대 1 MiB, 4096 record,
-  record당 64 KiB다. group/other permission이나 symbolic link는 거부한다. 이 parser를 foreground
-  hook에서 직접 실행하는 계약은 아니며 native receiver/spool writer는 별도 release gate다.
+- Manual Rust adapter 입력은 private regular JSONL file로 제한하며 최대 1 MiB, 4096 record,
+  record당 64 KiB다. group/other permission이나 symbolic link는 거부한다. Codex automatic OTLP/HTTP
+  JSON request도 최대 1 MiB와 4096 log record로 제한하며 같은 canonical mapper에 합류한다.
+  Claude Code와 Cursor에는 automatic receiver나 foreground producer가 아직 없다.
 
 ### Outbound infrastructure
 
@@ -241,6 +263,45 @@ anti-corruption layer다.
 - standalone 설정은 `local_runtime.v2` strict JSON이다. 기존 v1은 retention 기본값으로 호환
   로드한다. 팀 identity, 이메일, endpoint와 transport
   설정은 포함하지 않는다.
+- Codex automatic integration은 별도 private `runtime/collector.json`,
+  `runtime/integrations/codex/tls` credential tree와
+  `runtime/integrations/codex/codex-config-ownership-v1.json`을 사용한다. Collector settings은 private
+  random 256-bit request-header value와 bounded credential path metadata를 소유하고 PEM body를 넣지
+  않는다. Receiver는 IPv4 loopback에만 bind한다. Codex와 내부 probe는 private CA가 서명한
+  server certificate와 IP SAN을 검증하고, `/health`, `/v1/logs`, `/v1/notify` request는 exact
+  `x-agent-observability-token` header를 제공해야 한다. Codex exporter에 client certificate/private-key
+  field를 구성하지 않으며 transport는 mTLS가 아니다. 외부 network client는 없다. 같은 OS user가
+  private header secret이나 server key를 읽을 수 있는 위협은 이 경계 밖이며 별도 account 또는
+  sandbox가 필요하다.
+- `connect codex`는 collector LaunchAgent를 준비하고 health를 확인한 뒤 Codex config를 변경한다.
+  v2 mTLS에서 v3로 바뀌는 경우 settings migration journal이 exact prior bytes/mode와 credential
+  generation을 보존한다. LaunchAgent와 Codex config commit 전에는 legacy credential을 지우지 않으며,
+  실패 시 config 해제와 service rollback이 모두 확인된 뒤에만 settings와 replacement credential을
+  복원·정리한다. 보상 실패 시에는 v3 settings, journal, credential을 유지해 실행 중 참조를 깨지 않는다.
+  service install/restart 또는 commit 결과가 불확실한 오류도 같은 방식으로 보존하고 다음 lifecycle
+  command가 LaunchAgent ownership phase를 먼저 복구한다.
+  성공 시 durable `integration_committed` phase를 기록한 뒤에만 obsolete generation과 journal을
+  fsync하며 제거한다. `status`와 `disconnect`는 settings parse 전에 남은 journal과 config ownership을
+  조정하며 committed phase는 이전 settings로 되돌리지 않는다.
+  `$CODEX_HOME/config.toml` 또는 기본 `~/.codex/config.toml`의 exact prior/connected bytes, hash, mode와
+  transaction phase를 private ownership snapshot에 보존한다. 관리하는 값은 top-level `notify`, `otel.exporter`,
+  `otel.log_user_prompt=false`, `otel.environment="local"`뿐이다. 기존 값이 다르면 connect는 conflict로
+  중단한다. `disconnect codex`는 LaunchAgent 종료를 먼저 확인하고 현재 전체 bytes/mode가 snapshot의
+  connected state와 같을 때만 이전 bytes/mode를 복원하거나 연결 전 파일이 없었다면 제거한다. Crash
+  phase는 다음 lifecycle command에서 복구하며 conflict와 rollback failure는 사용자 설정을 덮어쓰지 않는다.
+- The ephemeral settings UI exposes the same `codex-integration` status/connect/disconnect use cases and can
+  open an existing private report. Integration mutations require the same private UI session plus exact Host
+  and Origin checks as config mutation. Closing the UI does not disconnect a previously installed LaunchAgent.
+- LaunchAgent label은 runtime root hash로 분리한다. Private ownership transaction은 prior plist
+  bytes/mode, prior loaded state, desired state와 phase를 기록하고 reconnect·disconnect·crash recovery에서
+  정확한 이전 상태를 복원한다. 새 설치가 소유한 plist만 제거하며 inherited 또는 이전 정상 service를
+  역명령으로 파괴하지 않는다. Local SQLite와 report는 보존한다. Automatic collection은 현재 macOS
+  Codex만 지원한다.
+- Automatic collector는 source-ordered observation/disposition을 한 SQLite transaction에 commit한다.
+  Ingest와 retention을 포함한 current-record mutation은 durable report generation을 같은 authority에서
+  증가시킨다. Renderer는 generation-consistent snapshot을 쓰고 exact generation만 acknowledge한다. Private
+  marker는 wakeup hint일 뿐이며 startup은 미확인 generation을 재조정한다. Retry exhaustion은 authenticated
+  health와 CLI/UI에 degraded 상태로 나타난다.
 - composition root는 `setup`에서 private install layout, collection policy, singleton lock,
   SQLite authority, storage admission, first report와 local browser open을 결합한다. `demo`는
   별도 runtime과 embedded content-free fixture만 사용한다. `config set`은 local-runtime의
@@ -287,6 +348,9 @@ anti-corruption layer다.
   하나라도 bounds를 넘는 eligible trace가 있어 `truncated=true`이면 apply는 selected prefix까지 전부
   거부하며, 더 큰 bounded limit으로 새 plan을 만들어야 한다.
   단, CLI store open은 최초 schema 초기화/migration과 dirty projection repair를 수행할 수 있다.
+  automatic collector startup과 HTML refresh는 non-authoritative JSONL repair를 수행하지 않으며,
+  current-schema report connection은 전체 `integrity_check` 대신 필요한 version/generation metadata와
+  실제 report query 실패로 fail closed한다.
   `retention-apply`는 같은 UTC-day cutoff와 현재 authority에서 plan ID를 재검증한다. archive 경로는 managed
   runtime root 밖이어야 하며 parent/file은 각각 0700/0600이어야 한다. archive file sync가 SQLite
   mutation보다 먼저다. archive는 temporary sync 후 no-overwrite link로 publish하고 header/footer 및
@@ -318,7 +382,14 @@ Web UI는 TypeScript `strict` mode를 사용한다.
 - agent별 예외 처리는 UI가 아니라 canonical contract나 adapter에서 해결한다.
 - Rust outbound infrastructure는 빌드된 TypeScript UI asset과 `ReportDtoV1`을 하나의
   self-contained HTML artifact로 조립한다. `report <runtime-root> [rate-table-json]`은 SQLite의 typed
-  snapshot을 읽고 고정된 private logs 경로에 원자 기록한다. Node.js는 build/test에서만 사용된다.
+  snapshot을 bounded transaction과 generation fence로 record batch 단위로 읽고, SQLite read lock을
+  닫은 뒤 privacy-safe span으로 즉시 축소한다. source record 전체를 별도 vector로 유지하지 않으며,
+  검증된 DTO JSON과 HTML shell은
+  완성된 중간 문자열 없이 private temporary file로 streaming한 뒤 고정된 logs 경로에 원자 기록한다.
+  Node.js는 build/test에서만 사용된다.
+- Automatic collector의 report refresh는 ingest quiet period 뒤 최신 generation을 한 번 렌더한다.
+  연속 ingest 중 성장하는 전체 report를 주기적으로 다시 만들지 않으며, 새 commit이 render와
+  겹치면 stale generation을 acknowledge하지 않고 quiet-period 수렴을 다시 예약한다.
 - team profile의 hosted UI도 같은 `ReportDtoVx` schema와 UI component를 사용한다. transport와
   authentication/authorization만 profile별 composition root에서 달라진다. hosted query는
   server-resolved tenant/workspace scope 밖의 DTO를 생성할 수 없다.

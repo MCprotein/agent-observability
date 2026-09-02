@@ -2,16 +2,17 @@
 
 use agent_observability_contracts::{
     AdapterDispositionKind, AgentSource, ObservationEvent, SourceCheckpoint, SourceObservation,
-    canonical_observation_payload_hash,
+    canonical_observation_payload_hash, hash_opaque_identifier,
 };
 use agent_observability_domain::{
-    CorrelationIds, LifecycleState, ObservationId, OperationId, PermissionId, RequestId, SessionId,
-    SourceCursor, SourceGeneration, SpanId, Timing, TokenUsage, TraceId, TurnId,
+    CorrelationIds, LifecycleState, MAX_IDENTIFIER_BYTES, ObservationId, OperationId, PermissionId,
+    RequestId, SessionId, SourceCursor, SourceGeneration, SpanId, Timing, TokenUsage, TraceId,
+    TurnId,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
@@ -22,6 +23,13 @@ pub const HANDOFF_SCHEMA_VERSION: &str = "codex_handoff.v1";
 pub const MAX_HANDOFF_BYTES: u64 = 1024 * 1024;
 pub const MAX_HANDOFF_LINES: usize = 4096;
 pub const MAX_HANDOFF_LINE_BYTES: usize = 64 * 1024;
+pub const MAX_OTLP_LOG_RECORDS: usize = 4096;
+pub const MAX_PENDING_OTLP_REQUESTS: usize = 1024;
+pub const MAX_RECENTLY_COMPLETED_OTLP_REQUESTS: usize = 1024;
+pub const MAX_PERSISTED_OTLP_CORRELATION_BYTES: usize = 512 * 1024;
+pub const OTLP_REQUEST_CORRELATION_TTL_MS: u64 = 5 * 60 * 1000;
+pub const PROJECTED_NOTIFY_SCHEMA_VERSION: &str = "codex_projected_notify.v1";
+pub const MAX_PROJECTED_NOTIFY_BYTES: usize = MAX_IDENTIFIER_BYTES * 2 + 256;
 const KNOWN_CODEX_MODELS: &[&str] = &[
     "gpt-test",
     "gpt-5.4",
@@ -31,14 +39,96 @@ const KNOWN_CODEX_MODELS: &[&str] = &[
     "gpt-5.6-terra",
 ];
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceSurface {
     OtelLog,
     Notify,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNotifyPayload {
+    #[serde(rename = "type")]
+    event_name: String,
+    #[serde(rename = "thread-id")]
+    thread_id: String,
+    #[serde(rename = "turn-id")]
+    turn_id: String,
+    #[serde(rename = "cwd")]
+    _cwd: String,
+    #[serde(rename = "input-messages")]
+    _input_messages: Vec<String>,
+    #[serde(rename = "last-assistant-message")]
+    _last_assistant_message: Option<String>,
+}
+
+/// Strict, bounded privacy projection for a Codex `agent-turn-complete` notification.
+///
+/// This is the only notify representation that may cross a transport boundary. It contains the
+/// official event discriminator and opaque correlation identifiers, but no prompt, response, cwd,
+/// tool argument, or extension metadata.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectedNotifyV1 {
+    schema_version: String,
+    event_name: String,
+    thread_id: String,
+    turn_id: String,
+}
+
+impl ProjectedNotifyV1 {
+    fn new(event_name: String, thread_id: String, turn_id: String) -> Result<Self, AdapterError> {
+        if event_name != "agent-turn-complete" {
+            return Err(AdapterError::InvalidSchema);
+        }
+        parse_identifier::<SessionId>(&thread_id)?;
+        parse_identifier::<TurnId>(&turn_id)?;
+        Ok(Self {
+            schema_version: PROJECTED_NOTIFY_SCHEMA_VERSION.into(),
+            event_name,
+            thread_id,
+            turn_id,
+        })
+    }
+
+    fn validate(self) -> Result<Self, AdapterError> {
+        if self.schema_version != PROJECTED_NOTIFY_SCHEMA_VERSION {
+            return Err(AdapterError::InvalidSchema);
+        }
+        Self::new(self.event_name, self.thread_id, self.turn_id)
+    }
+
+    #[must_use]
+    pub fn event_name(&self) -> &str {
+        &self.event_name
+    }
+
+    #[must_use]
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    #[must_use]
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    /// Serializes the bounded allowlisted payload for local transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] if serialization fails or the projection exceeds its hard bound.
+    pub fn to_json(&self) -> Result<Vec<u8>, AdapterError> {
+        let encoded = serde_json::to_vec(self).map_err(|_| AdapterError::InvalidJson)?;
+        if encoded.len() > MAX_PROJECTED_NOTIFY_BYTES {
+            return Err(AdapterError::RecordTooLarge);
+        }
+        Ok(encoded)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct HandoffRecord {
     schema_version: String,
@@ -72,6 +162,320 @@ pub enum AdapterItem {
 #[derive(Debug, Default)]
 pub struct AdapterBatch {
     pub items: Vec<AdapterItem>,
+}
+
+type OtlpRequestPairKey = (String, String, String);
+
+#[derive(Clone, Debug)]
+struct PendingOtlpRequest {
+    correlation_id: String,
+    official_retry_identity: Option<String>,
+    inserted_at_unix_ms: u64,
+    sequence: u64,
+    current_record_index: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedOtlpRequestCorrelationState {
+    schema_version: String,
+    next_sequence: u64,
+    pending: Vec<PersistedPendingOtlpRequest>,
+    #[serde(default)]
+    recently_completed: Vec<PersistedCompletedOfficialRetry>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedPendingOtlpRequest {
+    source_generation_hash: String,
+    conversation_hash: String,
+    model_hash: String,
+    correlation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    official_retry_identity: Option<String>,
+    inserted_at_unix_ms: u64,
+    sequence: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CompletedOfficialRetry {
+    key: OtlpRequestPairKey,
+    official_retry_identity: String,
+    completed_at_unix_ms: u64,
+    sequence: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedCompletedOfficialRetry {
+    source_generation_hash: String,
+    conversation_hash: String,
+    model_hash: String,
+    official_retry_identity: String,
+    completed_at_unix_ms: u64,
+    sequence: u64,
+}
+
+/// Bounded, content-free correlation state for Codex OTLP requests split across HTTP exports.
+#[derive(Clone, Debug, Default)]
+pub struct OtlpRequestCorrelationState {
+    pending: BTreeMap<OtlpRequestPairKey, VecDeque<PendingOtlpRequest>>,
+    recently_completed: VecDeque<CompletedOfficialRetry>,
+    next_sequence: u64,
+}
+
+impl OtlpRequestCorrelationState {
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.pending.values().map(VecDeque::len).sum()
+    }
+
+    /// Restores bounded, privacy-projected correlation state and expires stale entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] when the snapshot is malformed, oversized, or violates bounds.
+    pub fn from_persisted_json(input: &str, now_unix_ms: u64) -> Result<Self, AdapterError> {
+        if input.len() > MAX_PERSISTED_OTLP_CORRELATION_BYTES {
+            return Err(AdapterError::HandoffTooLarge);
+        }
+        let persisted: PersistedOtlpRequestCorrelationState =
+            serde_json::from_str(input).map_err(|_| AdapterError::InvalidJson)?;
+        if persisted.schema_version != "codex_request_correlation.v1"
+            || persisted.pending.len() > MAX_PENDING_OTLP_REQUESTS
+            || persisted.recently_completed.len() > MAX_RECENTLY_COMPLETED_OTLP_REQUESTS
+            || persisted
+                .pending
+                .len()
+                .checked_add(persisted.recently_completed.len())
+                .is_none_or(|len| len > MAX_PENDING_OTLP_REQUESTS)
+        {
+            return Err(AdapterError::InvalidSchema);
+        }
+        let mut state = Self {
+            pending: BTreeMap::new(),
+            recently_completed: VecDeque::new(),
+            next_sequence: persisted.next_sequence,
+        };
+        for pending in persisted.pending {
+            if !is_private_hash(&pending.source_generation_hash)
+                || !is_private_hash(&pending.conversation_hash)
+                || !is_private_hash(&pending.model_hash)
+                || !is_private_hash(&pending.correlation_id)
+                || pending
+                    .official_retry_identity
+                    .as_deref()
+                    .is_some_and(|identity| !is_private_hash(identity))
+                || pending.sequence >= state.next_sequence
+            {
+                return Err(AdapterError::InvalidSchema);
+            }
+            state.push(
+                (
+                    pending.source_generation_hash,
+                    pending.conversation_hash,
+                    pending.model_hash,
+                ),
+                PendingOtlpRequest {
+                    correlation_id: pending.correlation_id,
+                    official_retry_identity: pending.official_retry_identity,
+                    inserted_at_unix_ms: pending.inserted_at_unix_ms,
+                    sequence: pending.sequence,
+                    current_record_index: None,
+                },
+            );
+        }
+        for completed in persisted.recently_completed {
+            if !is_private_hash(&completed.source_generation_hash)
+                || !is_private_hash(&completed.conversation_hash)
+                || !is_private_hash(&completed.model_hash)
+                || !is_private_hash(&completed.official_retry_identity)
+                || completed.sequence >= state.next_sequence
+            {
+                return Err(AdapterError::InvalidSchema);
+            }
+            state.recently_completed.push_back(CompletedOfficialRetry {
+                key: (
+                    completed.source_generation_hash,
+                    completed.conversation_hash,
+                    completed.model_hash,
+                ),
+                official_retry_identity: completed.official_retry_identity,
+                completed_at_unix_ms: completed.completed_at_unix_ms,
+                sequence: completed.sequence,
+            });
+        }
+        state.expire(now_unix_ms);
+        Ok(state)
+    }
+
+    /// Serializes only hashed identifiers and bounded scalar correlation state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] if the bounded snapshot cannot be encoded.
+    pub fn to_persisted_json(&self) -> Result<String, AdapterError> {
+        let pending = self
+            .pending
+            .iter()
+            .flat_map(|(key, queue)| {
+                queue.iter().map(|request| PersistedPendingOtlpRequest {
+                    source_generation_hash: key.0.clone(),
+                    conversation_hash: key.1.clone(),
+                    model_hash: key.2.clone(),
+                    correlation_id: request.correlation_id.clone(),
+                    official_retry_identity: request.official_retry_identity.clone(),
+                    inserted_at_unix_ms: request.inserted_at_unix_ms,
+                    sequence: request.sequence,
+                })
+            })
+            .collect();
+        let recently_completed = self
+            .recently_completed
+            .iter()
+            .map(|completed| PersistedCompletedOfficialRetry {
+                source_generation_hash: completed.key.0.clone(),
+                conversation_hash: completed.key.1.clone(),
+                model_hash: completed.key.2.clone(),
+                official_retry_identity: completed.official_retry_identity.clone(),
+                completed_at_unix_ms: completed.completed_at_unix_ms,
+                sequence: completed.sequence,
+            })
+            .collect();
+        let encoded = serde_json::to_string(&PersistedOtlpRequestCorrelationState {
+            schema_version: "codex_request_correlation.v1".into(),
+            next_sequence: self.next_sequence,
+            pending,
+            recently_completed,
+        })
+        .map_err(|_| AdapterError::InvalidJson)?;
+        if encoded.len() > MAX_PERSISTED_OTLP_CORRELATION_BYTES {
+            return Err(AdapterError::HandoffTooLarge);
+        }
+        Ok(encoded)
+    }
+
+    fn expire(&mut self, now_unix_ms: u64) {
+        self.pending.retain(|_, queue| {
+            queue.retain(|pending| {
+                now_unix_ms.saturating_sub(pending.inserted_at_unix_ms)
+                    < OTLP_REQUEST_CORRELATION_TTL_MS
+            });
+            !queue.is_empty()
+        });
+        self.recently_completed.retain(|completed| {
+            now_unix_ms.saturating_sub(completed.completed_at_unix_ms)
+                < OTLP_REQUEST_CORRELATION_TTL_MS
+        });
+    }
+
+    fn push(&mut self, key: OtlpRequestPairKey, pending: PendingOtlpRequest) {
+        self.pending.entry(key).or_default().push_back(pending);
+        self.enforce_capacity();
+    }
+
+    fn enforce_capacity(&mut self) {
+        while self
+            .pending_len()
+            .saturating_add(self.recently_completed.len())
+            > MAX_PENDING_OTLP_REQUESTS
+        {
+            self.evict_oldest();
+        }
+    }
+
+    fn contains_official_retry(
+        &self,
+        key: &OtlpRequestPairKey,
+        official_retry_identity: &str,
+    ) -> bool {
+        self.pending.get(key).is_some_and(|queue| {
+            queue.iter().any(|pending| {
+                pending.official_retry_identity.as_deref() == Some(official_retry_identity)
+            })
+        }) || self.recently_completed.iter().any(|completed| {
+            &completed.key == key && completed.official_retry_identity == official_retry_identity
+        })
+    }
+
+    fn push_completed(&mut self, completed: CompletedOfficialRetry) {
+        self.recently_completed.push_back(completed);
+        self.enforce_capacity();
+    }
+
+    fn remember_completed_official_retry(
+        &mut self,
+        key: OtlpRequestPairKey,
+        official_retry_identity: Option<&str>,
+        now_unix_ms: u64,
+    ) {
+        let Some(official_retry_identity) = official_retry_identity else {
+            return;
+        };
+        let sequence = self.next_sequence();
+        self.push_completed(CompletedOfficialRetry {
+            key,
+            official_retry_identity: official_retry_identity.to_owned(),
+            completed_at_unix_ms: now_unix_ms,
+            sequence,
+        });
+    }
+
+    fn evict_oldest(&mut self) {
+        let oldest_pending = self
+            .pending
+            .iter()
+            .filter_map(|(key, queue)| queue.front().map(|pending| (pending.sequence, key)))
+            .min_by(Ord::cmp)
+            .map(|(sequence, key)| (sequence, key.clone()));
+        let oldest_completed = self
+            .recently_completed
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, completed)| completed.sequence)
+            .map(|(index, completed)| (completed.sequence, index));
+        if oldest_completed.is_some_and(|completed| {
+            oldest_pending
+                .as_ref()
+                .is_none_or(|pending| completed.0 <= pending.0)
+        }) {
+            self.recently_completed
+                .remove(oldest_completed.expect("checked above").1);
+            return;
+        }
+        let Some((_, key)) = oldest_pending else {
+            return;
+        };
+        let remove_key = self.pending.get_mut(&key).is_some_and(|queue| {
+            queue.pop_front();
+            queue.is_empty()
+        });
+        if remove_key {
+            self.pending.remove(&key);
+        }
+    }
+
+    fn next_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        if let Some(next) = self.next_sequence.checked_add(1) {
+            self.next_sequence = next;
+        } else {
+            self.pending.clear();
+            self.recently_completed.clear();
+            self.next_sequence = 1;
+        }
+        sequence
+    }
+
+    fn finish_batch(&mut self) {
+        self.pending.retain(|_, queue| {
+            for pending in queue.iter_mut() {
+                pending.current_record_index = None;
+            }
+            !queue.is_empty()
+        });
+    }
 }
 
 impl AdapterBatch {
@@ -264,6 +668,494 @@ pub fn parse_handoff_jsonl(input: &str) -> Result<AdapterBatch, AdapterError> {
     Ok(batch)
 }
 
+/// Decodes one bounded OTLP/HTTP JSON logs request into the existing content-free Codex adapter
+/// boundary. Only explicitly owned scalar fields are copied; prompt text, tool arguments/output,
+/// account identity, and unknown attributes are discarded before canonical mapping.
+///
+/// `first_cursor` must be the next monotonic cursor for `source_generation`. The returned cursor is
+/// the last consumed cursor, or `previous_cursor` when the request contains no log records.
+///
+/// # Errors
+///
+/// Returns [`AdapterError`] for oversized or malformed OTLP JSON, invalid cursor values, or a
+/// request containing more than [`MAX_OTLP_LOG_RECORDS`] records.
+pub fn parse_otlp_http_json(
+    input: &[u8],
+    source_generation: &str,
+    previous_cursor: Option<&str>,
+    first_cursor: u64,
+    fallback_received_at_unix_ms: u64,
+) -> Result<(AdapterBatch, Option<String>), AdapterError> {
+    parse_otlp_http_json_with_state(
+        input,
+        source_generation,
+        previous_cursor,
+        first_cursor,
+        fallback_received_at_unix_ms,
+        &mut OtlpRequestCorrelationState::default(),
+    )
+}
+
+/// Stateful variant of [`parse_otlp_http_json`] for collectors that receive one OTLP export at a
+/// time. State changes are applied only when the complete export maps successfully.
+///
+/// # Errors
+///
+/// Returns the same bounded decode and mapping errors as [`parse_otlp_http_json`].
+pub fn parse_otlp_http_json_with_state(
+    input: &[u8],
+    source_generation: &str,
+    previous_cursor: Option<&str>,
+    first_cursor: u64,
+    fallback_received_at_unix_ms: u64,
+    state: &mut OtlpRequestCorrelationState,
+) -> Result<(AdapterBatch, Option<String>), AdapterError> {
+    if input.len() as u64 > MAX_HANDOFF_BYTES {
+        return Err(AdapterError::HandoffTooLarge);
+    }
+    if source_generation.is_empty() || first_cursor == 0 {
+        return Err(AdapterError::InvalidCursorSequence);
+    }
+    let root: Value = serde_json::from_slice(input).map_err(|_| AdapterError::InvalidJson)?;
+    let resource_logs = root
+        .get("resourceLogs")
+        .and_then(Value::as_array)
+        .ok_or(AdapterError::InvalidJson)?;
+    let mut records = Vec::new();
+    let mut next_cursor = first_cursor;
+    let mut prior = previous_cursor.map(str::to_owned);
+    for resource in resource_logs {
+        let scope_logs = resource
+            .get("scopeLogs")
+            .and_then(Value::as_array)
+            .ok_or(AdapterError::InvalidJson)?;
+        for scope in scope_logs {
+            let log_records = scope
+                .get("logRecords")
+                .and_then(Value::as_array)
+                .ok_or(AdapterError::InvalidJson)?;
+            for log_record in log_records {
+                if records.len() >= MAX_OTLP_LOG_RECORDS {
+                    return Err(AdapterError::TooManyRecords);
+                }
+                let attributes = otlp_attributes(log_record)?;
+                let event_name = match attributes.get("event.name") {
+                    None => continue,
+                    Some(Value::String(value)) if !value.is_empty() => value.clone(),
+                    Some(_) => return Err(AdapterError::InvalidFieldType),
+                };
+                let cursor = next_cursor.to_string();
+                next_cursor = next_cursor
+                    .checked_add(1)
+                    .ok_or(AdapterError::InvalidCursorSequence)?;
+                let received_at_unix_ms =
+                    otlp_observed_time_unix_ms(log_record, fallback_received_at_unix_ms)?;
+                let canonical = canonical_otlp_attributes(&event_name, &attributes)?;
+                records.push(HandoffRecord {
+                    schema_version: HANDOFF_SCHEMA_VERSION.into(),
+                    source_generation: source_generation.into(),
+                    previous_cursor: prior.clone(),
+                    cursor: cursor.clone(),
+                    surface: SourceSurface::OtelLog,
+                    received_at_unix_ms,
+                    event_name,
+                    attributes: canonical,
+                });
+                prior = Some(cursor);
+            }
+        }
+    }
+    let mut next_state = state.clone();
+    correlate_otlp_request_pairs(
+        &mut records,
+        source_generation,
+        fallback_received_at_unix_ms,
+        &mut next_state,
+    )?;
+    let mut jsonl = String::new();
+    for record in &records {
+        jsonl.push_str(&serde_json::to_string(record).map_err(|_| AdapterError::InvalidJson)?);
+        jsonl.push('\n');
+    }
+    let batch = parse_handoff_jsonl(&jsonl)?;
+    *state = next_state;
+    Ok((batch, prior))
+}
+
+fn otlp_observed_time_unix_ms(
+    record: &Value,
+    fallback_received_at_unix_ms: u64,
+) -> Result<u64, AdapterError> {
+    for key in ["timeUnixNano", "observedTimeUnixNano"] {
+        let Some(value) = record.get(key) else {
+            continue;
+        };
+        let nanos = otlp_u64(value).ok_or(AdapterError::InvalidTiming)?;
+        if nanos != 0 {
+            return Ok(nanos / 1_000_000);
+        }
+    }
+    Ok(fallback_received_at_unix_ms)
+}
+
+/// Strictly projects a raw Codex `agent-turn-complete` notify argument before transport.
+///
+/// # Errors
+///
+/// Returns [`AdapterError`] when the bounded JSON payload is malformed, contains unknown fields,
+/// lacks the supported event or identifiers, or exceeds the projected payload bound.
+pub fn project_notify_json(input: &[u8]) -> Result<ProjectedNotifyV1, AdapterError> {
+    if input.len() as u64 > MAX_HANDOFF_LINE_BYTES as u64 {
+        return Err(AdapterError::RecordTooLarge);
+    }
+    let payload: RawNotifyPayload =
+        serde_json::from_slice(input).map_err(|error| match error.classify() {
+            serde_json::error::Category::Data => AdapterError::InvalidSchema,
+            _ => AdapterError::InvalidJson,
+        })?;
+    let projected = ProjectedNotifyV1::new(payload.event_name, payload.thread_id, payload.turn_id)?;
+    projected.to_json()?;
+    Ok(projected)
+}
+
+/// Maps a strictly projected Codex notify wire payload without retaining content fields.
+///
+/// # Errors
+///
+/// Returns [`AdapterError`] when strict projection or canonical mapping fails.
+pub fn parse_projected_notify_json(
+    input: &[u8],
+    source_generation: &str,
+    previous_cursor: Option<&str>,
+    cursor: u64,
+    received_at_unix_ms: u64,
+) -> Result<AdapterBatch, AdapterError> {
+    if input.len() > MAX_PROJECTED_NOTIFY_BYTES {
+        return Err(AdapterError::RecordTooLarge);
+    }
+    let payload = serde_json::from_slice::<ProjectedNotifyV1>(input)
+        .map_err(|error| match error.classify() {
+            serde_json::error::Category::Data => AdapterError::InvalidSchema,
+            _ => AdapterError::InvalidJson,
+        })?
+        .validate()?;
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "thread_id".into(),
+        Value::String(payload.thread_id().into()),
+    );
+    attributes.insert("turn_id".into(), Value::String(payload.turn_id().into()));
+    let record = HandoffRecord {
+        schema_version: HANDOFF_SCHEMA_VERSION.into(),
+        source_generation: source_generation.into(),
+        previous_cursor: previous_cursor.map(str::to_owned),
+        cursor: cursor.to_string(),
+        surface: SourceSurface::Notify,
+        received_at_unix_ms,
+        event_name: payload.event_name().into(),
+        attributes,
+    };
+    let json = serde_json::to_string(&record).map_err(|_| AdapterError::InvalidJson)?;
+    parse_handoff_jsonl(&json)
+}
+
+fn otlp_attributes(record: &Value) -> Result<BTreeMap<String, Value>, AdapterError> {
+    let values = record
+        .get("attributes")
+        .and_then(Value::as_array)
+        .ok_or(AdapterError::InvalidJson)?;
+    let mut attributes = BTreeMap::new();
+    for attribute in values {
+        let key = attribute
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or(AdapterError::InvalidJson)?;
+        if !is_owned_otlp_attribute(key) {
+            continue;
+        }
+        let value = attribute
+            .get("value")
+            .and_then(otlp_any_value)
+            .ok_or(AdapterError::InvalidFieldType)?;
+        attributes.insert(key.to_owned(), value);
+    }
+    Ok(attributes)
+}
+
+fn is_owned_otlp_attribute(key: &str) -> bool {
+    matches!(
+        key,
+        "event.name"
+            | "conversation.id"
+            | "turn.id"
+            | "model"
+            | "event.kind"
+            | "tool_name"
+            | "call_id"
+            | "decision"
+            | "duration_ms"
+            | "input_token_count"
+            | "output_token_count"
+            | "cached_token_count"
+            | "reasoning_token_count"
+            | "tool_token_count"
+            | "auth.request_id"
+            | "success"
+            | "http.response.status_code"
+            | "error.message"
+    )
+}
+
+fn otlp_any_value(value: &Value) -> Option<Value> {
+    if let Some(value) = value.get("stringValue").and_then(Value::as_str) {
+        return Some(Value::String(value.to_owned()));
+    }
+    if let Some(value) = value.get("boolValue").and_then(Value::as_bool) {
+        return Some(Value::Bool(value));
+    }
+    if let Some(value) = value.get("intValue").and_then(otlp_u64) {
+        return Some(Value::Number(value.into()));
+    }
+    value
+        .get("doubleValue")
+        .and_then(Value::as_f64)
+        .and_then(serde_json::Number::from_f64)
+        .map(Value::Number)
+}
+
+fn otlp_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn canonical_otlp_attributes(
+    event_name: &str,
+    source: &BTreeMap<String, Value>,
+) -> Result<BTreeMap<String, Value>, AdapterError> {
+    let mut output = BTreeMap::new();
+    copy_string(source, &mut output, "conversation.id", "conversation_id")?;
+    copy_string(source, &mut output, "turn.id", "turn_id")?;
+    copy_string(source, &mut output, "model", "model")?;
+    copy_string(source, &mut output, "event.kind", "kind")?;
+    copy_string(source, &mut output, "tool_name", "tool_name")?;
+    copy_string(source, &mut output, "call_id", "call_id")?;
+    copy_string(source, &mut output, "decision", "decision")?;
+    copy_u64(source, &mut output, "duration_ms", "duration_ms")?;
+    copy_u64(source, &mut output, "input_token_count", "input_tokens")?;
+    copy_u64(source, &mut output, "output_token_count", "output_tokens")?;
+    copy_u64(
+        source,
+        &mut output,
+        "cached_token_count",
+        "cached_input_tokens",
+    )?;
+    copy_u64(
+        source,
+        &mut output,
+        "reasoning_token_count",
+        "reasoning_output_tokens",
+    )?;
+    copy_u64(source, &mut output, "tool_token_count", "total_tokens")?;
+
+    if matches!(event_name, "codex.api_request" | "codex.sse_event") {
+        copy_string(source, &mut output, "auth.request_id", "request_id")?;
+    }
+    if let Some(success) = canonical_success(event_name, source)? {
+        output.insert("success".into(), Value::Bool(success));
+    }
+    Ok(output)
+}
+
+fn correlate_otlp_request_pairs(
+    records: &mut [HandoffRecord],
+    source_generation: &str,
+    now_unix_ms: u64,
+    state: &mut OtlpRequestCorrelationState,
+) -> Result<(), AdapterError> {
+    state.expire(now_unix_ms);
+    for index in 0..records.len() {
+        let event_name = records[index].event_name.as_str();
+        let is_completed = event_name == "codex.sse_event"
+            && optional_string(&records[index].attributes, "kind")?.as_deref()
+                == Some("response.completed");
+        if event_name != "codex.api_request" && !is_completed {
+            continue;
+        }
+        let Some((conversation_id, model)) = otlp_request_pair_key(&records[index].attributes)?
+        else {
+            continue;
+        };
+        let key = (
+            hash_opaque_identifier(source_generation),
+            hash_opaque_identifier(&conversation_id),
+            hash_opaque_identifier(&model),
+        );
+        if event_name == "codex.api_request" {
+            let request_id = optional_string(&records[index].attributes, "request_id")?;
+            let official_retry_identity = request_id.as_deref().map(hash_opaque_identifier);
+            let correlation_id = official_retry_identity.clone().unwrap_or_else(|| {
+                stable_id(
+                    "id:sha256",
+                    &[
+                        "codex-local-request-v1",
+                        source_generation,
+                        &conversation_id,
+                        &model,
+                        &records[index].cursor,
+                    ],
+                )
+            });
+            records[index]
+                .attributes
+                .insert("request_id".into(), Value::String(correlation_id.clone()));
+            if optional_bool(&records[index].attributes, "success")? == Some(false) {
+                continue;
+            }
+            if official_retry_identity
+                .as_deref()
+                .is_some_and(|identity| state.contains_official_retry(&key, identity))
+            {
+                continue;
+            }
+            let sequence = state.next_sequence();
+            state.push(
+                key,
+                PendingOtlpRequest {
+                    correlation_id,
+                    official_retry_identity,
+                    inserted_at_unix_ms: now_unix_ms,
+                    sequence,
+                    current_record_index: Some(index),
+                },
+            );
+            continue;
+        }
+        let pending = state.pending.get_mut(&key).and_then(VecDeque::pop_front);
+        let remove_key = state.pending.get(&key).is_some_and(VecDeque::is_empty);
+        if remove_key {
+            state.pending.remove(&key);
+        }
+        let Some(pending) = pending else {
+            continue;
+        };
+        state.remember_completed_official_retry(
+            key,
+            pending.official_retry_identity.as_deref(),
+            now_unix_ms,
+        );
+        let completed_request_id = optional_string(&records[index].attributes, "request_id")?;
+        let request_id = match completed_request_id {
+            Some(completed) if hash_opaque_identifier(&completed) == pending.correlation_id => {
+                Some(completed)
+            }
+            Some(_) => None,
+            None => Some(pending.correlation_id.clone()),
+        };
+        if let Some(request_id) = request_id {
+            if let Some(api_index) = pending.current_record_index {
+                records[api_index]
+                    .attributes
+                    .insert("request_id".into(), Value::String(request_id.clone()));
+            }
+            records[index]
+                .attributes
+                .insert("request_id".into(), Value::String(request_id));
+        } else {
+            if let Some(api_index) = pending.current_record_index {
+                records[api_index].attributes.remove("request_id");
+            }
+            records[index].attributes.remove("request_id");
+        }
+    }
+    state.finish_batch();
+    Ok(())
+}
+
+fn is_private_hash(value: &str) -> bool {
+    value.len() == 74
+        && value.starts_with("id:sha256:")
+        && value[10..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn otlp_request_pair_key(
+    attributes: &BTreeMap<String, Value>,
+) -> Result<Option<(String, String)>, AdapterError> {
+    let conversation_id = optional_string(attributes, "conversation_id")?;
+    let model = optional_string(attributes, "model")?;
+    Ok(conversation_id.zip(model))
+}
+
+fn copy_string(
+    source: &BTreeMap<String, Value>,
+    output: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    output_key: &str,
+) -> Result<(), AdapterError> {
+    let Some(value) = source.get(source_key) else {
+        return Ok(());
+    };
+    let value = value.as_str().ok_or(AdapterError::InvalidFieldType)?;
+    if value.is_empty() {
+        return Err(AdapterError::InvalidIdentifier);
+    }
+    output.insert(output_key.into(), Value::String(value.into()));
+    Ok(())
+}
+
+fn copy_u64(
+    source: &BTreeMap<String, Value>,
+    output: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    output_key: &str,
+) -> Result<(), AdapterError> {
+    let Some(value) = source.get(source_key) else {
+        return Ok(());
+    };
+    let value = otlp_u64(value).ok_or(AdapterError::InvalidFieldType)?;
+    output.insert(output_key.into(), Value::Number(value.into()));
+    Ok(())
+}
+
+fn otlp_bool(value: &Value) -> Option<bool> {
+    value
+        .as_bool()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn canonical_success(
+    event_name: &str,
+    source: &BTreeMap<String, Value>,
+) -> Result<Option<bool>, AdapterError> {
+    let explicit = source
+        .get("success")
+        .map(|value| otlp_bool(value).ok_or(AdapterError::InvalidFieldType))
+        .transpose()?;
+    let status = source
+        .get("http.response.status_code")
+        .map(|value| {
+            let status = otlp_u64(value).ok_or(AdapterError::InvalidFieldType)?;
+            if !(100..=599).contains(&status) {
+                return Err(AdapterError::InvalidFieldType);
+            }
+            Ok((200..=299).contains(&status))
+        })
+        .transpose()?;
+    let completed = (event_name == "codex.sse_event"
+        && source.get("event.kind").and_then(Value::as_str) == Some("response.completed"))
+    .then_some(true);
+    let error = source.contains_key("error.message").then_some(false);
+
+    let mut signals = [explicit, status, completed, error].into_iter().flatten();
+    let Some(success) = signals.next() else {
+        return Ok(None);
+    };
+    if signals.any(|signal| signal != success) {
+        return Err(AdapterError::InvalidFieldType);
+    }
+    Ok(Some(success))
+}
+
 fn checkpoint_from_record(record: &HandoffRecord) -> Result<SourceCheckpoint, AdapterError> {
     Ok(SourceCheckpoint {
         source: AgentSource::Codex,
@@ -389,11 +1281,14 @@ fn request_observation(
     includes_usage: bool,
 ) -> Result<Mapping, AdapterError> {
     let session = required_string(&record.attributes, "conversation_id")?;
-    let turn = required_string(&record.attributes, "turn_id")?;
+    let turn = optional_string(&record.attributes, "turn_id")?;
     let request = required_string(&record.attributes, "request_id")?;
     let correlation = CorrelationIds {
         session_id: Some(parse_identifier::<SessionId>(&session)?),
-        turn_id: Some(parse_identifier::<TurnId>(&turn)?),
+        turn_id: turn
+            .as_deref()
+            .map(parse_identifier::<TurnId>)
+            .transpose()?,
         request_id: Some(parse_identifier::<RequestId>(&request)?),
         ..CorrelationIds::default()
     };
@@ -414,7 +1309,7 @@ fn request_observation(
         record,
         previous_cursor,
         &session,
-        Some(&turn),
+        turn.as_deref(),
         &format!(
             "request:{request}:{}",
             if includes_usage { "response" } else { "api" }
@@ -434,11 +1329,14 @@ fn tool_observation(
     previous_cursor: Option<String>,
 ) -> Result<Mapping, AdapterError> {
     let session = required_string(&record.attributes, "conversation_id")?;
-    let turn = required_string(&record.attributes, "turn_id")?;
+    let turn = optional_string(&record.attributes, "turn_id")?;
     let operation = required_string(&record.attributes, "call_id")?;
     let correlation = CorrelationIds {
         session_id: Some(parse_identifier::<SessionId>(&session)?),
-        turn_id: Some(parse_identifier::<TurnId>(&turn)?),
+        turn_id: turn
+            .as_deref()
+            .map(parse_identifier::<TurnId>)
+            .transpose()?,
         operation_id: Some(parse_identifier::<OperationId>(&operation)?),
         ..CorrelationIds::default()
     };
@@ -446,7 +1344,7 @@ fn tool_observation(
         record,
         previous_cursor,
         &session,
-        Some(&turn),
+        turn.as_deref(),
         &format!("tool:{operation}"),
         correlation,
         ObservationEvent::ToolOperation {
@@ -464,12 +1362,15 @@ fn permission_observation(
     previous_cursor: Option<String>,
 ) -> Result<Mapping, AdapterError> {
     let session = required_string(&record.attributes, "conversation_id")?;
-    let turn = required_string(&record.attributes, "turn_id")?;
+    let turn = optional_string(&record.attributes, "turn_id")?;
     let permission = required_string(&record.attributes, "call_id")?;
     let decision = canonical_decision(&record.attributes)?;
     let correlation = CorrelationIds {
         session_id: Some(parse_identifier::<SessionId>(&session)?),
-        turn_id: Some(parse_identifier::<TurnId>(&turn)?),
+        turn_id: turn
+            .as_deref()
+            .map(parse_identifier::<TurnId>)
+            .transpose()?,
         permission_id: Some(parse_identifier::<PermissionId>(&permission)?),
         ..CorrelationIds::default()
     };
@@ -477,7 +1378,7 @@ fn permission_observation(
         record,
         previous_cursor,
         &session,
-        Some(&turn),
+        turn.as_deref(),
         &format!("permission:{permission}"),
         correlation,
         ObservationEvent::Permission {
@@ -509,7 +1410,11 @@ fn build_observation(
     let trace_id = parse_identifier::<TraceId>(&stable_id("codex-trace", &[session]))?;
     let session_span = stable_id("codex-session", &[session]);
     let (span_id, parent_span_id) = match turn {
-        None => (session_span, None),
+        None if leaf == "session" => (session_span, None),
+        None => (
+            stable_id("codex-span", &[session, leaf]),
+            Some(session_span),
+        ),
         Some(turn_id) if leaf == "turn" => (
             stable_id("codex-turn", &[session, turn_id]),
             Some(session_span),
@@ -691,10 +1596,17 @@ fn stable_id(prefix: &str, components: &[&str]) -> String {
 mod tests {
     use super::{
         AdapterError, AdapterItem, DiagnosticCode, MAX_HANDOFF_BYTES, MAX_HANDOFF_LINE_BYTES,
-        MAX_HANDOFF_LINES, parse_handoff_jsonl, read_handoff_file,
+        MAX_HANDOFF_LINES, MAX_OTLP_LOG_RECORDS, MAX_PENDING_OTLP_REQUESTS,
+        MAX_PROJECTED_NOTIFY_BYTES, MAX_RECENTLY_COMPLETED_OTLP_REQUESTS,
+        OTLP_REQUEST_CORRELATION_TTL_MS, OtlpRequestCorrelationState,
+        PROJECTED_NOTIFY_SCHEMA_VERSION, parse_handoff_jsonl, parse_otlp_http_json,
+        parse_otlp_http_json_with_state, parse_projected_notify_json, project_notify_json,
+        read_handoff_file,
     };
     use agent_observability_contracts::ObservationEvent;
+    use agent_observability_contracts::hash_opaque_identifier;
     use agent_observability_domain::LifecycleState;
+    use agent_observability_domain::MAX_IDENTIFIER_BYTES;
     use std::fs;
 
     const FIXTURE: &str = include_str!("../tests/fixtures/codex-handoff.jsonl");
@@ -703,6 +1615,868 @@ mod tests {
         "sha256:0b30a1810b6e34152310691a3a660ecf33e98d4940fc63fe9b340811241f526c";
     const EXPECTED_PROJECTION_HASH: &str =
         "sha256:6dc1fa2ad7837c0e9ac2dcd6ac0dca52da1b0c11872db203d53ae742c97ee45a";
+
+    fn otlp_api_request(conversation_id: &str, request_id: &str) -> Vec<u8> {
+        format!(
+            r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"attributes":[
+              {{"key":"event.name","value":{{"stringValue":"codex.api_request"}}}},
+              {{"key":"conversation.id","value":{{"stringValue":"{conversation_id}"}}}},
+              {{"key":"model","value":{{"stringValue":"gpt-test"}}}},
+              {{"key":"auth.request_id","value":{{"stringValue":"{request_id}"}}}},
+              {{"key":"http.response.status_code","value":{{"intValue":"200"}}}}
+            ]}}]}}]}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    fn otlp_api_request_without_id(conversation_id: &str) -> Vec<u8> {
+        format!(
+            r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"attributes":[
+              {{"key":"event.name","value":{{"stringValue":"codex.api_request"}}}},
+              {{"key":"conversation.id","value":{{"stringValue":"{conversation_id}"}}}},
+              {{"key":"model","value":{{"stringValue":"gpt-test"}}}},
+              {{"key":"http.response.status_code","value":{{"intValue":"200"}}}}
+            ]}}]}}]}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    fn otlp_completed_response(conversation_id: &str) -> Vec<u8> {
+        format!(
+            r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"attributes":[
+              {{"key":"event.name","value":{{"stringValue":"codex.sse_event"}}}},
+              {{"key":"conversation.id","value":{{"stringValue":"{conversation_id}"}}}},
+              {{"key":"model","value":{{"stringValue":"gpt-test"}}}},
+              {{"key":"event.kind","value":{{"stringValue":"response.completed"}}}}
+            ]}}]}}]}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    fn only_request_id(batch: &super::AdapterBatch) -> Option<&str> {
+        batch
+            .observations()
+            .find(|observation| matches!(observation.event, ObservationEvent::ModelRequest { .. }))
+            .and_then(|observation| observation.correlation.request_id.as_ref())
+            .map(agent_observability_domain::RequestId::as_str)
+    }
+
+    #[test]
+    fn current_codex_otlp_json_is_allowlisted_before_canonical_mapping() {
+        let input = br#"{
+          "resourceLogs": [{"scopeLogs": [{"logRecords": [
+            {"timeUnixNano":"1787875200000000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
+              {"key":"user.email","value":{"stringValue":"SECRET_EMAIL@example.com"}},
+              {"key":"unknown.array","value":{"arrayValue":{"values":[{"stringValue":"RAW_ARRAY_SECRET"}]}}},
+              {"key":"unknown.kvlist","value":{"kvlistValue":{"values":[{"key":"private","value":{"stringValue":"RAW_KV_SECRET"}}]}}},
+              {"key":"unknown.bytes","value":{"bytesValue":"UkFXX0JZVEVTX1NFQ1JFVA=="}}
+            ]},
+            {"timeUnixNano":"1787875200100000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
+              {"key":"attempt","value":{"intValue":"1"}},
+              {"key":"http.response.status_code","value":{"intValue":"200"}},
+              {"key":"duration_ms","value":{"stringValue":"100"}},
+              {"key":"auth.request_id","value":{"stringValue":"request-native-1"}}
+            ]},
+            {"timeUnixNano":"1787875200200000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"event.kind","value":{"stringValue":"response.completed"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
+              {"key":"input_token_count","value":{"stringValue":"100"}},
+              {"key":"output_token_count","value":{"stringValue":"25"}},
+              {"key":"cached_token_count","value":{"intValue":"10"}},
+              {"key":"reasoning_token_count","value":{"intValue":"5"}},
+              {"key":"tool_token_count","value":{"stringValue":"125"}}
+            ]},
+            {"timeUnixNano":"1787875200300000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.tool_result"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"tool_name","value":{"stringValue":"exec_command"}},
+              {"key":"call_id","value":{"stringValue":"call-1"}},
+              {"key":"success","value":{"stringValue":"true"}},
+              {"key":"arguments","value":{"stringValue":"RAW_ARGUMENT_SECRET"}},
+              {"key":"output","value":{"stringValue":"RAW_OUTPUT_SECRET"}}
+            ]}
+          ]}]}]
+        }"#;
+        let (batch, cursor) = parse_otlp_http_json(input, "codex-0.151.0", None, 1, 0).unwrap();
+        assert_eq!(cursor.as_deref(), Some("4"));
+        assert_eq!(batch.observations().count(), 4);
+        assert_eq!(batch.diagnostics().count(), 0);
+        let requests = batch
+            .observations()
+            .filter(|observation| {
+                matches!(observation.event, ObservationEvent::ModelRequest { .. })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].correlation.request_id,
+            requests[1].correlation.request_id
+        );
+        assert_eq!(
+            requests[0]
+                .correlation
+                .request_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            hash_opaque_identifier("request-native-1")
+        );
+        assert_eq!(requests[1].token_usage.input, Some(100));
+        assert_eq!(requests[1].token_usage.output, Some(25));
+        assert_eq!(requests[1].token_usage.total, Some(125));
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.correlation.turn_id.is_none())
+        );
+        let debug = format!("{batch:?}");
+        for secret in [
+            "SECRET_EMAIL@example.com",
+            "RAW_ARRAY_SECRET",
+            "RAW_KV_SECRET",
+            "RAW_ARGUMENT_SECRET",
+            "RAW_OUTPUT_SECRET",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[test]
+    fn current_codex_otlp_skips_internal_logs_and_uses_observed_time_for_zero_time() {
+        let input = br#"{
+          "resourceLogs": [{"scopeLogs": [{"logRecords": [
+            {"timeUnixNano":"0","observedTimeUnixNano":"1787875200000000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}}
+            ]},
+            {"timeUnixNano":"0","observedTimeUnixNano":"1787875200001000000","attributes":[]}
+          ]}]}]
+        }"#;
+
+        let (batch, cursor) = parse_otlp_http_json(input, "codex-0.151.0", None, 1, 99).unwrap();
+
+        assert_eq!(cursor.as_deref(), Some("1"));
+        let observations = batch.observations().collect::<Vec<_>>();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].timing.start_unix_ms, 1_787_875_200_000);
+        assert_eq!(observations[0].timing.end_unix_ms, Some(1_787_875_200_000));
+    }
+
+    #[test]
+    fn native_request_pair_without_official_request_id_gets_local_correlation() {
+        let input = br#"{
+          "resourceLogs": [{"scopeLogs": [{"logRecords": [
+            {"timeUnixNano":"1787875200000000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
+              {"key":"attempt","value":{"intValue":"1"}},
+              {"key":"http.response.status_code","value":{"intValue":"200"}},
+              {"key":"duration_ms","value":{"stringValue":"100"}}
+            ]},
+            {"timeUnixNano":"1787875200100000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"event.kind","value":{"stringValue":"response.completed"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
+              {"key":"input_token_count","value":{"stringValue":"100"}},
+              {"key":"output_token_count","value":{"stringValue":"25"}},
+              {"key":"response.body","value":{"stringValue":"RAW_RESPONSE_SECRET"}}
+            ]}
+          ]}]}]
+        }"#;
+        let (batch, cursor) = parse_otlp_http_json(input, "codex-0.151.0", None, 41, 0).unwrap();
+        assert_eq!(cursor.as_deref(), Some("42"));
+        let requests = batch.observations().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].correlation.request_id,
+            requests[1].correlation.request_id
+        );
+        assert!(
+            requests[0]
+                .correlation
+                .request_id
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .starts_with("id:sha256:")
+        );
+        assert_eq!(batch.diagnostics().count(), 0);
+        let debug = format!("{batch:?}");
+        assert!(!debug.contains("otlp-41"));
+        assert!(!debug.contains("otlp-42"));
+        assert!(!debug.contains("RAW_RESPONSE_SECRET"));
+    }
+
+    #[test]
+    fn otlp_rejects_present_but_invalid_timestamp_and_outcome_fields() {
+        let cases: &[(&[u8], AdapterError)] = &[
+            (
+                br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"not-a-timestamp","attributes":[{"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},{"key":"conversation.id","value":{"stringValue":"conversation-1"}}]}]}]}]}"#,
+                AdapterError::InvalidTiming,
+            ),
+            (
+                br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[{"key":"event.name","value":{"stringValue":"codex.tool_result"}},{"key":"conversation.id","value":{"stringValue":"conversation-1"}},{"key":"call_id","value":{"stringValue":"call-1"}},{"key":"success","value":{"stringValue":"yes"}}]}]}]}]}"#,
+                AdapterError::InvalidFieldType,
+            ),
+            (
+                br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[{"key":"event.name","value":{"stringValue":"codex.api_request"}},{"key":"conversation.id","value":{"stringValue":"conversation-1"}},{"key":"model","value":{"stringValue":"gpt-test"}},{"key":"http.response.status_code","value":{"stringValue":"invalid"}}]}]}]}]}"#,
+                AdapterError::InvalidFieldType,
+            ),
+            (
+                br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[{"key":"event.name","value":{"stringValue":"codex.api_request"}},{"key":"conversation.id","value":{"stringValue":"conversation-1"}},{"key":"model","value":{"stringValue":"gpt-test"}},{"key":"http.response.status_code","value":{"intValue":"600"}}]}]}]}]}"#,
+                AdapterError::InvalidFieldType,
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let error = parse_otlp_http_json(input, "generation-a", None, 1, 123).unwrap_err();
+            assert_eq!(error.to_string(), expected.to_string());
+        }
+    }
+
+    #[test]
+    fn otlp_rejects_contradictory_success_signals() {
+        let contradictory_attributes = [
+            r#"{"key":"success","value":{"boolValue":true}},{"key":"http.response.status_code","value":{"intValue":"500"}}"#,
+            r#"{"key":"success","value":{"boolValue":false}},{"key":"http.response.status_code","value":{"intValue":"200"}}"#,
+            r#"{"key":"success","value":{"boolValue":true}},{"key":"error.message","value":{"stringValue":"PRIVATE_ERROR"}}"#,
+            r#"{"key":"http.response.status_code","value":{"intValue":"200"}},{"key":"error.message","value":{"stringValue":"PRIVATE_ERROR"}}"#,
+        ];
+
+        for attributes in contradictory_attributes {
+            let input = format!(
+                r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"attributes":[{{"key":"event.name","value":{{"stringValue":"codex.api_request"}}}},{{"key":"conversation.id","value":{{"stringValue":"conversation-1"}}}},{{"key":"model","value":{{"stringValue":"gpt-test"}}}},{attributes}]}}]}}]}}]}}"#
+            );
+            assert!(matches!(
+                parse_otlp_http_json(input.as_bytes(), "generation-a", None, 1, 123),
+                Err(AdapterError::InvalidFieldType)
+            ));
+        }
+
+        let completed_but_failed = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[{"key":"event.name","value":{"stringValue":"codex.sse_event"}},{"key":"conversation.id","value":{"stringValue":"conversation-1"}},{"key":"model","value":{"stringValue":"gpt-test"}},{"key":"event.kind","value":{"stringValue":"response.completed"}},{"key":"success","value":{"boolValue":false}}]}]}]}]}"#;
+        assert!(matches!(
+            parse_otlp_http_json(completed_but_failed, "generation-a", None, 1, 123),
+            Err(AdapterError::InvalidFieldType)
+        ));
+    }
+
+    #[test]
+    fn otlp_uses_fallback_time_and_observed_lifecycle_only_when_signals_are_absent() {
+        let input = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[{"key":"event.name","value":{"stringValue":"codex.tool_result"}},{"key":"conversation.id","value":{"stringValue":"conversation-1"}},{"key":"call_id","value":{"stringValue":"call-1"}}]}]}]}]}"#;
+        let (batch, _) = parse_otlp_http_json(input, "generation-a", None, 1, 123).unwrap();
+        let observation = batch.observations().next().unwrap();
+        assert_eq!(observation.lifecycle, LifecycleState::Observed);
+        assert_eq!(observation.timing.end_unix_ms, Some(123));
+    }
+
+    #[test]
+    fn stateful_correlation_pairs_split_exports_in_fifo_order() {
+        let mut state = OtlpRequestCorrelationState::default();
+        for (cursor, request_id) in [(1, "request-1"), (2, "request-2")] {
+            let (batch, _) = parse_otlp_http_json_with_state(
+                &otlp_api_request("conversation-1", request_id),
+                "generation-a",
+                None,
+                cursor,
+                100,
+                &mut state,
+            )
+            .unwrap();
+            assert_eq!(
+                only_request_id(&batch),
+                Some(hash_opaque_identifier(request_id).as_str())
+            );
+        }
+        assert_eq!(state.pending_len(), 2);
+
+        for (cursor, request_id) in [(3, "request-1"), (4, "request-2")] {
+            let (batch, _) = parse_otlp_http_json_with_state(
+                &otlp_completed_response("conversation-1"),
+                "generation-a",
+                None,
+                cursor,
+                101,
+                &mut state,
+            )
+            .unwrap();
+            assert_eq!(
+                only_request_id(&batch),
+                Some(hash_opaque_identifier(request_id).as_str())
+            );
+        }
+        assert_eq!(state.pending_len(), 0);
+    }
+
+    #[test]
+    fn successful_official_retry_is_idempotent_across_restart_and_completion() {
+        let first_request = otlp_api_request("conversation-1", "request-1");
+        let mut state = OtlpRequestCorrelationState::default();
+        parse_otlp_http_json_with_state(&first_request, "generation-a", None, 1, 100, &mut state)
+            .unwrap();
+        assert_eq!(state.pending_len(), 1);
+
+        let before_retry = state.to_persisted_json().unwrap();
+        parse_otlp_http_json_with_state(&first_request, "generation-a", None, 1, 101, &mut state)
+            .unwrap();
+        assert_eq!(state.pending_len(), 1);
+        assert_eq!(state.to_persisted_json().unwrap(), before_retry);
+
+        let persisted = state.to_persisted_json().unwrap();
+        let mut restored =
+            OtlpRequestCorrelationState::from_persisted_json(&persisted, 102).unwrap();
+        let (retry, _) = parse_otlp_http_json_with_state(
+            &first_request,
+            "generation-a",
+            None,
+            1,
+            103,
+            &mut restored,
+        )
+        .unwrap();
+        assert_eq!(
+            only_request_id(&retry),
+            Some(hash_opaque_identifier("request-1").as_str())
+        );
+        assert_eq!(restored.pending_len(), 1);
+        assert_eq!(restored.to_persisted_json().unwrap(), persisted);
+
+        let (completed, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response("conversation-1"),
+            "generation-a",
+            Some("1"),
+            2,
+            104,
+            &mut restored,
+        )
+        .unwrap();
+        assert_eq!(
+            only_request_id(&completed),
+            Some(hash_opaque_identifier("request-1").as_str())
+        );
+        assert_eq!(restored.pending_len(), 0);
+
+        let completed_persisted = restored.to_persisted_json().unwrap();
+        let mut restored =
+            OtlpRequestCorrelationState::from_persisted_json(&completed_persisted, 105).unwrap();
+        parse_otlp_http_json_with_state(
+            &first_request,
+            "generation-a",
+            Some("2"),
+            3,
+            105,
+            &mut restored,
+        )
+        .unwrap();
+        assert_eq!(restored.pending_len(), 0);
+
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("conversation-1", "request-2"),
+            "generation-a",
+            Some("3"),
+            4,
+            106,
+            &mut restored,
+        )
+        .unwrap();
+        let (subsequent, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response("conversation-1"),
+            "generation-a",
+            Some("4"),
+            5,
+            107,
+            &mut restored,
+        )
+        .unwrap();
+        assert_eq!(
+            only_request_id(&subsequent),
+            Some(hash_opaque_identifier("request-2").as_str())
+        );
+        assert_eq!(restored.pending_len(), 0);
+    }
+
+    #[test]
+    fn no_id_retry_keeps_cursor_identity_without_official_deduplication() {
+        let request = otlp_api_request_without_id("conversation-1");
+        let mut state = OtlpRequestCorrelationState::default();
+        let mut request_ids = Vec::new();
+        for _ in 0..2 {
+            let (batch, _) =
+                parse_otlp_http_json_with_state(&request, "generation-a", None, 7, 100, &mut state)
+                    .unwrap();
+            request_ids.push(only_request_id(&batch).unwrap().to_owned());
+        }
+        assert_eq!(request_ids[0], request_ids[1]);
+        assert_eq!(state.pending_len(), 2);
+
+        parse_otlp_http_json_with_state(
+            &otlp_completed_response("conversation-1"),
+            "generation-a",
+            Some("7"),
+            8,
+            101,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.pending_len(), 1);
+    }
+
+    #[test]
+    fn correlation_isolated_by_generation_and_restart_fails_closed() {
+        let mut state = OtlpRequestCorrelationState::default();
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("conversation-1", "request-1"),
+            "generation-a",
+            None,
+            1,
+            100,
+            &mut state,
+        )
+        .unwrap();
+
+        for (generation, state) in [
+            ("generation-b", &mut state),
+            ("generation-a", &mut OtlpRequestCorrelationState::default()),
+        ] {
+            let (batch, _) = parse_otlp_http_json_with_state(
+                &otlp_completed_response("conversation-1"),
+                generation,
+                None,
+                2,
+                101,
+                state,
+            )
+            .unwrap();
+            assert_eq!(batch.observations().count(), 0);
+            assert_eq!(
+                batch.diagnostics().next().map(|diagnostic| diagnostic.code),
+                Some(DiagnosticCode::MissingCorrelation)
+            );
+        }
+    }
+
+    #[test]
+    fn correlation_expires_and_never_exceeds_hard_capacity() {
+        let mut state = OtlpRequestCorrelationState::default();
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("expired", "request-expired"),
+            "generation-a",
+            None,
+            1,
+            100,
+            &mut state,
+        )
+        .unwrap();
+        let (expired, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response("expired"),
+            "generation-a",
+            None,
+            2,
+            100 + OTLP_REQUEST_CORRELATION_TTL_MS,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(expired.observations().count(), 0);
+        assert_eq!(state.pending_len(), 0);
+
+        for index in 0..=MAX_PENDING_OTLP_REQUESTS {
+            parse_otlp_http_json_with_state(
+                &otlp_api_request(
+                    &format!("conversation-{index}"),
+                    &format!("request-{index}"),
+                ),
+                "generation-a",
+                None,
+                index as u64 + 3,
+                200,
+                &mut state,
+            )
+            .unwrap();
+        }
+        assert_eq!(state.pending_len(), MAX_PENDING_OTLP_REQUESTS);
+
+        let (evicted, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response("conversation-0"),
+            "generation-a",
+            None,
+            2_000,
+            201,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(evicted.observations().count(), 0);
+        assert_eq!(
+            evicted
+                .diagnostics()
+                .next()
+                .map(|diagnostic| diagnostic.code),
+            Some(DiagnosticCode::MissingCorrelation)
+        );
+        let (retained, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response(&format!("conversation-{MAX_PENDING_OTLP_REQUESTS}")),
+            "generation-a",
+            None,
+            2_001,
+            201,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            only_request_id(&retained),
+            Some(hash_opaque_identifier(&format!("request-{MAX_PENDING_OTLP_REQUESTS}")).as_str())
+        );
+    }
+
+    #[test]
+    fn completed_official_retry_identities_expire_and_stay_bounded() {
+        let mut expired_state = OtlpRequestCorrelationState::default();
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("expired", "request-expired"),
+            "generation-a",
+            None,
+            1,
+            100,
+            &mut expired_state,
+        )
+        .unwrap();
+        parse_otlp_http_json_with_state(
+            &otlp_completed_response("expired"),
+            "generation-a",
+            Some("1"),
+            2,
+            101,
+            &mut expired_state,
+        )
+        .unwrap();
+        assert_eq!(expired_state.recently_completed.len(), 1);
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("expired", "request-expired"),
+            "generation-a",
+            Some("2"),
+            3,
+            101 + OTLP_REQUEST_CORRELATION_TTL_MS,
+            &mut expired_state,
+        )
+        .unwrap();
+        assert_eq!(expired_state.recently_completed.len(), 0);
+        assert_eq!(expired_state.pending_len(), 1);
+
+        let mut bounded_state = OtlpRequestCorrelationState::default();
+        for index in 0..=MAX_RECENTLY_COMPLETED_OTLP_REQUESTS {
+            let request_id = format!("request-{index}");
+            let request_cursor = index as u64 * 2 + 1;
+            parse_otlp_http_json_with_state(
+                &otlp_api_request("conversation", &request_id),
+                "generation-a",
+                None,
+                request_cursor,
+                200,
+                &mut bounded_state,
+            )
+            .unwrap();
+            parse_otlp_http_json_with_state(
+                &otlp_completed_response("conversation"),
+                "generation-a",
+                None,
+                request_cursor + 1,
+                201,
+                &mut bounded_state,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            bounded_state.recently_completed.len(),
+            MAX_RECENTLY_COMPLETED_OTLP_REQUESTS
+        );
+
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("conversation", "request-0"),
+            "generation-a",
+            None,
+            3_000,
+            202,
+            &mut bounded_state,
+        )
+        .unwrap();
+        assert_eq!(bounded_state.recently_completed.len(), 1023);
+        assert_eq!(bounded_state.pending_len(), 1);
+        parse_otlp_http_json_with_state(
+            &otlp_api_request(
+                "conversation",
+                &format!("request-{MAX_RECENTLY_COMPLETED_OTLP_REQUESTS}"),
+            ),
+            "generation-a",
+            None,
+            3_001,
+            202,
+            &mut bounded_state,
+        )
+        .unwrap();
+        assert_eq!(bounded_state.pending_len(), 1);
+        assert!(bounded_state.to_persisted_json().is_ok());
+    }
+
+    #[test]
+    fn failed_retry_is_observed_but_does_not_consume_completion_fifo() {
+        let input = br#"{
+          "resourceLogs": [{"scopeLogs": [{"logRecords": [
+            {"timeUnixNano":"100000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-test"}},
+              {"key":"auth.request_id","value":{"stringValue":"request-retry"}},
+              {"key":"http.response.status_code","value":{"intValue":"500"}}
+            ]},
+            {"timeUnixNano":"101000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-test"}},
+              {"key":"auth.request_id","value":{"stringValue":"request-retry"}},
+              {"key":"http.response.status_code","value":{"intValue":"200"}}
+            ]},
+            {"timeUnixNano":"102000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-test"}},
+              {"key":"event.kind","value":{"stringValue":"response.completed"}}
+            ]},
+            {"timeUnixNano":"103000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-test"}},
+              {"key":"http.response.status_code","value":{"intValue":"200"}}
+            ]}
+          ]}]}]
+        }"#;
+        let mut state = OtlpRequestCorrelationState::default();
+        let (batch, _) =
+            parse_otlp_http_json_with_state(input, "generation-a", None, 1, 100, &mut state)
+                .unwrap();
+        let requests = batch.observations().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].lifecycle, LifecycleState::Failed);
+        assert_ne!(requests[0].observation_id, requests[1].observation_id);
+        assert_ne!(requests[0].source_cursor, requests[1].source_cursor);
+        assert_eq!(
+            requests[1].correlation.request_id,
+            requests[2].correlation.request_id
+        );
+        assert_eq!(
+            requests[0].correlation.request_id,
+            requests[1].correlation.request_id
+        );
+        assert_ne!(
+            requests[1].correlation.request_id,
+            requests[3].correlation.request_id
+        );
+        assert_eq!(state.pending_len(), 1);
+    }
+
+    #[test]
+    fn persisted_correlation_state_is_bounded_private_and_restartable() {
+        let mut state = OtlpRequestCorrelationState::default();
+        parse_otlp_http_json_with_state(
+            &otlp_api_request("PRIVATE_CONVERSATION", "PRIVATE_REQUEST"),
+            "PRIVATE_GENERATION",
+            None,
+            1,
+            100,
+            &mut state,
+        )
+        .unwrap();
+        let persisted = state.to_persisted_json().unwrap();
+        for raw in [
+            "PRIVATE_CONVERSATION",
+            "PRIVATE_REQUEST",
+            "PRIVATE_GENERATION",
+        ] {
+            assert!(!persisted.contains(raw));
+        }
+        let expired = OtlpRequestCorrelationState::from_persisted_json(
+            &persisted,
+            100 + OTLP_REQUEST_CORRELATION_TTL_MS,
+        )
+        .unwrap();
+        assert_eq!(expired.pending_len(), 0);
+        let mut restored =
+            OtlpRequestCorrelationState::from_persisted_json(&persisted, 101).unwrap();
+        let (completed, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response("PRIVATE_CONVERSATION"),
+            "PRIVATE_GENERATION",
+            Some("1"),
+            2,
+            102,
+            &mut restored,
+        )
+        .unwrap();
+        assert_eq!(
+            only_request_id(&completed),
+            Some(hash_opaque_identifier("PRIVATE_REQUEST").as_str())
+        );
+        assert_eq!(restored.pending_len(), 0);
+    }
+
+    #[test]
+    fn raw_notify_is_strictly_projected_before_mapping() {
+        let input = br#"{
+          "type":"agent-turn-complete",
+          "thread-id":"conversation-1",
+          "turn-id":"turn-1",
+          "cwd":"/SECRET/PRIVATE/REPO",
+          "input-messages":["RAW_PROMPT_SECRET"],
+          "last-assistant-message":"RAW_ASSISTANT_SECRET"
+        }"#;
+        let projected = project_notify_json(input).unwrap();
+        let encoded = projected.to_json().unwrap();
+        assert!(encoded.len() <= MAX_PROJECTED_NOTIFY_BYTES);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
+            serde_json::json!({
+                "schema_version": PROJECTED_NOTIFY_SCHEMA_VERSION,
+                "event_name": "agent-turn-complete",
+                "thread_id": "conversation-1",
+                "turn_id": "turn-1"
+            })
+        );
+        for secret in [
+            "/SECRET/PRIVATE/REPO",
+            "RAW_PROMPT_SECRET",
+            "RAW_ASSISTANT_SECRET",
+        ] {
+            assert!(!String::from_utf8_lossy(&encoded).contains(secret));
+        }
+
+        let batch = parse_projected_notify_json(&encoded, "codex-notify-v1", None, 1, 123).unwrap();
+        let turn = batch.observations().next().unwrap();
+        assert!(matches!(turn.event, ObservationEvent::Turn));
+        assert_eq!(
+            turn.correlation.session_id.as_ref().unwrap().as_str(),
+            "conversation-1"
+        );
+        assert_eq!(
+            turn.correlation.turn_id.as_ref().unwrap().as_str(),
+            "turn-1"
+        );
+        let debug = format!("{batch:?}");
+        for secret in [
+            "/SECRET/PRIVATE/REPO",
+            "RAW_PROMPT_SECRET",
+            "RAW_ASSISTANT_SECRET",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[test]
+    fn notify_projection_rejects_unknown_and_malformed_payloads() {
+        let unknown = br#"{
+          "type":"agent-turn-complete",
+          "thread-id":"conversation-1",
+          "turn-id":"turn-1",
+          "cwd":"/tmp",
+          "input-messages":[],
+          "last-assistant-message":null,
+          "unknown-metadata":"RAW_UNKNOWN_SENTINEL"
+        }"#;
+        assert!(matches!(
+            project_notify_json(unknown),
+            Err(AdapterError::InvalidSchema)
+        ));
+
+        let malformed = br#"{
+          "type":"agent-turn-complete",
+          "thread-id":"conversation-1",
+          "turn-id":"turn-1",
+          "cwd":"/tmp",
+          "input-messages":{"tool-arguments":"RAW_TOOL_ARGUMENTS"},
+          "last-assistant-message":null
+        }"#;
+        assert!(matches!(
+            project_notify_json(malformed),
+            Err(AdapterError::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn notify_projection_ids_are_bounded_and_deterministic() {
+        let bounded_id = "i".repeat(MAX_IDENTIFIER_BYTES);
+        let input = format!(
+            r#"{{"type":"agent-turn-complete","thread-id":"{bounded_id}","turn-id":"{bounded_id}","cwd":"/tmp","input-messages":[],"last-assistant-message":null}}"#
+        );
+        let first = project_notify_json(input.as_bytes()).unwrap();
+        let second = project_notify_json(input.as_bytes()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.to_json().unwrap(), second.to_json().unwrap());
+        assert!(first.to_json().unwrap().len() <= MAX_PROJECTED_NOTIFY_BYTES);
+
+        let oversized_id = "i".repeat(MAX_IDENTIFIER_BYTES + 1);
+        let oversized = format!(
+            r#"{{"type":"agent-turn-complete","thread-id":"{oversized_id}","turn-id":"turn-1","cwd":"/tmp","input-messages":[],"last-assistant-message":null}}"#
+        );
+        assert!(matches!(
+            project_notify_json(oversized.as_bytes()),
+            Err(AdapterError::InvalidIdentifier)
+        ));
+
+        let projected = project_notify_json(input.as_bytes())
+            .unwrap()
+            .to_json()
+            .unwrap();
+        let first_batch =
+            parse_projected_notify_json(&projected, "generation", None, 1, 123).unwrap();
+        let second_batch =
+            parse_projected_notify_json(&projected, "generation", None, 1, 123).unwrap();
+        let first_observation = first_batch.observations().next().unwrap();
+        let second_observation = second_batch.observations().next().unwrap();
+        assert_eq!(
+            first_observation.trace_id.as_str(),
+            second_observation.trace_id.as_str()
+        );
+        assert_eq!(
+            first_observation.span_id.as_str(),
+            second_observation.span_id.as_str()
+        );
+        assert!(first_observation.trace_id.as_str().len() <= MAX_IDENTIFIER_BYTES);
+        assert!(first_observation.span_id.as_str().len() <= MAX_IDENTIFIER_BYTES);
+    }
+
+    #[test]
+    fn projected_notify_parser_rejects_raw_and_extended_wire_payloads() {
+        let raw = br#"{
+          "type":"agent-turn-complete",
+          "thread-id":"conversation-1",
+          "turn-id":"turn-1",
+          "cwd":"/RAW_PATH_SECRET",
+          "input-messages":["RAW_PROMPT_SECRET"],
+          "last-assistant-message":"RAW_ASSISTANT_SECRET"
+        }"#;
+        assert!(matches!(
+            parse_projected_notify_json(raw, "generation", None, 1, 123),
+            Err(AdapterError::InvalidSchema)
+        ));
+
+        let extended = br#"{
+          "schema_version":"codex_projected_notify.v1",
+          "event_name":"agent-turn-complete",
+          "thread_id":"conversation-1",
+          "turn_id":"turn-1",
+          "raw_content":"RAW_PROMPT_SECRET"
+        }"#;
+        assert!(matches!(
+            parse_projected_notify_json(extended, "generation", None, 1, 123),
+            Err(AdapterError::InvalidSchema)
+        ));
+    }
 
     #[test]
     fn maps_primary_and_supplement_sources_without_losing_timing_updates() {
@@ -860,6 +2634,26 @@ mod tests {
         assert!(parse_handoff_jsonl(&exact_records).is_ok());
         assert!(matches!(
             parse_handoff_jsonl(&(exact_records + "\n")),
+            Err(AdapterError::TooManyRecords)
+        ));
+    }
+
+    #[test]
+    fn otlp_record_bound_accepts_exact_limit_and_rejects_next_record() {
+        let record =
+            r#"{"attributes":[{"key":"event.name","value":{"stringValue":"codex.user_prompt"}}]}"#;
+        let records = std::iter::repeat_n(record, MAX_OTLP_LOG_RECORDS)
+            .collect::<Vec<_>>()
+            .join(",");
+        let exact =
+            format!(r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{records}]}}]}}]}}"#);
+        assert!(parse_otlp_http_json(exact.as_bytes(), "codex-test", None, 1, 0).is_ok());
+
+        let over = format!(
+            r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{records},{record}]}}]}}]}}"#
+        );
+        assert!(matches!(
+            parse_otlp_http_json(over.as_bytes(), "codex-test", None, 1, 0),
             Err(AdapterError::TooManyRecords)
         ));
     }

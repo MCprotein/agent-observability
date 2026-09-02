@@ -1,7 +1,7 @@
 # Adapter Compatibility Contract
 
-Status: exact-version macOS standalone private handoff imports supported
-Last verified: 2026-08-29
+Status: v1.8.0 In Progress; Codex automatic local capability supported on the pinned macOS boundary, publication pending, exact-version private imports supported
+Last verified: 2026-09-02
 
 이 문서는 Codex, Claude Code, Cursor adapter가 어떤 공식 surface를 어떤 우선순위로 사용하고,
 어떤 evidence가 있어야 특정 제품/version을 지원한다고 표시할 수 있는지 정의한다. 제품 업데이트로
@@ -14,14 +14,13 @@ surface가 바뀌면 이 문서와 versioned capability manifest를 함께 갱�
 adapter family, source generation, 공식 session/conversation/generation identifier와 source cursor로
 동일 observation을 합친다.
 
-아래 표는 canonical handoff producer가 따라야 할 source 의미와 field ownership을 정의한다.
-현재 release가 해당 native receiver나 foreground producer를 구현했다는 뜻은 아니다.
+아래 표는 source 의미, field ownership과 현재 runtime 경계를 정의한다.
 
-| Adapter | Primary source | Supplement / fallback | Verified official reference |
-| --- | --- | --- | --- |
-| Codex | native telemetry for model/API/token/tool signals | `agent-turn-complete` notify for turn lifecycle; local session output is not used by the Rust adapter | [Advanced configuration](https://developers.openai.com/codex/config-advanced), [Configuration reference](https://developers.openai.com/codex/config-reference) |
-| Claude Code | native telemetry for usage, cost and tool metrics | hooks for lifecycle events; no transcript dependency in the Rust adapter | [Hooks reference](https://code.claude.com/docs/en/hooks), [Monitoring usage](https://code.claude.com/docs/en/monitoring-usage) |
-| Cursor | generic `preToolUse`/`postToolUse`/`postToolUseFailure` hooks with `tool_use_id` | session/turn lifecycle hooks; specific shell/MCP/file hooks are diagnostic-only because they lack a shared operation ID | [Hooks reference](https://cursor.com/docs/hooks) |
+| Adapter | Primary source | Supplement / fallback | Current runtime support | Verified official reference |
+| --- | --- | --- | --- | --- |
+| Codex | native telemetry for model/API/token/tool signals | `agent-turn-complete` notify owns turn completion only; local session output is unused | macOS automatic private-CA HTTPS local OTLP/HTTP JSON with exact private random request header + projected bounded notify, plus manual handoff import; actual Codex e2e is part of the exact-revision release gate | [Advanced configuration](https://developers.openai.com/codex/config-advanced), [Configuration reference](https://developers.openai.com/codex/config-reference) |
+| Claude Code | native telemetry for usage, cost and tool metrics | hooks for lifecycle events; no transcript dependency in the Rust adapter | manual handoff import only; automatic producer/receiver TODO | [Hooks reference](https://code.claude.com/docs/en/hooks), [Monitoring usage](https://code.claude.com/docs/en/monitoring-usage) |
+| Cursor | generic `preToolUse`/`postToolUse`/`postToolUseFailure` hooks with `tool_use_id` | session/turn lifecycle hooks; specific shell/MCP/file hooks are diagnostic-only because they lack a shared operation ID | manual handoff import only; automatic producer/receiver TODO | [Hooks reference](https://cursor.com/docs/hooks) |
 
 Cursor의 durable `tool.name`은 원문 이름이 아니라 `shell`, `mcp`, `file`, `agent`, `other` 중 하나인
 bounded canonical category다. 같은 `tool_use_id`의 start/result/failure source observation은 append-only로
@@ -31,16 +30,31 @@ Raw email supplied by a product surface is used only for local profile matching.
 an opaque `identity_binding_ref`; raw email is not written to observation records, local outbox, retry queue,
 diagnostics or team ingest.
 
+For Codex automatic collection, raw notify JSON is projected by the foreground helper before transport. Bounded
+raw OTLP JSON and tool attributes may transiently enter receiver memory during decode. Only explicitly owned
+scalar values cross the adapter boundary:
+
+- `conversation.id`, `turn.id`, request/call ID and fixed source cursor/generation
+- known model, bounded tool category and bounded permission decision
+- duration, input/output/cached/reasoning/total token counts and success state
+
+Prompt, response, tool arguments/output, command, cwd, path, raw account identity and unknown attributes are
+discarded before canonical mapping. They are never persisted, logged, placed in diagnostics, projected to JSONL
+or HTML, reported, archived or exported.
+
 ## Runtime rules
 
-- A future foreground producer must perform bounded validation and a constant-size local IPC/spool handoff only. It must not call
-  team REST endpoints, render reports, scan transcripts or wait for background flush completion.
-- A future observational command hook must use host asynchronous mode where supported and never opt into fail-closed behavior
-  for capture. A synchronous-only host handler has a 10 ms enqueue deadline and 50 ms total deadline, then exits
-  successfully on timeout, unavailable daemon or full channel. Exact event/mode support is versioned evidence,
-  not a cross-product assumption.
-- A future native telemetry receiver must normalize asynchronously. Exporter batch/flush behavior
-  is not treated as proof that the observation reached this product; only the local durable transaction is.
+- The Codex notify helper accepts at most 64 KiB of raw input, projects it to a smaller closed content-free
+  representation before any I/O, and performs only a bounded local private-CA HTTPS + exact-header handoff. Accepted, rejected and
+  unavailable outcomes all exit successfully so observation cannot block Codex work. It does not call team
+  endpoints, render reports, scan transcripts or wait for background flush completion.
+- The Codex OTLP receiver binds only IPv4 loopback. Clients validate its private-CA server certificate and
+  loopback IP SAN; every request must carry the exact `x-agent-observability-token` header containing the
+  runtime's private random 256-bit value. The exporter contains no client certificate/private-key fields, so the
+  transport is not mTLS. The receiver limits a JSON request to 1 MiB and 4096 log records and assigns monotonic
+  local cursors. Exporter success is not treated as durability; only the local transactional commit is authoritative.
+- Claude Code and Cursor automatic foreground producers remain future work. Their exact event/mode support must
+  be backed by versioned evidence rather than inferred from Codex behavior.
 - A future file fallback must use a persisted generation fingerprint and cursor, filesystem notification where
   reliable, and adaptive reconciliation. It never rescans an unchanged file from byte zero.
 - Undocumented credential stores, browser sessions and private account APIs are never scraped. An undocumented
@@ -64,9 +78,22 @@ Each entry in `crates/contracts/capabilities/adapter-capability-v1.yaml` contain
 `cargo test -p agent-observability-contracts adapter_capability_v1` validates schema, field ownership and
 privacy closure. The Codex, Claude Code and Cursor adapter suites verify declared input/projection fixture hashes,
 exact replay output, bounded input, restart/idempotency and privacy behavior. Claude Code additionally locks permission,
-compaction, failed lifecycle, interrupt-gap and out-of-order timestamp fixtures. The supported boundary is restricted
-to macOS, standalone, `private_canonical_handoff_v1`, and the exact declared versions. Cross-version/OS/profile
-execution, native receiver and foreground producer evidence remain future promotion gates.
+compaction, failed lifecycle, interrupt-gap and out-of-order timestamp fixtures. The capability manifest publishes
+separate manual `private_canonical_handoff_v1` entries and a macOS standalone `codex_automatic_local.v3` entry
+pinned to Codex `0.151.0`. Native receiver, foreground notify, privacy, restart and exact-binary performance
+evidence passed on the pinned macOS boundary, so the closed entry is `supported`. Publication remains a v1.8.0
+release gate; cross-version/OS/profile execution remains a future gate.
+
+The automatic-path release gate is
+`cargo run -p xtask -- perf automatic --profile release --check`. Its versioned protocol is
+`crates/contracts/performance/automatic-local-performance-v1.yaml`; the older `perf local` workload does not
+substitute for collector or foreground-notify evidence. The gate first runs actual Codex `0.151.0` against a
+content-free loopback Responses fixture, then drives synthetic Codex-shaped OTLP through the product client.
+
+Codex `0.151.0` on macOS loads the previous client-identity config under the strict diagnostic but fails later
+while constructing the exporter. The automated v1.8.0 gate now proves the corrected private-CA HTTPS plus
+exact-header exporter with actual `codex exec`, native OTLP acceptance, private session and exact 10-input/2-output
+token records, and a durable-tree raw-prompt sentinel scan.
 
 | Scenario | Required evidence |
 | --- | --- |
@@ -82,14 +109,20 @@ Mandatory signal absence is `unknown_source` and blocks support for that product
 remain `unknown_source`. Capability verification must run against the oldest and newest declared supported
 version and rerun when an official surface or schema changes.
 
-## Current planning assumptions
+## Current implementation boundary
 
 Historical v0.6 fixtures retain partial Codex and Claude Code source examples. Rust Codex, Claude Code and
 Cursor adapters implement bounded canonical handoff parsers, fixed source precedence, content-free dispositions,
 fixture hash validation and CLI-to-private-store replay. Claude Code uses documented OTel events as primary and
 hooks only for lifecycle. Cursor uses generic tool hooks as primary and lifecycle hooks as supplement; specific
-shell/MCP/file hooks remain diagnostic-only, and raw transcript/content fields are not parsed. No adapter includes
-an OTLP HTTP/gRPC receiver or foreground spool writer. Cross-version execution and full performance evidence
-remain roadmap work. These receiver/producer capabilities are not part of the stable import boundary. The current
-release claim is macOS only; other platforms fail closed or remain unsupported until equivalent no-follow,
-identity, permission and execution evidence exists.
+shell/MCP/file hooks remain diagnostic-only, and raw transcript/content fields are not parsed.
+
+The v1.8.0 code adds a Codex-only OTLP/HTTP JSON receiver, bounded notify helper, exact config ownership and
+macOS LaunchAgent. It does not add OTLP/gRPC, Claude Code automatic collection, Cursor automatic collection,
+file scraping or a team transport. Manual imports remain the stable shared boundary. The automatic capability is
+pinned to Codex `0.151.0`. Actual-Codex E2E and exact-revision 5-run evidence passed for implementation source
+`272783ff2e5bb6c7a10b224aa7821e571d6ca8f3`, so the source entry is `supported`. The promotion source must pass
+the same exact-revision gate, and publication evidence remains a separate v1.8.0 release gate. Until then v1.8.0
+stays **In Progress**, not Released.
+Other platforms fail closed for automatic setup until equivalent service, no-follow, identity, permission and
+execution evidence exists; manual private imports retain their existing supported boundary.

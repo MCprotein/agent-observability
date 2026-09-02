@@ -16,6 +16,7 @@ const releasePackage = JSON.parse(
   readFileSync("distribution/npm/package.json", "utf8"),
 );
 const releaseWorkflow = readFileSync(".github/workflows/release.yml", "utf8");
+const ciWorkflow = readFileSync(".github/workflows/ci.yml", "utf8");
 const cargoMetadata = JSON.parse(
   execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
     encoding: "utf8",
@@ -91,6 +92,48 @@ test("release workflow pins actions and uses the tested publication state machin
   assert.match(releaseWorkflow, /dist\/install\.sh/);
   assert.match(releaseWorkflow, /Smoke test release installer/);
   assert.match(releaseWorkflow, /AGENT_OBSERVABILITY_RELEASE_BASE_URL=/);
+  assert.match(
+    releaseWorkflow,
+    /revision="\$GITHUB_SHA"[\s\S]*git rev-parse "\$GITHUB_SHA\^2"[\s\S]*revision="\$second_parent"/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /test "\$\(git rev-parse "\$GITHUB_SHA\^\{tree\}"\)" = "\$\(git rev-parse "\$second_parent\^\{tree\}"\)"/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /artifact="automatic-release-evidence-\$SOURCE_REVISION"/,
+  );
+  assert.match(releaseWorkflow, /--source-revision "\$SOURCE_REVISION"/);
+  assert.match(
+    releaseWorkflow,
+    /-f head_sha="\$SOURCE_REVISION"[\s\S]*-f event=workflow_dispatch[\s\S]*-f status=success/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /publish:[\s\S]*needs:[\s\S]*- build[\s\S]*- automatic-release-evidence/,
+  );
+  assert.match(ciWorkflow, /if: github\.event_name == 'workflow_dispatch'/);
+  assert.match(
+    ciWorkflow,
+    /set \+e[\s\S]*perf automatic --profile release --check[\s\S]*tee "\$RUNNER_TEMP\/automatic-release-evidence\.out"[\s\S]*gate_status=\$\{PIPESTATUS\[0\]\}[\s\S]*set -e[\s\S]*test -f "\$manifest"[\s\S]*echo "manifest=\$manifest" >> "\$GITHUB_OUTPUT"[\s\S]*exit "\$gate_status"/,
+  );
+  assert.match(
+    ciWorkflow,
+    /Upload exact-revision automatic release evidence[\s\S]*if: always\(\) && steps\.evidence\.outputs\.manifest != ''/,
+  );
+  assert.match(ciWorkflow, /--source-revision "\$GITHUB_SHA"/);
+  assert.match(
+    ciWorkflow,
+    /name: automatic-release-evidence-\$\{\{ github\.sha \}\}/,
+  );
+  assert.match(ciWorkflow, /path: \$\{\{ steps\.evidence\.outputs\.manifest \}\}/);
+  for (const workflow of [ciWorkflow, releaseWorkflow]) {
+    assert.match(
+      workflow,
+      /cargo \+1\.97\.0 run --locked -p xtask -- evidence validate-automatic "\$manifest"/,
+    );
+  }
 });
 
 interface CommandResult {

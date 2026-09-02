@@ -41,9 +41,10 @@ gate를 통과해 추가한다.
   사용자 작성 JavaScript는 허용하지 않는다. 제품 소스는 Rust/TypeScript로 제한하고,
   빌드·테스트·릴리스 로직은 strict TypeScript를 사용하되 얇은 Shell/YAML 배포 glue는 허용한다.
 - architecture와 engineering rule의 정본은 `docs/ARCHITECTURE.md`다.
-- standalone은 collector, login, network 없이 완전하게 동작해야 한다. team profile은 같은
-  domain 의미와 report contract를 사용하되 별도 strict ingest contract를 가지며 local 경로를
-  대체하거나 약화하지 않는다.
+- standalone manual import는 collector, daemon, login, network 없이 완전하게 동작해야 한다.
+  선택적 standalone automatic collection은 local-only receiver를 추가할 수 있지만 외부 network를
+  사용하거나 manual path를 필수 dependency로 바꾸지 않는다. team profile은 같은 domain 의미와
+  report contract를 사용하되 별도 strict ingest contract를 가지며 local 경로를 대체하거나 약화하지 않는다.
 - canonical contract와 privacy boundary를 안정화하기 전에 새 agent adapter를 추가하지
   않는다.
 
@@ -54,7 +55,7 @@ gate를 통과해 추가한다.
 | v0.x | Completed | Local-only PoC를 작은 minor release로 쪼개 검증했다. |
 | v1.x | Active | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
 
-## Active Train: v0.1.0-v1.7.0
+## Active Train: v0.1.0-v1.8.0
 
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
@@ -87,6 +88,7 @@ gate를 통과해 추가한다.
 | v1.5.0 | Released | Local visual configuration console | Release workflow `33478394514` published the GitHub Package and public Release; downloaded checksums, universal `x86_64 arm64` executable version, and four artifact attestations verified independently |
 | v1.6.0 | Released | Integrity-checked one-command installer | Release workflow `33481569104` published the Package, public Release, and attested installer; downloaded checksums, universal `x86_64 arm64` version, fresh public install, and all five artifact attestations verified independently |
 | v1.7.0 | Released | TypeScript tooling completion and short CLI alias | Release workflow `33486442683` published the Package and public Release; downloaded checksums, universal `x86_64 arm64` version, both installed command aliases, and all five artifact attestations verified independently |
+| v1.8.0 | In Progress | Codex automatic local collection | Private-CA HTTPS `127.0.0.1` OTLP/HTTP JSON receiver with an exact private random request header, pre-transport projected fail-open notify supplement, macOS LaunchAgent lifecycle, exact Codex config ownership/restore, scalar-only adapter projection, automatic private report refresh, and unchanged daemon-free/network-free manual imports; Claude Code/Cursor automatic and commercial team remain TODO | Targeted and workspace tests, privacy sentinels, command smoke, docs consistency, independent review, and release publication evidence remain required before `Released` |
 
 ## Branch Strategy
 
@@ -131,9 +133,9 @@ line으로 승격한다.
 | Advanced team alerting | cost/error/latency spike rules, notification delivery, dedupe/suppression and alert audit | shared dashboard 이후 실제 notification 운영 요구와 incident owner가 확인될 것 |
 | Optional gateway/control plane | provider-compatible routing, request attribution, billing reconciliation assumptions, Desktop App setting inheritance checks | 관측만으로 부족하고 요청 통제/과금 보정이 필요하다는 evidence가 있을 것 |
 
-Team 항목은 collector endpoint 하나로 완료되지 않는다. `docs/TEAM_ARCHITECTURE.md`의 G0-G4를
-순서대로 통과하며 G0 전에는 버전을 배정하지 않고, G4 evidence 전에는 상용화 완료로 표시하지
-않는다.
+Team 항목은 local receiver나 collector endpoint 하나로 완료되지 않는다. `docs/TEAM_ARCHITECTURE.md`와
+`docs/TEAM_CONTRACTS.md`의 G0-G4 승인과 evidence를 순서대로 통과해야 한다. G0 전에는 버전을
+배정하지 않고, G4 evidence 전에는 commercial team을 완료 또는 출시로 표시하지 않는다.
 
 ## Version Cycle
 
@@ -158,16 +160,20 @@ Team 항목은 collector endpoint 하나로 완료되지 않는다. `docs/TEAM_A
 
 - 원문 prompt/output은 local opt-in 없이는 local event log, report, export에 남지 않아야 한다.
   team retry queue와 collector에는 local opt-in 여부와 무관하게 들어갈 수 없다.
+- Raw notify, telemetry와 tool field는 bounded parsing 동안 process memory에 일시적으로 들어올 수
+  있지만 durable record, log, diagnostic, projection, report 또는 export에는 들어갈 수 없다. Adapter
+  boundary는 명시적으로 allowlist된 scalar만 통과시킨다.
 - 비용은 실제 청구액으로 단정하지 않는다. 단가표 기반 예상치와 assumption을 함께
   표시한다.
 - central collector나 gateway는 local-only 경로가 깨끗하게 동작하기 전까지 필수
   경로가 아니다.
-- team profile이 추가되어도 standalone은 network, login, collector 없이 동일한 local 기능을
-  유지해야 한다.
+- team profile이 추가되어도 standalone manual import는 network, login, daemon, collector 없이
+  동일한 local 기능을 유지해야 한다. Optional local automatic collection은 team dependency가 아니다.
 - agent별 adapter가 달라도 뒤쪽 schema는 하나로 유지한다.
-- hook foreground path는 local bounded handoff만 수행하고 network, full-file scan, report render나 queue
-  drain을 기다리지 않는다. Local release는 declared CPU/RSS/disk/latency budget과 pressure fixture를
-  통과해야 한다.
+- hook foreground path는 local bounded handoff만 수행하고 external network, full-file scan, report
+  render나 queue drain을 기다리지 않는다. Automatic local adapter는 declared deadline 안의 인증된
+  loopback transport만 사용할 수 있다. Local release는 declared CPU/RSS/disk/latency budget과 pressure
+  fixture를 통과해야 한다.
 - accepted observation을 직접 수정하지 않는다. 귀속 보정과 분석 제외는 idempotent append-only
   revision으로 처리하고 privacy deletion과 구분한다.
 - unsupported 또는 불안정한 agent log/hook format은 추측으로 안정 계약처럼 쓰지

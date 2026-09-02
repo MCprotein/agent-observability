@@ -52,6 +52,7 @@ current shell commands. G1 promotion must add a wrapper that fails when a named 
 | adapter heartbeat | `crates/contracts/schemas/adapter-heartbeat-v1.schema.json` | Future G1 test target: `adapter_heartbeat_v1` |
 | adapter capability matrix | `crates/contracts/capabilities/adapter-capability-v1.yaml` | Future G1 test target: `adapter_capability_v1` |
 | local performance protocol | `crates/contracts/performance/local-performance-v1.yaml` | `cargo run -p xtask -- perf local --profile release --check` |
+| automatic local performance protocol | `crates/contracts/performance/automatic-local-performance-v1.yaml` | `cargo run -p xtask -- perf automatic --profile release --check` |
 | observation revision | `crates/contracts/schemas/observation-revision-v1.schema.json` | Future G1 test target: `observation_revision_v1` |
 | deletion/hold receipt | `crates/contracts/schemas/deletion-v1.schema.json` | Future G1 test target: `deletion_v1` |
 | quota/reservation ledger | `crates/contracts/schemas/quota-v1.schema.json` | Future G1 test target: `quota_v1` |

@@ -17,7 +17,6 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -28,7 +27,16 @@ use std::time::Duration;
 
 const DB_NAME: &str = "local-store.sqlite3";
 const PROJECTION_NAME: &str = "observations.jsonl";
+const STORE_OPEN_LOCK_NAME: &str = ".store-open.lock";
+const REPORT_RENDER_LOCK_NAME: &str = ".report-render.lock";
 pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v4";
+const REPORT_GENERATION_KEY: &str = "report_generation";
+const REPORT_ACKNOWLEDGED_GENERATION_KEY: &str = "report_acknowledged_generation";
+const REPORT_VISIT_BATCH_SIZE: i64 = 128;
+const CODEX_CORRELATION_KEY_PREFIX: &str = "codex_request_correlation.v1:";
+const MAX_CODEX_CORRELATION_STATE_BYTES: usize = 512 * 1024;
+const MAX_CODEX_PENDING_CORRELATIONS: usize = 1024;
+const MAX_CODEX_RECENTLY_COMPLETED_CORRELATIONS: usize = 1024;
 const MAX_EXPIRED_SPAN_GUARDS: u64 = 100_000;
 const MAX_RETENTION_RECEIPTS: u64 = 1_024;
 const MAX_ADAPTER_DISPOSITIONS: u64 = 100_000;
@@ -130,6 +138,81 @@ pub enum IngestStatus {
     Suppressed,
 }
 
+#[derive(Clone, Debug)]
+pub struct ReportSnapshot {
+    pub generation: u64,
+    pub records: Vec<DurableRecordV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReportVisit {
+    pub generation: u64,
+    pub records: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReportStatus {
+    pub generation: u64,
+    pub acknowledged_generation: u64,
+}
+
+#[derive(Debug)]
+pub struct ReportRenderGuard {
+    _file: File,
+}
+
+impl ReportStatus {
+    #[must_use]
+    pub const fn pending(self) -> bool {
+        self.generation != self.acknowledged_generation
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum StoreBatchItem<'a> {
+    Observation(&'a SourceObservation),
+    Disposition {
+        checkpoint: &'a SourceCheckpoint,
+        disposition: AdapterDispositionKind,
+        code: AdapterDispositionCode,
+        canonical_payload_hash: Option<&'a str>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexCorrelationStateV1 {
+    schema_version: String,
+    next_sequence: u64,
+    pending: Vec<CodexPendingCorrelationV1>,
+    #[serde(default)]
+    recently_completed: Vec<CodexCompletedOfficialRetryV1>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexPendingCorrelationV1 {
+    source_generation_hash: String,
+    conversation_hash: String,
+    model_hash: String,
+    correlation_id: String,
+    #[serde(default)]
+    official_retry_identity: Option<String>,
+    inserted_at_unix_ms: u64,
+    sequence: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexCompletedOfficialRetryV1 {
+    source_generation_hash: String,
+    conversation_hash: String,
+    model_hash: String,
+    official_retry_identity: String,
+    completed_at_unix_ms: u64,
+    sequence: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetentionPlan {
     pub plan_id: String,
@@ -210,6 +293,7 @@ pub enum StoreError {
     InvalidRetentionBounds,
     PendingRetentionRecovery,
     MigrationAdmissionRequired,
+    ReportSnapshotChanged,
 }
 
 impl Display for StoreError {
@@ -238,6 +322,7 @@ impl Display for StoreError {
             Self::MigrationAdmissionRequired => {
                 "legacy local store migration requires admitted temporary disk headroom"
             }
+            Self::ReportSnapshotChanged => "report snapshot changed while it was being visited",
         })
     }
 }
@@ -272,7 +357,6 @@ impl From<serde_json::Error> for StoreError {
 pub struct LocalStore {
     dir: PathBuf,
     db: Connection,
-    has_expired_guards: Cell<bool>,
 }
 
 impl LocalStore {
@@ -282,7 +366,7 @@ impl LocalStore {
     ///
     /// Returns [`StoreError`] for insecure permissions, incompatible state, or I/O failure.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
-        Self::open_internal(dir.as_ref(), None)
+        Self::open_internal(dir.as_ref(), None, true)
     }
 
     /// Opens the store while allowing a legacy schema rewrite within admitted temporary bytes.
@@ -295,15 +379,71 @@ impl LocalStore {
         dir: impl AsRef<Path>,
         admitted_temporary_bytes: u64,
     ) -> Result<Self, StoreError> {
-        Self::open_internal(dir.as_ref(), Some(admitted_temporary_bytes))
+        Self::open_internal(dir.as_ref(), Some(admitted_temporary_bytes), true)
+    }
+
+    /// Opens the store while allowing migration but defers non-authoritative JSONL repair.
+    ///
+    /// This keeps collector availability independent from projection filesystem work. Callers that
+    /// require the JSONL artifact can repair it later through [`Self::repair_projection_if_needed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for insecure permissions, incompatible state, migration admission,
+    /// or authoritative `SQLite` failure.
+    pub fn open_with_migration_headroom_deferred_projection(
+        dir: impl AsRef<Path>,
+        admitted_temporary_bytes: u64,
+    ) -> Result<Self, StoreError> {
+        Self::open_internal(dir.as_ref(), Some(admitted_temporary_bytes), false)
+    }
+
+    /// Opens an already initialized current-schema store without creating, migrating, or repairing
+    /// artifacts. This is intended for concurrent projection consumers such as report rendering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the store is missing, insecure, or not on the current schema.
+    pub fn open_current(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let dir = dir.as_ref();
+        fs::symlink_metadata(dir)?;
+        private_dir(dir)?;
+        let dir = fs::canonicalize(dir)?;
+        let db_path = dir.join(DB_NAME);
+        private_file(&db_path)?;
+        let db = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        db.pragma_update(None, "foreign_keys", true)?;
+        db.pragma_update(None, "synchronous", "FULL")?;
+        let schema = db
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| StoreError::SchemaMismatch)?;
+        if schema != LOCAL_STORE_SCHEMA_VERSION {
+            return Err(StoreError::SchemaMismatch);
+        }
+        metadata_generation(&db, REPORT_GENERATION_KEY)?;
+        metadata_generation(&db, REPORT_ACKNOWLEDGED_GENERATION_KEY)?;
+        Ok(Self { dir, db })
     }
 
     fn open_internal(
         dir: &Path,
         admitted_temporary_bytes: Option<u64>,
+        repair_projection: bool,
     ) -> Result<Self, StoreError> {
         private_dir(dir)?;
         let dir = fs::canonicalize(dir)?;
+        let _open_guard = acquire_private_lock(&dir, STORE_OPEN_LOCK_NAME)?;
         let db_path = dir.join(DB_NAME);
         match private_create_new(&db_path) {
             Ok(file) => file.sync_all()?,
@@ -346,17 +486,21 @@ impl LocalStore {
             return Err(StoreError::SchemaMismatch);
         }
         validate_schema(&db)?;
-        let has_expired_guards = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM expired_span_states)",
-            [],
-            |row| row.get::<_, bool>(0),
-        )?;
-        let store = Self {
-            dir,
-            db,
-            has_expired_guards: Cell::new(has_expired_guards),
-        };
-        let projection_path = store.projection_path();
+        ensure_report_metadata(&db)?;
+        let store = Self { dir, db };
+        if repair_projection {
+            store.repair_projection_if_needed()?;
+        }
+        Ok(store)
+    }
+
+    /// Repairs the JSONL projection only when it is missing or marked dirty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when projection state cannot be validated or rebuilt.
+    pub fn repair_projection_if_needed(&self) -> Result<bool, StoreError> {
+        let projection_path = self.projection_path();
         let projection_missing = match fs::symlink_metadata(&projection_path) {
             Ok(_) => {
                 private_file(&projection_path)?;
@@ -365,11 +509,12 @@ impl LocalStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => true,
             Err(error) => return Err(error.into()),
         };
-        let projection_dirty = store.projection_dirty()?;
+        let projection_dirty = self.projection_dirty()?;
         if projection_missing || projection_dirty {
-            store.rebuild_projection()?;
+            self.rebuild_projection()?;
+            return Ok(true);
         }
-        Ok(store)
+        Ok(false)
     }
 
     /// Atomically accepts one source observation.
@@ -409,23 +554,120 @@ impl LocalStore {
         &mut self,
         observations: &[SourceObservation],
     ) -> Result<Vec<IngestStatus>, StoreError> {
-        self.ingest_batch_at(observations, None)
+        let items = observations
+            .iter()
+            .map(StoreBatchItem::Observation)
+            .collect::<Vec<_>>();
+        self.ingest_ordered_batch_at(&items, None)
     }
 
-    fn ingest_batch_at(
+    /// Atomically commits ordered observations and content-free dispositions while deferring the
+    /// replayable projection rebuild.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::ingest`] and [`Self::ingest_disposition`].
+    pub fn ingest_ordered_batch_deferred_projection(
         &mut self,
-        observations: &[SourceObservation],
+        items: &[StoreBatchItem<'_>],
+    ) -> Result<Vec<IngestStatus>, StoreError> {
+        self.ingest_ordered_batch_at(items, None)
+    }
+
+    /// Atomically commits a Codex batch and its bounded privacy-safe correlation snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::ingest_ordered_batch_deferred_projection`] and rejects
+    /// malformed or non-private correlation snapshots.
+    pub fn ingest_codex_batch_with_correlation_state_deferred_projection(
+        &mut self,
+        items: &[StoreBatchItem<'_>],
+        source_generation: &str,
+        correlation_state_json: &str,
+    ) -> Result<Vec<IngestStatus>, StoreError> {
+        self.ingest_ordered_batch_with_correlation_state_at(
+            items,
+            source_generation,
+            correlation_state_json,
+            None,
+        )
+    }
+
+    /// Loads the private correlation snapshot for one Codex source generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for invalid identifiers, malformed state, or storage failure.
+    pub fn codex_request_correlation_state(
+        &self,
+        source_generation: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let key = codex_correlation_key(source_generation)?;
+        let value = self
+            .db
+            .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        if let Some(value) = value.as_deref() {
+            validate_codex_correlation_state(value, source_generation)?;
+        }
+        Ok(value)
+    }
+
+    fn ingest_ordered_batch_at(
+        &mut self,
+        items: &[StoreBatchItem<'_>],
+        crash: Option<CrashPoint>,
+    ) -> Result<Vec<IngestStatus>, StoreError> {
+        self.ingest_ordered_batch_at_inner(items, None, crash)
+    }
+
+    fn ingest_ordered_batch_with_correlation_state_at(
+        &mut self,
+        items: &[StoreBatchItem<'_>],
+        source_generation: &str,
+        correlation_state_json: &str,
+        crash: Option<CrashPoint>,
+    ) -> Result<Vec<IngestStatus>, StoreError> {
+        validate_codex_correlation_state(correlation_state_json, source_generation)?;
+        let key = codex_correlation_key(source_generation)?;
+        self.ingest_ordered_batch_at_inner(items, Some((&key, correlation_state_json)), crash)
+    }
+
+    fn ingest_ordered_batch_at_inner(
+        &mut self,
+        items: &[StoreBatchItem<'_>],
+        correlation_state: Option<(&str, &str)>,
         crash: Option<CrashPoint>,
     ) -> Result<Vec<IngestStatus>, StoreError> {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-        let mut statuses = Vec::with_capacity(observations.len());
-        for observation in observations {
-            statuses.push(Self::ingest_in_transaction(
-                &tx,
-                observation,
-                None,
-                self.has_expired_guards.get(),
-            )?);
+        let mut statuses = Vec::with_capacity(items.len());
+        for item in items {
+            statuses.push(match item {
+                StoreBatchItem::Observation(observation) => {
+                    Self::ingest_in_transaction(&tx, observation, None)?
+                }
+                StoreBatchItem::Disposition {
+                    checkpoint,
+                    disposition,
+                    code,
+                    canonical_payload_hash,
+                } => Self::ingest_disposition_in_transaction(
+                    &tx,
+                    checkpoint,
+                    *disposition,
+                    *code,
+                    *canonical_payload_hash,
+                )?,
+            });
+        }
+        if let Some((key, value)) = correlation_state {
+            tx.execute(
+                "INSERT INTO metadata(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            )?;
         }
         if crash == Some(CrashPoint::BeforeCommit) {
             return Err(StoreError::Crash(CrashPoint::BeforeCommit));
@@ -465,6 +707,25 @@ impl LocalStore {
         code: AdapterDispositionCode,
         canonical_payload_hash: Option<&str>,
     ) -> Result<IngestStatus, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let status = Self::ingest_disposition_in_transaction(
+            &tx,
+            checkpoint,
+            disposition,
+            code,
+            canonical_payload_hash,
+        )?;
+        tx.commit()?;
+        Ok(status)
+    }
+
+    fn ingest_disposition_in_transaction(
+        tx: &Transaction<'_>,
+        checkpoint: &SourceCheckpoint,
+        disposition: AdapterDispositionKind,
+        code: AdapterDispositionCode,
+        canonical_payload_hash: Option<&str>,
+    ) -> Result<IngestStatus, StoreError> {
         let source = checkpoint.source.as_str();
         let generation = hash_opaque_identifier(checkpoint.source_generation.as_str());
         let cursor = checkpoint.source_cursor.as_str();
@@ -487,7 +748,6 @@ impl LocalStore {
             },
             str::to_owned,
         );
-        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         if let Some((existing_disposition, existing_code, existing_hash)) = tx
             .query_row(
                 "SELECT disposition, code, payload_hash FROM adapter_dispositions WHERE source=?1 AND generation=?2 AND cursor=?3",
@@ -504,19 +764,18 @@ impl LocalStore {
             }
             return Ok(IngestStatus::Duplicate);
         }
-        if cursor_exists(&tx, "source_inputs", source, &generation, cursor)? {
+        if cursor_exists(tx, "source_inputs", source, &generation, cursor)? {
             return Err(StoreError::PayloadConflict);
         }
-        if !checkpoint_cursor_matches(&tx, checkpoint)? {
+        if !checkpoint_cursor_matches(tx, checkpoint)? {
             return Err(StoreError::CursorConflict);
         }
         tx.execute(
             "INSERT INTO adapter_dispositions(source,generation,cursor,disposition,code,payload_hash) VALUES (?1,?2,?3,?4,?5,?6)",
             params![source, generation, cursor, disposition.as_str(), code.as_str(), payload_hash],
         )?;
-        advance_checkpoint_cursor(&tx, checkpoint)?;
-        prune_adapter_dispositions(&tx)?;
-        tx.commit()?;
+        advance_checkpoint_cursor(tx, checkpoint)?;
+        prune_adapter_dispositions(tx)?;
         Ok(IngestStatus::Committed)
     }
 
@@ -540,8 +799,7 @@ impl LocalStore {
         rebuild_projection: bool,
     ) -> Result<IngestStatus, StoreError> {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-        let status =
-            Self::ingest_in_transaction(&tx, observation, crash, self.has_expired_guards.get())?;
+        let status = Self::ingest_in_transaction(&tx, observation, crash)?;
         tx.commit()?;
         if crash == Some(CrashPoint::AfterCommit) {
             return Err(StoreError::Crash(CrashPoint::AfterCommit));
@@ -558,7 +816,6 @@ impl LocalStore {
         tx: &Transaction<'_>,
         observation: &SourceObservation,
         crash: Option<CrashPoint>,
-        has_expired_guards: bool,
     ) -> Result<IngestStatus, StoreError> {
         let source = source_name(observation);
         let generation = private_source_generation(observation);
@@ -615,14 +872,13 @@ impl LocalStore {
                 return Ok(IngestStatus::Suppressed);
             }
         }
-        if has_expired_guards
-            && let Some(existing_hash) = tx
-                .query_row(
-                    "SELECT canonical_state_hash FROM expired_span_states WHERE span_id=?1",
-                    [state.span_id.as_str()],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
+        if let Some(existing_hash) = tx
+            .query_row(
+                "SELECT canonical_state_hash FROM expired_span_states WHERE span_id=?1",
+                [state.span_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
         {
             if existing_hash != canonical_state_hash(&state)? {
                 return Err(StoreError::PayloadConflict);
@@ -693,6 +949,7 @@ impl LocalStore {
         )?;
         advance_cursor(tx, observation)?;
         mark_projection_dirty(tx)?;
+        advance_report_generation(tx)?;
         if crash == Some(CrashPoint::BeforeCommit) {
             return Err(StoreError::Crash(CrashPoint::BeforeCommit));
         }
@@ -873,6 +1130,157 @@ impl LocalStore {
         Ok(records)
     }
 
+    /// Reads current records and their report generation from one consistent snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the snapshot or stored record contract cannot be read.
+    pub fn report_snapshot(&self) -> Result<ReportSnapshot, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)?;
+        let generation = metadata_generation(&tx, REPORT_GENERATION_KEY)?;
+        let records = {
+            let mut statement =
+                tx.prepare("SELECT record_json FROM records ORDER BY commit_seq")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.map(|row| {
+                let json = row?;
+                serde_json::from_str(&json).map_err(StoreError::Json)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        tx.commit()?;
+        Ok(ReportSnapshot {
+            generation,
+            records,
+        })
+    }
+
+    /// Visits one consistent, ordered report snapshot without retaining all source records.
+    ///
+    /// Rows are copied in bounded transactions and visited after each read transaction closes, so
+    /// projection work cannot hold a `SQLite` read lock. A generation fence rejects a multi-batch
+    /// visit if a writer commits between batches. The returned count belongs to the visited
+    /// generation and is not queried separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the snapshot or a stored record cannot be read.
+    pub fn visit_report_snapshot(
+        &self,
+        mut visit: impl FnMut(usize, DurableRecordV1),
+    ) -> Result<ReportVisit, StoreError> {
+        let mut expected_generation = None;
+        let mut expected_records = None;
+        let mut last_commit_seq = 0_i64;
+        let mut visited = 0_usize;
+
+        loop {
+            let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)?;
+            let generation = metadata_generation(&tx, REPORT_GENERATION_KEY)?;
+            if expected_generation.is_some_and(|expected| expected != generation) {
+                return Err(StoreError::ReportSnapshotChanged);
+            }
+            let generation = *expected_generation.get_or_insert(generation);
+            let records = if let Some(records) = expected_records {
+                records
+            } else {
+                let count = tx.query_row("SELECT COUNT(*) FROM records", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                let count = usize::try_from(count).map_err(|_| StoreError::SchemaMismatch)?;
+                expected_records = Some(count);
+                count
+            };
+            let batch = {
+                let mut statement = tx.prepare(
+                    "SELECT commit_seq, record_json FROM records WHERE commit_seq > ?1 ORDER BY commit_seq LIMIT ?2",
+                )?;
+                let rows = statement
+                    .query_map(params![last_commit_seq, REPORT_VISIT_BATCH_SIZE], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            tx.commit()?;
+
+            if batch.is_empty() {
+                if visited == records {
+                    return Ok(ReportVisit {
+                        generation,
+                        records,
+                    });
+                }
+                return Err(StoreError::SchemaMismatch);
+            }
+            for (commit_seq, json) in batch {
+                if commit_seq <= last_commit_seq || visited >= records {
+                    return Err(StoreError::SchemaMismatch);
+                }
+                let record = serde_json::from_str(&json).map_err(StoreError::Json)?;
+                visit(visited, record);
+                visited = visited.checked_add(1).ok_or(StoreError::SchemaMismatch)?;
+                last_commit_seq = commit_seq;
+            }
+            if visited == records {
+                if metadata_generation(&self.db, REPORT_GENERATION_KEY)? != generation {
+                    return Err(StoreError::ReportSnapshotChanged);
+                }
+                return Ok(ReportVisit {
+                    generation,
+                    records,
+                });
+            }
+        }
+    }
+
+    /// Returns the durable report generation state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when generation metadata is missing, invalid, or cannot be read.
+    pub fn report_status(&self) -> Result<ReportStatus, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)?;
+        let status = ReportStatus {
+            generation: metadata_generation(&tx, REPORT_GENERATION_KEY)?,
+            acknowledged_generation: metadata_generation(&tx, REPORT_ACKNOWLEDGED_GENERATION_KEY)?,
+        };
+        tx.commit()?;
+        if status.acknowledged_generation > status.generation {
+            return Err(StoreError::SchemaMismatch);
+        }
+        Ok(status)
+    }
+
+    /// Serializes report artifact publication across local processes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the private render lock cannot be safely acquired.
+    pub fn acquire_report_render_guard(&self) -> Result<ReportRenderGuard, StoreError> {
+        let file = acquire_private_lock(&self.dir, REPORT_RENDER_LOCK_NAME)?;
+        Ok(ReportRenderGuard { _file: file })
+    }
+
+    /// Acknowledges a report only when authority is still at the rendered generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when durable generation metadata cannot be updated transactionally.
+    pub fn acknowledge_report_generation(&self, generation: u64) -> Result<bool, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let current = metadata_generation(&tx, REPORT_GENERATION_KEY)?;
+        if current != generation {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE metadata SET value=?1 WHERE key=?2",
+            params![generation.to_string(), REPORT_ACKNOWLEDGED_GENERATION_KEY],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Plans a bounded archive-and-prune pass without changing authority or projections.
     ///
     /// # Errors
@@ -984,11 +1392,11 @@ impl LocalStore {
              DROP TABLE retention_selected_traces;",
         )?;
         mark_projection_dirty(&tx)?;
+        advance_report_generation(&tx)?;
         if crash == Some(CrashPoint::BeforeRetentionCommit) {
             return Err(StoreError::Crash(CrashPoint::BeforeRetentionCommit));
         }
         tx.commit()?;
-        self.has_expired_guards.set(true);
         if crash == Some(CrashPoint::AfterRetentionCommit) {
             return Err(StoreError::Crash(CrashPoint::AfterRetentionCommit));
         }
@@ -1021,6 +1429,65 @@ impl LocalStore {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn codex_correlation_key(source_generation: &str) -> Result<String, StoreError> {
+    if source_generation.is_empty() || source_generation.len() > 512 {
+        return Err(StoreError::InvalidObservation);
+    }
+    Ok(format!(
+        "{CODEX_CORRELATION_KEY_PREFIX}{}",
+        hash_opaque_identifier(source_generation)
+    ))
+}
+
+fn validate_codex_correlation_state(
+    input: &str,
+    source_generation: &str,
+) -> Result<(), StoreError> {
+    if input.len() > MAX_CODEX_CORRELATION_STATE_BYTES {
+        return Err(StoreError::InvalidObservation);
+    }
+    let state: CodexCorrelationStateV1 = serde_json::from_str(input)?;
+    let expected_generation = hash_opaque_identifier(source_generation);
+    if state.schema_version != "codex_request_correlation.v1"
+        || state.pending.len() > MAX_CODEX_PENDING_CORRELATIONS
+        || state.recently_completed.len() > MAX_CODEX_RECENTLY_COMPLETED_CORRELATIONS
+        || state
+            .pending
+            .len()
+            .checked_add(state.recently_completed.len())
+            .is_none_or(|len| len > MAX_CODEX_PENDING_CORRELATIONS)
+        || state.pending.iter().any(|pending| {
+            pending.source_generation_hash != expected_generation
+                || !is_private_identifier_hash(&pending.conversation_hash)
+                || !is_private_identifier_hash(&pending.model_hash)
+                || !is_private_identifier_hash(&pending.correlation_id)
+                || pending
+                    .official_retry_identity
+                    .as_deref()
+                    .is_some_and(|identity| !is_private_identifier_hash(identity))
+                || pending.sequence >= state.next_sequence
+                || pending.inserted_at_unix_ms == 0
+        })
+        || state.recently_completed.iter().any(|completed| {
+            completed.source_generation_hash != expected_generation
+                || !is_private_identifier_hash(&completed.conversation_hash)
+                || !is_private_identifier_hash(&completed.model_hash)
+                || !is_private_identifier_hash(&completed.official_retry_identity)
+                || completed.sequence >= state.next_sequence
+                || completed.completed_at_unix_ms == 0
+        })
+    {
+        return Err(StoreError::InvalidObservation);
+    }
+    Ok(())
+}
+
+fn is_private_identifier_hash(value: &str) -> bool {
+    value.len() == 74
+        && value.starts_with("id:sha256:")
+        && value[10..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn prune_expired_span_guards(tx: &Transaction<'_>) -> Result<(), StoreError> {
@@ -1495,6 +1962,26 @@ fn lock_archive_directory(parent: &Path) -> Result<File, StoreError> {
     let file = options.open(path)?;
     private_open_file(&file)?;
     file.try_lock_exclusive()?;
+    Ok(file)
+}
+
+fn acquire_private_lock(parent: &Path, name: &str) -> Result<File, StoreError> {
+    let path = parent.join(name);
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(StoreError::Symlink);
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(no_follow_flag());
+    }
+    let file = options.open(path)?;
+    private_open_file(&file)?;
+    file.lock_exclusive()?;
     Ok(file)
 }
 
@@ -2476,6 +2963,26 @@ fn mark_projection_dirty(tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn metadata_generation(db: &Connection, key: &str) -> Result<u64, StoreError> {
+    let value: String = db
+        .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StoreError::SchemaMismatch)?;
+    value.parse().map_err(|_| StoreError::SchemaMismatch)
+}
+
+fn advance_report_generation(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let generation = metadata_generation(tx, REPORT_GENERATION_KEY)?
+        .checked_add(1)
+        .ok_or(StoreError::SchemaMismatch)?;
+    tx.execute(
+        "UPDATE metadata SET value=?1 WHERE key=?2",
+        params![generation.to_string(), REPORT_GENERATION_KEY],
+    )?;
+    Ok(())
+}
+
 fn count(db: &Connection, table: &str) -> Result<u64, StoreError> {
     Ok(db
         .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
@@ -2514,6 +3021,58 @@ fn initialize_empty_schema(db: &Connection) -> Result<(), StoreError> {
             "INSERT INTO metadata(key, value) VALUES ('projection_dirty', '1')",
             [],
         )?;
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, '0')",
+            [REPORT_GENERATION_KEY],
+        )?;
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, '0')",
+            [REPORT_ACKNOWLEDGED_GENERATION_KEY],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn ensure_report_metadata(db: &Connection) -> Result<(), StoreError> {
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let generation = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [REPORT_GENERATION_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let acknowledged = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [REPORT_ACKNOWLEDGED_GENERATION_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    match (generation, acknowledged) {
+        (None, None) => {
+            tx.execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, '1')",
+                [REPORT_GENERATION_KEY],
+            )?;
+            tx.execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, '0')",
+                [REPORT_ACKNOWLEDGED_GENERATION_KEY],
+            )?;
+        }
+        (Some(generation), Some(acknowledged)) => {
+            let generation = generation
+                .parse::<u64>()
+                .map_err(|_| StoreError::SchemaMismatch)?;
+            let acknowledged = acknowledged
+                .parse::<u64>()
+                .map_err(|_| StoreError::SchemaMismatch)?;
+            if acknowledged > generation {
+                return Err(StoreError::SchemaMismatch);
+            }
+        }
+        _ => return Err(StoreError::SchemaMismatch),
     }
     tx.commit()?;
     Ok(())
@@ -2833,6 +3392,48 @@ mod tests {
         }
     }
 
+    fn correlation_snapshot(request_id: &str) -> String {
+        serde_json::json!({
+            "schema_version": "codex_request_correlation.v1",
+            "next_sequence": 2,
+            "pending": [{
+                "source_generation_hash": hash_opaque_identifier("generation"),
+                "conversation_hash": hash_opaque_identifier("conversation"),
+                "model_hash": hash_opaque_identifier("model"),
+                "correlation_id": hash_opaque_identifier(request_id),
+                "official_retry_identity": hash_opaque_identifier(request_id),
+                "inserted_at_unix_ms": 100,
+                "sequence": 0
+            }],
+            "recently_completed": [{
+                "source_generation_hash": hash_opaque_identifier("generation"),
+                "conversation_hash": hash_opaque_identifier("conversation"),
+                "model_hash": hash_opaque_identifier("model"),
+                "official_retry_identity": hash_opaque_identifier(&format!("{request_id}-completed")),
+                "completed_at_unix_ms": 101,
+                "sequence": 1
+            }]
+        })
+        .to_string()
+    }
+
+    fn completed_correlation_snapshot(request_id: &str) -> String {
+        serde_json::json!({
+            "schema_version": "codex_request_correlation.v1",
+            "next_sequence": 1,
+            "pending": [],
+            "recently_completed": [{
+                "source_generation_hash": hash_opaque_identifier("generation"),
+                "conversation_hash": hash_opaque_identifier("conversation"),
+                "model_hash": hash_opaque_identifier("model"),
+                "official_retry_identity": hash_opaque_identifier(request_id),
+                "completed_at_unix_ms": 100,
+                "sequence": 0
+            }]
+        })
+        .to_string()
+    }
+
     fn temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "agent-observability-local-store-{label}-{}",
@@ -2921,6 +3522,7 @@ mod tests {
         store.ingest(&observation("1", "session", None)).unwrap();
         let projection = store.projection_path();
         let before = fs::metadata(&projection).unwrap().modified().unwrap();
+        assert!(!store.repair_projection_if_needed().unwrap());
         drop(store);
         let reopened = LocalStore::open(&dir).unwrap();
         assert_eq!(
@@ -2930,6 +3532,100 @@ mod tests {
                 .unwrap(),
             before
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_open_requires_existing_schema_without_repairing_projection() {
+        let missing = temp_dir("current-open-missing");
+        let _ = fs::remove_dir_all(&missing);
+        assert!(matches!(
+            LocalStore::open_current(&missing),
+            Err(StoreError::Io(ref error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(!missing.exists());
+
+        let dir = temp_dir("current-open-no-repair");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        let projection = store.projection_path();
+        fs::remove_file(&projection).unwrap();
+        drop(store);
+
+        let reopened = LocalStore::open_current(&dir).unwrap();
+        assert!(reopened.report_status().unwrap().pending());
+        assert!(!projection.exists());
+        assert!(reopened.repair_projection_if_needed().unwrap());
+        assert!(projection.is_file());
+        let _ = fs::remove_dir_all(&dir);
+
+        let lightweight = temp_dir("current-open-skips-full-schema-audit");
+        let _ = fs::remove_dir_all(&lightweight);
+        let store = LocalStore::open(&lightweight).unwrap();
+        let database = store.database_path();
+        drop(store);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE report_consumer_probe(value INTEGER);")
+            .unwrap();
+        drop(connection);
+        let reopened = LocalStore::open_current(&lightweight).unwrap();
+        assert!(!reopened.report_status().unwrap().pending());
+        drop(reopened);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("DROP TABLE report_consumer_probe;")
+            .unwrap();
+        let _ = fs::remove_dir_all(&lightweight);
+
+        let legacy = temp_dir("current-open-legacy");
+        let _ = fs::remove_dir_all(&legacy);
+        let store = LocalStore::open(&legacy).unwrap();
+        let database = store.database_path();
+        drop(store);
+        downgrade_to_historical_schema(&database, "local_state.v3");
+        assert!(matches!(
+            LocalStore::open_current(&legacy),
+            Err(StoreError::SchemaMismatch)
+        ));
+        let connection = Connection::open(database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "local_state.v3"
+        );
+        let _ = fs::remove_dir_all(&legacy);
+    }
+
+    #[test]
+    fn admitted_open_can_defer_non_authoritative_projection_repair() {
+        let dir = temp_dir("admitted-open-deferred-projection");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store
+            .ingest_ordered_batch_deferred_projection(&[StoreBatchItem::Observation(&observation(
+                "1", "session", None,
+            ))])
+            .unwrap();
+        let projection = store.projection_path();
+        fs::remove_file(&projection).unwrap();
+        let database_bytes = fs::metadata(store.database_path()).unwrap().len();
+        drop(store);
+
+        let reopened = LocalStore::open_with_migration_headroom_deferred_projection(
+            &dir,
+            database_bytes.saturating_mul(2),
+        )
+        .unwrap();
+        assert_eq!(reopened.record_count().unwrap(), 1);
+        assert!(reopened.report_status().unwrap().pending());
+        assert!(!projection.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3026,6 +3722,93 @@ mod tests {
     }
 
     #[test]
+    fn ordered_mixed_batch_commits_and_replays_in_one_cursor_namespace() {
+        let dir = temp_dir("ordered-mixed-batch");
+        let _ = fs::remove_dir_all(&dir);
+        let first = observation("1", "session", None);
+        let disposition = SourceCheckpoint {
+            source: AgentSource::Codex,
+            source_generation: SourceGeneration::parse("generation").unwrap(),
+            previous_source_cursor: Some(SourceCursor::parse("1").unwrap()),
+            source_cursor: SourceCursor::parse("2").unwrap(),
+        };
+        let last = observation_after("3", Some("2"), "turn", Some("session"));
+        let items = [
+            StoreBatchItem::Observation(&first),
+            StoreBatchItem::Disposition {
+                checkpoint: &disposition,
+                disposition: AdapterDispositionKind::Diagnostic,
+                code: AdapterDispositionCode::ContentEventIgnored,
+                canonical_payload_hash: None,
+            },
+            StoreBatchItem::Observation(&last),
+        ];
+        let mut store = LocalStore::open(&dir).unwrap();
+
+        assert_eq!(
+            store
+                .ingest_ordered_batch_deferred_projection(&items)
+                .unwrap(),
+            [
+                IngestStatus::Committed,
+                IngestStatus::Committed,
+                IngestStatus::Committed
+            ]
+        );
+        assert_eq!(store.observation_count().unwrap(), 2);
+        assert_eq!(store.disposition_count().unwrap(), 1);
+        assert_eq!(
+            store.cursor("codex", "generation").unwrap().as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            store
+                .ingest_ordered_batch_deferred_projection(&items)
+                .unwrap(),
+            [
+                IngestStatus::Duplicate,
+                IngestStatus::Duplicate,
+                IngestStatus::Duplicate
+            ]
+        );
+        assert_eq!(store.observation_count().unwrap(), 2);
+        assert_eq!(store.disposition_count().unwrap(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ordered_mixed_batch_rolls_back_dispositions_and_observations() {
+        let dir = temp_dir("ordered-mixed-rollback");
+        let _ = fs::remove_dir_all(&dir);
+        let first = observation("1", "session", None);
+        let disposition = SourceCheckpoint {
+            source: AgentSource::Codex,
+            source_generation: SourceGeneration::parse("generation").unwrap(),
+            previous_source_cursor: Some(SourceCursor::parse("1").unwrap()),
+            source_cursor: SourceCursor::parse("2").unwrap(),
+        };
+        let items = [
+            StoreBatchItem::Observation(&first),
+            StoreBatchItem::Disposition {
+                checkpoint: &disposition,
+                disposition: AdapterDispositionKind::Diagnostic,
+                code: AdapterDispositionCode::ContentEventIgnored,
+                canonical_payload_hash: Some("invalid"),
+            },
+        ];
+        let mut store = LocalStore::open(&dir).unwrap();
+
+        assert!(matches!(
+            store.ingest_ordered_batch_deferred_projection(&items),
+            Err(StoreError::InvalidObservation)
+        ));
+        assert_eq!(store.observation_count().unwrap(), 0);
+        assert_eq!(store.disposition_count().unwrap(), 0);
+        assert_eq!(store.cursor("codex", "generation").unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn deferred_batch_crash_boundaries_reopen_without_partial_progress() {
         for (label, point, expected) in [
             ("batch-before-commit", CrashPoint::BeforeCommit, 0),
@@ -3037,9 +3820,13 @@ mod tests {
                 observation("1", "session", None),
                 observation_after("2", Some("1"), "turn", Some("session")),
             ];
+            let items = batch
+                .iter()
+                .map(StoreBatchItem::Observation)
+                .collect::<Vec<_>>();
             let mut store = LocalStore::open(&dir).unwrap();
             assert!(matches!(
-                store.ingest_batch_at(&batch, Some(point)),
+                store.ingest_ordered_batch_at(&items, Some(point)),
                 Err(StoreError::Crash(actual)) if actual == point
             ));
             drop(store);
@@ -3056,6 +3843,98 @@ mod tests {
             assert_eq!(reopened.observation_count().unwrap(), 2);
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn correlation_snapshot_and_cursor_share_crash_atomicity() {
+        for (label, point, committed) in [
+            ("correlation-before-commit", CrashPoint::BeforeCommit, false),
+            ("correlation-after-commit", CrashPoint::AfterCommit, true),
+        ] {
+            let dir = temp_dir(label);
+            let _ = fs::remove_dir_all(&dir);
+            let item = observation("1", "session", None);
+            let items = [StoreBatchItem::Observation(&item)];
+            let snapshot = correlation_snapshot("request-private");
+            let mut store = LocalStore::open(&dir).unwrap();
+            assert!(matches!(
+                store.ingest_ordered_batch_with_correlation_state_at(
+                    &items,
+                    "generation",
+                    &snapshot,
+                    Some(point),
+                ),
+                Err(StoreError::Crash(actual)) if actual == point
+            ));
+            drop(store);
+
+            let reopened = LocalStore::open(&dir).unwrap();
+            assert_eq!(
+                reopened.cursor("codex", "generation").unwrap().as_deref(),
+                committed.then_some("1")
+            );
+            assert_eq!(
+                reopened
+                    .codex_request_correlation_state("generation")
+                    .unwrap()
+                    .as_deref(),
+                committed.then_some(snapshot.as_str())
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn correlation_snapshot_rejects_raw_or_cross_generation_identifiers() {
+        let dir = temp_dir("correlation-privacy-validation");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let item = observation("1", "session", None);
+        let items = [StoreBatchItem::Observation(&item)];
+        let raw = correlation_snapshot("request-private").replace(
+            &hash_opaque_identifier("conversation"),
+            "private@example.com",
+        );
+        assert!(matches!(
+            store.ingest_codex_batch_with_correlation_state_deferred_projection(
+                &items,
+                "generation",
+                &raw,
+            ),
+            Err(StoreError::InvalidObservation)
+        ));
+        let raw_official_identity = correlation_snapshot("request-private").replace(
+            &hash_opaque_identifier("request-private"),
+            "raw-official-request-id",
+        );
+        assert!(matches!(
+            store.ingest_codex_batch_with_correlation_state_deferred_projection(
+                &items,
+                "generation",
+                &raw_official_identity,
+            ),
+            Err(StoreError::InvalidObservation)
+        ));
+        let raw_completed_identity = completed_correlation_snapshot("request-private").replace(
+            &hash_opaque_identifier("request-private"),
+            "raw-completed-request-id",
+        );
+        assert!(matches!(
+            store.ingest_codex_batch_with_correlation_state_deferred_projection(
+                &items,
+                "generation",
+                &raw_completed_identity,
+            ),
+            Err(StoreError::InvalidObservation)
+        ));
+        assert_eq!(store.cursor("codex", "generation").unwrap(), None);
+        assert_eq!(
+            store
+                .codex_request_correlation_state("other-generation")
+                .unwrap(),
+            None
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3475,24 +4354,26 @@ mod tests {
 
     #[test]
     fn concurrent_first_open_initializes_schema_once() {
-        let dir = temp_dir("concurrent-first-open");
-        let _ = fs::remove_dir_all(&dir);
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(20));
-        let handles = (0..20)
-            .map(|_| {
-                let dir = dir.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    LocalStore::open(dir).map(|store| store.counts().unwrap())
+        for round in 0..8 {
+            let dir = temp_dir(&format!("concurrent-first-open-{round}"));
+            let _ = fs::remove_dir_all(&dir);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(20));
+            let handles = (0..20)
+                .map(|_| {
+                    let dir = dir.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        LocalStore::open(dir).map(|store| store.counts().unwrap())
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        for handle in handles {
-            assert_eq!(handle.join().unwrap().unwrap(), (0, 0, 0));
+                .collect::<Vec<_>>();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap().unwrap(), (0, 0, 0));
+            }
+            LocalStore::open(&dir).unwrap();
+            let _ = fs::remove_dir_all(&dir);
         }
-        LocalStore::open(&dir).unwrap();
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -3525,6 +4406,14 @@ mod tests {
         );
         assert_eq!(
             fs::metadata(store.projection_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(dir.join(STORE_OPEN_LOCK_NAME))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -3587,6 +4476,16 @@ mod tests {
             LocalStore::open(&store_dir),
             Err(StoreError::Symlink)
         ));
+
+        let lock_store = root.join("lock-store");
+        fs::create_dir(&lock_store).unwrap();
+        fs::set_permissions(&lock_store, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&target_file, lock_store.join(STORE_OPEN_LOCK_NAME)).unwrap();
+        let lock_result = LocalStore::open(&lock_store);
+        assert!(
+            matches!(&lock_result, Err(StoreError::Symlink)),
+            "{lock_result:?}"
+        );
 
         let projection_store = root.join("projection-store");
         let store = LocalStore::open(&projection_store).unwrap();
@@ -3946,6 +4845,290 @@ mod tests {
             .unwrap()
             .cast_unsigned();
         assert_eq!(free_pages, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connection_opened_before_retention_cannot_resurrect_expired_span() {
+        let dir = temp_dir("retention-two-connections");
+        let _ = fs::remove_dir_all(&dir);
+        let mut collector = LocalStore::open(&dir).unwrap();
+        let mut retention = LocalStore::open(&dir).unwrap();
+        retention
+            .ingest(&observation("1", "session", None))
+            .unwrap();
+        retention
+            .ingest(&observation_after("2", Some("1"), "turn", Some("session")))
+            .unwrap();
+        let plan = retention.retention_plan(100, 100, 1_048_576).unwrap();
+        retention
+            .apply_retention(
+                100,
+                100,
+                1_048_576,
+                &plan.plan_id,
+                &dir.join("archive/expired.jsonl"),
+            )
+            .unwrap();
+
+        let replay = observation_after("3", Some("2"), "turn", Some("session"));
+        assert_eq!(collector.ingest(&replay).unwrap(), IngestStatus::Suppressed);
+        assert_eq!(collector.record_count().unwrap(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_generation_tracks_record_mutations_and_exact_acknowledgement() {
+        let dir = temp_dir("report-generation");
+        let _ = fs::remove_dir_all(&dir);
+        let mut writer = LocalStore::open(&dir).unwrap();
+        assert_eq!(
+            writer.report_status().unwrap(),
+            ReportStatus {
+                generation: 0,
+                acknowledged_generation: 0,
+            }
+        );
+        writer.ingest(&observation("1", "session", None)).unwrap();
+        let snapshot = writer.report_snapshot().unwrap();
+        assert_eq!(snapshot.generation, 1);
+        let mut visited = Vec::new();
+        let visit = writer
+            .visit_report_snapshot(|index, record| visited.push((index, record)))
+            .unwrap();
+        assert_eq!(visit.generation, snapshot.generation);
+        assert_eq!(visit.records, snapshot.records.len());
+        assert_eq!(visited.len(), snapshot.records.len());
+        assert_eq!(visited[0].0, 0);
+        assert_eq!(visited[0].1, snapshot.records[0]);
+        assert_eq!(snapshot.records.len(), 1);
+
+        let mut concurrent_writer = LocalStore::open(&dir).unwrap();
+        concurrent_writer
+            .ingest(&observation_after("2", Some("1"), "turn", Some("session")))
+            .unwrap();
+        assert!(
+            !writer
+                .acknowledge_report_generation(snapshot.generation)
+                .unwrap()
+        );
+        assert!(writer.report_status().unwrap().pending());
+
+        let latest = writer.report_snapshot().unwrap();
+        assert_eq!(latest.generation, 2);
+        assert_eq!(latest.records.len(), 2);
+        assert!(
+            writer
+                .acknowledge_report_generation(latest.generation)
+                .unwrap()
+        );
+        assert!(!writer.report_status().unwrap().pending());
+
+        let plan = writer.retention_plan(100, 100, 1_048_576).unwrap();
+        writer
+            .apply_retention(
+                100,
+                100,
+                1_048_576,
+                &plan.plan_id,
+                &dir.join("archive/expired.jsonl"),
+            )
+            .unwrap();
+        let status = writer.report_status().unwrap();
+        assert_eq!(status.generation, 3);
+        assert_eq!(status.acknowledged_generation, 2);
+        assert!(status.pending());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_visitor_releases_read_lock_before_slow_projection() {
+        let dir = temp_dir("report-visitor-concurrent-write");
+        let _ = fs::remove_dir_all(&dir);
+        let mut seed = LocalStore::open(&dir).unwrap();
+        seed.ingest(&observation("1", "session", None)).unwrap();
+        drop(seed);
+        let reader = LocalStore::open_current(&dir).unwrap();
+        let mut visited = Vec::new();
+        let writer_dir = dir.clone();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            let mut writer = LocalStore::open(&writer_dir).unwrap();
+            let result = writer.ingest(&observation_after("2", Some("1"), "turn", Some("session")));
+            done_tx.send(result).unwrap();
+        });
+
+        let error = reader
+            .visit_report_snapshot(|index, record| {
+                visited.push((index, record));
+                if index == 0 {
+                    start_tx.send(()).unwrap();
+                    done_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("writer must commit while the visitor is active")
+                        .unwrap();
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            })
+            .unwrap_err();
+        writer.join().unwrap();
+
+        assert!(matches!(error, StoreError::ReportSnapshotChanged));
+        assert_eq!(visited.len(), 1);
+        assert_eq!(reader.report_status().unwrap().generation, 2);
+        assert!(reader.report_status().unwrap().pending());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn report_visitor_rejects_a_generation_change_between_batches() {
+        for initial_records in [128_u64, 129, 256, 257] {
+            let dir = temp_dir(&format!(
+                "report-visitor-generation-fence-{initial_records}"
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let mut writer = LocalStore::open(&dir).unwrap();
+            writer.ingest(&observation("1", "session", None)).unwrap();
+            for ordinal in 2..=initial_records {
+                let cursor = ordinal.to_string();
+                let previous = (ordinal - 1).to_string();
+                writer
+                    .ingest(&observation_after(
+                        &cursor,
+                        Some(&previous),
+                        &format!("turn-{ordinal}"),
+                        Some("session"),
+                    ))
+                    .unwrap();
+            }
+            let reader = LocalStore::open_current(&dir).unwrap();
+            let next = initial_records + 1;
+            let final_index = usize::try_from(initial_records).unwrap() - 1;
+
+            let error = reader
+                .visit_report_snapshot(|index, _record| {
+                    if index == final_index {
+                        writer
+                            .ingest(&observation_after(
+                                &next.to_string(),
+                                Some(&initial_records.to_string()),
+                                &format!("turn-{next}"),
+                                Some("session"),
+                            ))
+                            .unwrap();
+                    }
+                })
+                .unwrap_err();
+
+            assert!(matches!(error, StoreError::ReportSnapshotChanged));
+            assert_eq!(reader.report_status().unwrap().generation, next);
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn report_visits_and_sustained_writes_do_not_hold_sqlite_locks() {
+        let dir = temp_dir("report-visitor-sustained-writes");
+        let _ = fs::remove_dir_all(&dir);
+        let mut seed = LocalStore::open(&dir).unwrap();
+        seed.ingest(&observation("1", "session", None)).unwrap();
+        drop(seed);
+
+        let writer_dir = dir.clone();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_start = std::sync::Arc::clone(&start);
+        let committed_writes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer_committed_writes = std::sync::Arc::clone(&committed_writes);
+        let writer = std::thread::spawn(move || {
+            writer_start.wait();
+            let mut writer = LocalStore::open(&writer_dir).unwrap();
+            let mut max_write = Duration::ZERO;
+            for ordinal in 2..=257 {
+                let cursor = ordinal.to_string();
+                let previous = (ordinal - 1).to_string();
+                let write_started = std::time::Instant::now();
+                writer
+                    .ingest(&observation_after(
+                        &cursor,
+                        Some(&previous),
+                        &format!("turn-{ordinal}"),
+                        Some("session"),
+                    ))
+                    .unwrap();
+                max_write = max_write.max(write_started.elapsed());
+                writer_committed_writes.fetch_add(1, std::sync::atomic::Ordering::Release);
+                std::thread::sleep(Duration::from_micros(250));
+            }
+            max_write
+        });
+
+        let reader = LocalStore::open_current(&dir).unwrap();
+        start.wait();
+        let mut overlapping_visits = 0_u64;
+        let mut writes_during_visits = 0_u64;
+        while !writer.is_finished() {
+            overlapping_visits += 1;
+            let writes_before = committed_writes.load(std::sync::atomic::Ordering::Acquire);
+            match reader.visit_report_snapshot(|_, _| {
+                std::thread::sleep(Duration::from_micros(100));
+            }) {
+                Ok(_) | Err(StoreError::ReportSnapshotChanged) => {}
+                Err(error) => panic!("report visitor failed during sustained writes: {error}"),
+            }
+            let writes_after = committed_writes.load(std::sync::atomic::Ordering::Acquire);
+            writes_during_visits =
+                writes_during_visits.saturating_add(writes_after.saturating_sub(writes_before));
+        }
+        let max_write = writer.join().unwrap();
+        assert!(overlapping_visits > 0);
+        assert!(
+            writes_during_visits >= 16,
+            "only {writes_during_visits} writes completed during report visits"
+        );
+        assert!(
+            max_write < Duration::from_secs(2),
+            "one writer approached the SQLite busy timeout: {max_write:?}"
+        );
+
+        let mut visited = 0;
+        let final_visit = reader
+            .visit_report_snapshot(|index, _| {
+                assert_eq!(index, visited);
+                visited += 1;
+            })
+            .unwrap();
+        assert_eq!(final_visit.records, 257);
+        assert_eq!(visited, 257);
+        assert_eq!(final_visit.generation, 257);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn existing_v4_store_without_report_metadata_reopens_pending() {
+        let dir = temp_dir("report-generation-v4-backfill");
+        let _ = fs::remove_dir_all(&dir);
+        let store = LocalStore::open(&dir).unwrap();
+        let database = store.database_path();
+        drop(store);
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute(
+                "DELETE FROM metadata WHERE key IN (?1, ?2)",
+                params![REPORT_GENERATION_KEY, REPORT_ACKNOWLEDGED_GENERATION_KEY],
+            )
+            .unwrap();
+        drop(connection);
+
+        let reopened = LocalStore::open(&dir).unwrap();
+        assert_eq!(
+            reopened.report_status().unwrap(),
+            ReportStatus {
+                generation: 1,
+                acknowledged_generation: 0,
+            }
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

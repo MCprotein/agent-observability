@@ -1,11 +1,62 @@
+use agent_observability_local_runtime::{ConfigMutationGuard, StorageBudget, install, load, save};
+use agent_observability_local_store::LocalStore;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 #[cfg(unix)]
 use std::fs;
 
 fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_agent-observability"))
+}
+
+#[cfg(unix)]
+fn private_codex_handoff(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let handoff = root.join("codex-handoff.jsonl");
+    fs::write(
+        &handoff,
+        include_str!("../../adapter-codex/tests/fixtures/codex-handoff.jsonl"),
+    )
+    .unwrap();
+    fs::set_permissions(&handoff, fs::Permissions::from_mode(0o600)).unwrap();
+    handoff
+}
+
+#[cfg(unix)]
+fn spawn_codex_ingest(root: &Path, handoff: &Path) -> Child {
+    binary()
+        .args([
+            "codex-ingest",
+            root.to_str().unwrap(),
+            handoff.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn assert_ingest_waits(child: &mut Child) {
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().unwrap().is_none());
+}
+
+#[cfg(unix)]
+fn inflate_allocated_accounting(root: &Path) {
+    let source = root.join("allocated-budget-fixture");
+    fs::write(&source, vec![0_u8; 1024 * 1024]).unwrap();
+    let reduced = StorageBudget::calculate(256 * 1024 * 1024, false).unwrap();
+    for index in 0..300 {
+        let allocated = StorageBudget::allocated_tree_bytes(root).unwrap();
+        if allocated + 512 * 1024 > reduced.writable_limit() {
+            return;
+        }
+        fs::hard_link(&source, root.join(format!("allocated-budget-link-{index}"))).unwrap();
+    }
+    panic!("failed to inflate storage accounting above the reduced budget");
 }
 
 #[test]
@@ -51,6 +102,57 @@ fn invalid_real_process_command_fails_on_stderr() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown command"));
+}
+
+#[test]
+fn codex_notify_real_process_rejects_before_io_with_zero_exit() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-notify-missing-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let output = binary()
+        .args([
+            "codex-notify",
+            root.to_str().unwrap(),
+            r#"{"type":"agent-turn-complete"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "notify=rejected"
+    );
+    assert!(output.stderr.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn codex_notify_real_process_is_unavailable_after_valid_projection() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-notify-unavailable-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let output = binary()
+        .args([
+            "codex-notify",
+            root.to_str().unwrap(),
+            r#"{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1","cwd":"/RAW_CWD_SENTINEL","input-messages":["RAW_PROMPT_SENTINEL"],"last-assistant-message":"RAW_ASSISTANT_SENTINEL"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "notify=unavailable"
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!root.join("runtime/collector.json").exists());
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]
@@ -251,6 +353,7 @@ fn demo_fails_when_collection_policy_blocks_first_value() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn retention_plan_is_read_only_and_apply_writes_one_private_archive() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -280,6 +383,20 @@ fn retention_plan_is_read_only_and_apply_writes_one_private_archive() {
         "{}",
         String::from_utf8_lossy(&ingest.stderr)
     );
+    let initial_report = binary()
+        .args(["report", runtime.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(initial_report.status.success());
+    let dashboard = runtime.join("logs/agent-observability-report.html");
+    assert!(
+        !fs::read_to_string(&dashboard)
+            .unwrap()
+            .contains(r#""generatedSpans":0"#)
+    );
+    let store = LocalStore::open(installed_store(&runtime)).unwrap();
+    assert!(!store.report_status().unwrap().pending());
+    drop(store);
     let projection = installed_store(&runtime).join("observations.jsonl");
     let before = fs::read(&projection).unwrap();
 
@@ -341,6 +458,32 @@ fn retention_plan_is_read_only_and_apply_writes_one_private_archive() {
         0o600
     );
     assert!(fs::read_to_string(&projection).unwrap().is_empty());
+    let store = LocalStore::open(installed_store(&runtime)).unwrap();
+    assert!(store.report_status().unwrap().pending());
+    drop(store);
+    assert!(
+        !fs::read_to_string(&dashboard)
+            .unwrap()
+            .contains(r#""generatedSpans":0"#)
+    );
+
+    let refresh = binary()
+        .args(["dashboard", runtime.to_str().unwrap(), "--no-open"])
+        .output()
+        .unwrap();
+    assert!(
+        refresh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refresh.stderr)
+    );
+    assert!(
+        fs::read_to_string(&dashboard)
+            .unwrap()
+            .contains(r#""generatedSpans":0"#)
+    );
+    let store = LocalStore::open(installed_store(&runtime)).unwrap();
+    assert!(!store.report_status().unwrap().pending());
+    drop(store);
 
     let stale_replay = binary()
         .args([
@@ -423,6 +566,59 @@ fn installed_runtime_config_disables_ingest_without_creating_a_store() {
         .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("collection_disabled=1"));
+    assert!(!root.join("state/store/local-store.sqlite3").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_disable_blocks_manual_ingest_before_admission() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-concurrent-disable-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let layout = install(&root).unwrap();
+    let handoff = private_codex_handoff(&root);
+    let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+    let mut ingest = spawn_codex_ingest(&root, &handoff);
+    assert_ingest_waits(&mut ingest);
+
+    let mut config = load(&layout.config).unwrap();
+    config.enabled = false;
+    save(&guard, &config).unwrap();
+    drop(guard);
+
+    let output = ingest.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("collection_disabled=1"));
+    assert!(!root.join("state/store/local-store.sqlite3").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_budget_reduction_blocks_manual_ingest_before_commit() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-concurrent-budget-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let layout = install(&root).unwrap();
+    let handoff = private_codex_handoff(&root);
+    inflate_allocated_accounting(&root);
+    let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+    let mut ingest = spawn_codex_ingest(&root, &handoff);
+    assert_ingest_waits(&mut ingest);
+
+    let mut config = load(&layout.config).unwrap();
+    config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+    save(&guard, &config).unwrap();
+    drop(guard);
+
+    let output = ingest.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("storage_blocked=1"));
     assert!(!root.join("state/store/local-store.sqlite3").exists());
     let _ = fs::remove_dir_all(root);
 }

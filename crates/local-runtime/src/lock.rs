@@ -11,6 +11,12 @@ pub struct Singleton {
     pub boot_nonce: [u8; 32],
     metadata_path: PathBuf,
 }
+
+/// Serializes short-lived mutations that share one runtime accounting root.
+#[derive(Debug)]
+pub struct MutationGuard {
+    file: File,
+}
 #[derive(Debug)]
 pub enum SingletonError {
     Io(std::io::Error),
@@ -122,6 +128,49 @@ impl Singleton {
 impl Drop for Singleton {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.metadata_path);
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+impl MutationGuard {
+    pub fn acquire(runtime_dir: &Path) -> Result<Self, SingletonError> {
+        Self::acquire_with(runtime_dir, false)
+    }
+
+    pub fn try_acquire(runtime_dir: &Path) -> Result<Self, SingletonError> {
+        Self::acquire_with(runtime_dir, true)
+    }
+
+    fn acquire_with(runtime_dir: &Path, nonblocking: bool) -> Result<Self, SingletonError> {
+        private_runtime_dir(runtime_dir)?;
+        let lock_path = runtime_dir.join("mutation.lock");
+        reject_symlink(&lock_path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(no_follow_flag());
+        }
+        let file = options.open(&lock_path)?;
+        private_open_file(&file)?;
+        if nonblocking {
+            file.try_lock_exclusive().map_err(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    SingletonError::AlreadyRunning
+                } else {
+                    SingletonError::Io(error)
+                }
+            })?;
+        } else {
+            file.lock_exclusive().map_err(SingletonError::Io)?;
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for MutationGuard {
+    fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
 }
@@ -303,6 +352,26 @@ mod tests {
         assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
         drop(a);
         drop(b);
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn mutation_guard_waits_for_the_current_writer() {
+        let d = std::env::temp_dir().join(format!("local-runtime-mutation-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let first = MutationGuard::acquire(&d).unwrap();
+        let second_dir = d.clone();
+        let acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let acquired_by_thread = acquired.clone();
+        let thread = std::thread::spawn(move || {
+            let _second = MutationGuard::acquire(&second_dir).unwrap();
+            acquired_by_thread.store(true, std::sync::atomic::Ordering::Release);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!acquired.load(std::sync::atomic::Ordering::Acquire));
+        drop(first);
+        thread.join().unwrap();
+        assert!(acquired.load(std::sync::atomic::Ordering::Acquire));
         let _ = fs::remove_dir_all(d);
     }
 

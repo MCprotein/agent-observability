@@ -133,6 +133,17 @@
     ["path", { d: "M10 12h4" }]
   ];
 
+  // node_modules/lucide/dist/esm/icons/cable.mjs
+  var Cable = [
+    ["path", { d: "M17 19a1 1 0 0 1-1-1v-2a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2a1 1 0 0 1-1 1z" }],
+    ["path", { d: "M17 21v-2" }],
+    ["path", { d: "M19 14V6.5a1 1 0 0 0-7 0v11a1 1 0 0 1-7 0V10" }],
+    ["path", { d: "M21 21v-2" }],
+    ["path", { d: "M3 5V3" }],
+    ["path", { d: "M4 10a2 2 0 0 1-2-2V6a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2a2 2 0 0 1-2 2z" }],
+    ["path", { d: "M7 5V3" }]
+  ];
+
   // node_modules/lucide/dist/esm/icons/check.mjs
   var Check = [["path", { d: "M20 6 9 17l-5-5" }]];
 
@@ -150,6 +161,13 @@
     ["path", { d: "M3 12A9 3 0 0 0 21 12" }]
   ];
 
+  // node_modules/lucide/dist/esm/icons/external-link.mjs
+  var ExternalLink = [
+    ["path", { d: "M15 3h6v6" }],
+    ["path", { d: "M10 14 21 3" }],
+    ["path", { d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" }]
+  ];
+
   // node_modules/lucide/dist/esm/icons/gauge.mjs
   var Gauge = [
     ["path", { d: "m12 14 4-4" }],
@@ -165,6 +183,21 @@
       }
     ],
     ["path", { d: "M3.22 13H9.5l.5-1 2 4.5 2-7 1.5 3.5h5.27" }]
+  ];
+
+  // node_modules/lucide/dist/esm/icons/monitor-up.mjs
+  var MonitorUp = [
+    ["path", { d: "m9 10 3-3 3 3" }],
+    ["path", { d: "M12 13V7" }],
+    ["rect", { width: "20", height: "14", x: "2", y: "3", rx: "2" }],
+    ["path", { d: "M12 17v4" }],
+    ["path", { d: "M8 21h8" }]
+  ];
+
+  // node_modules/lucide/dist/esm/icons/power.mjs
+  var Power = [
+    ["path", { d: "M12 2v10" }],
+    ["path", { d: "M18.4 6.6a9 9 0 1 1-12.77.04" }]
   ];
 
   // node_modules/lucide/dist/esm/icons/refresh-cw.mjs
@@ -773,6 +806,8 @@
   var draft = null;
   var defaults = null;
   var revision = "";
+  var integration = null;
+  var integrationUnavailable = false;
   var busy = false;
   var conflicted = false;
   var heartbeatTimer;
@@ -796,7 +831,17 @@
       return;
     }
     try {
-      applyEnvelope(await api("/api/config"));
+      const envelope = await api("/api/config");
+      applyEnvelope(envelope);
+      try {
+        integration = await api("/api/integrations/codex");
+        integrationUnavailable = false;
+      } catch (error) {
+        const apiError = error;
+        if (apiError.code === "invalid_session") throw error;
+        integration = null;
+        integrationUnavailable = true;
+      }
       renderSettings();
       heartbeatTimer = window.setInterval(() => void heartbeat(), 2e4);
     } catch (error) {
@@ -842,6 +887,7 @@
     <header class="topbar">
       <div class="brand"><span class="brand-mark"><i data-lucide="settings-2"></i></span><span>Agent Observability</span></div>
       <div class="topbar-actions">
+        <button class="button monitor-button" id="open-dashboard" type="button"><i data-lucide="monitor-up"></i>\uBAA8\uB2C8\uD130\uB9C1</button>
         <span class="session-badge"><i data-lucide="shield-check"></i>\uB85C\uCEEC \uC804\uC6A9 \xB7 \uC138\uC158 \uD65C\uC131</span>
         <button class="icon-button" id="close-session" type="button" title="\uC124\uC815 \uC138\uC158 \uB2EB\uAE30" aria-label="\uC124\uC815 \uC138\uC158 \uB2EB\uAE30"><i data-lucide="x"></i></button>
       </div>
@@ -853,7 +899,7 @@
         <a href="#collection"><i data-lucide="activity"></i>\uC218\uC9D1</a>
         <a href="#storage"><i data-lucide="database"></i>\uC800\uC7A5\uC18C</a>
         <a href="#retention"><i data-lucide="archive"></i>\uBCF4\uAD00</a>
-        <div class="nav-note"><strong>\uC785\uB825 \uBC29\uC2DD</strong><span>\uC218\uB3D9 private handoff</span><span>\uC790\uB3D9 producer \uBBF8\uD3EC\uD568</span></div>
+        <div class="nav-note"><strong>Codex</strong><span>${configNavigationStatus()}</span><span>${collectorNavigationStatus()}</span></div>
       </nav>
       <main class="settings-main">
         <form id="settings-form" novalidate>
@@ -899,6 +945,7 @@
     <div class="section-heading"><div><p class="eyebrow">Standalone</p><h1 id="overview-title">\uB85C\uCEEC \uC218\uC9D1 \uC815\uCC45</h1><p>\uC815\uC801 \uB9AC\uD3EC\uD2B8\uC640 \uB3C5\uB9BD\uC801\uC73C\uB85C \uC800\uC7A5\xB7\uBCF4\uAD00 \uD55C\uB3C4\uB97C \uAD00\uB9AC\uD569\uB2C8\uB2E4.</p></div>
       <label class="collection-toggle"><span><strong>\uC218\uC9D1 \uD5C8\uC6A9</strong><small id="enabled-copy">${config.enabled ? "private handoff\uB97C \uCC98\uB9AC\uD569\uB2C8\uB2E4" : "\uC124\uC815\uAC12\uC744 \uC720\uC9C0\uD55C \uCC44 \uCC98\uB9AC\uB97C \uC911\uC9C0\uD569\uB2C8\uB2E4"}</small></span><input type="checkbox" id="enabled" ${config.enabled ? "checked" : ""}><span class="toggle-track" aria-hidden="true"><span></span></span></label>
     </div>
+    ${integrationPanel()}
     <div class="policy-strip" aria-label="\uC815\uCC45 \uC694\uC57D">
       ${summaryItem("activity", "\uD655\uC778 \uC8FC\uAE30", formatDuration(config.collection.file_reconcile_interval_ms))}
       ${summaryItem("sliders-horizontal", "\uBC30\uCE58 \uC0C1\uD55C", `${formatNumber(config.collection.max_batch_records)}\uAC1C`)}
@@ -907,6 +954,34 @@
     </div>
     <div class="policy-notice"><i data-lucide="shield-check"></i><div><strong>\uC774 \uD654\uBA74\uC740 \uB85C\uCEEC \uC815\uCC45\uB9CC \uBCC0\uACBD\uD569\uB2C8\uB2E4.</strong><span>\uC678\uBD80 \uC804\uC1A1 \uC5C6\uC774 Rust\uAC00 \uAC80\uC99D\uD55C \uB4A4 private config\uC5D0 \uC6D0\uC790\uC801\uC73C\uB85C \uC800\uC7A5\uD569\uB2C8\uB2E4.</span></div></div>
   </section>`;
+  }
+  function integrationPanel() {
+    const connected = integration?.config === "connected";
+    const ready = integration?.collector === "ready";
+    const degraded = integration?.collector === "degraded";
+    const conflicted2 = integration?.config === "conflict";
+    const state = integrationUnavailable ? "\uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00" : conflicted2 ? "\uC124\uC815 \uCDA9\uB3CC" : connected && degraded ? "\uB9AC\uD3EC\uD2B8 \uBC18\uC601 \uC9C0\uC5F0" : connected && ready ? "\uC218\uC9D1 \uC911" : connected ? "\uC218\uC9D1\uAE30 \uC751\uB2F5 \uC5C6\uC74C" : "\uC5F0\uACB0 \uC548 \uB428";
+    const detail = integrationUnavailable ? "\uB85C\uCEEC \uC124\uC815\uC740 \uC0AC\uC6A9\uD560 \uC218 \uC788\uC9C0\uB9CC Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC\uB97C \uD655\uC778\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4." : conflicted2 ? "Codex \uC124\uC815\uC774 \uC5F0\uACB0 \uD6C4 \uBCC0\uACBD\uB418\uC5B4 \uC790\uB3D9 \uBCF5\uC6D0\uC744 \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4." : connected && degraded ? "\uC774\uBCA4\uD2B8 \uC218\uC9D1\uC740 \uAC00\uB2A5\uD558\uC9C0\uB9CC \uBAA8\uB2C8\uD130\uB9C1 \uB9AC\uD3EC\uD2B8\uAC00 \uCD5C\uC2E0 \uC0C1\uD0DC\uAC00 \uC544\uB2D9\uB2C8\uB2E4." : connected && ready ? "Codex \uC774\uBCA4\uD2B8\uB97C private local runtime\uC5D0 \uBC18\uC601\uD569\uB2C8\uB2E4." : connected ? "Codex \uC5F0\uACB0\uC740 \uC720\uC9C0\uB418\uC9C0\uB9CC \uB85C\uCEEC \uC218\uC9D1\uAE30\uC5D0 \uC5F0\uACB0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD558\uBA74 \uB2E4\uC74C \uC791\uC5C5\uBD80\uD130 \uAE30\uB85D\uD569\uB2C8\uB2E4.";
+    const action = integrationUnavailable ? `<button class="button secondary" id="refresh-integration" type="button"><i data-lucide="refresh-cw"></i>\uB2E4\uC2DC \uD655\uC778</button>` : connected ? `<button class="button secondary" id="toggle-integration" type="button"><i data-lucide="power"></i>\uC5F0\uACB0 \uD574\uC81C</button>` : `<button class="button primary" id="toggle-integration" type="button"><i data-lucide="cable"></i>Codex \uC5F0\uACB0</button>`;
+    const panelState = integrationUnavailable ? "unavailable" : conflicted2 ? "conflict" : degraded ? "degraded" : ready ? "ready" : "idle";
+    const collectorLabel = integrationUnavailable ? "\uD655\uC778 \uBD88\uAC00" : degraded ? "\uB9AC\uD3EC\uD2B8 \uC9C0\uC5F0" : ready ? "\uC815\uC0C1" : "\uC911\uC9C0";
+    return `<div class="integration-panel" data-state="${panelState}" data-config-state="${integration?.config ?? "disconnected"}" data-collector-state="${integration?.collector ?? "unavailable"}">
+    <div class="integration-identity"><span class="integration-icon"><i data-lucide="activity"></i></span><div><span>Codex</span><strong>${state}</strong><small>${detail}</small></div></div>
+    <div class="integration-meta"><span><b>\uC218\uC9D1\uAE30</b>${collectorLabel}</span><span><b>\uC800\uC7A5</b>\uB85C\uCEEC \uC804\uC6A9</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
+    <div class="integration-actions">${action}<button class="button monitor-button" id="overview-dashboard" type="button"><i data-lucide="external-link"></i>\uB9AC\uD3EC\uD2B8 \uC5F4\uAE30</button></div>
+  </div>`;
+  }
+  function configNavigationStatus() {
+    if (integrationUnavailable) return "\uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00";
+    if (integration?.config === "connected") return "\uC790\uB3D9 \uC218\uC9D1 \uC5F0\uACB0\uB428";
+    if (integration?.config === "conflict") return "Codex \uC124\uC815 \uCDA9\uB3CC";
+    return "\uC790\uB3D9 \uC218\uC9D1 \uC5F0\uACB0 \uC548 \uB428";
+  }
+  function collectorNavigationStatus() {
+    if (integrationUnavailable) return "collector \uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00";
+    if (integration?.collector === "ready") return "collector \uC2E4\uD589 \uC911";
+    if (integration?.collector === "degraded") return "collector \uC2E4\uD589 \uC911 \xB7 \uB9AC\uD3EC\uD2B8 \uC9C0\uC5F0";
+    return "collector \uC911\uC9C0\uB428";
   }
   function collectionSection(config) {
     return `<section class="settings-section" id="collection" aria-labelledby="collection-title">
@@ -1012,6 +1087,10 @@
     document.querySelector("#close-session")?.addEventListener("click", requestCloseSession);
     document.querySelector("#cancel-close")?.addEventListener("click", closeCloseDialog);
     document.querySelector("#confirm-close")?.addEventListener("click", () => void closeSession());
+    document.querySelector("#toggle-integration")?.addEventListener("click", () => void toggleIntegration());
+    document.querySelector("#refresh-integration")?.addEventListener("click", () => void refreshIntegration());
+    document.querySelector("#open-dashboard")?.addEventListener("click", () => void openDashboard());
+    document.querySelector("#overview-dashboard")?.addEventListener("click", () => void openDashboard());
     document.querySelectorAll("dialog").forEach((dialog) => {
       dialog.addEventListener("keydown", trapDialogFocus);
     });
@@ -1029,6 +1108,53 @@
       { rootMargin: "-32% 0px -60% 0px", threshold: 0 }
     );
     document.querySelectorAll(".settings-section").forEach((section) => navigationObserver?.observe(section));
+  }
+  async function toggleIntegration() {
+    if (busy || !integration) return;
+    const lifecycleToken = token;
+    setBusy(true);
+    try {
+      const method = integration.config === "connected" ? "DELETE" : "POST";
+      const nextIntegration = await api("/api/integrations/codex", { method });
+      if (token !== lifecycleToken) return;
+      integration = nextIntegration;
+      renderSettings("toggle-integration");
+      showToast(
+        integration.config === "connected" ? "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD588\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uD574\uC81C\uD588\uC2B5\uB2C8\uB2E4.",
+        "success"
+      );
+    } catch (error) {
+      if (token !== lifecycleToken) return;
+      setBusy(false);
+      showToast(messageOf(error), "error");
+    }
+  }
+  async function refreshIntegration() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      integration = await api("/api/integrations/codex");
+      integrationUnavailable = false;
+      renderSettings("toggle-integration");
+      showToast("Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC\uB97C \uD655\uC778\uD588\uC2B5\uB2C8\uB2E4.", "success");
+    } catch (error) {
+      const apiError = error;
+      if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
+        expireSession();
+        return;
+      }
+      setBusy(false);
+      showToast(messageOf(error), "error");
+    }
+  }
+  async function openDashboard() {
+    if (busy) return;
+    try {
+      await api("/api/dashboard/open", { method: "POST" });
+      showToast("\uBAA8\uB2C8\uD130\uB9C1 \uB9AC\uD3EC\uD2B8\uB97C \uC5F4\uC5C8\uC2B5\uB2C8\uB2E4.", "success");
+    } catch (error) {
+      showToast(messageOf(error), "error");
+    }
   }
   function trapDialogFocus(event) {
     if (event.key !== "Tab") return;
@@ -1376,10 +1502,14 @@
       icons: {
         Activity,
         Archive,
+        Cable,
         Check,
         Database,
+        ExternalLink,
         Gauge,
         HeartPulse,
+        MonitorUp,
+        Power,
         RefreshCw,
         RotateCcw,
         Save,
@@ -1429,6 +1559,16 @@
   function setText(id, value) {
     const element = document.querySelector(`#${id}`);
     if (element) element.textContent = value;
+  }
+  function escapeHtml(value) {
+    const entities = {
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;"
+    };
+    return value.replace(/[&<>"']/g, (character) => entities[character] ?? character);
   }
   function setDisabled(id, value) {
     const button = document.querySelector(`#${id}`);

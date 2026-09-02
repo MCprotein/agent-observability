@@ -1,10 +1,14 @@
 import {
   Activity,
   Archive,
+  Cable,
   Check,
   Database,
+  ExternalLink,
   Gauge,
   HeartPulse,
+  MonitorUp,
+  Power,
   RefreshCw,
   RotateCcw,
   Save,
@@ -34,7 +38,15 @@ type Envelope = {
   config: LocalRuntimeConfigV2;
   defaults: LocalRuntimeConfigV2;
   revision: string;
-  collection_mode: "manual_import";
+  collection_mode: "automatic_codex" | "manual_import";
+};
+
+type IntegrationStatus = {
+  config: "connected" | "disconnected" | "conflict";
+  collector: "ready" | "degraded" | "unavailable";
+  endpoint?: string;
+  service?: string;
+  data_retained: boolean;
 };
 
 type ApiError = { code?: string; message?: string };
@@ -166,6 +178,8 @@ let persisted: LocalRuntimeConfigV2 | null = null;
 let draft: LocalRuntimeConfigV2 | null = null;
 let defaults: LocalRuntimeConfigV2 | null = null;
 let revision = "";
+let integration: IntegrationStatus | null = null;
+let integrationUnavailable = false;
 let busy = false;
 let conflicted = false;
 let heartbeatTimer: number | undefined;
@@ -193,7 +207,17 @@ async function bootstrap(): Promise<void> {
     return;
   }
   try {
-    applyEnvelope(await api<Envelope>("/api/config"));
+    const envelope = await api<Envelope>("/api/config");
+    applyEnvelope(envelope);
+    try {
+      integration = await api<IntegrationStatus>("/api/integrations/codex");
+      integrationUnavailable = false;
+    } catch (error) {
+      const apiError = error as Error & { code?: string };
+      if (apiError.code === "invalid_session") throw error;
+      integration = null;
+      integrationUnavailable = true;
+    }
     renderSettings();
     heartbeatTimer = window.setInterval(() => void heartbeat(), 20_000);
   } catch (error) {
@@ -243,6 +267,7 @@ function renderSettings(focusTarget?: string): void {
     <header class="topbar">
       <div class="brand"><span class="brand-mark"><i data-lucide="settings-2"></i></span><span>Agent Observability</span></div>
       <div class="topbar-actions">
+        <button class="button monitor-button" id="open-dashboard" type="button"><i data-lucide="monitor-up"></i>모니터링</button>
         <span class="session-badge"><i data-lucide="shield-check"></i>로컬 전용 · 세션 활성</span>
         <button class="icon-button" id="close-session" type="button" title="설정 세션 닫기" aria-label="설정 세션 닫기"><i data-lucide="x"></i></button>
       </div>
@@ -254,7 +279,7 @@ function renderSettings(focusTarget?: string): void {
         <a href="#collection"><i data-lucide="activity"></i>수집</a>
         <a href="#storage"><i data-lucide="database"></i>저장소</a>
         <a href="#retention"><i data-lucide="archive"></i>보관</a>
-        <div class="nav-note"><strong>입력 방식</strong><span>수동 private handoff</span><span>자동 producer 미포함</span></div>
+        <div class="nav-note"><strong>Codex</strong><span>${configNavigationStatus()}</span><span>${collectorNavigationStatus()}</span></div>
       </nav>
       <main class="settings-main">
         <form id="settings-form" novalidate>
@@ -301,6 +326,7 @@ function overviewSection(config: LocalRuntimeConfigV2): string {
     <div class="section-heading"><div><p class="eyebrow">Standalone</p><h1 id="overview-title">로컬 수집 정책</h1><p>정적 리포트와 독립적으로 저장·보관 한도를 관리합니다.</p></div>
       <label class="collection-toggle"><span><strong>수집 허용</strong><small id="enabled-copy">${config.enabled ? "private handoff를 처리합니다" : "설정값을 유지한 채 처리를 중지합니다"}</small></span><input type="checkbox" id="enabled" ${config.enabled ? "checked" : ""}><span class="toggle-track" aria-hidden="true"><span></span></span></label>
     </div>
+    ${integrationPanel()}
     <div class="policy-strip" aria-label="정책 요약">
       ${summaryItem("activity", "확인 주기", formatDuration(config.collection.file_reconcile_interval_ms))}
       ${summaryItem("sliders-horizontal", "배치 상한", `${formatNumber(config.collection.max_batch_records)}개`)}
@@ -309,6 +335,61 @@ function overviewSection(config: LocalRuntimeConfigV2): string {
     </div>
     <div class="policy-notice"><i data-lucide="shield-check"></i><div><strong>이 화면은 로컬 정책만 변경합니다.</strong><span>외부 전송 없이 Rust가 검증한 뒤 private config에 원자적으로 저장합니다.</span></div></div>
   </section>`;
+}
+
+function integrationPanel(): string {
+  const connected = integration?.config === "connected";
+  const ready = integration?.collector === "ready";
+  const degraded = integration?.collector === "degraded";
+  const conflicted = integration?.config === "conflict";
+  const state = integrationUnavailable
+    ? "상태 확인 불가"
+    : conflicted
+    ? "설정 충돌"
+    : connected && degraded
+      ? "리포트 반영 지연"
+      : connected && ready
+        ? "수집 중"
+        : connected
+          ? "수집기 응답 없음"
+          : "연결 안 됨";
+  const detail = integrationUnavailable
+    ? "로컬 설정은 사용할 수 있지만 Codex 자동 수집 상태를 확인하지 못했습니다."
+    : conflicted
+    ? "Codex 설정이 연결 후 변경되어 자동 복원을 중단했습니다."
+    : connected && degraded
+      ? "이벤트 수집은 가능하지만 모니터링 리포트가 최신 상태가 아닙니다."
+      : connected && ready
+        ? "Codex 이벤트를 private local runtime에 반영합니다."
+        : connected
+          ? "Codex 연결은 유지되지만 로컬 수집기에 연결할 수 없습니다."
+          : "Codex 자동 수집을 연결하면 다음 작업부터 기록합니다.";
+  const action = integrationUnavailable
+    ? `<button class="button secondary" id="refresh-integration" type="button"><i data-lucide="refresh-cw"></i>다시 확인</button>`
+    : connected
+    ? `<button class="button secondary" id="toggle-integration" type="button"><i data-lucide="power"></i>연결 해제</button>`
+    : `<button class="button primary" id="toggle-integration" type="button"><i data-lucide="cable"></i>Codex 연결</button>`;
+  const panelState = integrationUnavailable ? "unavailable" : conflicted ? "conflict" : degraded ? "degraded" : ready ? "ready" : "idle";
+  const collectorLabel = integrationUnavailable ? "확인 불가" : degraded ? "리포트 지연" : ready ? "정상" : "중지";
+  return `<div class="integration-panel" data-state="${panelState}" data-config-state="${integration?.config ?? "disconnected"}" data-collector-state="${integration?.collector ?? "unavailable"}">
+    <div class="integration-identity"><span class="integration-icon"><i data-lucide="activity"></i></span><div><span>Codex</span><strong>${state}</strong><small>${detail}</small></div></div>
+    <div class="integration-meta"><span><b>수집기</b>${collectorLabel}</span><span><b>저장</b>로컬 전용</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
+    <div class="integration-actions">${action}<button class="button monitor-button" id="overview-dashboard" type="button"><i data-lucide="external-link"></i>리포트 열기</button></div>
+  </div>`;
+}
+
+function configNavigationStatus(): string {
+  if (integrationUnavailable) return "자동 수집 상태 확인 불가";
+  if (integration?.config === "connected") return "자동 수집 연결됨";
+  if (integration?.config === "conflict") return "Codex 설정 충돌";
+  return "자동 수집 연결 안 됨";
+}
+
+function collectorNavigationStatus(): string {
+  if (integrationUnavailable) return "collector 상태 확인 불가";
+  if (integration?.collector === "ready") return "collector 실행 중";
+  if (integration?.collector === "degraded") return "collector 실행 중 · 리포트 지연";
+  return "collector 중지됨";
 }
 
 function collectionSection(config: LocalRuntimeConfigV2): string {
@@ -423,6 +504,10 @@ function bindEvents(): void {
   document.querySelector("#close-session")?.addEventListener("click", requestCloseSession);
   document.querySelector("#cancel-close")?.addEventListener("click", closeCloseDialog);
   document.querySelector("#confirm-close")?.addEventListener("click", () => void closeSession());
+  document.querySelector("#toggle-integration")?.addEventListener("click", () => void toggleIntegration());
+  document.querySelector("#refresh-integration")?.addEventListener("click", () => void refreshIntegration());
+  document.querySelector("#open-dashboard")?.addEventListener("click", () => void openDashboard());
+  document.querySelector("#overview-dashboard")?.addEventListener("click", () => void openDashboard());
   document.querySelectorAll<HTMLDialogElement>("dialog").forEach((dialog) => {
     dialog.addEventListener("keydown", trapDialogFocus);
   });
@@ -442,6 +527,56 @@ function bindEvents(): void {
   document
     .querySelectorAll(".settings-section")
     .forEach((section) => navigationObserver?.observe(section));
+}
+
+async function toggleIntegration(): Promise<void> {
+  if (busy || !integration) return;
+  const lifecycleToken = token;
+  setBusy(true);
+  try {
+    const method = integration.config === "connected" ? "DELETE" : "POST";
+    const nextIntegration = await api<IntegrationStatus>("/api/integrations/codex", { method });
+    if (token !== lifecycleToken) return;
+    integration = nextIntegration;
+    renderSettings("toggle-integration");
+    showToast(
+      integration.config === "connected" ? "Codex 자동 수집을 연결했습니다." : "Codex 자동 수집을 해제했습니다.",
+      "success",
+    );
+  } catch (error) {
+    if (token !== lifecycleToken) return;
+    setBusy(false);
+    showToast(messageOf(error), "error");
+  }
+}
+
+async function refreshIntegration(): Promise<void> {
+  if (busy) return;
+  setBusy(true);
+  try {
+    integration = await api<IntegrationStatus>("/api/integrations/codex");
+    integrationUnavailable = false;
+    renderSettings("toggle-integration");
+    showToast("Codex 자동 수집 상태를 확인했습니다.", "success");
+  } catch (error) {
+    const apiError = error as Error & { code?: string };
+    if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
+      expireSession();
+      return;
+    }
+    setBusy(false);
+    showToast(messageOf(error), "error");
+  }
+}
+
+async function openDashboard(): Promise<void> {
+  if (busy) return;
+  try {
+    await api<void>("/api/dashboard/open", { method: "POST" });
+    showToast("모니터링 리포트를 열었습니다.", "success");
+  } catch (error) {
+    showToast(messageOf(error), "error");
+  }
 }
 
 function trapDialogFocus(event: KeyboardEvent): void {
@@ -830,10 +965,14 @@ function mountIcons(): void {
     icons: {
       Activity,
       Archive,
+      Cable,
       Check,
       Database,
+      ExternalLink,
       Gauge,
       HeartPulse,
+      MonitorUp,
+      Power,
       RefreshCw,
       RotateCcw,
       Save,
@@ -894,6 +1033,17 @@ function formatDecimal(value: number): string {
 function setText(id: string, value: string): void {
   const element = document.querySelector<HTMLElement>(`#${id}`);
   if (element) element.textContent = value;
+}
+
+function escapeHtml(value: string): string {
+  const entities: Record<string, string> = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  };
+  return value.replace(/[&<>"']/g, (character) => entities[character] ?? character);
 }
 
 function setDisabled(id: string, value: boolean): void {

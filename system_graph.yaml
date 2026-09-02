@@ -46,9 +46,11 @@ invariants:
       storage, CLI, web UI, and pricing sources; connect those concerns through explicit ports.
   - id: local-performance-isolation
     severity: must
-    rule: Keep hook foreground work to a bounded local handoff with no synchronous network, full
-      transcript scan, report render, or queue drain; enforce configurable bounded cadence, resource
-      budgets, adaptive backoff, and load shedding that degrades team sync before coding-agent work.
+    rule: Keep hook foreground work to a bounded local handoff with no synchronous external network,
+      full transcript scan, report render, or queue drain; an automatic local adapter may use only
+      bounded authenticated loopback transport within declared deadlines. Enforce configurable bounded
+      cadence, resource budgets, adaptive backoff, and load shedding that degrades team sync before
+      coding-agent work.
   - id: local-transactional-observation
     severity: must
     rule: Atomically commit source generation and cursor, deterministic observation identity, local

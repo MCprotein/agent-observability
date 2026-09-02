@@ -3,6 +3,7 @@ use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, Permissions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -17,14 +18,31 @@ use agent_observability_domain::{
     CorrelationIds, LifecycleState, ObservationId, SourceCursor, SourceGeneration, SpanId, Timing,
     TokenUsage, TraceId,
 };
+use agent_observability_local_collector::{
+    CollectorSettings, HealthOutcome, OtlpSubmissionOutcome, check_health, install_settings,
+    load_settings, submit_otlp_json_outcome,
+};
 use agent_observability_local_runtime::{
     Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressMessage, IngressOutcome, LocalRuntimeConfigV2,
     PressureSample, RuntimeControl, StorageBudget,
 };
 use agent_observability_local_store::LocalStore;
+use serde::Deserialize;
+#[cfg(target_os = "macos")]
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-const USAGE: &str = "usage: cargo run -p xtask -- perf local --profile <release|smoke> --check";
+const USAGE: &str = "usage:\n  cargo run -p xtask -- perf <local|automatic> --profile <release|smoke> --check [--binary <absolute-path>]\n  cargo run -p xtask -- evidence validate-automatic <manifest> --source-revision <sha>";
 const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-performance-v1.yaml");
+const AUTOMATIC_PROTOCOL: &str =
+    include_str!("../../crates/contracts/performance/automatic-local-performance-v1.yaml");
+const AUTOMATIC_PROTOCOL_REVISION: &str =
+    "v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-diagnostics-rss-p95-v3";
+const AUTOMATIC_CODEX_VERSION: &str = "codex-cli 0.151.0";
+const AUTOMATIC_NOTIFY_SENTINELS: [&[u8]; 3] = [
+    b"AUTOMATIC_RAW_CWD_SENTINEL",
+    b"AUTOMATIC_RAW_PROMPT_SENTINEL",
+    b"AUTOMATIC_RAW_ASSISTANT_SENTINEL",
+];
 const REQUIRED_PROTOCOL_LINES: [&str; 50] = [
     "schema_version: local_performance.v1",
     "protocol_revision: v1.2.0-supported-rate-saturation-continuous-network",
@@ -93,6 +111,32 @@ const WORKER_PROTOCOL_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const SAMPLER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+const AUTOMATIC_BUILD_TIMEOUT: Duration = Duration::from_mins(10);
+const AUTOMATIC_START_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTOMATIC_ACTIVE_TIMEOUT_RELEASE: Duration = Duration::from_mins(5);
+const AUTOMATIC_ACTIVE_TIMEOUT_SMOKE: Duration = Duration::from_secs(15);
+const AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTOMATIC_BINARY_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT: Duration = Duration::from_secs(15);
+const AUTOMATIC_LIFECYCLE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTOMATIC_IDLE_CPU_PERCENT_MAX: f64 = 0.5;
+const AUTOMATIC_ACTIVE_CPU_PERCENT_MAX: f64 = 100.0;
+const AUTOMATIC_RSS_P95_MIB_MAX: f64 = 96.0;
+const AUTOMATIC_RSS_SAMPLE_TARGET: Duration = Duration::from_millis(10);
+const AUTOMATIC_RSS_MAX_OBSERVED_GAP: Duration = Duration::from_millis(100);
+const AUTOMATIC_RSS_MIN_RELEASE_SAMPLES: u64 = 100;
+const AUTOMATIC_RECORDS_PER_SYNTHETIC_REQUEST: u64 = 2;
+const AUTOMATIC_NOTIFY_RECORDS_PER_RUN: u64 = 1;
+const AUTOMATIC_ALLOCATED_DISK_BYTES_MAX: u64 = 1_073_741_824;
+const AUTOMATIC_CONNECT_OUTPUT_MAX_BYTES: u64 = 4_096;
+const AUTOMATIC_LIFECYCLE_SEED_MODE: u32 = 0o600;
+const AUTOMATIC_CODEX_E2E_PROMPT_SENTINEL: &str = "AUTOMATIC_CODEX_E2E_RAW_PROMPT_SENTINEL";
+const AUTOMATIC_CODEX_E2E_PROMPT: &str = concat!(
+    "AUTOMATIC_CODEX_E2E_RAW_PROMPT_SENTINEL",
+    " Reply with the requested test value only."
+);
+const AUTOMATIC_CODEX_E2E_RESPONSE_SENTINEL: &str = "AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL";
 #[cfg(target_os = "macos")]
 const NETWORK_MONITOR_START_ATTEMPTS: usize = 3;
 #[cfg(target_os = "macos")]
@@ -121,6 +165,339 @@ struct Config {
     saturation_events: usize,
     runs: usize,
     sample: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AutomaticConfig {
+    profile: Profile,
+    warmup: Duration,
+    idle: Duration,
+    events: usize,
+    inter_event: Duration,
+    runs: usize,
+    sample: Duration,
+    active_timeout: Duration,
+}
+
+impl AutomaticConfig {
+    fn for_profile(profile: Profile) -> Self {
+        match profile {
+            Profile::Release => Self {
+                profile,
+                warmup: Duration::from_mins(1),
+                idle: Duration::from_mins(15),
+                events: 10_000,
+                inter_event: Duration::from_millis(3),
+                runs: 5,
+                sample: Duration::from_secs(1),
+                active_timeout: AUTOMATIC_ACTIVE_TIMEOUT_RELEASE,
+            },
+            Profile::Smoke => Self {
+                profile,
+                warmup: Duration::from_millis(100),
+                idle: Duration::from_millis(250),
+                events: 25,
+                inter_event: Duration::from_millis(1),
+                runs: 1,
+                sample: Duration::from_millis(100),
+                active_timeout: AUTOMATIC_ACTIVE_TIMEOUT_SMOKE,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticProtocol {
+    schema_version: String,
+    version: String,
+    protocol_revision: String,
+    purpose: String,
+    profiles: AutomaticProtocolProfiles,
+    workload: AutomaticProtocolWorkload,
+    metrics: AutomaticProtocolMetrics,
+    execution: AutomaticProtocolExecution,
+    evidence: AutomaticProtocolEvidence,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticProtocolProfiles {
+    release: AutomaticReleaseProfile,
+    smoke: AutomaticSmokeProfile,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticReleaseProfile {
+    build: String,
+    required_os: String,
+    warmup_seconds: u64,
+    idle_seconds: u64,
+    synthetic_otlp_requests: usize,
+    synthetic_otlp_inter_request_ms: u64,
+    runs: usize,
+    sample_interval_seconds: u64,
+    active_timeout_seconds: u64,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticSmokeProfile {
+    build: String,
+    normative: bool,
+    release_check: bool,
+    synthetic_otlp_requests: usize,
+    runs: usize,
+    active_timeout_seconds: u64,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticProtocolWorkload {
+    lifecycle_preflight: String,
+    lifecycle_seed: String,
+    lifecycle_assertions: String,
+    lifecycle_cleanup: String,
+    codex_config_load_boundary: String,
+    observed_compatibility_correction: String,
+    real_codex_e2e_release_gate: String,
+    synthetic_benchmark_boundary: String,
+    notify_boundary: String,
+    collector_boundary: String,
+    payload: String,
+    readiness: String,
+    collector_shutdown: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticProtocolMetrics {
+    synthetic_collector_otlp: AutomaticPrimaryOtlpMetrics,
+    collector_cpu: AutomaticCpuMetrics,
+    collector_rss: AutomaticRssMetrics,
+    disk: AutomaticDiskMetrics,
+    network: AutomaticNetworkMetrics,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticPrimaryOtlpMetrics {
+    required_quantiles: Vec<String>,
+    validation_scope: String,
+    command_timeout_seconds: u64,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticCpuMetrics {
+    idle_average_percent_max: f64,
+    active_integrated_percent_max: f64,
+    normalization: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticRssMetrics {
+    p95_mib_max: f64,
+    peak_reported_diagnostic_only: bool,
+    active_and_report_sample_target_ms: u64,
+    observed_max_gap_ms_max: u64,
+    final_sample: bool,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticDiskMetrics {
+    allocated_tree_bytes_max: u64,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticNetworkMetrics {
+    allowed_transport: String,
+    bytes: String,
+    endpoints: String,
+    evidence: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticProtocolExecution {
+    build_timeout_seconds: u64,
+    startup_timeout_seconds: u64,
+    cleanup_timeout_seconds: u64,
+    fail_closed: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AutomaticProtocolEvidence {
+    output: String,
+    exact_source: String,
+    sanitized_paths: String,
+    release_scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticEvidenceManifest {
+    schema_version: String,
+    evidence_kind: String,
+    protocol_revision: String,
+    status: String,
+    release_readiness: String,
+    real_codex_e2e_status: String,
+    source_revision: String,
+    profile: String,
+    protocol: String,
+    command: String,
+    build: AutomaticEvidenceBuild,
+    host: AutomaticEvidenceHost,
+    workload: AutomaticEvidenceWorkload,
+    metrics: AutomaticEvidenceMetrics,
+    runs: Vec<AutomaticEvidenceRun>,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticEvidenceBuild {
+    package: String,
+    package_version: String,
+    cargo_locked: bool,
+    cargo_profile: String,
+    codex_package: String,
+    codex_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticEvidenceHost {
+    machine: String,
+    os: String,
+    filesystem: String,
+    power_mode: String,
+    logical_cores: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticEvidenceWorkload {
+    lifecycle_preflight: String,
+    collector_boundary: String,
+    transport: String,
+    codex_config_load_boundary: String,
+    observed_compatibility_correction: String,
+    real_codex_e2e_release_gate: String,
+    synthetic_benchmark_boundary: String,
+    notify_boundary: String,
+    runtime_path: String,
+    warmup_ms: u64,
+    idle_ms: u64,
+    synthetic_otlp_requests_per_run: usize,
+    inter_request_ms: u64,
+    runs: usize,
+    sample_interval_ms: u64,
+    active_timeout_ms: u64,
+    startup_timeout_ms: u64,
+    command_timeout_ms: u64,
+    cleanup_timeout_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticEvidenceMetrics {
+    synthetic_collector_otlp_p95_us: Option<u128>,
+    synthetic_collector_otlp_p99_us: Option<u128>,
+    collector_idle_cpu_percent_max: Option<f64>,
+    collector_active_cpu_percent_max: Option<f64>,
+    collector_rss_p95_kib_max: Option<f64>,
+    collector_peak_rss_kib: Option<f64>,
+    collector_rss_samples_min: Option<u64>,
+    collector_rss_observed_max_gap_ms: Option<u64>,
+    allocated_disk_bytes_max: Option<u64>,
+    collector_network_bytes_max: Option<u64>,
+    network_monitor_samples: u64,
+    all_observed_endpoints_loopback: bool,
+    network_evidence: String,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticEvidenceRun {
+    run: usize,
+    accepted_synthetic_otlp_requests: usize,
+    rejected_synthetic_otlp_requests: usize,
+    notify_supplement_accepted: bool,
+    durable_report_converged: bool,
+    report_generation: u64,
+    report_records: u64,
+    rss_samples: u64,
+    rss_observed_max_gap_ms: u64,
+    raw_notify_sentinels_absent: bool,
+    synthetic_collector_otlp_p95_us: u128,
+    synthetic_collector_otlp_p99_us: u128,
+    idle_cpu_percent: f64,
+    active_cpu_percent: f64,
+    rss_p95_kib: f64,
+    peak_rss_kib: f64,
+    allocated_disk_bytes: u64,
+    collector_network_bytes: u64,
+    network_monitor_samples: u64,
+    all_observed_endpoints_loopback: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexDiagnostic {
+    checks: CodexDiagnosticChecks,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexDiagnosticChecks {
+    #[serde(rename = "config.load")]
+    config_load: CodexConfigLoadCheck,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexConfigLoadCheck {
+    status: String,
+    details: CodexConfigLoadDetails,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexConfigLoadDetails {
+    #[serde(rename = "CODEX_HOME")]
+    codex_home: String,
+}
+
+#[derive(Debug)]
+struct AutomaticRunResult {
+    run: usize,
+    synthetic_otlp_latencies_us: Vec<u128>,
+    idle_samples: Vec<Sample>,
+    idle_cpu_percent: f64,
+    active_cpu_percent: f64,
+    rss_p95_kib: f64,
+    peak_rss_kib: f64,
+    rss_samples: u64,
+    rss_observed_max_gap_ms: u64,
+    peak_disk_bytes: u64,
+    collector_network_bytes: u64,
+    network_monitor_samples: u64,
+    accepted_primary_requests: usize,
+    rejected_primary_requests: usize,
+    notify_supplement_accepted: bool,
+    report_converged: bool,
+    report_generation: u64,
+    report_records: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReportConvergence {
+    generation: u64,
+    records: u64,
 }
 impl Config {
     fn for_profile(profile: Profile) -> Self {
@@ -479,7 +856,6 @@ fn terminate_monitor_descendants(pid: u32) -> Result<(), String> {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn errors_result(errors: &[String]) -> Result<(), String> {
     if errors.is_empty() {
         Ok(())
@@ -685,6 +1061,10 @@ impl DirectoryCleanup {
             Err(error) => Err(format!("remove {}: {error}", self.label)),
         }
     }
+
+    fn preserve(&mut self) {
+        self.complete = true;
+    }
 }
 
 impl Drop for DirectoryCleanup {
@@ -785,10 +1165,41 @@ fn main() {
         command(&args)
     };
     if let Err(error) = result {
-        eprintln!("{error}");
+        eprintln!("{}", public_error_message(&args, &error));
         std::process::exit(1);
     }
 }
+
+fn public_error_message<'a>(args: &[String], error: &'a str) -> &'a str {
+    if args.first().map(String::as_str) == Some("perf")
+        && args.get(1).map(String::as_str) == Some("automatic")
+    {
+        "automatic_check_failed"
+    } else if args.first().map(String::as_str) == Some("evidence") {
+        "automatic_evidence_validation_failed"
+    } else {
+        error
+    }
+}
+
+fn automatic_manifest_metadata(
+    manifest_path: &Path,
+    profile: Profile,
+    status: &str,
+) -> Result<String, String> {
+    if manifest_path.is_absolute() {
+        return Err("automatic manifest metadata requires a relative path".into());
+    }
+    if !matches!(status, "pass" | "failed") {
+        return Err("automatic manifest metadata has an invalid status".into());
+    }
+    Ok(format!(
+        "manifest={}\nprofile={}\nstatus={status}",
+        manifest_path.display(),
+        profile_name(profile)
+    ))
+}
+
 fn command(args: &[String]) -> Result<(), String> {
     if args.is_empty() || args == ["help"] || args == ["--help"] || args == ["-h"] {
         println!(
@@ -796,9 +1207,23 @@ fn command(args: &[String]) -> Result<(), String> {
         );
         return Ok(());
     }
-    if args.len() != 5
+    if let [evidence, validate, manifest, revision_flag, revision] = args
+        && evidence == "evidence"
+        && validate == "validate-automatic"
+        && revision_flag == "--source-revision"
+    {
+        return validate_automatic_release_evidence_file(Path::new(manifest), revision);
+    }
+    let supplied_binary = match args {
+        [_, mode, _, _, _, flag, path] if mode == "automatic" && flag == "--binary" => {
+            Some(Path::new(path))
+        }
+        [_, _, _, _, _] => None,
+        _ => return Err(USAGE.into()),
+    };
+    if args.len() < 5
         || args[0] != "perf"
-        || args[1] != "local"
+        || !matches!(args[1].as_str(), "local" | "automatic")
         || args[2] != "--profile"
         || args[4] != "--check"
     {
@@ -809,7 +1234,1546 @@ fn command(args: &[String]) -> Result<(), String> {
         "smoke" => Profile::Smoke,
         _ => return Err("--profile must be release or smoke".into()),
     };
-    run(Config::for_profile(profile))
+    if args[1] == "automatic" {
+        run_automatic(AutomaticConfig::for_profile(profile), supplied_binary)
+    } else {
+        run(Config::for_profile(profile))
+    }
+}
+
+fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Result<(), String> {
+    validate_automatic_protocol_contract()?;
+    validate_automatic_profile_host(config.profile, env::consts::OS)?;
+    validate_network_surface()?;
+    if config.profile == Profile::Release {
+        require_clean_worktree()?;
+    }
+    let source_revision = source_revision()?;
+    let binary = resolve_automatic_binary(config.profile, supplied_binary)?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "clock before epoch")?
+        .as_nanos();
+    let evidence_root =
+        PathBuf::from("docs/evidence/local/performance").join(format!("automatic-{stamp}"));
+    fs::create_dir_all(&evidence_root)
+        .map_err(|error| format!("create automatic evidence directory: {error}"))?;
+    fs::set_permissions(&evidence_root, Permissions::from_mode(0o700))
+        .map_err(|error| format!("protect automatic evidence directory: {error}"))?;
+    let mut smoke_cleanup = (config.profile == Profile::Smoke)
+        .then(|| DirectoryCleanup::new(evidence_root.clone(), "automatic smoke evidence path"));
+    let runtime_root = env::temp_dir().join(format!("agent-observability-automatic-{stamp}"));
+    let mut runtime_cleanup = DirectoryCleanup::new(runtime_root.clone(), "automatic runtime path");
+    fs::create_dir(&runtime_root)
+        .map_err(|error| format!("create automatic runtime parent: {error}"))?;
+    fs::set_permissions(&runtime_root, Permissions::from_mode(0o700))
+        .map_err(|error| format!("protect automatic runtime parent: {error}"))?;
+    let host = HostEvidence::collect(&evidence_root)?;
+    let lifecycle = run_automatic_lifecycle_smoke(&binary, &runtime_root);
+    let (results, mut errors) =
+        collect_automatic_run_results(config, &binary, &runtime_root, lifecycle);
+    let validation = validate_automatic_results(config, &results, &errors);
+    if let Err(error) = &validation {
+        errors.push(format!("validation: {error}"));
+    }
+    let manifest_path = evidence_root.join("manifest.yaml");
+    let status = if validation.is_ok() {
+        "pending-validation"
+    } else {
+        "failed"
+    };
+    let manifest =
+        render_automatic_manifest(config, &host, &source_revision, &results, &errors, status);
+    validate_automatic_manifest_shape(&manifest)?;
+    fs::write(&manifest_path, &manifest)
+        .map_err(|error| format!("write automatic manifest: {error}"))?;
+    let runtime_result = runtime_cleanup.cleanup();
+    let smoke_result = smoke_cleanup.as_mut().map_or(Ok(()), |cleanup| {
+        if validation.is_err() {
+            cleanup.preserve();
+            Ok(())
+        } else {
+            cleanup.cleanup()
+        }
+    });
+    if let Err(cleanup_error) = combine_cleanup(runtime_result, smoke_result) {
+        errors.push(format!("cleanup: {cleanup_error}"));
+        if config.profile == Profile::Release {
+            let failed = render_automatic_manifest(
+                config,
+                &host,
+                &source_revision,
+                &results,
+                &errors,
+                "failed",
+            );
+            fs::write(&manifest_path, failed)
+                .map_err(|error| format!("finalize automatic cleanup failure: {error}"))?;
+        }
+        println!(
+            "{}",
+            automatic_manifest_metadata(&manifest_path, config.profile, "failed")?
+        );
+        return Err(format!(
+            "automatic performance cleanup failed: {cleanup_error}"
+        ));
+    }
+    if let Err(error) = validation {
+        println!(
+            "{}",
+            automatic_manifest_metadata(&manifest_path, config.profile, "failed")?
+        );
+        return Err(format!(
+            "automatic performance check failed; manifest: {}: {error}",
+            manifest_path.display()
+        ));
+    }
+    if config.profile == Profile::Release {
+        let passed =
+            render_automatic_manifest(config, &host, &source_revision, &results, &errors, "pass");
+        validate_automatic_manifest_shape(&passed)?;
+        fs::write(&manifest_path, passed)
+            .map_err(|error| format!("finalize automatic manifest: {error}"))?;
+    }
+    println!(
+        "{}",
+        automatic_manifest_metadata(&manifest_path, config.profile, "pass")?
+    );
+    Ok(())
+}
+
+fn collect_automatic_run_results(
+    config: AutomaticConfig,
+    binary: &Path,
+    runtime_root: &Path,
+    lifecycle: Result<(), String>,
+) -> (Vec<AutomaticRunResult>, Vec<String>) {
+    let mut results = Vec::new();
+    let mut errors = Vec::new();
+    if let Err(error) = lifecycle {
+        errors.push(format!("lifecycle preflight: {error}"));
+        return (results, errors);
+    }
+    for run_number in 1..=config.runs {
+        match execute_automatic_run(config, run_number, binary, runtime_root) {
+            Ok(result) => results.push(result),
+            Err(error) => {
+                errors.push(format!("run {run_number}: {error}"));
+                break;
+            }
+        }
+    }
+    (results, errors)
+}
+
+fn validate_automatic_protocol_contract() -> Result<(), String> {
+    validate_automatic_protocol(AUTOMATIC_PROTOCOL)
+}
+
+fn validate_automatic_protocol(protocol: &str) -> Result<(), String> {
+    let parsed = serde_saphyr::from_str::<AutomaticProtocol>(protocol)
+        .map_err(|error| format!("parse embedded automatic performance protocol: {error}"))?;
+    let expected = expected_automatic_protocol();
+    if parsed != expected {
+        return Err(format!(
+            "embedded automatic performance protocol drifted from executable configuration: {parsed:#?}"
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn expected_automatic_protocol() -> AutomaticProtocol {
+    let release = AutomaticConfig::for_profile(Profile::Release);
+    let smoke = AutomaticConfig::for_profile(Profile::Smoke);
+    AutomaticProtocol {
+        schema_version: "automatic_local_performance.v1".into(),
+        version: "v1.8.0".into(),
+        protocol_revision: AUTOMATIC_PROTOCOL_REVISION.into(),
+        purpose: "normative automatic release evidence for real Codex compatibility, local lifecycle, privacy, and synthetic collector performance".into(),
+        profiles: AutomaticProtocolProfiles {
+            release: AutomaticReleaseProfile {
+                build: "cargo +1.97.0 build --locked -p agent-observability-cli --release".into(),
+                required_os: "macos".into(),
+                warmup_seconds: release.warmup.as_secs(),
+                idle_seconds: release.idle.as_secs(),
+                synthetic_otlp_requests: release.events,
+                synthetic_otlp_inter_request_ms: u64::try_from(release.inter_event.as_millis())
+                    .expect("release inter-request duration fits u64"),
+                runs: release.runs,
+                sample_interval_seconds: release.sample.as_secs(),
+                active_timeout_seconds: release.active_timeout.as_secs(),
+            },
+            smoke: AutomaticSmokeProfile {
+                build: "cargo +1.97.0 build --locked -p agent-observability-cli".into(),
+                normative: false,
+                release_check: false,
+                synthetic_otlp_requests: smoke.events,
+                runs: smoke.runs,
+                active_timeout_seconds: smoke.active_timeout.as_secs(),
+            },
+        },
+        workload: AutomaticProtocolWorkload {
+            lifecycle_preflight: "bounded built-binary no-argument setup --no-open under isolated HOME and CODEX_HOME, installed Codex 0.151.0 strict config loading, and one actual codex exec against a content-free loopback Responses fixture".into(),
+            lifecycle_seed: "exact private Codex config bytes and permission mode".into(),
+            lifecycle_assertions: "connected config, exact Codex 0.151.0 version and strict config loading, ready or degraded collector, installed KeepAlive LaunchAgent plist, pre-failure synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, unexpected SIGKILL service termination and bounded unaided launchd KeepAlive recovery, post-recovery synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service".into(),
+            lifecycle_cleanup: "best-effort bounded disconnect, bootout, exact seed restoration, plist removal, and isolated directory removal on success or error".into(),
+            codex_config_load_boundary: "installed @openai/codex 0.151.0 exact version, strict diagnostic loading, and actual codex exec proving exporter construction and native OTLP delivery without an external model request".into(),
+            observed_compatibility_correction: "Codex 0.151.0 on macOS fails exporter construction when client certificate and client private-key identity fields are present; corrected product config uses private-CA HTTPS plus the exact x-agent-observability-token private random request header and no client identity fields".into(),
+            real_codex_e2e_release_gate: "the same exact-revision evidence runs actual Codex 0.151.0 macOS codex exec against a content-free loopback Responses fixture and requires exporter construction, native OTLP acceptance, a private session record, exact 10 input and 2 output token records, and no raw prompt or response persistence".into(),
+            synthetic_benchmark_boundary: "after the real Codex gate passes, sustained synthetic Codex-shaped OTLP/HTTP JSON /v1/logs requests measure the private-CA HTTPS exact-header collector path and durable report authority".into(),
+            notify_boundary: "separately verified built agent-observability codex-notify supplement through private-CA HTTPS with the exact private random request header".into(),
+            collector_boundary: "built agent-observability collector-serve subprocess".into(),
+            payload: "bounded synthetic Codex-shaped OTLP log pairs with opaque identifiers; one bounded notify supplement per measured run whose raw sentinels must be absent from the durable tree".into(),
+            readiness: "successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, exactly two durable synthetic records per accepted OTLP request plus one notify record, acknowledged report generation, and HTML generatedSpans parity with authoritative SQLite must converge before collector shutdown".into(),
+            collector_shutdown: "bounded child termination and wait".into(),
+        },
+        metrics: AutomaticProtocolMetrics {
+            synthetic_collector_otlp: AutomaticPrimaryOtlpMetrics {
+                required_quantiles: vec!["p95".into(), "p99".into()],
+                validation_scope: "diagnostic only unless a versioned collector SLO is calibrated; foreground hook latency remains governed by local-performance-v1".into(),
+                command_timeout_seconds: LOCAL_COMMAND_TIMEOUT.as_secs(),
+            },
+            collector_cpu: AutomaticCpuMetrics {
+                idle_average_percent_max: AUTOMATIC_IDLE_CPU_PERCENT_MAX,
+                active_integrated_percent_max: AUTOMATIC_ACTIVE_CPU_PERCENT_MAX,
+                normalization: "percent of one logical core".into(),
+            },
+            collector_rss: AutomaticRssMetrics {
+                p95_mib_max: AUTOMATIC_RSS_P95_MIB_MAX,
+                peak_reported_diagnostic_only: true,
+                active_and_report_sample_target_ms: u64::try_from(
+                    AUTOMATIC_RSS_SAMPLE_TARGET.as_millis(),
+                )
+                .expect("RSS target interval fits u64"),
+                observed_max_gap_ms_max: u64::try_from(
+                    AUTOMATIC_RSS_MAX_OBSERVED_GAP.as_millis(),
+                )
+                .expect("RSS maximum gap fits u64"),
+                final_sample: true,
+            },
+            disk: AutomaticDiskMetrics {
+                allocated_tree_bytes_max: AUTOMATIC_ALLOCATED_DISK_BYTES_MAX,
+            },
+            network: AutomaticNetworkMetrics {
+                allowed_transport: "private-CA HTTPS with exact private random request header on IPv4 loopback only; not mTLS".into(),
+                bytes: "measured collector process bytes from the existing platform NetworkMonitor and reported without classifying loopback traffic as external".into(),
+                endpoints: "every observed collector endpoint must be IPv4 loopback".into(),
+                evidence: "process NetworkMonitor plus independent socket endpoint scans plus static product surface validation".into(),
+            },
+        },
+        execution: AutomaticProtocolExecution {
+            build_timeout_seconds: AUTOMATIC_BUILD_TIMEOUT.as_secs(),
+            startup_timeout_seconds: AUTOMATIC_START_TIMEOUT.as_secs(),
+            cleanup_timeout_seconds: AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT.as_secs(),
+            fail_closed: "missing or invalid benchmark metrics, real Codex execution or native OTLP failure, rejected synthetic OTLP requests, Codex version or strict config-load incompatibility, missing notify or report convergence evidence, durable raw sentinels, non-loopback endpoints, timeout, or threshold breach produce non-zero exit".into(),
+        },
+        evidence: AutomaticProtocolEvidence {
+            output: "docs/evidence/local/performance/automatic-<run>/manifest.yaml".into(),
+            exact_source: "full git commit, Rust 1.97.0 locked build command, tested binary, package version, profile, and protocol revision".into(),
+            sanitized_paths: "run-relative runtime and protocol paths only; credentials, private key content, port, host path, payload, and raw collector output are forbidden".into(),
+            release_scope: "exact-revision release gate combining actual Codex 0.151.0 macOS end-to-end telemetry compatibility with synthetic collector performance evidence".into(),
+        },
+    }
+}
+
+fn validate_automatic_profile_host(profile: Profile, os: &str) -> Result<(), String> {
+    if profile == Profile::Release && os != "macos" {
+        return Err("automatic release performance evidence requires macOS".into());
+    }
+    Ok(())
+}
+
+fn build_automatic_binary(profile: Profile) -> Result<PathBuf, String> {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("xtask manifest directory has no workspace parent")?;
+    let mut command = Command::new("cargo");
+    command
+        .current_dir(workspace)
+        .args([
+            "+1.97.0",
+            "build",
+            "--locked",
+            "-p",
+            "agent-observability-cli",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    if profile == Profile::Release {
+        command.arg("--release");
+    }
+    let mut child = ChildGuard(
+        command
+            .spawn()
+            .map_err(|error| format!("start automatic product build: {error}"))?,
+    );
+    let status = wait_for_child(&mut child, AUTOMATIC_BUILD_TIMEOUT)?;
+    if !status.success() {
+        return Err(format!("automatic product build failed: {status}"));
+    }
+    let target =
+        env::var_os("CARGO_TARGET_DIR").map_or_else(|| workspace.join("target"), PathBuf::from);
+    let binary = target
+        .join(if profile == Profile::Release {
+            "release"
+        } else {
+            "debug"
+        })
+        .join("agent-observability");
+    if !binary.is_file() {
+        return Err("built automatic collector binary is missing".into());
+    }
+    Ok(binary)
+}
+
+fn resolve_automatic_binary(
+    profile: Profile,
+    supplied_binary: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let Some(binary) = supplied_binary else {
+        return build_automatic_binary(profile);
+    };
+    if !binary.is_absolute() {
+        return Err("supplied automatic binary path must be absolute".into());
+    }
+    let metadata = fs::symlink_metadata(binary)
+        .map_err(|error| format!("inspect supplied automatic binary: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("supplied automatic binary must be a regular file, not a symlink".into());
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err("supplied automatic binary must be executable".into());
+    }
+    let version =
+        run_bounded_product_command(binary, &["--version"], AUTOMATIC_BINARY_VERSION_TIMEOUT)?;
+    if version.trim() != env!("CARGO_PKG_VERSION") {
+        return Err(format!(
+            "supplied automatic binary version mismatch: expected {}, got {}",
+            env!("CARGO_PKG_VERSION"),
+            version.trim()
+        ));
+    }
+    Ok(binary.to_path_buf())
+}
+
+struct AutomaticLifecycleCleanup<'a> {
+    binary: &'a Path,
+    home: PathBuf,
+    codex_home: PathBuf,
+    config: PathBuf,
+    seed: Vec<u8>,
+    seed_mode: u32,
+    target: Option<String>,
+    plist: Option<PathBuf>,
+    connection_may_exist: bool,
+    complete: bool,
+}
+
+impl AutomaticLifecycleCleanup<'_> {
+    fn environment(&self) -> [(&str, &Path); 2] {
+        [("HOME", &self.home), ("CODEX_HOME", &self.codex_home)]
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        if self.complete {
+            return Ok(());
+        }
+        let mut errors = Vec::new();
+        if self.connection_may_exist
+            && let Err(error) = retry_automatic_lifecycle_disconnect(self)
+        {
+            errors.push(format!(
+                "best-effort automatic lifecycle disconnect: {error}"
+            ));
+        }
+        let mut artifacts = automatic_lifecycle_service_artifacts(
+            &self.home,
+            self.target.as_deref(),
+            self.plist.as_deref(),
+        )
+        .unwrap_or_else(|error| {
+            errors.push(error);
+            Vec::new()
+        });
+        for (target, plist) in artifacts.drain(..) {
+            if let Err(error) = run_bounded_status_command(
+                "/bin/launchctl",
+                &["bootout", &target],
+                WORKER_EXIT_TIMEOUT,
+                &[0, 3, 113],
+            ) {
+                errors.push(format!("best-effort automatic lifecycle bootout: {error}"));
+            }
+            if let Err(error) = fs::remove_file(&plist)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                errors.push(format!(
+                    "best-effort automatic lifecycle plist removal: {error}"
+                ));
+            }
+        }
+        if let Some(parent) = self.config.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            errors.push(format!(
+                "best-effort automatic lifecycle config parent: {error}"
+            ));
+        }
+        if let Err(error) = fs::write(&self.config, &self.seed) {
+            errors.push(format!(
+                "best-effort automatic lifecycle config restoration: {error}"
+            ));
+        } else if let Err(error) =
+            fs::set_permissions(&self.config, Permissions::from_mode(self.seed_mode))
+        {
+            errors.push(format!(
+                "best-effort automatic lifecycle config mode restoration: {error}"
+            ));
+        }
+        self.complete = true;
+        errors_result(&errors)
+    }
+}
+
+fn automatic_lifecycle_service_artifacts(
+    home: &Path,
+    known_target: Option<&str>,
+    known_plist: Option<&Path>,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let mut plists = known_plist
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    let directory = home.join("Library/LaunchAgents");
+    match fs::read_dir(&directory) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry
+                    .map_err(|error| format!("inspect automatic lifecycle plist entry: {error}"))?
+                    .path();
+                let matching =
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with("io.agent-observability.collector.")
+                                && path.extension().is_some_and(|extension| {
+                                    extension
+                                        .to_str()
+                                        .is_some_and(|value| value.eq_ignore_ascii_case("plist"))
+                                })
+                        });
+                if matching && !plists.contains(&path) {
+                    plists.push(path);
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "inspect automatic lifecycle LaunchAgent directory: {error}"
+            ));
+        }
+    }
+    let uid = run_bounded_status_command("/usr/bin/id", &["-u"], LOCAL_COMMAND_TIMEOUT, &[0])?;
+    let uid = uid.trim();
+    plists
+        .into_iter()
+        .map(|plist| {
+            let label = plist
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .ok_or("automatic lifecycle plist has an invalid label")?;
+            let target = known_target
+                .filter(|target| target.ends_with(label))
+                .map_or_else(|| format!("gui/{uid}/{label}"), str::to_owned);
+            Ok((target, plist))
+        })
+        .collect()
+}
+
+impl Drop for AutomaticLifecycleCleanup<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!("fallback automatic lifecycle cleanup failed: {error}");
+        }
+    }
+}
+
+struct LocalCodexModelServer {
+    port: u16,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl LocalCodexModelServer {
+    fn start() -> Result<Self, String> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| format!("bind local Codex model fixture: {error}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| format!("inspect local Codex model fixture: {error}"))?
+            .port();
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("configure local Codex model fixture: {error}"))?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let thread = thread::spawn(move || {
+            while !worker_shutdown.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = serve_local_codex_model_request(&mut stream);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            port,
+            shutdown,
+            thread: Some(thread),
+        })
+    }
+
+    const fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for LocalCodexModelServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = TcpStream::connect((Ipv4Addr::LOCALHOST, self.port));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn automatic_lifecycle_seed(port: u16) -> Vec<u8> {
+    format!(
+        "# exact automatic lifecycle seed\nmodel = \"gpt-test\"\nmodel_provider = \"agentobs-e2e\"\n\n[model_providers.agentobs-e2e]\nname = \"Agent Observability local e2e\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\nwire_api = \"responses\"\nenv_key = \"HOME\"\nrequest_max_retries = 0\nstream_max_retries = 0\nrequires_openai_auth = false\n"
+    )
+    .into_bytes()
+}
+
+fn serve_local_codex_model_request(stream: &mut TcpStream) -> Result<(), String> {
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("bound local Codex model fixture read: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("bound local Codex model fixture write: {error}"))?;
+    let mut request = Vec::with_capacity(8_192);
+    let mut buffer = [0_u8; 8_192];
+    let (header_end, content_length) = loop {
+        let bytes = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("read local Codex model fixture request: {error}"))?;
+        if bytes == 0 {
+            return Err("local Codex model fixture request ended before headers".into());
+        }
+        request.extend_from_slice(&buffer[..bytes]);
+        if request.len() > MAX_REQUEST_BYTES {
+            return Err("local Codex model fixture request exceeded size bound".into());
+        }
+        if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = index + 4;
+            let headers = std::str::from_utf8(&request[..header_end])
+                .map_err(|_| "local Codex model fixture headers were not UTF-8")?;
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            break (header_end, content_length);
+        }
+    };
+    if header_end.saturating_add(content_length) > MAX_REQUEST_BYTES {
+        return Err("local Codex model fixture body exceeded size bound".into());
+    }
+    while request.len() < header_end + content_length {
+        let bytes = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("read local Codex model fixture body: {error}"))?;
+        if bytes == 0 {
+            return Err("local Codex model fixture request ended before body".into());
+        }
+        request.extend_from_slice(&buffer[..bytes]);
+    }
+    let request_line = std::str::from_utf8(&request[..header_end])
+        .map_err(|_| "local Codex model fixture request line was not UTF-8")?
+        .lines()
+        .next()
+        .ok_or("local Codex model fixture request line was missing")?;
+    let response = if request_line.contains(" /v1/responses ") {
+        local_codex_sse_response()
+    } else {
+        "{}".into()
+    };
+    let content_type = if request_line.contains(" /v1/responses ") {
+        "text/event-stream"
+    } else {
+        "application/json"
+    };
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+        response.len(),
+    )
+    .map_err(|error| format!("write local Codex model fixture response: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("flush local Codex model fixture response: {error}"))
+}
+
+fn local_codex_sse_response() -> String {
+    const SENTINEL_SLOT: &str = "__AGENTOBS_RESPONSE_SENTINEL__";
+    const EVENTS: [&str; 8] = [
+        r#"{"type":"response.created","response":{"id":"resp_agentobs","object":"response","created_at":0,"status":"in_progress","output":[]}}"#,
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_agentobs","type":"message","role":"assistant","status":"in_progress","content":[]}}"#,
+        r#"{"type":"response.content_part.added","item_id":"msg_agentobs","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}"#,
+        r#"{"type":"response.output_text.delta","item_id":"msg_agentobs","output_index":0,"content_index":0,"delta":"__AGENTOBS_RESPONSE_SENTINEL__"}"#,
+        r#"{"type":"response.output_text.done","item_id":"msg_agentobs","output_index":0,"content_index":0,"text":"__AGENTOBS_RESPONSE_SENTINEL__"}"#,
+        r#"{"type":"response.content_part.done","item_id":"msg_agentobs","output_index":0,"content_index":0,"part":{"type":"output_text","text":"__AGENTOBS_RESPONSE_SENTINEL__","annotations":[]}}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_agentobs","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"__AGENTOBS_RESPONSE_SENTINEL__","annotations":[]}]}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_agentobs","object":"response","created_at":0,"status":"completed","output":[{"id":"msg_agentobs","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"__AGENTOBS_RESPONSE_SENTINEL__","annotations":[]}]}],"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":12}}}"#,
+    ];
+    EVENTS
+        .into_iter()
+        .fold(String::new(), |mut response, event| {
+            let event = event.replace(SENTINEL_SLOT, AUTOMATIC_CODEX_E2E_RESPONSE_SENTINEL);
+            write!(response, "data: {event}\n\n").expect("writing to a String cannot fail");
+            response
+        })
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(), String> {
+    if env::consts::OS != "macos" {
+        return Err("automatic lifecycle smoke requires macOS".into());
+    }
+    let root = runtime_root.join("lifecycle-smoke/home/.agent-observability");
+    let home = runtime_root.join("lifecycle-smoke/home");
+    let codex_home = runtime_root.join("lifecycle-smoke/codex-home");
+    fs::create_dir_all(&home)
+        .map_err(|error| format!("create automatic lifecycle home: {error}"))?;
+    fs::set_permissions(&home, Permissions::from_mode(0o700))
+        .map_err(|error| format!("protect automatic lifecycle home: {error}"))?;
+    fs::create_dir_all(&codex_home)
+        .map_err(|error| format!("create automatic lifecycle Codex home: {error}"))?;
+    fs::set_permissions(&codex_home, Permissions::from_mode(0o700))
+        .map_err(|error| format!("protect automatic lifecycle Codex home: {error}"))?;
+    let model_server = LocalCodexModelServer::start()?;
+    let seed = automatic_lifecycle_seed(model_server.port());
+    let config = codex_home.join("config.toml");
+    fs::write(&config, &seed)
+        .map_err(|error| format!("seed automatic lifecycle Codex config: {error}"))?;
+    fs::set_permissions(
+        &config,
+        Permissions::from_mode(AUTOMATIC_LIFECYCLE_SEED_MODE),
+    )
+    .map_err(|error| format!("protect automatic lifecycle Codex config: {error}"))?;
+    let mut cleanup = AutomaticLifecycleCleanup {
+        binary,
+        home,
+        codex_home,
+        config,
+        seed,
+        seed_mode: AUTOMATIC_LIFECYCLE_SEED_MODE,
+        target: None,
+        plist: None,
+        connection_may_exist: true,
+        complete: false,
+    };
+    let smoke = (|| {
+        let setup = run_bounded_product_command_with_env(
+            binary,
+            &["setup", "--no-open"],
+            AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+            &cleanup.environment(),
+        )
+        .map_err(|_| "automatic lifecycle setup stage failed")?;
+        require_output_line(&setup, "status", "ready")
+            .map_err(|_| "automatic lifecycle setup stage failed")?;
+        require_output_line(&setup, "config", "connected")
+            .map_err(|_| "automatic lifecycle setup stage failed")?;
+        require_collector_ready_or_degraded(&setup)
+            .map_err(|_| "automatic lifecycle setup stage failed")?;
+        verify_installed_codex_compatibility(&cleanup)
+            .map_err(|_| "automatic lifecycle Codex config stage failed")?;
+        let service =
+            output_value(&setup, "service").ok_or("automatic lifecycle setup omitted service")?;
+        if !service.starts_with("io.agent-observability.collector.") {
+            return Err("automatic lifecycle setup returned an invalid service label".into());
+        }
+        let plist = cleanup
+            .home
+            .join("Library/LaunchAgents")
+            .join(format!("{service}.plist"));
+        let uid = run_bounded_status_command("/usr/bin/id", &["-u"], LOCAL_COMMAND_TIMEOUT, &[0])?;
+        let target = format!("gui/{}/{service}", uid.trim());
+        cleanup.plist = Some(plist.clone());
+        cleanup.target = Some(target.clone());
+        verify_automatic_launch_agent_plist(&plist, binary, &root)?;
+
+        let status = run_bounded_product_command_with_env(
+            binary,
+            &["status", "codex"],
+            AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+            &cleanup.environment(),
+        )?;
+        require_output_line(&status, "config", "connected")?;
+        require_collector_ready_or_degraded(&status)?;
+        let initial_records = automatic_report_record_count(binary, &root, &cleanup)
+            .map_err(|_| "automatic lifecycle initial report stage failed")?;
+        let live_codex_records = verify_real_codex_e2e(binary, &root, &cleanup, initial_records)
+            .map_err(|_| "automatic lifecycle real Codex stage failed")?;
+        submit_automatic_synthetic_otlp(&root, 0, 0)?;
+        let pre_failure_otlp_records = require_automatic_record_growth(
+            binary,
+            &root,
+            &cleanup,
+            live_codex_records,
+            "pre-failure synthetic collector OTLP",
+        )?;
+        submit_automatic_notify(binary, &root, &cleanup, 0)?;
+        require_automatic_record_growth(
+            binary,
+            &root,
+            &cleanup,
+            pre_failure_otlp_records,
+            "pre-failure notify",
+        )?;
+        assert_automatic_notify_sentinels_absent(&root)?;
+
+        run_bounded_status_command(
+            "/bin/launchctl",
+            &["kill", "SIGKILL", &target],
+            AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
+            &[0],
+        )?;
+        wait_for_automatic_lifecycle_recovery(binary, &cleanup)?;
+
+        let recovered_records = automatic_report_record_count(binary, &root, &cleanup)?;
+        submit_automatic_synthetic_otlp(&root, 0, 1)?;
+        let post_recovery_otlp_records = require_automatic_record_growth(
+            binary,
+            &root,
+            &cleanup,
+            recovered_records,
+            "post-recovery synthetic collector OTLP",
+        )?;
+        submit_automatic_notify(binary, &root, &cleanup, 1)?;
+        require_automatic_record_growth(
+            binary,
+            &root,
+            &cleanup,
+            post_recovery_otlp_records,
+            "post-recovery notify",
+        )?;
+        assert_automatic_notify_sentinels_absent(&root)?;
+
+        let occupied_port = load_settings(&root)
+            .map_err(|error| error.to_string())?
+            .port;
+        run_bounded_status_command(
+            "/bin/launchctl",
+            &["bootout", &target],
+            AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
+            &[0],
+        )?;
+        let occupied = occupy_automatic_lifecycle_port(occupied_port)?;
+        let reconnected = run_bounded_product_command_with_env(
+            binary,
+            &["connect", "codex", path_text(&root)?],
+            AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+            &cleanup.environment(),
+        )?;
+        require_output_line(&reconnected, "config", "connected")?;
+        require_collector_ready_or_degraded(&reconnected)?;
+        let recovered_port = load_settings(&root)
+            .map_err(|error| error.to_string())?
+            .port;
+        if recovered_port == occupied_port {
+            return Err("automatic lifecycle occupied port was not recovered".into());
+        }
+        drop(occupied);
+
+        run_concurrent_automatic_connects(binary, &root, &cleanup)?;
+        fs::remove_file(root.join("runtime/collector.json"))
+            .map_err(|error| format!("remove automatic lifecycle settings: {error}"))?;
+
+        let disconnected = run_bounded_product_command_with_env(
+            binary,
+            &["disconnect", "codex", path_text(&root)?],
+            AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+            &cleanup.environment(),
+        )?;
+        require_output_line(&disconnected, "config", "disconnected")?;
+        require_output_line(&disconnected, "collector", "stopped")?;
+        cleanup.connection_may_exist = false;
+        verify_exact_file(
+            &cleanup.config,
+            &cleanup.seed,
+            AUTOMATIC_LIFECYCLE_SEED_MODE,
+            "Codex config",
+        )?;
+        if plist.exists() {
+            return Err("automatic lifecycle disconnect left the LaunchAgent plist".into());
+        }
+        if launch_agent_is_loaded(&target)? {
+            return Err("automatic lifecycle disconnect left the LaunchAgent loaded".into());
+        }
+        verify_inherited_automatic_plist(binary, &root, &mut cleanup, &plist, &target, false)?;
+        verify_inherited_automatic_plist(binary, &root, &mut cleanup, &plist, &target, true)?;
+        Ok(())
+    })();
+    drop(model_server);
+    combine_cleanup(smoke, cleanup.cleanup())
+}
+
+fn automatic_report_record_count(
+    binary: &Path,
+    root: &Path,
+    cleanup: &AutomaticLifecycleCleanup<'_>,
+) -> Result<u64, String> {
+    let report = run_bounded_product_command_with_env(
+        binary,
+        &["report", path_text(root)?],
+        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+        &cleanup.environment(),
+    )?;
+    output_value(&report, "records")
+        .ok_or_else(|| String::from("automatic lifecycle report omitted records"))?
+        .parse::<u64>()
+        .map_err(|_| "automatic lifecycle report returned invalid records".into())
+}
+
+fn verify_real_codex_e2e(
+    binary: &Path,
+    root: &Path,
+    cleanup: &AutomaticLifecycleCleanup<'_>,
+    previous_records: u64,
+) -> Result<u64, String> {
+    let output = run_bounded_external_command_with_env(
+        "codex",
+        &[
+            "exec",
+            "--strict-config",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--json",
+            AUTOMATIC_CODEX_E2E_PROMPT,
+        ],
+        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+        &cleanup.environment(),
+        &[0],
+    )?;
+    if !output.lines().any(|line| {
+        line.contains(r#""type":"turn.completed""#)
+            && line.contains(r#""input_tokens":10"#)
+            && line.contains(r#""output_tokens":2"#)
+    }) {
+        return Err("real Codex end-to-end fixture did not complete with exact token usage".into());
+    }
+    let records = require_automatic_record_growth(
+        binary,
+        root,
+        cleanup,
+        previous_records,
+        "real Codex native OTLP",
+    )?;
+    let observations = fs::read_to_string(root.join("state/store/observations.jsonl"))
+        .map_err(|error| format!("read real Codex durable observations: {error}"))?;
+    let mut saw_session = false;
+    let mut saw_token_usage = false;
+    for line in observations.lines() {
+        if !line.contains(r#""agent":{"name":"codex","model":"gpt-test"}"#) {
+            continue;
+        }
+        saw_session |= line.contains(r#""event_type":"session""#);
+        saw_token_usage |= line.contains(r#""input_tokens":10.0"#)
+            && line.contains(r#""output_tokens":2.0"#)
+            && line.contains(r#""total_tokens":12.0"#);
+    }
+    if !saw_session || !saw_token_usage {
+        return Err(
+            "real Codex native OTLP did not produce the expected private session and token records"
+                .into(),
+        );
+    }
+    assert_tree_excludes_bytes(
+        root,
+        &[
+            AUTOMATIC_CODEX_E2E_PROMPT_SENTINEL.as_bytes(),
+            AUTOMATIC_CODEX_E2E_RESPONSE_SENTINEL.as_bytes(),
+        ],
+    )?;
+    Ok(records)
+}
+
+fn assert_tree_excludes_bytes(root: &Path, sentinels: &[&[u8]]) -> Result<(), String> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect automatic privacy path: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path)
+                .map_err(|error| format!("scan automatic privacy directory: {error}"))?
+            {
+                pending.push(
+                    entry
+                        .map_err(|error| format!("scan automatic privacy entry: {error}"))?
+                        .path(),
+                );
+            }
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let body =
+            fs::read(&path).map_err(|error| format!("read automatic privacy artifact: {error}"))?;
+        for sentinel in sentinels {
+            if body
+                .windows(sentinel.len())
+                .any(|window| window == *sentinel)
+            {
+                return Err(format!(
+                    "automatic privacy sentinel persisted in {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_automatic_record_growth(
+    binary: &Path,
+    root: &Path,
+    cleanup: &AutomaticLifecycleCleanup<'_>,
+    previous: u64,
+    boundary: &str,
+) -> Result<u64, String> {
+    let started = Instant::now();
+    loop {
+        let records = automatic_report_record_count(binary, root, cleanup)?;
+        if records > previous {
+            return Ok(records);
+        }
+        if started.elapsed() >= AUTOMATIC_LIFECYCLE_RECOVERY_TIMEOUT {
+            return Err(format!(
+                "automatic lifecycle {boundary} produced no new durable report record"
+            ));
+        }
+        sleep(Duration::from_millis(20));
+    }
+}
+
+fn occupy_automatic_lifecycle_port(port: u16) -> Result<TcpListener, String> {
+    let started = Instant::now();
+    loop {
+        match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+            Ok(listener) => return Ok(listener),
+            Err(_) if started.elapsed() < AUTOMATIC_LIFECYCLE_RECOVERY_TIMEOUT => {
+                sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "occupy automatic lifecycle persisted port after bootout: {error}"
+                ));
+            }
+        }
+    }
+}
+
+fn submit_automatic_notify(
+    binary: &Path,
+    root: &Path,
+    cleanup: &AutomaticLifecycleCleanup<'_>,
+    event: usize,
+) -> Result<(), String> {
+    let payload = automatic_notify_payload(0, event);
+    let root = path_text(root)?;
+    let started = Instant::now();
+    loop {
+        if let Ok(notify) = run_bounded_product_command_with_env(
+            binary,
+            &["codex-notify", root, &payload],
+            LOCAL_COMMAND_TIMEOUT,
+            &cleanup.environment(),
+        ) && notify.trim() == "notify=accepted"
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= AUTOMATIC_LIFECYCLE_RECOVERY_TIMEOUT {
+            return Err("automatic lifecycle notify was not accepted".into());
+        }
+        sleep(Duration::from_millis(50));
+    }
+}
+
+fn retry_automatic_lifecycle_disconnect(
+    cleanup: &AutomaticLifecycleCleanup<'_>,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        match run_bounded_product_command_with_env(
+            cleanup.binary,
+            &["disconnect", "codex"],
+            AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT,
+            &cleanup.environment(),
+        ) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if error.contains("lifecycle is busy")
+                    && started.elapsed() < AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT =>
+            {
+                sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn run_concurrent_automatic_connects(
+    binary: &Path,
+    root: &Path,
+    cleanup: &AutomaticLifecycleCleanup<'_>,
+) -> Result<(), String> {
+    let ownership = AutomaticLifecycleOwnership::capture(root, cleanup)?;
+    let root_text = path_text(root)?;
+    let mut commands = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let mut command = Command::new(binary);
+        command
+            .args(["connect", "codex", root_text])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (name, value) in cleanup.environment() {
+            command.env(name, value);
+        }
+        commands.push(ChildGuard(command.spawn().map_err(|error| {
+            format!("spawn concurrent automatic lifecycle connect: {error}")
+        })?));
+    }
+
+    let deadline = Instant::now() + AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT;
+    let mut outcomes = Vec::with_capacity(commands.len());
+    for command in &mut commands {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        outcomes.push(collect_automatic_connect_output(command, remaining));
+    }
+    let mut completed = Vec::with_capacity(outcomes.len());
+    for outcome in outcomes {
+        completed.push(outcome?);
+    }
+    let successes = completed
+        .iter()
+        .filter(|outcome| outcome.status.success())
+        .count();
+    let busy_failures = completed
+        .iter()
+        .filter(|outcome| {
+            !outcome.status.success()
+                && outcome
+                    .stderr
+                    .contains("Codex integration lifecycle is busy")
+        })
+        .count();
+    if !((successes == 1 && busy_failures == 1) || successes == 2) {
+        return Err(format!(
+            "automatic lifecycle concurrent connect outcomes violated the product contract: {}",
+            format_automatic_connect_outcomes(&completed)
+        ));
+    }
+    for outcome in completed.iter().filter(|outcome| outcome.status.success()) {
+        require_output_line(&outcome.stdout, "integration", "codex")?;
+        require_output_line(&outcome.stdout, "config", "connected")?;
+        require_collector_ready_or_degraded(&outcome.stdout)?;
+    }
+
+    let status = run_bounded_product_command_with_env(
+        binary,
+        &["status", "codex", root_text],
+        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+        &cleanup.environment(),
+    )?;
+    require_output_line(&status, "integration", "codex")?;
+    require_output_line(&status, "config", "connected")?;
+    require_collector_ready_or_degraded(&status)?;
+    ownership.verify(binary, root, cleanup)
+}
+
+#[derive(Debug)]
+struct AutomaticConnectOutput {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug)]
+struct AutomaticLifecycleOwnership {
+    settings: CollectorSettings,
+    settings_bytes: Vec<u8>,
+    config_bytes: Vec<u8>,
+    config_mode: u32,
+    plist: PathBuf,
+    plist_bytes: Vec<u8>,
+    plist_mode: u32,
+    target: String,
+}
+
+impl AutomaticLifecycleOwnership {
+    fn capture(root: &Path, cleanup: &AutomaticLifecycleCleanup<'_>) -> Result<Self, String> {
+        let settings_path = root.join("runtime/collector.json");
+        let plist = cleanup
+            .plist
+            .clone()
+            .ok_or("automatic lifecycle plist ownership is unavailable")?;
+        Ok(Self {
+            settings: load_settings(root).map_err(|error| error.to_string())?,
+            settings_bytes: fs::read(settings_path).map_err(|error| {
+                format!("read automatic lifecycle settings before concurrency: {error}")
+            })?,
+            config_bytes: fs::read(&cleanup.config).map_err(|error| {
+                format!("read automatic lifecycle config before concurrency: {error}")
+            })?,
+            config_mode: file_mode(&cleanup.config, "automatic lifecycle config")?,
+            plist_bytes: fs::read(&plist).map_err(|error| {
+                format!("read automatic lifecycle plist before concurrency: {error}")
+            })?,
+            plist_mode: file_mode(&plist, "automatic lifecycle plist")?,
+            plist,
+            target: cleanup
+                .target
+                .clone()
+                .ok_or("automatic lifecycle target ownership is unavailable")?,
+        })
+    }
+
+    fn verify(
+        &self,
+        binary: &Path,
+        root: &Path,
+        cleanup: &AutomaticLifecycleCleanup<'_>,
+    ) -> Result<(), String> {
+        let settings_path = root.join("runtime/collector.json");
+        let settings_after = load_settings(root).map_err(|error| error.to_string())?;
+        let settings_bytes_after = fs::read(settings_path).map_err(|error| {
+            format!("read automatic lifecycle settings after concurrency: {error}")
+        })?;
+        if settings_after != self.settings || settings_bytes_after != self.settings_bytes {
+            return Err("automatic lifecycle concurrent connect changed collector settings".into());
+        }
+        verify_exact_file(
+            &cleanup.config,
+            &self.config_bytes,
+            self.config_mode,
+            "owned Codex config",
+        )?;
+        verify_exact_file(
+            &self.plist,
+            &self.plist_bytes,
+            self.plist_mode,
+            "owned LaunchAgent plist",
+        )?;
+        verify_automatic_launch_agent_plist(&self.plist, binary, root)?;
+        if !launch_agent_is_loaded(&self.target)? {
+            return Err("automatic lifecycle concurrent connect lost LaunchAgent ownership".into());
+        }
+        Ok(())
+    }
+}
+
+fn collect_automatic_connect_output(
+    child: &mut ChildGuard,
+    timeout: Duration,
+) -> Result<AutomaticConnectOutput, String> {
+    let status = match wait_for_child(child, timeout) {
+        Ok(status) => status,
+        Err(error) => {
+            child.terminate()?;
+            return Err(format!(
+                "concurrent automatic lifecycle connect did not terminate boundedly: {error}"
+            ));
+        }
+    };
+    let stdout = read_bounded_child_stream(
+        child
+            .stdout
+            .take()
+            .ok_or("concurrent automatic lifecycle connect stdout is unavailable")?,
+        "stdout",
+    )?;
+    let stderr = read_bounded_child_stream(
+        child
+            .stderr
+            .take()
+            .ok_or("concurrent automatic lifecycle connect stderr is unavailable")?,
+        "stderr",
+    )?;
+    Ok(AutomaticConnectOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_bounded_child_stream(stream: impl Read, label: &str) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    stream
+        .take(AUTOMATIC_CONNECT_OUTPUT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read concurrent automatic lifecycle connect {label}: {error}"))?;
+    if bytes.len() as u64 > AUTOMATIC_CONNECT_OUTPUT_MAX_BYTES {
+        return Err(format!(
+            "concurrent automatic lifecycle connect {label} exceeded {AUTOMATIC_CONNECT_OUTPUT_MAX_BYTES} bytes"
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| format!("concurrent automatic lifecycle connect {label} is not UTF-8"))
+}
+
+fn format_automatic_connect_outcomes(outcomes: &[AutomaticConnectOutput]) -> String {
+    outcomes
+        .iter()
+        .enumerate()
+        .map(|(index, outcome)| {
+            format!(
+                "child {} status={} stdout={:?} stderr={:?}",
+                index + 1,
+                outcome.status,
+                outcome.stdout.trim(),
+                outcome.stderr.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn file_mode(path: &Path, label: &str) -> Result<u32, String> {
+    Ok(fs::metadata(path)
+        .map_err(|error| format!("inspect {label}: {error}"))?
+        .permissions()
+        .mode()
+        & 0o777)
+}
+
+fn verify_inherited_automatic_plist(
+    binary: &Path,
+    root: &Path,
+    cleanup: &mut AutomaticLifecycleCleanup<'_>,
+    plist: &Path,
+    target: &str,
+    loaded: bool,
+) -> Result<(), String> {
+    let label = plist
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or("automatic lifecycle inherited plist label is invalid")?;
+    let inherited = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{}</string>\n<key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\n</dict></plist>\n",
+        xml_escape(label)
+    );
+    if let Some(parent) = plist.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create inherited LaunchAgent directory: {error}"))?;
+    }
+    fs::write(plist, inherited.as_bytes())
+        .map_err(|error| format!("write inherited automatic lifecycle plist: {error}"))?;
+    fs::set_permissions(plist, Permissions::from_mode(0o600))
+        .map_err(|error| format!("protect inherited automatic lifecycle plist: {error}"))?;
+    if loaded {
+        let domain = target
+            .rsplit_once('/')
+            .map(|(domain, _)| domain)
+            .ok_or("automatic lifecycle inherited LaunchAgent target is invalid")?;
+        run_bounded_status_command(
+            "/bin/launchctl",
+            &["bootstrap", domain, path_text(plist)?],
+            AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
+            &[0],
+        )?;
+    }
+
+    cleanup.connection_may_exist = true;
+    let connected = run_bounded_product_command_with_env(
+        binary,
+        &["connect", "codex", path_text(root)?],
+        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+        &cleanup.environment(),
+    )?;
+    require_output_line(&connected, "config", "connected")?;
+    require_collector_ready_or_degraded(&connected)?;
+    let disconnected = run_bounded_product_command_with_env(
+        binary,
+        &["disconnect", "codex", path_text(root)?],
+        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+        &cleanup.environment(),
+    )?;
+    require_output_line(&disconnected, "config", "disconnected")?;
+    cleanup.connection_may_exist = false;
+    verify_exact_file(
+        plist,
+        inherited.as_bytes(),
+        0o600,
+        "inherited LaunchAgent plist",
+    )?;
+    if launch_agent_is_loaded(target)? != loaded {
+        return Err(
+            "automatic lifecycle did not restore inherited LaunchAgent loaded state".into(),
+        );
+    }
+    verify_exact_file(
+        &cleanup.config,
+        &cleanup.seed,
+        AUTOMATIC_LIFECYCLE_SEED_MODE,
+        "Codex config",
+    )?;
+    if loaded {
+        run_bounded_status_command(
+            "/bin/launchctl",
+            &["bootout", target],
+            AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
+            &[0],
+        )?;
+    }
+    fs::remove_file(plist)
+        .map_err(|error| format!("remove inherited automatic lifecycle plist: {error}"))?;
+    Ok(())
+}
+
+fn submit_automatic_synthetic_otlp(root: &Path, run: usize, event: usize) -> Result<(), String> {
+    let body = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
+      {"attributes":[
+        {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+        {"key":"conversation.id","value":{"stringValue":"automatic-perf-$RUN"}},
+        {"key":"model","value":{"stringValue":"gpt-test"}},
+        {"key":"auth.request_id","value":{"stringValue":"automatic-request-$EVENT"}},
+        {"key":"success","value":{"boolValue":true}}
+      ]},
+      {"attributes":[
+        {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
+        {"key":"conversation.id","value":{"stringValue":"automatic-perf-$RUN"}},
+        {"key":"model","value":{"stringValue":"gpt-test"}},
+        {"key":"event.kind","value":{"stringValue":"response.completed"}},
+        {"key":"input_token_count","value":{"intValue":"10"}},
+        {"key":"output_token_count","value":{"intValue":"5"}}
+      ]}
+    ]}]}]}"#
+        .replace("$RUN", &run.to_string())
+        .replace("$EVENT", &event.to_string());
+    match submit_otlp_json_outcome(root, body.as_bytes())
+        .map_err(|error| format!("run={run} event={event}: {error}"))?
+    {
+        OtlpSubmissionOutcome::Accepted => Ok(()),
+        OtlpSubmissionOutcome::Rejected { status, category } => Err(format!(
+            "automatic synthetic collector OTLP request was rejected: run={run} event={event} status={status} category={}",
+            category.as_str()
+        )),
+    }
+}
+
+fn verify_installed_codex_compatibility(
+    cleanup: &AutomaticLifecycleCleanup<'_>,
+) -> Result<(), String> {
+    let environment = cleanup.environment();
+    let version = run_bounded_external_command_with_env(
+        "codex",
+        &["--version"],
+        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+        &environment,
+        &[0],
+    )?;
+    if version.trim() != AUTOMATIC_CODEX_VERSION {
+        return Err(format!(
+            "automatic lifecycle requires {AUTOMATIC_CODEX_VERSION}, found {}",
+            version.trim()
+        ));
+    }
+    let diagnostic = run_bounded_external_command_with_env(
+        "codex",
+        &["--strict-config", "doctor", "--json"],
+        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+        &environment,
+        &[0, 1],
+    )?;
+    let diagnostic = serde_saphyr::from_str::<CodexDiagnostic>(&diagnostic)
+        .map_err(|error| format!("parse Codex compatibility diagnostic: {error}"))?;
+    if diagnostic.checks.config_load.status != "ok" {
+        return Err("Codex 0.151.0 rejected the generated strict config".into());
+    }
+    let expected_home = fs::canonicalize(&cleanup.codex_home)
+        .map_err(|error| format!("canonicalize isolated CODEX_HOME: {error}"))?;
+    let observed_home = fs::canonicalize(&diagnostic.checks.config_load.details.codex_home)
+        .map_err(|error| format!("canonicalize Codex diagnostic CODEX_HOME: {error}"))?;
+    if observed_home != expected_home {
+        return Err("Codex compatibility diagnostic did not load the isolated CODEX_HOME".into());
+    }
+    Ok(())
+}
+
+fn assert_automatic_notify_sentinels_absent(root: &Path) -> Result<(), String> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect automatic durable path: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            let entries = fs::read_dir(&path)
+                .map_err(|error| format!("scan automatic durable directory: {error}"))?;
+            for entry in entries {
+                pending.push(
+                    entry
+                        .map_err(|error| format!("scan automatic durable entry: {error}"))?
+                        .path(),
+                );
+            }
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("read automatic durable file for privacy scan: {error}"))?;
+        if AUTOMATIC_NOTIFY_SENTINELS.iter().any(|sentinel| {
+            bytes
+                .windows(sentinel.len())
+                .any(|window| window == *sentinel)
+        }) {
+            return Err("automatic durable tree retained a raw notify sentinel".into());
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_automatic_lifecycle_recovery(
+    binary: &Path,
+    cleanup: &AutomaticLifecycleCleanup<'_>,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        if let Ok(status) = run_bounded_product_command_with_env(
+            binary,
+            &["status", "codex"],
+            AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+            &cleanup.environment(),
+        ) && require_output_line(&status, "config", "connected").is_ok()
+            && require_collector_ready_or_degraded(&status).is_ok()
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= AUTOMATIC_LIFECYCLE_RECOVERY_TIMEOUT {
+            return Err("automatic lifecycle collector recovery timed out".into());
+        }
+        sleep(Duration::from_millis(50));
+    }
+}
+
+fn verify_automatic_launch_agent_plist(
+    plist: &Path,
+    binary: &Path,
+    root: &Path,
+) -> Result<(), String> {
+    let bytes = fs::read(plist)
+        .map_err(|error| format!("read automatic lifecycle LaunchAgent plist: {error}"))?;
+    let body = std::str::from_utf8(&bytes)
+        .map_err(|_| "automatic lifecycle LaunchAgent plist is not UTF-8")?;
+    if !body.contains(&xml_escape(path_text(binary)?))
+        || !body.contains(&xml_escape(path_text(root)?))
+        || !body.contains("<string>collector-serve</string>")
+    {
+        return Err("automatic lifecycle LaunchAgent plist has unexpected arguments".into());
+    }
+    Ok(())
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn require_output_line(output: &str, key: &str, expected: &str) -> Result<(), String> {
+    if output_value(output, key).as_deref() == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!("automatic lifecycle expected {key}={expected}"))
+    }
+}
+
+fn require_collector_ready_or_degraded(output: &str) -> Result<(), String> {
+    if output_value(output, "collector")
+        .is_some_and(|value| matches!(value.as_str(), "ready" | "degraded"))
+    {
+        Ok(())
+    } else {
+        Err("automatic lifecycle collector was neither ready nor degraded".into())
+    }
+}
+
+fn output_value(output: &str, key: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (candidate, value) = line.split_once('=')?;
+        (candidate == key).then(|| value.to_owned())
+    })
+}
+
+fn verify_exact_file(
+    path: &Path,
+    expected_bytes: &[u8],
+    expected_mode: u32,
+    label: &str,
+) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|error| format!("read restored {label}: {error}"))?;
+    let mode = fs::metadata(path)
+        .map_err(|error| format!("inspect restored {label}: {error}"))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if bytes != expected_bytes || mode != expected_mode {
+        return Err(format!(
+            "automatic lifecycle did not exactly restore {label}"
+        ));
+    }
+    Ok(())
+}
+
+fn launch_agent_is_loaded(target: &str) -> Result<bool, String> {
+    let mut child = Command::new("/bin/launchctl")
+        .args(["print", target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("inspect automatic lifecycle LaunchAgent: {error}"))?;
+    Ok(wait_for_child(&mut child, WORKER_EXIT_TIMEOUT)
+        .map_err(|error| format!("wait for automatic lifecycle LaunchAgent inspection: {error}"))?
+        .success())
 }
 
 fn run(config: Config) -> Result<(), String> {
@@ -1074,6 +3038,515 @@ fn validate_protocol_contract() -> Result<(), String> {
         return Err(format!("embedded performance protocol is missing {line}"));
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_automatic_run(
+    config: AutomaticConfig,
+    run: usize,
+    binary: &Path,
+    runtime_root: &Path,
+) -> Result<AutomaticRunResult, String> {
+    let root = runtime_root.join(format!("run-{run}"));
+    run_bounded_product_command(binary, &["init", path_text(&root)?], LOCAL_COMMAND_TIMEOUT)?;
+    install_settings(&root).map_err(|error| error.to_string())?;
+    let mut collector = ChildGuard(
+        Command::new(binary)
+            .args(["collector-serve", path_text(&root)?])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("spawn built local collector: {error}"))?,
+    );
+    let mut network_monitor = NetworkMonitor::start(collector.id())?;
+    wait_for_automatic_ready(&root, &mut collector)?;
+    assert_automatic_network_local(collector.id())?;
+
+    let started = Instant::now();
+    automatic_sample_phase(
+        config.warmup,
+        config.sample,
+        &root,
+        collector.id(),
+        &mut network_monitor,
+        started,
+        "warmup",
+    )?;
+    let idle_samples = automatic_sample_phase(
+        config.idle,
+        config.sample,
+        &root,
+        collector.id(),
+        &mut network_monitor,
+        started,
+        "idle",
+    )?;
+    let idle_cpu_percent = average_sample_cpu(&idle_samples)?;
+    let mut rss_sampler = start_rss_sampler(collector.id(), AUTOMATIC_RSS_SAMPLE_TARGET)?;
+    let active_cpu_before = process_cpu_seconds(collector.id())?;
+    let active_started = Instant::now();
+    let mut active_sampler =
+        start_pressure_sampler(root.clone(), collector.id(), false, None, config.sample)?;
+    let mut synthetic_otlp_latencies_us = Vec::with_capacity(config.events);
+    let mut accepted_primary_requests = 0_usize;
+    for event in 0..config.events {
+        if active_started.elapsed() >= config.active_timeout {
+            return Err(format!(
+                "automatic active workload exceeded {} ms",
+                config.active_timeout.as_millis()
+            ));
+        }
+        let event_offset = u32::try_from(event).map_err(|_| "automatic event count overflow")?;
+        let scheduled = active_started + config.inter_event.saturating_mul(event_offset);
+        sleep(scheduled.saturating_duration_since(Instant::now()));
+        let synthetic_started = Instant::now();
+        submit_automatic_synthetic_otlp(&root, run, event)?;
+        synthetic_otlp_latencies_us.push(synthetic_started.elapsed().as_micros());
+        accepted_primary_requests = accepted_primary_requests.saturating_add(1);
+        if event % 100 == 0 {
+            assert_automatic_network_local(collector.id())?;
+            network_monitor.sample()?;
+        }
+    }
+    let active_elapsed = active_started.elapsed();
+    let active_cpu_after = process_cpu_seconds(collector.id())?;
+    let active_cpu_percent =
+        interval_cpu_percent(active_cpu_before, active_cpu_after, active_elapsed);
+    let notify_payload = automatic_notify_payload(run, config.events);
+    let notify = run_bounded_product_command(
+        binary,
+        &["codex-notify", path_text(&root)?, &notify_payload],
+        LOCAL_COMMAND_TIMEOUT,
+    )?;
+    let notify_supplement_accepted = notify.trim() == "notify=accepted";
+    if !notify_supplement_accepted {
+        return Err(format!(
+            "notify supplement was not accepted: {}",
+            notify.trim()
+        ));
+    }
+    let convergence = wait_for_automatic_report_convergence(&root, &mut collector)?;
+    assert_automatic_notify_sentinels_absent(&root)?;
+    assert_automatic_network_local(collector.id())?;
+    let active_peaks = active_sampler.stop()?;
+    let rss = rss_sampler.stop()?;
+    network_monitor.final_sample()?;
+    let peak_disk_bytes = active_peaks.disk_bytes.max(
+        StorageBudget::allocated_tree_bytes(&root)
+            .map_err(|error| format!("measure automatic allocated disk: {error}"))?,
+    );
+    let peak_rss_kib = active_peaks
+        .rss_kib
+        .max(rss.peak_rss_kib)
+        .max(ps_metric(collector.id(), "rss")?);
+    let network_evidence = network_monitor.finish()?;
+    collector.terminate()?;
+    Ok(AutomaticRunResult {
+        run,
+        synthetic_otlp_latencies_us,
+        idle_samples,
+        idle_cpu_percent,
+        active_cpu_percent,
+        rss_p95_kib: rss.p95_rss_kib,
+        peak_rss_kib,
+        rss_samples: rss.samples,
+        rss_observed_max_gap_ms: rss.max_gap_ms,
+        peak_disk_bytes,
+        collector_network_bytes: network_evidence.max_bytes,
+        network_monitor_samples: network_evidence.samples,
+        accepted_primary_requests,
+        rejected_primary_requests: 0,
+        notify_supplement_accepted,
+        report_converged: true,
+        report_generation: convergence.generation,
+        report_records: convergence.records,
+    })
+}
+
+fn run_bounded_product_command(
+    binary: &Path,
+    arguments: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    run_bounded_product_command_with_env(binary, arguments, timeout, &[])
+}
+
+fn run_bounded_product_command_with_env(
+    binary: &Path,
+    arguments: &[&str],
+    timeout: Duration,
+    environment: &[(&str, &Path)],
+) -> Result<String, String> {
+    let mut command = Command::new(binary);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = ChildGuard(
+        command
+            .spawn()
+            .map_err(|error| format!("spawn built product command: {error}"))?,
+    );
+    let status = wait_for_child(&mut child, timeout)
+        .map_err(|error| format!("wait for built product command: {error}"))?;
+    let mut output = String::new();
+    child
+        .stdout
+        .take()
+        .ok_or("built product command stdout is unavailable")?
+        .take(4_096)
+        .read_to_string(&mut output)
+        .map_err(|error| format!("read built product command output: {error}"))?;
+    if !status.success() {
+        let mut error = String::new();
+        child
+            .stderr
+            .take()
+            .ok_or("built product command stderr is unavailable")?
+            .take(4_096)
+            .read_to_string(&mut error)
+            .map_err(|read_error| format!("read built product command error: {read_error}"))?;
+        return Err(format!(
+            "built product command failed: {status}: {}",
+            error.trim()
+        ));
+    }
+    Ok(output)
+}
+
+fn run_bounded_external_command_with_env(
+    program: &str,
+    arguments: &[&str],
+    timeout: Duration,
+    environment: &[(&str, &Path)],
+    accepted_codes: &[i32],
+) -> Result<String, String> {
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = ChildGuard(
+        command
+            .spawn()
+            .map_err(|error| format!("spawn bounded command {program}: {error}"))?,
+    );
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("bounded command {program} stdout is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("bounded command {program} stderr is unavailable"))?;
+    let stdout_reader = spawn_bounded_text_reader(stdout, 262_144, "stdout");
+    let stderr_reader = spawn_bounded_text_reader(stderr, 4_096, "stderr");
+    let status = match wait_for_child(&mut child, timeout) {
+        Ok(status) => status,
+        Err(error) => {
+            let cleanup = child.terminate();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(combine_cleanup(
+                Err(format!("wait for bounded command {program}: {error}")),
+                cleanup,
+            )
+            .unwrap_err());
+        }
+    };
+    let output = stdout_reader
+        .join()
+        .map_err(|_| format!("bounded command {program} stdout reader panicked"))??;
+    let error = stderr_reader
+        .join()
+        .map_err(|_| format!("bounded command {program} stderr reader panicked"))??;
+    if !status
+        .code()
+        .is_some_and(|code| accepted_codes.contains(&code))
+    {
+        return Err(format!(
+            "bounded command {program} failed: {status}: {}",
+            error.trim()
+        ));
+    }
+    Ok(output)
+}
+
+fn spawn_bounded_text_reader<R>(
+    mut reader: R,
+    limit: usize,
+    label: &'static str,
+) -> thread::JoinHandle<Result<String, String>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut bounded = Vec::with_capacity(limit.min(8_192));
+        let mut buffer = [0_u8; 8_192];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|error| format!("read bounded command {label}: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            if bounded.len() <= limit {
+                let remaining = limit.saturating_add(1).saturating_sub(bounded.len());
+                bounded.extend_from_slice(&buffer[..read.min(remaining)]);
+            }
+        }
+        if bounded.len() > limit {
+            return Err(format!("bounded command {label} exceeded {limit} bytes"));
+        }
+        String::from_utf8(bounded)
+            .map_err(|_| format!("bounded command {label} was not valid UTF-8"))
+    })
+}
+
+fn run_bounded_status_command(
+    program: &str,
+    arguments: &[&str],
+    timeout: Duration,
+    accepted_codes: &[i32],
+) -> Result<String, String> {
+    let mut child = ChildGuard(
+        Command::new(program)
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("spawn bounded command {program}: {error}"))?,
+    );
+    let status = wait_for_child(&mut child, timeout)
+        .map_err(|error| format!("wait for bounded command {program}: {error}"))?;
+    let mut output = String::new();
+    child
+        .stdout
+        .take()
+        .ok_or("bounded command stdout is unavailable")?
+        .take(4_096)
+        .read_to_string(&mut output)
+        .map_err(|error| format!("read bounded command output: {error}"))?;
+    if !status
+        .code()
+        .is_some_and(|code| accepted_codes.contains(&code))
+    {
+        return Err(format!("bounded command {program} failed: {status}"));
+    }
+    Ok(output)
+}
+
+fn wait_for_automatic_ready(root: &Path, collector: &mut ChildGuard) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        if collector
+            .try_wait()
+            .map_err(|error| format!("inspect automatic collector startup: {error}"))?
+            .is_some()
+        {
+            return Err("built automatic collector exited during startup".into());
+        }
+        if matches!(
+            check_health(root),
+            HealthOutcome::Ready | HealthOutcome::Degraded
+        ) {
+            return Ok(());
+        }
+        if started.elapsed() >= AUTOMATIC_START_TIMEOUT {
+            return Err("built automatic collector readiness timed out".into());
+        }
+        sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_automatic_report_convergence(
+    root: &Path,
+    collector: &mut ChildGuard,
+) -> Result<ReportConvergence, String> {
+    let started = Instant::now();
+    loop {
+        if collector
+            .try_wait()
+            .map_err(|error| format!("inspect automatic collector convergence: {error}"))?
+            .is_some()
+        {
+            return Err("built automatic collector exited before report convergence".into());
+        }
+        if check_health(root) == HealthOutcome::Ready
+            && let Ok(store) = LocalStore::open_current(root.join("state/store"))
+            && let Ok(status_before) = store.report_status()
+            && !status_before.pending()
+            && let Ok(record_count) = store.record_count()
+            && record_count > 0
+            && let Ok(report) =
+                fs::read_to_string(root.join("logs/agent-observability-report.html"))
+            && report.contains(&format!(r#""generatedSpans":{record_count}"#))
+            && let Ok(status_after) = store.report_status()
+            && status_after == status_before
+            && !status_after.pending()
+        {
+            return Ok(ReportConvergence {
+                generation: status_after.generation,
+                records: record_count,
+            });
+        }
+        if started.elapsed() >= AUTOMATIC_START_TIMEOUT {
+            return Err("automatic durable report convergence timed out".into());
+        }
+        sleep(Duration::from_millis(20));
+    }
+}
+
+fn automatic_notify_payload(run: usize, event: usize) -> String {
+    format!(
+        "{{\"type\":\"agent-turn-complete\",\"thread-id\":\"automatic-perf-{run}\",\"turn-id\":\"turn-{event}\",\"cwd\":\"/AUTOMATIC_RAW_CWD_SENTINEL\",\"input-messages\":[\"AUTOMATIC_RAW_PROMPT_SENTINEL\"],\"last-assistant-message\":\"AUTOMATIC_RAW_ASSISTANT_SENTINEL\"}}"
+    )
+}
+
+fn path_text(path: &Path) -> Result<&str, String> {
+    path.to_str()
+        .ok_or_else(|| "non-UTF8 automatic path".into())
+}
+
+fn automatic_sample_phase(
+    duration: Duration,
+    interval: Duration,
+    root: &Path,
+    pid: u32,
+    network_monitor: &mut NetworkMonitor,
+    started: Instant,
+    phase: &str,
+) -> Result<Vec<Sample>, String> {
+    let phase_started = Instant::now();
+    let mut previous_cpu = process_cpu_seconds(pid)?;
+    let mut previous_at = Instant::now();
+    let mut samples = Vec::new();
+    loop {
+        let remaining = duration.saturating_sub(phase_started.elapsed());
+        if remaining.is_zero() && !samples.is_empty() {
+            break;
+        }
+        sleep(interval.min(remaining));
+        let current_cpu = process_cpu_seconds(pid)?;
+        let current_at = Instant::now();
+        assert_automatic_network_local(pid)?;
+        let network_bytes = network_monitor.sample()?;
+        samples.push(Sample {
+            phase: phase.into(),
+            elapsed_ms: started.elapsed().as_millis(),
+            cpu_percent: Some(interval_cpu_percent(
+                previous_cpu,
+                current_cpu,
+                current_at.duration_since(previous_at),
+            )),
+            rss_kib: Some(ps_metric(pid, "rss")?),
+            disk_bytes: Some(
+                StorageBudget::allocated_tree_bytes(root)
+                    .map_err(|error| format!("measure automatic allocated disk: {error}"))?,
+            ),
+            network_bytes: Some(network_bytes),
+        });
+        previous_cpu = current_cpu;
+        previous_at = current_at;
+        if phase_started.elapsed() >= duration {
+            break;
+        }
+    }
+    Ok(samples)
+}
+
+fn average_sample_cpu(samples: &[Sample]) -> Result<f64, String> {
+    let values = samples
+        .iter()
+        .filter_map(|sample| sample.cpu_percent)
+        .collect::<Vec<_>>();
+    let count = u32::try_from(values.len()).map_err(|_| "too many automatic CPU samples")?;
+    if count == 0 {
+        return Err("automatic CPU samples are missing".into());
+    }
+    Ok(values.iter().sum::<f64>() / f64::from(count))
+}
+
+#[cfg(target_os = "macos")]
+fn assert_automatic_network_local(pid: u32) -> Result<(), String> {
+    let output = Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP"])
+        .output()
+        .map_err(|error| format!("inspect automatic collector sockets: {error}"))?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err("automatic collector socket inspection failed".into());
+    }
+    let body = String::from_utf8(output.stdout)
+        .map_err(|_| "automatic collector socket inspection is not UTF-8")?;
+    for line in body.lines().skip(1) {
+        let Some((_, endpoints)) = line.split_once("TCP ") else {
+            continue;
+        };
+        let endpoints = endpoints.split_whitespace().next().unwrap_or_default();
+        for endpoint in endpoints.split("->") {
+            if endpoint != "*:*" && !endpoint.starts_with("127.0.0.1:") {
+                return Err("automatic collector opened a non-loopback network endpoint".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn assert_automatic_network_local(pid: u32) -> Result<(), String> {
+    let mut sockets = Vec::new();
+    for entry in fs::read_dir(format!("/proc/{pid}/fd"))
+        .map_err(|error| format!("inspect automatic collector descriptors: {error}"))?
+    {
+        let target = fs::read_link(
+            entry
+                .map_err(|error| format!("inspect automatic collector descriptor: {error}"))?
+                .path(),
+        )
+        .map_err(|error| format!("inspect automatic collector descriptor target: {error}"))?;
+        let target = target.to_string_lossy();
+        if let Some(inode) = target
+            .strip_prefix("socket:[")
+            .and_then(|value| value.strip_suffix(']'))
+        {
+            sockets.push(inode.to_owned());
+        }
+    }
+    let tcp = fs::read_to_string(format!("/proc/{pid}/net/tcp"))
+        .map_err(|error| format!("inspect automatic collector TCP endpoints: {error}"))?;
+    for line in tcp.lines().skip(1) {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 10 || !sockets.iter().any(|inode| inode == fields[9]) {
+            continue;
+        }
+        let local = fields[1]
+            .split_once(':')
+            .map(|pair| pair.0)
+            .unwrap_or_default();
+        let remote = fields[2]
+            .split_once(':')
+            .map(|pair| pair.0)
+            .unwrap_or_default();
+        if local != "0100007F" || !matches!(remote, "00000000" | "0100007F") {
+            return Err("automatic collector opened a non-loopback network endpoint".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn assert_automatic_network_local(_pid: u32) -> Result<(), String> {
+    Err("automatic collector network evidence is unsupported on this host".into())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1384,6 +3857,157 @@ struct PressureSampler {
     handle: Option<thread::JoinHandle<()>>,
     process_exit_confirmed: Arc<AtomicBool>,
     drain_sample_count: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct RssPeaks {
+    p95_rss_kib: f64,
+    peak_rss_kib: f64,
+    samples: u64,
+    max_gap_ms: u64,
+}
+
+struct RssSampler {
+    stop: Option<mpsc::Sender<()>>,
+    result: mpsc::Receiver<Result<RssPeaks, String>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+struct ProcessRssReader {
+    pid: u32,
+    #[cfg(target_os = "macos")]
+    system: System,
+}
+
+impl ProcessRssReader {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            #[cfg(target_os = "macos")]
+            system: System::new(),
+        }
+    }
+
+    fn sample_kib(&mut self) -> Result<f64, String> {
+        #[cfg(target_os = "macos")]
+        {
+            let pid = Pid::from_u32(self.pid);
+            let updated = self.system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                true,
+                ProcessRefreshKind::nothing().with_memory(),
+            );
+            if updated != 1 {
+                return Err("process RSS is unavailable".into());
+            }
+            let bytes = self
+                .system
+                .process(pid)
+                .ok_or("process RSS is unavailable")?
+                .memory();
+            let kib = u32::try_from(bytes / 1024)
+                .map_err(|_| "process RSS exceeds the supported range")?;
+            Ok(f64::from(kib))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            ps_metric(self.pid, "rss")
+        }
+    }
+}
+
+impl Drop for RssSampler {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        self.handle.take();
+    }
+}
+
+impl RssSampler {
+    fn stop(&mut self) -> Result<RssPeaks, String> {
+        self.stop_with_timeout(SAMPLER_STOP_TIMEOUT)
+    }
+
+    fn stop_with_timeout(&mut self, timeout: Duration) -> Result<RssPeaks, String> {
+        let signal_failed = self
+            .stop
+            .take()
+            .ok_or_else(|| "RSS sampler stop sender is missing".to_string())?
+            .send(())
+            .is_err();
+        let result = match self.result.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(error) => {
+                self.handle.take();
+                return Err(format!("receive RSS sampler result: {error}"));
+            }
+        };
+        self.handle
+            .take()
+            .ok_or_else(|| "RSS sampler handle is missing".to_string())?
+            .join()
+            .map_err(|_| "RSS sampler panicked".to_string())?;
+        let peaks = result?;
+        if signal_failed && peaks.samples == 0 {
+            return Err("RSS sampler ended without evidence".into());
+        }
+        Ok(peaks)
+    }
+}
+
+fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String> {
+    if interval.is_zero() {
+        return Err("RSS sampler interval must be positive".into());
+    }
+    let mut reader = ProcessRssReader::new(pid);
+    let initial = reader.sample_kib()?;
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let result = (|| {
+            let mut rss_samples_kib = vec![initial];
+            let mut peaks = RssPeaks {
+                peak_rss_kib: initial,
+                p95_rss_kib: initial,
+                samples: 1,
+                max_gap_ms: 0,
+            };
+            let mut last_sample = Instant::now();
+            let mut next_sample = last_sample + interval;
+            loop {
+                let wait = next_sample.saturating_duration_since(Instant::now());
+                let stopped = match stop_rx.recv_timeout(wait) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+                    Err(mpsc::RecvTimeoutError::Timeout) => false,
+                };
+                let rss_kib = reader.sample_kib()?;
+                rss_samples_kib.push(rss_kib);
+                peaks.peak_rss_kib = peaks.peak_rss_kib.max(rss_kib);
+                peaks.samples = peaks.samples.saturating_add(1);
+                let sampled_at = Instant::now();
+                peaks.max_gap_ms = peaks
+                    .max_gap_ms
+                    .max(ceil_duration_millis(sampled_at.duration_since(last_sample)));
+                last_sample = sampled_at;
+                if stopped {
+                    peaks.p95_rss_kib = rss_p95_kib(&rss_samples_kib);
+                    break;
+                }
+                while next_sample <= sampled_at {
+                    next_sample += interval;
+                }
+            }
+            Ok(peaks)
+        })();
+        let _ = result_tx.send(result);
+    });
+    Ok(RssSampler {
+        stop: Some(stop_tx),
+        result: result_rx,
+        handle: Some(handle),
+    })
 }
 
 impl Drop for PressureSampler {
@@ -2215,18 +4839,153 @@ fn record_macos_network_line(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct NetworkSurfacePolicy {
+    path: &'static str,
+    allowed_tokens: &'static [&'static str],
+    requires_ipv4_loopback: bool,
+}
+
+const NETWORK_SURFACE_POLICIES: &[NetworkSurfacePolicy] = &[
+    NetworkSurfacePolicy {
+        path: "crates/local-ui/Cargo.toml",
+        allowed_tokens: &["hyper", "tokio"],
+        requires_ipv4_loopback: false,
+    },
+    NetworkSurfacePolicy {
+        path: "crates/local-ui/src/lib.rs",
+        allowed_tokens: &["std::net", "TcpListener", "TcpStream", "hyper", "tokio"],
+        requires_ipv4_loopback: true,
+    },
+    NetworkSurfacePolicy {
+        path: "crates/local-collector/Cargo.toml",
+        allowed_tokens: &["tokio"],
+        requires_ipv4_loopback: false,
+    },
+    NetworkSurfacePolicy {
+        path: "crates/local-collector/src/lib.rs",
+        allowed_tokens: &["std::net", "TcpListener", "TcpStream", "tokio"],
+        requires_ipv4_loopback: true,
+    },
+    NetworkSurfacePolicy {
+        path: "crates/codex-integration/src/lib.rs",
+        allowed_tokens: &["std::net", "TcpListener", "TcpStream"],
+        requires_ipv4_loopback: true,
+    },
+    NetworkSurfacePolicy {
+        path: "crates/cli/Cargo.toml",
+        allowed_tokens: &["tokio"],
+        requires_ipv4_loopback: false,
+    },
+    NetworkSurfacePolicy {
+        path: "crates/cli/src/main.rs",
+        allowed_tokens: &["tokio"],
+        requires_ipv4_loopback: false,
+    },
+];
+
+const NETWORK_TOKENS: &[&str] = &[
+    "std::net",
+    "TcpListener",
+    "TcpStream",
+    "UdpSocket",
+    "reqwest",
+    "hyper",
+    "tokio",
+];
+
+const GLOBALLY_FORBIDDEN_NETWORK_TOKENS: &[&str] = &[
+    "UdpSocket",
+    "reqwest",
+    "hyper::client",
+    "ToSocketAddrs",
+    "collector_endpoint",
+    "TeamIngestEnvelope",
+];
+
+fn validate_network_file(path: &Path, body: &str) -> Result<(), String> {
+    let relative = path.to_string_lossy().replace('\\', "/");
+    if let Some(token) = GLOBALLY_FORBIDDEN_NETWORK_TOKENS
+        .iter()
+        .find(|token| body.contains(**token))
+    {
+        return Err(format!("network surface token {token} found in {relative}"));
+    }
+
+    validate_network_urls(&relative, body)?;
+
+    let policy = NETWORK_SURFACE_POLICIES
+        .iter()
+        .find(|policy| policy.path == relative);
+    for token in NETWORK_TOKENS.iter().filter(|token| body.contains(**token)) {
+        if !policy.is_some_and(|policy| policy.allowed_tokens.contains(token)) {
+            return Err(format!("network surface token {token} found in {relative}"));
+        }
+    }
+
+    if policy.is_some_and(|policy| policy.requires_ipv4_loopback)
+        && !body.contains("Ipv4Addr::LOCALHOST")
+    {
+        return Err(format!(
+            "approved network surface {relative} lacks an IPv4 loopback boundary"
+        ));
+    }
+    for token in [
+        "0.0.0.0",
+        "[::]",
+        "Ipv4Addr::UNSPECIFIED",
+        "Ipv6Addr::UNSPECIFIED",
+    ] {
+        if body.contains(token) {
+            return Err(format!(
+                "external network destination token {token} found in {relative}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_network_urls(path: &str, body: &str) -> Result<(), String> {
+    for scheme in ["http://", "https://"] {
+        for (offset, _) in body.match_indices(scheme) {
+            let suffix = &body[offset..];
+            let end = suffix
+                .find(|character: char| {
+                    character.is_ascii_whitespace()
+                        || matches!(character, '"' | '\'' | '<' | '>' | ')' | ']')
+                })
+                .unwrap_or(suffix.len());
+            let url = &suffix[..end];
+            let allowed_loopback =
+                url.starts_with("http://127.0.0.1:") || url.starts_with("https://127.0.0.1:");
+            let allowed_non_destination = matches!(
+                (path, url),
+                (
+                    "crates/local-ui/src/lib.rs",
+                    "http://{host}" | "http://example.invalid"
+                )
+            ) || (path == "crates/codex-integration/src/lib.rs"
+                && url.starts_with("http://www.apple.com/DTDs/PropertyList-1.0.dtd"))
+                || (url == scheme
+                    && matches!(
+                        path,
+                        "crates/static-report/src/lib.rs" | "crates/cli/src/main.rs"
+                    ));
+            if !allowed_loopback && !allowed_non_destination {
+                return Err(format!(
+                    "external network destination {url} found in {path}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_network_surface() -> Result<(), String> {
-    const FORBIDDEN: [&str; 8] = [
-        "std::net",
-        "TcpStream",
-        "UdpSocket",
-        "reqwest",
-        "hyper",
-        "tokio",
-        "collector_endpoint",
-        "TeamIngestEnvelope",
-    ];
-    let mut pending = vec![PathBuf::from("crates")];
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("xtask manifest directory has no workspace parent")?;
+    let mut pending = vec![workspace_root.join("crates")];
     let mut inspected = 1_usize;
     while let Some(path) = pending.pop() {
         let metadata =
@@ -2251,16 +5010,14 @@ fn validate_network_surface() -> Result<(), String> {
             }
         } else if path
             .extension()
-            .is_some_and(|extension| matches!(extension.to_str(), Some("rs" | "toml" | "lock")))
+            .is_some_and(|extension| matches!(extension.to_str(), Some("rs" | "toml")))
         {
             let body =
                 fs::read_to_string(&path).map_err(|e| format!("read network surface: {e}"))?;
-            if let Some(token) = FORBIDDEN.iter().find(|token| body.contains(**token)) {
-                return Err(format!(
-                    "network surface token {token} found in {}",
-                    path.display()
-                ));
-            }
+            let relative = path
+                .strip_prefix(workspace_root)
+                .map_err(|_| "network surface escaped the workspace root")?;
+            validate_network_file(relative, &body)?;
         }
     }
     Ok(())
@@ -2421,6 +5178,650 @@ fn ps_value(pid: u32, field: &str) -> Option<String> {
         .trim()
         .to_owned();
     (!value.is_empty()).then_some(value)
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_automatic_results(
+    config: AutomaticConfig,
+    results: &[AutomaticRunResult],
+    errors: &[String],
+) -> Result<(), String> {
+    if !errors.is_empty() {
+        return Err("automatic workload failed; inspect the sanitized manifest".into());
+    }
+    if results.len() != config.runs {
+        return Err("incomplete automatic run evidence".into());
+    }
+    for result in results {
+        if result.accepted_primary_requests != config.events
+            || result.synthetic_otlp_latencies_us.len() != config.events
+            || result.idle_samples.is_empty()
+        {
+            return Err("incomplete automatic synthetic collector OTLP or idle evidence".into());
+        }
+        if result.rejected_primary_requests != 0 {
+            return Err("automatic synthetic collector OTLP requests were rejected".into());
+        }
+        if !result.notify_supplement_accepted {
+            return Err("automatic notify supplement evidence is missing".into());
+        }
+        if !result.report_converged {
+            return Err("automatic durable report convergence evidence is missing".into());
+        }
+        let expected_records = u64::try_from(config.events)
+            .map_err(|_| "automatic expected record count overflow")?
+            .checked_mul(AUTOMATIC_RECORDS_PER_SYNTHETIC_REQUEST)
+            .and_then(|records| records.checked_add(AUTOMATIC_NOTIFY_RECORDS_PER_RUN))
+            .ok_or("automatic expected record count overflow")?;
+        if result.rss_samples < 2
+            || result.report_generation != expected_records
+            || result.report_records != expected_records
+        {
+            return Err(format!(
+                "automatic RSS or exact durable report evidence is incomplete: expected_records={expected_records}, report_generation={}, report_records={}, rss_samples={}",
+                result.report_generation, result.report_records, result.rss_samples
+            ));
+        }
+        if config.profile == Profile::Release
+            && (result.rss_samples < AUTOMATIC_RSS_MIN_RELEASE_SAMPLES
+                || result.rss_observed_max_gap_ms
+                    > u64::try_from(AUTOMATIC_RSS_MAX_OBSERVED_GAP.as_millis()).unwrap_or(u64::MAX))
+        {
+            return Err("automatic RSS sample cadence evidence is insufficient".into());
+        }
+        if !result.idle_cpu_percent.is_finite()
+            || result.idle_cpu_percent.is_sign_negative()
+            || !result.active_cpu_percent.is_finite()
+            || result.active_cpu_percent.is_sign_negative()
+            || !result.rss_p95_kib.is_finite()
+            || result.rss_p95_kib.is_sign_negative()
+            || !result.peak_rss_kib.is_finite()
+            || result.peak_rss_kib.is_sign_negative()
+            || result.peak_rss_kib < result.rss_p95_kib
+        {
+            return Err("automatic resource evidence is non-finite or negative".into());
+        }
+        if result.network_monitor_samples == 0 {
+            return Err("automatic collector network monitor samples are missing".into());
+        }
+    }
+    if config.profile == Profile::Release {
+        if results
+            .iter()
+            .any(|result| result.idle_cpu_percent > AUTOMATIC_IDLE_CPU_PERCENT_MAX)
+        {
+            return Err("automatic collector idle CPU budget exceeded".into());
+        }
+        if results
+            .iter()
+            .any(|result| result.active_cpu_percent > AUTOMATIC_ACTIVE_CPU_PERCENT_MAX)
+        {
+            return Err("automatic collector active CPU exceeded one logical core".into());
+        }
+        if results
+            .iter()
+            .any(|result| result.rss_p95_kib > AUTOMATIC_RSS_P95_MIB_MAX * 1024.0)
+        {
+            return Err("automatic collector RSS p95 budget exceeded".into());
+        }
+        if results
+            .iter()
+            .any(|result| result.peak_disk_bytes > AUTOMATIC_ALLOCATED_DISK_BYTES_MAX)
+        {
+            return Err("automatic allocated disk budget exceeded".into());
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_automatic_manifest(
+    config: AutomaticConfig,
+    host: &HostEvidence,
+    source_revision: &str,
+    results: &[AutomaticRunResult],
+    errors: &[String],
+    status: &str,
+) -> String {
+    let run_quantiles = results
+        .iter()
+        .filter(|result| !result.synthetic_otlp_latencies_us.is_empty())
+        .map(|result| {
+            let mut latencies = result.synthetic_otlp_latencies_us.clone();
+            latencies.sort_unstable();
+            (percentile(&latencies, 95), percentile(&latencies, 99))
+        })
+        .collect::<Vec<_>>();
+    let p95 = run_quantiles.iter().map(|(p95, _)| *p95).max();
+    let p99 = run_quantiles.iter().map(|(_, p99)| *p99).max();
+    let idle_cpu = results
+        .iter()
+        .map(|result| result.idle_cpu_percent)
+        .max_by(f64::total_cmp);
+    let active_cpu = results
+        .iter()
+        .map(|result| result.active_cpu_percent)
+        .max_by(f64::total_cmp);
+    let peak_rss = results
+        .iter()
+        .map(|result| result.peak_rss_kib)
+        .max_by(f64::total_cmp);
+    let rss_p95 = results
+        .iter()
+        .map(|result| result.rss_p95_kib)
+        .max_by(f64::total_cmp);
+    let peak_disk = results.iter().map(|result| result.peak_disk_bytes).max();
+    let collector_network = results
+        .iter()
+        .map(|result| result.collector_network_bytes)
+        .max();
+    let network_samples = results
+        .iter()
+        .map(|result| result.network_monitor_samples)
+        .sum::<u64>();
+    let rss_samples_min = results.iter().map(|result| result.rss_samples).min();
+    let rss_max_gap = results
+        .iter()
+        .map(|result| result.rss_observed_max_gap_ms)
+        .max();
+    let release_readiness = match status {
+        "pass" => "verified",
+        "pending-validation" => "pending",
+        _ => "not_verified",
+    };
+    let real_codex_e2e_status = if errors
+        .iter()
+        .any(|error| error.starts_with("lifecycle preflight: "))
+    {
+        "failed"
+    } else {
+        "passed"
+    };
+    let real_codex_e2e_gate = if real_codex_e2e_status == "failed" {
+        "failed-lifecycle-preflight"
+    } else {
+        "passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response"
+    };
+    let mut manifest = format!(
+        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: {release_readiness}\nreal_codex_e2e_status: {real_codex_e2e_status}\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.151.0\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: {real_codex_e2e_gate}\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_rss_p95_kib_max: {}\n  collector_peak_rss_kib: {}\n  collector_rss_samples_min: {}\n  collector_rss_observed_max_gap_ms: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
+        profile_name(config.profile),
+        profile_name(config.profile),
+        env!("CARGO_PKG_VERSION"),
+        if config.profile == Profile::Release {
+            "release"
+        } else {
+            "dev"
+        },
+        host.machine,
+        env::consts::OS,
+        host.filesystem,
+        host.power_mode,
+        host.logical_cores,
+        config.warmup.as_millis(),
+        config.idle.as_millis(),
+        config.events,
+        config.inter_event.as_millis(),
+        config.runs,
+        config.sample.as_millis(),
+        config.active_timeout.as_millis(),
+        AUTOMATIC_START_TIMEOUT.as_millis(),
+        LOCAL_COMMAND_TIMEOUT.as_millis(),
+        WORKER_EXIT_TIMEOUT.as_millis(),
+        optional_u128(p95),
+        optional_u128(p99),
+        optional_f64(idle_cpu),
+        optional_f64(active_cpu),
+        optional_f64(rss_p95),
+        optional_f64(peak_rss),
+        optional_u64(rss_samples_min),
+        optional_u64(rss_max_gap),
+        optional_u64(peak_disk),
+        optional_u64(collector_network),
+        network_samples,
+    );
+    for result in results {
+        let mut run_latencies = result.synthetic_otlp_latencies_us.clone();
+        run_latencies.sort_unstable();
+        let _ = writeln!(
+            manifest,
+            "  - run: {}\n    accepted_synthetic_otlp_requests: {}\n    rejected_synthetic_otlp_requests: {}\n    notify_supplement_accepted: {}\n    durable_report_converged: {}\n    report_generation: {}\n    report_records: {}\n    rss_samples: {}\n    rss_observed_max_gap_ms: {}\n    raw_notify_sentinels_absent: true\n    synthetic_collector_otlp_p95_us: {}\n    synthetic_collector_otlp_p99_us: {}\n    idle_cpu_percent: {}\n    active_cpu_percent: {}\n    rss_p95_kib: {}\n    peak_rss_kib: {}\n    allocated_disk_bytes: {}\n    collector_network_bytes: {}\n    network_monitor_samples: {}\n    all_observed_endpoints_loopback: true",
+            result.run,
+            result.accepted_primary_requests,
+            result.rejected_primary_requests,
+            result.notify_supplement_accepted,
+            result.report_converged,
+            result.report_generation,
+            result.report_records,
+            result.rss_samples,
+            result.rss_observed_max_gap_ms,
+            percentile(&run_latencies, 95),
+            percentile(&run_latencies, 99),
+            result.idle_cpu_percent,
+            result.active_cpu_percent,
+            result.rss_p95_kib,
+            result.peak_rss_kib,
+            result.peak_disk_bytes,
+            result.collector_network_bytes,
+            result.network_monitor_samples,
+        );
+    }
+    if errors.is_empty() {
+        manifest.push_str("errors: []\n");
+    } else {
+        manifest.push_str("errors:\n");
+        for error in errors {
+            let _ = writeln!(
+                manifest,
+                "  - {}",
+                yaml_single_quoted(automatic_evidence_error_code(error))
+            );
+        }
+    }
+    manifest
+}
+
+fn automatic_evidence_error_code(error: &str) -> &'static str {
+    if let Some(error) = error.strip_prefix("lifecycle preflight: ") {
+        if error.contains("requires codex") {
+            "code=lifecycle_codex_version_failed"
+        } else if error.contains("compatibility diagnostic")
+            || error.contains("strict config")
+            || error.contains("isolated CODEX_HOME")
+            || error.contains("Codex config stage")
+        {
+            "code=lifecycle_codex_config_failed"
+        } else if error.contains("real Codex") {
+            "code=lifecycle_codex_e2e_failed"
+        } else if error.contains("initial report") {
+            "code=lifecycle_report_failed"
+        } else if error.contains("setup") {
+            "code=lifecycle_setup_failed"
+        } else if error.contains("recovery") || error.contains("SIGKILL") {
+            "code=lifecycle_recovery_failed"
+        } else if error.contains("occupied port") || error.contains("concurrent") {
+            "code=lifecycle_reconnect_failed"
+        } else if error.contains("disconnect") || error.contains("restore") {
+            "code=lifecycle_cleanup_failed"
+        } else {
+            "code=lifecycle_preflight_failed"
+        }
+    } else if error.starts_with("run ") {
+        "code=benchmark_run_failed"
+    } else if error.starts_with("validation: ") {
+        "code=evidence_validation_failed"
+    } else if error.starts_with("cleanup: ") {
+        "code=cleanup_failed"
+    } else {
+        "code=automatic_check_failed"
+    }
+}
+
+fn validate_automatic_manifest_shape(manifest: &str) -> Result<AutomaticEvidenceManifest, String> {
+    let evidence = parse_automatic_manifest(manifest)?;
+    let expected_lifecycle = "built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect";
+    let expected_collector = "built-agent-observability-collector-serve-subprocess";
+    let expected_transport = "private-ca-https-exact-private-random-request-header-not-mtls";
+    let expected_config = "installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp";
+    let expected_correction = "codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity";
+    let expected_benchmark = "post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report";
+    let expected_notify = "separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan";
+    if evidence.schema_version != "automatic_local_performance.v1"
+        || evidence.evidence_kind != "automatic_release_evidence"
+        || evidence.protocol_revision != AUTOMATIC_PROTOCOL_REVISION
+        || !evidence.build.cargo_locked
+        || evidence.build.codex_version != "0.151.0"
+        || evidence.workload.lifecycle_preflight != expected_lifecycle
+        || evidence.workload.collector_boundary != expected_collector
+        || evidence.workload.transport != expected_transport
+        || evidence.workload.codex_config_load_boundary != expected_config
+        || evidence.workload.observed_compatibility_correction != expected_correction
+        || evidence.workload.synthetic_benchmark_boundary != expected_benchmark
+        || evidence.workload.notify_boundary != expected_notify
+        || evidence.workload.runtime_path != "run-relative/runtime"
+    {
+        return Err("automatic performance manifest shape is invalid".into());
+    }
+    let expected_readiness = match evidence.status.as_str() {
+        "pass" => "verified",
+        "pending-validation" => "pending",
+        "failed" => "not_verified",
+        _ => return Err("automatic performance manifest status is invalid".into()),
+    };
+    if evidence.release_readiness != expected_readiness {
+        return Err("automatic performance manifest release readiness is inconsistent".into());
+    }
+    let codex_failed = evidence
+        .errors
+        .iter()
+        .any(|error| error.starts_with("code=lifecycle_"));
+    let expected_codex_status = if codex_failed { "failed" } else { "passed" };
+    if evidence.real_codex_e2e_status != expected_codex_status {
+        return Err("automatic performance manifest has inconsistent real Codex status".into());
+    }
+    let expected_codex_gate = if codex_failed {
+        "failed-lifecycle-preflight"
+    } else {
+        "passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response"
+    };
+    if evidence.workload.real_codex_e2e_release_gate != expected_codex_gate {
+        return Err("automatic performance manifest has inconsistent real Codex gate".into());
+    }
+    validate_automatic_manifest_privacy(manifest)?;
+    if evidence.source_revision.len() != 40
+        || !evidence
+            .source_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("automatic performance manifest source revision is invalid".into());
+    }
+    Ok(evidence)
+}
+
+fn parse_automatic_manifest(manifest: &str) -> Result<AutomaticEvidenceManifest, String> {
+    serde_saphyr::from_str(manifest)
+        .map_err(|error| format!("parse automatic performance manifest: {error}"))
+}
+
+fn validate_automatic_release_evidence_file(
+    path: &Path,
+    expected_revision: &str,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| "automatic release evidence manifest is unavailable".to_string())?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > 1_048_576
+    {
+        return Err("automatic release evidence manifest must be one bounded regular file".into());
+    }
+    let manifest = fs::read_to_string(path)
+        .map_err(|_| "automatic release evidence manifest is unreadable".to_string())?;
+    let evidence = validate_automatic_manifest_shape(&manifest)?;
+    validate_automatic_release_evidence(&evidence, expected_revision)?;
+    println!("automatic release evidence verified");
+    Ok(())
+}
+
+fn validate_automatic_release_evidence(
+    evidence: &AutomaticEvidenceManifest,
+    expected_revision: &str,
+) -> Result<(), String> {
+    validate_automatic_release_identity(evidence, expected_revision)?;
+    validate_automatic_release_workload(evidence)?;
+    validate_automatic_release_runs(&evidence.runs)?;
+    validate_automatic_release_aggregates(evidence)
+}
+
+fn validate_automatic_release_identity(
+    evidence: &AutomaticEvidenceManifest,
+    expected_revision: &str,
+) -> Result<(), String> {
+    if expected_revision.len() != 40
+        || !expected_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("expected automatic release evidence revision is invalid".into());
+    }
+    if evidence.schema_version != "automatic_local_performance.v1"
+        || evidence.evidence_kind != "automatic_release_evidence"
+        || evidence.protocol_revision != AUTOMATIC_PROTOCOL_REVISION
+        || evidence.status != "pass"
+        || evidence.release_readiness != "verified"
+        || evidence.real_codex_e2e_status != "passed"
+        || evidence.source_revision != expected_revision
+        || evidence.profile != "release"
+        || evidence.protocol != "crates/contracts/performance/automatic-local-performance-v1.yaml"
+        || evidence.command != "cargo run -p xtask -- perf automatic --profile release --check"
+        || evidence.build.package != "agent-observability-cli"
+        || evidence.build.package_version != env!("CARGO_PKG_VERSION")
+        || !evidence.build.cargo_locked
+        || evidence.build.cargo_profile != "release"
+        || evidence.build.codex_package != "@openai/codex"
+        || evidence.build.codex_version != "0.151.0"
+        || evidence.host.os != "macos"
+        || !evidence.errors.is_empty()
+    {
+        return Err("automatic release evidence identity or release state is invalid".into());
+    }
+    validate_automatic_release_host(&evidence.host)?;
+    Ok(())
+}
+
+fn validate_automatic_release_host(host: &AutomaticEvidenceHost) -> Result<(), String> {
+    let machine = host
+        .machine
+        .strip_prefix("sanitized-")
+        .and_then(|value| value.strip_suffix("-logical-core"))
+        .ok_or("automatic release evidence machine is invalid")?;
+    let (architecture, cores) = machine
+        .rsplit_once('-')
+        .ok_or("automatic release evidence machine is invalid")?;
+    let machine_cores = cores
+        .parse::<usize>()
+        .map_err(|_| "automatic release evidence machine core count is invalid")?;
+    if host.logical_cores == 0
+        || host.logical_cores != machine_cores
+        || !matches!(architecture, "aarch64" | "x86_64")
+        || host.filesystem.len() > 64
+        || validated_evidence_token(&host.filesystem, "filesystem").is_err()
+        || !matches!(host.power_mode.as_str(), "ac" | "battery")
+    {
+        return Err("automatic release evidence host contract is invalid".into());
+    }
+    Ok(())
+}
+
+fn validate_automatic_release_workload(evidence: &AutomaticEvidenceManifest) -> Result<(), String> {
+    let expected_gate = "passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response";
+    let expected_lifecycle = "built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect";
+    let expected_collector = "built-agent-observability-collector-serve-subprocess";
+    let expected_transport = "private-ca-https-exact-private-random-request-header-not-mtls";
+    let expected_config = "installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp";
+    let expected_correction = "codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity";
+    let expected_benchmark = "post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report";
+    let expected_notify = "separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan";
+    if evidence.workload.lifecycle_preflight != expected_lifecycle
+        || evidence.workload.collector_boundary != expected_collector
+        || evidence.workload.transport != expected_transport
+        || evidence.workload.codex_config_load_boundary != expected_config
+        || evidence.workload.observed_compatibility_correction != expected_correction
+        || evidence.workload.real_codex_e2e_release_gate != expected_gate
+        || evidence.workload.synthetic_benchmark_boundary != expected_benchmark
+        || evidence.workload.notify_boundary != expected_notify
+        || evidence.workload.runtime_path != "run-relative/runtime"
+        || evidence.workload.warmup_ms != 60_000
+        || evidence.workload.idle_ms != 900_000
+        || evidence.workload.synthetic_otlp_requests_per_run != 10_000
+        || evidence.workload.inter_request_ms != 3
+        || evidence.workload.runs != 5
+        || evidence.workload.sample_interval_ms != 1_000
+        || evidence.workload.active_timeout_ms != 300_000
+        || evidence.workload.startup_timeout_ms != 10_000
+        || evidence.workload.command_timeout_ms != 1_000
+        || evidence.workload.cleanup_timeout_ms != 5_000
+        || !evidence.metrics.all_observed_endpoints_loopback
+        || evidence.metrics.network_evidence
+            != "process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface"
+    {
+        return Err("automatic release evidence workload contract is invalid".into());
+    }
+    Ok(())
+}
+
+fn validate_automatic_release_runs(runs: &[AutomaticEvidenceRun]) -> Result<(), String> {
+    if runs.len() != 5 {
+        return Err("automatic release evidence must contain exactly five runs".into());
+    }
+    let mut seen = [false; 5];
+    for run in runs {
+        let Some(index) = run.run.checked_sub(1).filter(|index| *index < seen.len()) else {
+            return Err("automatic release evidence run number is out of range".into());
+        };
+        if seen[index] {
+            return Err("automatic release evidence contains a duplicate run".into());
+        }
+        seen[index] = true;
+        if run.accepted_synthetic_otlp_requests != 10_000
+            || run.rejected_synthetic_otlp_requests != 0
+            || !run.notify_supplement_accepted
+            || !run.durable_report_converged
+            || run.report_generation != 20_001
+            || run.report_records != 20_001
+            || run.rss_samples < AUTOMATIC_RSS_MIN_RELEASE_SAMPLES
+            || run.rss_observed_max_gap_ms
+                > u64::try_from(AUTOMATIC_RSS_MAX_OBSERVED_GAP.as_millis()).unwrap_or(u64::MAX)
+            || !run.raw_notify_sentinels_absent
+            || run.synthetic_collector_otlp_p95_us > run.synthetic_collector_otlp_p99_us
+            || !run.idle_cpu_percent.is_finite()
+            || run.idle_cpu_percent.is_sign_negative()
+            || run.idle_cpu_percent > AUTOMATIC_IDLE_CPU_PERCENT_MAX
+            || !run.active_cpu_percent.is_finite()
+            || run.active_cpu_percent.is_sign_negative()
+            || run.active_cpu_percent > AUTOMATIC_ACTIVE_CPU_PERCENT_MAX
+            || !run.rss_p95_kib.is_finite()
+            || run.rss_p95_kib.is_sign_negative()
+            || run.rss_p95_kib > AUTOMATIC_RSS_P95_MIB_MAX * 1024.0
+            || !run.peak_rss_kib.is_finite()
+            || run.peak_rss_kib.is_sign_negative()
+            || run.peak_rss_kib < run.rss_p95_kib
+            || run.allocated_disk_bytes > AUTOMATIC_ALLOCATED_DISK_BYTES_MAX
+            || run.network_monitor_samples == 0
+            || !run.all_observed_endpoints_loopback
+        {
+            return Err(format!(
+                "automatic release evidence run {} is invalid",
+                run.run
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_automatic_release_aggregates(
+    evidence: &AutomaticEvidenceManifest,
+) -> Result<(), String> {
+    let expected_idle = evidence
+        .runs
+        .iter()
+        .map(|run| run.idle_cpu_percent)
+        .max_by(f64::total_cmp);
+    let expected_active = evidence
+        .runs
+        .iter()
+        .map(|run| run.active_cpu_percent)
+        .max_by(f64::total_cmp);
+    let expected_rss_p95 = evidence
+        .runs
+        .iter()
+        .map(|run| run.rss_p95_kib)
+        .max_by(f64::total_cmp);
+    let expected_peak_rss = evidence
+        .runs
+        .iter()
+        .map(|run| run.peak_rss_kib)
+        .max_by(f64::total_cmp);
+    let expected_p95 = evidence
+        .runs
+        .iter()
+        .map(|run| run.synthetic_collector_otlp_p95_us)
+        .max();
+    let expected_p99 = evidence
+        .runs
+        .iter()
+        .map(|run| run.synthetic_collector_otlp_p99_us)
+        .max();
+    if evidence.metrics.synthetic_collector_otlp_p95_us != expected_p95
+        || evidence.metrics.synthetic_collector_otlp_p99_us != expected_p99
+        || evidence.metrics.collector_idle_cpu_percent_max != expected_idle
+        || evidence.metrics.collector_active_cpu_percent_max != expected_active
+        || evidence.metrics.collector_rss_p95_kib_max != expected_rss_p95
+        || evidence.metrics.collector_peak_rss_kib != expected_peak_rss
+        || evidence.metrics.collector_rss_samples_min
+            != evidence.runs.iter().map(|run| run.rss_samples).min()
+        || evidence.metrics.collector_rss_observed_max_gap_ms
+            != evidence
+                .runs
+                .iter()
+                .map(|run| run.rss_observed_max_gap_ms)
+                .max()
+        || evidence.metrics.allocated_disk_bytes_max
+            != evidence
+                .runs
+                .iter()
+                .map(|run| run.allocated_disk_bytes)
+                .max()
+        || evidence.metrics.collector_network_bytes_max
+            != evidence
+                .runs
+                .iter()
+                .map(|run| run.collector_network_bytes)
+                .max()
+        || evidence.metrics.network_monitor_samples
+            != evidence
+                .runs
+                .iter()
+                .map(|run| run.network_monitor_samples)
+                .sum::<u64>()
+    {
+        return Err("automatic release evidence aggregate metrics are inconsistent".into());
+    }
+    Ok(())
+}
+
+fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
+    let allowed_errors = [
+        "  - 'code=lifecycle_preflight_failed'",
+        "  - 'code=lifecycle_codex_version_failed'",
+        "  - 'code=lifecycle_codex_config_failed'",
+        "  - 'code=lifecycle_codex_e2e_failed'",
+        "  - 'code=lifecycle_report_failed'",
+        "  - 'code=lifecycle_setup_failed'",
+        "  - 'code=lifecycle_recovery_failed'",
+        "  - 'code=lifecycle_reconnect_failed'",
+        "  - 'code=lifecycle_cleanup_failed'",
+        "  - 'code=benchmark_run_failed'",
+        "  - 'code=evidence_validation_failed'",
+        "  - 'code=cleanup_failed'",
+        "  - 'code=automatic_check_failed'",
+    ];
+    if manifest
+        .lines()
+        .filter(|line| line.starts_with("  - '"))
+        .any(|line| !allowed_errors.contains(&line))
+    {
+        return Err("automatic performance manifest contains a non-allowlisted error".into());
+    }
+    for sentinel in [
+        "AUTOMATIC_RAW_CWD_SENTINEL",
+        "AUTOMATIC_RAW_PROMPT_SENTINEL",
+        "AUTOMATIC_RAW_ASSISTANT_SENTINEL",
+        AUTOMATIC_CODEX_E2E_PROMPT_SENTINEL,
+        AUTOMATIC_CODEX_E2E_RESPONSE_SENTINEL,
+    ] {
+        if manifest.contains(sentinel) {
+            return Err("automatic performance manifest contains a raw content sentinel".into());
+        }
+    }
+    for forbidden in [
+        "/tmp/",
+        "/private/tmp/",
+        "collector.json",
+        "\"token\"",
+        "private_key",
+        "private-key.pem",
+        "BEGIN PRIVATE KEY",
+        "BEGIN RSA PRIVATE KEY",
+        "BEGIN EC PRIVATE KEY",
+    ] {
+        if manifest.contains(forbidden) {
+            return Err(format!(
+                "automatic performance manifest contains unsanitized field {forbidden}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2737,12 +6138,7 @@ fn metric_summary(results: &[RunResult]) -> Option<MetricSummary> {
         idle_cpu_delta_percent: enabled_idle - baseline_idle,
         active_cpu_delta_percent: enabled_active - baseline_active,
         active_any_minute_cpu_delta_percent: active_any_minute - baseline_active,
-        enabled_rss_p95_kib: enabled_rss_p95_kib.max(
-            enabled
-                .iter()
-                .map(|result| result.peak_rss_kib)
-                .max_by(f64::total_cmp)?,
-        ),
+        enabled_rss_p95_kib,
         total_allocated_disk_bytes,
         network_bytes,
     })
@@ -2884,7 +6280,7 @@ fn validate_results(
         if summary.total_allocated_disk_bytes > 1_073_741_824 {
             return Err("allocated disk budget exceeded".into());
         }
-        let latencies = results
+        let mut latencies = results
             .iter()
             .filter(|result| result.enabled)
             .flat_map(|result| {
@@ -2895,6 +6291,7 @@ fn validate_results(
                     .copied()
             })
             .collect::<Vec<_>>();
+        latencies.sort_unstable();
         if percentile(&latencies, 95) > 20_000 || percentile(&latencies, 99) > 50_000 {
             return Err("foreground latency budget exceeded".into());
         }
@@ -2911,6 +6308,18 @@ fn percentile_f64(values: &[f64], p: usize) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     sorted[((sorted.len() - 1) * p) / 100]
+}
+
+fn rss_p95_kib(values: &[f64]) -> f64 {
+    percentile_f64(values, 95)
+}
+
+fn ceil_duration_millis(duration: Duration) -> u64 {
+    let millis = duration.as_millis();
+    let rounded = millis.saturating_add(u128::from(
+        !duration.subsec_nanos().is_multiple_of(1_000_000),
+    ));
+    u64::try_from(rounded).unwrap_or(u64::MAX)
 }
 fn profile_name(profile: Profile) -> &'static str {
     match profile {
@@ -3003,6 +6412,208 @@ mod tests {
             power_mode: "ac".into(),
         }
     }
+    fn automatic_config() -> AutomaticConfig {
+        AutomaticConfig {
+            profile: Profile::Release,
+            warmup: Duration::ZERO,
+            idle: Duration::ZERO,
+            events: 100,
+            inter_event: Duration::ZERO,
+            runs: 2,
+            sample: Duration::ZERO,
+            active_timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn supplied_automatic_binary_must_be_absolute_regular_executable_and_versioned() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("agent-observability-binary-{stamp}"));
+        fs::create_dir(&root).unwrap();
+        let binary = root.join("agent-observability");
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nsleep 2\nprintf '{}\\n'\n",
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            resolve_automatic_binary(Profile::Smoke, Some(&binary)).unwrap(),
+            binary
+        );
+        assert!(
+            resolve_automatic_binary(Profile::Smoke, Some(Path::new("relative-binary")))
+                .unwrap_err()
+                .contains("must be absolute")
+        );
+
+        let symlink = root.join("agentobs");
+        std::os::unix::fs::symlink(&binary, &symlink).unwrap();
+        assert!(
+            resolve_automatic_binary(Profile::Smoke, Some(&symlink))
+                .unwrap_err()
+                .contains("not a symlink")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_external_command_drains_output_while_the_process_is_running() {
+        let output = run_bounded_external_command_with_env(
+            "awk",
+            &["BEGIN { for (i = 0; i < 131072; i++) printf \"x\" }"],
+            Duration::from_secs(5),
+            &[],
+            &[0],
+        )
+        .unwrap();
+        assert_eq!(output.len(), 131_072);
+    }
+    fn automatic_result(run: usize, latencies_us: Vec<u128>) -> AutomaticRunResult {
+        AutomaticRunResult {
+            run,
+            accepted_primary_requests: latencies_us.len(),
+            synthetic_otlp_latencies_us: latencies_us,
+            idle_samples: vec![s("idle", Some(0.1), Some(1.0), Some(1), Some(321))],
+            idle_cpu_percent: 0.1,
+            active_cpu_percent: 0.1,
+            rss_p95_kib: 1.0,
+            peak_rss_kib: 1.0,
+            rss_samples: AUTOMATIC_RSS_MIN_RELEASE_SAMPLES,
+            rss_observed_max_gap_ms: 10,
+            peak_disk_bytes: 1,
+            collector_network_bytes: 321,
+            network_monitor_samples: 2,
+            rejected_primary_requests: 0,
+            notify_supplement_accepted: true,
+            report_converged: true,
+            report_generation: 201,
+            report_records: 201,
+        }
+    }
+    fn validate_single_automatic(result: AutomaticRunResult) -> Result<(), String> {
+        let mut config = automatic_config();
+        config.runs = 1;
+        validate_automatic_results(config, &[result], &[])
+    }
+
+    #[test]
+    fn rss_sampler_takes_an_initial_and_final_sample() {
+        let mut sampler = start_rss_sampler(std::process::id(), Duration::from_millis(10)).unwrap();
+        let peaks = sampler.stop().unwrap();
+
+        assert!(peaks.peak_rss_kib > 0.0);
+        assert!(peaks.samples >= 2);
+    }
+
+    #[test]
+    fn rss_p95_ignores_one_peak_but_includes_the_exact_boundary() {
+        let mut one_peak = vec![1.0; 19];
+        one_peak.push(128.0 * 1024.0);
+        assert!((rss_p95_kib(&one_peak) - 1.0).abs() < f64::EPSILON);
+
+        let mut boundary = vec![1.0; 18];
+        boundary.extend([96.0 * 1024.0, 128.0 * 1024.0]);
+        assert!((rss_p95_kib(&boundary) - 96.0 * 1024.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rss_cadence_rounds_partial_milliseconds_up() {
+        assert_eq!(ceil_duration_millis(Duration::from_millis(100)), 100);
+        assert_eq!(
+            ceil_duration_millis(Duration::from_millis(100) + Duration::from_nanos(1)),
+            101
+        );
+    }
+
+    #[test]
+    fn rss_sampler_timeout_detaches_instead_of_joining_a_blocked_thread() {
+        let (stop_tx, _stop_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            release_rx.recv().unwrap();
+            let _ = result_tx.send(Ok(RssPeaks::default()));
+        });
+        let mut sampler = RssSampler {
+            stop: Some(stop_tx),
+            result: result_rx,
+            handle: Some(handle),
+        };
+        let started = Instant::now();
+        let error = sampler
+            .stop_with_timeout(Duration::from_millis(10))
+            .unwrap_err();
+
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(sampler.handle.is_none());
+        release_tx.send(()).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rss_sampler_observes_a_bounded_subprocess_memory_spike() {
+        let mut child = Command::new("/usr/bin/perl")
+            .args([
+                "-e",
+                "select(undef,undef,undef,0.05); $x = 'x' x (64*1024*1024); select(undef,undef,undef,1.0);",
+            ])
+            .spawn()
+            .unwrap();
+        let mut sampler = start_rss_sampler(child.id(), Duration::from_millis(10)).unwrap();
+        thread::sleep(Duration::from_millis(600));
+        let peaks = sampler.stop().unwrap();
+        let status = child.wait().unwrap();
+
+        assert!(status.success());
+        assert!(peaks.peak_rss_kib >= 32.0 * 1024.0);
+        assert!(peaks.samples >= 3);
+        assert!(peaks.max_gap_ms <= 100);
+    }
+
+    #[test]
+    fn automatic_validation_requires_rss_cadence_and_exact_durable_records() {
+        let latencies = vec![1; automatic_config().events];
+        let mut result = automatic_result(1, latencies.clone());
+        result.rss_samples = 1;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("exact durable report evidence")
+        );
+
+        let mut result = automatic_result(1, latencies.clone());
+        result.report_generation = 100;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("exact durable report evidence")
+        );
+
+        let mut result = automatic_result(1, latencies);
+        result.report_records = 100;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("exact durable report evidence")
+        );
+
+        let mut result = automatic_result(1, vec![1; automatic_config().events]);
+        result.rss_observed_max_gap_ms = 101;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("sample cadence evidence")
+        );
+    }
     fn enabled(idle_cpu: f64, active_cpu: f64, rss: f64, disk: u64, net: u64) -> Vec<Sample> {
         vec![
             s("warmup", Some(0.1), Some(rss), Some(disk), Some(net)),
@@ -3028,6 +6639,805 @@ mod tests {
         assert_eq!(TOTAL_PIPELINE_PAYLOAD_BYTES_MAX, 4_784_128);
         assert!(PROTOCOL.contains("active_any_minute_percent_max"));
     }
+
+    #[test]
+    fn automatic_protocol_requires_exact_lifecycle_and_honest_network_evidence() {
+        validate_automatic_protocol_contract().unwrap();
+        assert!(AUTOMATIC_PROTOCOL.contains("required_os: macos"));
+        assert!(AUTOMATIC_PROTOCOL.contains("validation_scope: diagnostic only"));
+        assert!(AUTOMATIC_PROTOCOL.contains("NetworkMonitor"));
+        assert!(AUTOMATIC_PROTOCOL.contains("unexpected SIGKILL service termination"));
+        assert!(AUTOMATIC_PROTOCOL.contains("bounded unaided launchd KeepAlive recovery"));
+        assert!(AUTOMATIC_PROTOCOL.contains("installed @openai/codex 0.151.0 exact version"));
+        assert!(
+            AUTOMATIC_PROTOCOL.contains(
+                "actual codex exec proving exporter construction and native OTLP delivery"
+            )
+        );
+        assert!(
+            AUTOMATIC_PROTOCOL
+                .contains("client certificate and client private-key identity fields are present")
+        );
+        assert!(AUTOMATIC_PROTOCOL.contains("exact 10 input and 2 output token records"));
+        assert!(AUTOMATIC_PROTOCOL.contains("sustained synthetic Codex-shaped OTLP/HTTP JSON"));
+        assert!(AUTOMATIC_PROTOCOL.contains("after the real Codex gate passes"));
+        assert!(AUTOMATIC_PROTOCOL.contains("HTML generatedSpans parity"));
+        assert!(AUTOMATIC_PROTOCOL.contains("not mTLS"));
+        assert!(!AUTOMATIC_PROTOCOL.contains("launchd kickstart recovery"));
+        assert!(
+            AUTOMATIC_PROTOCOL
+                .contains("separately verified built agent-observability codex-notify")
+        );
+        assert!(!AUTOMATIC_PROTOCOL.contains("external_network_bytes_required"));
+    }
+
+    #[test]
+    fn automatic_protocol_rejects_profile_and_threshold_mutations() {
+        for (name, original, replacement) in [
+            ("release runs", "    runs: 5\n", "    runs: 6\n"),
+            ("smoke runs", "    runs: 1\n", "    runs: 2\n"),
+            (
+                "release warmup",
+                "    warmup_seconds: 60\n",
+                "    warmup_seconds: 61\n",
+            ),
+            (
+                "release idle",
+                "    idle_seconds: 900\n",
+                "    idle_seconds: 901\n",
+            ),
+            (
+                "release request count",
+                "    synthetic_otlp_requests: 10000\n",
+                "    synthetic_otlp_requests: 9999\n",
+            ),
+            (
+                "smoke request count",
+                "    synthetic_otlp_requests: 25\n",
+                "    synthetic_otlp_requests: 24\n",
+            ),
+            (
+                "release request cadence",
+                "    synthetic_otlp_inter_request_ms: 3\n",
+                "    synthetic_otlp_inter_request_ms: 4\n",
+            ),
+            (
+                "release sample interval",
+                "    sample_interval_seconds: 1\n",
+                "    sample_interval_seconds: 2\n",
+            ),
+            (
+                "build timeout",
+                "  build_timeout_seconds: 600\n",
+                "  build_timeout_seconds: 601\n",
+            ),
+            (
+                "release active timeout",
+                "    active_timeout_seconds: 300\n",
+                "    active_timeout_seconds: 301\n",
+            ),
+            (
+                "smoke active timeout",
+                "    active_timeout_seconds: 15\n",
+                "    active_timeout_seconds: 16\n",
+            ),
+            (
+                "request timeout",
+                "    command_timeout_seconds: 1\n",
+                "    command_timeout_seconds: 2\n",
+            ),
+            (
+                "startup timeout",
+                "  startup_timeout_seconds: 10\n",
+                "  startup_timeout_seconds: 11\n",
+            ),
+            (
+                "cleanup timeout",
+                "  cleanup_timeout_seconds: 5\n",
+                "  cleanup_timeout_seconds: 6\n",
+            ),
+            (
+                "synthetic latency scope",
+                "    validation_scope: diagnostic only unless a versioned collector SLO is calibrated; foreground hook latency remains governed by local-performance-v1\n",
+                "    validation_scope: release threshold\n",
+            ),
+            (
+                "idle CPU",
+                "    idle_average_percent_max: 0.5\n",
+                "    idle_average_percent_max: 0.6\n",
+            ),
+            (
+                "active CPU",
+                "    active_integrated_percent_max: 100\n",
+                "    active_integrated_percent_max: 99\n",
+            ),
+            ("RSS", "    p95_mib_max: 96\n", "    p95_mib_max: 95\n"),
+            (
+                "peak RSS scope",
+                "    peak_reported_diagnostic_only: true\n",
+                "    peak_reported_diagnostic_only: false\n",
+            ),
+            (
+                "disk",
+                "    allocated_tree_bytes_max: 1073741824\n",
+                "    allocated_tree_bytes_max: 1073741823\n",
+            ),
+        ] {
+            let mutated = AUTOMATIC_PROTOCOL.replacen(original, replacement, 1);
+            assert_ne!(
+                mutated, AUTOMATIC_PROTOCOL,
+                "missing mutation fixture for {name}"
+            );
+            assert!(
+                validate_automatic_protocol(&mutated).is_err(),
+                "automatic protocol accepted mutated {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_protocol_rejects_unknown_structure() {
+        let mutated = AUTOMATIC_PROTOCOL.replacen(
+            "execution:\n",
+            "execution:\n  undocumented_timeout_seconds: 1\n",
+            1,
+        );
+
+        assert!(validate_automatic_protocol(&mutated).is_err());
+        assert!(
+            validate_automatic_protocol(&format!(
+                "{AUTOMATIC_PROTOCOL}\n---\nschema_version: shadow\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn automatic_release_profile_requires_macos() {
+        validate_automatic_profile_host(Profile::Release, "macos").unwrap();
+        assert!(validate_automatic_profile_host(Profile::Release, "linux").is_err());
+        validate_automatic_profile_host(Profile::Smoke, "linux").unwrap();
+    }
+
+    #[test]
+    fn automatic_synthetic_latency_is_diagnostic() {
+        let mut bad = vec![1; 94];
+        bad.extend([21_000; 6]);
+        let result = automatic_result(1, bad);
+
+        validate_single_automatic(result).unwrap();
+    }
+
+    #[test]
+    fn automatic_cpu_limits_are_fail_closed() {
+        let mut idle = automatic_result(1, vec![1; 100]);
+        idle.idle_cpu_percent = 0.6;
+        assert!(
+            validate_single_automatic(idle)
+                .unwrap_err()
+                .contains("idle CPU")
+        );
+
+        let mut active = automatic_result(1, vec![1; 100]);
+        active.active_cpu_percent = 100.1;
+        assert!(
+            validate_single_automatic(active)
+                .unwrap_err()
+                .contains("active CPU")
+        );
+    }
+
+    #[test]
+    fn automatic_rss_limit_is_fail_closed() {
+        let mut result = automatic_result(1, vec![1; 100]);
+        result.rss_p95_kib = 96.0 * 1024.0 + 1.0;
+        result.peak_rss_kib = result.rss_p95_kib;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("RSS")
+        );
+    }
+
+    #[test]
+    fn automatic_peak_rss_is_diagnostic() {
+        let mut result = automatic_result(1, vec![1; 100]);
+        result.peak_rss_kib = 128.0 * 1024.0;
+
+        validate_single_automatic(result).unwrap();
+    }
+
+    #[test]
+    fn automatic_disk_limit_is_fail_closed() {
+        let mut result = automatic_result(1, vec![1; 100]);
+        result.peak_disk_bytes = 1_073_741_825;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("disk")
+        );
+    }
+
+    #[test]
+    fn automatic_rejections_are_fail_closed() {
+        let mut result = automatic_result(1, vec![1; 100]);
+        result.rejected_primary_requests = 1;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("rejected")
+        );
+    }
+
+    #[test]
+    fn automatic_incomplete_evidence_is_fail_closed() {
+        let mut result = automatic_result(1, vec![1; 100]);
+        result.accepted_primary_requests = 99;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("incomplete")
+        );
+    }
+
+    #[test]
+    fn automatic_report_convergence_is_fail_closed() {
+        let mut result = automatic_result(1, vec![1; 100]);
+        result.report_converged = false;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("report convergence")
+        );
+    }
+
+    #[test]
+    fn automatic_invalid_metrics_are_fail_closed() {
+        let mut result = automatic_result(1, vec![1; 100]);
+        result.peak_rss_kib = f64::NAN;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("non-finite or negative")
+        );
+    }
+
+    #[test]
+    fn automatic_manifest_reports_measured_bytes_and_loopback_separately() {
+        let results = vec![automatic_result(1, vec![1; 100])];
+        let mut config = automatic_config();
+        config.runs = 1;
+        let manifest = render_automatic_manifest(
+            config,
+            &host(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &results,
+            &[],
+            "pending-validation",
+        );
+
+        assert!(manifest.contains("collector_network_bytes_max: 321"));
+        assert!(manifest.contains("collector_network_bytes: 321"));
+        assert!(manifest.contains("network_monitor_samples: 2"));
+        assert!(manifest.contains("all_observed_endpoints_loopback: true"));
+        assert!(manifest.contains("release_readiness: pending"));
+        assert!(manifest.contains("real_codex_e2e_status: passed"));
+        assert!(!manifest.contains("external_network_bytes"));
+        validate_automatic_manifest_shape(&manifest).unwrap();
+        assert!(
+            validate_automatic_manifest_shape(
+                &manifest.replace("status: pending-validation", "status: unknown")
+            )
+            .is_err()
+        );
+        let passed = render_automatic_manifest(
+            config,
+            &host(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &results,
+            &[],
+            "pass",
+        );
+        assert!(passed.contains("release_readiness: verified"));
+        validate_automatic_manifest_shape(&passed).unwrap();
+
+        let missing_lifecycle = manifest.replace(
+            "  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n",
+            "",
+        );
+        assert!(validate_automatic_manifest_shape(&missing_lifecycle).is_err());
+
+        for private_key_evidence in [
+            "private_key: leaked",
+            "client-private-key.pem",
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+        ] {
+            assert!(
+                validate_automatic_manifest_shape(&format!("{manifest}\n{private_key_evidence}\n"))
+                    .is_err(),
+                "automatic manifest accepted private key evidence: {private_key_evidence}"
+            );
+        }
+    }
+
+    fn valid_automatic_release_manifest() -> String {
+        let config = AutomaticConfig::for_profile(Profile::Release);
+        let results = (1..=5)
+            .map(|run| {
+                let latencies = match run {
+                    1 => [vec![1; 9_500], vec![10; 500]].concat(),
+                    2 => [vec![2; 9_400], vec![3; 500], vec![20; 100]].concat(),
+                    _ => vec![1; 10_000],
+                };
+                let mut result = automatic_result(run, latencies);
+                result.report_generation = 20_001;
+                result.report_records = 20_001;
+                result
+            })
+            .collect::<Vec<_>>();
+        render_automatic_manifest(
+            config,
+            &host(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &results,
+            &[],
+            "pass",
+        )
+        .replacen(&format!("  os: {}", env::consts::OS), "  os: macos", 1)
+        .replacen(
+            "machine: sanitized-test-4-logical-core",
+            "machine: sanitized-aarch64-4-logical-core",
+            1,
+        )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn automatic_release_evidence_is_strictly_typed_and_run_scoped() {
+        let manifest = valid_automatic_release_manifest();
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let parsed = parse_automatic_manifest(&manifest).unwrap();
+        validate_automatic_release_evidence(&parsed, revision).unwrap();
+        assert_eq!(parsed.metrics.synthetic_collector_otlp_p95_us, Some(3));
+        assert_eq!(parsed.metrics.synthetic_collector_otlp_p99_us, Some(10));
+
+        for accepted_host in [
+            manifest.replace("sanitized-aarch64", "sanitized-x86_64"),
+            manifest.replace("power_mode: ac", "power_mode: battery"),
+            manifest.replace(
+                "filesystem: testfs",
+                &format!("filesystem: {}", "f".repeat(64)),
+            ),
+        ] {
+            let evidence = parse_automatic_manifest(&accepted_host).unwrap();
+            validate_automatic_release_evidence(&evidence, revision).unwrap();
+        }
+
+        for malformed in [
+            manifest.replacen("status: pass", "status: pass\nstatus: failed", 1),
+            format!("{manifest}unknown_top_level: true\n"),
+            manifest.replacen(
+                "    report_generation: 20001",
+                "    report_generation: 20001\n    report_generation: 20001",
+                1,
+            ),
+            manifest.replacen("  - run: 5", "  - run: 4", 1),
+            manifest.replacen("report_generation: 20001", "report_generation: 200010", 1),
+            manifest.replacen("rss_samples: 100", "rss_samples: NaN", 1),
+            manifest.replacen("    report_records: 20001", "report_records: 20001", 1),
+            manifest.replacen(
+                "collector_rss_samples_min: 100",
+                "collector_rss_samples_min: 101",
+                1,
+            ),
+            manifest.replacen(
+                "machine: sanitized-aarch64-4-logical-core",
+                "machine: sanitized-aarch64-5-logical-core",
+                1,
+            ),
+            manifest.replacen(
+                "machine: sanitized-aarch64-4-logical-core",
+                "machine: sanitized-riscv64-4-logical-core",
+                1,
+            ),
+            manifest
+                .replacen(
+                    "machine: sanitized-aarch64-4-logical-core",
+                    "machine: sanitized-aarch64-0-logical-core",
+                    1,
+                )
+                .replacen("logical_cores: 4", "logical_cores: 0", 1),
+            manifest.replacen(
+                "machine: sanitized-aarch64-4-logical-core",
+                "machine: sanitized-aarch64-many-logical-core",
+                1,
+            ),
+            manifest.replacen("filesystem: testfs", "filesystem: /Users/private", 1),
+            manifest.replacen(
+                "filesystem: testfs",
+                &format!("filesystem: {}", "f".repeat(65)),
+                1,
+            ),
+            manifest.replacen("power_mode: ac", "power_mode: unknown", 1),
+            manifest.replacen(
+                "synthetic_collector_otlp_p95_us: 3",
+                "synthetic_collector_otlp_p95_us: 4",
+                1,
+            ),
+            manifest.replacen(
+                "synthetic_collector_otlp_p99_us: 10",
+                "synthetic_collector_otlp_p99_us: 11",
+                1,
+            ),
+            manifest.replacen(
+                "collector_rss_p95_kib_max: 1",
+                "collector_rss_p95_kib_max: 2",
+                1,
+            ),
+            manifest.replacen("    rss_p95_kib: 1", "    rss_p95_kib: 2", 1),
+            manifest.replacen(
+                "    synthetic_collector_otlp_p95_us: 1",
+                "    synthetic_collector_otlp_p95_us: 11",
+                1,
+            ),
+            manifest.replacen(
+                "    synthetic_collector_otlp_p99_us: 10",
+                "    synthetic_collector_otlp_p99_us: 9",
+                1,
+            ),
+        ] {
+            let rejected = parse_automatic_manifest(&malformed)
+                .and_then(|evidence| validate_automatic_release_evidence(&evidence, revision));
+            assert!(
+                rejected.is_err(),
+                "accepted malformed evidence:\n{malformed}"
+            );
+        }
+        assert!(
+            validate_automatic_release_evidence(&parsed, &"f".repeat(40)).is_err(),
+            "accepted evidence for a different source revision"
+        );
+    }
+
+    #[test]
+    fn automatic_release_evidence_accepts_diagnostic_latency_over_foreground_budget() {
+        let config = AutomaticConfig::for_profile(Profile::Release);
+        let results = (1..=5)
+            .map(|run| {
+                let mut result = automatic_result(run, vec![75_000; 10_000]);
+                result.report_generation = 20_001;
+                result.report_records = 20_001;
+                result
+            })
+            .collect::<Vec<_>>();
+        let manifest = render_automatic_manifest(
+            config,
+            &host(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &results,
+            &[],
+            "pass",
+        )
+        .replacen(&format!("  os: {}", env::consts::OS), "  os: macos", 1)
+        .replacen(
+            "machine: sanitized-test-4-logical-core",
+            "machine: sanitized-aarch64-4-logical-core",
+            1,
+        );
+        let evidence = parse_automatic_manifest(&manifest).unwrap();
+
+        validate_automatic_release_evidence(&evidence, "0123456789abcdef0123456789abcdef01234567")
+            .unwrap();
+    }
+
+    #[test]
+    fn automatic_process_errors_are_content_free() {
+        let raw = "/Users/private/AUTOMATIC_CODEX_E2E_RAW_PROMPT_SENTINEL private-key.pem";
+        let automatic = vec!["perf".into(), "automatic".into()];
+        let evidence = vec!["evidence".into(), "validate-automatic".into()];
+        let local = vec!["perf".into(), "local".into()];
+        assert_eq!(
+            public_error_message(&automatic, raw),
+            "automatic_check_failed"
+        );
+        assert_eq!(
+            public_error_message(&evidence, raw),
+            "automatic_evidence_validation_failed"
+        );
+        assert_eq!(public_error_message(&local, raw), raw);
+    }
+
+    #[test]
+    fn automatic_lifecycle_failures_use_content_free_stage_codes() {
+        for (error, code) in [
+            (
+                "lifecycle preflight: automatic lifecycle requires codex-cli 0.151.0, found private",
+                "code=lifecycle_codex_version_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle Codex config stage failed",
+                "code=lifecycle_codex_config_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle real Codex stage failed",
+                "code=lifecycle_codex_e2e_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle setup stage failed",
+                "code=lifecycle_setup_failed",
+            ),
+        ] {
+            assert_eq!(automatic_evidence_error_code(error), code);
+            assert!(!code.contains("private"));
+        }
+    }
+
+    #[test]
+    fn automatic_manifest_metadata_is_relative_and_content_free() {
+        let metadata = automatic_manifest_metadata(
+            Path::new("docs/evidence/local/performance/automatic-123/manifest.yaml"),
+            Profile::Release,
+            "failed",
+        )
+        .unwrap();
+        assert_eq!(
+            metadata,
+            "manifest=docs/evidence/local/performance/automatic-123/manifest.yaml\nprofile=release\nstatus=failed"
+        );
+        assert!(!metadata.contains("AUTOMATIC_RAW_PROMPT_SENTINEL"));
+        assert!(
+            automatic_manifest_metadata(
+                Path::new("/Users/private/AUTOMATIC_RAW_PROMPT_SENTINEL/manifest.yaml"),
+                Profile::Release,
+                "failed"
+            )
+            .is_err()
+        );
+        assert!(
+            automatic_manifest_metadata(
+                Path::new("docs/evidence/local/performance/automatic-123/manifest.yaml"),
+                Profile::Release,
+                "pending"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn preserved_smoke_evidence_survives_cleanup_drop() {
+        let root = env::temp_dir().join(format!(
+            "automatic-preserved-smoke-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        {
+            let mut cleanup = DirectoryCleanup::new(root.clone(), "preserved smoke evidence");
+            cleanup.preserve();
+        }
+
+        assert!(root.is_dir());
+        fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn automatic_failure_manifest_without_completed_runs_retains_shape() {
+        let (results, mut errors) = collect_automatic_run_results(
+            automatic_config(),
+            Path::new("unused-after-lifecycle-failure"),
+            Path::new("unused-after-lifecycle-failure"),
+            Err("synthetic preflight failure".into()),
+        );
+        let validation = validate_automatic_results(automatic_config(), &results, &errors);
+        errors.push(format!("validation: {}", validation.unwrap_err()));
+        let manifest = render_automatic_manifest(
+            automatic_config(),
+            &host(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &results,
+            &errors,
+            "failed",
+        );
+        let root = env::temp_dir().join(format!(
+            "automatic-zero-run-failure-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let manifest_path = root.join("manifest.yaml");
+        fs::write(&manifest_path, &manifest).unwrap();
+        let retained = fs::read_to_string(&manifest_path).unwrap();
+
+        assert!(retained.contains("status: failed"));
+        assert!(retained.contains("release_readiness: not_verified"));
+        assert!(retained.contains("real_codex_e2e_status: failed"));
+        assert!(retained.contains("real_codex_e2e_release_gate: failed-lifecycle-preflight"));
+        assert!(!retained.contains("real_codex_e2e_release_gate: passed-actual-codex"));
+        assert!(retained.contains("collector_rss_samples_min: null"));
+        assert!(retained.contains("collector_rss_observed_max_gap_ms: null"));
+        assert!(retained.contains("code=lifecycle_preflight_failed"));
+        assert!(!retained.contains("synthetic preflight failure"));
+        validate_automatic_manifest_shape(&retained).unwrap();
+        assert!(
+            validate_automatic_manifest_shape(&retained.replace(
+                "release_readiness: not_verified",
+                "release_readiness: verified"
+            ))
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn specific_lifecycle_failures_render_valid_failed_manifests() {
+        for failure in [
+            "automatic lifecycle requires codex-cli 0.151.0, found private",
+            "automatic lifecycle Codex config stage failed",
+            "automatic lifecycle real Codex stage failed",
+            "automatic lifecycle setup stage failed",
+        ] {
+            let manifest = render_automatic_manifest(
+                automatic_config(),
+                &host(),
+                "0123456789abcdef0123456789abcdef01234567",
+                &[],
+                &[format!("lifecycle preflight: {failure}")],
+                "failed",
+            );
+            let parsed = validate_automatic_manifest_shape(&manifest).unwrap();
+            assert_eq!(parsed.real_codex_e2e_status, "failed");
+            assert_eq!(
+                parsed.workload.real_codex_e2e_release_gate,
+                "failed-lifecycle-preflight"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_failure_manifest_never_retains_raw_diagnostics() {
+        let errors = vec![
+            "lifecycle preflight: /Users/private/project prompt response stderr".into(),
+            "run 1: /private/var/runtime collector output".into(),
+            "validation: /home/runner/work/private-key.pem".into(),
+            "cleanup: /var/folders/private".into(),
+            "unexpected raw diagnostic".into(),
+        ];
+        let manifest = render_automatic_manifest(
+            automatic_config(),
+            &host(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &[],
+            &errors,
+            "failed",
+        );
+
+        for code in [
+            "code=lifecycle_preflight_failed",
+            "code=benchmark_run_failed",
+            "code=evidence_validation_failed",
+            "code=cleanup_failed",
+            "code=automatic_check_failed",
+        ] {
+            assert!(manifest.contains(code));
+        }
+        for raw in [
+            "/Users/private",
+            "/private/var",
+            "/home/runner",
+            "/var/folders",
+            "prompt response stderr",
+            "collector output",
+            "private-key.pem",
+            "unexpected raw diagnostic",
+        ] {
+            assert!(!manifest.contains(raw), "manifest retained {raw}");
+        }
+        validate_automatic_manifest_shape(&manifest).unwrap();
+    }
+
+    #[test]
+    fn automatic_notify_privacy_scan_rejects_raw_sentinels_anywhere_in_durable_tree() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("agent-observability-notify-scan-{stamp}"));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("projected.bin"), b"privacy-safe projection").unwrap();
+        assert_automatic_notify_sentinels_absent(&root).unwrap();
+
+        fs::write(
+            nested.join("leaked.bin"),
+            b"prefix AUTOMATIC_RAW_PROMPT_SENTINEL suffix",
+        )
+        .unwrap();
+        assert!(assert_automatic_notify_sentinels_absent(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn automatic_codex_privacy_scan_rejects_each_isolated_sentinel() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("agent-observability-codex-scan-{stamp}"));
+        fs::create_dir_all(&root).unwrap();
+        for (index, sentinel) in [
+            AUTOMATIC_CODEX_E2E_PROMPT_SENTINEL.as_bytes(),
+            AUTOMATIC_CODEX_E2E_RESPONSE_SENTINEL.as_bytes(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = root.join(format!("leaked-{index}.bin"));
+            fs::write(&path, sentinel).unwrap();
+            assert!(assert_tree_excludes_bytes(&root, &[sentinel]).is_err());
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_codex_fixture_uses_the_scanned_response_sentinel() {
+        let response = local_codex_sse_response();
+        assert!(response.contains(AUTOMATIC_CODEX_E2E_RESPONSE_SENTINEL));
+        assert!(!response.contains("__AGENTOBS_RESPONSE_SENTINEL__"));
+    }
+
+    #[test]
+    fn approved_ipv4_loopback_network_surfaces_pass() {
+        validate_network_file(
+            Path::new("crates/local-collector/src/lib.rs"),
+            "use std::net::{Ipv4Addr, TcpStream}; use tokio::net::TcpListener; \
+             TcpListener::bind(Ipv4Addr::LOCALHOST); https://127.0.0.1:4318/v1/logs",
+        )
+        .unwrap();
+        validate_network_file(
+            Path::new("crates/codex-integration/src/lib.rs"),
+            "use std::net::{Ipv4Addr, TcpStream}; \
+             TcpStream::connect((Ipv4Addr::LOCALHOST, 4318));",
+        )
+        .unwrap();
+        validate_network_file(
+            Path::new("crates/local-ui/src/lib.rs"),
+            "use hyper::server; use std::net::Ipv4Addr; \
+             use tokio::net::TcpListener; TcpListener::bind(Ipv4Addr::LOCALHOST);",
+        )
+        .unwrap();
+        validate_network_surface().unwrap();
+    }
+
+    #[test]
+    fn network_surface_rejects_external_destinations_and_clients() {
+        let collector = Path::new("crates/local-collector/src/lib.rs");
+        for body in [
+            "use reqwest::Client; Ipv4Addr::LOCALHOST;",
+            "use std::net::{Ipv4Addr, TcpStream}; Ipv4Addr::LOCALHOST; \
+             https://collector.example.com/v1/logs",
+            "use std::net::{Ipv4Addr, TcpStream}; Ipv4Addr::LOCALHOST; \
+             TeamIngestEnvelope",
+            "use std::net::{Ipv4Addr, TcpStream}; Ipv4Addr::UNSPECIFIED;",
+        ] {
+            assert!(validate_network_file(collector, body).is_err(), "{body}");
+        }
+        let unapproved = Path::new("crates/application/src/lib.rs");
+        for body in [
+            "use std::net::TcpStream;",
+            "use hyper::server;",
+            "use tokio::runtime;",
+        ] {
+            assert!(validate_network_file(unapproved, body).is_err(), "{body}");
+        }
+    }
+
     #[test]
     fn missing_metric_fails_closed() {
         assert!(
@@ -3078,6 +7488,20 @@ mod tests {
         assert!(validate_results(c(), &pair(enabled(0.1, 0.1, 100_000.0, 1, 0)), &[]).is_err());
     }
     #[test]
+    fn rss_peak_does_not_inflate_rss_p95() {
+        let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
+        results[1].samples.push(s(
+            "active",
+            Some(0.1),
+            Some(128.0 * 1024.0),
+            Some(1),
+            Some(0),
+        ));
+        results[1].peak_rss_kib = 128.0 * 1024.0;
+
+        validate_results(c(), &results, &[]).unwrap();
+    }
+    #[test]
     fn disk_threshold() {
         assert!(
             validate_results(c(), &pair(enabled(0.1, 0.1, 1.0, 1_073_741_825, 0)), &[]).is_err()
@@ -3086,8 +7510,35 @@ mod tests {
     #[test]
     fn latency_threshold() {
         let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
-        results[1].latencies_us = vec![30_000];
+        results[1].latencies_us = [vec![1; 94], vec![30_000; 6]].concat();
         assert!(validate_results(c(), &results, &[]).is_err());
+    }
+    #[test]
+    fn one_foreground_latency_outlier_does_not_inflate_quantiles() {
+        let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
+        results[1].latencies_us = [vec![1; 98], vec![30_000]].concat();
+
+        validate_results(c(), &results, &[]).unwrap();
+    }
+    #[test]
+    fn foreground_p99_threshold_is_independent_of_p95() {
+        let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
+        results[1].latencies_us = [vec![1; 98], vec![51_000; 2]].concat();
+
+        assert!(validate_results(c(), &results, &[]).is_err());
+    }
+    #[test]
+    fn foreground_latency_gate_is_independent_of_sample_order() {
+        for latencies in [
+            [vec![51_000; 2], vec![1; 98]].concat(),
+            [vec![1; 49], vec![51_000; 2], vec![1; 49]].concat(),
+            [vec![1; 98], vec![51_000; 2]].concat(),
+        ] {
+            let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
+            results[1].latencies_us = latencies;
+
+            assert!(validate_results(c(), &results, &[]).is_err());
+        }
     }
     #[test]
     fn network_threshold() {
