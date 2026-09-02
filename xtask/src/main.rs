@@ -1280,16 +1280,26 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
             fs::write(&manifest_path, failed)
                 .map_err(|error| format!("finalize automatic cleanup failure: {error}"))?;
         }
+        println!(
+            "manifest={}\nprofile={}\nstatus=failed",
+            manifest_path.display(),
+            profile_name(config.profile)
+        );
         return Err(format!(
             "automatic performance cleanup failed: {cleanup_error}"
         ));
     }
-    validation.map_err(|error| {
-        format!(
+    if let Err(error) = validation {
+        println!(
+            "manifest={}\nprofile={}\nstatus=failed",
+            manifest_path.display(),
+            profile_name(config.profile)
+        );
+        return Err(format!(
             "automatic performance check failed; manifest: {}: {error}",
             manifest_path.display()
-        )
-    })?;
+        ));
+    }
     if config.profile == Profile::Release {
         let passed =
             render_automatic_manifest(config, &host, &source_revision, &results, &errors, "pass");

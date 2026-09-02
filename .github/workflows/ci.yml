@@ -119,14 +119,21 @@ jobs:
           cargo +1.97.0 build --release --locked -p agent-observability-cli
           binary="$PWD/target/release/agent-observability"
           test "$("$binary" --version)" = "1.8.0"
+          set +e
           cargo +1.97.0 run --locked -p xtask -- perf automatic --profile release --check \
             --binary "$binary" | tee "$RUNNER_TEMP/automatic-release-evidence.out"
+          gate_status=${PIPESTATUS[0]}
+          set -e
           manifest="$(sed -n 's/^manifest=//p' "$RUNNER_TEMP/automatic-release-evidence.out")"
           test -f "$manifest"
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+          if (( gate_status != 0 )); then
+            exit "$gate_status"
+          fi
           cargo +1.97.0 run --locked -p xtask -- evidence validate-automatic "$manifest" \
             --source-revision "$GITHUB_SHA"
-          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
       - name: Upload exact-revision automatic release evidence
+        if: always() && steps.evidence.outputs.manifest != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: automatic-release-evidence-${{ github.sha }}

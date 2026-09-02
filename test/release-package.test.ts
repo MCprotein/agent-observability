@@ -114,6 +114,14 @@ test("release workflow pins actions and uses the tested publication state machin
     /publish:[\s\S]*needs:[\s\S]*- build[\s\S]*- automatic-release-evidence/,
   );
   assert.match(ciWorkflow, /if: github\.event_name == 'workflow_dispatch'/);
+  assert.match(
+    ciWorkflow,
+    /gate_status=\$\{PIPESTATUS\[0\]\}[\s\S]*echo "manifest=\$manifest" >> "\$GITHUB_OUTPUT"[\s\S]*exit "\$gate_status"/,
+  );
+  assert.match(
+    ciWorkflow,
+    /Upload exact-revision automatic release evidence[\s\S]*if: always\(\) && steps\.evidence\.outputs\.manifest != ''/,
+  );
   assert.match(ciWorkflow, /--source-revision "\$GITHUB_SHA"/);
   assert.match(
     ciWorkflow,
