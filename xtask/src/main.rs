@@ -6796,6 +6796,7 @@ mod tests {
             &[],
             "pass",
         )
+        .replacen(&format!("  os: {}", env::consts::OS), "  os: macos", 1)
     }
 
     #[test]
