@@ -114,9 +114,9 @@ collector whose durable report is pending or whose bounded report refresh retrie
 Connect refuses conflicting pre-existing OTEL values unless they match exactly; an unrelated pre-existing notify is not a conflict.
 Before changing the file, it stores the exact prior and connected bytes, hashes, existence, permission modes
 and transaction phase in `runtime/integrations/codex/codex-config-ownership-v1.json` with private permissions.
-A lock scoped to the canonical Codex config path serializes supported lifecycle writers. Repeated exact-state
-comparison before temp-file fsync/atomic rename detects observed external edits without displacing the canonical
-file. This is not a portable filesystem CAS against an arbitrary process that ignores the lock and writes through
+A lock scoped to the canonical Codex config path serializes supported lifecycle writers. After the temporary file
+is synced, repeated exact-state comparison before atomic rename detects observed external edits without displacing
+the canonical file. This is not a portable filesystem CAS against an arbitrary process that ignores the lock and writes through
 an already-open descriptor in the final check/rename interval. Prepared and restoring snapshots recover deterministically on
 the next lifecycle command after a process crash.
 
