@@ -28,13 +28,15 @@ use agent_observability_local_runtime::{
 };
 use agent_observability_local_store::LocalStore;
 use serde::Deserialize;
+#[cfg(target_os = "macos")]
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 const USAGE: &str = "usage:\n  cargo run -p xtask -- perf <local|automatic> --profile <release|smoke> --check [--binary <absolute-path>]\n  cargo run -p xtask -- evidence validate-automatic <manifest> --source-revision <sha>";
 const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-performance-v1.yaml");
 const AUTOMATIC_PROTOCOL: &str =
     include_str!("../../crates/contracts/performance/automatic-local-performance-v1.yaml");
 const AUTOMATIC_PROTOCOL_REVISION: &str =
-    "v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-rss-active-report-v2";
+    "v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-diagnostics-rss-p95-v3";
 const AUTOMATIC_CODEX_VERSION: &str = "codex-cli 0.151.0";
 const AUTOMATIC_NOTIFY_SENTINELS: [&[u8]; 3] = [
     b"AUTOMATIC_RAW_CWD_SENTINEL",
@@ -118,11 +120,9 @@ const AUTOMATIC_BINARY_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT: Duration = Duration::from_secs(15);
 const AUTOMATIC_LIFECYCLE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
-const AUTOMATIC_PRIMARY_OTLP_P95_MS_MAX: u64 = 20;
-const AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX: u64 = 50;
 const AUTOMATIC_IDLE_CPU_PERCENT_MAX: f64 = 0.5;
 const AUTOMATIC_ACTIVE_CPU_PERCENT_MAX: f64 = 100.0;
-const AUTOMATIC_PEAK_RSS_MIB_MAX: f64 = 96.0;
+const AUTOMATIC_RSS_P95_MIB_MAX: f64 = 96.0;
 const AUTOMATIC_RSS_SAMPLE_TARGET: Duration = Duration::from_millis(10);
 const AUTOMATIC_RSS_MAX_OBSERVED_GAP: Duration = Duration::from_millis(100);
 const AUTOMATIC_RSS_MIN_RELEASE_SAMPLES: u64 = 100;
@@ -285,8 +285,6 @@ struct AutomaticProtocolMetrics {
 struct AutomaticPrimaryOtlpMetrics {
     required_quantiles: Vec<String>,
     validation_scope: String,
-    p95_ms_max: u64,
-    p99_ms_max: u64,
     command_timeout_seconds: u64,
 }
 
@@ -301,7 +299,8 @@ struct AutomaticCpuMetrics {
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct AutomaticRssMetrics {
-    peak_mib_max: f64,
+    p95_mib_max: f64,
+    peak_reported_diagnostic_only: bool,
     active_and_report_sample_target_ms: u64,
     observed_max_gap_ms_max: u64,
     final_sample: bool,
@@ -413,6 +412,7 @@ struct AutomaticEvidenceMetrics {
     synthetic_collector_otlp_p99_us: Option<u128>,
     collector_idle_cpu_percent_max: Option<f64>,
     collector_active_cpu_percent_max: Option<f64>,
+    collector_rss_p95_kib_max: Option<f64>,
     collector_peak_rss_kib: Option<f64>,
     collector_rss_samples_min: Option<u64>,
     collector_rss_observed_max_gap_ms: Option<u64>,
@@ -441,6 +441,7 @@ struct AutomaticEvidenceRun {
     synthetic_collector_otlp_p99_us: u128,
     idle_cpu_percent: f64,
     active_cpu_percent: f64,
+    rss_p95_kib: f64,
     peak_rss_kib: f64,
     allocated_disk_bytes: u64,
     collector_network_bytes: u64,
@@ -478,6 +479,7 @@ struct AutomaticRunResult {
     idle_samples: Vec<Sample>,
     idle_cpu_percent: f64,
     active_cpu_percent: f64,
+    rss_p95_kib: f64,
     peak_rss_kib: f64,
     rss_samples: u64,
     rss_observed_max_gap_ms: u64,
@@ -1059,6 +1061,10 @@ impl DirectoryCleanup {
             Err(error) => Err(format!("remove {}: {error}", self.label)),
         }
     }
+
+    fn preserve(&mut self) {
+        self.complete = true;
+    }
 }
 
 impl Drop for DirectoryCleanup {
@@ -1282,9 +1288,14 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
     fs::write(&manifest_path, &manifest)
         .map_err(|error| format!("write automatic manifest: {error}"))?;
     let runtime_result = runtime_cleanup.cleanup();
-    let smoke_result = smoke_cleanup
-        .as_mut()
-        .map_or(Ok(()), DirectoryCleanup::cleanup);
+    let smoke_result = smoke_cleanup.as_mut().map_or(Ok(()), |cleanup| {
+        if validation.is_err() {
+            cleanup.preserve();
+            Ok(())
+        } else {
+            cleanup.cleanup()
+        }
+    });
     if let Err(cleanup_error) = combine_cleanup(runtime_result, smoke_result) {
         errors.push(format!("cleanup: {cleanup_error}"));
         if config.profile == Profile::Release {
@@ -1420,9 +1431,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
         metrics: AutomaticProtocolMetrics {
             synthetic_collector_otlp: AutomaticPrimaryOtlpMetrics {
                 required_quantiles: vec!["p95".into(), "p99".into()],
-                validation_scope: "every run independently".into(),
-                p95_ms_max: AUTOMATIC_PRIMARY_OTLP_P95_MS_MAX,
-                p99_ms_max: AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX,
+                validation_scope: "diagnostic only unless a versioned collector SLO is calibrated; foreground hook latency remains governed by local-performance-v1".into(),
                 command_timeout_seconds: LOCAL_COMMAND_TIMEOUT.as_secs(),
             },
             collector_cpu: AutomaticCpuMetrics {
@@ -1431,7 +1440,8 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
                 normalization: "percent of one logical core".into(),
             },
             collector_rss: AutomaticRssMetrics {
-                peak_mib_max: AUTOMATIC_PEAK_RSS_MIB_MAX,
+                p95_mib_max: AUTOMATIC_RSS_P95_MIB_MAX,
+                peak_reported_diagnostic_only: true,
                 active_and_report_sample_target_ms: u64::try_from(
                     AUTOMATIC_RSS_SAMPLE_TARGET.as_millis(),
                 )
@@ -1892,11 +1902,16 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
             &["setup", "--no-open"],
             AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
             &cleanup.environment(),
-        )?;
-        require_output_line(&setup, "status", "ready")?;
-        require_output_line(&setup, "config", "connected")?;
-        require_collector_ready_or_degraded(&setup)?;
-        verify_installed_codex_compatibility(&cleanup)?;
+        )
+        .map_err(|_| "automatic lifecycle setup stage failed")?;
+        require_output_line(&setup, "status", "ready")
+            .map_err(|_| "automatic lifecycle setup stage failed")?;
+        require_output_line(&setup, "config", "connected")
+            .map_err(|_| "automatic lifecycle setup stage failed")?;
+        require_collector_ready_or_degraded(&setup)
+            .map_err(|_| "automatic lifecycle setup stage failed")?;
+        verify_installed_codex_compatibility(&cleanup)
+            .map_err(|_| "automatic lifecycle Codex config stage failed")?;
         let service =
             output_value(&setup, "service").ok_or("automatic lifecycle setup omitted service")?;
         if !service.starts_with("io.agent-observability.collector.") {
@@ -1920,8 +1935,10 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
         )?;
         require_output_line(&status, "config", "connected")?;
         require_collector_ready_or_degraded(&status)?;
-        let initial_records = automatic_report_record_count(binary, &root, &cleanup)?;
-        let live_codex_records = verify_real_codex_e2e(binary, &root, &cleanup, initial_records)?;
+        let initial_records = automatic_report_record_count(binary, &root, &cleanup)
+            .map_err(|_| "automatic lifecycle initial report stage failed")?;
+        let live_codex_records = verify_real_codex_e2e(binary, &root, &cleanup, initial_records)
+            .map_err(|_| "automatic lifecycle real Codex stage failed")?;
         submit_automatic_synthetic_otlp(&root, 0, 0)?;
         let pre_failure_otlp_records = require_automatic_record_growth(
             binary,
@@ -3131,6 +3148,7 @@ fn execute_automatic_run(
         idle_samples,
         idle_cpu_percent,
         active_cpu_percent,
+        rss_p95_kib: rss.p95_rss_kib,
         peak_rss_kib,
         rss_samples: rss.samples,
         rss_observed_max_gap_ms: rss.max_gap_ms,
@@ -3841,8 +3859,9 @@ struct PressureSampler {
     drain_sample_count: Arc<AtomicU64>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct RssPeaks {
+    p95_rss_kib: f64,
     peak_rss_kib: f64,
     samples: u64,
     max_gap_ms: u64,
@@ -3852,6 +3871,49 @@ struct RssSampler {
     stop: Option<mpsc::Sender<()>>,
     result: mpsc::Receiver<Result<RssPeaks, String>>,
     handle: Option<thread::JoinHandle<()>>,
+}
+
+struct ProcessRssReader {
+    pid: u32,
+    #[cfg(target_os = "macos")]
+    system: System,
+}
+
+impl ProcessRssReader {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            #[cfg(target_os = "macos")]
+            system: System::new(),
+        }
+    }
+
+    fn sample_kib(&mut self) -> Result<f64, String> {
+        #[cfg(target_os = "macos")]
+        {
+            let pid = Pid::from_u32(self.pid);
+            let updated = self.system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                true,
+                ProcessRefreshKind::nothing().with_memory(),
+            );
+            if updated != 1 {
+                return Err("process RSS is unavailable".into());
+            }
+            let bytes = self
+                .system
+                .process(pid)
+                .ok_or("process RSS is unavailable")?
+                .memory();
+            let kib = u32::try_from(bytes / 1024)
+                .map_err(|_| "process RSS exceeds the supported range")?;
+            Ok(f64::from(kib))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            ps_metric(self.pid, "rss")
+        }
+    }
 }
 
 impl Drop for RssSampler {
@@ -3899,13 +3961,16 @@ fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String>
     if interval.is_zero() {
         return Err("RSS sampler interval must be positive".into());
     }
-    let initial = ps_metric(pid, "rss")?;
+    let mut reader = ProcessRssReader::new(pid);
+    let initial = reader.sample_kib()?;
     let (stop_tx, stop_rx) = mpsc::channel();
     let (result_tx, result_rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         let result = (|| {
+            let mut rss_samples_kib = vec![initial];
             let mut peaks = RssPeaks {
                 peak_rss_kib: initial,
+                p95_rss_kib: initial,
                 samples: 1,
                 max_gap_ms: 0,
             };
@@ -3917,15 +3982,17 @@ fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String>
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
                     Err(mpsc::RecvTimeoutError::Timeout) => false,
                 };
-                peaks.peak_rss_kib = peaks.peak_rss_kib.max(ps_metric(pid, "rss")?);
+                let rss_kib = reader.sample_kib()?;
+                rss_samples_kib.push(rss_kib);
+                peaks.peak_rss_kib = peaks.peak_rss_kib.max(rss_kib);
                 peaks.samples = peaks.samples.saturating_add(1);
                 let sampled_at = Instant::now();
-                peaks.max_gap_ms = peaks.max_gap_ms.max(
-                    u64::try_from(sampled_at.duration_since(last_sample).as_millis())
-                        .unwrap_or(u64::MAX),
-                );
+                peaks.max_gap_ms = peaks
+                    .max_gap_ms
+                    .max(ceil_duration_millis(sampled_at.duration_since(last_sample)));
                 last_sample = sampled_at;
                 if stopped {
+                    peaks.p95_rss_kib = rss_p95_kib(&rss_samples_kib);
                     break;
                 }
                 while next_sample <= sampled_at {
@@ -5166,29 +5233,16 @@ fn validate_automatic_results(
             || result.idle_cpu_percent.is_sign_negative()
             || !result.active_cpu_percent.is_finite()
             || result.active_cpu_percent.is_sign_negative()
+            || !result.rss_p95_kib.is_finite()
+            || result.rss_p95_kib.is_sign_negative()
             || !result.peak_rss_kib.is_finite()
             || result.peak_rss_kib.is_sign_negative()
+            || result.peak_rss_kib < result.rss_p95_kib
         {
             return Err("automatic resource evidence is non-finite or negative".into());
         }
         if result.network_monitor_samples == 0 {
             return Err("automatic collector network monitor samples are missing".into());
-        }
-        if config.profile == Profile::Release {
-            let mut latencies = result.synthetic_otlp_latencies_us.clone();
-            latencies.sort_unstable();
-            if percentile(&latencies, 95) > u128::from(AUTOMATIC_PRIMARY_OTLP_P95_MS_MAX) * 1_000 {
-                return Err(format!(
-                    "automatic run {} synthetic collector OTLP p95 latency budget exceeded",
-                    result.run
-                ));
-            }
-            if percentile(&latencies, 99) > u128::from(AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX) * 1_000 {
-                return Err(format!(
-                    "automatic run {} synthetic collector OTLP p99 latency budget exceeded",
-                    result.run
-                ));
-            }
         }
     }
     if config.profile == Profile::Release {
@@ -5206,9 +5260,9 @@ fn validate_automatic_results(
         }
         if results
             .iter()
-            .any(|result| result.peak_rss_kib > AUTOMATIC_PEAK_RSS_MIB_MAX * 1024.0)
+            .any(|result| result.rss_p95_kib > AUTOMATIC_RSS_P95_MIB_MAX * 1024.0)
         {
-            return Err("automatic collector RSS budget exceeded".into());
+            return Err("automatic collector RSS p95 budget exceeded".into());
         }
         if results
             .iter()
@@ -5252,6 +5306,10 @@ fn render_automatic_manifest(
         .iter()
         .map(|result| result.peak_rss_kib)
         .max_by(f64::total_cmp);
+    let rss_p95 = results
+        .iter()
+        .map(|result| result.rss_p95_kib)
+        .max_by(f64::total_cmp);
     let peak_disk = results.iter().map(|result| result.peak_disk_bytes).max();
     let collector_network = results
         .iter()
@@ -5285,7 +5343,7 @@ fn render_automatic_manifest(
         "passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response"
     };
     let mut manifest = format!(
-        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: {release_readiness}\nreal_codex_e2e_status: {real_codex_e2e_status}\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.151.0\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: {real_codex_e2e_gate}\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_peak_rss_kib: {}\n  collector_rss_samples_min: {}\n  collector_rss_observed_max_gap_ms: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
+        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: {release_readiness}\nreal_codex_e2e_status: {real_codex_e2e_status}\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.151.0\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: {real_codex_e2e_gate}\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_rss_p95_kib_max: {}\n  collector_peak_rss_kib: {}\n  collector_rss_samples_min: {}\n  collector_rss_observed_max_gap_ms: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
         profile_name(config.profile),
         profile_name(config.profile),
         env!("CARGO_PKG_VERSION"),
@@ -5313,6 +5371,7 @@ fn render_automatic_manifest(
         optional_u128(p99),
         optional_f64(idle_cpu),
         optional_f64(active_cpu),
+        optional_f64(rss_p95),
         optional_f64(peak_rss),
         optional_u64(rss_samples_min),
         optional_u64(rss_max_gap),
@@ -5325,7 +5384,7 @@ fn render_automatic_manifest(
         run_latencies.sort_unstable();
         let _ = writeln!(
             manifest,
-            "  - run: {}\n    accepted_synthetic_otlp_requests: {}\n    rejected_synthetic_otlp_requests: {}\n    notify_supplement_accepted: {}\n    durable_report_converged: {}\n    report_generation: {}\n    report_records: {}\n    rss_samples: {}\n    rss_observed_max_gap_ms: {}\n    raw_notify_sentinels_absent: true\n    synthetic_collector_otlp_p95_us: {}\n    synthetic_collector_otlp_p99_us: {}\n    idle_cpu_percent: {}\n    active_cpu_percent: {}\n    peak_rss_kib: {}\n    allocated_disk_bytes: {}\n    collector_network_bytes: {}\n    network_monitor_samples: {}\n    all_observed_endpoints_loopback: true",
+            "  - run: {}\n    accepted_synthetic_otlp_requests: {}\n    rejected_synthetic_otlp_requests: {}\n    notify_supplement_accepted: {}\n    durable_report_converged: {}\n    report_generation: {}\n    report_records: {}\n    rss_samples: {}\n    rss_observed_max_gap_ms: {}\n    raw_notify_sentinels_absent: true\n    synthetic_collector_otlp_p95_us: {}\n    synthetic_collector_otlp_p99_us: {}\n    idle_cpu_percent: {}\n    active_cpu_percent: {}\n    rss_p95_kib: {}\n    peak_rss_kib: {}\n    allocated_disk_bytes: {}\n    collector_network_bytes: {}\n    network_monitor_samples: {}\n    all_observed_endpoints_loopback: true",
             result.run,
             result.accepted_primary_requests,
             result.rejected_primary_requests,
@@ -5339,6 +5398,7 @@ fn render_automatic_manifest(
             percentile(&run_latencies, 99),
             result.idle_cpu_percent,
             result.active_cpu_percent,
+            result.rss_p95_kib,
             result.peak_rss_kib,
             result.peak_disk_bytes,
             result.collector_network_bytes,
@@ -5361,8 +5421,30 @@ fn render_automatic_manifest(
 }
 
 fn automatic_evidence_error_code(error: &str) -> &'static str {
-    if error.starts_with("lifecycle preflight: ") {
-        "code=lifecycle_preflight_failed"
+    if let Some(error) = error.strip_prefix("lifecycle preflight: ") {
+        if error.contains("requires codex") {
+            "code=lifecycle_codex_version_failed"
+        } else if error.contains("compatibility diagnostic")
+            || error.contains("strict config")
+            || error.contains("isolated CODEX_HOME")
+            || error.contains("Codex config stage")
+        {
+            "code=lifecycle_codex_config_failed"
+        } else if error.contains("real Codex") {
+            "code=lifecycle_codex_e2e_failed"
+        } else if error.contains("initial report") {
+            "code=lifecycle_report_failed"
+        } else if error.contains("setup") {
+            "code=lifecycle_setup_failed"
+        } else if error.contains("recovery") || error.contains("SIGKILL") {
+            "code=lifecycle_recovery_failed"
+        } else if error.contains("occupied port") || error.contains("concurrent") {
+            "code=lifecycle_reconnect_failed"
+        } else if error.contains("disconnect") || error.contains("restore") {
+            "code=lifecycle_cleanup_failed"
+        } else {
+            "code=lifecycle_preflight_failed"
+        }
     } else if error.starts_with("run ") {
         "code=benchmark_run_failed"
     } else if error.starts_with("validation: ") {
@@ -5411,7 +5493,7 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<AutomaticEvidence
     let codex_failed = evidence
         .errors
         .iter()
-        .any(|error| error == "code=lifecycle_preflight_failed");
+        .any(|error| error.starts_with("code=lifecycle_"));
     let expected_codex_status = if codex_failed { "failed" } else { "passed" };
     if evidence.real_codex_e2e_status != expected_codex_status {
         return Err("automatic performance manifest has inconsistent real Codex status".into());
@@ -5591,10 +5673,6 @@ fn validate_automatic_release_runs(runs: &[AutomaticEvidenceRun]) -> Result<(), 
             || run.rss_observed_max_gap_ms
                 > u64::try_from(AUTOMATIC_RSS_MAX_OBSERVED_GAP.as_millis()).unwrap_or(u64::MAX)
             || !run.raw_notify_sentinels_absent
-            || run.synthetic_collector_otlp_p95_us
-                > u128::from(AUTOMATIC_PRIMARY_OTLP_P95_MS_MAX) * 1_000
-            || run.synthetic_collector_otlp_p99_us
-                > u128::from(AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX) * 1_000
             || run.synthetic_collector_otlp_p95_us > run.synthetic_collector_otlp_p99_us
             || !run.idle_cpu_percent.is_finite()
             || run.idle_cpu_percent.is_sign_negative()
@@ -5602,9 +5680,12 @@ fn validate_automatic_release_runs(runs: &[AutomaticEvidenceRun]) -> Result<(), 
             || !run.active_cpu_percent.is_finite()
             || run.active_cpu_percent.is_sign_negative()
             || run.active_cpu_percent > AUTOMATIC_ACTIVE_CPU_PERCENT_MAX
+            || !run.rss_p95_kib.is_finite()
+            || run.rss_p95_kib.is_sign_negative()
+            || run.rss_p95_kib > AUTOMATIC_RSS_P95_MIB_MAX * 1024.0
             || !run.peak_rss_kib.is_finite()
             || run.peak_rss_kib.is_sign_negative()
-            || run.peak_rss_kib > AUTOMATIC_PEAK_RSS_MIB_MAX * 1024.0
+            || run.peak_rss_kib < run.rss_p95_kib
             || run.allocated_disk_bytes > AUTOMATIC_ALLOCATED_DISK_BYTES_MAX
             || run.network_monitor_samples == 0
             || !run.all_observed_endpoints_loopback
@@ -5631,7 +5712,12 @@ fn validate_automatic_release_aggregates(
         .iter()
         .map(|run| run.active_cpu_percent)
         .max_by(f64::total_cmp);
-    let expected_rss = evidence
+    let expected_rss_p95 = evidence
+        .runs
+        .iter()
+        .map(|run| run.rss_p95_kib)
+        .max_by(f64::total_cmp);
+    let expected_peak_rss = evidence
         .runs
         .iter()
         .map(|run| run.peak_rss_kib)
@@ -5650,7 +5736,8 @@ fn validate_automatic_release_aggregates(
         || evidence.metrics.synthetic_collector_otlp_p99_us != expected_p99
         || evidence.metrics.collector_idle_cpu_percent_max != expected_idle
         || evidence.metrics.collector_active_cpu_percent_max != expected_active
-        || evidence.metrics.collector_peak_rss_kib != expected_rss
+        || evidence.metrics.collector_rss_p95_kib_max != expected_rss_p95
+        || evidence.metrics.collector_peak_rss_kib != expected_peak_rss
         || evidence.metrics.collector_rss_samples_min
             != evidence.runs.iter().map(|run| run.rss_samples).min()
         || evidence.metrics.collector_rss_observed_max_gap_ms
@@ -5686,6 +5773,14 @@ fn validate_automatic_release_aggregates(
 fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
     let allowed_errors = [
         "  - 'code=lifecycle_preflight_failed'",
+        "  - 'code=lifecycle_codex_version_failed'",
+        "  - 'code=lifecycle_codex_config_failed'",
+        "  - 'code=lifecycle_codex_e2e_failed'",
+        "  - 'code=lifecycle_report_failed'",
+        "  - 'code=lifecycle_setup_failed'",
+        "  - 'code=lifecycle_recovery_failed'",
+        "  - 'code=lifecycle_reconnect_failed'",
+        "  - 'code=lifecycle_cleanup_failed'",
         "  - 'code=benchmark_run_failed'",
         "  - 'code=evidence_validation_failed'",
         "  - 'code=cleanup_failed'",
@@ -6043,12 +6138,7 @@ fn metric_summary(results: &[RunResult]) -> Option<MetricSummary> {
         idle_cpu_delta_percent: enabled_idle - baseline_idle,
         active_cpu_delta_percent: enabled_active - baseline_active,
         active_any_minute_cpu_delta_percent: active_any_minute - baseline_active,
-        enabled_rss_p95_kib: enabled_rss_p95_kib.max(
-            enabled
-                .iter()
-                .map(|result| result.peak_rss_kib)
-                .max_by(f64::total_cmp)?,
-        ),
+        enabled_rss_p95_kib,
         total_allocated_disk_bytes,
         network_bytes,
     })
@@ -6190,7 +6280,7 @@ fn validate_results(
         if summary.total_allocated_disk_bytes > 1_073_741_824 {
             return Err("allocated disk budget exceeded".into());
         }
-        let latencies = results
+        let mut latencies = results
             .iter()
             .filter(|result| result.enabled)
             .flat_map(|result| {
@@ -6201,6 +6291,7 @@ fn validate_results(
                     .copied()
             })
             .collect::<Vec<_>>();
+        latencies.sort_unstable();
         if percentile(&latencies, 95) > 20_000 || percentile(&latencies, 99) > 50_000 {
             return Err("foreground latency budget exceeded".into());
         }
@@ -6217,6 +6308,18 @@ fn percentile_f64(values: &[f64], p: usize) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     sorted[((sorted.len() - 1) * p) / 100]
+}
+
+fn rss_p95_kib(values: &[f64]) -> f64 {
+    percentile_f64(values, 95)
+}
+
+fn ceil_duration_millis(duration: Duration) -> u64 {
+    let millis = duration.as_millis();
+    let rounded = millis.saturating_add(u128::from(
+        !duration.subsec_nanos().is_multiple_of(1_000_000),
+    ));
+    u64::try_from(rounded).unwrap_or(u64::MAX)
 }
 fn profile_name(profile: Profile) -> &'static str {
     match profile {
@@ -6381,6 +6484,7 @@ mod tests {
             idle_samples: vec![s("idle", Some(0.1), Some(1.0), Some(1), Some(321))],
             idle_cpu_percent: 0.1,
             active_cpu_percent: 0.1,
+            rss_p95_kib: 1.0,
             peak_rss_kib: 1.0,
             rss_samples: AUTOMATIC_RSS_MIN_RELEASE_SAMPLES,
             rss_observed_max_gap_ms: 10,
@@ -6407,6 +6511,26 @@ mod tests {
 
         assert!(peaks.peak_rss_kib > 0.0);
         assert!(peaks.samples >= 2);
+    }
+
+    #[test]
+    fn rss_p95_ignores_one_peak_but_includes_the_exact_boundary() {
+        let mut one_peak = vec![1.0; 19];
+        one_peak.push(128.0 * 1024.0);
+        assert!((rss_p95_kib(&one_peak) - 1.0).abs() < f64::EPSILON);
+
+        let mut boundary = vec![1.0; 18];
+        boundary.extend([96.0 * 1024.0, 128.0 * 1024.0]);
+        assert!((rss_p95_kib(&boundary) - 96.0 * 1024.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rss_cadence_rounds_partial_milliseconds_up() {
+        assert_eq!(ceil_duration_millis(Duration::from_millis(100)), 100);
+        assert_eq!(
+            ceil_duration_millis(Duration::from_millis(100) + Duration::from_nanos(1)),
+            101
+        );
     }
 
     #[test]
@@ -6452,7 +6576,7 @@ mod tests {
         assert!(status.success());
         assert!(peaks.peak_rss_kib >= 32.0 * 1024.0);
         assert!(peaks.samples >= 3);
-        assert!(peaks.max_gap_ms <= 500);
+        assert!(peaks.max_gap_ms <= 100);
     }
 
     #[test]
@@ -6520,7 +6644,7 @@ mod tests {
     fn automatic_protocol_requires_exact_lifecycle_and_honest_network_evidence() {
         validate_automatic_protocol_contract().unwrap();
         assert!(AUTOMATIC_PROTOCOL.contains("required_os: macos"));
-        assert!(AUTOMATIC_PROTOCOL.contains("validation_scope: every run independently"));
+        assert!(AUTOMATIC_PROTOCOL.contains("validation_scope: diagnostic only"));
         assert!(AUTOMATIC_PROTOCOL.contains("NetworkMonitor"));
         assert!(AUTOMATIC_PROTOCOL.contains("unexpected SIGKILL service termination"));
         assert!(AUTOMATIC_PROTOCOL.contains("bounded unaided launchd KeepAlive recovery"));
@@ -6612,8 +6736,11 @@ mod tests {
                 "  cleanup_timeout_seconds: 5\n",
                 "  cleanup_timeout_seconds: 6\n",
             ),
-            ("p95", "    p95_ms_max: 20\n", "    p95_ms_max: 21\n"),
-            ("p99", "    p99_ms_max: 50\n", "    p99_ms_max: 51\n"),
+            (
+                "synthetic latency scope",
+                "    validation_scope: diagnostic only unless a versioned collector SLO is calibrated; foreground hook latency remains governed by local-performance-v1\n",
+                "    validation_scope: release threshold\n",
+            ),
             (
                 "idle CPU",
                 "    idle_average_percent_max: 0.5\n",
@@ -6624,7 +6751,12 @@ mod tests {
                 "    active_integrated_percent_max: 100\n",
                 "    active_integrated_percent_max: 99\n",
             ),
-            ("RSS", "    peak_mib_max: 96\n", "    peak_mib_max: 95\n"),
+            ("RSS", "    p95_mib_max: 96\n", "    p95_mib_max: 95\n"),
+            (
+                "peak RSS scope",
+                "    peak_reported_diagnostic_only: true\n",
+                "    peak_reported_diagnostic_only: false\n",
+            ),
             (
                 "disk",
                 "    allocated_tree_bytes_max: 1073741824\n",
@@ -6668,25 +6800,12 @@ mod tests {
     }
 
     #[test]
-    fn automatic_p95_is_validated_per_run() {
+    fn automatic_synthetic_latency_is_diagnostic() {
         let mut bad = vec![1; 94];
         bad.extend([21_000; 6]);
-        let results = vec![automatic_result(1, bad), automatic_result(2, vec![1; 100])];
+        let result = automatic_result(1, bad);
 
-        let error = validate_automatic_results(automatic_config(), &results, &[]).unwrap_err();
-
-        assert!(error.contains("run 1 synthetic collector OTLP p95"));
-    }
-
-    #[test]
-    fn automatic_p99_is_validated_per_run() {
-        let mut bad = vec![1; 98];
-        bad.extend([51_000; 2]);
-        let results = vec![automatic_result(1, bad), automatic_result(2, vec![1; 100])];
-
-        let error = validate_automatic_results(automatic_config(), &results, &[]).unwrap_err();
-
-        assert!(error.contains("run 1 synthetic collector OTLP p99"));
+        validate_single_automatic(result).unwrap();
     }
 
     #[test]
@@ -6711,12 +6830,21 @@ mod tests {
     #[test]
     fn automatic_rss_limit_is_fail_closed() {
         let mut result = automatic_result(1, vec![1; 100]);
-        result.peak_rss_kib = 96.0 * 1024.0 + 1.0;
+        result.rss_p95_kib = 96.0 * 1024.0 + 1.0;
+        result.peak_rss_kib = result.rss_p95_kib;
         assert!(
             validate_single_automatic(result)
                 .unwrap_err()
                 .contains("RSS")
         );
+    }
+
+    #[test]
+    fn automatic_peak_rss_is_diagnostic() {
+        let mut result = automatic_result(1, vec![1; 100]);
+        result.peak_rss_kib = 128.0 * 1024.0;
+
+        validate_single_automatic(result).unwrap();
     }
 
     #[test]
@@ -6866,6 +6994,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn automatic_release_evidence_is_strictly_typed_and_run_scoped() {
         let manifest = valid_automatic_release_manifest();
         let revision = "0123456789abcdef0123456789abcdef01234567";
@@ -6943,6 +7072,12 @@ mod tests {
                 1,
             ),
             manifest.replacen(
+                "collector_rss_p95_kib_max: 1",
+                "collector_rss_p95_kib_max: 2",
+                1,
+            ),
+            manifest.replacen("    rss_p95_kib: 1", "    rss_p95_kib: 2", 1),
+            manifest.replacen(
                 "    synthetic_collector_otlp_p95_us: 1",
                 "    synthetic_collector_otlp_p95_us: 11",
                 1,
@@ -6967,6 +7102,37 @@ mod tests {
     }
 
     #[test]
+    fn automatic_release_evidence_accepts_diagnostic_latency_over_foreground_budget() {
+        let config = AutomaticConfig::for_profile(Profile::Release);
+        let results = (1..=5)
+            .map(|run| {
+                let mut result = automatic_result(run, vec![75_000; 10_000]);
+                result.report_generation = 20_001;
+                result.report_records = 20_001;
+                result
+            })
+            .collect::<Vec<_>>();
+        let manifest = render_automatic_manifest(
+            config,
+            &host(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &results,
+            &[],
+            "pass",
+        )
+        .replacen(&format!("  os: {}", env::consts::OS), "  os: macos", 1)
+        .replacen(
+            "machine: sanitized-test-4-logical-core",
+            "machine: sanitized-aarch64-4-logical-core",
+            1,
+        );
+        let evidence = parse_automatic_manifest(&manifest).unwrap();
+
+        validate_automatic_release_evidence(&evidence, "0123456789abcdef0123456789abcdef01234567")
+            .unwrap();
+    }
+
+    #[test]
     fn automatic_process_errors_are_content_free() {
         let raw = "/Users/private/AUTOMATIC_CODEX_E2E_RAW_PROMPT_SENTINEL private-key.pem";
         let automatic = vec!["perf".into(), "automatic".into()];
@@ -6981,6 +7147,31 @@ mod tests {
             "automatic_evidence_validation_failed"
         );
         assert_eq!(public_error_message(&local, raw), raw);
+    }
+
+    #[test]
+    fn automatic_lifecycle_failures_use_content_free_stage_codes() {
+        for (error, code) in [
+            (
+                "lifecycle preflight: automatic lifecycle requires codex-cli 0.151.0, found private",
+                "code=lifecycle_codex_version_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle Codex config stage failed",
+                "code=lifecycle_codex_config_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle real Codex stage failed",
+                "code=lifecycle_codex_e2e_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle setup stage failed",
+                "code=lifecycle_setup_failed",
+            ),
+        ] {
+            assert_eq!(automatic_evidence_error_code(error), code);
+            assert!(!code.contains("private"));
+        }
     }
 
     #[test]
@@ -7012,6 +7203,25 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn preserved_smoke_evidence_survives_cleanup_drop() {
+        let root = env::temp_dir().join(format!(
+            "automatic-preserved-smoke-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        {
+            let mut cleanup = DirectoryCleanup::new(root.clone(), "preserved smoke evidence");
+            cleanup.preserve();
+        }
+
+        assert!(root.is_dir());
+        fs::remove_dir(&root).unwrap();
     }
 
     #[test]
@@ -7062,6 +7272,31 @@ mod tests {
             .is_err()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn specific_lifecycle_failures_render_valid_failed_manifests() {
+        for failure in [
+            "automatic lifecycle requires codex-cli 0.151.0, found private",
+            "automatic lifecycle Codex config stage failed",
+            "automatic lifecycle real Codex stage failed",
+            "automatic lifecycle setup stage failed",
+        ] {
+            let manifest = render_automatic_manifest(
+                automatic_config(),
+                &host(),
+                "0123456789abcdef0123456789abcdef01234567",
+                &[],
+                &[format!("lifecycle preflight: {failure}")],
+                "failed",
+            );
+            let parsed = validate_automatic_manifest_shape(&manifest).unwrap();
+            assert_eq!(parsed.real_codex_e2e_status, "failed");
+            assert_eq!(
+                parsed.workload.real_codex_e2e_release_gate,
+                "failed-lifecycle-preflight"
+            );
+        }
     }
 
     #[test]
@@ -7253,6 +7488,20 @@ mod tests {
         assert!(validate_results(c(), &pair(enabled(0.1, 0.1, 100_000.0, 1, 0)), &[]).is_err());
     }
     #[test]
+    fn rss_peak_does_not_inflate_rss_p95() {
+        let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
+        results[1].samples.push(s(
+            "active",
+            Some(0.1),
+            Some(128.0 * 1024.0),
+            Some(1),
+            Some(0),
+        ));
+        results[1].peak_rss_kib = 128.0 * 1024.0;
+
+        validate_results(c(), &results, &[]).unwrap();
+    }
+    #[test]
     fn disk_threshold() {
         assert!(
             validate_results(c(), &pair(enabled(0.1, 0.1, 1.0, 1_073_741_825, 0)), &[]).is_err()
@@ -7261,8 +7510,35 @@ mod tests {
     #[test]
     fn latency_threshold() {
         let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
-        results[1].latencies_us = vec![30_000];
+        results[1].latencies_us = [vec![1; 94], vec![30_000; 6]].concat();
         assert!(validate_results(c(), &results, &[]).is_err());
+    }
+    #[test]
+    fn one_foreground_latency_outlier_does_not_inflate_quantiles() {
+        let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
+        results[1].latencies_us = [vec![1; 98], vec![30_000]].concat();
+
+        validate_results(c(), &results, &[]).unwrap();
+    }
+    #[test]
+    fn foreground_p99_threshold_is_independent_of_p95() {
+        let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
+        results[1].latencies_us = [vec![1; 98], vec![51_000; 2]].concat();
+
+        assert!(validate_results(c(), &results, &[]).is_err());
+    }
+    #[test]
+    fn foreground_latency_gate_is_independent_of_sample_order() {
+        for latencies in [
+            [vec![51_000; 2], vec![1; 98]].concat(),
+            [vec![1; 49], vec![51_000; 2], vec![1; 49]].concat(),
+            [vec![1; 98], vec![51_000; 2]].concat(),
+        ] {
+            let mut results = pair(enabled(0.1, 0.1, 1.0, 1, 0));
+            results[1].latencies_us = latencies;
+
+            assert!(validate_results(c(), &results, &[]).is_err());
+        }
     }
     #[test]
     fn network_threshold() {

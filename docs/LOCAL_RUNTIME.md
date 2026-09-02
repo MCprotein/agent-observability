@@ -324,18 +324,21 @@ cargo run -p xtask -- perf automatic --profile release --check
 The `local` workload measures the fixed-capacity manual-ingress runtime against
 `crates/contracts/performance/local-performance-v1.yaml`. The `automatic` workload launches the built
 collector and foreground `codex-notify` commands, then sends synthetic Codex-shaped OTLP through the product's
-private-CA HTTPS and exact-header client. It measures authenticated response latency, collector idle/active CPU,
-RSS, allocated disk and loopback-only network behavior against
+private-CA HTTPS and exact-header client. It reports authenticated response latency as diagnostic evidence and
+validates collector idle/active CPU, RSS p95, allocated disk and loopback-only network behavior against
 `crates/contracts/performance/automatic-local-performance-v1.yaml`. This combines a real Codex compatibility
 gate with synthetic collector performance evidence while remaining separate from the older internal-ingress benchmark.
 
-smoke is non-normative and deletes its temporary output. release writes sanitized evidence under
+smoke is non-normative and deletes successful temporary output; a failed smoke retains only its sanitized
+manifest so the printed diagnostic path remains usable. release writes sanitized evidence under
 docs/evidence/local/performance/ and exits nonzero when required evidence is missing or a budget is breached.
 For `perf local`, enabled runs permit at most 1% explicit fail-open rejection and must reconcile every enqueued
 event with one durable observation after graceful fixture shutdown; foreground enqueue does not itself imply
 durability. For `perf automatic`, every foreground notify must be accepted and each run independently enforces
-the response-latency, collector CPU/RSS, allocated-disk and loopback-only network rules in the automatic
-protocol. Durable completeness requires exactly two synthetic records per accepted OTLP request plus one notify
+collector CPU, RSS p95, allocated-disk and loopback-only network rules in the automatic protocol. Synthetic
+collector response p95/p99 and peak RSS remain reported diagnostics: they are not substitutes for the foreground
+hook latency and resident-memory p95 budgets in the normative local protocol. Durable completeness requires
+exactly two synthetic records per accepted OTLP request plus one notify
 record in both the authoritative generation and report count. Its isolated lifecycle preflight runs actual Codex
 `0.151.0` `codex exec` against a content-free loopback
 Responses fixture before the synthetic load. The gate requires exporter construction, one accepted native OTLP

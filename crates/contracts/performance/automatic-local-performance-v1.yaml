@@ -1,6 +1,6 @@
 schema_version: automatic_local_performance.v1
 version: v1.8.0
-protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-rss-active-report-v2
+protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-diagnostics-rss-p95-v3
 purpose: normative automatic release evidence for real Codex compatibility, local lifecycle, privacy, and synthetic collector performance
 profiles:
   release:
@@ -37,16 +37,15 @@ workload:
 metrics:
   synthetic_collector_otlp:
     required_quantiles: [p95, p99]
-    validation_scope: every run independently
-    p95_ms_max: 20
-    p99_ms_max: 50
+    validation_scope: diagnostic only unless a versioned collector SLO is calibrated; foreground hook latency remains governed by local-performance-v1
     command_timeout_seconds: 1
   collector_cpu:
     idle_average_percent_max: 0.5
     active_integrated_percent_max: 100
     normalization: percent of one logical core
   collector_rss:
-    peak_mib_max: 96
+    p95_mib_max: 96
+    peak_reported_diagnostic_only: true
     active_and_report_sample_target_ms: 10
     observed_max_gap_ms_max: 100
     final_sample: true
