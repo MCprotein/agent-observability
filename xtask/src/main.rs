@@ -1633,19 +1633,21 @@ fn serve_local_codex_model_request(stream: &mut TcpStream) -> Result<(), String>
 }
 
 fn local_codex_sse_response() -> String {
+    const SENTINEL_SLOT: &str = "__AGENTOBS_RESPONSE_SENTINEL__";
     const EVENTS: [&str; 8] = [
         r#"{"type":"response.created","response":{"id":"resp_agentobs","object":"response","created_at":0,"status":"in_progress","output":[]}}"#,
         r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_agentobs","type":"message","role":"assistant","status":"in_progress","content":[]}}"#,
         r#"{"type":"response.content_part.added","item_id":"msg_agentobs","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}"#,
-        r#"{"type":"response.output_text.delta","item_id":"msg_agentobs","output_index":0,"content_index":0,"delta":"AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL"}"#,
-        r#"{"type":"response.output_text.done","item_id":"msg_agentobs","output_index":0,"content_index":0,"text":"AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL"}"#,
-        r#"{"type":"response.content_part.done","item_id":"msg_agentobs","output_index":0,"content_index":0,"part":{"type":"output_text","text":"AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL","annotations":[]}}"#,
-        r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_agentobs","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL","annotations":[]}]}}"#,
-        r#"{"type":"response.completed","response":{"id":"resp_agentobs","object":"response","created_at":0,"status":"completed","output":[{"id":"msg_agentobs","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"AUTOMATIC_CODEX_E2E_RAW_RESPONSE_SENTINEL","annotations":[]}]}],"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":12}}}"#,
+        r#"{"type":"response.output_text.delta","item_id":"msg_agentobs","output_index":0,"content_index":0,"delta":"__AGENTOBS_RESPONSE_SENTINEL__"}"#,
+        r#"{"type":"response.output_text.done","item_id":"msg_agentobs","output_index":0,"content_index":0,"text":"__AGENTOBS_RESPONSE_SENTINEL__"}"#,
+        r#"{"type":"response.content_part.done","item_id":"msg_agentobs","output_index":0,"content_index":0,"part":{"type":"output_text","text":"__AGENTOBS_RESPONSE_SENTINEL__","annotations":[]}}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_agentobs","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"__AGENTOBS_RESPONSE_SENTINEL__","annotations":[]}]}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_agentobs","object":"response","created_at":0,"status":"completed","output":[{"id":"msg_agentobs","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"__AGENTOBS_RESPONSE_SENTINEL__","annotations":[]}]}],"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":12}}}"#,
     ];
     EVENTS
         .into_iter()
         .fold(String::new(), |mut response, event| {
+            let event = event.replace(SENTINEL_SLOT, AUTOMATIC_CODEX_E2E_RESPONSE_SENTINEL);
             write!(response, "data: {event}\n\n").expect("writing to a String cannot fail");
             response
         })
@@ -4920,7 +4922,7 @@ fn render_automatic_manifest(
         .map(|result| result.network_monitor_samples)
         .sum::<u64>();
     let mut manifest = format!(
-        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: verified\nreal_codex_e2e_status: passed\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.151.0\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_peak_rss_kib: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
+        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: verified\nreal_codex_e2e_status: passed\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.151.0\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_peak_rss_kib: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
         profile_name(config.profile),
         profile_name(config.profile),
         env!("CARGO_PKG_VERSION"),
@@ -4953,7 +4955,6 @@ fn render_automatic_manifest(
         optional_u64(collector_network),
         network_samples,
     );
-    manifest = manifest.replace("no-raw-prompt\n", "no-raw-prompt-or-response\n");
     for result in results {
         let mut run_latencies = result.synthetic_otlp_latencies_us.clone();
         run_latencies.sort_unstable();
@@ -6080,6 +6081,13 @@ mod tests {
             fs::remove_file(path).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_codex_fixture_uses_the_scanned_response_sentinel() {
+        let response = local_codex_sse_response();
+        assert!(response.contains(AUTOMATIC_CODEX_E2E_RESPONSE_SENTINEL));
+        assert!(!response.contains("__AGENTOBS_RESPONSE_SENTINEL__"));
     }
 
     #[test]

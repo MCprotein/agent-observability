@@ -870,6 +870,9 @@ fn otlp_attributes(record: &Value) -> Result<BTreeMap<String, Value>, AdapterErr
             .get("key")
             .and_then(Value::as_str)
             .ok_or(AdapterError::InvalidJson)?;
+        if !is_owned_otlp_attribute(key) {
+            continue;
+        }
         let value = attribute
             .get("value")
             .and_then(otlp_any_value)
@@ -877,6 +880,30 @@ fn otlp_attributes(record: &Value) -> Result<BTreeMap<String, Value>, AdapterErr
         attributes.insert(key.to_owned(), value);
     }
     Ok(attributes)
+}
+
+fn is_owned_otlp_attribute(key: &str) -> bool {
+    matches!(
+        key,
+        "event.name"
+            | "conversation.id"
+            | "turn.id"
+            | "model"
+            | "event.kind"
+            | "tool_name"
+            | "call_id"
+            | "decision"
+            | "duration_ms"
+            | "input_token_count"
+            | "output_token_count"
+            | "cached_token_count"
+            | "reasoning_token_count"
+            | "tool_token_count"
+            | "auth.request_id"
+            | "success"
+            | "http.response.status_code"
+            | "error.message"
+    )
 }
 
 fn otlp_any_value(value: &Value) -> Option<Value> {
@@ -1642,7 +1669,10 @@ mod tests {
               {"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},
               {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
               {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
-              {"key":"user.email","value":{"stringValue":"SECRET_EMAIL@example.com"}}
+              {"key":"user.email","value":{"stringValue":"SECRET_EMAIL@example.com"}},
+              {"key":"unknown.array","value":{"arrayValue":{"values":[{"stringValue":"RAW_ARRAY_SECRET"}]}}},
+              {"key":"unknown.kvlist","value":{"kvlistValue":{"values":[{"key":"private","value":{"stringValue":"RAW_KV_SECRET"}}]}}},
+              {"key":"unknown.bytes","value":{"bytesValue":"UkFXX0JZVEVTX1NFQ1JFVA=="}}
             ]},
             {"timeUnixNano":"1787875200100000000","attributes":[
               {"key":"event.name","value":{"stringValue":"codex.api_request"}},
@@ -1710,6 +1740,8 @@ mod tests {
         let debug = format!("{batch:?}");
         for secret in [
             "SECRET_EMAIL@example.com",
+            "RAW_ARRAY_SECRET",
+            "RAW_KV_SECRET",
             "RAW_ARGUMENT_SECRET",
             "RAW_OUTPUT_SECRET",
         ] {
