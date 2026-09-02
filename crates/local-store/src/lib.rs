@@ -1144,6 +1144,36 @@ impl LocalStore {
         })
     }
 
+    /// Visits one consistent, ordered report snapshot without retaining source records.
+    ///
+    /// The visitor receives ownership of each decoded record. The returned generation belongs to
+    /// the same transaction as every visited row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the snapshot or a stored record cannot be read.
+    pub fn visit_report_snapshot(
+        &self,
+        mut visit: impl FnMut(usize, DurableRecordV1),
+    ) -> Result<u64, StoreError> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)?;
+        let generation = metadata_generation(&tx, REPORT_GENERATION_KEY)?;
+        {
+            let mut statement =
+                tx.prepare("SELECT record_json FROM records ORDER BY commit_seq")?;
+            let mut rows = statement.query([])?;
+            let mut index = 0_usize;
+            while let Some(row) = rows.next()? {
+                let json = row.get::<_, String>(0)?;
+                let record = serde_json::from_str(&json).map_err(StoreError::Json)?;
+                visit(index, record);
+                index = index.saturating_add(1);
+            }
+        }
+        tx.commit()?;
+        Ok(generation)
+    }
+
     /// Returns the durable report generation state.
     ///
     /// # Errors
@@ -4778,6 +4808,14 @@ mod tests {
         writer.ingest(&observation("1", "session", None)).unwrap();
         let snapshot = writer.report_snapshot().unwrap();
         assert_eq!(snapshot.generation, 1);
+        let mut visited = Vec::new();
+        let visited_generation = writer
+            .visit_report_snapshot(|index, record| visited.push((index, record)))
+            .unwrap();
+        assert_eq!(visited_generation, snapshot.generation);
+        assert_eq!(visited.len(), snapshot.records.len());
+        assert_eq!(visited[0].0, 0);
+        assert_eq!(visited[0].1, snapshot.records[0]);
         assert_eq!(snapshot.records.len(), 1);
 
         let mut concurrent_writer = LocalStore::open(&dir).unwrap();

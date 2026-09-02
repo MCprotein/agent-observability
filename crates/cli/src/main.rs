@@ -8,7 +8,7 @@ use agent_observability_adapter_codex::{
 use agent_observability_adapter_cursor::{
     AdapterItem as CursorAdapterItem, read_handoff_file as read_cursor_handoff_file,
 };
-use agent_observability_application::{parse_rate_table_json, project_report};
+use agent_observability_application::{ReportProjector, parse_rate_table_json};
 use agent_observability_codex_integration::{
     CodexIntegrationStatus, CollectorStatus, ConnectionStatus, connect as connect_integration,
     disconnect as disconnect_integration, status as integration_status,
@@ -844,20 +844,32 @@ fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String>
         .map_err(|error| error.to_string())?;
     let mut rendered = None;
     for _ in 0..REPORT_RENDER_RETRY_LIMIT {
-        let snapshot = store.report_snapshot().map_err(|error| error.to_string())?;
-        let report = project_report(
-            &snapshot.records,
-            current_timestamp()?,
-            "Agent Observability Report",
-            rate_table.as_ref(),
-        )
-        .map_err(|error| error.to_string())?;
+        let record_count =
+            usize::try_from(store.record_count().map_err(|error| error.to_string())?)
+                .map_err(|_| "record count does not fit this platform".to_string())?;
+        let mut projector = ReportProjector::new(record_count, rate_table.as_ref());
+        let mut projection_error = None;
+        let generation = store
+            .visit_report_snapshot(|index, record| {
+                if projection_error.is_none()
+                    && let Err(error) = projector.push(index, &record)
+                {
+                    projection_error = Some(error);
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        if let Some(error) = projection_error {
+            return Err(error.to_string());
+        }
+        let report = projector
+            .finish(current_timestamp()?, "Agent Observability Report")
+            .map_err(|error| error.to_string())?;
         let bytes = write_private(&output_path, &report).map_err(|error| error.to_string())?;
         if store
-            .acknowledge_report_generation(snapshot.generation)
+            .acknowledge_report_generation(generation)
             .map_err(|error| error.to_string())?
         {
-            rendered = Some((snapshot.records.len(), report.cost.status, bytes));
+            rendered = Some((record_count, report.cost.status, bytes));
             break;
         }
     }

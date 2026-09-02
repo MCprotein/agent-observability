@@ -181,6 +181,73 @@ impl Display for ReportProjectionError {
 
 impl Error for ReportProjectionError {}
 
+/// Incrementally projects durable records without retaining the source records.
+#[derive(Debug)]
+pub struct ReportProjector<'a> {
+    spans: Vec<ReportSpanV1>,
+    table: Option<&'a RateTable>,
+}
+
+impl<'a> ReportProjector<'a> {
+    #[must_use]
+    pub fn new(capacity: usize, table: Option<&'a RateTable>) -> Self {
+        Self {
+            spans: Vec::with_capacity(capacity),
+            table,
+        }
+    }
+
+    /// Validates and projects one record, retaining only its privacy-safe report span.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReportProjectionError`] when the record is invalid.
+    pub fn push(
+        &mut self,
+        index: usize,
+        record: &DurableRecordV1,
+    ) -> Result<(), ReportProjectionError> {
+        let record = sanitize_durable_record(record)
+            .map_err(|source| ReportProjectionError::InvalidRecord { index, source })?;
+        self.spans.push(report_span(&record, self.table));
+        Ok(())
+    }
+
+    /// Finalizes aggregate, filter, trace, and ordering projections.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReportProjectionError`] when a derived report value is invalid.
+    pub fn finish(
+        mut self,
+        generated_at: impl Into<String>,
+        title: impl Into<String>,
+    ) -> Result<ReportDtoV1, ReportProjectionError> {
+        self.spans.sort_by(|left, right| {
+            left.start_time_unix_ms
+                .total_cmp(&right.start_time_unix_ms)
+                .then_with(|| left.trace_id.cmp(&right.trace_id))
+                .then_with(|| left.span_id.cmp(&right.span_id))
+        });
+        let summary = summarize_report(&self.spans)?;
+        let cost = estimate_cost_for_spans(&self.spans, self.table);
+        let report = ReportDtoV1 {
+            schema_version: REPORT_DTO_VERSION.into(),
+            generated_at: generated_at.into(),
+            title: redact_sensitive_text(&title.into(), "title"),
+            summary,
+            cost,
+            filters: report_filters(&self.spans),
+            traces: trace_summaries(&self.spans),
+            spans: self.spans,
+        };
+        report
+            .validate()
+            .map_err(ReportProjectionError::InvalidReport)?;
+        Ok(report)
+    }
+}
+
 /// Projects validated durable spans into the privacy-safe report DTO.
 ///
 /// The projector is pure: it does not inspect or copy durable content, and it rejects the
@@ -195,42 +262,11 @@ pub fn project_report(
     title: impl Into<String>,
     table: Option<&RateTable>,
 ) -> Result<ReportDtoV1, ReportProjectionError> {
-    let records = records
-        .iter()
-        .enumerate()
-        .map(|(index, record)| {
-            sanitize_durable_record(record)
-                .map_err(|source| ReportProjectionError::InvalidRecord { index, source })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut spans = records
-        .iter()
-        .map(|record| report_span(record, table))
-        .collect::<Vec<_>>();
-    spans.sort_by(|left, right| {
-        left.start_time_unix_ms
-            .total_cmp(&right.start_time_unix_ms)
-            .then_with(|| left.trace_id.cmp(&right.trace_id))
-            .then_with(|| left.span_id.cmp(&right.span_id))
-    });
-
-    let summary = summarize_report(&spans)?;
-    let cost = estimate_cost_for_records(&records, table);
-    let report = ReportDtoV1 {
-        schema_version: REPORT_DTO_VERSION.into(),
-        generated_at: generated_at.into(),
-        title: redact_sensitive_text(&title.into(), "title"),
-        summary,
-        cost,
-        filters: report_filters(&spans),
-        traces: trace_summaries(&spans),
-        spans,
-    };
-    report
-        .validate()
-        .map_err(ReportProjectionError::InvalidReport)?;
-    Ok(report)
+    let mut projector = ReportProjector::new(records.len(), table);
+    for (index, record) in records.iter().enumerate() {
+        projector.push(index, record)?;
+    }
+    projector.finish(generated_at, title)
 }
 
 fn report_span(record: &DurableRecordV1, table: Option<&RateTable>) -> ReportSpanV1 {
@@ -721,7 +757,61 @@ pub fn estimate_cost_for_records(
     }
 }
 
+fn estimate_cost_for_spans(spans: &[ReportSpanV1], table: Option<&RateTable>) -> CostEstimateV1 {
+    let Some(table) = table else {
+        return unknown_cost("missing_rate_table");
+    };
+    let costs = spans
+        .iter()
+        .filter(|span| has_report_token_metrics(&span.metrics))
+        .map(|span| &span.cost);
+    let aggregate = aggregate_cost_refs(costs);
+    if aggregate.count == 0 {
+        return cost_result(
+            table,
+            "unknown",
+            Some("missing_token_metrics"),
+            None,
+            None,
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        );
+    }
+    aggregate_report_costs(table, &aggregate)
+}
+
+fn has_report_token_metrics(metrics: &ReportMetricsV1) -> bool {
+    [
+        metrics.input_tokens,
+        metrics.output_tokens,
+        metrics.cached_input_tokens,
+        metrics.cache_creation_input_tokens,
+        metrics.reasoning_output_tokens,
+    ]
+    .into_iter()
+    .any(|value| metric(value).is_some())
+}
+
+fn aggregate_report_costs(table: &RateTable, aggregate: &AggregateCost) -> CostEstimateV1 {
+    CostEstimateV1 {
+        status: aggregate.status.into(),
+        reason: None,
+        estimated_cost: Some(round_currency(aggregate.amount)),
+        currency: Some(table.currency.clone()),
+        model: None,
+        rate_table: table_ref(table),
+        cost: CostDetailV1 {
+            assumption: table.assumption.clone(),
+            incomplete_count: Some(aggregate.incomplete),
+            unknown_count: Some(aggregate.unknown),
+            ..CostDetailV1::default()
+        },
+    }
+}
+
 struct AggregateCost {
+    count: u64,
     status: &'static str,
     amount: f64,
     incomplete: u64,
@@ -729,15 +819,22 @@ struct AggregateCost {
 }
 
 fn aggregate_costs(costs: &[CostEstimateV1]) -> AggregateCost {
-    let incomplete = costs
-        .iter()
-        .filter(|cost| cost.status == "incomplete")
-        .count() as u64;
-    let unknown = costs.iter().filter(|cost| cost.status == "unknown").count() as u64;
-    let estimated = costs
-        .iter()
-        .filter(|cost| cost.status == "estimated")
-        .count();
+    aggregate_cost_refs(costs.iter())
+}
+
+fn aggregate_cost_refs<'a>(costs: impl Iterator<Item = &'a CostEstimateV1>) -> AggregateCost {
+    let mut count = 0_u64;
+    let mut incomplete = 0_u64;
+    let mut unknown = 0_u64;
+    let mut estimated = 0_u64;
+    let mut amount = 0.0;
+    for cost in costs {
+        count = count.saturating_add(1);
+        incomplete = incomplete.saturating_add(u64::from(cost.status == "incomplete"));
+        unknown = unknown.saturating_add(u64::from(cost.status == "unknown"));
+        estimated = estimated.saturating_add(u64::from(cost.status == "estimated"));
+        amount += cost.estimated_cost.unwrap_or(0.0);
+    }
     let status = if estimated == 0 && incomplete == 0 {
         "unknown"
     } else if incomplete > 0 || unknown > 0 {
@@ -746,11 +843,9 @@ fn aggregate_costs(costs: &[CostEstimateV1]) -> AggregateCost {
         "estimated"
     };
     AggregateCost {
+        count,
         status,
-        amount: costs
-            .iter()
-            .map(|cost| cost.estimated_cost.unwrap_or(0.0))
-            .sum(),
+        amount,
         incomplete,
         unknown,
     }

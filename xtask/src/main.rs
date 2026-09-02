@@ -2370,7 +2370,9 @@ fn submit_automatic_synthetic_otlp(root: &Path, run: usize, event: usize) -> Res
     ]}]}]}"#
         .replace("$RUN", &run.to_string())
         .replace("$EVENT", &event.to_string());
-    match submit_otlp_json_outcome(root, body.as_bytes()).map_err(|error| error.to_string())? {
+    match submit_otlp_json_outcome(root, body.as_bytes())
+        .map_err(|error| format!("run={run} event={event}: {error}"))?
+    {
         OtlpSubmissionOutcome::Accepted => Ok(()),
         OtlpSubmissionOutcome::Rejected { status, category } => Err(format!(
             "automatic synthetic collector OTLP request was rejected: run={run} event={event} status={status} category={}",

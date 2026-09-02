@@ -5,6 +5,8 @@ use agent_observability_adapter_codex::{
     AdapterBatch, AdapterItem, MAX_HANDOFF_BYTES, OtlpRequestCorrelationState,
     parse_otlp_http_json_with_state, parse_projected_notify_json, project_notify_json,
 };
+use agent_observability_application::ReportProjector;
+#[cfg(test)]
 use agent_observability_application::project_report;
 use agent_observability_local_runtime::{
     Admission, InstalledLayout, LocalRuntimeConfigV2, MutationGuard, PressureSample,
@@ -76,7 +78,6 @@ const REPORT_DIRTY_FILE_NAME: &str = "report-dirty";
 const REPORT_RETRY_LIMIT: u32 = 4;
 const REPORT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
 const REPORT_DEBOUNCE_DELAY: Duration = Duration::from_millis(200);
-const REPORT_MAX_COALESCE_DELAY: Duration = Duration::from_secs(2);
 const REPORT_AUTHORITY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_LIFETIME: Duration = Duration::from_secs(30);
@@ -240,6 +241,10 @@ pub enum HealthOutcome {
 #[derive(Debug)]
 pub enum CollectorError {
     Io(std::io::Error),
+    RequestIo {
+        stage: &'static str,
+        source: std::io::Error,
+    },
     Runtime(String),
 }
 
@@ -1140,17 +1145,39 @@ impl std::fmt::Display for CollectorError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "local collector I/O error: {error}"),
+            Self::RequestIo { stage, source } => {
+                write!(formatter, "local collector {stage} I/O error: {source}")
+            }
             Self::Runtime(message) => formatter.write_str(message),
         }
     }
 }
 
-impl std::error::Error for CollectorError {}
+impl std::error::Error for CollectorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) | Self::RequestIo { source: error, .. } => Some(error),
+            Self::Runtime(_) => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for CollectorError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
     }
+}
+
+fn request_io(stage: &'static str, error: std::io::Error) -> CollectorError {
+    let source = if error.kind() == std::io::ErrorKind::WouldBlock {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "collector request deadline expired",
+        )
+    } else {
+        error
+    };
+    CollectorError::RequestIo { stage, source }
 }
 
 fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, CollectorError> {
@@ -1748,7 +1775,9 @@ enum IngestError {
 impl IngestError {
     const fn status(&self) -> StatusCode {
         match self {
-            Self::Invalid(CollectorError::Io(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Invalid(CollectorError::Io(_) | CollectorError::RequestIo { .. }) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             Self::Invalid(CollectorError::Runtime(_)) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Busy | Self::Pressure => StatusCode::SERVICE_UNAVAILABLE,
             Self::Policy => StatusCode::PAYLOAD_TOO_LARGE,
@@ -1977,7 +2006,6 @@ fn schedule_report_refresh(state: &AppState) {
         state,
         ReportRefreshTiming {
             debounce: REPORT_DEBOUNCE_DELAY,
-            max_coalesce: REPORT_MAX_COALESCE_DELAY,
             retry_initial: REPORT_RETRY_INITIAL_DELAY,
         },
     );
@@ -2018,7 +2046,6 @@ async fn watch_report_authority(state: AppState, mut observed_generation: u64, i
 #[derive(Clone, Copy, Debug)]
 struct ReportRefreshTiming {
     debounce: Duration,
-    max_coalesce: Duration,
     retry_initial: Duration,
 }
 
@@ -2123,19 +2150,14 @@ fn schedule_report_refresh_with_timing(state: &AppState, timing: ReportRefreshTi
 }
 
 async fn await_report_debounce(state: &AppState, timing: ReportRefreshTiming) {
-    let started = tokio::time::Instant::now();
-    let maximum = started + timing.max_coalesce;
-    let mut quiet_until = started + timing.debounce;
     let mut observed = state.report_refresh_requested.load(Ordering::Acquire);
     loop {
-        tokio::time::sleep_until(quiet_until.min(maximum)).await;
-        let now = tokio::time::Instant::now();
+        tokio::time::sleep(timing.debounce).await;
         let latest = state.report_refresh_requested.load(Ordering::Acquire);
-        if latest == observed || now >= maximum {
+        if latest == observed {
             return;
         }
         observed = latest;
-        quiet_until = now + timing.debounce;
     }
 }
 
@@ -2374,7 +2396,8 @@ fn authenticated_request(
             "collector foreground request timed out",
         )));
     }
-    let stream = TcpStream::connect_timeout(&address, connect_timeout.min(remaining))?;
+    let stream = TcpStream::connect_timeout(&address, connect_timeout.min(remaining))
+        .map_err(|error| request_io("connect", error))?;
     let server_name = ServerName::try_from("127.0.0.1").map_err(crypto_error)?;
     let connection = ClientConnection::new(config, server_name).map_err(crypto_error)?;
     let mut tls = StreamOwned::new(connection, DeadlineStream::new(stream, deadline));
@@ -2391,12 +2414,18 @@ fn authenticated_request(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{AUTH_HEADER_NAME}: {}\r\n{content_headers}Connection: close\r\n\r\n",
         settings.auth_token,
     );
-    tls.write_all(request.as_bytes())?;
+    tls.write_all(request.as_bytes())
+        .map_err(|error| request_io("request-write", error))?;
     if !body.is_empty() {
-        tls.write_all(body)?;
+        tls.write_all(body)
+            .map_err(|error| request_io("request-write", error))?;
     }
-    tls.flush()?;
-    read_bounded_http_response(&mut tls)
+    tls.flush()
+        .map_err(|error| request_io("request-write", error))?;
+    read_bounded_http_response(&mut tls).map_err(|error| match error {
+        CollectorError::Io(error) => request_io("response-read", error),
+        error => error,
+    })
 }
 
 fn read_bounded_http_response(
@@ -2489,20 +2518,30 @@ fn refresh_report(
     let _render_guard = store
         .acquire_report_render_guard()
         .map_err(|_| ReportFailure::RenderGuard)?;
-    let snapshot = store
-        .report_snapshot()
+    let capacity = usize::try_from(store.record_count().map_err(|_| ReportFailure::Snapshot)?)
         .map_err(|_| ReportFailure::Snapshot)?;
-    let report = project_report(
-        &snapshot.records,
-        timestamp_from_unix_ms(now_unix_ms).map_err(|_| ReportFailure::Projection)?,
-        "Agent Observability Report",
-        None,
-    )
-    .map_err(|_| ReportFailure::Projection)?;
+    let mut projector = ReportProjector::new(capacity, None);
+    let mut projection_failure = false;
+    let generation = store
+        .visit_report_snapshot(|index, record| {
+            if !projection_failure && projector.push(index, &record).is_err() {
+                projection_failure = true;
+            }
+        })
+        .map_err(|_| ReportFailure::Snapshot)?;
+    if projection_failure {
+        return Err(ReportFailure::Projection);
+    }
+    let report = projector
+        .finish(
+            timestamp_from_unix_ms(now_unix_ms).map_err(|_| ReportFailure::Projection)?,
+            "Agent Observability Report",
+        )
+        .map_err(|_| ReportFailure::Projection)?;
     write_private(&layout.logs.join(REPORT_FILE_NAME), &report)
         .map_err(|_| ReportFailure::Publish)?;
     store
-        .acknowledge_report_generation(snapshot.generation)
+        .acknowledge_report_generation(generation)
         .map_err(|_| ReportFailure::Acknowledge)
 }
 
@@ -3039,7 +3078,6 @@ mod tests {
     fn fast_report_timing() -> super::ReportRefreshTiming {
         super::ReportRefreshTiming {
             debounce: Duration::from_millis(20),
-            max_coalesce: Duration::from_millis(80),
             retry_initial: Duration::from_millis(10),
         }
     }
@@ -3887,7 +3925,15 @@ mod tests {
             Duration::from_millis(120),
         );
         let elapsed = started.elapsed();
-        assert!(result.is_err(), "slow-drip response escaped deadline");
+        let Err(error) = result else {
+            panic!("slow-drip response escaped deadline");
+        };
+        assert!(matches!(
+            &error,
+            super::CollectorError::RequestIo { stage: "response-read", source }
+                if source.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(!error.to_string().contains("os error 35"));
         assert!(
             elapsed < Duration::from_millis(400),
             "foreground request exceeded absolute deadline: {elapsed:?}"
@@ -4782,6 +4828,42 @@ mod tests {
                     .unwrap()
                     .pending()
             );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_refresh_waits_for_quiet_during_continuous_ingest() {
+        let root = test_root("report-refresh-continuous");
+        let _ = fs::remove_dir_all(&root);
+        let state = app_state(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            for event in 0..10 {
+                {
+                    let mut collector = state.collector.lock().await;
+                    ingest_notify_locked(
+                        &mut collector,
+                        &projected_notify(&format!("thread-{event}"), "turn-1"),
+                    )
+                    .unwrap();
+                }
+                super::schedule_report_refresh_with_timing(&state, fast_report_timing());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 0);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while state.report_refresh_scheduled.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 1);
         });
         let _ = fs::remove_dir_all(root);
     }

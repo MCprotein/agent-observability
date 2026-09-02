@@ -129,9 +129,10 @@ a durable SQLite report generation. A renderer reads a generation-consistent sna
 exact generation written to `logs/agent-observability-report.html`; a private marker is only a best-effort wakeup.
 Startup reconciles every unacknowledged generation. Refresh uses bounded exponential retries and reports a
 degraded health state after exhaustion. CLI and UI preserve that state instead of presenting the report as
-current. Burst refresh is quiet-period coalesced and forced after at most two seconds of continuous ingest so
-HTML/projection fsync does not occupy the foreground notify path indefinitely. A failure never turns raw input
-into a fallback log or file.
+current. Burst refresh is quiet-period coalesced; continuous ingest does not repeatedly rebuild a growing full
+report. The latest generation is rendered once input becomes quiet, while explicit report commands and startup
+recovery retain their convergence paths. HTML/projection fsync therefore does not occupy the foreground notify
+path indefinitely. A failure never turns raw input into a fallback log or file.
 
 ## Manual imports
 
