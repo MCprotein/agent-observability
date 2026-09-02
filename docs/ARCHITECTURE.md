@@ -6,7 +6,7 @@
 
 ## Current and target stack
 
-현재 `v1.8.0`은 **In Progress**다. macOS standalone은 Codex, Claude Code와 Cursor의 private
+현재 `v1.8.0`은 **Released**다. macOS standalone은 Codex, Claude Code와 Cursor의 private
 handoff 수동 import를 daemon과 network 없이 계속 제공한다. 선택적 Codex automatic path는 private-CA
 HTTPS와 exact private random request header로 인증하는 `127.0.0.1` OTLP/HTTP JSON receiver,
 pre-transport projected notify supplement와 LaunchAgent를 추가한다. 이 transport는 mTLS가 아니다. Rust 경로는

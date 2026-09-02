@@ -12,7 +12,7 @@
 | One-shot local ingest CLI | Implemented |
 | Codex OTLP/HTTP JSON receiver | Supported for pinned Codex 0.151.0 on macOS through private-CA HTTPS on IPv4 loopback with exact private random request header |
 | Codex `agent-turn-complete` notify supplement | Implemented with bounded fail-open local delivery |
-| Codex config ownership and macOS LaunchAgent | Supported on the pinned macOS boundary with exact restore; v1.8.0 publication pending |
+| Codex config ownership and macOS LaunchAgent | Supported on the pinned macOS boundary with exact restore; released in v1.8.0 |
 | SQLite authority and JSONL projection | Implemented |
 | Static HTML report | Implemented |
 | Ephemeral loopback settings UI | Implemented |
