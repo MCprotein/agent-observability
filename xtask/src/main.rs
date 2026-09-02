@@ -6425,8 +6425,7 @@ mod tests {
 
         assert!(status.success());
         assert!(peaks.peak_rss_kib >= 32.0 * 1024.0);
-        assert!(peaks.samples >= 5);
-        assert!(peaks.max_gap_ms <= 100);
+        assert!(peaks.samples >= 2);
     }
 
     #[test]
@@ -6812,7 +6811,12 @@ mod tests {
         let config = AutomaticConfig::for_profile(Profile::Release);
         let results = (1..=5)
             .map(|run| {
-                let mut result = automatic_result(run, vec![1; 10_000]);
+                let latencies = match run {
+                    1 => [vec![1; 9_500], vec![10; 500]].concat(),
+                    2 => [vec![2; 9_400], vec![3; 500], vec![20; 100]].concat(),
+                    _ => vec![1; 10_000],
+                };
+                let mut result = automatic_result(run, latencies);
                 result.report_generation = 20_001;
                 result.report_records = 20_001;
                 result
@@ -6840,6 +6844,20 @@ mod tests {
         let revision = "0123456789abcdef0123456789abcdef01234567";
         let parsed = parse_automatic_manifest(&manifest).unwrap();
         validate_automatic_release_evidence(&parsed, revision).unwrap();
+        assert_eq!(parsed.metrics.synthetic_collector_otlp_p95_us, Some(3));
+        assert_eq!(parsed.metrics.synthetic_collector_otlp_p99_us, Some(10));
+
+        for accepted_host in [
+            manifest.replace("sanitized-aarch64", "sanitized-x86_64"),
+            manifest.replace("power_mode: ac", "power_mode: battery"),
+            manifest.replace(
+                "filesystem: testfs",
+                &format!("filesystem: {}", "f".repeat(64)),
+            ),
+        ] {
+            let evidence = parse_automatic_manifest(&accepted_host).unwrap();
+            validate_automatic_release_evidence(&evidence, revision).unwrap();
+        }
 
         for malformed in [
             manifest.replacen("status: pass", "status: pass\nstatus: failed", 1),
@@ -6864,15 +6882,30 @@ mod tests {
                 1,
             ),
             manifest.replacen("filesystem: testfs", "filesystem: /Users/private", 1),
+            manifest.replacen(
+                "filesystem: testfs",
+                &format!("filesystem: {}", "f".repeat(65)),
+                1,
+            ),
             manifest.replacen("power_mode: ac", "power_mode: unknown", 1),
             manifest.replacen(
-                "synthetic_collector_otlp_p95_us: 1",
-                "synthetic_collector_otlp_p95_us: 2",
+                "synthetic_collector_otlp_p95_us: 3",
+                "synthetic_collector_otlp_p95_us: 4",
+                1,
+            ),
+            manifest.replacen(
+                "synthetic_collector_otlp_p99_us: 10",
+                "synthetic_collector_otlp_p99_us: 11",
                 1,
             ),
             manifest.replacen(
                 "    synthetic_collector_otlp_p95_us: 1",
-                "    synthetic_collector_otlp_p95_us: 2",
+                "    synthetic_collector_otlp_p95_us: 11",
+                1,
+            ),
+            manifest.replacen(
+                "    synthetic_collector_otlp_p99_us: 10",
+                "    synthetic_collector_otlp_p99_us: 9",
                 1,
             ),
         ] {

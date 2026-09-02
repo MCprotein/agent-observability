@@ -22,10 +22,11 @@ use axum::{
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
+#[cfg(any(target_os = "macos", test))]
+use std::process::{Child, Command, Stdio};
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -43,7 +44,12 @@ const MAX_SESSION_LIFETIME: Duration = Duration::from_hours(1);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "macos")]
 const DASHBOARD_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const DASHBOARD_OPENER_PATH: &str = "/usr/bin/open";
+#[cfg(any(target_os = "macos", test))]
+const DASHBOARD_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CONNECTIONS: usize = 64;
 const SETTINGS_SHELL: &str = include_str!("generated/settings-shell.html");
 const SETTINGS_SCRIPT: &str = include_str!("generated/settings-ui.js");
@@ -396,46 +402,96 @@ async fn open_dashboard(
     let report = state.root.join("logs").join(REPORT_FILE_NAME);
     tokio::task::spawn_blocking(move || open_dashboard_file(&report))
         .await
-        .map_err(|_| dashboard_error())?
-        .map_err(|()| dashboard_error())?;
+        .map_err(|_| dashboard_error(DashboardOpenError::TaskFailed))?
+        .map_err(dashboard_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DashboardOpenError {
+    #[cfg(target_os = "macos")]
+    MissingReport,
+    #[cfg(not(target_os = "macos"))]
+    UnsupportedPlatform,
+    #[cfg(any(target_os = "macos", test))]
+    SpawnFailed,
+    #[cfg(any(target_os = "macos", test))]
+    ExitFailed,
+    #[cfg(any(target_os = "macos", test))]
+    WaitFailed,
+    #[cfg(any(target_os = "macos", test))]
+    TimedOut,
+    #[cfg(any(target_os = "macos", test))]
+    TerminateFailed,
+    #[cfg(any(target_os = "macos", test))]
+    ReapFailed,
+    #[cfg(any(target_os = "macos", test))]
+    ReapTimedOut,
+    TaskFailed,
+}
+
 #[cfg(target_os = "macos")]
-fn open_dashboard_file(path: &Path) -> Result<(), ()> {
+fn open_dashboard_file(path: &Path) -> Result<(), DashboardOpenError> {
     if !path.is_file() {
-        return Err(());
+        return Err(DashboardOpenError::MissingReport);
     }
-    let mut command = Command::new("open");
+    let mut command = Command::new(DASHBOARD_OPENER_PATH);
     command.arg(path);
     run_dashboard_opener(&mut command, DASHBOARD_OPEN_TIMEOUT)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn open_dashboard_file(_path: &Path) -> Result<(), ()> {
-    Err(())
+fn open_dashboard_file(_path: &Path) -> Result<(), DashboardOpenError> {
+    Err(DashboardOpenError::UnsupportedPlatform)
 }
 
-fn run_dashboard_opener(command: &mut Command, timeout: Duration) -> Result<(), ()> {
+#[cfg(any(target_os = "macos", test))]
+fn run_dashboard_opener(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<(), DashboardOpenError> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|_| ())?;
+        .map_err(|_| DashboardOpenError::SpawnFailed)?;
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success().then_some(()).ok_or(()),
+            Ok(Some(status)) => {
+                return status
+                    .success()
+                    .then_some(())
+                    .ok_or(DashboardOpenError::ExitFailed);
+            }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(());
+            Ok(None) => {
+                terminate_and_reap_dashboard_opener(child)?;
+                return Err(DashboardOpenError::TimedOut);
+            }
+            Err(_) => {
+                terminate_and_reap_dashboard_opener(child)?;
+                return Err(DashboardOpenError::WaitFailed);
             }
         }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn terminate_and_reap_dashboard_opener(mut child: Child) -> Result<(), DashboardOpenError> {
+    let termination_failed = child.kill().is_err();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = result_tx.send(child.wait());
+    });
+    match result_rx.recv_timeout(DASHBOARD_REAP_TIMEOUT) {
+        Ok(Ok(_)) if termination_failed => Err(DashboardOpenError::TerminateFailed),
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(_)) => Err(DashboardOpenError::ReapFailed),
+        Err(_) => Err(DashboardOpenError::ReapTimedOut),
     }
 }
 
@@ -447,12 +503,35 @@ fn integration_error() -> ApiError {
     )
 }
 
-fn dashboard_error() -> ApiError {
-    ApiError::new(
-        StatusCode::CONFLICT,
-        "dashboard_unavailable",
-        "모니터링 리포트를 열 수 없습니다.",
-    )
+fn dashboard_error(error: DashboardOpenError) -> ApiError {
+    let (code, message) = match error {
+        #[cfg(target_os = "macos")]
+        DashboardOpenError::MissingReport => (
+            "dashboard_missing",
+            "모니터링 리포트가 아직 생성되지 않았습니다.",
+        ),
+        #[cfg(not(target_os = "macos"))]
+        DashboardOpenError::UnsupportedPlatform => (
+            "dashboard_unsupported",
+            "이 운영체제에서는 모니터링 리포트를 자동으로 열 수 없습니다.",
+        ),
+        #[cfg(any(target_os = "macos", test))]
+        DashboardOpenError::TimedOut => (
+            "dashboard_open_timeout",
+            "모니터링 리포트를 여는 시간이 초과되었습니다.",
+        ),
+        #[cfg(any(target_os = "macos", test))]
+        DashboardOpenError::SpawnFailed
+        | DashboardOpenError::ExitFailed
+        | DashboardOpenError::WaitFailed
+        | DashboardOpenError::TerminateFailed
+        | DashboardOpenError::ReapFailed
+        | DashboardOpenError::ReapTimedOut
+        | DashboardOpenError::TaskFailed => {
+            ("dashboard_open_failed", "모니터링 리포트를 열 수 없습니다.")
+        }
+    };
+    ApiError::new(StatusCode::CONFLICT, code, message)
 }
 
 async fn heartbeat(
@@ -664,9 +743,11 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::DASHBOARD_OPENER_PATH;
     use super::{
-        AppState, LocalConfigService, constant_time_equal, dashboard_error, prepare, router,
-        run_dashboard_opener, run_integration, session_token,
+        AppState, DashboardOpenError, LocalConfigService, constant_time_equal, dashboard_error,
+        prepare, router, run_dashboard_opener, run_integration, session_token,
     };
     use agent_observability_codex_integration::{CodexIntegrationStatus, IntegrationError};
     use agent_observability_local_runtime::{LocalRuntimeConfigV2, install, revision};
@@ -755,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_opener_failure_is_bounded_and_content_free() {
+    fn dashboard_opener_failure_is_content_free() {
         let mut command = Command::new("sh");
         command.args([
             "-c",
@@ -763,7 +844,7 @@ mod tests {
         ]);
         assert!(run_dashboard_opener(&mut command, Duration::from_secs(1)).is_err());
 
-        let response = dashboard_error().into_response();
+        let response = dashboard_error(DashboardOpenError::ExitFailed).into_response();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -772,7 +853,7 @@ mod tests {
             .block_on(async {
                 let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
                 let error: Value = serde_json::from_slice(&body).unwrap();
-                assert_eq!(error["code"], "dashboard_unavailable");
+                assert_eq!(error["code"], "dashboard_open_failed");
                 assert_eq!(error["message"], "모니터링 리포트를 열 수 없습니다.");
                 assert!(
                     !body
@@ -785,6 +866,57 @@ mod tests {
                         .any(|value| value == b"AUTOMATIC_RAW_PROMPT_SENTINEL")
                 );
             });
+    }
+
+    #[test]
+    fn dashboard_opener_timeout_kills_and_reaps_the_process() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let started = Instant::now();
+
+        assert!(run_dashboard_opener(&mut command, Duration::from_millis(50)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dashboard_opener_uses_the_trusted_platform_binary() {
+        let command = Command::new(DASHBOARD_OPENER_PATH);
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("/usr/bin/open"));
+    }
+
+    #[test]
+    fn dashboard_opener_stderr_helper() {
+        if std::env::var_os("AGENTOBS_DASHBOARD_STDERR_HELPER").is_none() {
+            return;
+        }
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "echo 'AUTOMATIC_DASHBOARD_STDERR_SENTINEL' >&2; exit 9",
+        ]);
+        assert!(run_dashboard_opener(&mut command, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn dashboard_opener_never_leaks_child_stderr() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::dashboard_opener_stderr_helper",
+                "--nocapture",
+            ])
+            .env("AGENTOBS_DASHBOARD_STDERR_HELPER", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        for stream in [&output.stdout, &output.stderr] {
+            assert!(
+                !stream
+                    .windows(b"AUTOMATIC_DASHBOARD_STDERR_SENTINEL".len())
+                    .any(|value| value == b"AUTOMATIC_DASHBOARD_STDERR_SENTINEL")
+            );
+        }
     }
 
     #[test]
