@@ -664,14 +664,26 @@ fn settle_pending_migration_before_disconnect(
 fn status_without_settings(
     layout: &InstalledLayout,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
-    let config = codex_config_ownership_manager(layout)?.ownership_status()?;
+    let manager = codex_config_ownership_manager(layout)?;
+    let config = manager.ownership_status()?;
+    let notify = if config == Some(ConfigConnectionStatus::Connected) {
+        manager.notify_ownership()?.map(Into::into)
+    } else {
+        None
+    };
     let service = launch_agent_ownership_status(&layout.root)?;
-    Ok(missing_settings_status(&layout.root, config, service))
+    Ok(missing_settings_status(
+        &layout.root,
+        config,
+        notify,
+        service,
+    ))
 }
 
 fn missing_settings_status(
     root: &Path,
     config: Option<ConfigConnectionStatus>,
+    notify: Option<NotifyStatus>,
     service: LaunchAgentOwnershipStatus,
 ) -> CodexIntegrationStatus {
     if config.is_none() && service == LaunchAgentOwnershipStatus::Absent {
@@ -686,7 +698,7 @@ fn missing_settings_status(
     };
     CodexIntegrationStatus {
         config,
-        notify: None,
+        notify,
         collector: CollectorStatus::Unavailable,
         endpoint: None,
         service: (service != LaunchAgentOwnershipStatus::Absent).then(|| service_label(root)),
@@ -2532,10 +2544,12 @@ mod tests {
         let status = missing_settings_status(
             root,
             Some(ConfigConnectionStatus::Connected),
+            Some(NotifyStatus::ExternalPreserved),
             LaunchAgentOwnershipStatus::Absent,
         );
 
         assert_eq!(status.config, ConnectionStatus::Connected);
+        assert_eq!(status.notify, Some(NotifyStatus::ExternalPreserved));
         assert_eq!(status.collector, CollectorStatus::Unavailable);
         assert_eq!(status.endpoint, None);
         assert_eq!(status.service, None);
@@ -2545,7 +2559,7 @@ mod tests {
     fn missing_settings_reports_launch_agent_only_as_conflict() {
         let root = Path::new("/runtime");
 
-        let status = missing_settings_status(root, None, LaunchAgentOwnershipStatus::Owned);
+        let status = missing_settings_status(root, None, None, LaunchAgentOwnershipStatus::Owned);
 
         assert_eq!(status.config, ConnectionStatus::Conflict);
         assert_eq!(status.collector, CollectorStatus::Unavailable);
@@ -2560,6 +2574,7 @@ mod tests {
     fn missing_settings_without_ownership_remains_disconnected() {
         let status = missing_settings_status(
             Path::new("/runtime"),
+            None,
             None,
             LaunchAgentOwnershipStatus::Absent,
         );

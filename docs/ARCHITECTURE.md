@@ -290,8 +290,11 @@ anti-corruption layer다.
   `otel.log_user_prompt=false`, `otel.environment="local"`이다. top-level `notify`가 비어 있을 때만 agentobs
   notify를 추가 소유하며 기존 valid non-empty string-array notify는 그대로 보존하고
   `external_preserved`로 보고한다. malformed notify 또는 기존 OTEL 값이 다르면 connect는 config를
-  수정하지 않고 conflict로 중단한다. `disconnect codex`는 LaunchAgent 종료를 먼저 확인하고 현재 전체 bytes/mode가 snapshot의
-  connected state와 같을 때만 이전 bytes/mode를 복원하거나 연결 전 파일이 없었다면 제거한다. Crash
+  수정하지 않고 conflict로 중단한다. `disconnect codex`는 LaunchAgent 종료를 먼저 확인하고 commit 전
+  반복 검사에서 현재 전체 bytes/mode가 snapshot의 connected state와 같을 때만 이전 bytes/mode를
+  복원하거나 연결 전 파일이 없었다면 제거한다. 검사에서 관측된 edit는 보존한다. agentobs writer는
+  lock으로 직렬화하지만 arbitrary non-cooperating open-descriptor write를 배제하는 portable filesystem
+  CAS는 제공하지 않는다. Crash
   phase는 다음 lifecycle command에서 복구하며 conflict와 rollback failure는 사용자 설정을 덮어쓰지 않는다.
 - The ephemeral settings UI exposes the same `codex-integration` status/connect/disconnect use cases and can
   open an existing private report. Integration mutations require the same private UI session plus exact Host

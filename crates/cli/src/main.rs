@@ -130,6 +130,10 @@ impl IngestResult {
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
+    if public_help_requested(&arguments) {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     if let Some(result) = run_collector_command(&arguments) {
         return match result {
             Ok(()) => ExitCode::SUCCESS,
@@ -162,6 +166,12 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn public_help_requested(arguments: &[String]) -> bool {
+    arguments.first().is_some_and(|command| {
+        !matches!(command.as_str(), "collector-serve" | "codex-notify") && help_requested(arguments)
+    })
 }
 
 fn run_collector_command(arguments: &[String]) -> Option<Result<(), String>> {

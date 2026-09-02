@@ -100,8 +100,10 @@ agentobs disconnect codex
 
 `disconnect`는 collector service를 연결 전의 정확한 plist와 loaded 상태로 되돌린 뒤 Codex 설정을
 연결 전의 정확한 bytes와 permission으로 복원한다. connect가 새로 만든 service/config만 종료하고
-제거한다. agentobs가 소유하지 않은 기존 `notify`는 연결 중에도 보존된다. 연결 뒤 어떤 설정이든 바뀌어 현재
-전체 bytes 또는 mode가 기록된 connected state와 다르면 편집을 덮어쓰지 않고 중단한다. 이미 수집된
+제거한다. agentobs가 소유하지 않은 기존 `notify`는 연결 중에도 보존된다. 연결 뒤 설정 변경이 commit 전
+exact-state 검사에서 관측되면 편집을 덮어쓰지 않고 중단한다. agentobs lifecycle writer끼리는 private
+lock으로 직렬화한다. 단, 같은 파일의 열린 descriptor에 lock을 무시하고 동시에 쓰는 임의 프로세스까지
+portable하게 배제하는 filesystem CAS는 아니므로 그런 비협조적 write와의 최종 경쟁은 보장하지 않는다. 이미 수집된
 local data는 유지된다.
 
 macOS 시스템 설정의 **로그인 항목 및 확장 프로그램 > 앱 백그라운드 활동**에

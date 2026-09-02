@@ -1271,10 +1271,14 @@ fn atomic_replace_with(
         }
         boundary(AtomicReplaceBoundary::ExpectationChecked)?;
 
-        // Supported writers share the private lock held by the caller. A filesystem has no
-        // portable compare-and-swap that can exclude arbitrary non-cooperating open-FD writes
-        // between this exact bytes/mode check and rename. Keeping the canonical name in place
-        // until this atomic rename means a crash can expose only the complete old or new file.
+        // Recheck after the injectable validation boundary so an edit observed immediately before
+        // commit fails closed. Supported writers also share the private lock held by the caller.
+        // A portable filesystem still cannot exclude an arbitrary non-cooperating open-FD write
+        // in the final interval between this recheck and rename.
+        let commit_current = read_optional_private_file(path)?;
+        if !expected.matches(&commit_current) {
+            return Err(ConfigError::Conflict);
+        }
         fs::rename(&temp, path)?;
         boundary(AtomicReplaceBoundary::Renamed)?;
         sync_dir(parent)?;
@@ -1300,6 +1304,10 @@ fn remove_checked(path: &Path, expected: FileExpectation<'_>) -> Result<(), Conf
         return Err(ConfigError::Conflict);
     }
     if current.existed {
+        let commit_current = read_optional_private_file(path)?;
+        if !expected.matches(&commit_current) {
+            return Err(ConfigError::Conflict);
+        }
         fs::remove_file(path)?;
     }
     sync_dir(parent)?;
@@ -2466,7 +2474,7 @@ mod tests {
     }
 
     #[test]
-    fn non_cooperating_open_fd_write_cannot_be_portably_cased() {
+    fn post_validation_open_fd_write_is_detected_before_replace() {
         let root = root("open-fd-cas-limit");
         prepare(&root);
         let path = root.join("config.toml");
@@ -2476,7 +2484,7 @@ mod tests {
         set_mode(&path, 0o600).unwrap();
         let mut external = OpenOptions::new().write(true).open(&path).unwrap();
 
-        atomic_replace_with(
+        let result = atomic_replace_with(
             &path,
             FileExpectation::present_bytes(old, 0o600),
             new,
@@ -2490,12 +2498,10 @@ mod tests {
                 }
                 Ok(())
             },
-        )
-        .unwrap();
+        );
 
-        // There is no portable content-CAS rename against an arbitrary writer. The supported
-        // writer still never removes the canonical name: its complete replacement wins here.
-        assert_eq!(fs::read(&path).unwrap(), new);
+        assert!(matches!(result, Err(ConfigError::Conflict)));
+        assert_eq!(fs::read(&path).unwrap(), b"non-cooperating write\n");
         let _ = fs::remove_dir_all(root);
     }
 

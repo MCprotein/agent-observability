@@ -114,15 +114,18 @@ collector whose durable report is pending or whose bounded report refresh retrie
 Connect refuses conflicting pre-existing OTEL values unless they match exactly; an unrelated pre-existing notify is not a conflict.
 Before changing the file, it stores the exact prior and connected bytes, hashes, existence, permission modes
 and transaction phase in `runtime/integrations/codex/codex-config-ownership-v1.json` with private permissions.
-A lock scoped to the canonical Codex config path, exact-state comparison, temp-file fsync and atomic rename preserve supported concurrent
-edits without ever displacing the canonical file. Prepared and restoring snapshots recover deterministically on
+A lock scoped to the canonical Codex config path serializes supported lifecycle writers. Repeated exact-state
+comparison before temp-file fsync/atomic rename detects observed external edits without displacing the canonical
+file. This is not a portable filesystem CAS against an arbitrary process that ignores the lock and writes through
+an already-open descriptor in the final check/rename interval. Prepared and restoring snapshots recover deterministically on
 the next lifecycle command after a process crash.
 
 `status codex [root]` reports config ownership and authenticated collector health. `disconnect codex [root]`
 first restores the exact pre-connect LaunchAgent plist and loaded state; it stops and removes only a service
 created by connect. It then restores the exact prior config bytes and mode, or removes the config if connect
-created it, only while the complete current bytes and mode equal the recorded connected state. Any intervening
-edit fails closed and is preserved. SQLite, JSONL and HTML data remain.
+created it, only while the complete current bytes and mode equal the recorded connected state at the commit
+checks. An edit observed by those checks fails closed and is preserved; the non-cooperating open-descriptor
+limitation above still applies. SQLite, JSONL and HTML data remain.
 
 The raw notify argument exists transiently only in the bounded foreground projector and is reduced before
 settings or socket access; the receiver sees only `ProjectedNotifyV1`. Raw OTLP requests can exist transiently in

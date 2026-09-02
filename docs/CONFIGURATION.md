@@ -145,9 +145,11 @@ serialized compare/replace transaction으로 교체한다. 중간 crash는 snaps
 다음 lifecycle command에서 결정적으로 복구한다. 기존 다른 exporter/privacy/environment 값을
 병합하거나 덮어쓰지 않고 conflict로 중단하며, 기존 notify는 agentobs 소유권 밖에 둔다.
 
-Disconnect는 현재 config의 전체 bytes와 mode가 snapshot의 exact connected state와 같을 때만 prior
-bytes와 mode를 복원한다. 연결 전 config가 없었다면 생성한 file을 제거한다. User 또는 다른 tool이
-managed value가 아닌 설정만 바꾼 경우에도 conflict로 중단하고 그 편집을 보존한다. Successful
+Disconnect는 commit 전 반복 검사에서 현재 config의 전체 bytes와 mode가 snapshot의 exact connected
+state와 같을 때만 prior bytes와 mode를 복원한다. 연결 전 config가 없었다면 생성한 file을 제거한다.
+검사에서 관측된 user/tool 편집은 managed value 여부와 무관하게 conflict로 중단하고 보존한다.
+agentobs writer는 lock으로 직렬화하지만, lock을 무시하고 이미 열린 descriptor에 최종 검사와 rename
+사이 쓰는 임의 프로세스를 배제하는 portable filesystem CAS는 아니다. Successful
 disconnect는 연결 전 LaunchAgent plist와 loaded 상태를 먼저 복원한다. Connect가 새로 만든 service만
 종료·제거하며, 그 뒤 config를 복원한다. Local observation, SQLite와 dashboard는 보존한다.
 
