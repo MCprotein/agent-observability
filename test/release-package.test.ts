@@ -116,7 +116,7 @@ test("release workflow pins actions and uses the tested publication state machin
   assert.match(ciWorkflow, /if: github\.event_name == 'workflow_dispatch'/);
   assert.match(
     ciWorkflow,
-    /gate_status=\$\{PIPESTATUS\[0\]\}[\s\S]*echo "manifest=\$manifest" >> "\$GITHUB_OUTPUT"[\s\S]*exit "\$gate_status"/,
+    /set \+e[\s\S]*perf automatic --profile release --check[\s\S]*tee "\$RUNNER_TEMP\/automatic-release-evidence\.out"[\s\S]*gate_status=\$\{PIPESTATUS\[0\]\}[\s\S]*set -e[\s\S]*test -f "\$manifest"[\s\S]*echo "manifest=\$manifest" >> "\$GITHUB_OUTPUT"[\s\S]*exit "\$gate_status"/,
   );
   assert.match(
     ciWorkflow,

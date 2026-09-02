@@ -1175,6 +1175,25 @@ fn public_error_message<'a>(args: &[String], error: &'a str) -> &'a str {
         error
     }
 }
+
+fn automatic_manifest_metadata(
+    manifest_path: &Path,
+    profile: Profile,
+    status: &str,
+) -> Result<String, String> {
+    if manifest_path.is_absolute() {
+        return Err("automatic manifest metadata requires a relative path".into());
+    }
+    if !matches!(status, "pass" | "failed") {
+        return Err("automatic manifest metadata has an invalid status".into());
+    }
+    Ok(format!(
+        "manifest={}\nprofile={}\nstatus={status}",
+        manifest_path.display(),
+        profile_name(profile)
+    ))
+}
+
 fn command(args: &[String]) -> Result<(), String> {
     if args.is_empty() || args == ["help"] || args == ["--help"] || args == ["-h"] {
         println!(
@@ -1281,9 +1300,8 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
                 .map_err(|error| format!("finalize automatic cleanup failure: {error}"))?;
         }
         println!(
-            "manifest={}\nprofile={}\nstatus=failed",
-            manifest_path.display(),
-            profile_name(config.profile)
+            "{}",
+            automatic_manifest_metadata(&manifest_path, config.profile, "failed")?
         );
         return Err(format!(
             "automatic performance cleanup failed: {cleanup_error}"
@@ -1291,9 +1309,8 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
     }
     if let Err(error) = validation {
         println!(
-            "manifest={}\nprofile={}\nstatus=failed",
-            manifest_path.display(),
-            profile_name(config.profile)
+            "{}",
+            automatic_manifest_metadata(&manifest_path, config.profile, "failed")?
         );
         return Err(format!(
             "automatic performance check failed; manifest: {}: {error}",
@@ -1308,9 +1325,8 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
             .map_err(|error| format!("finalize automatic manifest: {error}"))?;
     }
     println!(
-        "manifest={}\nprofile={}\nstatus=pass",
-        manifest_path.display(),
-        profile_name(config.profile)
+        "{}",
+        automatic_manifest_metadata(&manifest_path, config.profile, "pass")?
     );
     Ok(())
 }
@@ -6965,6 +6981,37 @@ mod tests {
             "automatic_evidence_validation_failed"
         );
         assert_eq!(public_error_message(&local, raw), raw);
+    }
+
+    #[test]
+    fn automatic_manifest_metadata_is_relative_and_content_free() {
+        let metadata = automatic_manifest_metadata(
+            Path::new("docs/evidence/local/performance/automatic-123/manifest.yaml"),
+            Profile::Release,
+            "failed",
+        )
+        .unwrap();
+        assert_eq!(
+            metadata,
+            "manifest=docs/evidence/local/performance/automatic-123/manifest.yaml\nprofile=release\nstatus=failed"
+        );
+        assert!(!metadata.contains("AUTOMATIC_RAW_PROMPT_SENTINEL"));
+        assert!(
+            automatic_manifest_metadata(
+                Path::new("/Users/private/AUTOMATIC_RAW_PROMPT_SENTINEL/manifest.yaml"),
+                Profile::Release,
+                "failed"
+            )
+            .is_err()
+        );
+        assert!(
+            automatic_manifest_metadata(
+                Path::new("docs/evidence/local/performance/automatic-123/manifest.yaml"),
+                Profile::Release,
+                "pending"
+            )
+            .is_err()
+        );
     }
 
     #[test]
