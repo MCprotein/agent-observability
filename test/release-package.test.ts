@@ -120,6 +120,12 @@ test("release workflow pins actions and uses the tested publication state machin
     /name: automatic-release-evidence-\$\{\{ github\.sha \}\}/,
   );
   assert.match(ciWorkflow, /path: \$\{\{ steps\.evidence\.outputs\.manifest \}\}/);
+  for (const workflow of [ciWorkflow, releaseWorkflow]) {
+    assert.match(workflow, /report_generation: 20001/);
+    assert.match(workflow, /report_records: 20001/);
+    assert.match(workflow, /rss_samples:[\s\S]*\$2 < 100/);
+    assert.match(workflow, /rss_observed_max_gap_ms:[\s\S]*\$2 > 100/);
+  }
 });
 
 interface CommandResult {

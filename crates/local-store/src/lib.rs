@@ -4978,10 +4978,11 @@ mod tests {
             }
             let reader = LocalStore::open_current(&dir).unwrap();
             let next = initial_records + 1;
+            let final_index = usize::try_from(initial_records).unwrap() - 1;
 
             let error = reader
                 .visit_report_snapshot(|index, _record| {
-                    if index == 0 {
+                    if index == final_index {
                         writer
                             .ingest(&observation_after(
                                 &next.to_string(),
@@ -5011,9 +5012,10 @@ mod tests {
         let writer_dir = dir.clone();
         let start = std::sync::Arc::new(std::sync::Barrier::new(2));
         let writer_start = std::sync::Arc::clone(&start);
+        let committed_writes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer_committed_writes = std::sync::Arc::clone(&committed_writes);
         let writer = std::thread::spawn(move || {
             writer_start.wait();
-            let started = std::time::Instant::now();
             let mut writer = LocalStore::open(&writer_dir).unwrap();
             let mut max_write = Duration::ZERO;
             for ordinal in 2..=257 {
@@ -5029,32 +5031,38 @@ mod tests {
                     ))
                     .unwrap();
                 max_write = max_write.max(write_started.elapsed());
+                writer_committed_writes.fetch_add(1, std::sync::atomic::Ordering::Release);
                 std::thread::sleep(Duration::from_micros(250));
             }
-            (started.elapsed(), max_write)
+            max_write
         });
 
         let reader = LocalStore::open_current(&dir).unwrap();
         start.wait();
         let mut overlapping_visits = 0_u64;
+        let mut writes_during_visits = 0_u64;
         while !writer.is_finished() {
             overlapping_visits += 1;
+            let writes_before = committed_writes.load(std::sync::atomic::Ordering::Acquire);
             match reader.visit_report_snapshot(|_, _| {
                 std::thread::sleep(Duration::from_micros(100));
             }) {
                 Ok(_) | Err(StoreError::ReportSnapshotChanged) => {}
                 Err(error) => panic!("report visitor failed during sustained writes: {error}"),
             }
+            let writes_after = committed_writes.load(std::sync::atomic::Ordering::Acquire);
+            writes_during_visits =
+                writes_during_visits.saturating_add(writes_after.saturating_sub(writes_before));
         }
-        let (writer_elapsed, max_write) = writer.join().unwrap();
+        let max_write = writer.join().unwrap();
         assert!(overlapping_visits > 0);
+        assert!(
+            writes_during_visits >= 16,
+            "only {writes_during_visits} writes completed during report visits"
+        );
         assert!(
             max_write < Duration::from_secs(2),
             "one writer approached the SQLite busy timeout: {max_write:?}"
-        );
-        assert!(
-            writer_elapsed < Duration::from_secs(10),
-            "report reads delayed sustained writes for {writer_elapsed:?}"
         );
 
         let mut visited = 0;

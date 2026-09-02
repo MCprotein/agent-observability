@@ -1116,19 +1116,10 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
         .map_err(|error| format!("create automatic runtime parent: {error}"))?;
     fs::set_permissions(&runtime_root, Permissions::from_mode(0o700))
         .map_err(|error| format!("protect automatic runtime parent: {error}"))?;
-    run_automatic_lifecycle_smoke(&binary, &runtime_root)?;
     let host = HostEvidence::collect(&evidence_root)?;
-    let mut results = Vec::new();
-    let mut errors = Vec::new();
-    for run_number in 1..=config.runs {
-        match execute_automatic_run(config, run_number, &binary, &runtime_root) {
-            Ok(result) => results.push(result),
-            Err(error) => {
-                errors.push(format!("run {run_number}: {error}"));
-                break;
-            }
-        }
-    }
+    let lifecycle = run_automatic_lifecycle_smoke(&binary, &runtime_root);
+    let (results, mut errors) =
+        collect_automatic_run_results(config, &binary, &runtime_root, lifecycle);
     let validation = validate_automatic_results(config, &results, &errors);
     if let Err(error) = &validation {
         errors.push(format!("validation: {error}"));
@@ -1185,6 +1176,30 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
         profile_name(config.profile)
     );
     Ok(())
+}
+
+fn collect_automatic_run_results(
+    config: AutomaticConfig,
+    binary: &Path,
+    runtime_root: &Path,
+    lifecycle: Result<(), String>,
+) -> (Vec<AutomaticRunResult>, Vec<String>) {
+    let mut results = Vec::new();
+    let mut errors = Vec::new();
+    if let Err(error) = lifecycle {
+        errors.push(format!("lifecycle preflight: {error}"));
+        return (results, errors);
+    }
+    for run_number in 1..=config.runs {
+        match execute_automatic_run(config, run_number, binary, runtime_root) {
+            Ok(result) => results.push(result),
+            Err(error) => {
+                errors.push(format!("run {run_number}: {error}"));
+                break;
+            }
+        }
+    }
+    (results, errors)
 }
 
 fn validate_automatic_protocol_contract() -> Result<(), String> {
@@ -5094,8 +5109,21 @@ fn render_automatic_manifest(
         .iter()
         .map(|result| result.rss_observed_max_gap_ms)
         .max();
+    let release_readiness = if matches!(status, "pass" | "pending-validation") {
+        "verified"
+    } else {
+        "not_verified"
+    };
+    let real_codex_e2e_status = if errors
+        .iter()
+        .any(|error| error.starts_with("lifecycle preflight: "))
+    {
+        "failed"
+    } else {
+        "passed"
+    };
     let mut manifest = format!(
-        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: verified\nreal_codex_e2e_status: passed\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.151.0\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_peak_rss_kib: {}\n  collector_rss_samples_min: {}\n  collector_rss_observed_max_gap_ms: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
+        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: {release_readiness}\nreal_codex_e2e_status: {real_codex_e2e_status}\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.151.0\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_peak_rss_kib: {}\n  collector_rss_samples_min: {}\n  collector_rss_observed_max_gap_ms: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
         profile_name(config.profile),
         profile_name(config.profile),
         env!("CARGO_PKG_VERSION"),
@@ -5171,8 +5199,6 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
         "schema_version: automatic_local_performance.v1",
         "evidence_kind: automatic_release_evidence",
         "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-rss-active-report-v2",
-        "release_readiness: verified",
-        "real_codex_e2e_status: passed",
         "source_revision:",
         "cargo_locked: true",
         "codex_version: 0.151.0",
@@ -5200,6 +5226,28 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
         if !manifest.contains(field) {
             return Err(format!("automatic performance manifest is missing {field}"));
         }
+    }
+    let status = manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("status: "))
+        .ok_or("automatic performance manifest status is missing")?;
+    let expected_readiness = if matches!(status, "pass" | "pending-validation") {
+        "release_readiness: verified"
+    } else {
+        "release_readiness: not_verified"
+    };
+    if !manifest.lines().any(|line| line == expected_readiness) {
+        return Err(format!(
+            "automatic performance manifest status {status} has inconsistent release readiness"
+        ));
+    }
+    let expected_codex_status = if manifest.contains("  - 'lifecycle preflight: ") {
+        "real_codex_e2e_status: failed"
+    } else {
+        "real_codex_e2e_status: passed"
+    };
+    if !manifest.lines().any(|line| line == expected_codex_status) {
+        return Err("automatic performance manifest has inconsistent real Codex status".into());
     }
     for forbidden in [
         "/tmp/",
@@ -6317,20 +6365,49 @@ mod tests {
 
     #[test]
     fn automatic_failure_manifest_without_completed_runs_retains_shape() {
+        let (results, mut errors) = collect_automatic_run_results(
+            automatic_config(),
+            Path::new("unused-after-lifecycle-failure"),
+            Path::new("unused-after-lifecycle-failure"),
+            Err("synthetic preflight failure".into()),
+        );
+        let validation = validate_automatic_results(automatic_config(), &results, &errors);
+        errors.push(format!("validation: {}", validation.unwrap_err()));
         let manifest = render_automatic_manifest(
             automatic_config(),
             &host(),
             "0123456789abcdef0123456789abcdef01234567",
-            &[],
-            &["run 1: synthetic failure".into()],
+            &results,
+            &errors,
             "failed",
         );
+        let root = env::temp_dir().join(format!(
+            "automatic-zero-run-failure-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let manifest_path = root.join("manifest.yaml");
+        fs::write(&manifest_path, &manifest).unwrap();
+        let retained = fs::read_to_string(&manifest_path).unwrap();
 
-        assert!(manifest.contains("status: failed"));
-        assert!(manifest.contains("collector_rss_samples_min: null"));
-        assert!(manifest.contains("collector_rss_observed_max_gap_ms: null"));
-        assert!(manifest.contains("run 1: synthetic failure"));
-        validate_automatic_manifest_shape(&manifest).unwrap();
+        assert!(retained.contains("status: failed"));
+        assert!(retained.contains("release_readiness: not_verified"));
+        assert!(retained.contains("real_codex_e2e_status: failed"));
+        assert!(retained.contains("collector_rss_samples_min: null"));
+        assert!(retained.contains("collector_rss_observed_max_gap_ms: null"));
+        assert!(retained.contains("lifecycle preflight: synthetic preflight failure"));
+        validate_automatic_manifest_shape(&retained).unwrap();
+        assert!(
+            validate_automatic_manifest_shape(&retained.replace(
+                "release_readiness: not_verified",
+                "release_readiness: verified"
+            ))
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

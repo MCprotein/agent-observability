@@ -169,6 +169,10 @@ jobs:
           grep -Fxq "  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp" "$manifest"
           grep -Fxq "  real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response" "$manifest"
           grep -Fxq "  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report" "$manifest"
+          test "$(grep -Fc "    report_generation: 20001" "$manifest")" -eq 5
+          test "$(grep -Fc "    report_records: 20001" "$manifest")" -eq 5
+          awk '$1 == "rss_samples:" { count += 1; if ($2 < 100) bad = 1 } END { exit !(count == 5 && !bad) }' "$manifest"
+          awk '$1 == "rss_observed_max_gap_ms:" { count += 1; if ($2 > 100) bad = 1 } END { exit !(count == 5 && !bad) }' "$manifest"
 
   publish:
     name: Publish release and package
