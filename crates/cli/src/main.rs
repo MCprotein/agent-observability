@@ -27,7 +27,7 @@ use agent_observability_local_runtime::{
 use agent_observability_local_store::{
     IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore, RetentionPlan,
 };
-use agent_observability_local_ui::{PreparedUi, open_local_target};
+use agent_observability_local_ui::{PlatformOpenError, PreparedUi, open_local_target};
 use agent_observability_static_report::write_private;
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -258,7 +258,14 @@ fn announce_settings_ui(ui: &PreparedUi, open: bool) -> Result<(), String> {
 }
 
 fn open_settings_url(url: &str) -> Result<(), String> {
-    open_local_target(url).map_err(|error| format!("settings UI {error}"))
+    open_settings_url_with(url, |target| open_local_target(target))
+}
+
+fn open_settings_url_with(
+    url: &str,
+    opener: impl FnOnce(&str) -> Result<(), PlatformOpenError>,
+) -> Result<(), String> {
+    opener(url).map_err(|error| format!("settings UI {error}"))
 }
 
 fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
@@ -609,7 +616,14 @@ fn current_record_count(root: &Path) -> Result<usize, String> {
 }
 
 fn open_dashboard(path: &Path) -> Result<(), String> {
-    open_local_target(path).map_err(|error| format!("dashboard {error}"))
+    open_dashboard_with(path, |target| open_local_target(target))
+}
+
+fn open_dashboard_with(
+    path: &Path,
+    opener: impl FnOnce(&Path) -> Result<(), PlatformOpenError>,
+) -> Result<(), String> {
+    opener(path).map_err(|error| format!("dashboard {error}"))
 }
 
 fn show_config(root: &Path) -> Result<String, String> {
@@ -1113,13 +1127,14 @@ fn ingest_paths(path: &Path) -> Result<IngestPaths, String> {
 mod tests {
     use super::{
         IngestBlock, IngestResult, LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME,
-        format_codex_status, prepare_dashboard_with, require_demo_ingest, run, setup_with,
-        timestamp_from_duration,
+        format_codex_status, open_dashboard_with, open_settings_url_with, prepare_dashboard_with,
+        require_demo_ingest, run, setup_with, timestamp_from_duration,
     };
     use agent_observability_codex_integration::{
         CodexIntegrationStatus, CollectorStatus, ConnectionStatus,
     };
     use agent_observability_local_runtime::{MutationGuard, install};
+    use agent_observability_local_ui::PlatformOpenError;
     use std::fs;
     use std::path::Path;
     use std::time::Duration;
@@ -1350,6 +1365,46 @@ mod tests {
         .unwrap();
         assert_eq!(opened.into_inner().as_deref(), Some(dashboard.as_path()));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_open_wrappers_preserve_targets_and_content_free_errors() {
+        let settings = open_settings_url_with("http://127.0.0.1:3000/settings", |url| {
+            assert_eq!(url, "http://127.0.0.1:3000/settings");
+            Err(PlatformOpenError::TimedOut)
+        })
+        .unwrap_err();
+        assert_eq!(settings, "settings UI automatic open timed out");
+
+        let report = Path::new("/private/AUTOMATIC_PRIVATE_TARGET_SENTINEL.html");
+        let dashboard = open_dashboard_with(report, |path| {
+            assert_eq!(path, report);
+            Err(PlatformOpenError::ExitFailed)
+        })
+        .unwrap_err();
+        assert_eq!(dashboard, "dashboard automatic open failed");
+        assert!(!dashboard.contains("AUTOMATIC_PRIVATE_TARGET_SENTINEL"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn cli_open_wrappers_report_unsupported_platform_without_target_content() {
+        let settings = super::open_settings_url("AUTOMATIC_PRIVATE_SETTINGS_SENTINEL").unwrap_err();
+        assert_eq!(
+            settings,
+            "settings UI automatic open is unsupported on this platform"
+        );
+        assert!(!settings.contains("AUTOMATIC_PRIVATE_SETTINGS_SENTINEL"));
+
+        let dashboard = super::open_dashboard(Path::new(
+            "/private/AUTOMATIC_PRIVATE_DASHBOARD_SENTINEL.html",
+        ))
+        .unwrap_err();
+        assert_eq!(
+            dashboard,
+            "dashboard automatic open is unsupported on this platform"
+        );
+        assert!(!dashboard.contains("AUTOMATIC_PRIVATE_DASHBOARD_SENTINEL"));
     }
 
     #[cfg(unix)]

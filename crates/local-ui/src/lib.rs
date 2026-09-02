@@ -48,7 +48,7 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(target_os = "macos")]
 const PLATFORM_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const PLATFORM_OPENER_PATH: &str = "/usr/bin/open";
 #[cfg(any(target_os = "macos", test))]
 const PLATFORM_REAP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -463,14 +463,20 @@ fn open_dashboard_file(_path: &Path) -> Result<(), DashboardOpenError> {
 
 #[cfg(target_os = "macos")]
 pub fn open_local_target(target: impl AsRef<OsStr>) -> Result<(), PlatformOpenError> {
-    let mut command = Command::new(PLATFORM_OPENER_PATH);
-    command.arg(target);
+    let mut command = platform_open_command(target.as_ref());
     run_platform_opener(&mut command, PLATFORM_OPEN_TIMEOUT)
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn open_local_target(_target: impl AsRef<OsStr>) -> Result<(), PlatformOpenError> {
     Err(PlatformOpenError::UnsupportedPlatform)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn platform_open_command(target: &OsStr) -> Command {
+    let mut command = Command::new(PLATFORM_OPENER_PATH);
+    command.arg(target);
+    command
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -767,11 +773,10 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
-    use super::PLATFORM_OPENER_PATH;
     use super::{
         AppState, DashboardOpenError, LocalConfigService, PlatformOpenError, constant_time_equal,
-        dashboard_error, prepare, router, run_integration, run_platform_opener, session_token,
+        dashboard_error, platform_open_command, prepare, router, run_integration,
+        run_platform_opener, session_token,
     };
     use agent_observability_codex_integration::{CodexIntegrationStatus, IntegrationError};
     use agent_observability_local_runtime::{LocalRuntimeConfigV2, install, revision};
@@ -926,45 +931,85 @@ mod tests {
         fs::remove_file(pid_path).unwrap();
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn dashboard_opener_uses_the_trusted_platform_binary() {
-        let command = Command::new(PLATFORM_OPENER_PATH);
+    fn platform_opener_wires_the_trusted_binary_and_target() {
+        let target = std::ffi::OsStr::new("file:///private/report.html");
+        let command = platform_open_command(target);
         assert_eq!(command.get_program(), std::ffi::OsStr::new("/usr/bin/open"));
+        assert_eq!(command.get_args().collect::<Vec<_>>(), [target]);
     }
 
     #[test]
-    fn dashboard_opener_stderr_helper() {
-        if std::env::var_os("AGENTOBS_DASHBOARD_STDERR_HELPER").is_none() {
+    fn platform_opener_stdio_helper() {
+        if std::env::var_os("AGENTOBS_PLATFORM_STDIO_HELPER").is_none() {
             return;
         }
-        let mut command = Command::new("sh");
+        let mut command = Command::new("/bin/sh");
         command.args([
             "-c",
-            "echo 'AUTOMATIC_DASHBOARD_STDERR_SENTINEL' >&2; exit 9",
+            "if IFS= read -r _; then exit 9; fi; printf 'AUTOMATIC_PLATFORM_STDOUT_SENTINEL'; printf 'AUTOMATIC_PLATFORM_STDERR_SENTINEL' >&2",
         ]);
-        assert!(run_platform_opener(&mut command, Duration::from_secs(1)).is_err());
+        assert_eq!(
+            run_platform_opener(&mut command, Duration::from_secs(1)),
+            Ok(())
+        );
     }
 
     #[test]
-    fn dashboard_opener_never_leaks_child_stderr() {
-        let output = Command::new(std::env::current_exe().unwrap())
+    fn platform_opener_nulls_child_stdin_stdout_and_stderr() {
+        use std::io::Write;
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "tests::dashboard_opener_stderr_helper",
+                "tests::platform_opener_stdio_helper",
                 "--nocapture",
             ])
-            .env("AGENTOBS_DASHBOARD_STDERR_HELPER", "1")
-            .output()
+            .env("AGENTOBS_PLATFORM_STDIO_HELPER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"AUTOMATIC_PLATFORM_STDIN_SENTINEL\n")
+            .unwrap();
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
-        for stream in [&output.stdout, &output.stderr] {
-            assert!(
-                !stream
-                    .windows(b"AUTOMATIC_DASHBOARD_STDERR_SENTINEL".len())
-                    .any(|value| value == b"AUTOMATIC_DASHBOARD_STDERR_SENTINEL")
-            );
+        for sentinel in [
+            b"AUTOMATIC_PLATFORM_STDOUT_SENTINEL".as_slice(),
+            b"AUTOMATIC_PLATFORM_STDERR_SENTINEL".as_slice(),
+        ] {
+            let leaked = [&output.stdout, &output.stderr].iter().any(|stream| {
+                stream
+                    .windows(sentinel.len())
+                    .any(|value| value == sentinel)
+            });
+            assert!(!leaked, "platform opener leaked a child standard stream");
         }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn unsupported_platform_open_is_typed_and_content_free() {
+        let error = super::open_local_target("AUTOMATIC_PRIVATE_TARGET_SENTINEL").unwrap_err();
+        assert_eq!(error, PlatformOpenError::UnsupportedPlatform);
+        assert_eq!(
+            error.to_string(),
+            "automatic open is unsupported on this platform"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("AUTOMATIC_PRIVATE_TARGET_SENTINEL")
+        );
+
+        let response = dashboard_error(DashboardOpenError::Platform(error)).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[test]
