@@ -210,7 +210,7 @@
     {
       "capability_version": "codex_automatic_local.v3",
       "adapter_family": "codex",
-      "support_status": "experimental",
+      "support_status": "supported",
       "platforms": ["macos"],
       "profiles": ["standalone"],
       "product_version": "0.151.0",

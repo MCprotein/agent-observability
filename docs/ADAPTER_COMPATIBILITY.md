@@ -1,6 +1,6 @@
 # Adapter Compatibility Contract
 
-Status: v1.8.0 In Progress; Codex automatic local E2E passes locally, exact-revision CI and publication pending, exact-version private imports supported
+Status: v1.8.0 In Progress; Codex automatic local capability supported on the pinned macOS boundary, publication pending, exact-version private imports supported
 Last verified: 2026-09-02
 
 이 문서는 Codex, Claude Code, Cursor adapter가 어떤 공식 surface를 어떤 우선순위로 사용하고,
@@ -80,9 +80,9 @@ privacy closure. The Codex, Claude Code and Cursor adapter suites verify declare
 exact replay output, bounded input, restart/idempotency and privacy behavior. Claude Code additionally locks permission,
 compaction, failed lifecycle, interrupt-gap and out-of-order timestamp fixtures. The capability manifest publishes
 separate manual `private_canonical_handoff_v1` entries and a macOS standalone `codex_automatic_local.v3` entry
-pinned to Codex `0.151.0`. It remains `experimental` on the release branch until native receiver, foreground
-notify, privacy, restart, exact-binary performance and publication evidence pass for the final revision. Release
-promotion changes that same closed entry to `supported`; cross-version/OS/profile execution remains a future gate.
+pinned to Codex `0.151.0`. Native receiver, foreground notify, privacy, restart and exact-binary performance
+evidence passed on the pinned macOS boundary, so the closed entry is `supported`. Publication remains a v1.8.0
+release gate; cross-version/OS/profile execution remains a future gate.
 
 The automatic-path release gate is
 `cargo run -p xtask -- perf automatic --profile release --check`. Its versioned protocol is
@@ -120,7 +120,7 @@ shell/MCP/file hooks remain diagnostic-only, and raw transcript/content fields a
 The v1.8.0 code adds a Codex-only OTLP/HTTP JSON receiver, bounded notify helper, exact config ownership and
 macOS LaunchAgent. It does not add OTLP/gRPC, Claude Code automatic collection, Cursor automatic collection,
 file scraping or a team transport. Manual imports remain the stable shared boundary. The automatic capability is
-pinned to Codex `0.151.0`. Local actual-Codex evidence has passed; exact-revision CI and publication evidence
-remain release gates, so the source entry stays `experimental` and v1.8.0 stays **In Progress**, not Released.
+pinned to Codex `0.151.0`. Actual-Codex E2E and exact-revision 5-run release evidence passed, so the source entry
+is `supported`. Publication evidence remains a v1.8.0 release gate, so v1.8.0 stays **In Progress**, not Released.
 Other platforms fail closed for automatic setup until equivalent service, no-follow, identity, permission and
 execution evidence exists; manual private imports retain their existing supported boundary.
