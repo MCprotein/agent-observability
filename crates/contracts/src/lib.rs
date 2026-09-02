@@ -693,7 +693,17 @@ pub fn hash_opaque_identifier(value: &str) -> String {
 ///
 /// Returns [`ContractError`] when the sanitized record violates the closed wire contract.
 pub fn sanitize_durable_record(input: &DurableRecordV1) -> Result<DurableRecordV1, ContractError> {
-    let mut record = input.clone();
+    sanitize_owned_durable_record(input.clone())
+}
+
+/// Applies the mandatory durable privacy boundary while reusing an owned record allocation.
+///
+/// # Errors
+///
+/// Returns [`ContractError`] when the sanitized record violates the closed wire contract.
+pub fn sanitize_owned_durable_record(
+    mut record: DurableRecordV1,
+) -> Result<DurableRecordV1, ContractError> {
     let mut fields = Vec::new();
     hash_record_id(&mut record.trace_id, "trace_id", &mut fields);
     hash_record_id(&mut record.span_id, "span_id", &mut fields);

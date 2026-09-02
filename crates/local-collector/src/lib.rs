@@ -2523,11 +2523,13 @@ fn refresh_report(
     let _render_guard = store
         .acquire_report_render_guard()
         .map_err(|_| ReportFailure::RenderGuard)?;
-    let mut projector = ReportProjector::new(0, None);
+    let capacity = usize::try_from(store.record_count().map_err(|_| ReportFailure::Snapshot)?)
+        .map_err(|_| ReportFailure::Snapshot)?;
+    let mut projector = ReportProjector::new(capacity, None);
     let mut projection_failure = false;
     let visit = store
         .visit_report_snapshot(|index, record| {
-            if !projection_failure && projector.push(index, &record).is_err() {
+            if !projection_failure && projector.push_owned(index, record).is_err() {
                 projection_failure = true;
             }
         })

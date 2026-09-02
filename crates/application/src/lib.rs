@@ -5,6 +5,7 @@ use agent_observability_contracts::{
     REPORT_DTO_VERSION, RateTableRefV1, ReportAgentV1, ReportAttributesV1, ReportDtoV1,
     ReportFiltersV1, ReportMetricsV1, ReportSpanV1, ReportSummaryV1, ScalarValueV1, TraceSummaryV1,
     hash_opaque_identifier, redact_sensitive_text, sanitize_durable_record,
+    sanitize_owned_durable_record,
 };
 use agent_observability_domain::SpanKind;
 use agent_observability_domain::StatusCode;
@@ -208,6 +209,22 @@ impl<'a> ReportProjector<'a> {
         record: &DurableRecordV1,
     ) -> Result<(), ReportProjectionError> {
         let record = sanitize_durable_record(record)
+            .map_err(|source| ReportProjectionError::InvalidRecord { index, source })?;
+        self.spans.push(report_span(&record, self.table));
+        Ok(())
+    }
+
+    /// Validates and projects one owned record without cloning its durable representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReportProjectionError`] when the record is invalid.
+    pub fn push_owned(
+        &mut self,
+        index: usize,
+        record: DurableRecordV1,
+    ) -> Result<(), ReportProjectionError> {
+        let record = sanitize_owned_durable_record(record)
             .map_err(|source| ReportProjectionError::InvalidRecord { index, source })?;
         self.spans.push(report_span(&record, self.table));
         Ok(())

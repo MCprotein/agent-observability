@@ -826,11 +826,13 @@ fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String>
         .map_err(|error| error.to_string())?;
     let mut rendered = None;
     for _ in 0..REPORT_RENDER_RETRY_LIMIT {
-        let mut projector = ReportProjector::new(0, rate_table.as_ref());
+        let capacity = usize::try_from(store.record_count().map_err(|error| error.to_string())?)
+            .map_err(|_| "report record count exceeds this platform".to_string())?;
+        let mut projector = ReportProjector::new(capacity, rate_table.as_ref());
         let mut projection_error = None;
         let visit = match store.visit_report_snapshot(|index, record| {
             if projection_error.is_none()
-                && let Err(error) = projector.push(index, &record)
+                && let Err(error) = projector.push_owned(index, record)
             {
                 projection_error = Some(error);
             }
