@@ -120,7 +120,9 @@ shell/MCP/file hooks remain diagnostic-only, and raw transcript/content fields a
 The v1.8.0 code adds a Codex-only OTLP/HTTP JSON receiver, bounded notify helper, exact config ownership and
 macOS LaunchAgent. It does not add OTLP/gRPC, Claude Code automatic collection, Cursor automatic collection,
 file scraping or a team transport. Manual imports remain the stable shared boundary. The automatic capability is
-pinned to Codex `0.151.0`. Actual-Codex E2E and exact-revision 5-run release evidence passed, so the source entry
-is `supported`. Publication evidence remains a v1.8.0 release gate, so v1.8.0 stays **In Progress**, not Released.
+pinned to Codex `0.151.0`. Actual-Codex E2E and exact-revision 5-run evidence passed for implementation source
+`272783ff2e5bb6c7a10b224aa7821e571d6ca8f3`, so the source entry is `supported`. The promotion source must pass
+the same exact-revision gate, and publication evidence remains a separate v1.8.0 release gate. Until then v1.8.0
+stays **In Progress**, not Released.
 Other platforms fail closed for automatic setup until equivalent service, no-follow, identity, permission and
 execution evidence exists; manual private imports retain their existing supported boundary.

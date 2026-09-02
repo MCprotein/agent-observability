@@ -203,13 +203,14 @@ agentobs config set storage-bytes 2147483648
 Codex `0.151.0` strict config load는 config parsing만 검증하며 exporter construction이나 native
 telemetry delivery를 검증하지 않는다. macOS에서 client identity field가 있는 이전 config는
 exporter construction에 실패했다. 보정된 transport에서 실제 Codex process가 content-free loopback
-Responses fixture를 호출해 native telemetry를
-collector와 durable report까지 전달하는 local e2e와 exact-revision 5-run release evidence가 통과해
-automatic capability entry는 `supported`다. v1.8.0 tag, package와 Release 게시 검증은 아직 남아 있다.
+Responses fixture를 호출해 native telemetry를 collector와 durable report까지 전달하는 local e2e와
+구현 SHA `272783ff2e5bb6c7a10b224aa7821e571d6ca8f3`의 exact-revision 5-run evidence가 통과해 automatic
+capability entry는 `supported`다. 승격 commit의 exact-revision gate와 v1.8.0 tag, package, Release 게시
+검증은 아직 남아 있다.
 
 | Agent | Pinned / verified version | 현재 지원 | 알려진 제한 |
 | --- | --- | --- | --- |
-| Codex | 수동 verified `0.150.1`; 자동 pinned `0.151.0` (exact-revision release evidence passed) | 수동 handoff + 자동 local OTLP/HTTP JSON/notify | 자동 경로는 macOS only, v1.8.0 publication pending |
+| Codex | 수동 verified `0.150.1`; 자동 pinned `0.151.0` (implementation SHA evidence passed) | 수동 handoff + 자동 local OTLP/HTTP JSON/notify | 자동 경로는 macOS only, promotion SHA gate와 v1.8.0 publication pending |
 | Claude Code | `2.1.248` | OTel/hook canonical handoff 수동 import | 자동 연결 TODO, user interrupt signal 미확인 |
 | Cursor | `3.17.21` | generic tool canonical handoff 수동 import | 자동 연결 TODO, 일부 shell/MCP/file event는 diagnostic-only |
 
