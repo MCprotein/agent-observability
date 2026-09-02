@@ -27,14 +27,12 @@ use agent_observability_local_runtime::{
 use agent_observability_local_store::{
     IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore, RetentionPlan,
 };
-use agent_observability_local_ui::PreparedUi;
+use agent_observability_local_ui::{PreparedUi, open_local_target};
 use agent_observability_static_report::write_private;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -259,21 +257,8 @@ fn announce_settings_ui(ui: &PreparedUi, open: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn open_settings_url(url: &str) -> Result<(), String> {
-    let mut child = Command::new("open")
-        .arg(url)
-        .spawn()
-        .map_err(|error| format!("settings UI open failed: {error}"))?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn open_settings_url(_url: &str) -> Result<(), String> {
-    Err("automatic settings UI open is supported on macOS; use ui --no-open and open the reported URL".into())
+    open_local_target(url).map_err(|error| format!("settings UI {error}"))
 }
 
 fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
@@ -623,25 +608,8 @@ fn current_record_count(root: &Path) -> Result<usize, String> {
         .map_err(|error| error.to_string())
 }
 
-#[cfg(target_os = "macos")]
 fn open_dashboard(path: &Path) -> Result<(), String> {
-    let status = Command::new("open")
-        .arg(path)
-        .status()
-        .map_err(|error| format!("dashboard open failed: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("dashboard open failed with status {status}"))
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn open_dashboard(_path: &Path) -> Result<(), String> {
-    Err(
-        "dashboard open is supported on macOS; use setup --no-open and open the reported file"
-            .into(),
-    )
+    open_local_target(path).map_err(|error| format!("dashboard {error}"))
 }
 
 fn show_config(root: &Path) -> Result<String, String> {

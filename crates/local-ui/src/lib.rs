@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "macos", test))]
 use std::process::{Child, Command, Stdio};
 use std::{
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -45,11 +47,11 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(target_os = "macos")]
-const DASHBOARD_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+const PLATFORM_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "macos")]
-const DASHBOARD_OPENER_PATH: &str = "/usr/bin/open";
+const PLATFORM_OPENER_PATH: &str = "/usr/bin/open";
 #[cfg(any(target_os = "macos", test))]
-const DASHBOARD_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const PLATFORM_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CONNECTIONS: usize = 64;
 const SETTINGS_SHELL: &str = include_str!("generated/settings-shell.html");
 const SETTINGS_SCRIPT: &str = include_str!("generated/settings-ui.js");
@@ -73,6 +75,35 @@ impl std::fmt::Display for UiError {
 }
 
 impl std::error::Error for UiError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformOpenError {
+    UnsupportedPlatform,
+    SpawnFailed,
+    ExitFailed,
+    WaitFailed,
+    TimedOut,
+    TerminateFailed,
+    ReapFailed,
+    ReapTimedOut,
+}
+
+impl std::fmt::Display for PlatformOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedPlatform => "automatic open is unsupported on this platform",
+            Self::TimedOut => "automatic open timed out",
+            Self::SpawnFailed
+            | Self::ExitFailed
+            | Self::WaitFailed
+            | Self::TerminateFailed
+            | Self::ReapFailed
+            | Self::ReapTimedOut => "automatic open failed",
+        })
+    }
+}
+
+impl std::error::Error for PlatformOpenError {}
 
 impl From<std::io::Error> for UiError {
     fn from(error: std::io::Error) -> Self {
@@ -411,22 +442,7 @@ async fn open_dashboard(
 enum DashboardOpenError {
     #[cfg(target_os = "macos")]
     MissingReport,
-    #[cfg(not(target_os = "macos"))]
-    UnsupportedPlatform,
-    #[cfg(any(target_os = "macos", test))]
-    SpawnFailed,
-    #[cfg(any(target_os = "macos", test))]
-    ExitFailed,
-    #[cfg(any(target_os = "macos", test))]
-    WaitFailed,
-    #[cfg(any(target_os = "macos", test))]
-    TimedOut,
-    #[cfg(any(target_os = "macos", test))]
-    TerminateFailed,
-    #[cfg(any(target_os = "macos", test))]
-    ReapFailed,
-    #[cfg(any(target_os = "macos", test))]
-    ReapTimedOut,
+    Platform(PlatformOpenError),
     TaskFailed,
 }
 
@@ -435,27 +451,36 @@ fn open_dashboard_file(path: &Path) -> Result<(), DashboardOpenError> {
     if !path.is_file() {
         return Err(DashboardOpenError::MissingReport);
     }
-    let mut command = Command::new(DASHBOARD_OPENER_PATH);
-    command.arg(path);
-    run_dashboard_opener(&mut command, DASHBOARD_OPEN_TIMEOUT)
+    open_local_target(path).map_err(DashboardOpenError::Platform)
 }
 
 #[cfg(not(target_os = "macos"))]
 fn open_dashboard_file(_path: &Path) -> Result<(), DashboardOpenError> {
-    Err(DashboardOpenError::UnsupportedPlatform)
+    Err(DashboardOpenError::Platform(
+        PlatformOpenError::UnsupportedPlatform,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+pub fn open_local_target(target: impl AsRef<OsStr>) -> Result<(), PlatformOpenError> {
+    let mut command = Command::new(PLATFORM_OPENER_PATH);
+    command.arg(target);
+    run_platform_opener(&mut command, PLATFORM_OPEN_TIMEOUT)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn open_local_target(_target: impl AsRef<OsStr>) -> Result<(), PlatformOpenError> {
+    Err(PlatformOpenError::UnsupportedPlatform)
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn run_dashboard_opener(
-    command: &mut Command,
-    timeout: Duration,
-) -> Result<(), DashboardOpenError> {
+fn run_platform_opener(command: &mut Command, timeout: Duration) -> Result<(), PlatformOpenError> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|_| DashboardOpenError::SpawnFailed)?;
+        .map_err(|_| PlatformOpenError::SpawnFailed)?;
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -463,35 +488,35 @@ fn run_dashboard_opener(
                 return status
                     .success()
                     .then_some(())
-                    .ok_or(DashboardOpenError::ExitFailed);
+                    .ok_or(PlatformOpenError::ExitFailed);
             }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
-                terminate_and_reap_dashboard_opener(child)?;
-                return Err(DashboardOpenError::TimedOut);
+                terminate_and_reap_platform_opener(child)?;
+                return Err(PlatformOpenError::TimedOut);
             }
             Err(_) => {
-                terminate_and_reap_dashboard_opener(child)?;
-                return Err(DashboardOpenError::WaitFailed);
+                terminate_and_reap_platform_opener(child)?;
+                return Err(PlatformOpenError::WaitFailed);
             }
         }
     }
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn terminate_and_reap_dashboard_opener(mut child: Child) -> Result<(), DashboardOpenError> {
+fn terminate_and_reap_platform_opener(mut child: Child) -> Result<(), PlatformOpenError> {
     let termination_failed = child.kill().is_err();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = result_tx.send(child.wait());
     });
-    match result_rx.recv_timeout(DASHBOARD_REAP_TIMEOUT) {
-        Ok(Ok(_)) if termination_failed => Err(DashboardOpenError::TerminateFailed),
+    match result_rx.recv_timeout(PLATFORM_REAP_TIMEOUT) {
+        Ok(Ok(_)) if termination_failed => Err(PlatformOpenError::TerminateFailed),
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(_)) => Err(DashboardOpenError::ReapFailed),
-        Err(_) => Err(DashboardOpenError::ReapTimedOut),
+        Ok(Err(_)) => Err(PlatformOpenError::ReapFailed),
+        Err(_) => Err(PlatformOpenError::ReapTimedOut),
     }
 }
 
@@ -510,25 +535,22 @@ fn dashboard_error(error: DashboardOpenError) -> ApiError {
             "dashboard_missing",
             "모니터링 리포트가 아직 생성되지 않았습니다.",
         ),
-        #[cfg(not(target_os = "macos"))]
-        DashboardOpenError::UnsupportedPlatform => (
+        DashboardOpenError::Platform(PlatformOpenError::UnsupportedPlatform) => (
             "dashboard_unsupported",
             "이 운영체제에서는 모니터링 리포트를 자동으로 열 수 없습니다.",
         ),
-        #[cfg(any(target_os = "macos", test))]
-        DashboardOpenError::TimedOut => (
+        DashboardOpenError::Platform(PlatformOpenError::TimedOut) => (
             "dashboard_open_timeout",
             "모니터링 리포트를 여는 시간이 초과되었습니다.",
         ),
-        #[cfg(any(target_os = "macos", test))]
-        DashboardOpenError::SpawnFailed
-        | DashboardOpenError::ExitFailed
-        | DashboardOpenError::WaitFailed
-        | DashboardOpenError::TerminateFailed
-        | DashboardOpenError::ReapFailed
-        | DashboardOpenError::ReapTimedOut => {
-            ("dashboard_open_failed", "모니터링 리포트를 열 수 없습니다.")
-        }
+        DashboardOpenError::Platform(
+            PlatformOpenError::SpawnFailed
+            | PlatformOpenError::ExitFailed
+            | PlatformOpenError::WaitFailed
+            | PlatformOpenError::TerminateFailed
+            | PlatformOpenError::ReapFailed
+            | PlatformOpenError::ReapTimedOut,
+        ) => ("dashboard_open_failed", "모니터링 리포트를 열 수 없습니다."),
         DashboardOpenError::TaskFailed => {
             ("dashboard_open_failed", "모니터링 리포트를 열 수 없습니다.")
         }
@@ -746,10 +768,10 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "macos")]
-    use super::DASHBOARD_OPENER_PATH;
+    use super::PLATFORM_OPENER_PATH;
     use super::{
-        AppState, DashboardOpenError, LocalConfigService, constant_time_equal, dashboard_error,
-        prepare, router, run_dashboard_opener, run_integration, session_token,
+        AppState, DashboardOpenError, LocalConfigService, PlatformOpenError, constant_time_equal,
+        dashboard_error, prepare, router, run_integration, run_platform_opener, session_token,
     };
     use agent_observability_codex_integration::{CodexIntegrationStatus, IntegrationError};
     use agent_observability_local_runtime::{LocalRuntimeConfigV2, install, revision};
@@ -844,9 +866,10 @@ mod tests {
             "-c",
             "echo '/Users/private/AUTOMATIC_RAW_PROMPT_SENTINEL' >&2; exit 9",
         ]);
-        assert!(run_dashboard_opener(&mut command, Duration::from_secs(1)).is_err());
+        assert!(run_platform_opener(&mut command, Duration::from_secs(1)).is_err());
 
-        let response = dashboard_error(DashboardOpenError::ExitFailed).into_response();
+        let response = dashboard_error(DashboardOpenError::Platform(PlatformOpenError::ExitFailed))
+            .into_response();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -888,8 +911,8 @@ mod tests {
         let started = Instant::now();
 
         assert_eq!(
-            run_dashboard_opener(&mut command, Duration::from_millis(500)),
-            Err(DashboardOpenError::TimedOut)
+            run_platform_opener(&mut command, Duration::from_millis(500)),
+            Err(PlatformOpenError::TimedOut)
         );
         assert!(started.elapsed() < Duration::from_secs(2));
         let pid = fs::read_to_string(&pid_path).unwrap();
@@ -906,7 +929,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dashboard_opener_uses_the_trusted_platform_binary() {
-        let command = Command::new(DASHBOARD_OPENER_PATH);
+        let command = Command::new(PLATFORM_OPENER_PATH);
         assert_eq!(command.get_program(), std::ffi::OsStr::new("/usr/bin/open"));
     }
 
@@ -920,7 +943,7 @@ mod tests {
             "-c",
             "echo 'AUTOMATIC_DASHBOARD_STDERR_SENTINEL' >&2; exit 9",
         ]);
-        assert!(run_dashboard_opener(&mut command, Duration::from_secs(1)).is_err());
+        assert!(run_platform_opener(&mut command, Duration::from_secs(1)).is_err());
     }
 
     #[test]
