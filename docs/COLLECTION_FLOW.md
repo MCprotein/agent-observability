@@ -83,7 +83,7 @@ sequenceDiagram
     participant Store as SQLite authority
     participant Report as Private HTML report
 
-    Operator->>CLI: setup or connect codex
+    Operator->>CLI: connect codex
     CLI->>Launchd: install and start LaunchAgent
     CLI->>Receiver: private-CA HTTPS + exact-header health check
     Receiver-->>CLI: ready
@@ -102,7 +102,9 @@ sequenceDiagram
     Report->>Store: acknowledge exact rendered generation
 ```
 
-`connect codex` starts the collector and verifies health before taking Codex config ownership. A private
+`setup` prepares and optionally opens the private dashboard before entering this sequence through
+`connect codex`. The connect command starts the collector and verifies health before taking Codex config
+ownership. A private
 LaunchAgent transaction records prior plist bytes/mode and loaded state; failure or crash restores that exact
 state instead of unconditionally removing a service. `disconnect codex` first converges the LaunchAgent to its
 recorded prior state, then restores the exact prior Codex config only while the complete connected bytes and mode

@@ -148,7 +148,7 @@ flowchart TB
     Settings["Ephemeral settings UI"] --> Connect
     Ownership --> Codex
     LaunchAgent --> Receiver
-    Core -.->|"Future after G0-G4"| Team["Commercial team profile"]
+    Core -.->|"Future after G0 promotion; commercial readiness after G4"| Team["Commercial team profile"]
 ```
 
 경계 계약은 이름과 소유권을 분리한다.

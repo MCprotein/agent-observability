@@ -307,14 +307,15 @@ Private CA server certificate는 정상 client가 신뢰하지 않는 loopback l
 <details>
 <summary>GitHub Packages</summary>
 
-GitHub Packages는 `read:packages` 권한이 있는 personal access token(classic)이 필요하다.
+이 경로는 `v1.8.0` package가 게시된 뒤 사용한다. GitHub Packages는 `read:packages` 권한이 있는
+personal access token(classic)이 필요하다.
 
 ```bash
 npm login \
   --scope=@mcprotein \
   --auth-type=legacy \
   --registry=https://npm.pkg.github.com
-npm install --global @mcprotein/agent-observability \
+npm install --global @mcprotein/agent-observability@1.8.0 \
   --registry=https://npm.pkg.github.com
 ```
 
