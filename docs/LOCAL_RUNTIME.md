@@ -3,7 +3,7 @@
 v1.0.0 introduced the standalone local-only Rust runtime boundary. v1.2.0 added bounded local
 retention and private archive export; v1.4.0 added one-command setup, an isolated built-in demo,
 dashboard open, and atomic CLI configuration updates. v1.5.0 adds an explicit, ephemeral loopback
-settings UI. v1.8.0 is **Released** and adds optional Codex automatic local collection through a
+settings UI. v1.8.1 is **Released** and provides optional Codex automatic local collection through a
 private-CA HTTPS IPv4 loopback receiver with an exact private random request header, plus a macOS LaunchAgent.
 This transport is not mTLS. Manual Codex, Claude Code and Cursor imports remain
 fully functional without a daemon, receiver, login or network. The automatic path makes no external request.
