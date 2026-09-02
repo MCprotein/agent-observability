@@ -5203,13 +5203,17 @@ fn render_automatic_manifest(
     errors: &[String],
     status: &str,
 ) -> String {
-    let mut latencies = results
+    let run_quantiles = results
         .iter()
-        .flat_map(|result| result.synthetic_otlp_latencies_us.iter().copied())
+        .filter(|result| !result.synthetic_otlp_latencies_us.is_empty())
+        .map(|result| {
+            let mut latencies = result.synthetic_otlp_latencies_us.clone();
+            latencies.sort_unstable();
+            (percentile(&latencies, 95), percentile(&latencies, 99))
+        })
         .collect::<Vec<_>>();
-    latencies.sort_unstable();
-    let p95 = (!latencies.is_empty()).then(|| percentile(&latencies, 95));
-    let p99 = (!latencies.is_empty()).then(|| percentile(&latencies, 99));
+    let p95 = run_quantiles.iter().map(|(p95, _)| *p95).max();
+    let p99 = run_quantiles.iter().map(|(_, p99)| *p99).max();
     let idle_cpu = results
         .iter()
         .map(|result| result.idle_cpu_percent)
@@ -5468,14 +5472,35 @@ fn validate_automatic_release_identity(
         || evidence.build.cargo_profile != "release"
         || evidence.build.codex_package != "@openai/codex"
         || evidence.build.codex_version != "0.151.0"
-        || evidence.host.machine.is_empty()
         || evidence.host.os != "macos"
-        || evidence.host.filesystem.is_empty()
-        || evidence.host.power_mode.is_empty()
-        || evidence.host.logical_cores == 0
         || !evidence.errors.is_empty()
     {
         return Err("automatic release evidence identity or release state is invalid".into());
+    }
+    validate_automatic_release_host(&evidence.host)?;
+    Ok(())
+}
+
+fn validate_automatic_release_host(host: &AutomaticEvidenceHost) -> Result<(), String> {
+    let machine = host
+        .machine
+        .strip_prefix("sanitized-")
+        .and_then(|value| value.strip_suffix("-logical-core"))
+        .ok_or("automatic release evidence machine is invalid")?;
+    let (architecture, cores) = machine
+        .rsplit_once('-')
+        .ok_or("automatic release evidence machine is invalid")?;
+    let machine_cores = cores
+        .parse::<usize>()
+        .map_err(|_| "automatic release evidence machine core count is invalid")?;
+    if host.logical_cores == 0
+        || host.logical_cores != machine_cores
+        || !matches!(architecture, "aarch64" | "x86_64")
+        || host.filesystem.len() > 64
+        || validated_evidence_token(&host.filesystem, "filesystem").is_err()
+        || !matches!(host.power_mode.as_str(), "ac" | "battery")
+    {
+        return Err("automatic release evidence host contract is invalid".into());
     }
     Ok(())
 }
@@ -5544,6 +5569,7 @@ fn validate_automatic_release_runs(runs: &[AutomaticEvidenceRun]) -> Result<(), 
                 > u128::from(AUTOMATIC_PRIMARY_OTLP_P95_MS_MAX) * 1_000
             || run.synthetic_collector_otlp_p99_us
                 > u128::from(AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX) * 1_000
+            || run.synthetic_collector_otlp_p95_us > run.synthetic_collector_otlp_p99_us
             || !run.idle_cpu_percent.is_finite()
             || run.idle_cpu_percent.is_sign_negative()
             || run.idle_cpu_percent > AUTOMATIC_IDLE_CPU_PERCENT_MAX
@@ -5584,14 +5610,18 @@ fn validate_automatic_release_aggregates(
         .iter()
         .map(|run| run.peak_rss_kib)
         .max_by(f64::total_cmp);
-    if evidence
-        .metrics
-        .synthetic_collector_otlp_p95_us
-        .is_none_or(|value| value > u128::from(AUTOMATIC_PRIMARY_OTLP_P95_MS_MAX) * 1_000)
-        || evidence
-            .metrics
-            .synthetic_collector_otlp_p99_us
-            .is_none_or(|value| value > u128::from(AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX) * 1_000)
+    let expected_p95 = evidence
+        .runs
+        .iter()
+        .map(|run| run.synthetic_collector_otlp_p95_us)
+        .max();
+    let expected_p99 = evidence
+        .runs
+        .iter()
+        .map(|run| run.synthetic_collector_otlp_p99_us)
+        .max();
+    if evidence.metrics.synthetic_collector_otlp_p95_us != expected_p95
+        || evidence.metrics.synthetic_collector_otlp_p99_us != expected_p99
         || evidence.metrics.collector_idle_cpu_percent_max != expected_idle
         || evidence.metrics.collector_active_cpu_percent_max != expected_active
         || evidence.metrics.collector_peak_rss_kib != expected_rss
@@ -6797,6 +6827,11 @@ mod tests {
             "pass",
         )
         .replacen(&format!("  os: {}", env::consts::OS), "  os: macos", 1)
+        .replacen(
+            "machine: sanitized-test-4-logical-core",
+            "machine: sanitized-aarch64-4-logical-core",
+            1,
+        )
     }
 
     #[test]
@@ -6821,6 +6856,23 @@ mod tests {
             manifest.replacen(
                 "collector_rss_samples_min: 100",
                 "collector_rss_samples_min: 101",
+                1,
+            ),
+            manifest.replacen(
+                "machine: sanitized-aarch64-4-logical-core",
+                "machine: sanitized-aarch64-5-logical-core",
+                1,
+            ),
+            manifest.replacen("filesystem: testfs", "filesystem: /Users/private", 1),
+            manifest.replacen("power_mode: ac", "power_mode: unknown", 1),
+            manifest.replacen(
+                "synthetic_collector_otlp_p95_us: 1",
+                "synthetic_collector_otlp_p95_us: 2",
+                1,
+            ),
+            manifest.replacen(
+                "    synthetic_collector_otlp_p95_us: 1",
+                "    synthetic_collector_otlp_p95_us: 2",
                 1,
             ),
         ] {

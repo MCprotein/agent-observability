@@ -22,11 +22,10 @@ use axum::{
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -44,6 +43,7 @@ const MAX_SESSION_LIFETIME: Duration = Duration::from_hours(1);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const DASHBOARD_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 64;
 const SETTINGS_SHELL: &str = include_str!("generated/settings-shell.html");
 const SETTINGS_SCRIPT: &str = include_str!("generated/settings-ui.js");
@@ -396,30 +396,47 @@ async fn open_dashboard(
     let report = state.root.join("logs").join(REPORT_FILE_NAME);
     tokio::task::spawn_blocking(move || open_dashboard_file(&report))
         .await
-        .map_err(|_| dashboard_error("모니터링 리포트 열기 작업이 중단되었습니다."))?
-        .map_err(dashboard_error)?;
+        .map_err(|_| dashboard_error())?
+        .map_err(|()| dashboard_error())?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(target_os = "macos")]
-fn open_dashboard_file(path: &Path) -> Result<(), String> {
+fn open_dashboard_file(path: &Path) -> Result<(), ()> {
     if !path.is_file() {
-        return Err("아직 생성된 모니터링 리포트가 없습니다.".into());
+        return Err(());
     }
-    Command::new("open")
-        .arg(path)
-        .spawn()
-        .map(|mut child| {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        })
-        .map_err(|error| format!("모니터링 리포트를 열 수 없습니다: {error}"))
+    let mut command = Command::new("open");
+    command.arg(path);
+    run_dashboard_opener(&mut command, DASHBOARD_OPEN_TIMEOUT)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn open_dashboard_file(_path: &Path) -> Result<(), String> {
-    Err("브라우저 자동 열기는 현재 macOS에서 지원합니다.".into())
+fn open_dashboard_file(_path: &Path) -> Result<(), ()> {
+    Err(())
+}
+
+fn run_dashboard_opener(command: &mut Command, timeout: Duration) -> Result<(), ()> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| ())?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success().then_some(()).ok_or(()),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(());
+            }
+        }
+    }
 }
 
 fn integration_error() -> ApiError {
@@ -430,8 +447,12 @@ fn integration_error() -> ApiError {
     )
 }
 
-fn dashboard_error(message: impl Into<String>) -> ApiError {
-    ApiError::new(StatusCode::CONFLICT, "dashboard_unavailable", message)
+fn dashboard_error() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "dashboard_unavailable",
+        "모니터링 리포트를 열 수 없습니다.",
+    )
 }
 
 async fn heartbeat(
@@ -644,8 +665,8 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, LocalConfigService, constant_time_equal, prepare, router, run_integration,
-        session_token,
+        AppState, LocalConfigService, constant_time_equal, dashboard_error, prepare, router,
+        run_dashboard_opener, run_integration, session_token,
     };
     use agent_observability_codex_integration::{CodexIntegrationStatus, IntegrationError};
     use agent_observability_local_runtime::{LocalRuntimeConfigV2, install, revision};
@@ -658,6 +679,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
+        process::Command,
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
@@ -729,6 +751,39 @@ mod tests {
                             .any(|window| window == sentinel)
                     );
                 }
+            });
+    }
+
+    #[test]
+    fn dashboard_opener_failure_is_bounded_and_content_free() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "echo '/Users/private/AUTOMATIC_RAW_PROMPT_SENTINEL' >&2; exit 9",
+        ]);
+        assert!(run_dashboard_opener(&mut command, Duration::from_secs(1)).is_err());
+
+        let response = dashboard_error().into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                let error: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(error["code"], "dashboard_unavailable");
+                assert_eq!(error["message"], "모니터링 리포트를 열 수 없습니다.");
+                assert!(
+                    !body
+                        .windows(b"/Users/".len())
+                        .any(|value| value == b"/Users/")
+                );
+                assert!(
+                    !body
+                        .windows(b"AUTOMATIC_RAW_PROMPT_SENTINEL".len())
+                        .any(|value| value == b"AUTOMATIC_RAW_PROMPT_SENTINEL")
+                );
             });
     }
 
