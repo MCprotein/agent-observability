@@ -123,15 +123,8 @@ jobs:
             --binary "$binary" | tee "$RUNNER_TEMP/automatic-release-evidence.out"
           manifest="$(sed -n 's/^manifest=//p' "$RUNNER_TEMP/automatic-release-evidence.out")"
           test -f "$manifest"
-          grep -Fxq "status: pass" "$manifest"
-          grep -Fxq "evidence_kind: automatic_release_evidence" "$manifest"
-          grep -Fxq "release_readiness: verified" "$manifest"
-          grep -Fxq "real_codex_e2e_status: passed" "$manifest"
-          grep -Fxq "source_revision: $GITHUB_SHA" "$manifest"
-          grep -Fxq "profile: release" "$manifest"
-          grep -Fxq "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-rss-active-report-v2" "$manifest"
-          grep -Fxq "  codex_version: 0.151.0" "$manifest"
-          scripts/validate-automatic-run-evidence.sh "$manifest"
+          cargo +1.97.0 run --locked -p xtask -- evidence validate-automatic "$manifest" \
+            --source-revision "$GITHUB_SHA"
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
       - name: Upload exact-revision automatic release evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

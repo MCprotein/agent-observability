@@ -2,8 +2,8 @@
 #![allow(clippy::missing_errors_doc)]
 
 use agent_observability_codex_integration::{
-    CodexIntegrationStatus, connect as connect_codex, disconnect as disconnect_codex,
-    status as codex_status,
+    CodexIntegrationStatus, IntegrationError, connect as connect_codex,
+    disconnect as disconnect_codex, status as codex_status,
 };
 use agent_observability_local_collector::REPORT_FILE_NAME;
 use agent_observability_local_runtime::{
@@ -376,21 +376,15 @@ async fn disconnect_codex_integration(
 
 async fn run_integration(
     root: PathBuf,
-    operation: fn(
-        &Path,
-        &Path,
-    ) -> Result<
-        CodexIntegrationStatus,
-        agent_observability_codex_integration::IntegrationError,
-    >,
+    operation: fn(&Path, &Path) -> Result<CodexIntegrationStatus, IntegrationError>,
 ) -> Result<CodexIntegrationStatus, ApiError> {
     let executable = env::current_exe()
         .and_then(fs::canonicalize)
-        .map_err(|error| integration_error(format!("실행 파일을 확인할 수 없습니다: {error}")))?;
+        .map_err(|_| integration_error())?;
     tokio::task::spawn_blocking(move || operation(&root, &executable))
         .await
-        .map_err(|_| integration_error("Codex 연결 작업이 중단되었습니다."))?
-        .map_err(|error| integration_error(error.to_string()))
+        .map_err(|_| integration_error())?
+        .map_err(|_| integration_error())
 }
 
 async fn open_dashboard(
@@ -428,8 +422,12 @@ fn open_dashboard_file(_path: &Path) -> Result<(), String> {
     Err("브라우저 자동 열기는 현재 macOS에서 지원합니다.".into())
 }
 
-fn integration_error(message: impl Into<String>) -> ApiError {
-    ApiError::new(StatusCode::CONFLICT, "integration_failed", message)
+fn integration_error() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "integration_failed",
+        "Codex 자동 수집 상태를 확인하거나 변경할 수 없습니다.",
+    )
 }
 
 fn dashboard_error(message: impl Into<String>) -> ApiError {
@@ -646,16 +644,20 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, LocalConfigService, constant_time_equal, prepare, router, session_token,
+        AppState, LocalConfigService, constant_time_equal, prepare, router, run_integration,
+        session_token,
     };
+    use agent_observability_codex_integration::{CodexIntegrationStatus, IntegrationError};
     use agent_observability_local_runtime::{LocalRuntimeConfigV2, install, revision};
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
+        response::IntoResponse,
     };
     use serde_json::Value;
     use std::{
         fs,
+        path::{Path, PathBuf},
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
@@ -685,6 +687,49 @@ mod tests {
         second.enabled = false;
         assert_eq!(revision(&first).unwrap(), revision(&first).unwrap());
         assert_ne!(revision(&first).unwrap(), revision(&second).unwrap());
+    }
+
+    fn path_bearing_integration_failure(
+        _root: &Path,
+        _executable: &Path,
+    ) -> Result<CodexIntegrationStatus, IntegrationError> {
+        Err(IntegrationError::Runtime(
+            "/Users/private/AUTOMATIC_RAW_PROMPT_SENTINEL private-key.pem".into(),
+        ))
+    }
+
+    #[test]
+    fn integration_api_error_is_fixed_and_content_free() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let response =
+                    run_integration(PathBuf::from("unused"), path_bearing_integration_failure)
+                        .await
+                        .unwrap_err()
+                        .into_response();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                let error: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(error["code"], "integration_failed");
+                assert_eq!(
+                    error["message"],
+                    "Codex 자동 수집 상태를 확인하거나 변경할 수 없습니다."
+                );
+                for sentinel in [
+                    b"/Users/".as_slice(),
+                    b"AUTOMATIC_RAW_PROMPT_SENTINEL",
+                    b"private-key.pem",
+                ] {
+                    assert!(
+                        !body
+                            .windows(sentinel.len())
+                            .any(|window| window == sentinel)
+                    );
+                }
+            });
     }
 
     #[test]

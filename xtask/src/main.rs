@@ -29,7 +29,7 @@ use agent_observability_local_runtime::{
 use agent_observability_local_store::LocalStore;
 use serde::Deserialize;
 
-const USAGE: &str = "usage: cargo run -p xtask -- perf <local|automatic> --profile <release|smoke> --check [--binary <absolute-path>]";
+const USAGE: &str = "usage:\n  cargo run -p xtask -- perf <local|automatic> --profile <release|smoke> --check [--binary <absolute-path>]\n  cargo run -p xtask -- evidence validate-automatic <manifest> --source-revision <sha>";
 const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-performance-v1.yaml");
 const AUTOMATIC_PROTOCOL: &str =
     include_str!("../../crates/contracts/performance/automatic-local-performance-v1.yaml");
@@ -338,6 +338,114 @@ struct AutomaticProtocolEvidence {
     exact_source: String,
     sanitized_paths: String,
     release_scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticEvidenceManifest {
+    schema_version: String,
+    evidence_kind: String,
+    protocol_revision: String,
+    status: String,
+    release_readiness: String,
+    real_codex_e2e_status: String,
+    source_revision: String,
+    profile: String,
+    protocol: String,
+    command: String,
+    build: AutomaticEvidenceBuild,
+    host: AutomaticEvidenceHost,
+    workload: AutomaticEvidenceWorkload,
+    metrics: AutomaticEvidenceMetrics,
+    runs: Vec<AutomaticEvidenceRun>,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticEvidenceBuild {
+    package: String,
+    package_version: String,
+    cargo_locked: bool,
+    cargo_profile: String,
+    codex_package: String,
+    codex_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticEvidenceHost {
+    machine: String,
+    os: String,
+    filesystem: String,
+    power_mode: String,
+    logical_cores: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticEvidenceWorkload {
+    lifecycle_preflight: String,
+    collector_boundary: String,
+    transport: String,
+    codex_config_load_boundary: String,
+    observed_compatibility_correction: String,
+    real_codex_e2e_release_gate: String,
+    synthetic_benchmark_boundary: String,
+    notify_boundary: String,
+    runtime_path: String,
+    warmup_ms: u64,
+    idle_ms: u64,
+    synthetic_otlp_requests_per_run: usize,
+    inter_request_ms: u64,
+    runs: usize,
+    sample_interval_ms: u64,
+    active_timeout_ms: u64,
+    startup_timeout_ms: u64,
+    command_timeout_ms: u64,
+    cleanup_timeout_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticEvidenceMetrics {
+    synthetic_collector_otlp_p95_us: Option<u128>,
+    synthetic_collector_otlp_p99_us: Option<u128>,
+    collector_idle_cpu_percent_max: Option<f64>,
+    collector_active_cpu_percent_max: Option<f64>,
+    collector_peak_rss_kib: Option<f64>,
+    collector_rss_samples_min: Option<u64>,
+    collector_rss_observed_max_gap_ms: Option<u64>,
+    allocated_disk_bytes_max: Option<u64>,
+    collector_network_bytes_max: Option<u64>,
+    network_monitor_samples: u64,
+    all_observed_endpoints_loopback: bool,
+    network_evidence: String,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticEvidenceRun {
+    run: usize,
+    accepted_synthetic_otlp_requests: usize,
+    rejected_synthetic_otlp_requests: usize,
+    notify_supplement_accepted: bool,
+    durable_report_converged: bool,
+    report_generation: u64,
+    report_records: u64,
+    rss_samples: u64,
+    rss_observed_max_gap_ms: u64,
+    raw_notify_sentinels_absent: bool,
+    synthetic_collector_otlp_p95_us: u128,
+    synthetic_collector_otlp_p99_us: u128,
+    idle_cpu_percent: f64,
+    active_cpu_percent: f64,
+    peak_rss_kib: f64,
+    allocated_disk_bytes: u64,
+    collector_network_bytes: u64,
+    network_monitor_samples: u64,
+    all_observed_endpoints_loopback: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1051,8 +1159,20 @@ fn main() {
         command(&args)
     };
     if let Err(error) = result {
-        eprintln!("{error}");
+        eprintln!("{}", public_error_message(&args, &error));
         std::process::exit(1);
+    }
+}
+
+fn public_error_message<'a>(args: &[String], error: &'a str) -> &'a str {
+    if args.first().map(String::as_str) == Some("perf")
+        && args.get(1).map(String::as_str) == Some("automatic")
+    {
+        "automatic_check_failed"
+    } else if args.first().map(String::as_str) == Some("evidence") {
+        "automatic_evidence_validation_failed"
+    } else {
+        error
     }
 }
 fn command(args: &[String]) -> Result<(), String> {
@@ -1061,6 +1181,13 @@ fn command(args: &[String]) -> Result<(), String> {
             "{USAGE}\n\nRuns a local file-backed subprocess workload and writes sanitized evidence."
         );
         return Ok(());
+    }
+    if let [evidence, validate, manifest, revision_flag, revision] = args
+        && evidence == "evidence"
+        && validate == "validate-automatic"
+        && revision_flag == "--source-revision"
+    {
+        return validate_automatic_release_evidence_file(Path::new(manifest), revision);
     }
     let supplied_binary = match args {
         [_, mode, _, _, _, flag, path] if mode == "automatic" && flag == "--binary" => {
@@ -4967,7 +5094,7 @@ fn validate_automatic_results(
     errors: &[String],
 ) -> Result<(), String> {
     if !errors.is_empty() {
-        return Err(format!("automatic workload errors: {}", errors.join("; ")));
+        return Err("automatic workload failed; inspect the sanitized manifest".into());
     }
     if results.len() != config.runs {
         return Err("incomplete automatic run evidence".into());
@@ -5217,83 +5344,285 @@ fn automatic_evidence_error_code(error: &str) -> &'static str {
     }
 }
 
-fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
-    for field in [
-        "schema_version: automatic_local_performance.v1",
-        "evidence_kind: automatic_release_evidence",
-        "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-rss-active-report-v2",
-        "source_revision:",
-        "cargo_locked: true",
-        "codex_version: 0.151.0",
-        "collector_boundary: built-agent-observability-collector-serve-subprocess",
-        "transport: private-ca-https-exact-private-random-request-header-not-mtls",
-        "codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp",
-        "observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity",
-        "synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report",
-        "notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan",
-        "synthetic_collector_otlp_p95_us:",
-        "synthetic_collector_otlp_p99_us:",
-        "collector_idle_cpu_percent_max:",
-        "collector_active_cpu_percent_max:",
-        "collector_peak_rss_kib:",
-        "collector_rss_samples_min:",
-        "collector_rss_observed_max_gap_ms:",
-        "allocated_disk_bytes_max:",
-        "collector_network_bytes_max:",
-        "network_monitor_samples:",
-        "all_observed_endpoints_loopback: true",
-        "lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect",
-        "runtime_path: run-relative/runtime",
-    ] {
-        if !manifest.contains(field) {
-            return Err(format!("automatic performance manifest is missing {field}"));
-        }
+fn validate_automatic_manifest_shape(manifest: &str) -> Result<AutomaticEvidenceManifest, String> {
+    let evidence = parse_automatic_manifest(manifest)?;
+    let expected_lifecycle = "built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect";
+    let expected_collector = "built-agent-observability-collector-serve-subprocess";
+    let expected_transport = "private-ca-https-exact-private-random-request-header-not-mtls";
+    let expected_config = "installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp";
+    let expected_correction = "codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity";
+    let expected_benchmark = "post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report";
+    let expected_notify = "separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan";
+    if evidence.schema_version != "automatic_local_performance.v1"
+        || evidence.evidence_kind != "automatic_release_evidence"
+        || evidence.protocol_revision != AUTOMATIC_PROTOCOL_REVISION
+        || !evidence.build.cargo_locked
+        || evidence.build.codex_version != "0.151.0"
+        || evidence.workload.lifecycle_preflight != expected_lifecycle
+        || evidence.workload.collector_boundary != expected_collector
+        || evidence.workload.transport != expected_transport
+        || evidence.workload.codex_config_load_boundary != expected_config
+        || evidence.workload.observed_compatibility_correction != expected_correction
+        || evidence.workload.synthetic_benchmark_boundary != expected_benchmark
+        || evidence.workload.notify_boundary != expected_notify
+        || evidence.workload.runtime_path != "run-relative/runtime"
+    {
+        return Err("automatic performance manifest shape is invalid".into());
     }
-    let status = manifest
-        .lines()
-        .find_map(|line| line.strip_prefix("status: "))
-        .ok_or("automatic performance manifest status is missing")?;
-    if !matches!(status, "pass" | "pending-validation" | "failed") {
-        return Err(format!(
-            "automatic performance manifest status is invalid: {status}"
-        ));
-    }
-    let expected_readiness = match status {
-        "pass" => "release_readiness: verified",
-        "pending-validation" => "release_readiness: pending",
-        _ => "release_readiness: not_verified",
+    let expected_readiness = match evidence.status.as_str() {
+        "pass" => "verified",
+        "pending-validation" => "pending",
+        "failed" => "not_verified",
+        _ => return Err("automatic performance manifest status is invalid".into()),
     };
-    if !manifest.lines().any(|line| line == expected_readiness) {
-        return Err(format!(
-            "automatic performance manifest status {status} has inconsistent release readiness"
-        ));
+    if evidence.release_readiness != expected_readiness {
+        return Err("automatic performance manifest release readiness is inconsistent".into());
     }
-    let expected_codex_status = if manifest.contains("  - 'code=lifecycle_preflight_failed'") {
-        "real_codex_e2e_status: failed"
-    } else {
-        "real_codex_e2e_status: passed"
-    };
-    if !manifest.lines().any(|line| line == expected_codex_status) {
+    let codex_failed = evidence
+        .errors
+        .iter()
+        .any(|error| error == "code=lifecycle_preflight_failed");
+    let expected_codex_status = if codex_failed { "failed" } else { "passed" };
+    if evidence.real_codex_e2e_status != expected_codex_status {
         return Err("automatic performance manifest has inconsistent real Codex status".into());
     }
-    let expected_codex_gate = if expected_codex_status.ends_with("failed") {
-        "real_codex_e2e_release_gate: failed-lifecycle-preflight"
+    let expected_codex_gate = if codex_failed {
+        "failed-lifecycle-preflight"
     } else {
-        "real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response"
+        "passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response"
     };
-    if !manifest
-        .lines()
-        .any(|line| line.trim() == expected_codex_gate)
-    {
+    if evidence.workload.real_codex_e2e_release_gate != expected_codex_gate {
         return Err("automatic performance manifest has inconsistent real Codex gate".into());
     }
     validate_automatic_manifest_privacy(manifest)?;
-    let revision = manifest
-        .lines()
-        .find_map(|line| line.strip_prefix("source_revision: "))
-        .ok_or("automatic performance manifest source revision is missing")?;
-    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if evidence.source_revision.len() != 40
+        || !evidence
+            .source_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
         return Err("automatic performance manifest source revision is invalid".into());
+    }
+    Ok(evidence)
+}
+
+fn parse_automatic_manifest(manifest: &str) -> Result<AutomaticEvidenceManifest, String> {
+    serde_saphyr::from_str(manifest)
+        .map_err(|error| format!("parse automatic performance manifest: {error}"))
+}
+
+fn validate_automatic_release_evidence_file(
+    path: &Path,
+    expected_revision: &str,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| "automatic release evidence manifest is unavailable".to_string())?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > 1_048_576
+    {
+        return Err("automatic release evidence manifest must be one bounded regular file".into());
+    }
+    let manifest = fs::read_to_string(path)
+        .map_err(|_| "automatic release evidence manifest is unreadable".to_string())?;
+    let evidence = validate_automatic_manifest_shape(&manifest)?;
+    validate_automatic_release_evidence(&evidence, expected_revision)?;
+    println!("automatic release evidence verified");
+    Ok(())
+}
+
+fn validate_automatic_release_evidence(
+    evidence: &AutomaticEvidenceManifest,
+    expected_revision: &str,
+) -> Result<(), String> {
+    validate_automatic_release_identity(evidence, expected_revision)?;
+    validate_automatic_release_workload(evidence)?;
+    validate_automatic_release_runs(&evidence.runs)?;
+    validate_automatic_release_aggregates(evidence)
+}
+
+fn validate_automatic_release_identity(
+    evidence: &AutomaticEvidenceManifest,
+    expected_revision: &str,
+) -> Result<(), String> {
+    if expected_revision.len() != 40
+        || !expected_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("expected automatic release evidence revision is invalid".into());
+    }
+    if evidence.schema_version != "automatic_local_performance.v1"
+        || evidence.evidence_kind != "automatic_release_evidence"
+        || evidence.protocol_revision != AUTOMATIC_PROTOCOL_REVISION
+        || evidence.status != "pass"
+        || evidence.release_readiness != "verified"
+        || evidence.real_codex_e2e_status != "passed"
+        || evidence.source_revision != expected_revision
+        || evidence.profile != "release"
+        || evidence.protocol != "crates/contracts/performance/automatic-local-performance-v1.yaml"
+        || evidence.command != "cargo run -p xtask -- perf automatic --profile release --check"
+        || evidence.build.package != "agent-observability-cli"
+        || evidence.build.package_version != env!("CARGO_PKG_VERSION")
+        || !evidence.build.cargo_locked
+        || evidence.build.cargo_profile != "release"
+        || evidence.build.codex_package != "@openai/codex"
+        || evidence.build.codex_version != "0.151.0"
+        || evidence.host.machine.is_empty()
+        || evidence.host.os != "macos"
+        || evidence.host.filesystem.is_empty()
+        || evidence.host.power_mode.is_empty()
+        || evidence.host.logical_cores == 0
+        || !evidence.errors.is_empty()
+    {
+        return Err("automatic release evidence identity or release state is invalid".into());
+    }
+    Ok(())
+}
+
+fn validate_automatic_release_workload(evidence: &AutomaticEvidenceManifest) -> Result<(), String> {
+    let expected_gate = "passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response";
+    let expected_lifecycle = "built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect";
+    let expected_collector = "built-agent-observability-collector-serve-subprocess";
+    let expected_transport = "private-ca-https-exact-private-random-request-header-not-mtls";
+    let expected_config = "installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp";
+    let expected_correction = "codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity";
+    let expected_benchmark = "post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report";
+    let expected_notify = "separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan";
+    if evidence.workload.lifecycle_preflight != expected_lifecycle
+        || evidence.workload.collector_boundary != expected_collector
+        || evidence.workload.transport != expected_transport
+        || evidence.workload.codex_config_load_boundary != expected_config
+        || evidence.workload.observed_compatibility_correction != expected_correction
+        || evidence.workload.real_codex_e2e_release_gate != expected_gate
+        || evidence.workload.synthetic_benchmark_boundary != expected_benchmark
+        || evidence.workload.notify_boundary != expected_notify
+        || evidence.workload.runtime_path != "run-relative/runtime"
+        || evidence.workload.warmup_ms != 60_000
+        || evidence.workload.idle_ms != 900_000
+        || evidence.workload.synthetic_otlp_requests_per_run != 10_000
+        || evidence.workload.inter_request_ms != 3
+        || evidence.workload.runs != 5
+        || evidence.workload.sample_interval_ms != 1_000
+        || evidence.workload.active_timeout_ms != 300_000
+        || evidence.workload.startup_timeout_ms != 10_000
+        || evidence.workload.command_timeout_ms != 1_000
+        || evidence.workload.cleanup_timeout_ms != 5_000
+        || !evidence.metrics.all_observed_endpoints_loopback
+        || evidence.metrics.network_evidence
+            != "process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface"
+    {
+        return Err("automatic release evidence workload contract is invalid".into());
+    }
+    Ok(())
+}
+
+fn validate_automatic_release_runs(runs: &[AutomaticEvidenceRun]) -> Result<(), String> {
+    if runs.len() != 5 {
+        return Err("automatic release evidence must contain exactly five runs".into());
+    }
+    let mut seen = [false; 5];
+    for run in runs {
+        let Some(index) = run.run.checked_sub(1).filter(|index| *index < seen.len()) else {
+            return Err("automatic release evidence run number is out of range".into());
+        };
+        if seen[index] {
+            return Err("automatic release evidence contains a duplicate run".into());
+        }
+        seen[index] = true;
+        if run.accepted_synthetic_otlp_requests != 10_000
+            || run.rejected_synthetic_otlp_requests != 0
+            || !run.notify_supplement_accepted
+            || !run.durable_report_converged
+            || run.report_generation != 20_001
+            || run.report_records != 20_001
+            || run.rss_samples < AUTOMATIC_RSS_MIN_RELEASE_SAMPLES
+            || run.rss_observed_max_gap_ms
+                > u64::try_from(AUTOMATIC_RSS_MAX_OBSERVED_GAP.as_millis()).unwrap_or(u64::MAX)
+            || !run.raw_notify_sentinels_absent
+            || run.synthetic_collector_otlp_p95_us
+                > u128::from(AUTOMATIC_PRIMARY_OTLP_P95_MS_MAX) * 1_000
+            || run.synthetic_collector_otlp_p99_us
+                > u128::from(AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX) * 1_000
+            || !run.idle_cpu_percent.is_finite()
+            || run.idle_cpu_percent.is_sign_negative()
+            || run.idle_cpu_percent > AUTOMATIC_IDLE_CPU_PERCENT_MAX
+            || !run.active_cpu_percent.is_finite()
+            || run.active_cpu_percent.is_sign_negative()
+            || run.active_cpu_percent > AUTOMATIC_ACTIVE_CPU_PERCENT_MAX
+            || !run.peak_rss_kib.is_finite()
+            || run.peak_rss_kib.is_sign_negative()
+            || run.peak_rss_kib > AUTOMATIC_PEAK_RSS_MIB_MAX * 1024.0
+            || run.allocated_disk_bytes > AUTOMATIC_ALLOCATED_DISK_BYTES_MAX
+            || run.network_monitor_samples == 0
+            || !run.all_observed_endpoints_loopback
+        {
+            return Err(format!(
+                "automatic release evidence run {} is invalid",
+                run.run
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_automatic_release_aggregates(
+    evidence: &AutomaticEvidenceManifest,
+) -> Result<(), String> {
+    let expected_idle = evidence
+        .runs
+        .iter()
+        .map(|run| run.idle_cpu_percent)
+        .max_by(f64::total_cmp);
+    let expected_active = evidence
+        .runs
+        .iter()
+        .map(|run| run.active_cpu_percent)
+        .max_by(f64::total_cmp);
+    let expected_rss = evidence
+        .runs
+        .iter()
+        .map(|run| run.peak_rss_kib)
+        .max_by(f64::total_cmp);
+    if evidence
+        .metrics
+        .synthetic_collector_otlp_p95_us
+        .is_none_or(|value| value > u128::from(AUTOMATIC_PRIMARY_OTLP_P95_MS_MAX) * 1_000)
+        || evidence
+            .metrics
+            .synthetic_collector_otlp_p99_us
+            .is_none_or(|value| value > u128::from(AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX) * 1_000)
+        || evidence.metrics.collector_idle_cpu_percent_max != expected_idle
+        || evidence.metrics.collector_active_cpu_percent_max != expected_active
+        || evidence.metrics.collector_peak_rss_kib != expected_rss
+        || evidence.metrics.collector_rss_samples_min
+            != evidence.runs.iter().map(|run| run.rss_samples).min()
+        || evidence.metrics.collector_rss_observed_max_gap_ms
+            != evidence
+                .runs
+                .iter()
+                .map(|run| run.rss_observed_max_gap_ms)
+                .max()
+        || evidence.metrics.allocated_disk_bytes_max
+            != evidence
+                .runs
+                .iter()
+                .map(|run| run.allocated_disk_bytes)
+                .max()
+        || evidence.metrics.collector_network_bytes_max
+            != evidence
+                .runs
+                .iter()
+                .map(|run| run.collector_network_bytes)
+                .max()
+        || evidence.metrics.network_monitor_samples
+            != evidence
+                .runs
+                .iter()
+                .map(|run| run.network_monitor_samples)
+                .sum::<u64>()
+    {
+        return Err("automatic release evidence aggregate metrics are inconsistent".into());
     }
     Ok(())
 }
@@ -6447,6 +6776,81 @@ mod tests {
                 "automatic manifest accepted private key evidence: {private_key_evidence}"
             );
         }
+    }
+
+    fn valid_automatic_release_manifest() -> String {
+        let config = AutomaticConfig::for_profile(Profile::Release);
+        let results = (1..=5)
+            .map(|run| {
+                let mut result = automatic_result(run, vec![1; 10_000]);
+                result.report_generation = 20_001;
+                result.report_records = 20_001;
+                result
+            })
+            .collect::<Vec<_>>();
+        render_automatic_manifest(
+            config,
+            &host(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &results,
+            &[],
+            "pass",
+        )
+    }
+
+    #[test]
+    fn automatic_release_evidence_is_strictly_typed_and_run_scoped() {
+        let manifest = valid_automatic_release_manifest();
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let parsed = parse_automatic_manifest(&manifest).unwrap();
+        validate_automatic_release_evidence(&parsed, revision).unwrap();
+
+        for malformed in [
+            manifest.replacen("status: pass", "status: pass\nstatus: failed", 1),
+            format!("{manifest}unknown_top_level: true\n"),
+            manifest.replacen(
+                "    report_generation: 20001",
+                "    report_generation: 20001\n    report_generation: 20001",
+                1,
+            ),
+            manifest.replacen("  - run: 5", "  - run: 4", 1),
+            manifest.replacen("report_generation: 20001", "report_generation: 200010", 1),
+            manifest.replacen("rss_samples: 100", "rss_samples: NaN", 1),
+            manifest.replacen("    report_records: 20001", "report_records: 20001", 1),
+            manifest.replacen(
+                "collector_rss_samples_min: 100",
+                "collector_rss_samples_min: 101",
+                1,
+            ),
+        ] {
+            let rejected = parse_automatic_manifest(&malformed)
+                .and_then(|evidence| validate_automatic_release_evidence(&evidence, revision));
+            assert!(
+                rejected.is_err(),
+                "accepted malformed evidence:\n{malformed}"
+            );
+        }
+        assert!(
+            validate_automatic_release_evidence(&parsed, &"f".repeat(40)).is_err(),
+            "accepted evidence for a different source revision"
+        );
+    }
+
+    #[test]
+    fn automatic_process_errors_are_content_free() {
+        let raw = "/Users/private/AUTOMATIC_CODEX_E2E_RAW_PROMPT_SENTINEL private-key.pem";
+        let automatic = vec!["perf".into(), "automatic".into()];
+        let evidence = vec!["evidence".into(), "validate-automatic".into()];
+        let local = vec!["perf".into(), "local".into()];
+        assert_eq!(
+            public_error_message(&automatic, raw),
+            "automatic_check_failed"
+        );
+        assert_eq!(
+            public_error_message(&evidence, raw),
+            "automatic_evidence_validation_failed"
+        );
+        assert_eq!(public_error_message(&local, raw), raw);
     }
 
     #[test]

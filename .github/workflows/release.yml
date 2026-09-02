@@ -124,6 +124,10 @@ jobs:
       actions: read
       contents: read
     steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install release Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal
       - name: Download and validate exact-revision automatic release evidence
         env:
           GH_TOKEN: ${{ github.token }}
@@ -158,18 +162,8 @@ jobs:
           mapfile -t manifests < <(find "$evidence_root" -type f -name manifest.yaml -print)
           test "${#manifests[@]}" -eq 1
           manifest="${manifests[0]}"
-          grep -Fxq "status: pass" "$manifest"
-          grep -Fxq "evidence_kind: automatic_release_evidence" "$manifest"
-          grep -Fxq "release_readiness: verified" "$manifest"
-          grep -Fxq "real_codex_e2e_status: passed" "$manifest"
-          grep -Fxq "source_revision: $SOURCE_REVISION" "$manifest"
-          grep -Fxq "profile: release" "$manifest"
-          grep -Fxq "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-rss-active-report-v2" "$manifest"
-          grep -Fxq "  codex_version: 0.151.0" "$manifest"
-          grep -Fxq "  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp" "$manifest"
-          grep -Fxq "  real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response" "$manifest"
-          grep -Fxq "  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report" "$manifest"
-          scripts/validate-automatic-run-evidence.sh "$manifest"
+          cargo +1.97.0 run --locked -p xtask -- evidence validate-automatic "$manifest" \
+            --source-revision "$SOURCE_REVISION"
 
   publish:
     name: Publish release and package

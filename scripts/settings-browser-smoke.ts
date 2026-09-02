@@ -52,6 +52,20 @@ try {
   assert.deepEqual(bootstrapPageErrors, []);
   await bootstrapFailurePage.close();
 
+  const optionalIntegrationFailurePage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  await mockCodexApi(optionalIntegrationFailurePage, { failStatus: true });
+  await optionalIntegrationFailurePage.goto(url, { waitUntil: "networkidle" });
+  await optionalIntegrationFailurePage.locator("#settings-form").waitFor();
+  await optionalIntegrationFailurePage.locator(".integration-panel[data-state='unavailable']").waitFor();
+  assert.equal(
+    await optionalIntegrationFailurePage.locator(".integration-identity strong").innerText(),
+    "상태 확인 불가",
+  );
+  assert.equal(await optionalIntegrationFailurePage.locator("#save").isVisible(), true);
+  assert.equal(await optionalIntegrationFailurePage.locator("#refresh-integration").isVisible(), true);
+  assert.equal(await optionalIntegrationFailurePage.evaluate(() => sessionStorage.length), 1);
+  await optionalIntegrationFailurePage.close();
+
   const mutationFailurePage = await browser.newPage({ viewport: { width: 800, height: 600 } });
   await mockCodexApi(mutationFailurePage);
   await mutationFailurePage.route(`${origin}/api/config`, (route) => {
@@ -503,6 +517,7 @@ type MockCodexOptions = {
   failConnect?: boolean;
   conflictDisconnect?: boolean;
   delayedMethod?: "POST" | "DELETE";
+  failStatus?: boolean;
 };
 
 async function mockCodexApi(page: Page, options: MockCodexOptions = {}) {
@@ -535,6 +550,14 @@ async function mockCodexApi(page: Page, options: MockCodexOptions = {}) {
   await page.route("**/api/integrations/codex", async (route) => {
     const method = route.request().method();
     lifecycle.methods.push(method);
+    if (method === "GET" && options.failStatus) {
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "integration_failed", message: "fixed integration failure" }),
+      });
+      return;
+    }
     if (method === options.delayedMethod) {
       startLifecycle?.();
       await lifecycleRelease;

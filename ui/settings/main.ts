@@ -179,6 +179,7 @@ let draft: LocalRuntimeConfigV2 | null = null;
 let defaults: LocalRuntimeConfigV2 | null = null;
 let revision = "";
 let integration: IntegrationStatus | null = null;
+let integrationUnavailable = false;
 let busy = false;
 let conflicted = false;
 let heartbeatTimer: number | undefined;
@@ -206,12 +207,17 @@ async function bootstrap(): Promise<void> {
     return;
   }
   try {
-    const [envelope, integrationStatus] = await Promise.all([
-      api<Envelope>("/api/config"),
-      api<IntegrationStatus>("/api/integrations/codex"),
-    ]);
+    const envelope = await api<Envelope>("/api/config");
     applyEnvelope(envelope);
-    integration = integrationStatus;
+    try {
+      integration = await api<IntegrationStatus>("/api/integrations/codex");
+      integrationUnavailable = false;
+    } catch (error) {
+      const apiError = error as Error & { code?: string };
+      if (apiError.code === "invalid_session") throw error;
+      integration = null;
+      integrationUnavailable = true;
+    }
     renderSettings();
     heartbeatTimer = window.setInterval(() => void heartbeat(), 20_000);
   } catch (error) {
@@ -336,7 +342,9 @@ function integrationPanel(): string {
   const ready = integration?.collector === "ready";
   const degraded = integration?.collector === "degraded";
   const conflicted = integration?.config === "conflict";
-  const state = conflicted
+  const state = integrationUnavailable
+    ? "상태 확인 불가"
+    : conflicted
     ? "설정 충돌"
     : connected && degraded
       ? "리포트 반영 지연"
@@ -345,7 +353,9 @@ function integrationPanel(): string {
         : connected
           ? "수집기 응답 없음"
           : "연결 안 됨";
-  const detail = conflicted
+  const detail = integrationUnavailable
+    ? "로컬 설정은 사용할 수 있지만 Codex 자동 수집 상태를 확인하지 못했습니다."
+    : conflicted
     ? "Codex 설정이 연결 후 변경되어 자동 복원을 중단했습니다."
     : connected && degraded
       ? "이벤트 수집은 가능하지만 모니터링 리포트가 최신 상태가 아닙니다."
@@ -354,11 +364,13 @@ function integrationPanel(): string {
         : connected
           ? "Codex 연결은 유지되지만 로컬 수집기에 연결할 수 없습니다."
           : "Codex 자동 수집을 연결하면 다음 작업부터 기록합니다.";
-  const action = connected
+  const action = integrationUnavailable
+    ? `<button class="button secondary" id="refresh-integration" type="button"><i data-lucide="refresh-cw"></i>다시 확인</button>`
+    : connected
     ? `<button class="button secondary" id="toggle-integration" type="button"><i data-lucide="power"></i>연결 해제</button>`
     : `<button class="button primary" id="toggle-integration" type="button"><i data-lucide="cable"></i>Codex 연결</button>`;
-  const panelState = conflicted ? "conflict" : degraded ? "degraded" : ready ? "ready" : "idle";
-  const collectorLabel = degraded ? "리포트 지연" : ready ? "정상" : "중지";
+  const panelState = integrationUnavailable ? "unavailable" : conflicted ? "conflict" : degraded ? "degraded" : ready ? "ready" : "idle";
+  const collectorLabel = integrationUnavailable ? "확인 불가" : degraded ? "리포트 지연" : ready ? "정상" : "중지";
   return `<div class="integration-panel" data-state="${panelState}" data-config-state="${integration?.config ?? "disconnected"}" data-collector-state="${integration?.collector ?? "unavailable"}">
     <div class="integration-identity"><span class="integration-icon"><i data-lucide="activity"></i></span><div><span>Codex</span><strong>${state}</strong><small>${detail}</small></div></div>
     <div class="integration-meta"><span><b>수집기</b>${collectorLabel}</span><span><b>저장</b>로컬 전용</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
@@ -367,12 +379,14 @@ function integrationPanel(): string {
 }
 
 function configNavigationStatus(): string {
+  if (integrationUnavailable) return "자동 수집 상태 확인 불가";
   if (integration?.config === "connected") return "자동 수집 연결됨";
   if (integration?.config === "conflict") return "Codex 설정 충돌";
   return "자동 수집 연결 안 됨";
 }
 
 function collectorNavigationStatus(): string {
+  if (integrationUnavailable) return "collector 상태 확인 불가";
   if (integration?.collector === "ready") return "collector 실행 중";
   if (integration?.collector === "degraded") return "collector 실행 중 · 리포트 지연";
   return "collector 중지됨";
@@ -491,6 +505,7 @@ function bindEvents(): void {
   document.querySelector("#cancel-close")?.addEventListener("click", closeCloseDialog);
   document.querySelector("#confirm-close")?.addEventListener("click", () => void closeSession());
   document.querySelector("#toggle-integration")?.addEventListener("click", () => void toggleIntegration());
+  document.querySelector("#refresh-integration")?.addEventListener("click", () => void refreshIntegration());
   document.querySelector("#open-dashboard")?.addEventListener("click", () => void openDashboard());
   document.querySelector("#overview-dashboard")?.addEventListener("click", () => void openDashboard());
   document.querySelectorAll<HTMLDialogElement>("dialog").forEach((dialog) => {
@@ -530,6 +545,25 @@ async function toggleIntegration(): Promise<void> {
     );
   } catch (error) {
     if (token !== lifecycleToken) return;
+    setBusy(false);
+    showToast(messageOf(error), "error");
+  }
+}
+
+async function refreshIntegration(): Promise<void> {
+  if (busy) return;
+  setBusy(true);
+  try {
+    integration = await api<IntegrationStatus>("/api/integrations/codex");
+    integrationUnavailable = false;
+    renderSettings("toggle-integration");
+    showToast("Codex 자동 수집 상태를 확인했습니다.", "success");
+  } catch (error) {
+    const apiError = error as Error & { code?: string };
+    if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
+      expireSession();
+      return;
+    }
     setBusy(false);
     showToast(messageOf(error), "error");
   }
