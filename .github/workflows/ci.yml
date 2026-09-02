@@ -118,7 +118,10 @@ jobs:
           set -euo pipefail
           cargo +1.97.0 build --release --locked -p agent-observability-cli
           binary="$PWD/target/release/agent-observability"
-          test "$("$binary" --version)" = "1.8.0"
+          version="$(cargo +1.97.0 metadata --format-version 1 --no-deps | \
+            jq -r '.packages[] | select(.name == "agent-observability-cli") | .version')"
+          test -n "$version"
+          test "$("$binary" --version)" = "$version"
           set +e
           cargo +1.97.0 run --locked -p xtask -- perf automatic --profile release --check \
             --binary "$binary" | tee "$RUNNER_TEMP/automatic-release-evidence.out"
