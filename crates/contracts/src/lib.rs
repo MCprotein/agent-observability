@@ -1854,6 +1854,14 @@ mod tests {
                 serde_json::json!(true),
             ),
             (
+                "/automatic_local_capabilities/0/privacy/unknown_fields/otlp_attributes",
+                serde_json::json!("accepted"),
+            ),
+            (
+                "/automatic_local_capabilities/0/privacy/unknown_fields/notify_payload",
+                serde_json::json!("accepted"),
+            ),
+            (
                 "/automatic_local_capabilities/0/manual_ingest_boundary",
                 serde_json::json!("disabled"),
             ),
