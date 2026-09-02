@@ -4,16 +4,17 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 외부 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.8.0 Released.** 기존 Codex, Claude Code, Cursor private handoff 수동 import는
+> **v1.8.1 준비 중.** 기존 Codex, Claude Code, Cursor private handoff 수동 import는
 > daemon이나 network 없이 계속 동작한다. 선택적 Codex 자동 수집은 private CA HTTPS와
-> exact private random request header로 보호한 `127.0.0.1` OTLP/HTTP JSON receiver, bounded notify
-> supplement와 macOS LaunchAgent를 사용한다. 이 transport는 mTLS가 아니다.
+> exact private random request header로 보호한 `127.0.0.1` OTLP/HTTP JSON receiver와 macOS
+> LaunchAgent를 사용한다. 기존 Codex 앱의 `notify` 명령이 있으면 그대로 보존하고, 비어 있을 때만
+> content-free notify supplement를 설치한다. 이 transport는 mTLS가 아니다.
 > Claude Code/Cursor 자동 수집과 commercial team profile은 아직 TODO다.
 
-> **v1.7 이하에서 업그레이드할 때:** 인자 없는 `agentobs setup`은 v1.8부터 Codex 설정을 연결하고
-> persistent local LaunchAgent를 시작한다. 기존처럼 수동 import runtime과 dashboard만 준비하는
+> **v1.7 이하에서 업그레이드할 때:** 인자 없는 `agentobs setup`은 로컬 Codex를 감지한 경우에만
+> Codex 설정을 연결하고 persistent local LaunchAgent를 시작한다. 기존처럼 수동 import runtime과 dashboard만 준비하는
 > script는 `agentobs setup ~/.agent-observability --no-open`처럼 root를 명시한다. 자동 연결은 이후
-> `agentobs connect codex`로 언제든 추가할 수 있다.
+> 설정 UI 또는 고급 lifecycle 명령으로 언제든 추가할 수 있다.
 
 아래 automatic 명령과 설치 경로는 게시된 v1.8.0 기준이다.
 
@@ -74,8 +75,11 @@ Host와 Origin을 모두 확인한다. token은 같은 tab의 새로고침에서
 agentobs setup
 ```
 
-이 한 명령은 기본 위치 `~/.agent-observability`에 private runtime과 embedded SQLite transactional store를 만들고,
-초기 대시보드를 생성해 연 다음 Codex 설정과 local collector LaunchAgent를 연결한다. 대시보드 생성이나
+이 한 명령은 로컬 Codex 환경을 감지해 기본 위치 `~/.agent-observability`에 private runtime과 embedded
+SQLite transactional store를 만들고, 초기 대시보드를 생성해 연 다음 필요한 OTEL 설정과 local collector
+LaunchAgent를 연결한다. Codex가 감지되지 않으면 runtime과 dashboard만 준비하고 `codex=not_detected`를
+출력하며 Codex 디렉터리, 설정, collector service는 만들지 않는다. 이미 Codex 앱이나 다른 로컬 도구가
+`notify`를 사용 중이면 그 명령은 건드리지 않고 `notify=external_preserved`로 알린다. 대시보드 생성이나
 열기에 실패하면 연결을 시작하지 않으며, 반대로 연결이 실패하면 이미 연 로컬 대시보드는 남을 수 있다. 브라우저를 열지
 않는 환경에서는 `agentobs setup --no-open`을 사용한다. 처음에는 수집된 데이터가 없으므로 빈
 화면이 정상이다.
@@ -86,7 +90,7 @@ agentobs setup
 ~/.agent-observability/logs/agent-observability-report.html
 ```
 
-Codex 연결만 따로 관리할 수도 있다.
+평소에는 `setup`만 사용하면 된다. 아래 명령은 문제 진단이나 연결 해제처럼 lifecycle을 직접 관리할 때만 사용한다.
 
 ```bash
 agentobs connect codex
@@ -96,9 +100,14 @@ agentobs disconnect codex
 
 `disconnect`는 collector service를 연결 전의 정확한 plist와 loaded 상태로 되돌린 뒤 Codex 설정을
 연결 전의 정확한 bytes와 permission으로 복원한다. connect가 새로 만든 service/config만 종료하고
-제거한다. 연결 뒤 어떤 설정이든 바뀌어 현재
+제거한다. agentobs가 소유하지 않은 기존 `notify`는 연결 중에도 보존된다. 연결 뒤 어떤 설정이든 바뀌어 현재
 전체 bytes 또는 mode가 기록된 connected state와 다르면 편집을 덮어쓰지 않고 중단한다. 이미 수집된
 local data는 유지된다.
+
+macOS 시스템 설정의 **로그인 항목 및 확장 프로그램 > 앱 백그라운드 활동**에
+`agent-observability`가 보일 수 있다. 별도 GUI 앱이 설치된 것이 아니라 자동 수집용 CLI collector를
+launchd가 로그인 후 다시 실행할 수 있도록 등록한 표시다. `agentobs disconnect codex`가 이 등록을
+연결 전 상태로 복원한다.
 
 사용자 문서의 권장 명령은 `agentobs`다. 모니터링 화면은 `agentobs dashboard`, 설정 화면은
 `agentobs ui`로 연다. 배포 파일명인 `agent-observability`도 호환 명령으로 계속 제공한다.
@@ -109,7 +118,7 @@ local data는 유지된다.
 | 로컬 설정 UI | 지원 | UI server는 `ui` 실행 중에만 존재하며 Codex 연결과 runtime config 관리 제공 |
 | 내장 sample 체험 | 지원 | 외부 파일 없이 `demo` 한 명령으로 확인 |
 | Canonical handoff 수동 import | 지원 | 세 agent 모두 daemon과 network 없이 private JSONL import 가능 |
-| Codex 자동 연결 | 지원 (v1.8.0) | macOS LaunchAgent와 private-CA HTTPS + exact private random header를 사용한 loopback OTLP/HTTP JSON + projected notify |
+| Codex 자동 연결 | 지원 (v1.8.1 보완 중) | `setup`이 macOS Codex를 자동 연결하며 기존 notify를 보존하고 loopback OTLP/HTTP JSON을 사용 |
 | Claude Code/Cursor 자동 연결 | TODO | 현재 자동 receiver/config 연결은 Codex만 지원 |
 | Commercial team profile | TODO | G0-G4 승인과 evidence 전에는 완료로 간주하지 않음 |
 
@@ -131,13 +140,14 @@ local data는 유지된다.
 
 ### Codex 자동 수집
 
-`agentobs setup` 또는 `agentobs connect codex`가 `$CODEX_HOME/config.toml`을 연결한다.
+`agentobs setup`이 로컬 Codex를 감지해 `$CODEX_HOME/config.toml`을 연결한다.
 `CODEX_HOME`이 없으면 `~/.codex/config.toml`을 사용한다. Codex telemetry는 private CA로 server를
 검증하는 HTTPS와 exact `x-agent-observability-token` request header를 사용해 `127.0.0.1`
 receiver에 들어온다. Header 값은 runtime이 생성하는 private random 256-bit value다. Codex
 exporter에 client certificate나 client private-key field를 넣지 않으며, 이 transport는 mTLS가 아니다.
-`agent-turn-complete` notify는 raw payload를 전송 전에 bounded allowlist로 축약한 뒤 turn 완료만
-보완한다. 어느 경로도 외부 network를 사용하지 않는다.
+기존 `notify`가 없을 때만 `agent-turn-complete` supplement를 설치하며, raw payload를 전송 전에 bounded
+allowlist로 축약해 turn 완료만 보완한다. 기존 notify가 있으면 OTEL이 기본 수집 경로가 된다. 어느 경로도
+외부 network를 사용하지 않는다.
 
 Raw notify payload는 foreground helper의 bounded parsing 동안에만 process memory에 존재하며 receiver나
 socket에는 들어가지 않는다. Raw OTLP/tool field는 receiver의 bounded parsing 동안 일시적으로 존재할
@@ -208,7 +218,7 @@ capability entry는 `supported`다. v1.8.0 tag, Package와 public Release도 게
 ```mermaid
 flowchart TB
     Codex["Codex"] -->|"private-CA HTTPS + exact private header"| Receiver["HTTPS receiver on 127.0.0.1"]
-    Codex -->|"raw notify callback"| Notify["codex-notify allowlist projector"]
+    Codex -.->|"optional notify when slot is free"| Notify["codex-notify allowlist projector"]
     Notify -->|"projected supplement over authenticated HTTPS"| Receiver
     Manual["Private canonical handoff files"] --> Adapters["Rust adapters"]
     Receiver --> Allowlist["Codex scalar allowlist"]
@@ -218,8 +228,8 @@ flowchart TB
     Store --> Report["Privacy and cost projection"]
     Report --> HTML["Self-contained private HTML"]
     HTML --> Browser["Local browser via file"]
-    Connect["connect codex"] --> LaunchAgent["macOS LaunchAgent"]
-    Connect --> Ownership["Exact Codex config ownership"]
+    Connect["setup auto-detection"] --> LaunchAgent["macOS LaunchAgent"]
+    Connect --> Ownership["Exact Codex OTEL config ownership"]
     LaunchAgent --> Receiver
     Ownership --> Codex
     Settings["ui command"] --> Config["Authenticated ephemeral settings UI"]

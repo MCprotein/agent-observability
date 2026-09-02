@@ -38,7 +38,9 @@ agentobs report ~/.agent-observability /path/to/private-rate-table.json
 ~~~
 
 `setup` without an explicit root composes private install, store initialization, report generation and macOS
-browser open, then Codex automatic connection for `~/.agent-observability`. Dashboard preparation failure stops
+browser open, then read-only detection of a real Codex home or executable. A detected Codex installation is
+connected automatically for `~/.agent-observability`; otherwise setup reports `codex=not_detected` without
+creating a Codex home, config, or collector service. Dashboard preparation failure stops
 before integration mutation; connection failure can leave the already-open private dashboard in place.
 `setup --no-open` performs the same
 work without opening a browser. `setup <root> [--no-open]` initializes an explicit root in manual-import mode;
@@ -87,7 +89,8 @@ failure restores the prior settings and credentials, and an interrupted phase re
 
 The LaunchAgent plist is written to `~/Library/LaunchAgents` with a label derived from the runtime root. It
 runs the canonical absolute installed executable as `collector-serve <root>`, starts at load, and is kept alive
-by launchd. Automatic collection currently supports macOS Codex only. It does not scrape Codex files,
+by launchd. macOS may therefore list `agent-observability` under background activity in Login Items; this is
+the CLI collector registration, not a separately distributed GUI application. Automatic collection currently supports macOS Codex only. It does not scrape Codex files,
 credentials, browser sessions or private APIs and does not connect to an external host. The private-CA server
 certificate prevents a listener without the server private key from impersonating the trusted receiver to Codex,
 and the exact private header rejects requests without the runtime credential. This does not isolate a malicious
@@ -95,9 +98,12 @@ process running as the same OS user because that process can read the same `0600
 key and impersonate a client or receiver; separate user identities or an OS sandbox are required for that threat.
 
 Codex config ownership is transactional. The manager uses `$CODEX_HOME/config.toml` when `CODEX_HOME` is set,
-otherwise `~/.codex/config.toml`, and manages only top-level `notify`, the local JSON `otel.exporter`,
-`otel.log_user_prompt=false`, and `otel.environment="local"`. Notify is exactly the canonical absolute installed executable path,
-`codex-notify`, and absolute runtime root. The exporter contains only the configured local HTTPS `/v1/logs`
+otherwise `~/.codex/config.toml`, and manages the local JSON `otel.exporter`,
+`otel.log_user_prompt=false`, and `otel.environment="local"`. When top-level `notify` is absent, setup also owns an
+optional notify command containing the canonical absolute installed executable path, `codex-notify`, and absolute
+runtime root. A pre-existing non-empty string-array notify command is preserved byte-for-byte, remains outside
+agentobs ownership, and is reported as `notify=external_preserved`. Other notify shapes fail closed without
+modifying the config. The exporter contains only the configured local HTTPS `/v1/logs`
 endpoint, JSON protocol, private CA path and exact `x-agent-observability-token` header. It contains no client
 identity fields. The endpoint port is an OS-assigned available loopback port persisted in
 private collector settings. If that port is occupied after restart, autonomous collector startup fails closed
@@ -105,7 +111,7 @@ without changing settings. The next explicit `connect codex` verifies the unavai
 only the persisted port to another OS-assigned loopback port, and crash-safely reconnects the LaunchAgent.
 `status` reports an unreachable owned endpoint as unavailable. Degraded is reserved for an authenticated
 collector whose durable report is pending or whose bounded report refresh retries were exhausted.
-Connect refuses conflicting pre-existing managed values unless they match exactly.
+Connect refuses conflicting pre-existing OTEL values unless they match exactly; an unrelated pre-existing notify is not a conflict.
 Before changing the file, it stores the exact prior and connected bytes, hashes, existence, permission modes
 and transaction phase in `runtime/integrations/codex/codex-config-ownership-v1.json` with private permissions.
 A lock scoped to the canonical Codex config path, exact-state comparison, temp-file fsync and atomic rename preserve supported concurrent

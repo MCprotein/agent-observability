@@ -26,6 +26,12 @@ pub enum ConnectionStatus {
     Conflict,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotifyOwnership {
+    AgentobsOwned,
+    ExternalPreserved,
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
     Conflict,
@@ -130,9 +136,15 @@ struct OwnershipSnapshot {
     connected_bytes_hex: String,
     connected_hash: String,
     connected_mode: u32,
+    #[serde(default = "legacy_owns_notify")]
+    owns_notify: bool,
     managed_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_rotation: Option<PendingRotation>,
+}
+
+const fn legacy_owns_notify() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -240,7 +252,10 @@ impl CodexConfigManager {
         let prior = self.read_config()?;
         let mut document = parse_document(&prior.bytes)?;
         ensure_no_managed_conflict(&document, &managed)?;
-        patch_managed_values(&mut document, &managed);
+        let owns_notify = document
+            .get("notify")
+            .is_none_or(|item| notify_matches(item, &managed));
+        patch_managed_values(&mut document, &managed, owns_notify);
         let updated = document.to_string().into_bytes();
         let already_connected = prior.matches(&updated, prior.mode);
         let mut snapshot = OwnershipSnapshot {
@@ -258,7 +273,8 @@ impl CodexConfigManager {
             connected_bytes_hex: hex_encode(&updated),
             connected_hash: hash(&updated),
             connected_mode: prior.mode,
-            managed_fingerprint: managed.fingerprint(),
+            owns_notify,
+            managed_fingerprint: managed.fingerprint(owns_notify),
             pending_rotation: None,
         };
         let snapshot_bytes = snapshot.to_bytes()?;
@@ -317,7 +333,7 @@ impl CodexConfigManager {
     ) -> Result<Option<ConnectionStatus>, ConfigError> {
         let (mut snapshot, snapshot_file) = self.read_snapshot()?;
         let managed = self.managed_values()?;
-        let managed_fingerprint = managed.fingerprint();
+        let managed_fingerprint = managed.fingerprint(snapshot.owns_notify);
         let state = self.snapshot_state(&snapshot)?;
         if snapshot.phase == SnapshotPhase::Rotating {
             if snapshot.pending_managed_fingerprint() != Some(managed_fingerprint.as_str()) {
@@ -378,7 +394,10 @@ impl CodexConfigManager {
             return Ok(ConnectionStatus::Disconnected);
         }
         let (mut snapshot, mut snapshot_file) = self.read_snapshot()?;
-        let managed_fingerprint = self.managed.as_ref().map(ManagedValues::fingerprint);
+        let managed_fingerprint = self
+            .managed
+            .as_ref()
+            .map(|managed| managed.fingerprint(snapshot.owns_notify));
         let mut state = self.snapshot_state(&snapshot)?;
         if snapshot.phase == SnapshotPhase::Rotating {
             if managed_fingerprint.as_deref().is_some_and(|fingerprint| {
@@ -417,17 +436,20 @@ impl CodexConfigManager {
             )?;
         }
 
-        let current = self.read_config()?;
+        let connected = snapshot.connected_bytes()?;
         let prior = snapshot.prior_bytes()?;
         let restore_result = if snapshot.prior_existed {
             mutations.atomic_replace(
                 &self.config_path,
-                FileExpectation::present(&current),
+                FileExpectation::present_bytes(&connected, snapshot.connected_mode),
                 &prior,
                 snapshot.prior_mode,
             )
         } else {
-            mutations.remove_checked(&self.config_path, FileExpectation::present(&current))
+            mutations.remove_checked(
+                &self.config_path,
+                FileExpectation::present_bytes(&connected, snapshot.connected_mode),
+            )
         };
         if let Err(error) = restore_result {
             return match self.snapshot_state(&snapshot)? {
@@ -479,7 +501,10 @@ impl CodexConfigManager {
         };
         validate_private_file(&snapshot_path, &metadata)?;
         let (mut snapshot, mut snapshot_file) = self.read_snapshot()?;
-        let managed_fingerprint = self.managed.as_ref().map(ManagedValues::fingerprint);
+        let managed_fingerprint = self
+            .managed
+            .as_ref()
+            .map(|managed| managed.fingerprint(snapshot.owns_notify));
         let mut state = self.snapshot_state(&snapshot)?;
         if snapshot.phase == SnapshotPhase::Rotating {
             if managed_fingerprint.as_deref().is_some_and(|fingerprint| {
@@ -519,6 +544,33 @@ impl CodexConfigManager {
                 Err(ConfigError::InvalidSnapshot)
             }
             SnapshotState::Conflict => Ok(Some(ConnectionStatus::Conflict)),
+        }
+    }
+
+    /// Returns the persisted notify ownership decision for a connected config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsafe state paths, an invalid snapshot, an ownership conflict, or
+    /// an I/O failure.
+    pub fn notify_ownership(&self) -> Result<Option<NotifyOwnership>, ConfigError> {
+        self.ensure_private_state_dir()?;
+        let _lock = self.lock()?;
+        if checked_metadata(&self.snapshot_path())?.is_none() {
+            return Ok(None);
+        }
+        let (snapshot, _) = self.read_snapshot()?;
+        match self.snapshot_state(&snapshot)? {
+            SnapshotState::Connected => Ok(Some(if snapshot.owns_notify {
+                NotifyOwnership::AgentobsOwned
+            } else {
+                NotifyOwnership::ExternalPreserved
+            })),
+            SnapshotState::PreparedPrior | SnapshotState::RestoredPrior => Ok(None),
+            SnapshotState::RotationPrepared | SnapshotState::RotationApplied => {
+                Err(ConfigError::InvalidSnapshot)
+            }
+            SnapshotState::Conflict => Err(ConfigError::Conflict),
         }
     }
 
@@ -580,14 +632,14 @@ impl CodexConfigManager {
         managed: &ManagedValues,
     ) -> Result<ExistingFile, ConfigError> {
         let mut document = parse_document(&snapshot.connected_bytes()?)?;
-        replace_managed_values(&mut document, managed);
+        replace_managed_values(&mut document, managed, snapshot.owns_notify);
         let pending_bytes = document.to_string().into_bytes();
         snapshot.phase = SnapshotPhase::Rotating;
         snapshot.pending_rotation = Some(PendingRotation {
             connected_hash: hash(&pending_bytes),
             connected_bytes_hex: hex_encode(&pending_bytes),
             connected_mode: snapshot.connected_mode,
-            managed_fingerprint: managed.fingerprint(),
+            managed_fingerprint: managed.fingerprint(snapshot.owns_notify),
         });
         let rotating_file = self.write_snapshot(mutations, snapshot, snapshot_file)?;
         self.finish_rotation(
@@ -937,8 +989,11 @@ impl ManagedValues {
         Value::InlineTable(exporter)
     }
 
-    fn fingerprint(&self) -> String {
-        let mut bytes = self.notify().to_string().into_bytes();
+    fn fingerprint(&self, owns_notify: bool) -> String {
+        let mut bytes = Vec::new();
+        if owns_notify {
+            bytes.extend_from_slice(self.notify().to_string().as_bytes());
+        }
         bytes.extend_from_slice(self.exporter().to_string().as_bytes());
         bytes.extend_from_slice(b"\0false\0local");
         hash(&bytes)
@@ -968,7 +1023,12 @@ fn ensure_no_managed_conflict(
     document: &DocumentMut,
     managed: &ManagedValues,
 ) -> Result<(), ConfigError> {
-    ensure_absent_or_matching(document.get("notify"), |item| notify_matches(item, managed))?;
+    if let Some(notify) = document.get("notify")
+        && !notify_matches(notify, managed)
+        && !valid_external_notify(notify)
+    {
+        return Err(ConfigError::Conflict);
+    }
     if let Some(otel) = document.get("otel") {
         let table = otel.as_table_like().ok_or(ConfigError::Conflict)?;
         ensure_absent_or_matching(table.get("exporter"), |item| {
@@ -995,8 +1055,8 @@ fn ensure_absent_or_matching(
     }
 }
 
-fn patch_managed_values(document: &mut DocumentMut, managed: &ManagedValues) {
-    if document.get("notify").is_none() {
+fn patch_managed_values(document: &mut DocumentMut, managed: &ManagedValues, owns_notify: bool) {
+    if owns_notify && document.get("notify").is_none() {
         document["notify"] = value(managed.notify());
     }
     if document.get("otel").is_none() {
@@ -1016,8 +1076,10 @@ fn patch_managed_values(document: &mut DocumentMut, managed: &ManagedValues) {
     }
 }
 
-fn replace_managed_values(document: &mut DocumentMut, managed: &ManagedValues) {
-    document["notify"] = value(managed.notify());
+fn replace_managed_values(document: &mut DocumentMut, managed: &ManagedValues, owns_notify: bool) {
+    if owns_notify {
+        document["notify"] = value(managed.notify());
+    }
     let otel = document["otel"]
         .as_table_like_mut()
         .expect("manager-owned connected snapshot has an otel table");
@@ -1034,6 +1096,12 @@ fn notify_matches(item: &Item, managed: &ManagedValues) -> bool {
         && array.get(0).and_then(Value::as_str) == Some(managed.binary.as_str())
         && array.get(1).and_then(Value::as_str) == Some("codex-notify")
         && array.get(2).and_then(Value::as_str) == Some(managed.runtime_root.as_str())
+}
+
+fn valid_external_notify(item: &Item) -> bool {
+    item.as_array().is_some_and(|array| {
+        !array.is_empty() && array.iter().all(|value| value.as_str().is_some())
+    })
 }
 
 fn exporter_matches(item: &Item, managed: &ManagedValues) -> bool {
@@ -1576,22 +1644,97 @@ mod tests {
     }
 
     #[test]
-    fn rejects_conflicting_notify_and_otel_values() {
-        for (name, text) in [
-            ("notify", "notify = [\"other\"]\n"),
-            ("otel", "[otel]\nenvironment = \"production\"\n"),
+    fn preserves_an_existing_notify_command_across_connect_and_disconnect() {
+        let root = root("existing-notify");
+        prepare(&root);
+        let original = "notify = [\"/Applications/Codex.app/Contents/MacOS/SkyComputerUseClient\", \"notify\", \"--source\", \"codex\"]\nmodel = \"gpt-test\"\n";
+        fs::write(root.join("config.toml"), original).unwrap();
+        set_mode(&root.join("config.toml"), 0o600).unwrap();
+
+        let manager = manager(&root);
+        assert_eq!(manager.connect().unwrap(), ConnectionStatus::Connected);
+        let connected = fs::read_to_string(&manager.config_path).unwrap();
+        assert!(connected.starts_with(original));
+        assert!(connected.contains("[otel]"));
+        let (snapshot, _) = manager.read_snapshot().unwrap();
+        assert!(!snapshot.owns_notify);
+        assert_eq!(
+            manager.notify_ownership().unwrap(),
+            Some(NotifyOwnership::ExternalPreserved)
+        );
+
+        let rotated = manager_with_security(&root, 4318, "rotated");
+        assert_eq!(rotated.connect().unwrap(), ConnectionStatus::Connected);
+        let rotated_text = fs::read_to_string(&rotated.config_path).unwrap();
+        assert!(rotated_text.starts_with(original));
+        assert!(rotated_text.contains("/tls/rotated/ca-certificate.pem"));
+
+        assert_eq!(
+            rotated.disconnect().unwrap(),
+            ConnectionStatus::Disconnected
+        );
+        assert_eq!(fs::read_to_string(&rotated.config_path).unwrap(), original);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_malformed_notify_values_without_modifying_the_config() {
+        for (name, notify) in [
+            ("string", "notify = \"command\"\n"),
+            ("table", "[notify]\ncommand = \"program\"\n"),
+            ("empty-array", "notify = []\n"),
+            ("non-string-array", "notify = [\"program\", 7]\n"),
         ] {
-            let root = root(name);
+            let root = root(&format!("malformed-notify-{name}"));
             prepare(&root);
-            fs::write(root.join("config.toml"), text).unwrap();
+            fs::write(root.join("config.toml"), notify).unwrap();
             set_mode(&root.join("config.toml"), 0o600).unwrap();
-            assert!(matches!(
-                manager(&root).connect(),
-                Err(ConfigError::Conflict)
-            ));
-            assert_eq!(fs::read_to_string(root.join("config.toml")).unwrap(), text);
+            let manager = manager(&root);
+
+            assert!(matches!(manager.connect(), Err(ConfigError::Conflict)));
+            assert_eq!(fs::read_to_string(&manager.config_path).unwrap(), notify);
+            assert!(!manager.snapshot_path().exists());
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn legacy_snapshot_without_notify_scope_remains_readable() {
+        let root = root("legacy-notify-scope");
+        prepare(&root);
+        let manager = manager(&root);
+        manager.connect().unwrap();
+
+        let snapshot_path = manager.snapshot_path();
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+        snapshot.as_object_mut().unwrap().remove("owns_notify");
+        let mut bytes = serde_json::to_vec_pretty(&snapshot).unwrap();
+        bytes.push(b'\n');
+        fs::write(&snapshot_path, bytes).unwrap();
+        set_mode(&snapshot_path, 0o600).unwrap();
+
+        assert_eq!(manager.status().unwrap(), ConnectionStatus::Connected);
+        assert_eq!(
+            manager.disconnect().unwrap(),
+            ConnectionStatus::Disconnected
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_conflicting_otel_values_without_touching_notify() {
+        let root = root("otel-conflict");
+        prepare(&root);
+        let text = "notify = [\"other\"]\n[otel]\nenvironment = \"production\"\n";
+        fs::write(root.join("config.toml"), text).unwrap();
+        set_mode(&root.join("config.toml"), 0o600).unwrap();
+        assert!(matches!(
+            manager(&root).connect(),
+            Err(ConfigError::Conflict)
+        ));
+        assert_eq!(fs::read_to_string(root.join("config.toml")).unwrap(), text);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1684,7 +1827,7 @@ mod tests {
             ),
         ] {
             let candidate = candidate.unwrap().managed_values().unwrap().clone();
-            assert_ne!(base.fingerprint(), candidate.fingerprint());
+            assert_ne!(base.fingerprint(true), candidate.fingerprint(true));
             assert!(!exporter_matches(&base_exporter, &candidate));
         }
     }
@@ -1795,7 +1938,7 @@ mod tests {
                 assert!(snapshot.pending_rotation.is_none());
                 assert_eq!(
                     snapshot.managed_fingerprint,
-                    rotated.managed_values().unwrap().fingerprint()
+                    rotated.managed_values().unwrap().fingerprint(true)
                 );
 
                 assert_eq!(
@@ -2179,6 +2322,47 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn disconnect_does_not_overwrite_a_concurrent_foreign_notify_edit() {
+        let root = root("disconnect-concurrent-notify-edit");
+        prepare(&root);
+        let original = b"notify = ['foreign', 'before']\nmodel = 'before'\n";
+        fs::write(root.join("config.toml"), original).unwrap();
+        set_mode(&root.join("config.toml"), 0o600).unwrap();
+        let manager = manager(&root);
+        manager.connect().unwrap();
+
+        let connected = fs::read_to_string(&manager.config_path).unwrap();
+        let edited = connected
+            .replace("['foreign', 'before']", "['foreign', 'after']")
+            .into_bytes();
+        let edit_started = Arc::new(Barrier::new(2));
+        let edit_finished = Arc::new(Barrier::new(2));
+        let editor_path = manager.config_path.clone();
+        let editor_started = Arc::clone(&edit_started);
+        let editor_finished = Arc::clone(&edit_finished);
+        let editor_bytes = edited.clone();
+        let editor = thread::spawn(move || {
+            editor_started.wait();
+            fs::write(editor_path, editor_bytes).unwrap();
+            editor_finished.wait();
+        });
+        let mutations = ConcurrentEditMutations {
+            config_path: manager.config_path.clone(),
+            edit_started,
+            edit_finished,
+        };
+
+        assert!(matches!(
+            manager.disconnect_with(&mutations),
+            Err(ConfigError::Conflict)
+        ));
+        editor.join().unwrap();
+        assert_eq!(fs::read(&manager.config_path).unwrap(), edited);
+        assert!(manager.snapshot_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn disconnect_conflicts_after_a_mode_only_edit_and_preserves_it() {
@@ -2431,7 +2615,7 @@ mod tests {
         prepare(&root);
         let manager = manager(&root);
         let mut document = DocumentMut::new();
-        patch_managed_values(&mut document, manager.managed_values().unwrap());
+        patch_managed_values(&mut document, manager.managed_values().unwrap(), true);
         let original = document.to_string().into_bytes();
         fs::write(&manager.config_path, &original).unwrap();
         set_mode(&manager.config_path, 0o600).unwrap();

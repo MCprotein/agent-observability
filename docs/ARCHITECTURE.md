@@ -6,7 +6,7 @@
 
 ## Current and target stack
 
-현재 `v1.8.0`은 **Released**다. macOS standalone은 Codex, Claude Code와 Cursor의 private
+현재 `v1.8.1`은 **In Progress**다. macOS standalone은 Codex, Claude Code와 Cursor의 private
 handoff 수동 import를 daemon과 network 없이 계속 제공한다. 선택적 Codex automatic path는 private-CA
 HTTPS와 exact private random request header로 인증하는 `127.0.0.1` OTLP/HTTP JSON receiver,
 pre-transport projected notify supplement와 LaunchAgent를 추가한다. 이 transport는 mTLS가 아니다. Rust 경로는
@@ -132,7 +132,7 @@ corpus가 strict Rust wire DTO와 생성된 TypeScript validator의 required/def
 ```mermaid
 flowchart TB
     Codex["Codex"] -->|"private-CA HTTPS + exact private header"| Receiver["Local Codex receiver"]
-    Codex -->|"raw notify callback"| Notify["codex-notify allowlist projector"]
+    Codex -.->|"optional raw notify callback when slot is free"| Notify["codex-notify allowlist projector"]
     Notify -->|"projected supplement over authenticated HTTPS"| Receiver
     Manual["Private canonical handoff files"] --> Adapters["Rust inbound adapters"]
     Receiver --> Allowlist["Codex scalar allowlist"]
@@ -143,7 +143,7 @@ flowchart TB
     Store --> Projection["DurableRecord projection"]
     Store --> Report["ReportDto projection"]
     Report --> UI["Self-contained TypeScript UI"]
-    Connect["connect codex"] --> Ownership["Codex config ownership"]
+    Connect["setup auto-detection"] --> Ownership["Codex OTEL config ownership"]
     Connect --> LaunchAgent["macOS LaunchAgent"]
     Settings["Ephemeral settings UI"] --> Connect
     Ownership --> Codex
@@ -273,7 +273,9 @@ anti-corruption layer다.
   field를 구성하지 않으며 transport는 mTLS가 아니다. 외부 network client는 없다. 같은 OS user가
   private header secret이나 server key를 읽을 수 있는 위협은 이 경계 밖이며 별도 account 또는
   sandbox가 필요하다.
-- `connect codex`는 collector LaunchAgent를 준비하고 health를 확인한 뒤 Codex config를 변경한다.
+- 인자 없는 `setup`은 real Codex home 또는 PATH의 executable을 읽기 전용으로 감지한 뒤에만 automatic
+  connection을 시작한다. 감지되지 않으면 Codex home/config/collector service를 만들지 않는다.
+  명시적 `connect codex`는 collector LaunchAgent를 준비하고 health를 확인한 뒤 Codex config를 변경한다.
   v2 mTLS에서 v3로 바뀌는 경우 settings migration journal이 exact prior bytes/mode와 credential
   generation을 보존한다. LaunchAgent와 Codex config commit 전에는 legacy credential을 지우지 않으며,
   실패 시 config 해제와 service rollback이 모두 확인된 뒤에만 settings와 replacement credential을
@@ -284,9 +286,11 @@ anti-corruption layer다.
   fsync하며 제거한다. `status`와 `disconnect`는 settings parse 전에 남은 journal과 config ownership을
   조정하며 committed phase는 이전 settings로 되돌리지 않는다.
   `$CODEX_HOME/config.toml` 또는 기본 `~/.codex/config.toml`의 exact prior/connected bytes, hash, mode와
-  transaction phase를 private ownership snapshot에 보존한다. 관리하는 값은 top-level `notify`, `otel.exporter`,
-  `otel.log_user_prompt=false`, `otel.environment="local"`뿐이다. 기존 값이 다르면 connect는 conflict로
-  중단한다. `disconnect codex`는 LaunchAgent 종료를 먼저 확인하고 현재 전체 bytes/mode가 snapshot의
+  transaction phase를 private ownership snapshot에 보존한다. 항상 관리하는 값은 `otel.exporter`,
+  `otel.log_user_prompt=false`, `otel.environment="local"`이다. top-level `notify`가 비어 있을 때만 agentobs
+  notify를 추가 소유하며 기존 valid non-empty string-array notify는 그대로 보존하고
+  `external_preserved`로 보고한다. malformed notify 또는 기존 OTEL 값이 다르면 connect는 config를
+  수정하지 않고 conflict로 중단한다. `disconnect codex`는 LaunchAgent 종료를 먼저 확인하고 현재 전체 bytes/mode가 snapshot의
   connected state와 같을 때만 이전 bytes/mode를 복원하거나 연결 전 파일이 없었다면 제거한다. Crash
   phase는 다음 lifecycle command에서 복구하며 conflict와 rollback failure는 사용자 설정을 덮어쓰지 않는다.
 - The ephemeral settings UI exposes the same `codex-integration` status/connect/disconnect use cases and can

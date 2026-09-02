@@ -6,13 +6,13 @@
 
 ## Scope Boundary
 
-| Boundary | v1.8.0 status |
+| Boundary | v1.8.1 status |
 | --- | --- |
 | Private canonical handoff parser | Implemented for Codex, Claude Code, Cursor |
 | One-shot local ingest CLI | Implemented |
 | Codex OTLP/HTTP JSON receiver | Supported for pinned Codex 0.151.0 on macOS through private-CA HTTPS on IPv4 loopback with exact private random request header |
-| Codex `agent-turn-complete` notify supplement | Implemented with bounded fail-open local delivery |
-| Codex config ownership and macOS LaunchAgent | Supported on the pinned macOS boundary with exact restore; released in v1.8.0 |
+| Codex `agent-turn-complete` notify supplement | Installed only when notify is free; an existing local notify command is preserved |
+| Codex config ownership and macOS LaunchAgent | `setup` owns non-conflicting OTEL values, optionally owns an empty notify slot, and keeps exact restore |
 | SQLite authority and JSONL projection | Implemented |
 | Static HTML report | Implemented |
 | Ephemeral loopback settings UI | Implemented |
@@ -53,7 +53,7 @@ flowchart TB
     Archive["Private archive outside runtime"]
 
     Codex -->|"private-CA HTTPS + exact private header"| Receiver
-    Codex -->|"raw notify callback"| Notify["codex-notify allowlist projector"]
+    Codex -.->|"optional raw notify callback when slot is free"| Notify["codex-notify allowlist projector"]
     Codex -->|"private canonical handoff manual import"| Files
     Notify -->|"projected notify over authenticated HTTPS"| Receiver
     Receiver --> Allowlist --> Adapters
@@ -83,16 +83,22 @@ sequenceDiagram
     participant Store as SQLite authority
     participant Report as Private HTML report
 
-    Operator->>CLI: connect codex
+    Operator->>CLI: setup and read-only Codex detection
+    alt Codex not detected
+        CLI-->>Operator: dashboard ready; codex=not_detected
+    else Codex detected
     CLI->>Launchd: install and start LaunchAgent
     CLI->>Receiver: private-CA HTTPS + exact-header health check
     Receiver-->>CLI: ready
     CLI->>Config: connect with exact ownership snapshot
-    Config-->>Codex: local OTLP exporter and notify command
+    Config-->>Codex: local OTLP exporter; preserve existing notify
     Codex->>Receiver: private-CA HTTPS + exact-header OTLP HTTP JSON
-    Codex->>Notify: raw notify callback
-    Notify->>Notify: strict allowlist projection
-    Notify->>Receiver: projected supplement over authenticated HTTPS
+    opt notify was previously absent
+        Config-->>Codex: install optional agentobs notify command
+        Codex->>Notify: raw notify callback
+        Notify->>Notify: strict allowlist projection
+        Notify->>Receiver: projected supplement over authenticated HTTPS
+    end
     Receiver->>Adapter: copy allowlisted scalars only
     Note over Receiver,Adapter: only bounded raw OTLP may exist transiently in receiver memory
     Adapter->>Store: source-ordered observations and dispositions
@@ -100,10 +106,12 @@ sequenceDiagram
     Store->>Report: visit generation-consistent records after ingest quiets
     Report->>Report: project spans and stream private HTML atomically
     Report->>Store: acknowledge exact rendered generation
+    end
 ```
 
-`setup` prepares and optionally opens the private dashboard before entering this sequence through
-`connect codex`. The connect command starts the collector and verifies health before taking Codex config
+`setup` prepares and optionally opens the private dashboard, detects a real local Codex home or executable without
+creating either as detection evidence, and only then starts the
+collector and verifies health before taking the non-conflicting Codex OTEL config
 ownership. A private
 LaunchAgent transaction records prior plist bytes/mode and loaded state; failure or crash restores that exact
 state instead of unconditionally removing a service. `disconnect codex` first converges the LaunchAgent to its
