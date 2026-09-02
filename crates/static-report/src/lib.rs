@@ -314,10 +314,25 @@ mod tests {
 
     #[test]
     fn render_embeds_validated_data_without_script_breakout() {
-        let html = render(&report("Stable </script><title> report")).unwrap();
+        let report = report("Stable </script><title> & \"report\"");
+        let html = render(&report).unwrap();
+        let legacy = {
+            let data = serde_json::to_string(&report)
+                .unwrap()
+                .replace('&', "\\u0026")
+                .replace('<', "\\u003c")
+                .replace('>', "\\u003e");
+            SHELL
+                .replace(TITLE_TOKEN, &escape_html(&report.title))
+                .replace(GENERATED_AT_TOKEN, &escape_html(&report.generated_at))
+                .replace(DATA_TOKEN, &data)
+        };
+        assert_eq!(html, legacy, "streamed renderer changed report bytes");
         assert!(html.starts_with("<!doctype html>"));
-        assert!(html.contains("Stable &lt;/script&gt;&lt;title&gt; report"));
-        assert!(html.contains("Stable \\u003c/script\\u003e\\u003ctitle\\u003e report"));
+        assert!(html.contains("Stable &lt;/script&gt;&lt;title&gt; &amp; &quot;report&quot;"));
+        assert!(
+            html.contains("Stable \\u003c/script\\u003e\\u003ctitle\\u003e \\u0026 \\\"report\\\"")
+        );
         assert!(!html.contains(TITLE_TOKEN));
         assert!(!html.contains(DATA_TOKEN));
         assert!(!html.contains("http://"));

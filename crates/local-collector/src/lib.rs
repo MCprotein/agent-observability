@@ -2401,6 +2401,11 @@ fn authenticated_request(
     let server_name = ServerName::try_from("127.0.0.1").map_err(crypto_error)?;
     let connection = ClientConnection::new(config, server_name).map_err(crypto_error)?;
     let mut tls = StreamOwned::new(connection, DeadlineStream::new(stream, deadline));
+    while tls.conn.is_handshaking() {
+        tls.conn
+            .complete_io(&mut tls.sock)
+            .map_err(|error| request_io("tls-handshake", error))?;
+    }
     let body = body.unwrap_or_default();
     let content_headers = if body.is_empty() {
         String::new()
@@ -2518,11 +2523,9 @@ fn refresh_report(
     let _render_guard = store
         .acquire_report_render_guard()
         .map_err(|_| ReportFailure::RenderGuard)?;
-    let capacity = usize::try_from(store.record_count().map_err(|_| ReportFailure::Snapshot)?)
-        .map_err(|_| ReportFailure::Snapshot)?;
-    let mut projector = ReportProjector::new(capacity, None);
+    let mut projector = ReportProjector::new(0, None);
     let mut projection_failure = false;
-    let generation = store
+    let visit = store
         .visit_report_snapshot(|index, record| {
             if !projection_failure && projector.push(index, &record).is_err() {
                 projection_failure = true;
@@ -2541,7 +2544,7 @@ fn refresh_report(
     write_private(&layout.logs.join(REPORT_FILE_NAME), &report)
         .map_err(|_| ReportFailure::Publish)?;
     store
-        .acknowledge_report_generation(generation)
+        .acknowledge_report_generation(visit.generation)
         .map_err(|_| ReportFailure::Acknowledge)
 }
 
@@ -4865,7 +4868,23 @@ mod tests {
             .unwrap();
             assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 1);
         });
+        let html = fs::read_to_string(root.join("logs").join(REPORT_FILE_NAME)).unwrap();
+        assert!(html.contains(r#""generatedSpans":10"#));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn request_would_block_is_reported_as_a_staged_timeout() {
+        let error = super::request_io(
+            "response-read",
+            std::io::Error::from(std::io::ErrorKind::WouldBlock),
+        );
+        assert!(matches!(
+            &error,
+            super::CollectorError::RequestIo { stage: "response-read", source }
+                if source.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(!error.to_string().contains("os error 35"));
     }
 
     #[test]

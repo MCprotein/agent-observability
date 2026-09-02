@@ -96,7 +96,8 @@ sequenceDiagram
     Note over Receiver,Adapter: only bounded raw OTLP may exist transiently in receiver memory
     Adapter->>Store: source-ordered observations and dispositions
     Store->>Store: advance durable report generation
-    Store->>Report: render generation-consistent snapshot
+    Store->>Report: visit generation-consistent records after ingest quiets
+    Report->>Report: project spans and stream private HTML atomically
     Report->>Store: acknowledge exact rendered generation
 ```
 
@@ -106,6 +107,10 @@ state instead of unconditionally removing a service. `disconnect codex` first co
 recorded prior state, then restores the exact prior Codex config only while the complete connected bytes and mode
 still match. It retains local observations. Unacknowledged SQLite report generations survive crashes; startup
 reconciles them and bounded exponential retries expose an exhausted refresh as degraded health through CLI/UI.
+Continuous ingest only advances the durable generation and refresh request epoch; it does not repeatedly rebuild
+the growing full report. After one quiet period, the renderer visits source records one at a time, retains only
+privacy-safe report spans, and streams the validated DTO into the atomic private HTML artifact. Each bounded read
+transaction closes before projection work; a generation change between batches rejects that render for retry.
 
 The receiver binds only `127.0.0.1`. Clients validate its private-CA server certificate and loopback IP SAN; every
 route requires the exact `x-agent-observability-token` header containing the runtime's private random 256-bit

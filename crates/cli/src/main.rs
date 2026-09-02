@@ -844,20 +844,19 @@ fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String>
         .map_err(|error| error.to_string())?;
     let mut rendered = None;
     for _ in 0..REPORT_RENDER_RETRY_LIMIT {
-        let record_count =
-            usize::try_from(store.record_count().map_err(|error| error.to_string())?)
-                .map_err(|_| "record count does not fit this platform".to_string())?;
-        let mut projector = ReportProjector::new(record_count, rate_table.as_ref());
+        let mut projector = ReportProjector::new(0, rate_table.as_ref());
         let mut projection_error = None;
-        let generation = store
-            .visit_report_snapshot(|index, record| {
-                if projection_error.is_none()
-                    && let Err(error) = projector.push(index, &record)
-                {
-                    projection_error = Some(error);
-                }
-            })
-            .map_err(|error| error.to_string())?;
+        let visit = match store.visit_report_snapshot(|index, record| {
+            if projection_error.is_none()
+                && let Err(error) = projector.push(index, &record)
+            {
+                projection_error = Some(error);
+            }
+        }) {
+            Ok(visit) => visit,
+            Err(agent_observability_local_store::StoreError::ReportSnapshotChanged) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
         if let Some(error) = projection_error {
             return Err(error.to_string());
         }
@@ -866,10 +865,10 @@ fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String>
             .map_err(|error| error.to_string())?;
         let bytes = write_private(&output_path, &report).map_err(|error| error.to_string())?;
         if store
-            .acknowledge_report_generation(generation)
+            .acknowledge_report_generation(visit.generation)
             .map_err(|error| error.to_string())?
         {
-            rendered = Some((record_count, report.cost.status, bytes));
+            rendered = Some((visit.records, report.cost.status, bytes));
             break;
         }
     }

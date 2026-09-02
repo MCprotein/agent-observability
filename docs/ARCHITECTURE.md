@@ -381,7 +381,14 @@ Web UI는 TypeScript `strict` mode를 사용한다.
 - agent별 예외 처리는 UI가 아니라 canonical contract나 adapter에서 해결한다.
 - Rust outbound infrastructure는 빌드된 TypeScript UI asset과 `ReportDtoV1`을 하나의
   self-contained HTML artifact로 조립한다. `report <runtime-root> [rate-table-json]`은 SQLite의 typed
-  snapshot을 읽고 고정된 private logs 경로에 원자 기록한다. Node.js는 build/test에서만 사용된다.
+  snapshot을 bounded transaction과 generation fence로 record batch 단위로 읽고, SQLite read lock을
+  닫은 뒤 privacy-safe span으로 즉시 축소한다. source record 전체를 별도 vector로 유지하지 않으며,
+  검증된 DTO JSON과 HTML shell은
+  완성된 중간 문자열 없이 private temporary file로 streaming한 뒤 고정된 logs 경로에 원자 기록한다.
+  Node.js는 build/test에서만 사용된다.
+- Automatic collector의 report refresh는 ingest quiet period 뒤 최신 generation을 한 번 렌더한다.
+  연속 ingest 중 성장하는 전체 report를 주기적으로 다시 만들지 않으며, 새 commit이 render와
+  겹치면 stale generation을 acknowledge하지 않고 quiet-period 수렴을 다시 예약한다.
 - team profile의 hosted UI도 같은 `ReportDtoVx` schema와 UI component를 사용한다. transport와
   authentication/authorization만 profile별 composition root에서 달라진다. hosted query는
   server-resolved tenant/workspace scope 밖의 DTO를 생성할 수 없다.

@@ -31,6 +31,7 @@ const REPORT_RENDER_LOCK_NAME: &str = ".report-render.lock";
 pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v4";
 const REPORT_GENERATION_KEY: &str = "report_generation";
 const REPORT_ACKNOWLEDGED_GENERATION_KEY: &str = "report_acknowledged_generation";
+const REPORT_VISIT_BATCH_SIZE: i64 = 128;
 const CODEX_CORRELATION_KEY_PREFIX: &str = "codex_request_correlation.v1:";
 const MAX_CODEX_CORRELATION_STATE_BYTES: usize = 512 * 1024;
 const MAX_CODEX_PENDING_CORRELATIONS: usize = 1024;
@@ -140,6 +141,12 @@ pub enum IngestStatus {
 pub struct ReportSnapshot {
     pub generation: u64,
     pub records: Vec<DurableRecordV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReportVisit {
+    pub generation: u64,
+    pub records: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -285,6 +292,7 @@ pub enum StoreError {
     InvalidRetentionBounds,
     PendingRetentionRecovery,
     MigrationAdmissionRequired,
+    ReportSnapshotChanged,
 }
 
 impl Display for StoreError {
@@ -313,6 +321,7 @@ impl Display for StoreError {
             Self::MigrationAdmissionRequired => {
                 "legacy local store migration requires admitted temporary disk headroom"
             }
+            Self::ReportSnapshotChanged => "report snapshot changed while it was being visited",
         })
     }
 }
@@ -1144,10 +1153,12 @@ impl LocalStore {
         })
     }
 
-    /// Visits one consistent, ordered report snapshot without retaining source records.
+    /// Visits one consistent, ordered report snapshot without retaining all source records.
     ///
-    /// The visitor receives ownership of each decoded record. The returned generation belongs to
-    /// the same transaction as every visited row.
+    /// Rows are copied in bounded transactions and visited after each read transaction closes, so
+    /// projection work cannot hold a `SQLite` read lock. A generation fence rejects a multi-batch
+    /// visit if a writer commits between batches. The returned count belongs to the visited
+    /// generation and is not queried separately.
     ///
     /// # Errors
     ///
@@ -1155,23 +1166,66 @@ impl LocalStore {
     pub fn visit_report_snapshot(
         &self,
         mut visit: impl FnMut(usize, DurableRecordV1),
-    ) -> Result<u64, StoreError> {
-        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)?;
-        let generation = metadata_generation(&tx, REPORT_GENERATION_KEY)?;
-        {
-            let mut statement =
-                tx.prepare("SELECT record_json FROM records ORDER BY commit_seq")?;
-            let mut rows = statement.query([])?;
-            let mut index = 0_usize;
-            while let Some(row) = rows.next()? {
-                let json = row.get::<_, String>(0)?;
+    ) -> Result<ReportVisit, StoreError> {
+        let mut expected_generation = None;
+        let mut expected_records = None;
+        let mut last_commit_seq = 0_i64;
+        let mut visited = 0_usize;
+
+        loop {
+            let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)?;
+            let generation = metadata_generation(&tx, REPORT_GENERATION_KEY)?;
+            if expected_generation.is_some_and(|expected| expected != generation) {
+                return Err(StoreError::ReportSnapshotChanged);
+            }
+            let generation = *expected_generation.get_or_insert(generation);
+            let records = if let Some(records) = expected_records {
+                records
+            } else {
+                let count = tx.query_row("SELECT COUNT(*) FROM records", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                let count = usize::try_from(count).map_err(|_| StoreError::SchemaMismatch)?;
+                expected_records = Some(count);
+                count
+            };
+            let batch = {
+                let mut statement = tx.prepare(
+                    "SELECT commit_seq, record_json FROM records WHERE commit_seq > ?1 ORDER BY commit_seq LIMIT ?2",
+                )?;
+                let rows = statement
+                    .query_map(params![last_commit_seq, REPORT_VISIT_BATCH_SIZE], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            tx.commit()?;
+
+            if batch.is_empty() {
+                if visited == records {
+                    return Ok(ReportVisit {
+                        generation,
+                        records,
+                    });
+                }
+                return Err(StoreError::SchemaMismatch);
+            }
+            for (commit_seq, json) in batch {
+                if commit_seq <= last_commit_seq || visited >= records {
+                    return Err(StoreError::SchemaMismatch);
+                }
                 let record = serde_json::from_str(&json).map_err(StoreError::Json)?;
-                visit(index, record);
-                index = index.saturating_add(1);
+                visit(visited, record);
+                visited = visited.checked_add(1).ok_or(StoreError::SchemaMismatch)?;
+                last_commit_seq = commit_seq;
+            }
+            if visited == records {
+                return Ok(ReportVisit {
+                    generation,
+                    records,
+                });
             }
         }
-        tx.commit()?;
-        Ok(generation)
     }
 
     /// Returns the durable report generation state.
@@ -4809,10 +4863,11 @@ mod tests {
         let snapshot = writer.report_snapshot().unwrap();
         assert_eq!(snapshot.generation, 1);
         let mut visited = Vec::new();
-        let visited_generation = writer
+        let visit = writer
             .visit_report_snapshot(|index, record| visited.push((index, record)))
             .unwrap();
-        assert_eq!(visited_generation, snapshot.generation);
+        assert_eq!(visit.generation, snapshot.generation);
+        assert_eq!(visit.records, snapshot.records.len());
         assert_eq!(visited.len(), snapshot.records.len());
         assert_eq!(visited[0].0, 0);
         assert_eq!(visited[0].1, snapshot.records[0]);
@@ -4854,6 +4909,88 @@ mod tests {
         assert_eq!(status.acknowledged_generation, 2);
         assert!(status.pending());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_visitor_releases_read_lock_before_slow_projection() {
+        let dir = temp_dir("report-visitor-concurrent-write");
+        let _ = fs::remove_dir_all(&dir);
+        let mut seed = LocalStore::open(&dir).unwrap();
+        seed.ingest(&observation("1", "session", None)).unwrap();
+        drop(seed);
+        let reader = LocalStore::open_current(&dir).unwrap();
+        let mut visited = Vec::new();
+        let writer_dir = dir.clone();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            let mut writer = LocalStore::open(&writer_dir).unwrap();
+            let result = writer.ingest(&observation_after("2", Some("1"), "turn", Some("session")));
+            done_tx.send(result).unwrap();
+        });
+
+        let visit = reader
+            .visit_report_snapshot(|index, record| {
+                visited.push((index, record));
+                if index == 0 {
+                    start_tx.send(()).unwrap();
+                    done_rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .expect("writer must commit while the visitor is active")
+                        .unwrap();
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            })
+            .unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(visit.generation, 1);
+        assert_eq!(visit.records, 1);
+        assert_eq!(visited.len(), 1);
+        assert_eq!(reader.report_status().unwrap().generation, 2);
+        assert!(reader.report_status().unwrap().pending());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn report_visitor_rejects_a_generation_change_between_batches() {
+        let dir = temp_dir("report-visitor-generation-fence");
+        let _ = fs::remove_dir_all(&dir);
+        let mut writer = LocalStore::open(&dir).unwrap();
+        writer.ingest(&observation("1", "session", None)).unwrap();
+        for ordinal in 2..=129 {
+            let cursor = ordinal.to_string();
+            let previous = (ordinal - 1).to_string();
+            writer
+                .ingest(&observation_after(
+                    &cursor,
+                    Some(&previous),
+                    &format!("turn-{ordinal}"),
+                    Some("session"),
+                ))
+                .unwrap();
+        }
+        let reader = LocalStore::open_current(&dir).unwrap();
+
+        let error = reader
+            .visit_report_snapshot(|index, _record| {
+                if index == 0 {
+                    writer
+                        .ingest(&observation_after(
+                            "130",
+                            Some("129"),
+                            "turn-130",
+                            Some("session"),
+                        ))
+                        .unwrap();
+                }
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, StoreError::ReportSnapshotChanged));
+        assert_eq!(reader.report_status().unwrap().generation, 130);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

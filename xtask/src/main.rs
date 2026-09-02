@@ -2897,7 +2897,6 @@ fn execute_automatic_run(
         }
     }
     let active_elapsed = active_started.elapsed();
-    let active_peaks = active_sampler.stop()?;
     let active_cpu_after = process_cpu_seconds(collector.id())?;
     let active_cpu_percent =
         interval_cpu_percent(active_cpu_before, active_cpu_after, active_elapsed);
@@ -2917,6 +2916,7 @@ fn execute_automatic_run(
     wait_for_automatic_report_convergence(&root, &mut collector)?;
     assert_automatic_notify_sentinels_absent(&root)?;
     assert_automatic_network_local(collector.id())?;
+    let active_peaks = active_sampler.stop()?;
     network_monitor.final_sample()?;
     let peak_disk_bytes = active_peaks.disk_bytes.max(
         StorageBudget::allocated_tree_bytes(&root)
