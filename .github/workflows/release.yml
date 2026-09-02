@@ -164,7 +164,7 @@ jobs:
           grep -Fxq "real_codex_e2e_status: passed" "$manifest"
           grep -Fxq "source_revision: $SOURCE_REVISION" "$manifest"
           grep -Fxq "profile: release" "$manifest"
-          grep -Fxq "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-and-synthetic-benchmark" "$manifest"
+          grep -Fxq "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-report-rss-10ms" "$manifest"
           grep -Fxq "  codex_version: 0.151.0" "$manifest"
           grep -Fxq "  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp" "$manifest"
           grep -Fxq "  real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response" "$manifest"

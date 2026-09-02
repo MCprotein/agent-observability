@@ -3275,6 +3275,40 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_request_labels_a_stalled_tls_handshake() {
+        let root = test_root("authenticated-request-tls-stage");
+        let _ = fs::remove_dir_all(&root);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        configure_port(&root, listener.local_addr().unwrap().port());
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(250));
+        });
+
+        let Err(error) = authenticated_request(
+            &root,
+            "GET",
+            "/health",
+            None,
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+        ) else {
+            panic!("stalled TLS handshake unexpectedly completed");
+        };
+
+        assert!(matches!(
+            error,
+            super::CollectorError::RequestIo {
+                stage: "tls-handshake",
+                source,
+            } if source.kind() == std::io::ErrorKind::TimedOut
+                || source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn stalled_tls_handshake_does_not_delay_an_authenticated_client() {
         let root = test_root("concurrent-tls-handshakes");
         let _ = fs::remove_dir_all(&root);
@@ -5139,6 +5173,31 @@ mod tests {
                 .contains(r#""generatedSpans":1"#)
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_refresh_preserves_exact_counts_at_visitor_batch_boundaries() {
+        for count in [128_usize, 129, 257] {
+            let root = test_root(&format!("report-visitor-boundary-{count}"));
+            let _ = fs::remove_dir_all(&root);
+            let mut collector = collector_state(&root);
+            for index in 0..count {
+                ingest_notify_locked(
+                    &mut collector,
+                    &projected_notify(&format!("thread-{index}"), &format!("turn-{index}")),
+                )
+                .unwrap();
+            }
+
+            assert!(refresh_report_from_root(&root).unwrap());
+            assert!(!collector.store.report_status().unwrap().pending());
+            let html = fs::read_to_string(collector.layout.logs.join(REPORT_FILE_NAME)).unwrap();
+            assert!(
+                html.contains(&format!(r#""generatedSpans":{count}"#)),
+                "report did not preserve the {count}-record boundary"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

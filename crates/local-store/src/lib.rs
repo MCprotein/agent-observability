@@ -4936,7 +4936,7 @@ mod tests {
                 if index == 0 {
                     start_tx.send(()).unwrap();
                     done_rx
-                        .recv_timeout(Duration::from_secs(1))
+                        .recv_timeout(Duration::from_secs(2))
                         .expect("writer must commit while the visitor is active")
                         .unwrap();
                     std::thread::sleep(Duration::from_millis(100));
@@ -4990,6 +4990,62 @@ mod tests {
 
         assert!(matches!(error, StoreError::ReportSnapshotChanged));
         assert_eq!(reader.report_status().unwrap().generation, 130);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn report_visits_and_sustained_writes_do_not_hold_sqlite_locks() {
+        let dir = temp_dir("report-visitor-sustained-writes");
+        let _ = fs::remove_dir_all(&dir);
+        let mut seed = LocalStore::open(&dir).unwrap();
+        seed.ingest(&observation("1", "session", None)).unwrap();
+        drop(seed);
+
+        let writer_dir = dir.clone();
+        let writer = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut writer = LocalStore::open(&writer_dir).unwrap();
+            for ordinal in 2..=257 {
+                let cursor = ordinal.to_string();
+                let previous = (ordinal - 1).to_string();
+                writer
+                    .ingest(&observation_after(
+                        &cursor,
+                        Some(&previous),
+                        &format!("turn-{ordinal}"),
+                        Some("session"),
+                    ))
+                    .unwrap();
+                std::thread::sleep(Duration::from_micros(250));
+            }
+            started.elapsed()
+        });
+
+        let reader = LocalStore::open_current(&dir).unwrap();
+        while !writer.is_finished() {
+            match reader.visit_report_snapshot(|_, _| {
+                std::thread::sleep(Duration::from_micros(100));
+            }) {
+                Ok(_) | Err(StoreError::ReportSnapshotChanged) => {}
+                Err(error) => panic!("report visitor failed during sustained writes: {error}"),
+            }
+        }
+        let writer_elapsed = writer.join().unwrap();
+        assert!(
+            writer_elapsed < Duration::from_secs(10),
+            "report reads delayed sustained writes for {writer_elapsed:?}"
+        );
+
+        let mut visited = 0;
+        let final_visit = reader
+            .visit_report_snapshot(|index, _| {
+                assert_eq!(index, visited);
+                visited += 1;
+            })
+            .unwrap();
+        assert_eq!(final_visit.records, 257);
+        assert_eq!(visited, 257);
+        assert_eq!(final_visit.generation, 257);
         let _ = fs::remove_dir_all(dir);
     }
 

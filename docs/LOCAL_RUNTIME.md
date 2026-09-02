@@ -37,8 +37,10 @@ agentobs cursor-ingest ~/.agent-observability /path/to/private-handoff.jsonl
 agentobs report ~/.agent-observability /path/to/private-rate-table.json
 ~~~
 
-`setup` without an explicit root composes private install, store initialization, Codex automatic connection,
-report generation, and macOS browser open for `~/.agent-observability`. `setup --no-open` performs the same
+`setup` without an explicit root composes private install, store initialization, report generation and macOS
+browser open, then Codex automatic connection for `~/.agent-observability`. Dashboard preparation failure stops
+before integration mutation; connection failure can leave the already-open private dashboard in place.
+`setup --no-open` performs the same
 work without opening a browser. `setup <root> [--no-open]` initializes an explicit root in manual-import mode;
 run `connect codex <root>` separately to enable automatic Codex collection there.
 `demo` uses an isolated default root and embedded content-free fixture; it never reads an agent log.

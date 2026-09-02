@@ -53,10 +53,10 @@ runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui�
 
 제품은 하나의 core를 두 개의 독립된 composition root로 조립한다.
 
-| Profile | Required runtime | Storage | UI |
-| --- | --- | --- | --- |
-| `standalone` | Rust CLI; optional macOS local collector for Codex automatic mode | private embedded transactional state + JSONL/snapshot projections | self-contained report + ephemeral loopback settings UI |
-| `team` | local Rust CLI/forwarder + optional collector | same local state/outbox + tenant/workspace-scoped central store | 같은 TypeScript UI를 hosted report 또는 self-contained export로 제공 |
+| Profile | Status | Required runtime | Storage | UI |
+| --- | --- | --- | --- | --- |
+| `standalone` | Implemented product profile | Rust CLI; optional macOS local collector for Codex automatic mode | private embedded transactional state + JSONL/snapshot projections | self-contained report + ephemeral loopback settings UI |
+| `team` | Future TODO target; not implemented | local Rust CLI/forwarder + optional collector | planned local state/outbox + tenant/workspace-scoped central store | planned hosted report or self-contained export using the shared TypeScript UI contract |
 
 `standalone`은 기본이자 완전한 제품 경로다. Manual handoff import, 비용 추정과 report 생성은 login,
 network, daemon, collector 또는 central database 없이 모두 동작한다. Codex automatic mode를 선택한
@@ -64,7 +64,8 @@ network, daemon, collector 또는 central database 없이 모두 동작한다. C
 외부 request를 만들지 않는다. Team profile의 장애나 설정 부재가 local write와 local report를
 막아서는 안 된다.
 
-`team`은 같은 domain 의미를 재사용하되 local durable contract와 전송 계약은 분리한다.
+아래 `team` 항목은 구현 현황이 아니라 Future TODO의 필수 설계 계약이다. Team 구현은 같은 domain
+의미를 재사용하되 local durable contract와 전송 계약을 분리해야 한다.
 
 - 전용 team projector가 domain/application state에서 허용된 관측 필드만 골라
   `TeamIngestEnvelopeV1`을 만든다. `DurableRecordVx`를 입력이나 envelope payload로 사용하지

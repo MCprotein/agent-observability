@@ -1,6 +1,6 @@
 schema_version: automatic_local_performance.v1
 version: v1.8.0
-protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-and-synthetic-benchmark
+protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-report-rss-10ms
 purpose: normative automatic release evidence for real Codex compatibility, local lifecycle, privacy, and synthetic collector performance
 profiles:
   release:
@@ -47,6 +47,9 @@ metrics:
     normalization: percent of one logical core
   collector_rss:
     peak_mib_max: 96
+    active_sample_interval: profile sample_interval_seconds
+    report_sample_interval_ms: 10
+    report_phase_final_sample: true
   disk:
     allocated_tree_bytes_max: 1073741824
   network:

@@ -54,6 +54,7 @@ flowchart TB
 
     Codex -->|"private-CA HTTPS + exact private header"| Receiver
     Codex -->|"raw notify callback"| Notify["codex-notify allowlist projector"]
+    Codex -->|"private canonical handoff manual import"| Files
     Notify -->|"projected notify over authenticated HTTPS"| Receiver
     Receiver --> Allowlist --> Adapters
     Claude --> Files
@@ -220,7 +221,7 @@ sequenceDiagram
     participant CLI as report command
     participant Store as SQLite authority
     participant App as Rust projector
-    participant Binary as static-report binary
+    participant Assembler as static-report library
     participant HTML as private report.html
     actor Browser
 
@@ -229,9 +230,9 @@ sequenceDiagram
     Store-->>App: privacy-safe durable records
     App->>App: sanitize + map + price + aggregate
     App-->>CLI: validated ReportDtoV1
-    Note over CLI,Binary: built TypeScript asset embedded at compile time
-    CLI->>Binary: validated DTO
-    Binary->>HTML: atomic 0600 assembly
+    Note over CLI,Assembler: built TypeScript asset embedded at compile time
+    CLI->>Assembler: validated DTO
+    Assembler->>HTML: atomic 0600 assembly
     Browser->>HTML: open with file://
     Note over Browser,HTML: no server and no external request
 ```

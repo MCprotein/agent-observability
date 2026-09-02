@@ -34,7 +34,7 @@ const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-pe
 const AUTOMATIC_PROTOCOL: &str =
     include_str!("../../crates/contracts/performance/automatic-local-performance-v1.yaml");
 const AUTOMATIC_PROTOCOL_REVISION: &str =
-    "v1.8.0-codex-0.151-private-ca-header-real-e2e-and-synthetic-benchmark";
+    "v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-report-rss-10ms";
 const AUTOMATIC_CODEX_VERSION: &str = "codex-cli 0.151.0";
 const AUTOMATIC_NOTIFY_SENTINELS: [&[u8]; 3] = [
     b"AUTOMATIC_RAW_CWD_SENTINEL",
@@ -123,6 +123,7 @@ const AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX: u64 = 50;
 const AUTOMATIC_IDLE_CPU_PERCENT_MAX: f64 = 0.5;
 const AUTOMATIC_ACTIVE_CPU_PERCENT_MAX: f64 = 100.0;
 const AUTOMATIC_PEAK_RSS_MIB_MAX: f64 = 96.0;
+const AUTOMATIC_REPORT_RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 const AUTOMATIC_ALLOCATED_DISK_BYTES_MAX: u64 = 1_073_741_824;
 const AUTOMATIC_CONNECT_OUTPUT_MAX_BYTES: u64 = 4_096;
 const AUTOMATIC_LIFECYCLE_SEED_MODE: u32 = 0o600;
@@ -297,6 +298,9 @@ struct AutomaticCpuMetrics {
 #[serde(deny_unknown_fields)]
 struct AutomaticRssMetrics {
     peak_mib_max: f64,
+    active_sample_interval: String,
+    report_sample_interval_ms: u64,
+    report_phase_final_sample: bool,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -363,6 +367,7 @@ struct AutomaticRunResult {
     idle_cpu_percent: f64,
     active_cpu_percent: f64,
     peak_rss_kib: f64,
+    report_rss_samples: u64,
     peak_disk_bytes: u64,
     collector_network_bytes: u64,
     network_monitor_samples: u64,
@@ -370,6 +375,14 @@ struct AutomaticRunResult {
     rejected_primary_requests: usize,
     notify_supplement_accepted: bool,
     report_converged: bool,
+    report_generation: u64,
+    report_records: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReportConvergence {
+    generation: u64,
+    records: u64,
 }
 impl Config {
     fn for_profile(profile: Profile) -> Self {
@@ -1246,6 +1259,12 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
             },
             collector_rss: AutomaticRssMetrics {
                 peak_mib_max: AUTOMATIC_PEAK_RSS_MIB_MAX,
+                active_sample_interval: "profile sample_interval_seconds".into(),
+                report_sample_interval_ms: u64::try_from(
+                    AUTOMATIC_REPORT_RSS_SAMPLE_INTERVAL.as_millis(),
+                )
+                .expect("report RSS interval fits u64"),
+                report_phase_final_sample: true,
             },
             disk: AutomaticDiskMetrics {
                 allocated_tree_bytes_max: AUTOMATIC_ALLOCATED_DISK_BYTES_MAX,
@@ -2900,6 +2919,8 @@ fn execute_automatic_run(
     let active_cpu_after = process_cpu_seconds(collector.id())?;
     let active_cpu_percent =
         interval_cpu_percent(active_cpu_before, active_cpu_after, active_elapsed);
+    let mut report_rss_sampler =
+        start_rss_sampler(collector.id(), AUTOMATIC_REPORT_RSS_SAMPLE_INTERVAL)?;
     let notify_payload = automatic_notify_payload(run, config.events);
     let notify = run_bounded_product_command(
         binary,
@@ -2913,16 +2934,20 @@ fn execute_automatic_run(
             notify.trim()
         ));
     }
-    wait_for_automatic_report_convergence(&root, &mut collector)?;
+    let convergence = wait_for_automatic_report_convergence(&root, &mut collector)?;
     assert_automatic_notify_sentinels_absent(&root)?;
     assert_automatic_network_local(collector.id())?;
     let active_peaks = active_sampler.stop()?;
+    let report_rss = report_rss_sampler.stop()?;
     network_monitor.final_sample()?;
     let peak_disk_bytes = active_peaks.disk_bytes.max(
         StorageBudget::allocated_tree_bytes(&root)
             .map_err(|error| format!("measure automatic allocated disk: {error}"))?,
     );
-    let peak_rss_kib = active_peaks.rss_kib.max(ps_metric(collector.id(), "rss")?);
+    let peak_rss_kib = active_peaks
+        .rss_kib
+        .max(report_rss.peak_rss_kib)
+        .max(ps_metric(collector.id(), "rss")?);
     let network_evidence = network_monitor.finish()?;
     collector.terminate()?;
     Ok(AutomaticRunResult {
@@ -2932,6 +2957,7 @@ fn execute_automatic_run(
         idle_cpu_percent,
         active_cpu_percent,
         peak_rss_kib,
+        report_rss_samples: report_rss.samples,
         peak_disk_bytes,
         collector_network_bytes: network_evidence.max_bytes,
         network_monitor_samples: network_evidence.samples,
@@ -2939,6 +2965,8 @@ fn execute_automatic_run(
         rejected_primary_requests: 0,
         notify_supplement_accepted,
         report_converged: true,
+        report_generation: convergence.generation,
+        report_records: convergence.records,
     })
 }
 
@@ -3150,7 +3178,7 @@ fn wait_for_automatic_ready(root: &Path, collector: &mut ChildGuard) -> Result<(
 fn wait_for_automatic_report_convergence(
     root: &Path,
     collector: &mut ChildGuard,
-) -> Result<(), String> {
+) -> Result<ReportConvergence, String> {
     let started = Instant::now();
     loop {
         if collector
@@ -3162,15 +3190,21 @@ fn wait_for_automatic_report_convergence(
         }
         if check_health(root) == HealthOutcome::Ready
             && let Ok(store) = LocalStore::open_current(root.join("state/store"))
-            && let Ok(status) = store.report_status()
-            && !status.pending()
+            && let Ok(status_before) = store.report_status()
+            && !status_before.pending()
             && let Ok(record_count) = store.record_count()
             && record_count > 0
             && let Ok(report) =
                 fs::read_to_string(root.join("logs/agent-observability-report.html"))
             && report.contains(&format!(r#""generatedSpans":{record_count}"#))
+            && let Ok(status_after) = store.report_status()
+            && status_after == status_before
+            && !status_after.pending()
         {
-            return Ok(());
+            return Ok(ReportConvergence {
+                generation: status_after.generation,
+                records: record_count,
+            });
         }
         if started.elapsed() >= AUTOMATIC_START_TIMEOUT {
             return Err("automatic durable report convergence timed out".into());
@@ -3629,6 +3663,84 @@ struct PressureSampler {
     handle: Option<thread::JoinHandle<()>>,
     process_exit_confirmed: Arc<AtomicBool>,
     drain_sample_count: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RssPeaks {
+    peak_rss_kib: f64,
+    samples: u64,
+}
+
+struct RssSampler {
+    stop: Option<mpsc::Sender<()>>,
+    result: mpsc::Receiver<Result<RssPeaks, String>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for RssSampler {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl RssSampler {
+    fn stop(&mut self) -> Result<RssPeaks, String> {
+        self.stop
+            .take()
+            .ok_or_else(|| "RSS sampler stop sender is missing".to_string())?
+            .send(())
+            .map_err(|_| "signal RSS sampler stop".to_string())?;
+        let result = self
+            .result
+            .recv_timeout(SAMPLER_STOP_TIMEOUT)
+            .map_err(|error| format!("receive RSS sampler result: {error}"))?;
+        self.handle
+            .take()
+            .ok_or_else(|| "RSS sampler handle is missing".to_string())?
+            .join()
+            .map_err(|_| "RSS sampler panicked".to_string())?;
+        result
+    }
+}
+
+fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String> {
+    if interval.is_zero() {
+        return Err("RSS sampler interval must be positive".into());
+    }
+    let initial = ps_metric(pid, "rss")?;
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let result = (|| {
+            let mut peaks = RssPeaks {
+                peak_rss_kib: initial,
+                samples: 1,
+            };
+            loop {
+                let stopped = match stop_rx.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+                    Err(mpsc::RecvTimeoutError::Timeout) => false,
+                };
+                peaks.peak_rss_kib = peaks.peak_rss_kib.max(ps_metric(pid, "rss")?);
+                peaks.samples = peaks.samples.saturating_add(1);
+                if stopped {
+                    break;
+                }
+            }
+            Ok(peaks)
+        })();
+        let _ = result_tx.send(result);
+    });
+    Ok(RssSampler {
+        stop: Some(stop_tx),
+        result: result_rx,
+        handle: Some(handle),
+    })
 }
 
 impl Drop for PressureSampler {
@@ -4829,6 +4941,12 @@ fn validate_automatic_results(
         if !result.report_converged {
             return Err("automatic durable report convergence evidence is missing".into());
         }
+        if result.report_rss_samples < 2
+            || result.report_generation == 0
+            || result.report_records == 0
+        {
+            return Err("automatic final report RSS or generation evidence is missing".into());
+        }
         if !result.idle_cpu_percent.is_finite()
             || result.idle_cpu_percent.is_sign_negative()
             || !result.active_cpu_percent.is_finite()
@@ -4962,12 +5080,15 @@ fn render_automatic_manifest(
         run_latencies.sort_unstable();
         let _ = writeln!(
             manifest,
-            "  - run: {}\n    accepted_synthetic_otlp_requests: {}\n    rejected_synthetic_otlp_requests: {}\n    notify_supplement_accepted: {}\n    durable_report_converged: {}\n    raw_notify_sentinels_absent: true\n    synthetic_collector_otlp_p95_us: {}\n    synthetic_collector_otlp_p99_us: {}\n    idle_cpu_percent: {}\n    active_cpu_percent: {}\n    peak_rss_kib: {}\n    allocated_disk_bytes: {}\n    collector_network_bytes: {}\n    network_monitor_samples: {}\n    all_observed_endpoints_loopback: true",
+            "  - run: {}\n    accepted_synthetic_otlp_requests: {}\n    rejected_synthetic_otlp_requests: {}\n    notify_supplement_accepted: {}\n    durable_report_converged: {}\n    report_generation: {}\n    report_records: {}\n    report_rss_samples: {}\n    raw_notify_sentinels_absent: true\n    synthetic_collector_otlp_p95_us: {}\n    synthetic_collector_otlp_p99_us: {}\n    idle_cpu_percent: {}\n    active_cpu_percent: {}\n    peak_rss_kib: {}\n    allocated_disk_bytes: {}\n    collector_network_bytes: {}\n    network_monitor_samples: {}\n    all_observed_endpoints_loopback: true",
             result.run,
             result.accepted_primary_requests,
             result.rejected_primary_requests,
             result.notify_supplement_accepted,
             result.report_converged,
+            result.report_generation,
+            result.report_records,
+            result.report_rss_samples,
             percentile(&run_latencies, 95),
             percentile(&run_latencies, 99),
             result.idle_cpu_percent,
@@ -4993,7 +5114,7 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
     for field in [
         "schema_version: automatic_local_performance.v1",
         "evidence_kind: automatic_release_evidence",
-        "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-and-synthetic-benchmark",
+        "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-report-rss-10ms",
         "release_readiness: verified",
         "real_codex_e2e_status: passed",
         "source_revision:",
@@ -5011,6 +5132,7 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
         "collector_idle_cpu_percent_max:",
         "collector_active_cpu_percent_max:",
         "collector_peak_rss_kib:",
+        "report_rss_samples:",
         "allocated_disk_bytes_max:",
         "collector_network_bytes_max:",
         "network_monitor_samples:",
@@ -5702,18 +5824,58 @@ mod tests {
             idle_cpu_percent: 0.1,
             active_cpu_percent: 0.1,
             peak_rss_kib: 1.0,
+            report_rss_samples: 2,
             peak_disk_bytes: 1,
             collector_network_bytes: 321,
             network_monitor_samples: 2,
             rejected_primary_requests: 0,
             notify_supplement_accepted: true,
             report_converged: true,
+            report_generation: 1,
+            report_records: 1,
         }
     }
     fn validate_single_automatic(result: AutomaticRunResult) -> Result<(), String> {
         let mut config = automatic_config();
         config.runs = 1;
         validate_automatic_results(config, &[result], &[])
+    }
+
+    #[test]
+    fn rss_sampler_takes_an_initial_and_final_sample() {
+        let mut sampler = start_rss_sampler(std::process::id(), Duration::from_millis(10)).unwrap();
+        let peaks = sampler.stop().unwrap();
+
+        assert!(peaks.peak_rss_kib > 0.0);
+        assert!(peaks.samples >= 2);
+    }
+
+    #[test]
+    fn automatic_validation_requires_report_rss_and_generation_evidence() {
+        let latencies = vec![1; automatic_config().events];
+        let mut result = automatic_result(1, latencies.clone());
+        result.report_rss_samples = 1;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("report RSS or generation evidence")
+        );
+
+        let mut result = automatic_result(1, latencies.clone());
+        result.report_generation = 0;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("report RSS or generation evidence")
+        );
+
+        let mut result = automatic_result(1, latencies);
+        result.report_records = 0;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("report RSS or generation evidence")
+        );
     }
     fn enabled(idle_cpu: f64, active_cpu: f64, rss: f64, disk: u64, net: u64) -> Vec<Sample> {
         vec![

@@ -339,6 +339,20 @@ mod tests {
         assert!(!html.contains("https://"));
     }
 
+    #[test]
+    fn render_treats_template_token_text_in_values_as_literal_data() {
+        let title = format!("{TITLE_TOKEN} {GENERATED_AT_TOKEN} {DATA_TOKEN}");
+        let html = render(&report(&title)).unwrap();
+
+        for token in [TITLE_TOKEN, GENERATED_AT_TOKEN, DATA_TOKEN] {
+            assert_eq!(
+                html.matches(token).count(),
+                3,
+                "report data containing {token} was interpreted as template syntax"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_is_private_and_rejects_broad_parent() {

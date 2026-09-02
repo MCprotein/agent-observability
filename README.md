@@ -28,6 +28,8 @@ profile에 PATH 블록을 한 번만 등록한다.
 
 `v1.8.0` tag가 게시되기 전 이 release branch를 검증할 때는 checkout 안에서 현재 Mac architecture용
 Rust `1.97.0` native release binary를 직접 실행한다. 이 경로는 기존 설치 파일을 덮어쓰지 않는다.
+이 경우 아래 빠른 시작의 `agentobs` 명령도 모두 `target/release/agent-observability`로 실행해야 하며,
+전역 PATH에 남아 있는 이전 버전을 섞어 사용하지 않는다.
 
 ```bash
 cargo +1.97.0 build --release --locked -p agent-observability-cli
@@ -35,7 +37,7 @@ target/release/agent-observability --version
 target/release/agent-observability setup ~/.agent-observability --no-open
 ```
 
-게시된 `v1.8.0` release에서는 검증된 installer를 사용한다.
+`v1.8.0`이 게시된 뒤에는 검증된 installer를 사용한다.
 
 ```bash
 (
@@ -85,7 +87,8 @@ agentobs setup
 ```
 
 이 한 명령은 기본 위치 `~/.agent-observability`에 private runtime과 embedded SQLite transactional store를 만들고,
-Codex 설정을 연결하고, local collector LaunchAgent를 시작한 뒤 대시보드를 연다. 브라우저를 열지
+초기 대시보드를 생성해 연 다음 Codex 설정과 local collector LaunchAgent를 연결한다. 대시보드 생성이나
+열기에 실패하면 연결을 시작하지 않으며, 반대로 연결이 실패하면 이미 연 로컬 대시보드는 남을 수 있다. 브라우저를 열지
 않는 환경에서는 `agentobs setup --no-open`을 사용한다. 처음에는 수집된 데이터가 없으므로 빈
 화면이 정상이다.
 
