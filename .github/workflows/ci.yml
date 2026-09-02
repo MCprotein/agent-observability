@@ -129,7 +129,7 @@ jobs:
           grep -Fxq "real_codex_e2e_status: passed" "$manifest"
           grep -Fxq "source_revision: $GITHUB_SHA" "$manifest"
           grep -Fxq "profile: release" "$manifest"
-          grep -Fxq "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-report-rss-10ms" "$manifest"
+          grep -Fxq "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-rss-active-report-v2" "$manifest"
           grep -Fxq "  codex_version: 0.151.0" "$manifest"
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
       - name: Upload exact-revision automatic release evidence

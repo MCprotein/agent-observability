@@ -335,7 +335,9 @@ For `perf local`, enabled runs permit at most 1% explicit fail-open rejection an
 event with one durable observation after graceful fixture shutdown; foreground enqueue does not itself imply
 durability. For `perf automatic`, every foreground notify must be accepted and each run independently enforces
 the response-latency, collector CPU/RSS, allocated-disk and loopback-only network rules in the automatic
-protocol. Its isolated lifecycle preflight runs actual Codex `0.151.0` `codex exec` against a content-free loopback
+protocol. Durable completeness requires exactly two synthetic records per accepted OTLP request plus one notify
+record in both the authoritative generation and report count. Its isolated lifecycle preflight runs actual Codex
+`0.151.0` `codex exec` against a content-free loopback
 Responses fixture before the synthetic load. The gate requires exporter construction, one accepted native OTLP
 batch, a private session record, exact 10 input and 2 output token records, and absence of the raw prompt sentinel
 from the durable tree. It then sends synthetic Codex-shaped OTLP through the installed LaunchAgent collector;

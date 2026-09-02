@@ -1220,6 +1220,9 @@ impl LocalStore {
                 last_commit_seq = commit_seq;
             }
             if visited == records {
+                if metadata_generation(&self.db, REPORT_GENERATION_KEY)? != generation {
+                    return Err(StoreError::ReportSnapshotChanged);
+                }
                 return Ok(ReportVisit {
                     generation,
                     records,
@@ -4930,7 +4933,7 @@ mod tests {
             done_tx.send(result).unwrap();
         });
 
-        let visit = reader
+        let error = reader
             .visit_report_snapshot(|index, record| {
                 visited.push((index, record));
                 if index == 0 {
@@ -4942,11 +4945,10 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(100));
                 }
             })
-            .unwrap();
+            .unwrap_err();
         writer.join().unwrap();
 
-        assert_eq!(visit.generation, 1);
-        assert_eq!(visit.records, 1);
+        assert!(matches!(error, StoreError::ReportSnapshotChanged));
         assert_eq!(visited.len(), 1);
         assert_eq!(reader.report_status().unwrap().generation, 2);
         assert!(reader.report_status().unwrap().pending());
@@ -4955,42 +4957,47 @@ mod tests {
 
     #[test]
     fn report_visitor_rejects_a_generation_change_between_batches() {
-        let dir = temp_dir("report-visitor-generation-fence");
-        let _ = fs::remove_dir_all(&dir);
-        let mut writer = LocalStore::open(&dir).unwrap();
-        writer.ingest(&observation("1", "session", None)).unwrap();
-        for ordinal in 2..=129 {
-            let cursor = ordinal.to_string();
-            let previous = (ordinal - 1).to_string();
-            writer
-                .ingest(&observation_after(
-                    &cursor,
-                    Some(&previous),
-                    &format!("turn-{ordinal}"),
-                    Some("session"),
-                ))
-                .unwrap();
+        for initial_records in [128_u64, 129, 256, 257] {
+            let dir = temp_dir(&format!(
+                "report-visitor-generation-fence-{initial_records}"
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let mut writer = LocalStore::open(&dir).unwrap();
+            writer.ingest(&observation("1", "session", None)).unwrap();
+            for ordinal in 2..=initial_records {
+                let cursor = ordinal.to_string();
+                let previous = (ordinal - 1).to_string();
+                writer
+                    .ingest(&observation_after(
+                        &cursor,
+                        Some(&previous),
+                        &format!("turn-{ordinal}"),
+                        Some("session"),
+                    ))
+                    .unwrap();
+            }
+            let reader = LocalStore::open_current(&dir).unwrap();
+            let next = initial_records + 1;
+
+            let error = reader
+                .visit_report_snapshot(|index, _record| {
+                    if index == 0 {
+                        writer
+                            .ingest(&observation_after(
+                                &next.to_string(),
+                                Some(&initial_records.to_string()),
+                                &format!("turn-{next}"),
+                                Some("session"),
+                            ))
+                            .unwrap();
+                    }
+                })
+                .unwrap_err();
+
+            assert!(matches!(error, StoreError::ReportSnapshotChanged));
+            assert_eq!(reader.report_status().unwrap().generation, next);
+            let _ = fs::remove_dir_all(dir);
         }
-        let reader = LocalStore::open_current(&dir).unwrap();
-
-        let error = reader
-            .visit_report_snapshot(|index, _record| {
-                if index == 0 {
-                    writer
-                        .ingest(&observation_after(
-                            "130",
-                            Some("129"),
-                            "turn-130",
-                            Some("session"),
-                        ))
-                        .unwrap();
-                }
-            })
-            .unwrap_err();
-
-        assert!(matches!(error, StoreError::ReportSnapshotChanged));
-        assert_eq!(reader.report_status().unwrap().generation, 130);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -5002,12 +5009,17 @@ mod tests {
         drop(seed);
 
         let writer_dir = dir.clone();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_start = std::sync::Arc::clone(&start);
         let writer = std::thread::spawn(move || {
+            writer_start.wait();
             let started = std::time::Instant::now();
             let mut writer = LocalStore::open(&writer_dir).unwrap();
+            let mut max_write = Duration::ZERO;
             for ordinal in 2..=257 {
                 let cursor = ordinal.to_string();
                 let previous = (ordinal - 1).to_string();
+                let write_started = std::time::Instant::now();
                 writer
                     .ingest(&observation_after(
                         &cursor,
@@ -5016,13 +5028,17 @@ mod tests {
                         Some("session"),
                     ))
                     .unwrap();
+                max_write = max_write.max(write_started.elapsed());
                 std::thread::sleep(Duration::from_micros(250));
             }
-            started.elapsed()
+            (started.elapsed(), max_write)
         });
 
         let reader = LocalStore::open_current(&dir).unwrap();
+        start.wait();
+        let mut overlapping_visits = 0_u64;
         while !writer.is_finished() {
+            overlapping_visits += 1;
             match reader.visit_report_snapshot(|_, _| {
                 std::thread::sleep(Duration::from_micros(100));
             }) {
@@ -5030,7 +5046,12 @@ mod tests {
                 Err(error) => panic!("report visitor failed during sustained writes: {error}"),
             }
         }
-        let writer_elapsed = writer.join().unwrap();
+        let (writer_elapsed, max_write) = writer.join().unwrap();
+        assert!(overlapping_visits > 0);
+        assert!(
+            max_write < Duration::from_secs(2),
+            "one writer approached the SQLite busy timeout: {max_write:?}"
+        );
         assert!(
             writer_elapsed < Duration::from_secs(10),
             "report reads delayed sustained writes for {writer_elapsed:?}"

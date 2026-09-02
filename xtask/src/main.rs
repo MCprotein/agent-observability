@@ -34,7 +34,7 @@ const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-pe
 const AUTOMATIC_PROTOCOL: &str =
     include_str!("../../crates/contracts/performance/automatic-local-performance-v1.yaml");
 const AUTOMATIC_PROTOCOL_REVISION: &str =
-    "v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-report-rss-10ms";
+    "v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-rss-active-report-v2";
 const AUTOMATIC_CODEX_VERSION: &str = "codex-cli 0.151.0";
 const AUTOMATIC_NOTIFY_SENTINELS: [&[u8]; 3] = [
     b"AUTOMATIC_RAW_CWD_SENTINEL",
@@ -123,7 +123,11 @@ const AUTOMATIC_PRIMARY_OTLP_P99_MS_MAX: u64 = 50;
 const AUTOMATIC_IDLE_CPU_PERCENT_MAX: f64 = 0.5;
 const AUTOMATIC_ACTIVE_CPU_PERCENT_MAX: f64 = 100.0;
 const AUTOMATIC_PEAK_RSS_MIB_MAX: f64 = 96.0;
-const AUTOMATIC_REPORT_RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
+const AUTOMATIC_RSS_SAMPLE_TARGET: Duration = Duration::from_millis(10);
+const AUTOMATIC_RSS_MAX_OBSERVED_GAP: Duration = Duration::from_millis(100);
+const AUTOMATIC_RSS_MIN_RELEASE_SAMPLES: u64 = 100;
+const AUTOMATIC_RECORDS_PER_SYNTHETIC_REQUEST: u64 = 2;
+const AUTOMATIC_NOTIFY_RECORDS_PER_RUN: u64 = 1;
 const AUTOMATIC_ALLOCATED_DISK_BYTES_MAX: u64 = 1_073_741_824;
 const AUTOMATIC_CONNECT_OUTPUT_MAX_BYTES: u64 = 4_096;
 const AUTOMATIC_LIFECYCLE_SEED_MODE: u32 = 0o600;
@@ -298,9 +302,9 @@ struct AutomaticCpuMetrics {
 #[serde(deny_unknown_fields)]
 struct AutomaticRssMetrics {
     peak_mib_max: f64,
-    active_sample_interval: String,
-    report_sample_interval_ms: u64,
-    report_phase_final_sample: bool,
+    active_and_report_sample_target_ms: u64,
+    observed_max_gap_ms_max: u64,
+    final_sample: bool,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -367,7 +371,8 @@ struct AutomaticRunResult {
     idle_cpu_percent: f64,
     active_cpu_percent: f64,
     peak_rss_kib: f64,
-    report_rss_samples: u64,
+    rss_samples: u64,
+    rss_observed_max_gap_ms: u64,
     peak_disk_bytes: u64,
     collector_network_bytes: u64,
     network_monitor_samples: u64,
@@ -1241,7 +1246,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
             notify_boundary: "separately verified built agent-observability codex-notify supplement through private-CA HTTPS with the exact private random request header".into(),
             collector_boundary: "built agent-observability collector-serve subprocess".into(),
             payload: "bounded synthetic Codex-shaped OTLP log pairs with opaque identifiers; one bounded notify supplement per measured run whose raw sentinels must be absent from the durable tree".into(),
-            readiness: "successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, acknowledged report generation, and HTML generatedSpans parity with authoritative SQLite must converge before collector shutdown".into(),
+            readiness: "successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, exactly two durable synthetic records per accepted OTLP request plus one notify record, acknowledged report generation, and HTML generatedSpans parity with authoritative SQLite must converge before collector shutdown".into(),
             collector_shutdown: "bounded child termination and wait".into(),
         },
         metrics: AutomaticProtocolMetrics {
@@ -1259,12 +1264,15 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
             },
             collector_rss: AutomaticRssMetrics {
                 peak_mib_max: AUTOMATIC_PEAK_RSS_MIB_MAX,
-                active_sample_interval: "profile sample_interval_seconds".into(),
-                report_sample_interval_ms: u64::try_from(
-                    AUTOMATIC_REPORT_RSS_SAMPLE_INTERVAL.as_millis(),
+                active_and_report_sample_target_ms: u64::try_from(
+                    AUTOMATIC_RSS_SAMPLE_TARGET.as_millis(),
                 )
-                .expect("report RSS interval fits u64"),
-                report_phase_final_sample: true,
+                .expect("RSS target interval fits u64"),
+                observed_max_gap_ms_max: u64::try_from(
+                    AUTOMATIC_RSS_MAX_OBSERVED_GAP.as_millis(),
+                )
+                .expect("RSS maximum gap fits u64"),
+                final_sample: true,
             },
             disk: AutomaticDiskMetrics {
                 allocated_tree_bytes_max: AUTOMATIC_ALLOCATED_DISK_BYTES_MAX,
@@ -2890,6 +2898,7 @@ fn execute_automatic_run(
         "idle",
     )?;
     let idle_cpu_percent = average_sample_cpu(&idle_samples)?;
+    let mut rss_sampler = start_rss_sampler(collector.id(), AUTOMATIC_RSS_SAMPLE_TARGET)?;
     let active_cpu_before = process_cpu_seconds(collector.id())?;
     let active_started = Instant::now();
     let mut active_sampler =
@@ -2919,8 +2928,6 @@ fn execute_automatic_run(
     let active_cpu_after = process_cpu_seconds(collector.id())?;
     let active_cpu_percent =
         interval_cpu_percent(active_cpu_before, active_cpu_after, active_elapsed);
-    let mut report_rss_sampler =
-        start_rss_sampler(collector.id(), AUTOMATIC_REPORT_RSS_SAMPLE_INTERVAL)?;
     let notify_payload = automatic_notify_payload(run, config.events);
     let notify = run_bounded_product_command(
         binary,
@@ -2938,7 +2945,7 @@ fn execute_automatic_run(
     assert_automatic_notify_sentinels_absent(&root)?;
     assert_automatic_network_local(collector.id())?;
     let active_peaks = active_sampler.stop()?;
-    let report_rss = report_rss_sampler.stop()?;
+    let rss = rss_sampler.stop()?;
     network_monitor.final_sample()?;
     let peak_disk_bytes = active_peaks.disk_bytes.max(
         StorageBudget::allocated_tree_bytes(&root)
@@ -2946,7 +2953,7 @@ fn execute_automatic_run(
     );
     let peak_rss_kib = active_peaks
         .rss_kib
-        .max(report_rss.peak_rss_kib)
+        .max(rss.peak_rss_kib)
         .max(ps_metric(collector.id(), "rss")?);
     let network_evidence = network_monitor.finish()?;
     collector.terminate()?;
@@ -2957,7 +2964,8 @@ fn execute_automatic_run(
         idle_cpu_percent,
         active_cpu_percent,
         peak_rss_kib,
-        report_rss_samples: report_rss.samples,
+        rss_samples: rss.samples,
+        rss_observed_max_gap_ms: rss.max_gap_ms,
         peak_disk_bytes,
         collector_network_bytes: network_evidence.max_bytes,
         network_monitor_samples: network_evidence.samples,
@@ -3669,6 +3677,7 @@ struct PressureSampler {
 struct RssPeaks {
     peak_rss_kib: f64,
     samples: u64,
+    max_gap_ms: u64,
 }
 
 struct RssSampler {
@@ -3682,29 +3691,39 @@ impl Drop for RssSampler {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        self.handle.take();
     }
 }
 
 impl RssSampler {
     fn stop(&mut self) -> Result<RssPeaks, String> {
-        self.stop
+        self.stop_with_timeout(SAMPLER_STOP_TIMEOUT)
+    }
+
+    fn stop_with_timeout(&mut self, timeout: Duration) -> Result<RssPeaks, String> {
+        let signal_failed = self
+            .stop
             .take()
             .ok_or_else(|| "RSS sampler stop sender is missing".to_string())?
             .send(())
-            .map_err(|_| "signal RSS sampler stop".to_string())?;
-        let result = self
-            .result
-            .recv_timeout(SAMPLER_STOP_TIMEOUT)
-            .map_err(|error| format!("receive RSS sampler result: {error}"))?;
+            .is_err();
+        let result = match self.result.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(error) => {
+                self.handle.take();
+                return Err(format!("receive RSS sampler result: {error}"));
+            }
+        };
         self.handle
             .take()
             .ok_or_else(|| "RSS sampler handle is missing".to_string())?
             .join()
             .map_err(|_| "RSS sampler panicked".to_string())?;
-        result
+        let peaks = result?;
+        if signal_failed && peaks.samples == 0 {
+            return Err("RSS sampler ended without evidence".into());
+        }
+        Ok(peaks)
     }
 }
 
@@ -3720,16 +3739,29 @@ fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String>
             let mut peaks = RssPeaks {
                 peak_rss_kib: initial,
                 samples: 1,
+                max_gap_ms: 0,
             };
+            let mut last_sample = Instant::now();
+            let mut next_sample = last_sample + interval;
             loop {
-                let stopped = match stop_rx.recv_timeout(interval) {
+                let wait = next_sample.saturating_duration_since(Instant::now());
+                let stopped = match stop_rx.recv_timeout(wait) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
                     Err(mpsc::RecvTimeoutError::Timeout) => false,
                 };
                 peaks.peak_rss_kib = peaks.peak_rss_kib.max(ps_metric(pid, "rss")?);
                 peaks.samples = peaks.samples.saturating_add(1);
+                let sampled_at = Instant::now();
+                peaks.max_gap_ms = peaks.max_gap_ms.max(
+                    u64::try_from(sampled_at.duration_since(last_sample).as_millis())
+                        .unwrap_or(u64::MAX),
+                );
+                last_sample = sampled_at;
                 if stopped {
                     break;
+                }
+                while next_sample <= sampled_at {
+                    next_sample += interval;
                 }
             }
             Ok(peaks)
@@ -4941,11 +4973,26 @@ fn validate_automatic_results(
         if !result.report_converged {
             return Err("automatic durable report convergence evidence is missing".into());
         }
-        if result.report_rss_samples < 2
-            || result.report_generation == 0
-            || result.report_records == 0
+        let expected_records = u64::try_from(config.events)
+            .map_err(|_| "automatic expected record count overflow")?
+            .checked_mul(AUTOMATIC_RECORDS_PER_SYNTHETIC_REQUEST)
+            .and_then(|records| records.checked_add(AUTOMATIC_NOTIFY_RECORDS_PER_RUN))
+            .ok_or("automatic expected record count overflow")?;
+        if result.rss_samples < 2
+            || result.report_generation != expected_records
+            || result.report_records != expected_records
         {
-            return Err("automatic final report RSS or generation evidence is missing".into());
+            return Err(format!(
+                "automatic RSS or exact durable report evidence is incomplete: expected_records={expected_records}, report_generation={}, report_records={}, rss_samples={}",
+                result.report_generation, result.report_records, result.rss_samples
+            ));
+        }
+        if config.profile == Profile::Release
+            && (result.rss_samples < AUTOMATIC_RSS_MIN_RELEASE_SAMPLES
+                || result.rss_observed_max_gap_ms
+                    > u64::try_from(AUTOMATIC_RSS_MAX_OBSERVED_GAP.as_millis()).unwrap_or(u64::MAX))
+        {
+            return Err("automatic RSS sample cadence evidence is insufficient".into());
         }
         if !result.idle_cpu_percent.is_finite()
             || result.idle_cpu_percent.is_sign_negative()
@@ -5005,6 +5052,7 @@ fn validate_automatic_results(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_automatic_manifest(
     config: AutomaticConfig,
     host: &HostEvidence,
@@ -5041,8 +5089,13 @@ fn render_automatic_manifest(
         .iter()
         .map(|result| result.network_monitor_samples)
         .sum::<u64>();
+    let rss_samples_min = results.iter().map(|result| result.rss_samples).min();
+    let rss_max_gap = results
+        .iter()
+        .map(|result| result.rss_observed_max_gap_ms)
+        .max();
     let mut manifest = format!(
-        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: verified\nreal_codex_e2e_status: passed\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.151.0\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_peak_rss_kib: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
+        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: verified\nreal_codex_e2e_status: passed\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.151.0\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_peak_rss_kib: {}\n  collector_rss_samples_min: {}\n  collector_rss_observed_max_gap_ms: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
         profile_name(config.profile),
         profile_name(config.profile),
         env!("CARGO_PKG_VERSION"),
@@ -5071,6 +5124,8 @@ fn render_automatic_manifest(
         optional_f64(idle_cpu),
         optional_f64(active_cpu),
         optional_f64(peak_rss),
+        optional_u64(rss_samples_min),
+        optional_u64(rss_max_gap),
         optional_u64(peak_disk),
         optional_u64(collector_network),
         network_samples,
@@ -5080,7 +5135,7 @@ fn render_automatic_manifest(
         run_latencies.sort_unstable();
         let _ = writeln!(
             manifest,
-            "  - run: {}\n    accepted_synthetic_otlp_requests: {}\n    rejected_synthetic_otlp_requests: {}\n    notify_supplement_accepted: {}\n    durable_report_converged: {}\n    report_generation: {}\n    report_records: {}\n    report_rss_samples: {}\n    raw_notify_sentinels_absent: true\n    synthetic_collector_otlp_p95_us: {}\n    synthetic_collector_otlp_p99_us: {}\n    idle_cpu_percent: {}\n    active_cpu_percent: {}\n    peak_rss_kib: {}\n    allocated_disk_bytes: {}\n    collector_network_bytes: {}\n    network_monitor_samples: {}\n    all_observed_endpoints_loopback: true",
+            "  - run: {}\n    accepted_synthetic_otlp_requests: {}\n    rejected_synthetic_otlp_requests: {}\n    notify_supplement_accepted: {}\n    durable_report_converged: {}\n    report_generation: {}\n    report_records: {}\n    rss_samples: {}\n    rss_observed_max_gap_ms: {}\n    raw_notify_sentinels_absent: true\n    synthetic_collector_otlp_p95_us: {}\n    synthetic_collector_otlp_p99_us: {}\n    idle_cpu_percent: {}\n    active_cpu_percent: {}\n    peak_rss_kib: {}\n    allocated_disk_bytes: {}\n    collector_network_bytes: {}\n    network_monitor_samples: {}\n    all_observed_endpoints_loopback: true",
             result.run,
             result.accepted_primary_requests,
             result.rejected_primary_requests,
@@ -5088,7 +5143,8 @@ fn render_automatic_manifest(
             result.report_converged,
             result.report_generation,
             result.report_records,
-            result.report_rss_samples,
+            result.rss_samples,
+            result.rss_observed_max_gap_ms,
             percentile(&run_latencies, 95),
             percentile(&run_latencies, 99),
             result.idle_cpu_percent,
@@ -5114,7 +5170,7 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
     for field in [
         "schema_version: automatic_local_performance.v1",
         "evidence_kind: automatic_release_evidence",
-        "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-report-rss-10ms",
+        "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-rss-active-report-v2",
         "release_readiness: verified",
         "real_codex_e2e_status: passed",
         "source_revision:",
@@ -5132,7 +5188,8 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
         "collector_idle_cpu_percent_max:",
         "collector_active_cpu_percent_max:",
         "collector_peak_rss_kib:",
-        "report_rss_samples:",
+        "collector_rss_samples_min:",
+        "collector_rss_observed_max_gap_ms:",
         "allocated_disk_bytes_max:",
         "collector_network_bytes_max:",
         "network_monitor_samples:",
@@ -5824,15 +5881,16 @@ mod tests {
             idle_cpu_percent: 0.1,
             active_cpu_percent: 0.1,
             peak_rss_kib: 1.0,
-            report_rss_samples: 2,
+            rss_samples: AUTOMATIC_RSS_MIN_RELEASE_SAMPLES,
+            rss_observed_max_gap_ms: 10,
             peak_disk_bytes: 1,
             collector_network_bytes: 321,
             network_monitor_samples: 2,
             rejected_primary_requests: 0,
             notify_supplement_accepted: true,
             report_converged: true,
-            report_generation: 1,
-            report_records: 1,
+            report_generation: 201,
+            report_records: 201,
         }
     }
     fn validate_single_automatic(result: AutomaticRunResult) -> Result<(), String> {
@@ -5851,30 +5909,84 @@ mod tests {
     }
 
     #[test]
-    fn automatic_validation_requires_report_rss_and_generation_evidence() {
+    fn rss_sampler_timeout_detaches_instead_of_joining_a_blocked_thread() {
+        let (stop_tx, _stop_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            release_rx.recv().unwrap();
+            let _ = result_tx.send(Ok(RssPeaks::default()));
+        });
+        let mut sampler = RssSampler {
+            stop: Some(stop_tx),
+            result: result_rx,
+            handle: Some(handle),
+        };
+        let started = Instant::now();
+        let error = sampler
+            .stop_with_timeout(Duration::from_millis(10))
+            .unwrap_err();
+
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(sampler.handle.is_none());
+        release_tx.send(()).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rss_sampler_observes_a_bounded_subprocess_memory_spike() {
+        let mut child = Command::new("/usr/bin/perl")
+            .args([
+                "-e",
+                "select(undef,undef,undef,0.05); $x = 'x' x (64*1024*1024); select(undef,undef,undef,0.4);",
+            ])
+            .spawn()
+            .unwrap();
+        let mut sampler = start_rss_sampler(child.id(), Duration::from_millis(10)).unwrap();
+        thread::sleep(Duration::from_millis(250));
+        let peaks = sampler.stop().unwrap();
+        let status = child.wait().unwrap();
+
+        assert!(status.success());
+        assert!(peaks.peak_rss_kib >= 32.0 * 1024.0);
+        assert!(peaks.samples >= 5);
+        assert!(peaks.max_gap_ms <= 100);
+    }
+
+    #[test]
+    fn automatic_validation_requires_rss_cadence_and_exact_durable_records() {
         let latencies = vec![1; automatic_config().events];
         let mut result = automatic_result(1, latencies.clone());
-        result.report_rss_samples = 1;
+        result.rss_samples = 1;
         assert!(
             validate_single_automatic(result)
                 .unwrap_err()
-                .contains("report RSS or generation evidence")
+                .contains("exact durable report evidence")
         );
 
         let mut result = automatic_result(1, latencies.clone());
-        result.report_generation = 0;
+        result.report_generation = 100;
         assert!(
             validate_single_automatic(result)
                 .unwrap_err()
-                .contains("report RSS or generation evidence")
+                .contains("exact durable report evidence")
         );
 
         let mut result = automatic_result(1, latencies);
-        result.report_records = 0;
+        result.report_records = 100;
         assert!(
             validate_single_automatic(result)
                 .unwrap_err()
-                .contains("report RSS or generation evidence")
+                .contains("exact durable report evidence")
+        );
+
+        let mut result = automatic_result(1, vec![1; automatic_config().events]);
+        result.rss_observed_max_gap_ms = 101;
+        assert!(
+            validate_single_automatic(result)
+                .unwrap_err()
+                .contains("sample cadence evidence")
         );
     }
     fn enabled(idle_cpu: f64, active_cpu: f64, rss: f64, disk: u64, net: u64) -> Vec<Sample> {
@@ -6201,6 +6313,24 @@ mod tests {
                 "automatic manifest accepted private key evidence: {private_key_evidence}"
             );
         }
+    }
+
+    #[test]
+    fn automatic_failure_manifest_without_completed_runs_retains_shape() {
+        let manifest = render_automatic_manifest(
+            automatic_config(),
+            &host(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &[],
+            &["run 1: synthetic failure".into()],
+            "failed",
+        );
+
+        assert!(manifest.contains("status: failed"));
+        assert!(manifest.contains("collector_rss_samples_min: null"));
+        assert!(manifest.contains("collector_rss_observed_max_gap_ms: null"));
+        assert!(manifest.contains("run 1: synthetic failure"));
+        validate_automatic_manifest_shape(&manifest).unwrap();
     }
 
     #[test]

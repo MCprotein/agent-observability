@@ -1,6 +1,6 @@
 schema_version: automatic_local_performance.v1
 version: v1.8.0
-protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-report-rss-10ms
+protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-rss-active-report-v2
 purpose: normative automatic release evidence for real Codex compatibility, local lifecycle, privacy, and synthetic collector performance
 profiles:
   release:
@@ -32,7 +32,7 @@ workload:
   notify_boundary: separately verified built agent-observability codex-notify supplement through private-CA HTTPS with the exact private random request header
   collector_boundary: built agent-observability collector-serve subprocess
   payload: bounded synthetic Codex-shaped OTLP log pairs with opaque identifiers; one bounded notify supplement per measured run whose raw sentinels must be absent from the durable tree
-  readiness: successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, acknowledged report generation, and HTML generatedSpans parity with authoritative SQLite must converge before collector shutdown
+  readiness: successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, exactly two durable synthetic records per accepted OTLP request plus one notify record, acknowledged report generation, and HTML generatedSpans parity with authoritative SQLite must converge before collector shutdown
   collector_shutdown: bounded child termination and wait
 metrics:
   synthetic_collector_otlp:
@@ -47,9 +47,9 @@ metrics:
     normalization: percent of one logical core
   collector_rss:
     peak_mib_max: 96
-    active_sample_interval: profile sample_interval_seconds
-    report_sample_interval_ms: 10
-    report_phase_final_sample: true
+    active_and_report_sample_target_ms: 10
+    observed_max_gap_ms_max: 100
+    final_sample: true
   disk:
     allocated_tree_bytes_max: 1073741824
   network:
