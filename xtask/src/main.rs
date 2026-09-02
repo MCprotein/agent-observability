@@ -6414,18 +6414,19 @@ mod tests {
         let mut child = Command::new("/usr/bin/perl")
             .args([
                 "-e",
-                "select(undef,undef,undef,0.05); $x = 'x' x (64*1024*1024); select(undef,undef,undef,0.4);",
+                "select(undef,undef,undef,0.05); $x = 'x' x (64*1024*1024); select(undef,undef,undef,1.0);",
             ])
             .spawn()
             .unwrap();
         let mut sampler = start_rss_sampler(child.id(), Duration::from_millis(10)).unwrap();
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(600));
         let peaks = sampler.stop().unwrap();
         let status = child.wait().unwrap();
 
         assert!(status.success());
         assert!(peaks.peak_rss_kib >= 32.0 * 1024.0);
-        assert!(peaks.samples >= 2);
+        assert!(peaks.samples >= 3);
+        assert!(peaks.max_gap_ms <= 500);
     }
 
     #[test]
@@ -6879,6 +6880,23 @@ mod tests {
             manifest.replacen(
                 "machine: sanitized-aarch64-4-logical-core",
                 "machine: sanitized-aarch64-5-logical-core",
+                1,
+            ),
+            manifest.replacen(
+                "machine: sanitized-aarch64-4-logical-core",
+                "machine: sanitized-riscv64-4-logical-core",
+                1,
+            ),
+            manifest
+                .replacen(
+                    "machine: sanitized-aarch64-4-logical-core",
+                    "machine: sanitized-aarch64-0-logical-core",
+                    1,
+                )
+                .replacen("logical_cores: 4", "logical_cores: 0", 1),
+            manifest.replacen(
+                "machine: sanitized-aarch64-4-logical-core",
+                "machine: sanitized-aarch64-many-logical-core",
                 1,
             ),
             manifest.replacen("filesystem: testfs", "filesystem: /Users/private", 1),

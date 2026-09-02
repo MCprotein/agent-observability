@@ -526,8 +526,10 @@ fn dashboard_error(error: DashboardOpenError) -> ApiError {
         | DashboardOpenError::WaitFailed
         | DashboardOpenError::TerminateFailed
         | DashboardOpenError::ReapFailed
-        | DashboardOpenError::ReapTimedOut
-        | DashboardOpenError::TaskFailed => {
+        | DashboardOpenError::ReapTimedOut => {
+            ("dashboard_open_failed", "모니터링 리포트를 열 수 없습니다.")
+        }
+        DashboardOpenError::TaskFailed => {
             ("dashboard_open_failed", "모니터링 리포트를 열 수 없습니다.")
         }
     };
@@ -760,7 +762,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        process::Command,
+        process::{Command, Stdio},
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
@@ -870,12 +872,35 @@ mod tests {
 
     #[test]
     fn dashboard_opener_timeout_kills_and_reaps_the_process() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "exec sleep 30"]);
+        let pid_path = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-opener-{}.pid",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&pid_path);
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "echo $$ > \"$1\"; exec /bin/sleep 30",
+                "dashboard-opener-test",
+            ])
+            .arg(&pid_path);
         let started = Instant::now();
 
-        assert!(run_dashboard_opener(&mut command, Duration::from_millis(50)).is_err());
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            run_dashboard_opener(&mut command, Duration::from_millis(500)),
+            Err(DashboardOpenError::TimedOut)
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid = fs::read_to_string(&pid_path).unwrap();
+        let status = Command::new("/bin/sh")
+            .args(["-c", "kill -0 \"$1\"", "dashboard-opener-test", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        fs::remove_file(pid_path).unwrap();
     }
 
     #[cfg(target_os = "macos")]
