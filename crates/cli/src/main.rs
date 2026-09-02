@@ -10,8 +10,9 @@ use agent_observability_adapter_cursor::{
 };
 use agent_observability_application::{ReportProjector, parse_rate_table_json};
 use agent_observability_codex_integration::{
-    CodexIntegrationStatus, CollectorStatus, ConnectionStatus, connect as connect_integration,
-    disconnect as disconnect_integration, status as integration_status,
+    CodexIntegrationStatus, CollectorStatus, ConnectionStatus, NotifyStatus, codex_detected,
+    connect as connect_integration, disconnect as disconnect_integration,
+    status as integration_status,
 };
 use agent_observability_contracts::{
     AdapterDispositionCode, AdapterDispositionKind, REPORT_DTO_VERSION, SourceCheckpoint,
@@ -129,6 +130,10 @@ impl IngestResult {
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
+    if public_help_requested(&arguments) {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     if let Some(result) = run_collector_command(&arguments) {
         return match result {
             Ok(()) => ExitCode::SUCCESS,
@@ -161,6 +166,12 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn public_help_requested(arguments: &[String]) -> bool {
+    arguments.first().is_some_and(|command| {
+        !matches!(command.as_str(), "collector-serve" | "codex-notify") && help_requested(arguments)
+    })
 }
 
 fn run_collector_command(arguments: &[String]) -> Option<Result<(), String>> {
@@ -369,8 +380,15 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
     }
 }
 
+fn help_requested(arguments: &[String]) -> bool {
+    arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+}
+
 fn run_onboarding(arguments: &[String]) -> Option<Result<String, String>> {
     let result = match arguments {
+        _ if help_requested(arguments) => Ok(USAGE.into()),
         [command] if command == "demo" => default_demo_root().and_then(|root| demo(&root, true)),
         [command, flag] if command == "demo" && flag == "--no-open" => {
             default_demo_root().and_then(|root| demo(&root, false))
@@ -492,28 +510,41 @@ fn require_demo_ingest(ingest: &IngestResult) -> Result<(), String> {
 }
 
 fn setup(root: &Path, open: bool, automatic: bool) -> Result<String, String> {
-    setup_with(root, open, automatic, prepare_dashboard, connect_codex)
+    let detected = !automatic || codex_detected().map_err(|error| error.to_string())?;
+    setup_with(
+        root,
+        open,
+        automatic,
+        detected,
+        prepare_dashboard,
+        connect_codex,
+    )
 }
 
 fn setup_with(
     root: &Path,
     open: bool,
     automatic: bool,
+    codex_is_detected: bool,
     prepare: impl FnOnce(&Path, bool) -> Result<PathBuf, String>,
     connect: impl FnOnce(&Path) -> Result<String, String>,
 ) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
     let dashboard = prepare(&layout.root, open)?;
-    let connection = automatic.then(|| connect(&layout.root)).transpose()?;
+    let connection = (automatic && codex_is_detected)
+        .then(|| connect(&layout.root))
+        .transpose()?;
+    let collection = if automatic && codex_is_detected {
+        "automatic_codex"
+    } else {
+        "manual_import"
+    };
+    let detection = (automatic && !codex_is_detected).then_some("\ncodex=not_detected");
     Ok(format!(
-        "status=ready\nroot={}\ndashboard={}\ncollection={}\nopened={open}{}",
+        "status=ready\nroot={}\ndashboard={}\ncollection={collection}\nopened={open}{}{}",
         layout.root.display(),
         dashboard.display(),
-        if automatic {
-            "automatic_codex"
-        } else {
-            "manual_import"
-        },
+        detection.unwrap_or_default(),
         connection.map_or_else(String::new, |output| format!("\n{output}"))
     ))
 }
@@ -522,8 +553,9 @@ fn connect_codex(root: &Path) -> Result<String, String> {
     let status =
         connect_integration(root, &installed_executable()?).map_err(|error| error.to_string())?;
     Ok(format!(
-        "integration=codex\nconfig={}\ncollector={}\nendpoint={}\nservice={}\nmanual_import=available",
+        "integration=codex\nconfig={}\nnotify={}\ncollector={}\nendpoint={}\nservice={}\nmanual_import=available",
         connection_status(status.config),
+        notify_status(status.notify),
         collector_status(status.collector),
         status.endpoint.as_deref().unwrap_or_default(),
         status.service.as_deref().unwrap_or_default()
@@ -547,8 +579,9 @@ fn codex_status(root: &Path) -> Result<String, String> {
 
 fn format_codex_status(status: &CodexIntegrationStatus) -> String {
     let mut output = format!(
-        "integration=codex\nconfig={}\ncollector={}",
+        "integration=codex\nconfig={}\nnotify={}\ncollector={}",
         connection_status(status.config),
+        notify_status(status.notify),
         collector_status(status.collector),
     );
     if let Some(endpoint) = &status.endpoint {
@@ -556,6 +589,14 @@ fn format_codex_status(status: &CodexIntegrationStatus) -> String {
         output.push_str(endpoint);
     }
     output
+}
+
+const fn notify_status(status: Option<NotifyStatus>) -> &'static str {
+    match status {
+        Some(NotifyStatus::AgentobsOwned) => "agentobs_owned",
+        Some(NotifyStatus::ExternalPreserved) => "external_preserved",
+        None => "none",
+    }
 }
 
 fn installed_executable() -> Result<PathBuf, String> {
@@ -1128,7 +1169,7 @@ fn ingest_paths(path: &Path) -> Result<IngestPaths, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        IngestBlock, IngestResult, LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME,
+        IngestBlock, IngestResult, LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME, USAGE,
         format_codex_status, open_dashboard_with, open_settings_url_with, prepare_dashboard_with,
         require_demo_ingest, run, setup_with, timestamp_from_duration,
     };
@@ -1155,9 +1196,21 @@ mod tests {
     }
 
     #[test]
+    fn nested_help_never_executes_an_onboarding_command() {
+        for arguments in [
+            vec!["setup".into(), "--help".into()],
+            vec!["connect".into(), "codex".into(), "--help".into()],
+            vec!["disconnect".into(), "codex".into(), "-h".into()],
+        ] {
+            assert_eq!(run(arguments.into_iter()).unwrap(), USAGE);
+        }
+    }
+
+    #[test]
     fn codex_status_preserves_conflict_and_degraded_without_an_endpoint() {
         let output = format_codex_status(&CodexIntegrationStatus {
             config: ConnectionStatus::Conflict,
+            notify: None,
             collector: CollectorStatus::Degraded,
             endpoint: None,
             service: None,
@@ -1166,7 +1219,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "integration=codex\nconfig=conflict\ncollector=degraded"
+            "integration=codex\nconfig=conflict\nnotify=none\ncollector=degraded"
         );
     }
 
@@ -1232,6 +1285,7 @@ mod tests {
             &root,
             false,
             true,
+            true,
             |_, _| {
                 events.borrow_mut().push("dashboard");
                 Err("dashboard failed".into())
@@ -1250,6 +1304,7 @@ mod tests {
             &root,
             false,
             true,
+            true,
             |_, _| {
                 events.borrow_mut().push("dashboard");
                 Ok(dashboard.clone())
@@ -1262,6 +1317,37 @@ mod tests {
         .unwrap();
         assert!(output.contains("collection=automatic_codex"));
         assert_eq!(*events.borrow(), ["dashboard", "dashboard", "connect"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn automatic_setup_stays_local_when_codex_is_not_detected() {
+        use std::cell::Cell;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-setup-not-detected-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let connected = Cell::new(false);
+        let dashboard = root.join("logs").join(REPORT_FILE_NAME);
+        let output = setup_with(
+            &root,
+            false,
+            true,
+            false,
+            |_, _| Ok(dashboard.clone()),
+            |_| {
+                connected.set(true);
+                Ok("connected".into())
+            },
+        )
+        .unwrap();
+
+        assert!(!connected.get());
+        assert!(output.contains("status=ready"));
+        assert!(output.contains("collection=manual_import"));
+        assert!(output.contains("codex=not_detected"));
         let _ = fs::remove_dir_all(root);
     }
 

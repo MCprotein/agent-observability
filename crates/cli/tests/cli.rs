@@ -84,6 +84,28 @@ fn help_distinguishes_monitoring_from_settings() {
     assert!(stdout.contains("legacy alias: `agent-observability`"));
 }
 
+#[test]
+fn nested_ui_help_has_no_runtime_or_browser_side_effect() {
+    let working = std::env::temp_dir().join(format!(
+        "agent-observability-cli-ui-help-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&working);
+    std::fs::create_dir(&working).unwrap();
+
+    let output = binary()
+        .args(["ui", "--help"])
+        .current_dir(&working)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("agentobs ui"));
+    assert!(output.stderr.is_empty());
+    assert_eq!(std::fs::read_dir(&working).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(working);
+}
+
 fn installed_store(root: &Path) -> PathBuf {
     root.join("state/store")
 }

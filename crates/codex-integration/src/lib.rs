@@ -3,6 +3,7 @@
 
 use agent_observability_codex_config::{
     CodexConfigManager, ConfigError, ConnectionStatus as ConfigConnectionStatus, ExporterSecurity,
+    NotifyOwnership,
 };
 use agent_observability_local_collector::{
     CollectorError, CollectorSettings, HealthOutcome, check_health, commit_settings_migration,
@@ -56,6 +57,38 @@ pub enum CollectorStatus {
     Unavailable,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyStatus {
+    AgentobsOwned,
+    ExternalPreserved,
+}
+
+/// Reports whether a local Codex installation is available for automatic setup.
+///
+/// Detection is read-only. Explicit `connect codex` retains its existing behavior and may create
+/// the default Codex home when the user deliberately requests that integration.
+pub fn codex_detected() -> Result<bool, IntegrationError> {
+    let codex_home = codex_home_path()?;
+    codex_detected_at(&codex_home, env::var_os("PATH").as_deref())
+}
+
+fn codex_detected_at(
+    codex_home: &Path,
+    executable_path: Option<&std::ffi::OsStr>,
+) -> Result<bool, IntegrationError> {
+    match fs::symlink_metadata(codex_home) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(
+            IntegrationError::Runtime("Codex home must be a real directory".into()),
+        ),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(command_on_path("codex", executable_path))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LaunchAgentOwnershipStatus {
     Absent,
@@ -66,6 +99,7 @@ enum LaunchAgentOwnershipStatus {
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct CodexIntegrationStatus {
     pub config: ConnectionStatus,
+    pub notify: Option<NotifyStatus>,
     pub collector: CollectorStatus,
     pub endpoint: Option<String>,
     pub service: Option<String>,
@@ -209,8 +243,8 @@ fn connect_with_reloaded_settings<C: ConfigLifecycle>(
         .map_err(|error| rollback_migration_install(root, lifecycle, &service, error))?;
     let manager = config_from_settings(&settings)
         .map_err(|error| rollback_migration_install(root, lifecycle, &service, error))?;
-    let config = match manager.connect() {
-        Ok(config) => config.into(),
+    let (config, notify) = match manager.connect() {
+        Ok((config, notify)) => (config.into(), notify.map(Into::into)),
         Err(error) => {
             return Err(recover_failed_config_connect(
                 root, &manager, lifecycle, &service, error,
@@ -220,6 +254,7 @@ fn connect_with_reloaded_settings<C: ConfigLifecycle>(
     lifecycle.commit_install(&service)?;
     Ok(CodexIntegrationStatus {
         config,
+        notify,
         collector,
         endpoint: Some(settings.endpoint()),
         service: Some(service.label),
@@ -239,13 +274,14 @@ fn connect_prepared(
     let collector = lifecycle
         .wait_until_ready(root)
         .map_err(|error| rollback_install(lifecycle, &service, error))?;
-    let config_status = match config.connect() {
-        Ok(status) => status.into(),
+    let (config_status, notify) = match config.connect() {
+        Ok((status, notify)) => (status.into(), notify.map(Into::into)),
         Err(error) => return Err(rollback_install(lifecycle, &service, error)),
     };
     lifecycle.commit_install(&service)?;
     Ok(CodexIntegrationStatus {
         config: config_status,
+        notify,
         collector,
         endpoint: Some(endpoint.into()),
         service: Some(service.label),
@@ -371,6 +407,7 @@ fn disconnect_owned_prepared(
     };
     Ok(CodexIntegrationStatus {
         config: status.into(),
+        notify: None,
         collector: CollectorStatus::Unavailable,
         endpoint: endpoint.map(str::to_owned),
         service: Some(service.label),
@@ -380,7 +417,9 @@ fn disconnect_owned_prepared(
 
 trait ConfigLifecycle {
     fn status(&self) -> Result<ConfigConnectionStatus, IntegrationError>;
-    fn connect(&self) -> Result<ConfigConnectionStatus, IntegrationError>;
+    fn connect(
+        &self,
+    ) -> Result<(ConfigConnectionStatus, Option<NotifyOwnership>), IntegrationError>;
     fn disconnect(&self) -> Result<ConfigConnectionStatus, IntegrationError>;
 }
 
@@ -389,12 +428,25 @@ impl ConfigLifecycle for CodexConfigManager {
         self.status().map_err(Into::into)
     }
 
-    fn connect(&self) -> Result<ConfigConnectionStatus, IntegrationError> {
-        self.connect().map_err(Into::into)
+    fn connect(
+        &self,
+    ) -> Result<(ConfigConnectionStatus, Option<NotifyOwnership>), IntegrationError> {
+        let status = CodexConfigManager::connect(self)?;
+        let notify = CodexConfigManager::notify_ownership(self)?;
+        Ok((status, notify))
     }
 
     fn disconnect(&self) -> Result<ConfigConnectionStatus, IntegrationError> {
         self.disconnect().map_err(Into::into)
+    }
+}
+
+impl From<NotifyOwnership> for NotifyStatus {
+    fn from(ownership: NotifyOwnership) -> Self {
+        match ownership {
+            NotifyOwnership::AgentobsOwned => Self::AgentobsOwned,
+            NotifyOwnership::ExternalPreserved => Self::ExternalPreserved,
+        }
     }
 }
 
@@ -549,12 +601,18 @@ pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, 
         };
         let manager = codex_config_manager(&layout, executable, &settings)?;
         let config = manager.status()?;
+        let notify = if config == ConfigConnectionStatus::Connected {
+            manager.notify_ownership()?.map(Into::into)
+        } else {
+            None
+        };
         reconcile_collector_service(&layout.root, config)?;
         if settle_settings_migration_for_status(&layout.root, config)? {
             return status_without_settings(&layout);
         }
         Ok(CodexIntegrationStatus {
             config: config.into(),
+            notify,
             collector: collector_status(check_health(&layout.root)),
             endpoint: Some(settings.endpoint()),
             service: Some(service_label(&layout.root)),
@@ -606,14 +664,26 @@ fn settle_pending_migration_before_disconnect(
 fn status_without_settings(
     layout: &InstalledLayout,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
-    let config = codex_config_ownership_manager(layout)?.ownership_status()?;
+    let manager = codex_config_ownership_manager(layout)?;
+    let config = manager.ownership_status()?;
+    let notify = if config == Some(ConfigConnectionStatus::Connected) {
+        manager.notify_ownership()?.map(Into::into)
+    } else {
+        None
+    };
     let service = launch_agent_ownership_status(&layout.root)?;
-    Ok(missing_settings_status(&layout.root, config, service))
+    Ok(missing_settings_status(
+        &layout.root,
+        config,
+        notify,
+        service,
+    ))
 }
 
 fn missing_settings_status(
     root: &Path,
     config: Option<ConfigConnectionStatus>,
+    notify: Option<NotifyStatus>,
     service: LaunchAgentOwnershipStatus,
 ) -> CodexIntegrationStatus {
     if config.is_none() && service == LaunchAgentOwnershipStatus::Absent {
@@ -628,6 +698,7 @@ fn missing_settings_status(
     };
     CodexIntegrationStatus {
         config,
+        notify,
         collector: CollectorStatus::Unavailable,
         endpoint: None,
         service: (service != LaunchAgentOwnershipStatus::Absent).then(|| service_label(root)),
@@ -638,6 +709,7 @@ fn missing_settings_status(
 fn disconnected_status() -> CodexIntegrationStatus {
     CodexIntegrationStatus {
         config: ConnectionStatus::Disconnected,
+        notify: None,
         collector: CollectorStatus::Unavailable,
         endpoint: None,
         service: None,
@@ -746,7 +818,11 @@ fn codex_config_ownership_manager(
 }
 
 fn codex_config_path() -> Result<PathBuf, IntegrationError> {
-    let codex_home = env::var_os("CODEX_HOME")
+    Ok(codex_home_path()?.join("config.toml"))
+}
+
+fn codex_home_path() -> Result<PathBuf, IntegrationError> {
+    env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .map_or_else(
@@ -758,8 +834,29 @@ fn codex_config_path() -> Result<PathBuf, IntegrationError> {
                     .ok_or_else(|| IntegrationError::Runtime("HOME is not set".into()))
             },
             Ok,
-        )?;
-    Ok(codex_home.join("config.toml"))
+        )
+}
+
+fn command_on_path(command: &str, executable_path: Option<&std::ffi::OsStr>) -> bool {
+    executable_path.is_some_and(|path| {
+        env::split_paths(path).any(|directory| {
+            let candidate = directory.join(command);
+            fs::metadata(candidate)
+                .is_ok_and(|metadata| metadata.is_file() && executable_by_someone(&metadata))
+        })
+    })
+}
+
+#[cfg(unix)]
+fn executable_by_someone(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn executable_by_someone(_metadata: &fs::Metadata) -> bool {
+    true
 }
 
 fn ensure_codex_home(path: &Path) -> Result<(), IntegrationError> {
@@ -1948,13 +2045,14 @@ mod tests {
     use super::{
         CodexIntegrationStatus, CollectorLifecycle, CollectorService, CollectorStatus,
         ConfigConnectionStatus, ConfigLifecycle, ConnectionStatus, IntegrationError,
-        LaunchAgentOwnershipStatus, collector_status, connect_prepared,
-        connect_with_reloaded_settings, disconnect_owned_prepared, disconnect_prepared,
-        ensure_codex_home, exporter_security, finish_disconnect_settings_migration,
-        finish_settings_migration, launch_agent_body, missing_settings_status,
-        recover_connect_settings, recover_connect_settings_with, service_label,
-        settle_pending_migration_before_disconnect, settle_pending_migration_before_status,
-        settle_settings_migration_for_status, status, with_lifecycle_lock,
+        LaunchAgentOwnershipStatus, NotifyOwnership, NotifyStatus, codex_detected_at,
+        collector_status, connect_prepared, connect_with_reloaded_settings,
+        disconnect_owned_prepared, disconnect_prepared, ensure_codex_home, exporter_security,
+        finish_disconnect_settings_migration, finish_settings_migration, launch_agent_body,
+        missing_settings_status, recover_connect_settings, recover_connect_settings_with,
+        service_label, settle_pending_migration_before_disconnect,
+        settle_pending_migration_before_status, settle_settings_migration_for_status, status,
+        with_lifecycle_lock,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -2054,6 +2152,30 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn codex_detection_is_read_only_and_accepts_home_or_path_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("codex-detection");
+        let codex_home = root.join(".codex");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+
+        assert!(!codex_detected_at(&codex_home, Some(bin.as_os_str())).unwrap());
+        assert!(!codex_home.exists());
+
+        let codex = bin.join("codex");
+        fs::write(&codex, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(codex_detected_at(&codex_home, Some(bin.as_os_str())).unwrap());
+        assert!(!codex_home.exists());
+
+        fs::create_dir(&codex_home).unwrap();
+        assert!(codex_detected_at(&codex_home, None).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
     struct FakeConfig {
         state: Cell<ConfigConnectionStatus>,
         connect_error: Cell<bool>,
@@ -2089,7 +2211,9 @@ mod tests {
             Ok(self.state.get())
         }
 
-        fn connect(&self) -> Result<ConfigConnectionStatus, IntegrationError> {
+        fn connect(
+            &self,
+        ) -> Result<(ConfigConnectionStatus, Option<NotifyOwnership>), IntegrationError> {
             self.events.borrow_mut().push("config-connect");
             if self.connect_error.get() {
                 return Err(IntegrationError::Runtime("config connect failed".into()));
@@ -2100,7 +2224,10 @@ mod tests {
                     "config connect failed after apply".into(),
                 ));
             }
-            Ok(ConfigConnectionStatus::Connected)
+            Ok((
+                ConfigConnectionStatus::Connected,
+                Some(NotifyOwnership::AgentobsOwned),
+            ))
         }
 
         fn disconnect(&self) -> Result<ConfigConnectionStatus, IntegrationError> {
@@ -2211,6 +2338,7 @@ mod tests {
     fn status_is_serializable_with_stable_values() {
         let status = CodexIntegrationStatus {
             config: ConnectionStatus::Conflict,
+            notify: None,
             collector: CollectorStatus::Unavailable,
             endpoint: Some("https://127.0.0.1:43181/v1/logs".into()),
             service: Some("io.agent-observability.collector.example".into()),
@@ -2230,6 +2358,7 @@ mod tests {
         let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
         let status = CodexIntegrationStatus {
             config: ConnectionStatus::Connected,
+            notify: Some(NotifyStatus::AgentobsOwned),
             collector: CollectorStatus::Ready,
             endpoint: Some("https://127.0.0.1:4318/v1/logs".into()),
             service: Some("io.agent-observability.collector.test".into()),
@@ -2346,6 +2475,7 @@ mod tests {
         let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
         let status = CodexIntegrationStatus {
             config: ConnectionStatus::Disconnected,
+            notify: None,
             collector: CollectorStatus::Unavailable,
             endpoint: None,
             service: None,
@@ -2395,6 +2525,7 @@ mod tests {
     fn degraded_status_serializes_without_becoming_ready() {
         let status = CodexIntegrationStatus {
             config: ConnectionStatus::Connected,
+            notify: Some(NotifyStatus::ExternalPreserved),
             collector: CollectorStatus::Degraded,
             endpoint: None,
             service: None,
@@ -2413,10 +2544,12 @@ mod tests {
         let status = missing_settings_status(
             root,
             Some(ConfigConnectionStatus::Connected),
+            Some(NotifyStatus::ExternalPreserved),
             LaunchAgentOwnershipStatus::Absent,
         );
 
         assert_eq!(status.config, ConnectionStatus::Connected);
+        assert_eq!(status.notify, Some(NotifyStatus::ExternalPreserved));
         assert_eq!(status.collector, CollectorStatus::Unavailable);
         assert_eq!(status.endpoint, None);
         assert_eq!(status.service, None);
@@ -2426,7 +2559,7 @@ mod tests {
     fn missing_settings_reports_launch_agent_only_as_conflict() {
         let root = Path::new("/runtime");
 
-        let status = missing_settings_status(root, None, LaunchAgentOwnershipStatus::Owned);
+        let status = missing_settings_status(root, None, None, LaunchAgentOwnershipStatus::Owned);
 
         assert_eq!(status.config, ConnectionStatus::Conflict);
         assert_eq!(status.collector, CollectorStatus::Unavailable);
@@ -2441,6 +2574,7 @@ mod tests {
     fn missing_settings_without_ownership_remains_disconnected() {
         let status = missing_settings_status(
             Path::new("/runtime"),
+            None,
             None,
             LaunchAgentOwnershipStatus::Absent,
         );

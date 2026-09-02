@@ -55,7 +55,7 @@ gate를 통과해 추가한다.
 | v0.x | Completed | Local-only PoC를 작은 minor release로 쪼개 검증했다. |
 | v1.x | Active | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
 
-## Active Train: v0.1.0-v1.8.0
+## Active Train: v0.1.0-v1.8.1
 
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
@@ -89,6 +89,7 @@ gate를 통과해 추가한다.
 | v1.6.0 | Released | Integrity-checked one-command installer | Release workflow `33481569104` published the Package, public Release, and attested installer; downloaded checksums, universal `x86_64 arm64` version, fresh public install, and all five artifact attestations verified independently |
 | v1.7.0 | Released | TypeScript tooling completion and short CLI alias | Release workflow `33486442683` published the Package and public Release; downloaded checksums, universal `x86_64 arm64` version, both installed command aliases, and all five artifact attestations verified independently |
 | v1.8.0 | Released | Codex automatic local collection | Private-CA HTTPS `127.0.0.1` OTLP/HTTP JSON receiver with an exact private random request header, pre-transport projected fail-open notify supplement, macOS LaunchAgent lifecycle, exact Codex config ownership/restore, scalar-only adapter projection, automatic private report refresh, and unchanged daemon-free/network-free manual imports; Claude Code/Cursor automatic and commercial team remain TODO | Exact-source run `33629927036`, role-separated agent review recorded in `docs/reviews/v1.8.0.md`, merge `ff02332341244d326a9791feca01c151f854df12`, and release run `33639999475` passed; checksums, universal `x86_64 arm64`, both aliases, Package publication step, public Release, and five attestations verified |
+| v1.8.1 | In Progress | One-command Codex compatibility fix | `agentobs setup` preserves a pre-existing Codex app notify command, owns only non-conflicting OTEL values when notify is occupied, keeps exact rollback semantics, and treats nested `--help` as help instead of a runtime path | Targeted config ownership, CLI, full workspace, privacy and macOS setup smoke evidence plus independent review required before release |
 
 ## Branch Strategy
 

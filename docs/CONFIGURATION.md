@@ -122,25 +122,34 @@ exact prior bytes/mode와 credential generation을 durable migration journal에 
 제거하며, 실패하면 prior settings와 credentials를 복원한다. External endpoint 설정은 없다.
 
 Codex config는 `$CODEX_HOME/config.toml` 또는 기본 `~/.codex/config.toml`이다. Connection manager가
-소유하는 값은 다음 네 항목뿐이다.
+항상 소유하는 값은 아래 세 OTEL 항목이다. top-level `notify`는 기존 값이 없을 때만 선택적으로 소유한다.
 
 | Managed value | Required value |
 | --- | --- |
-| top-level `notify` | canonical absolute installed executable path, `codex-notify`, absolute runtime root의 3-element command |
+| top-level `notify` (optional) | 기존 값이 없을 때만 canonical absolute installed executable path, `codex-notify`, absolute runtime root의 3-element command를 추가; 기존 명령은 그대로 보존 |
 | `otel.exporter` | local HTTPS `/v1/logs` endpoint, JSON protocol, private CA path와 exact `x-agent-observability-token` header만 포함한 OTLP/HTTP exporter; client identity field 없음 |
 | `otel.log_user_prompt` | `false` |
 | `otel.environment` | `local` |
 
-Connect는 기존 managed value가 없거나 정확히 같은 경우에만 진행한다. 연결 전과 연결 직후 config의
+인자 없는 `setup`은 real Codex home 또는 PATH의 executable을 읽기 전용으로 감지한 경우에만 이
+connection lifecycle을 시작한다. 감지되지 않으면 `codex=not_detected`를 출력하며 Codex home, config,
+collector service를 생성하지 않는다. 명시적 `connect codex`는 사용자가 integration 생성을 요청한
+경로이므로 기존 생성 semantics를 유지한다.
+
+Connect는 기존 OTEL managed value가 없거나 정확히 같은 경우에만 진행한다. 기존의 non-empty
+string-array notify command는 충돌로 취급하지 않고 `external_preserved`로 보고한다. string, table,
+empty array 또는 string 이외의 원소가 있는 notify는 config를 수정하지 않고 conflict로 중단한다. 연결 전과 연결 직후 config의
 존재 여부, exact bytes, SHA-256와 permission mode를
 `<root>/runtime/integrations/codex/codex-config-ownership-v1.json`에 private snapshot으로 보존한 뒤
 serialized compare/replace transaction으로 교체한다. 중간 crash는 snapshot phase와 현재 file을 비교해
-다음 lifecycle command에서 결정적으로 복구한다. 기존 다른 notify/exporter/privacy/environment 값을
-병합하거나 덮어쓰지 않고 conflict로 중단한다.
+다음 lifecycle command에서 결정적으로 복구한다. 기존 다른 exporter/privacy/environment 값을
+병합하거나 덮어쓰지 않고 conflict로 중단하며, 기존 notify는 agentobs 소유권 밖에 둔다.
 
-Disconnect는 현재 config의 전체 bytes와 mode가 snapshot의 exact connected state와 같을 때만 prior
-bytes와 mode를 복원한다. 연결 전 config가 없었다면 생성한 file을 제거한다. User 또는 다른 tool이
-managed value가 아닌 설정만 바꾼 경우에도 conflict로 중단하고 그 편집을 보존한다. Successful
+Disconnect는 commit 전 반복 검사에서 현재 config의 전체 bytes와 mode가 snapshot의 exact connected
+state와 같을 때만 prior bytes와 mode를 복원한다. 연결 전 config가 없었다면 생성한 file을 제거한다.
+검사에서 관측된 user/tool 편집은 managed value 여부와 무관하게 conflict로 중단하고 보존한다.
+agentobs writer는 lock으로 직렬화하지만, lock을 무시하고 이미 열린 descriptor에 최종 검사와 rename
+사이 쓰는 임의 프로세스를 배제하는 portable filesystem CAS는 아니다. Successful
 disconnect는 연결 전 LaunchAgent plist와 loaded 상태를 먼저 복원한다. Connect가 새로 만든 service만
 종료·제거하며, 그 뒤 config를 복원한다. Local observation, SQLite와 dashboard는 보존한다.
 
