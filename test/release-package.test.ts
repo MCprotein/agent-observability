@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -121,10 +123,42 @@ test("release workflow pins actions and uses the tested publication state machin
   );
   assert.match(ciWorkflow, /path: \$\{\{ steps\.evidence\.outputs\.manifest \}\}/);
   for (const workflow of [ciWorkflow, releaseWorkflow]) {
-    assert.match(workflow, /report_generation: 20001/);
-    assert.match(workflow, /report_records: 20001/);
-    assert.match(workflow, /rss_samples:[\s\S]*\$2 < 100/);
-    assert.match(workflow, /rss_observed_max_gap_ms:[\s\S]*\$2 > 100/);
+    assert.match(workflow, /scripts\/validate-automatic-run-evidence\.sh "\$manifest"/);
+  }
+});
+
+test("automatic release evidence validator rejects malformed run metrics", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-observability-evidence-"));
+  const manifest = join(root, "manifest.yaml");
+  const run = (body: string) => {
+    writeFileSync(manifest, body, { mode: 0o600 });
+    return spawnSync("sh", ["scripts/validate-automatic-run-evidence.sh", manifest], {
+      encoding: "utf8",
+    }).status;
+  };
+  const entry = [
+    "    report_generation: 20001",
+    "    report_records: 20001",
+    "    rss_samples: 100",
+    "    rss_observed_max_gap_ms: 100",
+  ].join("\n");
+  const valid = Array.from({ length: 5 }, () => entry).join("\n");
+
+  try {
+    assert.equal(run(valid), 0);
+    for (const malformed of [
+      valid.replace("report_generation: 20001", "report_generation: 200010"),
+      valid.replace("report_records: 20001", "report_records: NaN"),
+      valid.replace("rss_samples: 100", "rss_samples: NaN"),
+      valid.replace("rss_observed_max_gap_ms: 100", "rss_observed_max_gap_ms: NaN"),
+      valid.replace("    report_generation: 20001\n", ""),
+      `${valid}\n    report_records: 20001`,
+      valid.replace("report_generation: 20001", "report_generation: 20001 extra"),
+    ]) {
+      assert.notEqual(run(malformed), 0, `accepted malformed manifest:\n${malformed}`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

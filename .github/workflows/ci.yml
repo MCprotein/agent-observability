@@ -131,10 +131,7 @@ jobs:
           grep -Fxq "profile: release" "$manifest"
           grep -Fxq "protocol_revision: v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-benchmark-rss-active-report-v2" "$manifest"
           grep -Fxq "  codex_version: 0.151.0" "$manifest"
-          test "$(grep -Fc "    report_generation: 20001" "$manifest")" -eq 5
-          test "$(grep -Fc "    report_records: 20001" "$manifest")" -eq 5
-          awk '$1 == "rss_samples:" { count += 1; if ($2 < 100) bad = 1 } END { exit !(count == 5 && !bad) }' "$manifest"
-          awk '$1 == "rss_observed_max_gap_ms:" { count += 1; if ($2 > 100) bad = 1 } END { exit !(count == 5 && !bad) }' "$manifest"
+          scripts/validate-automatic-run-evidence.sh "$manifest"
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
       - name: Upload exact-revision automatic release evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

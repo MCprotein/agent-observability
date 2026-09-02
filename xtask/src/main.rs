@@ -1164,11 +1164,11 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
         )
     })?;
     if config.profile == Profile::Release {
-        fs::write(
-            &manifest_path,
-            manifest.replace("status: pending-validation", "status: pass"),
-        )
-        .map_err(|error| format!("finalize automatic manifest: {error}"))?;
+        let passed =
+            render_automatic_manifest(config, &host, &source_revision, &results, &errors, "pass");
+        validate_automatic_manifest_shape(&passed)?;
+        fs::write(&manifest_path, passed)
+            .map_err(|error| format!("finalize automatic manifest: {error}"))?;
     }
     println!(
         "manifest={}\nprofile={}\nstatus=pass",
@@ -5109,10 +5109,10 @@ fn render_automatic_manifest(
         .iter()
         .map(|result| result.rss_observed_max_gap_ms)
         .max();
-    let release_readiness = if matches!(status, "pass" | "pending-validation") {
-        "verified"
-    } else {
-        "not_verified"
+    let release_readiness = match status {
+        "pass" => "verified",
+        "pending-validation" => "pending",
+        _ => "not_verified",
     };
     let real_codex_e2e_status = if errors
         .iter()
@@ -5122,8 +5122,13 @@ fn render_automatic_manifest(
     } else {
         "passed"
     };
+    let real_codex_e2e_gate = if real_codex_e2e_status == "failed" {
+        "failed-lifecycle-preflight"
+    } else {
+        "passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response"
+    };
     let mut manifest = format!(
-        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: {release_readiness}\nreal_codex_e2e_status: {real_codex_e2e_status}\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.151.0\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_peak_rss_kib: {}\n  collector_rss_samples_min: {}\n  collector_rss_observed_max_gap_ms: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
+        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: {release_readiness}\nreal_codex_e2e_status: {real_codex_e2e_status}\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.151.0\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: {real_codex_e2e_gate}\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_peak_rss_kib: {}\n  collector_rss_samples_min: {}\n  collector_rss_observed_max_gap_ms: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
         profile_name(config.profile),
         profile_name(config.profile),
         env!("CARGO_PKG_VERSION"),
@@ -5188,10 +5193,28 @@ fn render_automatic_manifest(
     } else {
         manifest.push_str("errors:\n");
         for error in errors {
-            let _ = writeln!(manifest, "  - {}", yaml_single_quoted(error));
+            let _ = writeln!(
+                manifest,
+                "  - {}",
+                yaml_single_quoted(automatic_evidence_error_code(error))
+            );
         }
     }
     manifest
+}
+
+fn automatic_evidence_error_code(error: &str) -> &'static str {
+    if error.starts_with("lifecycle preflight: ") {
+        "code=lifecycle_preflight_failed"
+    } else if error.starts_with("run ") {
+        "code=benchmark_run_failed"
+    } else if error.starts_with("validation: ") {
+        "code=evidence_validation_failed"
+    } else if error.starts_with("cleanup: ") {
+        "code=cleanup_failed"
+    } else {
+        "code=automatic_check_failed"
+    }
 }
 
 fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
@@ -5206,7 +5229,6 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
         "transport: private-ca-https-exact-private-random-request-header-not-mtls",
         "codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp",
         "observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity",
-        "real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response",
         "synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report",
         "notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan",
         "synthetic_collector_otlp_p95_us:",
@@ -5231,23 +5253,76 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
         .lines()
         .find_map(|line| line.strip_prefix("status: "))
         .ok_or("automatic performance manifest status is missing")?;
-    let expected_readiness = if matches!(status, "pass" | "pending-validation") {
-        "release_readiness: verified"
-    } else {
-        "release_readiness: not_verified"
+    if !matches!(status, "pass" | "pending-validation" | "failed") {
+        return Err(format!(
+            "automatic performance manifest status is invalid: {status}"
+        ));
+    }
+    let expected_readiness = match status {
+        "pass" => "release_readiness: verified",
+        "pending-validation" => "release_readiness: pending",
+        _ => "release_readiness: not_verified",
     };
     if !manifest.lines().any(|line| line == expected_readiness) {
         return Err(format!(
             "automatic performance manifest status {status} has inconsistent release readiness"
         ));
     }
-    let expected_codex_status = if manifest.contains("  - 'lifecycle preflight: ") {
+    let expected_codex_status = if manifest.contains("  - 'code=lifecycle_preflight_failed'") {
         "real_codex_e2e_status: failed"
     } else {
         "real_codex_e2e_status: passed"
     };
     if !manifest.lines().any(|line| line == expected_codex_status) {
         return Err("automatic performance manifest has inconsistent real Codex status".into());
+    }
+    let expected_codex_gate = if expected_codex_status.ends_with("failed") {
+        "real_codex_e2e_release_gate: failed-lifecycle-preflight"
+    } else {
+        "real_codex_e2e_release_gate: passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response"
+    };
+    if !manifest
+        .lines()
+        .any(|line| line.trim() == expected_codex_gate)
+    {
+        return Err("automatic performance manifest has inconsistent real Codex gate".into());
+    }
+    validate_automatic_manifest_privacy(manifest)?;
+    let revision = manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("source_revision: "))
+        .ok_or("automatic performance manifest source revision is missing")?;
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("automatic performance manifest source revision is invalid".into());
+    }
+    Ok(())
+}
+
+fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
+    let allowed_errors = [
+        "  - 'code=lifecycle_preflight_failed'",
+        "  - 'code=benchmark_run_failed'",
+        "  - 'code=evidence_validation_failed'",
+        "  - 'code=cleanup_failed'",
+        "  - 'code=automatic_check_failed'",
+    ];
+    if manifest
+        .lines()
+        .filter(|line| line.starts_with("  - '"))
+        .any(|line| !allowed_errors.contains(&line))
+    {
+        return Err("automatic performance manifest contains a non-allowlisted error".into());
+    }
+    for sentinel in [
+        "AUTOMATIC_RAW_CWD_SENTINEL",
+        "AUTOMATIC_RAW_PROMPT_SENTINEL",
+        "AUTOMATIC_RAW_ASSISTANT_SENTINEL",
+        AUTOMATIC_CODEX_E2E_PROMPT_SENTINEL,
+        AUTOMATIC_CODEX_E2E_RESPONSE_SENTINEL,
+    ] {
+        if manifest.contains(sentinel) {
+            return Err("automatic performance manifest contains a raw content sentinel".into());
+        }
     }
     for forbidden in [
         "/tmp/",
@@ -5265,13 +5340,6 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<(), String> {
                 "automatic performance manifest contains unsanitized field {forbidden}"
             ));
         }
-    }
-    let revision = manifest
-        .lines()
-        .find_map(|line| line.strip_prefix("source_revision: "))
-        .ok_or("automatic performance manifest source revision is missing")?;
-    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("automatic performance manifest source revision is invalid".into());
     }
     Ok(())
 }
@@ -6339,8 +6407,26 @@ mod tests {
         assert!(manifest.contains("collector_network_bytes: 321"));
         assert!(manifest.contains("network_monitor_samples: 2"));
         assert!(manifest.contains("all_observed_endpoints_loopback: true"));
+        assert!(manifest.contains("release_readiness: pending"));
+        assert!(manifest.contains("real_codex_e2e_status: passed"));
         assert!(!manifest.contains("external_network_bytes"));
         validate_automatic_manifest_shape(&manifest).unwrap();
+        assert!(
+            validate_automatic_manifest_shape(
+                &manifest.replace("status: pending-validation", "status: unknown")
+            )
+            .is_err()
+        );
+        let passed = render_automatic_manifest(
+            config,
+            &host(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &results,
+            &[],
+            "pass",
+        );
+        assert!(passed.contains("release_readiness: verified"));
+        validate_automatic_manifest_shape(&passed).unwrap();
 
         let missing_lifecycle = manifest.replace(
             "  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n",
@@ -6396,9 +6482,12 @@ mod tests {
         assert!(retained.contains("status: failed"));
         assert!(retained.contains("release_readiness: not_verified"));
         assert!(retained.contains("real_codex_e2e_status: failed"));
+        assert!(retained.contains("real_codex_e2e_release_gate: failed-lifecycle-preflight"));
+        assert!(!retained.contains("real_codex_e2e_release_gate: passed-actual-codex"));
         assert!(retained.contains("collector_rss_samples_min: null"));
         assert!(retained.contains("collector_rss_observed_max_gap_ms: null"));
-        assert!(retained.contains("lifecycle preflight: synthetic preflight failure"));
+        assert!(retained.contains("code=lifecycle_preflight_failed"));
+        assert!(!retained.contains("synthetic preflight failure"));
         validate_automatic_manifest_shape(&retained).unwrap();
         assert!(
             validate_automatic_manifest_shape(&retained.replace(
@@ -6408,6 +6497,48 @@ mod tests {
             .is_err()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn automatic_failure_manifest_never_retains_raw_diagnostics() {
+        let errors = vec![
+            "lifecycle preflight: /Users/private/project prompt response stderr".into(),
+            "run 1: /private/var/runtime collector output".into(),
+            "validation: /home/runner/work/private-key.pem".into(),
+            "cleanup: /var/folders/private".into(),
+            "unexpected raw diagnostic".into(),
+        ];
+        let manifest = render_automatic_manifest(
+            automatic_config(),
+            &host(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &[],
+            &errors,
+            "failed",
+        );
+
+        for code in [
+            "code=lifecycle_preflight_failed",
+            "code=benchmark_run_failed",
+            "code=evidence_validation_failed",
+            "code=cleanup_failed",
+            "code=automatic_check_failed",
+        ] {
+            assert!(manifest.contains(code));
+        }
+        for raw in [
+            "/Users/private",
+            "/private/var",
+            "/home/runner",
+            "/var/folders",
+            "prompt response stderr",
+            "collector output",
+            "private-key.pem",
+            "unexpected raw diagnostic",
+        ] {
+            assert!(!manifest.contains(raw), "manifest retained {raw}");
+        }
+        validate_automatic_manifest_shape(&manifest).unwrap();
     }
 
     #[test]
