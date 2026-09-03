@@ -1,6 +1,6 @@
 schema_version: automatic_local_performance.v1
-version: v1.8.2
-protocol_revision: v1.8.2-codex-0.152.1-private-ca-header-real-e2e-synthetic-diagnostics-rss-p95-v3
+version: v1.8.3
+protocol_revision: v1.8.3-codex-0.152.1-private-ca-header-ownership-rebase-real-e2e-synthetic-diagnostics-rss-p95-v4
 purpose: normative automatic release evidence for real Codex compatibility, local lifecycle, privacy, and synthetic collector performance
 profiles:
   release:
@@ -23,7 +23,7 @@ profiles:
 workload:
   lifecycle_preflight: bounded built-binary no-argument setup --no-open under isolated HOME and CODEX_HOME, installed Codex 0.152.1 strict config loading, and one actual codex exec against a content-free loopback Responses fixture
   lifecycle_seed: exact private Codex config bytes and permission mode
-  lifecycle_assertions: connected config, exact Codex 0.152.1 version and strict config loading, ready or degraded collector, installed KeepAlive LaunchAgent plist, pre-failure synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, unexpected SIGKILL service termination and bounded unaided launchd KeepAlive recovery, post-recovery synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service
+  lifecycle_assertions: connected config, safe rebase of later unowned Codex config edits through repeated setup, exact Codex 0.152.1 version and strict config loading, ready or degraded collector, installed KeepAlive LaunchAgent plist, pre-failure synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, unexpected SIGKILL service termination and bounded unaided launchd KeepAlive recovery, post-recovery synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect preserving the rebased edit, exact managed config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service
   lifecycle_cleanup: best-effort bounded disconnect, bootout, exact seed restoration, plist removal, and isolated directory removal on success or error
   codex_config_load_boundary: installed @openai/codex 0.152.1 exact version, strict diagnostic loading, and actual codex exec proving exporter construction and native OTLP delivery without an external model request
   observed_compatibility_correction: Codex 0.151.0 on macOS fails exporter construction when client certificate and client private-key identity fields are present; corrected product config uses private-CA HTTPS plus the exact x-agent-observability-token private random request header and no client identity fields

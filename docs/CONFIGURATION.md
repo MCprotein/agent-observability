@@ -145,8 +145,15 @@ serialized compare/replace transaction으로 교체한다. 중간 crash는 snaps
 다음 lifecycle command에서 결정적으로 복구한다. 기존 다른 exporter/privacy/environment 값을
 병합하거나 덮어쓰지 않고 conflict로 중단하며, 기존 notify는 agentobs 소유권 밖에 둔다.
 
+연결 후 Codex, OMX 또는 사용자가 agentobs 비소유 필드만 추가·수정했다면 `status`와 직접
+`disconnect`는 기존처럼 conflict를 보고한다. 명시적 `setup` 또는 `connect codex`는 현재 mode와
+agentobs 소유 OTEL 값, 선택적으로 소유한 notify가 snapshot과 정확히 같을 때만 비소유 변경을 새
+prior/connected snapshot에 재조정한다. 이 단계는 live config를 쓰지 않으며 snapshot 기록 전 config를
+다시 검사한다. 소유 값이나 mode가 바뀌었거나 TOML이 유효하지 않으면 재조정하지 않고 fail-closed 한다.
+
 Disconnect는 commit 전 반복 검사에서 현재 config의 전체 bytes와 mode가 snapshot의 exact connected
-state와 같을 때만 prior bytes와 mode를 복원한다. 연결 전 config가 없었다면 생성한 file을 제거한다.
+state와 같을 때만 prior bytes와 mode를 복원한다. 재조정된 비소유 변경은 prior에도 포함되므로 보존된다.
+연결 전 config가 없고 이후 비소유 설정도 추가되지 않았다면 생성한 file을 제거한다.
 검사에서 관측된 user/tool 편집은 managed value 여부와 무관하게 conflict로 중단하고 보존한다.
 agentobs writer는 lock으로 직렬화하지만, lock을 무시하고 이미 열린 descriptor에 최종 검사와 rename
 사이 쓰는 임의 프로세스를 배제하는 portable filesystem CAS는 아니다. Successful

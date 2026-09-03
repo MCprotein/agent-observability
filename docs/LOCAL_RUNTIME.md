@@ -112,6 +112,10 @@ only the persisted port to another OS-assigned loopback port, and crash-safely r
 `status` reports an unreachable owned endpoint as unavailable. Degraded is reserved for an authenticated
 collector whose durable report is pending or whose bounded report refresh retries were exhausted.
 Connect refuses conflicting pre-existing OTEL values unless they match exactly; an unrelated pre-existing notify is not a conflict.
+When a later Codex or OMX update changes only fields outside the agentobs-owned OTEL keys and optional owned
+notify slot, the next explicit setup/connect rebases those unowned changes into both sides of the ownership
+snapshot. A later disconnect therefore preserves them while restoring only the prior owned values. Managed-value
+or file-mode changes still fail closed, and the live config is never overwritten during snapshot rebasing.
 Before changing the file, it stores the exact prior and connected bytes, hashes, existence, permission modes
 and transaction phase in `runtime/integrations/codex/codex-config-ownership-v1.json` with private permissions.
 A lock scoped to the canonical Codex config path serializes supported lifecycle writers. After the temporary file
@@ -122,9 +126,10 @@ the next lifecycle command after a process crash.
 
 `status codex [root]` reports config ownership and authenticated collector health. `disconnect codex [root]`
 first restores the exact pre-connect LaunchAgent plist and loaded state; it stops and removes only a service
-created by connect. It then restores the exact prior config bytes and mode, or removes the config if connect
-created it, only while the complete current bytes and mode equal the recorded connected state at the commit
-checks. An edit observed by those checks fails closed and is preserved; the non-cooperating open-descriptor
+created by connect. It then restores the snapshot's exact prior config bytes and mode, including any unowned
+edits accepted by an explicit setup/connect rebase. A config created by connect is removed only when no such
+unowned edit made it an externally meaningful file. Restoration proceeds only while the complete current bytes
+and mode equal the recorded connected state at the commit checks. An edit observed by those checks fails closed and is preserved; the non-cooperating open-descriptor
 limitation above still applies. SQLite, JSONL and HTML data remain.
 
 The raw notify argument exists transiently only in the bounded foreground projector and is reduced before

@@ -6,7 +6,7 @@
 
 ## Current and target stack
 
-현재 `v1.8.2`는 **Released**다. macOS standalone은 Codex, Claude Code와 Cursor의 private
+현재 `v1.8.3`는 **In Progress**다. macOS standalone은 Codex, Claude Code와 Cursor의 private
 handoff 수동 import를 daemon과 network 없이 계속 제공한다. 선택적 Codex automatic path는 private-CA
 HTTPS와 exact private random request header로 인증하는 `127.0.0.1` OTLP/HTTP JSON receiver,
 pre-transport projected notify supplement와 LaunchAgent를 추가한다. 이 transport는 mTLS가 아니다. Rust 경로는
@@ -290,9 +290,12 @@ anti-corruption layer다.
   `otel.log_user_prompt=false`, `otel.environment="local"`이다. top-level `notify`가 비어 있을 때만 agentobs
   notify를 추가 소유하며 기존 valid non-empty string-array notify는 그대로 보존하고
   `external_preserved`로 보고한다. malformed notify 또는 기존 OTEL 값이 다르면 connect는 config를
-  수정하지 않고 conflict로 중단한다. `disconnect codex`는 LaunchAgent 종료를 먼저 확인하고 commit 전
+  수정하지 않고 conflict로 중단한다. 연결 뒤 비소유 field만 바뀐 경우 명시적 setup/connect는 소유
+  값과 mode의 exact match를 확인하고 live config를 수정하지 않은 채 prior/connected snapshot을
+  재조정한다. 소유 field 또는 mode 변경은 계속 fail-closed 한다. `disconnect codex`는 LaunchAgent 종료를 먼저 확인하고 commit 전
   반복 검사에서 현재 전체 bytes/mode가 snapshot의 connected state와 같을 때만 이전 bytes/mode를
-  복원하거나 연결 전 파일이 없었다면 제거한다. 검사에서 관측된 edit는 보존한다. agentobs writer는
+  복원하며, 재조정된 비소유 edit도 보존한다. 연결 전 파일이 없고 비소유 edit도 없다면 파일을 제거한다.
+  재조정 전 direct disconnect와 검사에서 관측된 edit는 conflict로 보존한다. agentobs writer는
   lock으로 직렬화하지만 arbitrary non-cooperating open-descriptor write를 배제하는 portable filesystem
   CAS는 제공하지 않는다. Crash
   phase는 다음 lifecycle command에서 복구하며 conflict와 rollback failure는 사용자 설정을 덮어쓰지 않는다.

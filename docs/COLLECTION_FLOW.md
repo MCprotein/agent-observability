@@ -115,8 +115,10 @@ verifies health before taking the non-conflicting Codex OTEL config
 ownership. A private
 LaunchAgent transaction records prior plist bytes/mode and loaded state; failure or crash restores that exact
 state instead of unconditionally removing a service. `disconnect codex` first converges the LaunchAgent to its
-recorded prior state, then restores the exact prior Codex config only while the complete connected bytes and mode
-still match. It retains local observations. Unacknowledged SQLite report generations survive crashes; startup
+recorded prior state. If later edits changed only fields outside the owned OTEL keys and optional notify slot,
+an explicit setup/connect first rebases them into the ownership snapshot without rewriting the live config;
+owned-value or mode changes remain fail-closed. Disconnect then restores the rebased prior Codex config only
+while the complete connected bytes and mode still match. It retains local observations. Unacknowledged SQLite report generations survive crashes; startup
 reconciles them and bounded exponential retries expose an exhausted refresh as degraded health through CLI/UI.
 Continuous ingest only advances the durable generation and refresh request epoch; it does not repeatedly rebuild
 the growing full report. After one quiet period, the renderer visits source records one at a time, retains only

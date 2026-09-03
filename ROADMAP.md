@@ -55,7 +55,7 @@ gate를 통과해 추가한다.
 | v0.x | Completed | Local-only PoC를 작은 minor release로 쪼개 검증했다. |
 | v1.x | Active | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
 
-## Active Train: v0.1.0-v1.8.2
+## Active Train: v0.1.0-v1.8.3
 
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
@@ -91,6 +91,7 @@ gate를 통과해 추가한다.
 | v1.8.0 | Released | Codex automatic local collection | Private-CA HTTPS `127.0.0.1` OTLP/HTTP JSON receiver with an exact private random request header, pre-transport projected fail-open notify supplement, macOS LaunchAgent lifecycle, exact Codex config ownership/restore, scalar-only adapter projection, automatic private report refresh, and unchanged daemon-free/network-free manual imports; Claude Code/Cursor automatic and commercial team remain TODO | Exact-source run `33629927036`, role-separated agent review recorded in `docs/reviews/v1.8.0.md`, merge `ff02332341244d326a9791feca01c151f854df12`, and release run `33639999475` passed; checksums, universal `x86_64 arm64`, both aliases, Package publication step, public Release, and five attestations verified |
 | v1.8.1 | Released | One-command Codex compatibility fix | `agentobs setup` detects and connects local Codex automatically, preserves a pre-existing Codex app notify command, owns only non-conflicting OTEL values when notify is occupied, keeps exact rollback semantics, and treats nested `--help` as help instead of a runtime path | Exact-source run `33654973198`, independent review in `docs/reviews/v1.8.1.md`, feature merge `c58a6aa92ef1d98f0dcb5c2abe41026d78cba5b1`, release-gate merge `853a142ec4178ef8acb23e352330d6bcc1e136a2`, and release run `33665212342` attempt 2 passed; checksums, universal `x86_64 arm64`, both aliases, Package publication step, public Release, fresh public install, and five attestations verified |
 | v1.8.2 | Released | Codex WebSocket telemetry correlation fix | Accept `codex.websocket_request` as the model-request start surface, correlate it with `codex.sse_event=response.completed` across collector restarts, preserve bounded privacy-safe state, and keep correlation-less global API events diagnostic-only | Exact-source run `33718729920`, independent review in `docs/reviews/v1.8.2.md`, merge `5698c88da3d3f77b0fc7023e564c22065d35c549`, and release run `33726590598` passed; checksums and all five payload attestations verified |
+| v1.8.3 | In Progress | Safe Codex ownership reconciliation | When agentobs-owned OTEL values are unchanged, rebase later non-owned Codex/OMX config changes into the ownership snapshot so one-command setup heals false conflicts and disconnect preserves those changes; managed value or mode edits remain fail-closed | Three-way ownership tests, actual local conflict recovery, full workspace/privacy checks, exact-source evidence and independent review required before release |
 
 ## Branch Strategy
 
