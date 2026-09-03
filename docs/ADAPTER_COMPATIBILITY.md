@@ -1,6 +1,6 @@
 # Adapter Compatibility Contract
 
-Status: v1.8.2 Released; Codex 0.152.1 automatic local boundary remains experimental with exact-revision release evidence passed; exact-version private imports supported
+Status: v1.8.3 Released; Codex 0.152.1 automatic local boundary remains experimental with exact-revision release evidence passed; exact-version private imports supported
 Last verified: 2026-09-03
 
 이 문서는 Codex, Claude Code, Cursor adapter가 어떤 공식 surface를 어떤 우선순위로 사용하고,
@@ -126,12 +126,14 @@ shell/MCP/file hooks remain diagnostic-only, and raw transcript/content fields a
 The v1.8.0 code adds a Codex-only OTLP/HTTP JSON receiver, bounded notify helper, exact config ownership and
 macOS LaunchAgent. It does not add OTLP/gRPC, Claude Code automatic collection, Cursor automatic collection,
 file scraping or a team transport. Manual imports remain the stable shared boundary. The automatic capability is
-pinned to Codex `0.152.1` for released v1.8.2. `codex.websocket_request` is the correlated request-start
+pinned to Codex `0.152.1` for released v1.8.3. `codex.websocket_request` is the correlated request-start
 surface and pairs with the completed SSE event without persisting raw identifiers. A correlation-less global
 `codex.api_request` remains diagnostic-only and cannot consume that completion. Actual-Codex E2E and
 exact-revision 5-run evidence passed for source `273d32a72bd145c67edd4292eae06b3c74011d46` in run
 `33718729920`.
-The previous v1.8.0 evidence passed for final source `2d2dcc004fbdf2bc7aaa487ea408ac9100456e1e`, and its tag,
-Package and public Release were published from merge `ff02332341244d326a9791feca01c151f854df12`.
+The v1.8.3 exact-source automatic evidence passed for final source
+`5e1cdb3dabd8ed60bbe3aa819f142109d4b01459` in run `33734662082`; the public release was published from
+merge `2695f9a85759ebe1f902e8734e080743d8f6674d`. Its ownership reconciliation does not widen the pinned
+Codex version or platform boundary.
 Other platforms fail closed for automatic setup until equivalent service, no-follow, identity, permission and
 execution evidence exists; manual private imports retain their existing supported boundary.
