@@ -4,7 +4,7 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 외부 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.8.2 준비 중.** 기존 Codex, Claude Code, Cursor private handoff 수동 import는
+> **v1.8.2 출시.** 기존 Codex, Claude Code, Cursor private handoff 수동 import는
 > daemon이나 network 없이 계속 동작한다. 선택적 Codex 자동 수집은 private CA HTTPS와
 > exact private random request header로 보호한 `127.0.0.1` OTLP/HTTP JSON receiver와 macOS
 > LaunchAgent를 사용한다. 기존 Codex 앱의 `notify` 명령이 있으면 그대로 보존하고, 비어 있을 때만
@@ -122,7 +122,7 @@ launchd가 로그인 후 다시 실행할 수 있도록 등록한 표시다. `ag
 | 로컬 설정 UI | 지원 | UI server는 `ui` 실행 중에만 존재하며 Codex 연결과 runtime config 관리 제공 |
 | 내장 sample 체험 | 지원 | 외부 파일 없이 `demo` 한 명령으로 확인 |
 | Canonical handoff 수동 import | 지원 | 세 agent 모두 daemon과 network 없이 private JSONL import 가능 |
-| Codex 자동 연결 | 실험적 (v1.8.2 후보) | `setup`이 macOS Codex를 자동 연결하며 기존 notify를 보존하고 loopback OTLP/HTTP JSON을 사용 |
+| Codex 자동 연결 | 실험적 (v1.8.2 출시) | `setup`이 macOS Codex를 자동 연결하며 기존 notify를 보존하고 loopback OTLP/HTTP JSON을 사용 |
 | Claude Code/Cursor 자동 연결 | TODO | 현재 자동 receiver/config 연결은 Codex만 지원 |
 | Commercial team profile | TODO | G0-G4 승인과 evidence 전에는 완료로 간주하지 않음 |
 
@@ -212,12 +212,12 @@ capability entry는 v1.8.1 기준 `supported`다. v1.8.1 tag, Package와 public 
 Codex `0.152.1`에서 관측된 correlation-less global HTTP API event는 diagnostic-only로 유지한다.
 WebSocket 경로는
 `codex.websocket_request`를 시작 이벤트로 삼고 token usage가 있는 `response.completed`와 private
-correlation ID로 연결한다. v1.8.2의 exact-revision release evidence는 아직 진행 중이며, 게시된 최신
-안정판은 v1.8.1이다.
+correlation ID로 연결한다. v1.8.2의 exact-revision five-run evidence와 실제 Codex e2e가 통과했으며,
+게시된 최신 안정판은 v1.8.2다.
 
 | Agent | Pinned / verified version | 현재 지원 | 알려진 제한 |
 | --- | --- | --- | --- |
-| Codex | 수동 verified `0.150.1`; 자동 candidate `0.152.1` (release evidence 진행 중) | 수동 handoff + 자동 local OTLP/HTTP JSON/notify | 자동 경로는 macOS only |
+| Codex | 수동 verified `0.150.1`; 자동 release-verified `0.152.1` | 수동 handoff + 실험적 자동 local OTLP/HTTP JSON/notify | 자동 경로는 macOS only; `0.153.0`은 미검증 |
 | Claude Code | `2.1.248` | OTel/hook canonical handoff 수동 import | 자동 연결 TODO, user interrupt signal 미확인 |
 | Cursor | `3.17.21` | generic tool canonical handoff 수동 import | 자동 연결 TODO, 일부 shell/MCP/file event는 diagnostic-only |
 
