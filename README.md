@@ -4,7 +4,9 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 외부 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.8.3 출시.** 기존 Codex, Claude Code, Cursor private handoff import는 daemon이나
+> **v1.8.4 출시.** SQLite lock과 I/O 오류를 schema corruption으로 잘못 표시하지 않고 실제 storage
+> error로 유지하며, report concurrency 검증을 scheduler timing에 의존하지 않도록 고쳤다. 기존 Codex,
+> Claude Code, Cursor private handoff import는 daemon이나
 > network 없이 계속 동작한다. v1.8.2에서 추가된 선택적 Codex WebSocket 자동 수집은 private CA HTTPS와
 > exact private random request header로 보호한 `127.0.0.1` OTLP/HTTP JSON receiver와 macOS
 > LaunchAgent를 사용한다. 기존 Codex 앱의 `notify` 명령이 있으면 그대로 보존하고, 비어 있을 때만
@@ -20,7 +22,7 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 > script는 `agentobs setup ~/.agent-observability --no-open`처럼 root를 명시한다. 자동 연결은 이후
 > 설정 UI 또는 고급 lifecycle 명령으로 언제든 추가할 수 있다.
 
-아래 automatic 명령과 설치 경로는 게시된 최신 안정판 v1.8.3 기준이다.
+아래 automatic 명령과 설치 경로는 게시된 최신 안정판 v1.8.4 기준이다.
 
 ## 빠른 시작
 
@@ -30,14 +32,14 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 release checksum과 실행 파일 버전을 확인한 뒤 `~/.local/bin`에 원자적으로 설치하고, 현재 shell의
 profile에 PATH 블록을 한 번만 등록한다.
 
-검증된 v1.8.3 installer를 사용한다.
+검증된 v1.8.4 installer를 사용한다.
 
 ```bash
 (
   set -eu
   installer="$(mktemp)"
   trap 'rm -f "$installer"' 0
-  curl -fsSL https://github.com/MCprotein/agent-observability/releases/download/v1.8.3/install.sh -o "$installer"
+  curl -fsSL https://github.com/MCprotein/agent-observability/releases/download/v1.8.4/install.sh -o "$installer"
   sh "$installer"
 )
 ```
@@ -125,7 +127,7 @@ launchd가 로그인 후 다시 실행할 수 있도록 등록한 표시다. `ag
 | 로컬 설정 UI | 지원 | UI server는 `ui` 실행 중에만 존재하며 Codex 연결과 runtime config 관리 제공 |
 | 내장 sample 체험 | 지원 | 외부 파일 없이 `demo` 한 명령으로 확인 |
 | Canonical handoff 수동 import | 지원 | 세 agent 모두 daemon과 network 없이 private JSONL import 가능 |
-| Codex 자동 연결 | 실험적 (v1.8.3 출시) | `setup`이 macOS Codex를 자동 연결하고, 기존 notify와 비소유 설정을 보존하며 loopback OTLP/HTTP JSON을 사용 |
+| Codex 자동 연결 | 실험적 (v1.8.4 최신) | `setup`이 macOS Codex를 자동 연결하고, 기존 notify와 비소유 설정을 보존하며 loopback OTLP/HTTP JSON을 사용 |
 | Claude Code/Cursor 자동 연결 | TODO | 현재 자동 receiver/config 연결은 Codex만 지원 |
 | Commercial team profile | TODO | G0-G4 승인과 evidence 전에는 완료로 간주하지 않음 |
 
@@ -216,12 +218,13 @@ Codex `0.152.1`에서 관측된 correlation-less global HTTP API event는 diagno
 WebSocket 경로는
 `codex.websocket_request`를 시작 이벤트로 삼고 token usage가 있는 `response.completed`와 private
 correlation ID로 연결한다. v1.8.2에서 이 상관관계가 추가됐고, v1.8.3은 이후 비소유 Codex 설정을
-안전하게 ownership snapshot에 재조정한다. 두 경로 모두 exact-revision evidence와 실제 Codex e2e를
-통과했으며 게시된 최신 안정판은 v1.8.3이다.
+안전하게 ownership snapshot에 재조정한다. v1.8.4는 이 경계를 넓히지 않고 SQLite operational-error
+fidelity와 deterministic concurrency coverage를 보강했다. 게시된 최신 안정판은 v1.8.4이며 automatic
+capability의 공식 release pin은 계속 Codex 0.152.1이다.
 
 | Agent | Pinned / verified version | 현재 지원 | 알려진 제한 |
 | --- | --- | --- | --- |
-| Codex | 수동 verified `0.150.1`; 자동 release-verified `0.152.1` | 수동 handoff + 실험적 자동 local OTLP/HTTP JSON/notify | 자동 경로는 macOS only; `0.153.0`은 미검증 |
+| Codex | 수동 verified `0.150.1`; 자동 release-verified `0.152.1` | 수동 handoff + 실험적 자동 local OTLP/HTTP JSON/notify | 자동 경로는 macOS only; `0.153.0`은 one-machine smoke만 통과했고 release 미검증/미지원 |
 | Claude Code | `2.1.248` | OTel/hook canonical handoff 수동 import | 자동 연결 TODO, user interrupt signal 미확인 |
 | Cursor | `3.17.21` | generic tool canonical handoff 수동 import | 자동 연결 TODO, 일부 shell/MCP/file event는 diagnostic-only |
 
@@ -327,7 +330,7 @@ npm login \
   --scope=@mcprotein \
   --auth-type=legacy \
   --registry=https://npm.pkg.github.com
-npm install --global @mcprotein/agent-observability@1.8.3 \
+npm install --global @mcprotein/agent-observability@1.8.4 \
   --registry=https://npm.pkg.github.com
 ```
 

@@ -92,7 +92,7 @@ gate를 통과해 추가한다.
 | v1.8.1 | Released | One-command Codex compatibility fix | `agentobs setup` detects and connects local Codex automatically, preserves a pre-existing Codex app notify command, owns only non-conflicting OTEL values when notify is occupied, keeps exact rollback semantics, and treats nested `--help` as help instead of a runtime path | Exact-source run `33654973198`, independent review in `docs/reviews/v1.8.1.md`, feature merge `c58a6aa92ef1d98f0dcb5c2abe41026d78cba5b1`, release-gate merge `853a142ec4178ef8acb23e352330d6bcc1e136a2`, and release run `33665212342` attempt 2 passed; checksums, universal `x86_64 arm64`, both aliases, Package publication step, public Release, fresh public install, and five attestations verified |
 | v1.8.2 | Released | Codex WebSocket telemetry correlation fix | Accept `codex.websocket_request` as the model-request start surface, correlate it with `codex.sse_event=response.completed` across collector restarts, preserve bounded privacy-safe state, and keep correlation-less global API events diagnostic-only | Exact-source run `33718729920`, independent review in `docs/reviews/v1.8.2.md`, merge `5698c88da3d3f77b0fc7023e564c22065d35c549`, and release run `33726590598` passed; checksums and all five payload attestations verified |
 | v1.8.3 | Released | Safe Codex ownership reconciliation | When agentobs-owned OTEL values are unchanged, rebase later non-owned Codex/OMX config changes into the ownership snapshot so one-command setup heals false conflicts and disconnect preserves those changes; managed value or mode edits remain fail-closed | Exact-source run `33734662082`, independent review in `docs/reviews/v1.8.3.md`, merge `2695f9a85759ebe1f902e8734e080743d8f6674d`, and release run `33755151845` passed; all five distributable checksums and attestations verified; public v1.8.3 setup recovered the real local conflict without changing Codex config bytes and remained idempotent |
-| v1.8.4 | In Progress | SQLite lock error fidelity and deterministic concurrency coverage | Preserve SQLite busy/I/O failures as typed storage errors instead of reporting schema corruption, and remove scheduler-dependent sustained-write test setup without weakening report generation fences | Induced lock regression, deterministic concurrent-write tests, repeated local-store runs, full workspace checks, exact-source evidence and independent review required before release |
+| v1.8.4 | Released | SQLite lock error fidelity and deterministic concurrency coverage | Preserve SQLite busy/I/O failures as typed storage errors instead of reporting schema corruption, and remove scheduler-dependent sustained-write test setup without weakening report generation fences | Exact-source run `33780806420`, independent architecture/code/test review in `docs/reviews/v1.8.4.md`, merge `869791e97c0168eed1bbb2961e5ec3cbd1c3233a`, and release run `33790634168` attempt 2 passed; all five distributable checksums and attestations verified; public v1.8.4 install and a one-machine Codex 0.153.0 post-publication smoke passed without changing the official 0.152.1 compatibility pin |
 
 ## Branch Strategy
 
@@ -110,10 +110,6 @@ gate를 통과해 추가한다.
   are complete. A role-separated subagent review can provide that independent evidence.
   Review evidence records the reviewer role, reviewed commit SHA, verdict, and resolved
   blocking findings. An incomplete gate keeps the PR in draft.
-- Confirm the resulting commit on `main`, switch to and update local `main`, then
-  delete the merged release branch locally and remotely. Start the next version
-  on a new branch from the updated `main`; preserve a merged branch only when its
-  PR records a concrete reason and removal condition.
 - After the release PR is merged, create one immutable annotated `vX.Y.Z` tag on
   the resulting `main` commit. The tag-triggered workflow must reject a tag that
   is not contained in `main` or does not match Cargo, root npm, and distribution
@@ -122,6 +118,12 @@ gate를 통과해 추가한다.
   GitHub Release and the same universal Rust executable through GitHub Packages.
   A failed publication keeps the GitHub Release in draft; never move or reuse a
   published version tag.
+- After publication and public-install QA, use a separate reviewed docs branch to
+  synchronize the README install path, ROADMAP `Released` state, release review,
+  and current-release documents. Delete each merged release/docs branch locally
+  and remotely. Start the next version only from `main` after that docs PR lands;
+  preserve a merged branch only when its PR records a concrete reason and removal
+  condition.
 
 The contributor-facing procedure is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -149,16 +151,19 @@ Team 항목은 local receiver나 collector endpoint 하나로 완료되지 않�
 2. 가장 작은 완성 범위로 구현한다.
 3. 변경된 동작을 fixture나 smoke로 검증한다.
 4. privacy/redaction boundary가 약해지지 않았는지 확인한다.
-5. README와 ROADMAP의 상태를 같이 갱신한다.
+5. README에는 candidate scope를, ROADMAP과 release review에는 아직 게시되지 않은 상태를 명확히 기록한다.
 6. 작성 역할과 분리된 독립 리뷰를 받고 blocking finding을 해결한다.
 7. 커밋 전에 금지된 외부 backend/vendor 참조가 들어오지 않았는지 검색한다.
-8. 완료 evidence가 모이고 PR이 mergeable이면 병합 직전에 상태를 `Released`로 바꾼다.
-   병합이 완료되지 않으면 상태를 되돌린다.
+8. 완료 evidence가 모이고 PR이 mergeable이면 release review를 `Candidate`, ROADMAP을
+   `In Progress`로 유지한 채 exact source와 남은 publication gate를 고정한다.
 9. release PR을 `main`에 병합하고 resulting commit SHA와 PR 상태를 확인한다.
 10. 병합 SHA에 annotated `vX.Y.Z` tag를 생성하고 Release, Package, checksum과
     provenance 게시 결과를 확인한다.
-11. local `main`을 갱신한 뒤 병합된 branch를 local/remote에서 삭제한다.
-12. 다음 버전은 갱신된 `main`에서 새 release branch로 시작한다.
+11. publication과 public-install QA가 통과하면 별도 post-publication docs branch에서 README 설치
+    버전, ROADMAP `Released`, release review evidence와 current-release 문서를 함께 갱신하고 독립
+    리뷰 후 병합한다. 이 후속 커밋은 immutable release tag의 제품 tree를 바꾸지 않는다.
+12. 각 PR 병합 뒤 local `main`을 갱신하고 병합된 branch를 local/remote에서 삭제한다.
+13. 다음 버전은 post-publication 문서가 반영된 `main`에서 새 release branch로 시작한다.
 
 ## Non-Skippable Gates
 

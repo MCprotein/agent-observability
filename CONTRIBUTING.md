@@ -17,14 +17,18 @@ agent-observability는 버전 단위의 작은 pull request로 변경을 검토�
    역할, 검토한 commit SHA, verdict, finding과 해결 결과를 기록한다. 리뷰는 테스트를
    대체하지 않으며, 실행하지 못한 gate를 통과한 것으로 표시하지 않는다.
 7. exit evidence가 모두 모이고 PR이 mergeable인 것을 확인한 뒤에만 draft를 해제한다.
-   최종 release 상태 변경은 병합 직전에 수행하고, 병합이 완료되지 않으면 상태를
-   되돌려 `main`에 없는 버전을 `Released`로 방치하지 않는다.
+   release review는 `Candidate`, ROADMAP은 `In Progress`로 유지해 아직 게시되지 않은
+   버전을 `Released`로 표시하지 않는다.
 8. PR을 `main`에 병합한 뒤 resulting commit SHA와 PR 상태를 확인한다.
 9. 병합 SHA에 annotated `vX.Y.Z` tag를 만들고 push한다. Release workflow가 GitHub
    Release와 GitHub Package를 모두 게시할 때까지 결과를 확인한다.
-10. `main`으로 전환해 remote와 동기화한 다음 병합된 release branch를 GitHub와 로컬에서
-   삭제한다. 보존해야 할 예외가 있으면 PR에 이유와 제거 조건을 기록한다.
-11. 다음 버전은 병합 결과를 포함한 최신 `main`에서 새 release branch로 시작한다.
+10. 공개 Release를 다시 내려받아 checksum, attestation, 설치와 필요한 사용자 경로 QA를
+    검증한다.
+11. 별도 post-publication docs branch에서 README 설치 버전, ROADMAP `Released`, release review
+    evidence와 current-release 문서를 함께 갱신하고 독립 리뷰 후 `main`에 병합한다.
+12. 각 PR 병합 뒤 remote와 동기화하고 병합된 release/docs branch를 GitHub와 로컬에서
+    삭제한다. 보존해야 할 예외가 있으면 PR에 이유와 제거 조건을 기록한다.
+13. 다음 버전은 post-publication 문서가 반영된 최신 `main`에서 새 release branch로 시작한다.
 
 버전 브랜치 하나에는 한 버전만 포함한다. 현재 버전을 `Released`, `Blocked`, 또는
 `Superseded`로 정리하기 전에는 다음 버전 구현을 섞지 않는다. 큰 버전을 여러 사람이
