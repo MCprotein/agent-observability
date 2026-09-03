@@ -35,9 +35,10 @@ const USAGE: &str = "usage:\n  cargo run -p xtask -- perf <local|automatic> --pr
 const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-performance-v1.yaml");
 const AUTOMATIC_PROTOCOL: &str =
     include_str!("../../crates/contracts/performance/automatic-local-performance-v1.yaml");
-const AUTOMATIC_PROTOCOL_REVISION: &str =
-    "v1.8.2-codex-0.152.1-private-ca-header-real-e2e-synthetic-diagnostics-rss-p95-v3";
+const AUTOMATIC_PROTOCOL_REVISION: &str = "v1.8.3-codex-0.152.1-private-ca-header-ownership-rebase-real-e2e-synthetic-diagnostics-rss-p95-v4";
 const AUTOMATIC_CODEX_VERSION: &str = "codex-cli 0.152.1";
+const AUTOMATIC_OWNERSHIP_REBASE_PROBE: &[u8] =
+    b"\n[hooks.state.\"agentobs-release-evidence\"]\ntrusted_hash = \"content-free\"\n";
 const AUTOMATIC_NOTIFY_SENTINELS: [&[u8]; 3] = [
     b"AUTOMATIC_RAW_CWD_SENTINEL",
     b"AUTOMATIC_RAW_PROMPT_SENTINEL",
@@ -1388,7 +1389,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
     let smoke = AutomaticConfig::for_profile(Profile::Smoke);
     AutomaticProtocol {
         schema_version: "automatic_local_performance.v1".into(),
-        version: "v1.8.2".into(),
+        version: "v1.8.3".into(),
         protocol_revision: AUTOMATIC_PROTOCOL_REVISION.into(),
         purpose: "normative automatic release evidence for real Codex compatibility, local lifecycle, privacy, and synthetic collector performance".into(),
         profiles: AutomaticProtocolProfiles {
@@ -1416,7 +1417,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
         workload: AutomaticProtocolWorkload {
             lifecycle_preflight: "bounded built-binary no-argument setup --no-open under isolated HOME and CODEX_HOME, installed Codex 0.152.1 strict config loading, and one actual codex exec against a content-free loopback Responses fixture".into(),
             lifecycle_seed: "exact private Codex config bytes and permission mode".into(),
-            lifecycle_assertions: "connected config, exact Codex 0.152.1 version and strict config loading, ready or degraded collector, installed KeepAlive LaunchAgent plist, pre-failure synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, unexpected SIGKILL service termination and bounded unaided launchd KeepAlive recovery, post-recovery synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service".into(),
+            lifecycle_assertions: "connected config, safe rebase of later unowned Codex config edits through repeated setup, exact Codex 0.152.1 version and strict config loading, ready or degraded collector, installed KeepAlive LaunchAgent plist, pre-failure synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, unexpected SIGKILL service termination and bounded unaided launchd KeepAlive recovery, post-recovery synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect preserving the rebased edit, exact managed config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service".into(),
             lifecycle_cleanup: "best-effort bounded disconnect, bootout, exact seed restoration, plist removal, and isolated directory removal on success or error".into(),
             codex_config_load_boundary: "installed @openai/codex 0.152.1 exact version, strict diagnostic loading, and actual codex exec proving exporter construction and native OTLP delivery without an external model request".into(),
             observed_compatibility_correction: "Codex 0.151.0 on macOS fails exporter construction when client certificate and client private-key identity fields are present; corrected product config uses private-CA HTTPS plus the exact x-agent-observability-token private random request header and no client identity fields".into(),
@@ -1911,6 +1912,7 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
         require_collector_ready_or_degraded(&setup)
             .map_err(|_| "automatic lifecycle setup stage failed")?;
         verify_installed_codex_compatibility(&cleanup)?;
+        verify_automatic_ownership_rebase(binary, &root, &mut cleanup)?;
         let service =
             output_value(&setup, "service").ok_or("automatic lifecycle setup omitted service")?;
         if !service.starts_with("io.agent-observability.collector.") {
@@ -2040,6 +2042,68 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
     })();
     drop(model_server);
     combine_cleanup(smoke, cleanup.cleanup())
+}
+
+fn verify_automatic_ownership_rebase(
+    binary: &Path,
+    root: &Path,
+    cleanup: &mut AutomaticLifecycleCleanup<'_>,
+) -> Result<(), String> {
+    let connected = fs::read(&cleanup.config)
+        .map_err(|error| format!("read connected Codex config for ownership rebase: {error}"))?;
+    if connected
+        .windows(AUTOMATIC_OWNERSHIP_REBASE_PROBE.len())
+        .any(|window| window == AUTOMATIC_OWNERSHIP_REBASE_PROBE)
+    {
+        return Err("automatic ownership rebase probe already existed".into());
+    }
+    let mut edited = connected;
+    edited.extend_from_slice(AUTOMATIC_OWNERSHIP_REBASE_PROBE);
+    fs::write(&cleanup.config, &edited).map_err(|error| {
+        format!("write external Codex config edit for ownership rebase: {error}")
+    })?;
+    fs::set_permissions(
+        &cleanup.config,
+        Permissions::from_mode(AUTOMATIC_LIFECYCLE_SEED_MODE),
+    )
+    .map_err(|error| format!("protect ownership-rebase Codex config: {error}"))?;
+
+    let conflicted = run_bounded_product_command_with_env(
+        binary,
+        &["status", "codex", path_text(root)?],
+        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+        &cleanup.environment(),
+    )?;
+    require_output_line(&conflicted, "config", "conflict")?;
+
+    let setup = run_bounded_product_command_with_env(
+        binary,
+        &["setup", "--no-open"],
+        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+        &cleanup.environment(),
+    )
+    .map_err(|_| "automatic lifecycle ownership rebase setup failed")?;
+    require_output_line(&setup, "config", "connected")
+        .map_err(|_| "automatic lifecycle ownership rebase setup failed")?;
+    require_collector_ready_or_degraded(&setup)
+        .map_err(|_| "automatic lifecycle ownership rebase setup failed")?;
+    verify_exact_file(
+        &cleanup.config,
+        &edited,
+        AUTOMATIC_LIFECYCLE_SEED_MODE,
+        "ownership-rebased connected Codex config",
+    )?;
+
+    let mut rebased_seed = cleanup.seed.clone();
+    rebased_seed.extend_from_slice(AUTOMATIC_OWNERSHIP_REBASE_PROBE);
+    cleanup.seed = rebased_seed;
+    let status = run_bounded_product_command_with_env(
+        binary,
+        &["status", "codex", path_text(root)?],
+        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+        &cleanup.environment(),
+    )?;
+    require_output_line(&status, "config", "connected")
 }
 
 fn automatic_report_record_count(
@@ -5351,7 +5415,7 @@ fn render_automatic_manifest(
         "passed-actual-codex-0.152.1-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response"
     };
     let mut manifest = format!(
-        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: {release_readiness}\nreal_codex_e2e_status: {real_codex_e2e_status}\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.152.1\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.152.1-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: {real_codex_e2e_gate}\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_rss_p95_kib_max: {}\n  collector_peak_rss_kib: {}\n  collector_rss_samples_min: {}\n  collector_rss_observed_max_gap_ms: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
+        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: {release_readiness}\nreal_codex_e2e_status: {real_codex_e2e_status}\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.152.1\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-ownership-rebase-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.152.1-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: {real_codex_e2e_gate}\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_rss_p95_kib_max: {}\n  collector_peak_rss_kib: {}\n  collector_rss_samples_min: {}\n  collector_rss_observed_max_gap_ms: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
         profile_name(config.profile),
         profile_name(config.profile),
         env!("CARGO_PKG_VERSION"),
@@ -5466,7 +5530,7 @@ fn automatic_evidence_error_code(error: &str) -> &'static str {
 
 fn validate_automatic_manifest_shape(manifest: &str) -> Result<AutomaticEvidenceManifest, String> {
     let evidence = parse_automatic_manifest(manifest)?;
-    let expected_lifecycle = "built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect";
+    let expected_lifecycle = "built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-ownership-rebase-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect";
     let expected_collector = "built-agent-observability-collector-serve-subprocess";
     let expected_transport = "private-ca-https-exact-private-random-request-header-not-mtls";
     let expected_config = "installed-codex-0.152.1-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp";
@@ -5623,7 +5687,7 @@ fn validate_automatic_release_host(host: &AutomaticEvidenceHost) -> Result<(), S
 
 fn validate_automatic_release_workload(evidence: &AutomaticEvidenceManifest) -> Result<(), String> {
     let expected_gate = "passed-actual-codex-0.152.1-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response";
-    let expected_lifecycle = "built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect";
+    let expected_lifecycle = "built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-ownership-rebase-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect";
     let expected_collector = "built-agent-observability-collector-serve-subprocess";
     let expected_transport = "private-ca-https-exact-private-random-request-header-not-mtls";
     let expected_config = "installed-codex-0.152.1-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp";
@@ -6950,7 +7014,7 @@ mod tests {
         validate_automatic_manifest_shape(&passed).unwrap();
 
         let missing_lifecycle = manifest.replace(
-            "  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n",
+            "  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-ownership-rebase-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n",
             "",
         );
         assert!(validate_automatic_manifest_shape(&missing_lifecycle).is_err());
@@ -8022,7 +8086,16 @@ mod tests {
         .unwrap();
         assert!(child.wait().unwrap().success());
         sampler.confirm_process_exit();
-        thread::sleep(Duration::from_millis(30));
+        let started = Instant::now();
+        while !sampler.handle.as_ref().unwrap().is_finished()
+            && started.elapsed() < SAMPLER_STOP_TIMEOUT
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            sampler.handle.as_ref().unwrap().is_finished(),
+            "pressure sampler did not observe the confirmed child exit"
+        );
         let peaks = sampler.stop().unwrap();
         assert!(peaks.process_exit_observed);
         fs::remove_dir_all(root).unwrap();

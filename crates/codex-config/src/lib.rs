@@ -15,6 +15,7 @@ const SNAPSHOT_FILE: &str = "codex-config-ownership-v1.json";
 const LOCK_FILE: &str = ".codex-config-ownership.lock";
 const SNAPSHOT_VERSION: &str = "codex_config_ownership.v1";
 const AUTH_HEADER_NAME: &str = "x-agent-observability-token";
+const OWNED_OTEL_KEYS: [&str; 3] = ["exporter", "log_user_prompt", "environment"];
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: u64 = MAX_CONFIG_BYTES * 4 + 8192;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -331,10 +332,18 @@ impl CodexConfigManager {
         mutations: &impl FileMutations,
         snapshot_path: &Path,
     ) -> Result<Option<ConnectionStatus>, ConfigError> {
-        let (mut snapshot, snapshot_file) = self.read_snapshot()?;
+        let (mut snapshot, mut snapshot_file) = self.read_snapshot()?;
         let managed = self.managed_values()?;
         let managed_fingerprint = managed.fingerprint(snapshot.owns_notify);
-        let state = self.snapshot_state(&snapshot)?;
+        let mut state = self.snapshot_state(&snapshot)?;
+        if state == SnapshotState::Conflict
+            && snapshot.phase == SnapshotPhase::Connected
+            && let Some(rebased_file) =
+                self.rebase_unowned_edits(mutations, &mut snapshot, &snapshot_file)?
+        {
+            snapshot_file = rebased_file;
+            state = SnapshotState::Connected;
+        }
         if snapshot.phase == SnapshotPhase::Rotating {
             if snapshot.pending_managed_fingerprint() != Some(managed_fingerprint.as_str()) {
                 return Err(ConfigError::Conflict);
@@ -373,7 +382,7 @@ impl CodexConfigManager {
         }
     }
 
-    /// Restores the exact pre-connect bytes when the managed values remain unchanged.
+    /// Restores the exact recorded prior state, including explicitly rebased unowned edits.
     ///
     /// # Errors
     ///
@@ -648,6 +657,45 @@ impl CodexConfigManager {
             &rotating_file,
             SnapshotState::RotationPrepared,
         )
+    }
+
+    fn rebase_unowned_edits(
+        &self,
+        mutations: &impl FileMutations,
+        snapshot: &mut OwnershipSnapshot,
+        snapshot_file: &ExistingFile,
+    ) -> Result<Option<ExistingFile>, ConfigError> {
+        let current = self.read_config()?;
+        if !current.existed || current.mode != snapshot.connected_mode {
+            return Ok(None);
+        }
+        let connected = parse_document(&snapshot.connected_bytes()?)?;
+        let current_document = parse_document(&current.bytes)?;
+        if !owned_values_match(&current_document, &connected, snapshot.owns_notify) {
+            return Ok(None);
+        }
+
+        let prior = parse_document(&snapshot.prior_bytes()?)?;
+        let mut rebased_prior = current_document.clone();
+        restore_owned_values(&mut rebased_prior, &prior, snapshot.owns_notify)?;
+        let rebased_prior = rebased_prior.to_string().into_bytes();
+
+        let confirmed = self.read_config()?;
+        if !confirmed.matches(&current.bytes, current.mode) {
+            return Err(ConfigError::Conflict);
+        }
+        snapshot.prior_existed = true;
+        snapshot.prior_hash = hash(&rebased_prior);
+        snapshot.prior_bytes_hex = hex_encode(&rebased_prior);
+        snapshot.prior_mode = current.mode;
+        snapshot.connected_hash = hash(&current.bytes);
+        snapshot.connected_bytes_hex = hex_encode(&current.bytes);
+        snapshot.connected_mode = current.mode;
+        Ok(Some(self.write_snapshot(
+            mutations,
+            snapshot,
+            snapshot_file,
+        )?))
     }
 
     fn finish_rotation(
@@ -1086,6 +1134,76 @@ fn replace_managed_values(document: &mut DocumentMut, managed: &ManagedValues, o
     otel.insert("exporter", value(managed.exporter()));
     otel.insert("log_user_prompt", value(false));
     otel.insert("environment", value("local"));
+}
+
+fn owned_values_match(current: &DocumentMut, connected: &DocumentMut, owns_notify: bool) -> bool {
+    if owns_notify {
+        if !items_match(current.get("notify"), connected.get("notify")) {
+            return false;
+        }
+    } else if current
+        .get("notify")
+        .is_some_and(|item| !valid_external_notify(item))
+    {
+        return false;
+    }
+    let current_otel = current.get("otel").and_then(Item::as_table_like);
+    let connected_otel = connected.get("otel").and_then(Item::as_table_like);
+    OWNED_OTEL_KEYS.iter().all(|key| {
+        items_match(
+            current_otel.and_then(|table| table.get(key)),
+            connected_otel.and_then(|table| table.get(key)),
+        )
+    })
+}
+
+fn items_match(left: Option<&Item>, right: Option<&Item>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.to_string() == right.to_string(),
+        _ => false,
+    }
+}
+
+fn restore_owned_values(
+    target: &mut DocumentMut,
+    prior: &DocumentMut,
+    owns_notify: bool,
+) -> Result<(), ConfigError> {
+    if owns_notify {
+        match prior.get("notify") {
+            Some(item) => target["notify"] = item.clone(),
+            None => {
+                target.remove("notify");
+            }
+        }
+    }
+
+    let prior_values = OWNED_OTEL_KEYS.map(|key| {
+        prior
+            .get("otel")
+            .and_then(Item::as_table_like)
+            .and_then(|table| table.get(key))
+            .cloned()
+    });
+    let target_otel = target
+        .get_mut("otel")
+        .and_then(Item::as_table_like_mut)
+        .ok_or(ConfigError::Conflict)?;
+    for (key, prior_value) in OWNED_OTEL_KEYS.into_iter().zip(prior_values) {
+        match prior_value {
+            Some(item) => {
+                target_otel.insert(key, item);
+            }
+            None => {
+                target_otel.remove(key);
+            }
+        }
+    }
+    if target_otel.is_empty() {
+        target.remove("otel");
+    }
+    Ok(())
 }
 
 fn notify_matches(item: &Item, managed: &ManagedValues) -> bool {
@@ -2327,6 +2445,258 @@ mod tests {
         assert!(matches!(manager.disconnect(), Err(ConfigError::Conflict)));
         assert_eq!(fs::read(&manager.config_path).unwrap(), edited);
         assert!(manager.snapshot_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconnect_rebases_unowned_edits_and_disconnect_preserves_them() {
+        let root = root("rebase-unowned-edit");
+        prepare(&root);
+        fs::write(root.join("config.toml"), b"model = 'before'\n").unwrap();
+        set_mode(&root.join("config.toml"), 0o600).unwrap();
+        let manager = manager(&root);
+        manager.connect().unwrap();
+        let mut edited = fs::read(&manager.config_path).unwrap();
+        edited.extend_from_slice(b"\n[hooks.state.test]\ntrusted_hash = 'added-later'\n");
+        fs::write(&manager.config_path, &edited).unwrap();
+
+        assert_eq!(manager.status().unwrap(), ConnectionStatus::Conflict);
+        assert_eq!(manager.connect().unwrap(), ConnectionStatus::Connected);
+        assert_eq!(manager.status().unwrap(), ConnectionStatus::Connected);
+        assert_eq!(fs::read(&manager.config_path).unwrap(), edited);
+
+        assert_eq!(
+            manager.disconnect().unwrap(),
+            ConnectionStatus::Disconnected
+        );
+        let restored = fs::read_to_string(&manager.config_path).unwrap();
+        assert!(restored.contains("model = 'before'"));
+        assert!(restored.contains("trusted_hash = 'added-later'"));
+        assert!(!restored.contains("[otel]"));
+        assert!(!manager.snapshot_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconnect_still_rejects_managed_edits() {
+        let edits = [
+            ("exporter", "protocol = \"json\"", "protocol = \"grpc\""),
+            (
+                "log-user-prompt",
+                "log_user_prompt = false",
+                "log_user_prompt = true",
+            ),
+            (
+                "environment",
+                "environment = \"local\"",
+                "environment = \"changed\"",
+            ),
+            (
+                "owned-notify",
+                ", \"codex-notify\",",
+                ", \"changed-notify\",",
+            ),
+        ];
+        for (name, from, to) in edits {
+            let root = root(&format!("rebase-managed-edit-{name}"));
+            prepare(&root);
+            let manager = manager(&root);
+            manager.connect().unwrap();
+            let text = fs::read_to_string(&manager.config_path).unwrap();
+            let edited = text.replace(from, to);
+            assert_ne!(edited, text, "test fixture did not contain {from}");
+            fs::write(&manager.config_path, &edited).unwrap();
+
+            assert!(matches!(manager.connect(), Err(ConfigError::Conflict)));
+            assert_eq!(fs::read_to_string(&manager.config_path).unwrap(), edited);
+            assert!(manager.snapshot_path().exists());
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnect_still_rejects_mode_only_edits() {
+        let root = root("rebase-mode-edit");
+        prepare(&root);
+        let manager = manager(&root);
+        manager.connect().unwrap();
+        let connected = fs::read(&manager.config_path).unwrap();
+        set_mode(&manager.config_path, 0o400).unwrap();
+
+        assert!(matches!(manager.connect(), Err(ConfigError::Conflict)));
+        assert_eq!(fs::read(&manager.config_path).unwrap(), connected);
+        assert_eq!(
+            unix_mode(&fs::metadata(&manager.config_path).unwrap()),
+            0o400
+        );
+        assert!(manager.snapshot_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconnect_preserves_later_unowned_notify_and_hook_trust_changes() {
+        let root = root("rebase-external-notify-and-hooks");
+        prepare(&root);
+        let original = b"notify = ['foreign', 'before']\nmodel = 'before'\n";
+        fs::write(root.join("config.toml"), original).unwrap();
+        set_mode(&root.join("config.toml"), 0o600).unwrap();
+        let manager = manager(&root);
+        manager.connect().unwrap();
+        let connected = fs::read_to_string(&manager.config_path).unwrap();
+        let edited = connected.replace("['foreign', 'before']", "['foreign', 'after']")
+            + "\n[hooks.state.\"project-hook\"]\ntrusted_hash = 'later'\n";
+        fs::write(&manager.config_path, &edited).unwrap();
+
+        assert_eq!(manager.connect().unwrap(), ConnectionStatus::Connected);
+        assert_eq!(fs::read_to_string(&manager.config_path).unwrap(), edited);
+        manager.disconnect().unwrap();
+        let restored = fs::read_to_string(&manager.config_path).unwrap();
+        assert!(restored.contains("notify = ['foreign', 'after']"));
+        assert!(restored.contains("trusted_hash = 'later'"));
+        assert!(!restored.contains("[otel]"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconnect_rejects_malformed_external_notify_without_rebasing_snapshot() {
+        for (name, notify) in [
+            ("string", "notify = \"command\"\n"),
+            ("table", "[notify]\ncommand = \"program\"\n"),
+            ("empty-array", "notify = []\n"),
+            ("non-string-array", "notify = [\"program\", 7]\n"),
+        ] {
+            let root = root(&format!("rebase-malformed-external-notify-{name}"));
+            prepare(&root);
+            fs::write(
+                root.join("config.toml"),
+                b"notify = [\"foreign\"]\nmodel = 'before'\n",
+            )
+            .unwrap();
+            set_mode(&root.join("config.toml"), 0o600).unwrap();
+            let manager = manager(&root);
+            manager.connect().unwrap();
+            let connected = fs::read_to_string(&manager.config_path).unwrap();
+            let edited = connected.replace("notify = [\"foreign\"]\n", notify);
+            assert_ne!(edited, connected, "test fixture did not contain notify");
+            fs::write(&manager.config_path, &edited).unwrap();
+            let snapshot = fs::read(manager.snapshot_path()).unwrap();
+
+            assert!(matches!(manager.connect(), Err(ConfigError::Conflict)));
+            assert_eq!(fs::read_to_string(&manager.config_path).unwrap(), edited);
+            assert_eq!(fs::read(manager.snapshot_path()).unwrap(), snapshot);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn reconnect_rebases_unowned_edit_when_config_did_not_previously_exist() {
+        let root = root("rebase-new-config-unowned-edit");
+        prepare(&root);
+        let manager = manager(&root);
+        manager.connect().unwrap();
+        let mut edited = fs::read(&manager.config_path).unwrap();
+        edited.splice(..0, b"theme = 'dark'\n".iter().copied());
+        fs::write(&manager.config_path, &edited).unwrap();
+
+        assert_eq!(manager.connect().unwrap(), ConnectionStatus::Connected);
+        assert_eq!(fs::read(&manager.config_path).unwrap(), edited);
+        manager.disconnect().unwrap();
+        assert_eq!(
+            fs::read_to_string(&manager.config_path).unwrap(),
+            "theme = 'dark'\n"
+        );
+        assert!(!manager.snapshot_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconnect_preserves_unowned_otel_values() {
+        let root = root("rebase-unowned-otel-value");
+        prepare(&root);
+        let manager = manager(&root);
+        manager.connect().unwrap();
+        let connected = fs::read_to_string(&manager.config_path).unwrap();
+        let edited = connected.replace(
+            "[otel]\n",
+            "[otel]\n# preserved external setting\ntrace_exporter = \"none\"\n",
+        );
+        fs::write(&manager.config_path, &edited).unwrap();
+
+        assert_eq!(manager.connect().unwrap(), ConnectionStatus::Connected);
+        assert_eq!(fs::read_to_string(&manager.config_path).unwrap(), edited);
+        manager.disconnect().unwrap();
+        let restored = fs::read_to_string(&manager.config_path).unwrap();
+        assert!(restored.contains("# preserved external setting"));
+        assert!(restored.contains("trace_exporter = \"none\""));
+        assert!(!restored.contains("exporter = {"));
+        assert!(!restored.contains("log_user_prompt"));
+        assert!(!restored.contains("environment = \"local\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconnect_rebase_snapshot_write_failure_is_retryable_without_config_loss() {
+        for apply_first in [false, true] {
+            let root = root(if apply_first {
+                "rebase-snapshot-applied-error"
+            } else {
+                "rebase-snapshot-write-error"
+            });
+            prepare(&root);
+            fs::write(root.join("config.toml"), b"model = 'before'\n").unwrap();
+            set_mode(&root.join("config.toml"), 0o600).unwrap();
+            let manager = manager(&root);
+            manager.connect().unwrap();
+            let mut edited = fs::read(&manager.config_path).unwrap();
+            edited.splice(..0, b"theme = 'dark'\n".iter().copied());
+            fs::write(&manager.config_path, &edited).unwrap();
+
+            assert!(matches!(
+                manager.connect_with(&FaultMutations::new(&[(1, apply_first)])),
+                Err(ConfigError::Io(_))
+            ));
+            assert_eq!(fs::read(&manager.config_path).unwrap(), edited);
+            assert_eq!(manager.connect().unwrap(), ConnectionStatus::Connected);
+            manager.disconnect().unwrap();
+            let restored = fs::read_to_string(&manager.config_path).unwrap();
+            assert!(restored.contains("theme = 'dark'"));
+            assert!(restored.contains("model = 'before'"));
+            assert!(!restored.contains("[otel]"));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn reconnect_rebases_unowned_edit_then_rotates_managed_values() {
+        let root = root("rebase-then-rotate");
+        prepare(&root);
+        let original = b"model = 'before'\n";
+        fs::write(root.join("config.toml"), original).unwrap();
+        set_mode(&root.join("config.toml"), 0o600).unwrap();
+        manager_with_security(&root, 4318, "first")
+            .connect()
+            .unwrap();
+        let mut edited = fs::read(root.join("config.toml")).unwrap();
+        edited.splice(..0, b"theme = 'dark'\n".iter().copied());
+        fs::write(root.join("config.toml"), &edited).unwrap();
+
+        let rotated = manager_with_security(&root, 5318, "second");
+        assert_eq!(rotated.connect().unwrap(), ConnectionStatus::Connected);
+        let connected = fs::read_to_string(&rotated.config_path).unwrap();
+        assert!(connected.contains("theme = 'dark'"));
+        assert!(connected.contains("https://127.0.0.1:5318/v1/logs"));
+        assert!(connected.contains("/tls/second/ca-certificate.pem"));
+        assert!(!connected.contains("/tls/first/"));
+
+        assert_eq!(
+            rotated.disconnect().unwrap(),
+            ConnectionStatus::Disconnected
+        );
+        let restored = fs::read_to_string(&rotated.config_path).unwrap();
+        assert!(restored.contains("theme = 'dark'"));
+        assert!(restored.contains("model = 'before'"));
+        assert!(!restored.contains("[otel]"));
         let _ = fs::remove_dir_all(root);
     }
 

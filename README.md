@@ -4,13 +4,15 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 외부 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.8.2 출시.** 기존 Codex, Claude Code, Cursor private handoff 수동 import는
-> daemon이나 network 없이 계속 동작한다. 선택적 Codex 자동 수집은 private CA HTTPS와
+> **v1.8.3 준비 중.** 기존 Codex, Claude Code, Cursor private handoff import는 daemon이나
+> network 없이 계속 동작한다. v1.8.2에서 추가된 선택적 Codex WebSocket 자동 수집은 private CA HTTPS와
 > exact private random request header로 보호한 `127.0.0.1` OTLP/HTTP JSON receiver와 macOS
 > LaunchAgent를 사용한다. 기존 Codex 앱의 `notify` 명령이 있으면 그대로 보존하고, 비어 있을 때만
 > content-free notify supplement를 설치한다. correlation identity가 있는 HTTP request와 WebSocket
 > request-start를 각각 해당 token completion과 연결하며, correlation-less global API event는
 > diagnostic-only로 둔다. 이 transport는 mTLS가 아니다.
+> setup은 기존 agentobs 소유 OTEL 값이 그대로인 경우 이후 추가된 비소유 Codex 설정을 보존하면서
+> ownership snapshot을 자동 재조정한다. 소유 값이 바뀌면 계속 fail-closed 한다.
 > Claude Code/Cursor 자동 수집과 commercial team profile은 아직 TODO다.
 
 > **v1.7 이하에서 업그레이드할 때:** 인자 없는 `agentobs setup`은 로컬 Codex를 감지한 경우에만
@@ -18,7 +20,7 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 > script는 `agentobs setup ~/.agent-observability --no-open`처럼 root를 명시한다. 자동 연결은 이후
 > 설정 UI 또는 고급 lifecycle 명령으로 언제든 추가할 수 있다.
 
-아래 automatic 명령과 설치 경로는 게시된 v1.8.1 기준이다.
+아래 automatic 명령과 설치 경로는 게시된 최신 안정판 v1.8.2 기준이다.
 
 ## 빠른 시작
 
@@ -28,14 +30,14 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 release checksum과 실행 파일 버전을 확인한 뒤 `~/.local/bin`에 원자적으로 설치하고, 현재 shell의
 profile에 PATH 블록을 한 번만 등록한다.
 
-검증된 v1.8.1 installer를 사용한다.
+검증된 v1.8.2 installer를 사용한다.
 
 ```bash
 (
   set -eu
   installer="$(mktemp)"
   trap 'rm -f "$installer"' 0
-  curl -fsSL https://github.com/MCprotein/agent-observability/releases/download/v1.8.1/install.sh -o "$installer"
+  curl -fsSL https://github.com/MCprotein/agent-observability/releases/download/v1.8.2/install.sh -o "$installer"
   sh "$installer"
 )
 ```
@@ -101,8 +103,9 @@ agentobs disconnect codex
 ```
 
 `disconnect`는 collector service를 연결 전의 정확한 plist와 loaded 상태로 되돌린 뒤 Codex 설정을
-연결 전의 정확한 bytes와 permission으로 복원한다. connect가 새로 만든 service/config만 종료하고
-제거한다. agentobs가 소유하지 않은 기존 `notify`는 연결 중에도 보존된다. 연결 뒤 설정 변경이 commit 전
+ownership snapshot의 prior bytes와 permission으로 복원한다. 명시적 setup/connect가 안전하게 재조정한
+비소유 변경은 이 prior state에 포함되어 보존된다. connect가 새로 만든 service는 종료·제거하고, config는
+연결 뒤 비소유 변경이 없을 때만 제거한다. agentobs가 소유하지 않은 기존 `notify`는 연결 중에도 보존된다. 재조정되지 않은 설정 변경이 commit 전
 exact-state 검사에서 관측되면 편집을 덮어쓰지 않고 중단한다. agentobs lifecycle writer끼리는 private
 lock으로 직렬화한다. 단, 같은 파일의 열린 descriptor에 lock을 무시하고 동시에 쓰는 임의 프로세스까지
 portable하게 배제하는 filesystem CAS는 아니므로 그런 비협조적 write와의 최종 경쟁은 보장하지 않는다. 이미 수집된
@@ -323,7 +326,7 @@ npm login \
   --scope=@mcprotein \
   --auth-type=legacy \
   --registry=https://npm.pkg.github.com
-npm install --global @mcprotein/agent-observability@1.8.1 \
+npm install --global @mcprotein/agent-observability@1.8.2 \
   --registry=https://npm.pkg.github.com
 ```
 
