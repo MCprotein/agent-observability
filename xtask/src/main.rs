@@ -1910,8 +1910,7 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
             .map_err(|_| "automatic lifecycle setup stage failed")?;
         require_collector_ready_or_degraded(&setup)
             .map_err(|_| "automatic lifecycle setup stage failed")?;
-        verify_installed_codex_compatibility(&cleanup)
-            .map_err(|_| "automatic lifecycle Codex config stage failed")?;
+        verify_installed_codex_compatibility(&cleanup)?;
         let service =
             output_value(&setup, "service").ok_or("automatic lifecycle setup omitted service")?;
         if !service.starts_with("io.agent-observability.collector.") {

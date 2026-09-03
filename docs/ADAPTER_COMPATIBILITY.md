@@ -126,9 +126,10 @@ shell/MCP/file hooks remain diagnostic-only, and raw transcript/content fields a
 The v1.8.0 code adds a Codex-only OTLP/HTTP JSON receiver, bounded notify helper, exact config ownership and
 macOS LaunchAgent. It does not add OTLP/gRPC, Claude Code automatic collection, Cursor automatic collection,
 file scraping or a team transport. Manual imports remain the stable shared boundary. The automatic capability is
-pinned to Codex `0.152.1` for the v1.8.2 candidate. HTTP `codex.api_request` and WebSocket
-`codex.websocket_request` are alternate request-start surfaces; both pair with the completed SSE event without
-persisting raw identifiers. Actual-Codex E2E and exact-revision 5-run evidence for v1.8.2 remain release gates.
+pinned to Codex `0.152.1` for the v1.8.2 candidate. `codex.websocket_request` is the correlated request-start
+surface and pairs with the completed SSE event without persisting raw identifiers. A correlation-less global
+`codex.api_request` remains diagnostic-only and cannot consume that completion. Actual-Codex E2E and
+exact-revision 5-run evidence for v1.8.2 remain release gates.
 The previous v1.8.0 evidence passed for final source `2d2dcc004fbdf2bc7aaa487ea408ac9100456e1e`, and its tag,
 Package and public Release were published from merge `ff02332341244d326a9791feca01c151f854df12`.
 Other platforms fail closed for automatic setup until equivalent service, no-follow, identity, permission and
