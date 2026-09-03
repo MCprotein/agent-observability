@@ -349,7 +349,7 @@ collector response p95/p99 and peak RSS remain reported diagnostics: they are no
 hook latency and resident-memory p95 budgets in the normative local protocol. Durable completeness requires
 exactly two synthetic records per accepted OTLP request plus one notify
 record in both the authoritative generation and report count. Its isolated lifecycle preflight runs actual Codex
-`0.151.0` `codex exec` against a content-free loopback
+`0.152.1` `codex exec` against a content-free loopback
 Responses fixture before the synthetic load. The gate requires exporter construction, one accepted native OTLP
 batch, a private session record, exact 10 input and 2 output token records, and absence of the raw prompt sentinel
 from the durable tree. It then sends synthetic Codex-shaped OTLP through the installed LaunchAgent collector;

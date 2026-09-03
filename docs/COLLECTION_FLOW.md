@@ -6,11 +6,11 @@
 
 ## Scope Boundary
 
-| Boundary | v1.8.1 status |
+| Boundary | v1.8.2 status |
 | --- | --- |
 | Private canonical handoff parser | Implemented for Codex, Claude Code, Cursor |
 | One-shot local ingest CLI | Implemented |
-| Codex OTLP/HTTP JSON receiver | Supported for pinned Codex 0.151.0 on macOS through private-CA HTTPS on IPv4 loopback with exact private random request header |
+| Codex OTLP/HTTP JSON receiver | Experimental v1.8.2 candidate for pinned Codex 0.152.1 WebSocket request telemetry on macOS through private-CA HTTPS on IPv4 loopback with exact private random request header; correlation-bearing legacy HTTP starts remain compatible and release evidence is in progress |
 | Codex `agent-turn-complete` notify supplement | Installed only when notify is free; an existing local notify command is preserved |
 | Codex config ownership and macOS LaunchAgent | `setup` owns non-conflicting OTEL values, optionally owns an empty notify slot, and keeps exact restore |
 | SQLite authority and JSONL projection | Implemented |

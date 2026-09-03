@@ -1,7 +1,7 @@
 # Adapter Compatibility Contract
 
-Status: v1.8.0 Released; Codex automatic local capability supported on the pinned macOS boundary; exact-version private imports supported
-Last verified: 2026-09-02
+Status: v1.8.2 In Progress; Codex 0.152.1 automatic local candidate is experimental pending release evidence; exact-version private imports supported
+Last verified: 2026-09-03
 
 이 문서는 Codex, Claude Code, Cursor adapter가 어떤 공식 surface를 어떤 우선순위로 사용하고,
 어떤 evidence가 있어야 특정 제품/version을 지원한다고 표시할 수 있는지 정의한다. 제품 업데이트로
@@ -80,20 +80,26 @@ privacy closure. The Codex, Claude Code and Cursor adapter suites verify declare
 exact replay output, bounded input, restart/idempotency and privacy behavior. Claude Code additionally locks permission,
 compaction, failed lifecycle, interrupt-gap and out-of-order timestamp fixtures. The capability manifest publishes
 separate manual `private_canonical_handoff_v1` entries and a macOS standalone `codex_automatic_local.v3` entry
-pinned to Codex `0.151.0`. Native receiver, foreground notify, privacy, restart and exact-binary performance
-evidence passed on the pinned macOS boundary, so the closed entry is `supported`. v1.8.0 publication completed;
-cross-version/OS/profile execution remains a future gate.
+pinned to Codex `0.152.1`. Native receiver, foreground notify, privacy, restart and smoke evidence pass on this
+macOS boundary, but the entry remains `experimental` until exact-revision five-run performance evidence passes.
+Cross-version/OS/profile execution remains a future gate.
 
 The automatic-path release gate is
 `cargo run -p xtask -- perf automatic --profile release --check`. Its versioned protocol is
 `crates/contracts/performance/automatic-local-performance-v1.yaml`; the older `perf local` workload does not
-substitute for collector or foreground-notify evidence. The gate first runs actual Codex `0.151.0` against a
+substitute for collector or foreground-notify evidence. The gate first runs actual Codex `0.152.1` against a
 content-free loopback Responses fixture, then drives synthetic Codex-shaped OTLP through the product client.
 
 Codex `0.151.0` on macOS loads the previous client-identity config under the strict diagnostic but fails later
 while constructing the exporter. The automated v1.8.0 gate now proves the corrected private-CA HTTPS plus
 exact-header exporter with actual `codex exec`, native OTLP acceptance, private session and exact 10-input/2-output
 token records, and a durable-tree raw-prompt sentinel scan.
+
+Codex `0.152.1` can emit a correlation-less global `codex.api_request`, followed by a
+`codex.websocket_request` carrying conversation/model identity and a
+`codex.sse_event=response.completed` carrying token usage. v1.8.2 treats the WebSocket event as the request
+start, assigns a private deterministic correlation ID, and pairs the completion across OTLP exports and
+collector restarts. The global API event remains diagnostic-only and cannot consume the WebSocket completion.
 
 | Scenario | Required evidence |
 | --- | --- |
@@ -120,8 +126,11 @@ shell/MCP/file hooks remain diagnostic-only, and raw transcript/content fields a
 The v1.8.0 code adds a Codex-only OTLP/HTTP JSON receiver, bounded notify helper, exact config ownership and
 macOS LaunchAgent. It does not add OTLP/gRPC, Claude Code automatic collection, Cursor automatic collection,
 file scraping or a team transport. Manual imports remain the stable shared boundary. The automatic capability is
-pinned to Codex `0.151.0`. Actual-Codex E2E and exact-revision 5-run evidence passed for final source
-`2d2dcc004fbdf2bc7aaa487ea408ac9100456e1e`, so the source entry is `supported`. Tag, Package and public Release
-publication completed from merge `ff02332341244d326a9791feca01c151f854df12`.
+pinned to Codex `0.152.1` for the v1.8.2 candidate. `codex.websocket_request` is the correlated request-start
+surface and pairs with the completed SSE event without persisting raw identifiers. A correlation-less global
+`codex.api_request` remains diagnostic-only and cannot consume that completion. Actual-Codex E2E and
+exact-revision 5-run evidence for v1.8.2 remain release gates.
+The previous v1.8.0 evidence passed for final source `2d2dcc004fbdf2bc7aaa487ea408ac9100456e1e`, and its tag,
+Package and public Release were published from merge `ff02332341244d326a9791feca01c151f854df12`.
 Other platforms fail closed for automatic setup until equivalent service, no-follow, identity, permission and
 execution evidence exists; manual private imports retain their existing supported boundary.

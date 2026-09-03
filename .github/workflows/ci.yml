@@ -54,15 +54,15 @@ jobs:
           rustup component add --toolchain 1.97.0 clippy
       - name: Run macOS tests
         run: cargo +1.97.0 test --workspace --no-fail-fast
-      - name: Install exact supported Codex CLI
+      - name: Install exact candidate Codex CLI
         shell: bash
         run: |
           set -euo pipefail
-          prefix="$RUNNER_TEMP/codex-0.151.0"
-          npm install --prefix "$prefix" @openai/codex@0.151.0
+          prefix="$RUNNER_TEMP/codex-0.152.1"
+          npm install --prefix "$prefix" @openai/codex@0.152.1
           echo "$prefix/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Verify exact Codex CLI
-        run: test "$(codex --version)" = "codex-cli 0.151.0"
+        run: test "$(codex --version)" = "codex-cli 0.152.1"
       - name: Run automatic performance smoke
         run: cargo +1.97.0 run --locked -p xtask -- perf automatic --profile smoke --check
       - name: Run macOS Clippy
@@ -102,15 +102,15 @@ jobs:
       - name: Install release Rust toolchain
         run: |
           rustup toolchain install 1.97.0 --profile minimal
-      - name: Install exact supported Codex CLI
+      - name: Install exact candidate Codex CLI
         shell: bash
         run: |
           set -euo pipefail
-          prefix="$RUNNER_TEMP/codex-0.151.0"
-          npm install --prefix "$prefix" @openai/codex@0.151.0
+          prefix="$RUNNER_TEMP/codex-0.152.1"
+          npm install --prefix "$prefix" @openai/codex@0.152.1
           echo "$prefix/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Verify exact Codex CLI
-        run: test "$(codex --version)" = "codex-cli 0.151.0"
+        run: test "$(codex --version)" = "codex-cli 0.152.1"
       - name: Run normative automatic release gate
         id: evidence
         shell: bash
