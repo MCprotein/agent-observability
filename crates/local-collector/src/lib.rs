@@ -5410,6 +5410,7 @@ mod tests {
                 super::TransportListener::new(listener, server_config, Duration::from_secs(1), 2);
             let app = router(app_state(&root));
             let server = tokio::spawn(async move { axum::serve(transport, app).await });
+            tokio::task::yield_now().await;
             let notify_root = root.clone();
             let outcome = tokio::task::spawn_blocking(move || {
                 submit_notify(
