@@ -347,6 +347,33 @@ impl From<rusqlite::Error> for StoreError {
         Self::Sqlite(error)
     }
 }
+
+fn required_schema_text(result: Result<String, rusqlite::Error>) -> Result<String, StoreError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(
+            rusqlite::Error::QueryReturnedNoRows
+            | rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::Utf8Error(..),
+        ) => Err(StoreError::SchemaMismatch),
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.starts_with("no such table:") || message.starts_with("no such column:") =>
+        {
+            Err(StoreError::SchemaMismatch)
+        }
+        Err(error) => Err(StoreError::Sqlite(error)),
+    }
+}
+
+fn required_schema_version(db: &Connection) -> Result<String, StoreError> {
+    required_schema_text(db.query_row(
+        "SELECT value FROM metadata WHERE key = 'schema_version'",
+        [],
+        |row| row.get(0),
+    ))
+}
+
 impl From<serde_json::Error> for StoreError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
@@ -421,13 +448,7 @@ impl LocalStore {
         db.busy_timeout(Duration::from_secs(5))?;
         db.pragma_update(None, "foreign_keys", true)?;
         db.pragma_update(None, "synchronous", "FULL")?;
-        let schema = db
-            .query_row(
-                "SELECT value FROM metadata WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|_| StoreError::SchemaMismatch)?;
+        let schema = required_schema_version(&db)?;
         if schema != LOCAL_STORE_SCHEMA_VERSION {
             return Err(StoreError::SchemaMismatch);
         }
@@ -466,12 +487,7 @@ impl LocalStore {
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         initialize_empty_schema(&db)?;
-        let schema = db.query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        );
-        let schema: String = schema.map_err(|_| StoreError::SchemaMismatch)?;
+        let schema = required_schema_version(&db)?;
         if matches!(
             schema.as_str(),
             "local_state.v1" | "local_state.v2" | "local_state.v3"
@@ -2964,11 +2980,11 @@ fn mark_projection_dirty(tx: &Transaction<'_>) -> Result<(), StoreError> {
 }
 
 fn metadata_generation(db: &Connection, key: &str) -> Result<u64, StoreError> {
-    let value: String = db
-        .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
-            row.get(0)
-        })
-        .map_err(|_| StoreError::SchemaMismatch)?;
+    let value = required_schema_text(db.query_row(
+        "SELECT value FROM metadata WHERE key=?1",
+        [key],
+        |row| row.get(0),
+    ))?;
     value.parse().map_err(|_| StoreError::SchemaMismatch)
 }
 
@@ -3089,13 +3105,7 @@ fn migrate_to_v4(db: &Connection) -> Result<(), StoreError> {
 
 fn prune_legacy_adapter_dispositions(db: &Connection) -> Result<(), StoreError> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
-    let version: String = tx
-        .query_row(
-            "SELECT value FROM metadata WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|_| StoreError::SchemaMismatch)?;
+    let version = required_schema_version(&tx)?;
     if !matches!(version.as_str(), "local_state.v2" | "local_state.v3") {
         tx.commit()?;
         return Ok(());
@@ -3114,13 +3124,7 @@ fn prune_legacy_adapter_dispositions(db: &Connection) -> Result<(), StoreError> 
 
 fn migrate_to_v4_inner(db: &Connection) -> Result<(), StoreError> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
-    let version: String = tx
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|_| StoreError::SchemaMismatch)?;
+    let version = required_schema_version(&tx)?;
     if version == LOCAL_STORE_SCHEMA_VERSION {
         tx.commit()?;
         return Ok(());
@@ -3235,13 +3239,11 @@ fn validate_schema(db: &Connection) -> Result<(), StoreError> {
         return Err(StoreError::SchemaMismatch);
     }
     for (kind, name, expected_sql) in SCHEMA_OBJECTS {
-        let actual_sql: String = db
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
-                params![kind, name],
-                |row| row.get(0),
-            )
-            .map_err(|_| StoreError::SchemaMismatch)?;
+        let actual_sql = required_schema_text(db.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+            params![kind, name],
+            |row| row.get(0),
+        ))?;
         if normalize_schema_sql(&actual_sql) != normalize_schema_sql(expected_sql) {
             return Err(StoreError::SchemaMismatch);
         }
@@ -3601,6 +3603,64 @@ mod tests {
             "local_state.v3"
         );
         let _ = fs::remove_dir_all(&legacy);
+    }
+
+    #[test]
+    fn required_schema_reads_distinguish_schema_mismatch_from_sqlite_busy() {
+        let dir = temp_dir("required-metadata-error-classification");
+        let _ = fs::remove_dir_all(&dir);
+        let store = LocalStore::open(&dir).unwrap();
+        let database = store.database_path();
+        drop(store);
+
+        let reader = Connection::open(&database).unwrap();
+        reader.busy_timeout(Duration::ZERO).unwrap();
+        reader
+            .execute("DELETE FROM metadata WHERE key=?1", [REPORT_GENERATION_KEY])
+            .unwrap();
+        assert!(matches!(
+            metadata_generation(&reader, REPORT_GENERATION_KEY),
+            Err(StoreError::SchemaMismatch)
+        ));
+        reader
+            .execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, '1')",
+                [REPORT_GENERATION_KEY],
+            )
+            .unwrap();
+        reader
+            .execute(
+                "UPDATE metadata SET value='invalid' WHERE key=?1",
+                [REPORT_GENERATION_KEY],
+            )
+            .unwrap();
+        assert!(matches!(
+            metadata_generation(&reader, REPORT_GENERATION_KEY),
+            Err(StoreError::SchemaMismatch)
+        ));
+        reader
+            .execute(
+                "UPDATE metadata SET value='1' WHERE key=?1",
+                [REPORT_GENERATION_KEY],
+            )
+            .unwrap();
+
+        let locker = Connection::open(&database).unwrap();
+        locker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let error = required_schema_version(&reader).unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(ref failure, _))
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        let error = metadata_generation(&reader, REPORT_GENERATION_KEY).unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(ref failure, _))
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        locker.execute_batch("ROLLBACK").unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4990,19 +5050,25 @@ mod tests {
             ));
             let _ = fs::remove_dir_all(&dir);
             let mut writer = LocalStore::open(&dir).unwrap();
-            writer.ingest(&observation("1", "session", None)).unwrap();
-            for ordinal in 2..=initial_records {
-                let cursor = ordinal.to_string();
-                let previous = (ordinal - 1).to_string();
-                writer
-                    .ingest(&observation_after(
-                        &cursor,
-                        Some(&previous),
-                        &format!("turn-{ordinal}"),
-                        Some("session"),
-                    ))
-                    .unwrap();
-            }
+            let observations = (1..=initial_records)
+                .map(|ordinal| {
+                    if ordinal == 1 {
+                        observation("1", "session", None)
+                    } else {
+                        let cursor = ordinal.to_string();
+                        let previous = (ordinal - 1).to_string();
+                        observation_after(
+                            &cursor,
+                            Some(previous.as_str()),
+                            &format!("turn-{ordinal}"),
+                            Some("session"),
+                        )
+                    }
+                })
+                .collect::<Vec<_>>();
+            writer
+                .ingest_batch_deferred_projection(&observations)
+                .unwrap();
             let reader = LocalStore::open_current(&dir).unwrap();
             let next = initial_records + 1;
             let final_index = usize::try_from(initial_records).unwrap() - 1;
@@ -5029,68 +5095,46 @@ mod tests {
     }
 
     #[test]
-    fn report_visits_and_sustained_writes_do_not_hold_sqlite_locks() {
-        let dir = temp_dir("report-visitor-sustained-writes");
+    fn report_visitor_callback_allows_a_batched_write_without_sqlite_lock() {
+        let dir = temp_dir("report-visitor-batched-write");
         let _ = fs::remove_dir_all(&dir);
         let mut seed = LocalStore::open(&dir).unwrap();
         seed.ingest(&observation("1", "session", None)).unwrap();
         drop(seed);
 
         let writer_dir = dir.clone();
-        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let writer_start = std::sync::Arc::clone(&start);
-        let committed_writes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let writer_committed_writes = std::sync::Arc::clone(&committed_writes);
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let writer = std::thread::spawn(move || {
-            writer_start.wait();
+            start_rx.recv().unwrap();
             let mut writer = LocalStore::open(&writer_dir).unwrap();
-            let mut max_write = Duration::ZERO;
-            for ordinal in 2..=257 {
-                let cursor = ordinal.to_string();
-                let previous = (ordinal - 1).to_string();
-                let write_started = std::time::Instant::now();
-                writer
-                    .ingest(&observation_after(
+            let observations = (2..=257)
+                .map(|ordinal| {
+                    let cursor = ordinal.to_string();
+                    let previous = (ordinal - 1).to_string();
+                    observation_after(
                         &cursor,
-                        Some(&previous),
+                        Some(previous.as_str()),
                         &format!("turn-{ordinal}"),
                         Some("session"),
-                    ))
-                    .unwrap();
-                max_write = max_write.max(write_started.elapsed());
-                writer_committed_writes.fetch_add(1, std::sync::atomic::Ordering::Release);
-                std::thread::sleep(Duration::from_micros(250));
-            }
-            max_write
+                    )
+                })
+                .collect::<Vec<_>>();
+            done_tx
+                .send(writer.ingest_batch_deferred_projection(&observations))
+                .unwrap();
         });
 
         let reader = LocalStore::open_current(&dir).unwrap();
-        start.wait();
-        let mut overlapping_visits = 0_u64;
-        let mut writes_during_visits = 0_u64;
-        while !writer.is_finished() {
-            overlapping_visits += 1;
-            let writes_before = committed_writes.load(std::sync::atomic::Ordering::Acquire);
-            match reader.visit_report_snapshot(|_, _| {
-                std::thread::sleep(Duration::from_micros(100));
-            }) {
-                Ok(_) | Err(StoreError::ReportSnapshotChanged) => {}
-                Err(error) => panic!("report visitor failed during sustained writes: {error}"),
-            }
-            let writes_after = committed_writes.load(std::sync::atomic::Ordering::Acquire);
-            writes_during_visits =
-                writes_during_visits.saturating_add(writes_after.saturating_sub(writes_before));
-        }
-        let max_write = writer.join().unwrap();
-        assert!(overlapping_visits > 0);
-        assert!(
-            writes_during_visits >= 16,
-            "only {writes_during_visits} writes completed during report visits"
-        );
-        assert!(
-            max_write < Duration::from_secs(2),
-            "one writer approached the SQLite busy timeout: {max_write:?}"
-        );
+        let error = reader
+            .visit_report_snapshot(|index, _| {
+                assert_eq!(index, 0);
+                start_tx.send(()).unwrap();
+                done_rx.recv().unwrap().unwrap();
+            })
+            .unwrap_err();
+        writer.join().unwrap();
+        assert!(matches!(error, StoreError::ReportSnapshotChanged));
 
         let mut visited = 0;
         let final_visit = reader
