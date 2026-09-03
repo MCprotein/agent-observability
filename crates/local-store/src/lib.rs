@@ -366,6 +366,14 @@ fn required_schema_text(result: Result<String, rusqlite::Error>) -> Result<Strin
     }
 }
 
+fn required_schema_version(db: &Connection) -> Result<String, StoreError> {
+    required_schema_text(db.query_row(
+        "SELECT value FROM metadata WHERE key = 'schema_version'",
+        [],
+        |row| row.get(0),
+    ))
+}
+
 impl From<serde_json::Error> for StoreError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
@@ -440,11 +448,7 @@ impl LocalStore {
         db.busy_timeout(Duration::from_secs(5))?;
         db.pragma_update(None, "foreign_keys", true)?;
         db.pragma_update(None, "synchronous", "FULL")?;
-        let schema = required_schema_text(db.query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get::<_, String>(0),
-        ))?;
+        let schema = required_schema_version(&db)?;
         if schema != LOCAL_STORE_SCHEMA_VERSION {
             return Err(StoreError::SchemaMismatch);
         }
@@ -483,12 +487,7 @@ impl LocalStore {
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         initialize_empty_schema(&db)?;
-        let schema = db.query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        );
-        let schema = required_schema_text(schema)?;
+        let schema = required_schema_version(&db)?;
         if matches!(
             schema.as_str(),
             "local_state.v1" | "local_state.v2" | "local_state.v3"
@@ -3106,13 +3105,7 @@ fn migrate_to_v4(db: &Connection) -> Result<(), StoreError> {
 
 fn prune_legacy_adapter_dispositions(db: &Connection) -> Result<(), StoreError> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
-    let version: String = tx
-        .query_row(
-            "SELECT value FROM metadata WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|_| StoreError::SchemaMismatch)?;
+    let version = required_schema_version(&tx)?;
     if !matches!(version.as_str(), "local_state.v2" | "local_state.v3") {
         tx.commit()?;
         return Ok(());
@@ -3131,13 +3124,7 @@ fn prune_legacy_adapter_dispositions(db: &Connection) -> Result<(), StoreError> 
 
 fn migrate_to_v4_inner(db: &Connection) -> Result<(), StoreError> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
-    let version: String = tx
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|_| StoreError::SchemaMismatch)?;
+    let version = required_schema_version(&tx)?;
     if version == LOCAL_STORE_SCHEMA_VERSION {
         tx.commit()?;
         return Ok(());
@@ -3619,7 +3606,7 @@ mod tests {
     }
 
     #[test]
-    fn required_metadata_distinguishes_schema_mismatch_from_sqlite_busy() {
+    fn required_schema_reads_distinguish_schema_mismatch_from_sqlite_busy() {
         let dir = temp_dir("required-metadata-error-classification");
         let _ = fs::remove_dir_all(&dir);
         let store = LocalStore::open(&dir).unwrap();
@@ -3660,6 +3647,12 @@ mod tests {
 
         let locker = Connection::open(&database).unwrap();
         locker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let error = required_schema_version(&reader).unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(ref failure, _))
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
         let error = metadata_generation(&reader, REPORT_GENERATION_KEY).unwrap_err();
         assert!(matches!(
             error,
