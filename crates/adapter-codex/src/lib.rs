@@ -748,9 +748,16 @@ pub fn parse_otlp_http_json_with_state(
                 next_cursor = next_cursor
                     .checked_add(1)
                     .ok_or(AdapterError::InvalidCursorSequence)?;
-                let received_at_unix_ms =
-                    otlp_observed_time_unix_ms(log_record, fallback_received_at_unix_ms)?;
-                let canonical = canonical_otlp_attributes(&event_name, &attributes)?;
+                let observed_time_unix_nanos = otlp_observed_time_unix_nanos(log_record)?;
+                let received_at_unix_ms = observed_time_unix_nanos
+                    .map_or(fallback_received_at_unix_ms, |nanos| nanos / 1_000_000);
+                let mut canonical = canonical_otlp_attributes(&event_name, &attributes)?;
+                project_websocket_replay_identity(
+                    &event_name,
+                    source_generation,
+                    observed_time_unix_nanos,
+                    &mut canonical,
+                )?;
                 records.push(HandoffRecord {
                     schema_version: HANDOFF_SCHEMA_VERSION.into(),
                     source_generation: source_generation.into(),
@@ -782,20 +789,45 @@ pub fn parse_otlp_http_json_with_state(
     Ok((batch, prior))
 }
 
-fn otlp_observed_time_unix_ms(
-    record: &Value,
-    fallback_received_at_unix_ms: u64,
-) -> Result<u64, AdapterError> {
+fn otlp_observed_time_unix_nanos(record: &Value) -> Result<Option<u64>, AdapterError> {
     for key in ["timeUnixNano", "observedTimeUnixNano"] {
         let Some(value) = record.get(key) else {
             continue;
         };
         let nanos = otlp_u64(value).ok_or(AdapterError::InvalidTiming)?;
         if nanos != 0 {
-            return Ok(nanos / 1_000_000);
+            return Ok(Some(nanos));
         }
     }
-    Ok(fallback_received_at_unix_ms)
+    Ok(None)
+}
+
+fn project_websocket_replay_identity(
+    event_name: &str,
+    source_generation: &str,
+    observed_time_unix_nanos: Option<u64>,
+    attributes: &mut BTreeMap<String, Value>,
+) -> Result<(), AdapterError> {
+    if event_name != "codex.websocket_request" || attributes.contains_key("request_id") {
+        return Ok(());
+    }
+    let observed_time_unix_nanos = observed_time_unix_nanos.ok_or(AdapterError::InvalidTiming)?;
+    let Some((conversation_id, model)) = otlp_request_pair_key(attributes)? else {
+        return Ok(());
+    };
+    let observed_time_unix_nanos = observed_time_unix_nanos.to_string();
+    let replay_identity = stable_id(
+        "id:sha256",
+        &[
+            "codex-websocket-replay-v1",
+            source_generation,
+            &conversation_id,
+            &model,
+            &observed_time_unix_nanos,
+        ],
+    );
+    attributes.insert("request_id".into(), Value::String(replay_identity));
+    Ok(())
 }
 
 /// Strictly projects a raw Codex `agent-turn-complete` notify argument before transport.
@@ -976,10 +1008,12 @@ fn correlate_otlp_request_pairs(
     state.expire(now_unix_ms);
     for index in 0..records.len() {
         let event_name = records[index].event_name.as_str();
+        let is_request_start =
+            matches!(event_name, "codex.api_request" | "codex.websocket_request");
         let is_completed = event_name == "codex.sse_event"
             && optional_string(&records[index].attributes, "kind")?.as_deref()
                 == Some("response.completed");
-        if event_name != "codex.api_request" && !is_completed {
+        if !is_request_start && !is_completed {
             continue;
         }
         let Some((conversation_id, model)) = otlp_request_pair_key(&records[index].attributes)?
@@ -991,7 +1025,7 @@ fn correlate_otlp_request_pairs(
             hash_opaque_identifier(&conversation_id),
             hash_opaque_identifier(&model),
         );
-        if event_name == "codex.api_request" {
+        if is_request_start {
             let request_id = optional_string(&records[index].attributes, "request_id")?;
             let official_retry_identity = request_id.as_deref().map(hash_opaque_identifier);
             let correlation_id = official_retry_identity.clone().unwrap_or_else(|| {
@@ -1198,7 +1232,7 @@ fn observation_from_record(
         (SourceSurface::OtelLog, "codex.conversation_starts") => {
             session_observation(record, previous_cursor)
         }
-        (SourceSurface::OtelLog, "codex.api_request") => {
+        (SourceSurface::OtelLog, "codex.api_request" | "codex.websocket_request") => {
             request_observation(record, previous_cursor, false)
         }
         (SourceSurface::OtelLog, "codex.sse_event") => {
@@ -1641,6 +1675,19 @@ mod tests {
         .into_bytes()
     }
 
+    fn otlp_websocket_request(conversation_id: &str, time_unix_nano: u64) -> Vec<u8> {
+        format!(
+            r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"timeUnixNano":"{time_unix_nano}","attributes":[
+              {{"key":"event.name","value":{{"stringValue":"codex.websocket_request"}}}},
+              {{"key":"conversation.id","value":{{"stringValue":"{conversation_id}"}}}},
+              {{"key":"model","value":{{"stringValue":"gpt-test"}}}},
+              {{"key":"success","value":{{"boolValue":true}}}},
+              {{"key":"duration_ms","value":{{"intValue":"12"}}}}
+            ]}}]}}]}}]}}"#
+        )
+        .into_bytes()
+    }
+
     fn otlp_completed_response(conversation_id: &str) -> Vec<u8> {
         format!(
             r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"attributes":[
@@ -1816,6 +1863,174 @@ mod tests {
         assert!(!debug.contains("otlp-41"));
         assert!(!debug.contains("otlp-42"));
         assert!(!debug.contains("RAW_RESPONSE_SECRET"));
+    }
+
+    #[test]
+    fn websocket_request_pairs_with_completed_response_in_actual_codex_shape() {
+        let input = br#"{
+          "resourceLogs": [{"scopeLogs": [{"logRecords": [
+            {"timeUnixNano":"1787875200000000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+              {"key":"duration_ms","value":{"intValue":"5"}},
+              {"key":"success","value":{"boolValue":true}}
+            ]},
+            {"timeUnixNano":"1787875200010000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.websocket_request"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
+              {"key":"duration_ms","value":{"intValue":"12"}},
+              {"key":"success","value":{"boolValue":true}}
+            ]},
+            {"timeUnixNano":"1787875200100000000","attributes":[
+              {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
+              {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+              {"key":"event.kind","value":{"stringValue":"response.completed"}},
+              {"key":"model","value":{"stringValue":"gpt-5.6-sol"}},
+              {"key":"input_token_count","value":{"intValue":"100"}},
+              {"key":"output_token_count","value":{"intValue":"25"}},
+              {"key":"tool_token_count","value":{"intValue":"125"}}
+            ]}
+          ]}]}]
+        }"#;
+
+        let (batch, cursor) = parse_otlp_http_json(input, "codex-0.152.1", None, 1, 0).unwrap();
+
+        assert_eq!(cursor.as_deref(), Some("3"));
+        let requests = batch.observations().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].correlation.request_id,
+            requests[1].correlation.request_id
+        );
+        assert_eq!(requests[1].token_usage.input, Some(100));
+        assert_eq!(requests[1].token_usage.output, Some(25));
+        assert_eq!(requests[1].token_usage.total, Some(125));
+        assert_eq!(
+            batch.diagnostics().next().map(|diagnostic| diagnostic.code),
+            Some(DiagnosticCode::MissingCorrelation)
+        );
+    }
+
+    #[test]
+    fn websocket_request_correlation_survives_split_exports() {
+        let mut state = OtlpRequestCorrelationState::default();
+        let (request, _) = parse_otlp_http_json_with_state(
+            &otlp_websocket_request("conversation-1", 100_000_000),
+            "generation-a",
+            None,
+            1,
+            100,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(request.observations().count(), 1);
+        assert_eq!(state.pending_len(), 1);
+
+        let (completed, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response("conversation-1"),
+            "generation-a",
+            Some("1"),
+            2,
+            101,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(only_request_id(&request), only_request_id(&completed));
+        assert_eq!(state.pending_len(), 0);
+    }
+
+    #[test]
+    fn websocket_request_replay_is_idempotent_across_restart() {
+        let request = otlp_websocket_request("conversation-1", 100_000_001);
+        let mut state = OtlpRequestCorrelationState::default();
+        let (first, _) =
+            parse_otlp_http_json_with_state(&request, "generation-a", None, 1, 100, &mut state)
+                .unwrap();
+        assert_eq!(state.pending_len(), 1);
+
+        let persisted = state.to_persisted_json().unwrap();
+        let mut restarted =
+            OtlpRequestCorrelationState::from_persisted_json(&persisted, 101).unwrap();
+        let (replayed, _) = parse_otlp_http_json_with_state(
+            &request,
+            "generation-a",
+            Some("1"),
+            2,
+            101,
+            &mut restarted,
+        )
+        .unwrap();
+        assert_eq!(only_request_id(&first), only_request_id(&replayed));
+        assert_eq!(restarted.pending_len(), 1);
+
+        let (completed, _) = parse_otlp_http_json_with_state(
+            &otlp_completed_response("conversation-1"),
+            "generation-a",
+            Some("2"),
+            3,
+            102,
+            &mut restarted,
+        )
+        .unwrap();
+        assert_eq!(only_request_id(&first), only_request_id(&completed));
+        assert_eq!(restarted.pending_len(), 0);
+    }
+
+    #[test]
+    fn websocket_replay_does_not_displace_distinct_fifo_requests() {
+        let first_request = otlp_websocket_request("conversation-1", 100_000_001);
+        let second_request = otlp_websocket_request("conversation-1", 100_000_002);
+        let mut state = OtlpRequestCorrelationState::default();
+        let mut request_ids = Vec::new();
+        for (cursor, request) in [(1, &first_request), (2, &second_request)] {
+            let (batch, _) = parse_otlp_http_json_with_state(
+                request,
+                "generation-a",
+                None,
+                cursor,
+                100,
+                &mut state,
+            )
+            .unwrap();
+            request_ids.push(only_request_id(&batch).unwrap().to_owned());
+        }
+        assert_ne!(request_ids[0], request_ids[1]);
+        assert_eq!(state.pending_len(), 2);
+
+        parse_otlp_http_json_with_state(&first_request, "generation-a", None, 3, 101, &mut state)
+            .unwrap();
+        assert_eq!(state.pending_len(), 2);
+
+        for (cursor, request_id) in [(4, &request_ids[0]), (5, &request_ids[1])] {
+            let (batch, _) = parse_otlp_http_json_with_state(
+                &otlp_completed_response("conversation-1"),
+                "generation-a",
+                None,
+                cursor,
+                102,
+                &mut state,
+            )
+            .unwrap();
+            assert_eq!(only_request_id(&batch), Some(request_id.as_str()));
+        }
+        assert_eq!(state.pending_len(), 0);
+    }
+
+    #[test]
+    fn websocket_request_without_nonzero_timestamp_fails_closed() {
+        let missing = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[
+          {"key":"event.name","value":{"stringValue":"codex.websocket_request"}},
+          {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+          {"key":"model","value":{"stringValue":"gpt-test"}},
+          {"key":"success","value":{"boolValue":true}}
+        ]}]}]}]}"#;
+        let zero = otlp_websocket_request("conversation-1", 0);
+        for input in [missing.as_slice(), zero.as_slice()] {
+            assert!(matches!(
+                parse_otlp_http_json(input, "generation-a", None, 1, 100),
+                Err(AdapterError::InvalidTiming)
+            ));
+        }
     }
 
     #[test]

@@ -36,8 +36,8 @@ const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-pe
 const AUTOMATIC_PROTOCOL: &str =
     include_str!("../../crates/contracts/performance/automatic-local-performance-v1.yaml");
 const AUTOMATIC_PROTOCOL_REVISION: &str =
-    "v1.8.0-codex-0.151-private-ca-header-real-e2e-synthetic-diagnostics-rss-p95-v3";
-const AUTOMATIC_CODEX_VERSION: &str = "codex-cli 0.151.0";
+    "v1.8.2-codex-0.152.1-private-ca-header-real-e2e-synthetic-diagnostics-rss-p95-v3";
+const AUTOMATIC_CODEX_VERSION: &str = "codex-cli 0.152.1";
 const AUTOMATIC_NOTIFY_SENTINELS: [&[u8]; 3] = [
     b"AUTOMATIC_RAW_CWD_SENTINEL",
     b"AUTOMATIC_RAW_PROMPT_SENTINEL",
@@ -1388,7 +1388,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
     let smoke = AutomaticConfig::for_profile(Profile::Smoke);
     AutomaticProtocol {
         schema_version: "automatic_local_performance.v1".into(),
-        version: "v1.8.0".into(),
+        version: "v1.8.2".into(),
         protocol_revision: AUTOMATIC_PROTOCOL_REVISION.into(),
         purpose: "normative automatic release evidence for real Codex compatibility, local lifecycle, privacy, and synthetic collector performance".into(),
         profiles: AutomaticProtocolProfiles {
@@ -1414,17 +1414,17 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
             },
         },
         workload: AutomaticProtocolWorkload {
-            lifecycle_preflight: "bounded built-binary no-argument setup --no-open under isolated HOME and CODEX_HOME, installed Codex 0.151.0 strict config loading, and one actual codex exec against a content-free loopback Responses fixture".into(),
+            lifecycle_preflight: "bounded built-binary no-argument setup --no-open under isolated HOME and CODEX_HOME, installed Codex 0.152.1 strict config loading, and one actual codex exec against a content-free loopback Responses fixture".into(),
             lifecycle_seed: "exact private Codex config bytes and permission mode".into(),
-            lifecycle_assertions: "connected config, exact Codex 0.151.0 version and strict config loading, ready or degraded collector, installed KeepAlive LaunchAgent plist, pre-failure synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, unexpected SIGKILL service termination and bounded unaided launchd KeepAlive recovery, post-recovery synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service".into(),
+            lifecycle_assertions: "connected config, exact Codex 0.152.1 version and strict config loading, ready or degraded collector, installed KeepAlive LaunchAgent plist, pre-failure synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, unexpected SIGKILL service termination and bounded unaided launchd KeepAlive recovery, post-recovery synthetic private-CA HTTPS exact-header OTLP and notify durability without raw notify sentinels, occupied persisted port explicit reconnect, concurrent explicit connect commands, missing-settings disconnect, exact config restoration, inherited loaded and unloaded plist restoration, and bounded removal of the isolated service".into(),
             lifecycle_cleanup: "best-effort bounded disconnect, bootout, exact seed restoration, plist removal, and isolated directory removal on success or error".into(),
-            codex_config_load_boundary: "installed @openai/codex 0.151.0 exact version, strict diagnostic loading, and actual codex exec proving exporter construction and native OTLP delivery without an external model request".into(),
+            codex_config_load_boundary: "installed @openai/codex 0.152.1 exact version, strict diagnostic loading, and actual codex exec proving exporter construction and native OTLP delivery without an external model request".into(),
             observed_compatibility_correction: "Codex 0.151.0 on macOS fails exporter construction when client certificate and client private-key identity fields are present; corrected product config uses private-CA HTTPS plus the exact x-agent-observability-token private random request header and no client identity fields".into(),
-            real_codex_e2e_release_gate: "the same exact-revision evidence runs actual Codex 0.151.0 macOS codex exec against a content-free loopback Responses fixture and requires exporter construction, native OTLP acceptance, a private session record, exact 10 input and 2 output token records, and no raw prompt or response persistence".into(),
+            real_codex_e2e_release_gate: "the same exact-revision evidence runs actual Codex 0.152.1 macOS codex exec against a content-free loopback Responses fixture and requires exporter construction, native OTLP acceptance, a private session record, exact 10 input and 2 output token records, and no raw prompt or response persistence".into(),
             synthetic_benchmark_boundary: "after the real Codex gate passes, sustained synthetic Codex-shaped OTLP/HTTP JSON /v1/logs requests measure the private-CA HTTPS exact-header collector path and durable report authority".into(),
             notify_boundary: "separately verified built agent-observability codex-notify supplement through private-CA HTTPS with the exact private random request header".into(),
             collector_boundary: "built agent-observability collector-serve subprocess".into(),
-            payload: "bounded synthetic Codex-shaped OTLP log pairs with opaque identifiers; one bounded notify supplement per measured run whose raw sentinels must be absent from the durable tree".into(),
+            payload: "bounded synthetic Codex-shaped WebSocket-request/completed OTLP log pairs with opaque identifiers; one bounded notify supplement per measured run whose raw sentinels must be absent from the durable tree".into(),
             readiness: "successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, exactly two durable synthetic records per accepted OTLP request plus one notify record, acknowledged report generation, and HTML generatedSpans parity with authoritative SQLite must converge before collector shutdown".into(),
             collector_shutdown: "bounded child termination and wait".into(),
         },
@@ -1472,7 +1472,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
             output: "docs/evidence/local/performance/automatic-<run>/manifest.yaml".into(),
             exact_source: "full git commit, Rust 1.97.0 locked build command, tested binary, package version, profile, and protocol revision".into(),
             sanitized_paths: "run-relative runtime and protocol paths only; credentials, private key content, port, host path, payload, and raw collector output are forbidden".into(),
-            release_scope: "exact-revision release gate combining actual Codex 0.151.0 macOS end-to-end telemetry compatibility with synthetic collector performance evidence".into(),
+            release_scope: "exact-revision release gate combining actual Codex 0.152.1 macOS end-to-end telemetry compatibility with synthetic collector performance evidence".into(),
         },
     }
 }
@@ -2563,12 +2563,21 @@ fn verify_inherited_automatic_plist(
 }
 
 fn submit_automatic_synthetic_otlp(root: &Path, run: usize, event: usize) -> Result<(), String> {
+    let observed_time_unix_nanos = u64::try_from(run)
+        .ok()
+        .and_then(|run| run.checked_add(1))
+        .and_then(|run| run.checked_mul(1_000_000_000))
+        .and_then(|base| {
+            u64::try_from(event)
+                .ok()
+                .and_then(|event| base.checked_add(event))
+        })
+        .ok_or_else(|| "automatic synthetic OTLP timestamp overflow".to_owned())?;
     let body = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
-      {"attributes":[
-        {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+      {"timeUnixNano":"$TIME","attributes":[
+        {"key":"event.name","value":{"stringValue":"codex.websocket_request"}},
         {"key":"conversation.id","value":{"stringValue":"automatic-perf-$RUN"}},
         {"key":"model","value":{"stringValue":"gpt-test"}},
-        {"key":"auth.request_id","value":{"stringValue":"automatic-request-$EVENT"}},
         {"key":"success","value":{"boolValue":true}}
       ]},
       {"attributes":[
@@ -2581,7 +2590,7 @@ fn submit_automatic_synthetic_otlp(root: &Path, run: usize, event: usize) -> Res
       ]}
     ]}]}]}"#
         .replace("$RUN", &run.to_string())
-        .replace("$EVENT", &event.to_string());
+        .replace("$TIME", &observed_time_unix_nanos.to_string());
     match submit_otlp_json_outcome(root, body.as_bytes())
         .map_err(|error| format!("run={run} event={event}: {error}"))?
     {
@@ -2620,7 +2629,7 @@ fn verify_installed_codex_compatibility(
     let diagnostic = serde_saphyr::from_str::<CodexDiagnostic>(&diagnostic)
         .map_err(|error| format!("parse Codex compatibility diagnostic: {error}"))?;
     if diagnostic.checks.config_load.status != "ok" {
-        return Err("Codex 0.151.0 rejected the generated strict config".into());
+        return Err("Codex 0.152.1 rejected the generated strict config".into());
     }
     let expected_home = fs::canonicalize(&cleanup.codex_home)
         .map_err(|error| format!("canonicalize isolated CODEX_HOME: {error}"))?;
@@ -5340,10 +5349,10 @@ fn render_automatic_manifest(
     let real_codex_e2e_gate = if real_codex_e2e_status == "failed" {
         "failed-lifecycle-preflight"
     } else {
-        "passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response"
+        "passed-actual-codex-0.152.1-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response"
     };
     let mut manifest = format!(
-        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: {release_readiness}\nreal_codex_e2e_status: {real_codex_e2e_status}\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.151.0\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: {real_codex_e2e_gate}\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_rss_p95_kib_max: {}\n  collector_peak_rss_kib: {}\n  collector_rss_samples_min: {}\n  collector_rss_observed_max_gap_ms: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
+        "schema_version: automatic_local_performance.v1\nevidence_kind: automatic_release_evidence\nprotocol_revision: {AUTOMATIC_PROTOCOL_REVISION}\nstatus: {status}\nrelease_readiness: {release_readiness}\nreal_codex_e2e_status: {real_codex_e2e_status}\nsource_revision: {source_revision}\nprofile: {}\nprotocol: crates/contracts/performance/automatic-local-performance-v1.yaml\ncommand: cargo run -p xtask -- perf automatic --profile {} --check\nbuild:\n  package: agent-observability-cli\n  package_version: {}\n  cargo_locked: true\n  cargo_profile: {}\n  codex_package: '@openai/codex'\n  codex_version: 0.152.1\nhost:\n  machine: {}\n  os: {}\n  filesystem: {}\n  power_mode: {}\n  logical_cores: {}\nworkload:\n  lifecycle_preflight: built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect\n  collector_boundary: built-agent-observability-collector-serve-subprocess\n  transport: private-ca-https-exact-private-random-request-header-not-mtls\n  codex_config_load_boundary: installed-codex-0.152.1-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp\n  observed_compatibility_correction: codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity\n  real_codex_e2e_release_gate: {real_codex_e2e_gate}\n  synthetic_benchmark_boundary: post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report\n  notify_boundary: separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan\n  runtime_path: run-relative/runtime\n  warmup_ms: {}\n  idle_ms: {}\n  synthetic_otlp_requests_per_run: {}\n  inter_request_ms: {}\n  runs: {}\n  sample_interval_ms: {}\n  active_timeout_ms: {}\n  startup_timeout_ms: {}\n  command_timeout_ms: {}\n  cleanup_timeout_ms: {}\nmetrics:\n  synthetic_collector_otlp_p95_us: {}\n  synthetic_collector_otlp_p99_us: {}\n  collector_idle_cpu_percent_max: {}\n  collector_active_cpu_percent_max: {}\n  collector_rss_p95_kib_max: {}\n  collector_peak_rss_kib: {}\n  collector_rss_samples_min: {}\n  collector_rss_observed_max_gap_ms: {}\n  allocated_disk_bytes_max: {}\n  collector_network_bytes_max: {}\n  network_monitor_samples: {}\n  all_observed_endpoints_loopback: true\n  network_evidence: process-network-monitor-plus-independent-socket-endpoint-scan-plus-static-product-surface\nruns:\n",
         profile_name(config.profile),
         profile_name(config.profile),
         env!("CARGO_PKG_VERSION"),
@@ -5461,7 +5470,7 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<AutomaticEvidence
     let expected_lifecycle = "built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect";
     let expected_collector = "built-agent-observability-collector-serve-subprocess";
     let expected_transport = "private-ca-https-exact-private-random-request-header-not-mtls";
-    let expected_config = "installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp";
+    let expected_config = "installed-codex-0.152.1-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp";
     let expected_correction = "codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity";
     let expected_benchmark = "post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report";
     let expected_notify = "separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan";
@@ -5469,7 +5478,7 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<AutomaticEvidence
         || evidence.evidence_kind != "automatic_release_evidence"
         || evidence.protocol_revision != AUTOMATIC_PROTOCOL_REVISION
         || !evidence.build.cargo_locked
-        || evidence.build.codex_version != "0.151.0"
+        || evidence.build.codex_version != "0.152.1"
         || evidence.workload.lifecycle_preflight != expected_lifecycle
         || evidence.workload.collector_boundary != expected_collector
         || evidence.workload.transport != expected_transport
@@ -5501,7 +5510,7 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<AutomaticEvidence
     let expected_codex_gate = if codex_failed {
         "failed-lifecycle-preflight"
     } else {
-        "passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response"
+        "passed-actual-codex-0.152.1-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response"
     };
     if evidence.workload.real_codex_e2e_release_gate != expected_codex_gate {
         return Err("automatic performance manifest has inconsistent real Codex gate".into());
@@ -5579,7 +5588,7 @@ fn validate_automatic_release_identity(
         || !evidence.build.cargo_locked
         || evidence.build.cargo_profile != "release"
         || evidence.build.codex_package != "@openai/codex"
-        || evidence.build.codex_version != "0.151.0"
+        || evidence.build.codex_version != "0.152.1"
         || evidence.host.os != "macos"
         || !evidence.errors.is_empty()
     {
@@ -5614,11 +5623,11 @@ fn validate_automatic_release_host(host: &AutomaticEvidenceHost) -> Result<(), S
 }
 
 fn validate_automatic_release_workload(evidence: &AutomaticEvidenceManifest) -> Result<(), String> {
-    let expected_gate = "passed-actual-codex-0.151.0-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response";
+    let expected_gate = "passed-actual-codex-0.152.1-macos-codex-exec-content-free-loopback-model-exporter-native-otlp-session-exact-10-input-2-output-tokens-no-raw-prompt-or-response";
     let expected_lifecycle = "built-binary-isolated-home-codex-home-strict-config-real-codex-loopback-model-e2e-setup-sigkill-keepalive-recovery-reconnect-concurrency-missing-settings-inherited-plist-disconnect";
     let expected_collector = "built-agent-observability-collector-serve-subprocess";
     let expected_transport = "private-ca-https-exact-private-random-request-header-not-mtls";
-    let expected_config = "installed-codex-0.151.0-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp";
+    let expected_config = "installed-codex-0.152.1-strict-config-diagnostic-and-actual-codex-exec-loopback-model-exporter-native-otlp";
     let expected_correction = "codex-0.151.0-macos-client-identity-fields-fail-exporter-construction-private-ca-https-exact-private-random-header-no-client-identity";
     let expected_benchmark = "post-real-codex-gate-sustained-synthetic-codex-shaped-otlp-http-json-v1-logs-over-private-ca-https-exact-private-random-header-through-centralized-local-collector-client-and-durable-report";
     let expected_notify = "separately-verified-built-agent-observability-codex-notify-private-ca-https-exact-private-random-header-supplement-with-durable-tree-raw-sentinel-scan";
@@ -6648,7 +6657,7 @@ mod tests {
         assert!(AUTOMATIC_PROTOCOL.contains("NetworkMonitor"));
         assert!(AUTOMATIC_PROTOCOL.contains("unexpected SIGKILL service termination"));
         assert!(AUTOMATIC_PROTOCOL.contains("bounded unaided launchd KeepAlive recovery"));
-        assert!(AUTOMATIC_PROTOCOL.contains("installed @openai/codex 0.151.0 exact version"));
+        assert!(AUTOMATIC_PROTOCOL.contains("installed @openai/codex 0.152.1 exact version"));
         assert!(
             AUTOMATIC_PROTOCOL.contains(
                 "actual codex exec proving exporter construction and native OTLP delivery"
@@ -7153,7 +7162,7 @@ mod tests {
     fn automatic_lifecycle_failures_use_content_free_stage_codes() {
         for (error, code) in [
             (
-                "lifecycle preflight: automatic lifecycle requires codex-cli 0.151.0, found private",
+                "lifecycle preflight: automatic lifecycle requires codex-cli 0.152.1, found private",
                 "code=lifecycle_codex_version_failed",
             ),
             (
@@ -7277,7 +7286,7 @@ mod tests {
     #[test]
     fn specific_lifecycle_failures_render_valid_failed_manifests() {
         for failure in [
-            "automatic lifecycle requires codex-cli 0.151.0, found private",
+            "automatic lifecycle requires codex-cli 0.152.1, found private",
             "automatic lifecycle Codex config stage failed",
             "automatic lifecycle real Codex stage failed",
             "automatic lifecycle setup stage failed",

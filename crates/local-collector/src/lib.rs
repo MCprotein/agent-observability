@@ -4736,6 +4736,57 @@ mod tests {
     }
 
     #[test]
+    fn collector_correlates_websocket_request_across_restart() {
+        let root = test_root("split-websocket-correlation");
+        let _ = fs::remove_dir_all(&root);
+        let request = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
+          {"attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+            {"key":"duration_ms","value":{"intValue":"5"}},
+            {"key":"success","value":{"boolValue":true}}
+          ]},
+          {"timeUnixNano":"100000001","attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.websocket_request"}},
+            {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+            {"key":"model","value":{"stringValue":"gpt-test"}},
+            {"key":"duration_ms","value":{"intValue":"12"}},
+            {"key":"success","value":{"boolValue":true}}
+          ]}
+        ]}]}]}"#;
+        let completed = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
+          {"attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
+            {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+            {"key":"model","value":{"stringValue":"gpt-test"}},
+            {"key":"event.kind","value":{"stringValue":"response.completed"}},
+            {"key":"input_token_count","value":{"intValue":"100"}},
+            {"key":"output_token_count","value":{"intValue":"25"}}
+          ]}
+        ]}]}]}"#;
+
+        let mut state = collector_state(&root);
+        ingest_locked(&mut state, request).unwrap();
+        assert_eq!(state.request_correlation.pending_len(), 1);
+        assert_eq!(state.store.observation_count().unwrap(), 1);
+        assert_eq!(state.store.disposition_count().unwrap(), 1);
+        drop(state);
+
+        let mut restarted = collector_state(&root);
+        assert_eq!(restarted.request_correlation.pending_len(), 1);
+        ingest_locked(&mut restarted, request).unwrap();
+        assert_eq!(restarted.request_correlation.pending_len(), 1);
+        assert_eq!(restarted.store.observation_count().unwrap(), 1);
+        assert_eq!(restarted.store.disposition_count().unwrap(), 3);
+        ingest_locked(&mut restarted, completed).unwrap();
+
+        assert_eq!(restarted.request_correlation.pending_len(), 0);
+        assert_eq!(restarted.last_cursor.as_deref(), Some("5"));
+        assert_eq!(restarted.store.observation_count().unwrap(), 2);
+        assert_eq!(restarted.store.disposition_count().unwrap(), 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn collector_restart_preserves_success_fifo_across_failed_retry_and_next_request() {
         let root = test_root("restart-correlation-fifo");
         let _ = fs::remove_dir_all(&root);

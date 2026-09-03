@@ -196,11 +196,11 @@ fn validate_codex_automatic_local_capability(
 ) -> Result<(), ContractError> {
     if capability.capability_version != "codex_automatic_local.v3"
         || capability.adapter_family != "codex"
-        || capability.support_status != "supported"
+        || capability.support_status != "experimental"
         || capability.platforms != ["macos"]
         || capability.profiles != ["standalone"]
-        || capability.product_version != "0.151.0"
-        || capability.verified_at != "2026-09-02"
+        || capability.product_version != "0.152.1"
+        || capability.verified_at != "2026-09-03"
         || capability.official_references.is_empty()
         || capability.official_references.iter().any(|reference| {
             !reference.starts_with(concat!("https", "://developers.openai.com/codex/"))
@@ -233,6 +233,7 @@ fn validate_codex_automatic_local_capability(
             != [
                 "codex.conversation_starts",
                 "codex.api_request",
+                "codex.websocket_request",
                 "codex.sse_event",
                 "codex.tool_decision",
                 "codex.tool_result",
@@ -1789,6 +1790,7 @@ mod tests {
             .expect("Codex capability exists");
         assert_eq!(codex.support_status, "supported");
         assert_eq!(codex.product_versions.oldest, "0.150.1");
+        assert_eq!(codex.product_versions.newest, "0.150.1");
         assert_eq!(codex.platforms, ["macos"]);
         assert_eq!(codex.profiles, ["standalone"]);
         assert!(!codex.privacy.content_fields_accepted);
@@ -1798,9 +1800,9 @@ mod tests {
             .first()
             .expect("Codex automatic local capability exists");
         assert_eq!(automatic.capability_version, "codex_automatic_local.v3");
-        assert_eq!(automatic.support_status, "supported");
-        assert_eq!(automatic.product_version, "0.151.0");
-        assert_eq!(automatic.verified_at, "2026-09-02");
+        assert_eq!(automatic.support_status, "experimental");
+        assert_eq!(automatic.product_version, "0.152.1");
+        assert_eq!(automatic.verified_at, "2026-09-03");
         assert_eq!(
             automatic.receiver_boundary,
             "private_ca_https_exact_header_ipv4_loopback_otlp_http_json_v3"

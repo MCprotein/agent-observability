@@ -75,18 +75,18 @@ jobs:
           rustup toolchain install 1.97.0 --profile minimal --target "${{ matrix.target }}"
       - name: Build native CLI
         run: cargo +1.97.0 build --release --locked -p agent-observability-cli --target "${{ matrix.target }}"
-      - name: Install exact supported Codex CLI
+      - name: Install exact candidate Codex CLI
         shell: bash
         run: |
           set -euo pipefail
-          prefix="$RUNNER_TEMP/codex-0.151.0"
-          npm install --prefix "$prefix" @openai/codex@0.151.0
+          prefix="$RUNNER_TEMP/codex-0.152.1"
+          npm install --prefix "$prefix" @openai/codex@0.152.1
           echo "$prefix/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Smoke test the exact native release binary
         shell: bash
         run: |
           set -euo pipefail
-          test "$(codex --version)" = "codex-cli 0.151.0"
+          test "$(codex --version)" = "codex-cli 0.152.1"
           binary="$PWD/target/${{ matrix.target }}/release/agent-observability"
           test "$("$binary" --version)" = "${GITHUB_REF_NAME#v}"
           cargo +1.97.0 run --locked -p xtask -- perf automatic --profile smoke --check \

@@ -210,11 +210,11 @@
     {
       "capability_version": "codex_automatic_local.v3",
       "adapter_family": "codex",
-      "support_status": "supported",
+      "support_status": "experimental",
       "platforms": ["macos"],
       "profiles": ["standalone"],
-      "product_version": "0.151.0",
-      "verified_at": "2026-09-02",
+      "product_version": "0.152.1",
+      "verified_at": "2026-09-03",
       "official_references": [
         "https://developers.openai.com/codex/config-advanced",
         "https://developers.openai.com/codex/config-reference"
@@ -230,6 +230,7 @@
           "events": [
             "codex.conversation_starts",
             "codex.api_request",
+            "codex.websocket_request",
             "codex.sse_event",
             "codex.tool_decision",
             "codex.tool_result"
