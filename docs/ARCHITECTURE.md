@@ -229,7 +229,7 @@ anti-corruption layer다.
   persist, log, diagnostic, projection 또는 export 경계를 통과하지 않는다.
 - Default-off private Codex detail capture는 공식 notify의 cwd, input messages, last assistant message만
   전용 authenticated localhost endpoint의 bounded envelope로 받아 per-turn private artifact에 분리한다.
-  Receiver는 content-free projection을 먼저 canonical ingest하고 bounded mutation lock 아래 private detail과
+  Receiver는 content-free projection을 먼저 canonical ingest하고 event loop 밖의 bounded blocking task에서 mutation lock 아래 private detail과
   terminal status를 동기화한 경우에만 available 성공을 반환한다. 메모리 queue나 restart-stranded pending은
   없다. 파일 기록·fsync·bounded scan·retention은 무한 재시도 없이 제한되며 상태는 일반 local storage
   budget과 분리된 최대 1,024개×1KiB diagnostic headroom에 둔다. 같은 hashed turn ID의 동일 detail 재시도는 no-op이고

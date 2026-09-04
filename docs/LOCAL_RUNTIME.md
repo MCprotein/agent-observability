@@ -152,7 +152,8 @@ decisions, timing, token counts and success state cross into the canonical adapt
 When `capture_private_codex_turn_details` is explicitly enabled, the foreground notify helper sends the
 content-free projection plus validated source-provided cwd, input messages and last assistant message to a
 dedicated capability-protected localhost endpoint. The collector commits the projection, then synchronously writes
-the per-turn private artifact and content-free terminal status under a bounded mutation-lock acquisition. It returns
+the per-turn private artifact and content-free terminal status under a bounded mutation-lock acquisition in a blocking
+task outside the collector event loop. It returns
 `available` only after both publications complete; there is no ephemeral detail queue or restart-stranded pending
 state. The helper's absolute 250 ms loopback/TLS/HTTP deadline keeps a slow or contended opt-in write fail-open for
 Codex. The artifact is correlated by

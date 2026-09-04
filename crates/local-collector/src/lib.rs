@@ -1785,7 +1785,26 @@ async fn ingest_notify_with_private_detail(State(state): State<AppState>, body: 
             drop(collector);
             schedule_report_refresh(&state);
             if config.capture_private_codex_turn_details {
-                persist_private_turn_detail_request(&state, &layout, &config, &private_detail)
+                let writer_state = state.clone();
+                if let Ok(response) = tokio::task::spawn_blocking(move || {
+                    persist_private_turn_detail_request(
+                        &writer_state,
+                        &layout,
+                        &config,
+                        &private_detail,
+                    )
+                })
+                .await
+                {
+                    response
+                } else {
+                    state.private_detail_failures.fetch_add(1, Ordering::AcqRel);
+                    private_turn_detail_receipt_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        PrivateTurnDetailReceiptState::Failed,
+                        "writer_task",
+                    )
+                }
             } else {
                 private_turn_detail_receipt_response(
                     StatusCode::CONFLICT,
