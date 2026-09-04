@@ -380,24 +380,6 @@
                   {
                     "type": "object",
                     "properties": {
-                      "inputTokens": true
-                    },
-                    "required": [
-                      "inputTokens"
-                    ]
-                  },
-                  {
-                    "type": "object",
-                    "properties": {
-                      "outputTokens": true
-                    },
-                    "required": [
-                      "outputTokens"
-                    ]
-                  },
-                  {
-                    "type": "object",
-                    "properties": {
                       "totalTokens": true
                     },
                     "required": [
@@ -407,28 +389,32 @@
                   {
                     "type": "object",
                     "properties": {
-                      "totalInputTokens": true
-                    },
-                    "required": [
-                      "totalInputTokens"
-                    ]
-                  },
-                  {
-                    "type": "object",
-                    "properties": {
-                      "totalOutputTokens": true
-                    },
-                    "required": [
-                      "totalOutputTokens"
-                    ]
-                  },
-                  {
-                    "type": "object",
-                    "properties": {
                       "totalAccumulatedTokens": true
                     },
                     "required": [
                       "totalAccumulatedTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "inputTokens": true,
+                      "outputTokens": true
+                    },
+                    "required": [
+                      "inputTokens",
+                      "outputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "totalInputTokens": true,
+                      "totalOutputTokens": true
+                    },
+                    "required": [
+                      "totalInputTokens",
+                      "totalOutputTokens"
                     ]
                   }
                 ]

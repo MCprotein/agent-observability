@@ -38,10 +38,10 @@ test("reduces only already-priced billable span scalars", () => {
 test("reduces every displayable token-total shape with stable precedence", () => {
   const cases: Array<[string, Metrics, number | undefined]> = [
     ["direct input and output", { inputTokens: 12, outputTokens: 3 }, 15],
-    ["direct partial", { outputTokens: 3 }, 3],
+    ["direct partial", { outputTokens: 3 }, undefined],
     ["reported total", { totalTokens: 20 }, 20],
     ["cumulative input and output", { totalInputTokens: 30, totalOutputTokens: 7 }, 37],
-    ["cumulative partial", { totalInputTokens: 30 }, 30],
+    ["cumulative partial", { totalInputTokens: 30 }, undefined],
     ["accumulated total", { totalAccumulatedTokens: 40 }, 40],
     ["direct before aggregate", { inputTokens: 1, outputTokens: 2, totalTokens: 99 }, 3],
     ["no displayable total", { cachedInputTokens: 8, contextWindowTokens: 128_000 }, undefined],
@@ -54,7 +54,7 @@ test("reduces every displayable token-total shape with stable precedence", () =>
   const summary = summarizeVisible(cases.slice(0, 6).map(([, metrics]) =>
     viewSpan("estimated", 0, metrics),
   ));
-  assert.equal(summary.totalTokens, 145);
+  assert.equal(summary.totalTokens, 112);
   assert.equal(summary.costStatus, "estimated");
 });
 

@@ -296,8 +296,8 @@ fn report_span(record: &DurableRecordV1, table: Option<&RateTable>) -> ReportSpa
     let session_id = scalar_string(attributes.session_id.as_ref());
     let turn_id = scalar_string(attributes.turn_id.as_ref());
     let model = record.agent.model.clone();
-    let tokens_present = report_token_metrics_present(&metrics);
     let latency_present = metrics.latency_ms.is_some() || metrics.duration_ms.is_some();
+    let tokens = token_availability(&metrics, record.span_kind);
     let private_detail = private_lookup_availability(
         record.agent.name.as_deref(),
         &attributes,
@@ -324,7 +324,7 @@ fn report_span(record: &DurableRecordV1, table: Option<&RateTable>) -> ReportSpa
             &repo,
             turn_id.as_deref(),
             model.as_deref(),
-            tokens_present,
+            tokens,
             latency_present,
             record.span_kind,
             private_detail,
@@ -350,7 +350,7 @@ fn report_availability(
     repo: &str,
     turn_id: Option<&str>,
     model: Option<&str>,
-    tokens_present: bool,
+    tokens: FieldAvailabilityV2,
     latency_present: bool,
     kind: SpanKind,
     private_detail: FieldAvailabilityV2,
@@ -397,8 +397,26 @@ fn report_availability(
             "span_kind_has_no_latency",
         )
     };
-    let tokens = if tokens_present {
+    ReportAvailabilityV2 {
+        repository,
+        turn,
+        model,
+        tokens,
+        latency,
+        source_location: private_detail.clone(),
+        request_content: private_detail.clone(),
+        response_content: private_detail,
+    }
+}
+
+fn token_availability(metrics: &ReportMetricsV1, kind: SpanKind) -> FieldAvailabilityV2 {
+    if report_token_total_present(metrics) {
         field_availability(AvailabilityStateV2::Available, "reported_by_adapter")
+    } else if report_token_metrics_present(metrics) {
+        field_availability(
+            AvailabilityStateV2::SourceUnavailable,
+            "partial_token_metrics",
+        )
     } else if matches!(kind, SpanKind::LlmRequest) {
         field_availability(
             AvailabilityStateV2::SourceUnavailable,
@@ -409,16 +427,6 @@ fn report_availability(
             AvailabilityStateV2::NotApplicable,
             "span_kind_has_no_token_usage",
         )
-    };
-    ReportAvailabilityV2 {
-        repository,
-        turn,
-        model,
-        tokens,
-        latency,
-        source_location: private_detail.clone(),
-        request_content: private_detail.clone(),
-        response_content: private_detail,
     }
 }
 
@@ -484,6 +492,13 @@ fn report_token_metrics_present(metrics: &ReportMetricsV1) -> bool {
     ]
     .into_iter()
     .any(|value| value.is_some())
+}
+
+fn report_token_total_present(metrics: &ReportMetricsV1) -> bool {
+    metrics.total_tokens.is_some()
+        || metrics.total_accumulated_tokens.is_some()
+        || (metrics.input_tokens.is_some() && metrics.output_tokens.is_some())
+        || (metrics.total_input_tokens.is_some() && metrics.total_output_tokens.is_some())
 }
 
 fn propagate_trace_repositories(spans: &mut [ReportSpanV2]) {

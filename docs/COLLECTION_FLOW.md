@@ -102,9 +102,8 @@ sequenceDiagram
             Notify->>Receiver: projected supplement over authenticated HTTPS
         else private detail enabled
             Notify->>Receiver: projection + validated detail over dedicated authenticated route
-            Receiver->>Store: durably record content-free queued status
-            Receiver->>Receiver: nonblocking 64-slot admission
-            Receiver->>Store: single guarded background writer persists private detail outside canonical store
+            Receiver->>Store: bounded guarded write of private detail + terminal status
+            Store-->>Receiver: available only after both files are durable
         end
     end
     Receiver->>Adapter: copy allowlisted scalars only
@@ -213,10 +212,9 @@ Raw body, prompt, response, tool arguments/output, command, raw cwd/path, accoun
 canonical persist, log, diagnostic, projection, report 또는 export 경계를 통과하지 않는다. Notify의 cwd는
 pseudonymous project reference로만 축약될 수 있다. 사용자가 private detail을 켠 경우에는 notify가 제공한 cwd,
 input messages, last assistant message만 전용 authenticated localhost route의 bounded envelope로 전달하고,
-collector가 durable content-free queued 상태를 먼저 기록하고 bounded detail queue의 단일 writer가 같은
-mutation lock 아래 hashed turn ID로 연결한 별도 private artifact와 terminal 결과를 저장한다. 상태는
-1,024개×1KiB로 제한된 별도 diagnostic partition에 둔다. Foreground callback은 durable queued 계약을
-위한 bounded content-free status 기록만 수행하고 raw detail 파일 기록·directory scan·prune·fsync는 수행하지 않는다.
+collector가 bounded mutation lock 아래 hashed turn ID로 연결한 별도 private artifact와 terminal 결과를
+동기화한 뒤에만 available을 반환한다. 상태는 1,024개×1KiB로 제한된 별도 diagnostic headroom에 둔다.
+메모리 detail queue와 재시작 뒤 고아 pending 상태는 없으며 전체 callback은 250ms deadline으로 fail open한다.
 Dashboard는 capability-protected localhost detail route로 선택한 turn만 읽으며 team path는 이 artifact를
 알지 못한다.
 

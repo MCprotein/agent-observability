@@ -179,12 +179,12 @@ pseudonymous project reference뿐이다. 원문 path/content는 canonical store,
 
 정확한 cwd와 Codex notify가 제공하는 input messages, last assistant message가 필요하면 Settings의
 `요청·응답 상세 저장`을 켠다. 기본값은 OFF이며 켠 이후 새 turn만 별도 `0600` private artifact에
-저장된다. 이때 foreground helper는 content-free projection과 검증된 상세를 하나의 bounded envelope로
-private-CA HTTPS localhost endpoint에 넘기기만 한다. Collector는 `202 Accepted`를 반환하기 전에 content-free
-`queued` 상태를 디스크에 기록한 뒤 64-slot detail queue에 넣는다. 단일 background writer가 같은 mutation
-lock 아래 상세 저장을 처리한다. Opt-in callback은 queued 계약을 보장하기 위한 최대 1KiB status 원자 기록과
-bounded status pruning만 수행하고, raw detail directory scan·prune·fsync는 수행하지 않는다.
-상태 파일은 최대 1,024개×1KiB의 별도 bounded diagnostic partition이라 일반 저장 예산이 가득 차도 실패 이유를
+저장된다. Foreground helper는 content-free projection과 검증된 상세를 하나의 bounded envelope로
+private-CA HTTPS localhost endpoint에 넘긴다. Collector는 bounded mutation-lock 구간에서 raw detail과
+content-free terminal status를 모두 원자 파일로 동기화한 뒤에만 `available` 성공을 반환한다. 별도 메모리
+queue나 재시작 후 남는 pending 상태는 없다. Callback 전체에는 250ms 절대 deadline이 있어 느리거나 잠긴
+runtime에서는 Codex를 막지 않고 명시적 unavailable로 fail open한다.
+상태 파일은 최대 1,024개×1KiB의 별도 bounded diagnostic headroom이라 일반 저장 예산이 가득 차도 실패 이유를
 남길 수 있다. 동일 turn의 같은 detail은 no-op이며 서로 다른 detail은
 기존 원문을 덮어쓰지 않고 `conflict`로 표시한다. 일반 report DTO/HTML에는 원문을 넣지 않고 선택한 turn에서 localhost 상세 endpoint로만
 읽는다. 이는 API wire request/response 캡처가 아니다. 기존 외부 `notify`를 보존한 환경에서는 해당

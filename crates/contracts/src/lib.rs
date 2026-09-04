@@ -104,13 +104,17 @@ pub struct AutomaticLocalSourceSurfaceV1 {
     pub role: String,
     pub transport: String,
     pub endpoint: String,
+    pub owned_fields: Vec<String>,
     pub events: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct AutomaticLocalPrivacyV1 {
-    pub content_fields_durable: bool,
+    pub canonical_content_fields_durable: bool,
+    pub opt_in_private_detail_fields_durable: bool,
+    pub private_detail_scope: String,
     pub raw_identifiers_durable: bool,
     pub raw_request_bodies_durable: bool,
     pub unknown_fields: AutomaticUnknownFieldPolicyV1,
@@ -199,7 +203,7 @@ fn validate_capability_entry(entry: &AdapterCapabilityEntryV1) -> Result<(), Con
 fn validate_codex_automatic_local_capability(
     capability: &CodexAutomaticLocalCapabilityV1,
 ) -> Result<(), ContractError> {
-    if capability.capability_version != "codex_automatic_local.v3"
+    if capability.capability_version != "codex_automatic_local.v4"
         || capability.adapter_family != "codex"
         || capability.support_status != "experimental"
         || capability.platforms != ["macos"]
@@ -211,11 +215,13 @@ fn validate_codex_automatic_local_capability(
             !reference.starts_with(concat!("https", "://developers.openai.com/codex/"))
         })
         || capability.receiver_boundary
-            != "private_ca_https_exact_header_ipv4_loopback_otlp_http_json_v3"
+            != "private_ca_https_exact_header_ipv4_loopback_otlp_http_json_v4"
         || capability.source_generation != "codex-otel-v1"
         || capability.manual_ingest_boundary != "private_canonical_handoff_v1"
         || capability.team_ingest != "disabled"
-        || capability.privacy.content_fields_durable
+        || capability.privacy.canonical_content_fields_durable
+        || !capability.privacy.opt_in_private_detail_fields_durable
+        || capability.privacy.private_detail_scope != "standalone_local_only_default_off"
         || capability.privacy.raw_identifiers_durable
         || capability.privacy.raw_request_bodies_durable
         || capability.privacy.unknown_fields.otlp_attributes
@@ -226,7 +232,7 @@ fn validate_codex_automatic_local_capability(
         return Err(ContractError::InvalidCapabilityManifest);
     }
 
-    if capability.source_surfaces.len() != 2 {
+    if capability.source_surfaces.len() != 3 {
         return Err(ContractError::InvalidCapabilityManifest);
     }
     let primary = &capability.source_surfaces[0];
@@ -234,6 +240,7 @@ fn validate_codex_automatic_local_capability(
         || primary.role != "primary"
         || primary.transport != "ipv4_loopback_private_ca_https_exact_header_json"
         || primary.endpoint != "/v1/logs"
+        || primary.owned_fields.is_empty()
         || primary.events
             != [
                 "codex.conversation_starts",
@@ -251,7 +258,23 @@ fn validate_codex_automatic_local_capability(
         || supplement.role != "supplement"
         || supplement.transport != "ipv4_loopback_private_ca_https_exact_header_projected_json"
         || supplement.endpoint != "/v1/notify"
+        || supplement.owned_fields != ["turn.lifecycle", "project.pseudonymous_reference"]
         || supplement.events != ["agent-turn-complete"]
+    {
+        return Err(ContractError::InvalidCapabilityManifest);
+    }
+    let private_detail = &capability.source_surfaces[2];
+    if private_detail.id != "codex_notify_private_turn_detail_v1"
+        || private_detail.role != "optional_private_detail"
+        || private_detail.transport != "ipv4_loopback_private_ca_https_exact_header_closed_json"
+        || private_detail.endpoint != "/v1/notify/private-detail"
+        || private_detail.owned_fields
+            != [
+                "source.cwd",
+                "request.input_messages",
+                "response.last_assistant_message",
+            ]
+        || private_detail.events != ["agent-turn-complete"]
     {
         return Err(ContractError::InvalidCapabilityManifest);
     }
@@ -1570,9 +1593,16 @@ impl ReportDtoV2 {
             validate_report_attributes(&span.attributes)?;
             validate_report_metrics(&span.metrics)?;
             let token_metrics_present = report_token_metrics_present(&span.metrics);
-            if (span.availability.tokens.state == AvailabilityStateV2::Available)
-                != token_metrics_present
-            {
+            let token_total_present = report_token_total_present(&span.metrics);
+            let token_availability_valid = if token_total_present {
+                span.availability.tokens.state == AvailabilityStateV2::Available
+            } else if token_metrics_present {
+                span.availability.tokens.state == AvailabilityStateV2::SourceUnavailable
+                    && span.availability.tokens.reason == "partial_token_metrics"
+            } else {
+                span.availability.tokens.state != AvailabilityStateV2::Available
+            };
+            if !token_availability_valid {
                 return Err(ContractError::ContradictoryReportAvailability);
             }
             for field in [
@@ -1793,6 +1823,13 @@ fn report_token_metrics_present(metrics: &ReportMetricsV1) -> bool {
     ]
     .into_iter()
     .any(|value| value.is_some())
+}
+
+fn report_token_total_present(metrics: &ReportMetricsV1) -> bool {
+    metrics.total_tokens.is_some()
+        || metrics.total_accumulated_tokens.is_some()
+        || (metrics.input_tokens.is_some() && metrics.output_tokens.is_some())
+        || (metrics.total_input_tokens.is_some() && metrics.total_output_tokens.is_some())
 }
 
 fn validate_scalar(value: &ScalarValueV1) -> Result<(), ContractError> {
@@ -2058,18 +2095,23 @@ mod tests {
             .automatic_local_capabilities
             .first()
             .expect("Codex automatic local capability exists");
-        assert_eq!(automatic.capability_version, "codex_automatic_local.v3");
+        assert_eq!(automatic.capability_version, "codex_automatic_local.v4");
         assert_eq!(automatic.support_status, "experimental");
         assert_eq!(automatic.product_version, "0.152.1");
         assert_eq!(automatic.verified_at, "2026-09-03");
         assert_eq!(
             automatic.receiver_boundary,
-            "private_ca_https_exact_header_ipv4_loopback_otlp_http_json_v3"
+            "private_ca_https_exact_header_ipv4_loopback_otlp_http_json_v4"
         );
         assert_eq!(automatic.source_generation, "codex-otel-v1");
         assert_eq!(automatic.manual_ingest_boundary, codex.ingest_boundary);
         assert_eq!(automatic.team_ingest, "disabled");
-        assert!(!automatic.privacy.content_fields_durable);
+        assert!(!automatic.privacy.canonical_content_fields_durable);
+        assert!(automatic.privacy.opt_in_private_detail_fields_durable);
+        assert_eq!(
+            automatic.privacy.private_detail_scope,
+            "standalone_local_only_default_off"
+        );
         assert!(!automatic.privacy.raw_identifiers_durable);
         assert!(!automatic.privacy.raw_request_bodies_durable);
         assert_eq!(
@@ -2122,7 +2164,7 @@ mod tests {
                 serde_json::json!(concat!("https", "://collector.example.com/v1/logs")),
             ),
             (
-                "/automatic_local_capabilities/0/privacy/content_fields_durable",
+                "/automatic_local_capabilities/0/privacy/canonical_content_fields_durable",
                 serde_json::json!(true),
             ),
             (

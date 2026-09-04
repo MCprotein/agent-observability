@@ -38,8 +38,8 @@ function summarizeVisible(spans) {
   return summary;
 }
 function tokenTotal(metrics) {
-  const direct = sumOptional(metrics.inputTokens, metrics.outputTokens);
-  const cumulative = sumOptional(metrics.totalInputTokens, metrics.totalOutputTokens);
+  const direct = sumComplete(metrics.inputTokens, metrics.outputTokens);
+  const cumulative = sumComplete(metrics.totalInputTokens, metrics.totalOutputTokens);
   return direct ?? metrics.totalTokens ?? cumulative ?? metrics.totalAccumulatedTokens;
 }
 function aggregateCostStatus(statuses) {
@@ -53,8 +53,8 @@ function aggregateCostStatus(statuses) {
 function hasTokenMetrics(span) {
   return tokenTotal(span.metrics) !== void 0 || NON_TOTAL_TOKEN_METRICS.some((key) => span.metrics[key] !== void 0);
 }
-function sumOptional(left, right) {
-  return left === void 0 && right === void 0 ? void 0 : (left ?? 0) + (right ?? 0);
+function sumComplete(left, right) {
+  return left === void 0 || right === void 0 ? void 0 : left + right;
 }
 export {
   aggregateCostStatus,

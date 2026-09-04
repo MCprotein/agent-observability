@@ -85,7 +85,7 @@ Each entry in `crates/contracts/capabilities/adapter-capability-v1.yaml` contain
 privacy closure. The Codex, Claude Code and Cursor adapter suites verify declared input/projection fixture hashes,
 exact replay output, bounded input, restart/idempotency and privacy behavior. Claude Code additionally locks permission,
 compaction, failed lifecycle, interrupt-gap and out-of-order timestamp fixtures. The capability manifest publishes
-separate manual `private_canonical_handoff_v1` entries and a macOS standalone `codex_automatic_local.v3` entry
+separate manual `private_canonical_handoff_v1` entries and a macOS standalone `codex_automatic_local.v4` entry
 pinned to Codex `0.152.1`. Native receiver, foreground notify, privacy, restart, smoke and exact-revision five-run
 evidence pass on this macOS boundary. The manifest remains `experimental` because cross-version/OS/profile
 execution remains a future promotion gate.

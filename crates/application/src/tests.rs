@@ -352,16 +352,28 @@ fn report_private_lookup_is_limited_to_current_codex_notify_turns() {
 }
 
 #[test]
-fn report_marks_aggregate_only_token_metrics_available() {
+fn report_distinguishes_complete_and_partial_aggregate_token_metrics() {
     let mut record = span("gpt-test", MetricsV1::default());
     record.metrics.total_input_tokens = Some(10.0);
-    let report = project_report(&[record], "generated", "tokens", None).unwrap();
+    let partial = project_report(&[record.clone()], "generated", "tokens", None).unwrap();
 
     assert_eq!(
-        report.spans[0].availability.tokens.state,
+        partial.spans[0].availability.tokens.state,
+        agent_observability_contracts::AvailabilityStateV2::SourceUnavailable
+    );
+    assert_eq!(
+        partial.spans[0].availability.tokens.reason,
+        "partial_token_metrics"
+    );
+    partial.validate().unwrap();
+
+    record.metrics.total_output_tokens = Some(2.0);
+    let complete = project_report(&[record], "generated", "tokens", None).unwrap();
+    assert_eq!(
+        complete.spans[0].availability.tokens.state,
         agent_observability_contracts::AvailabilityStateV2::Available
     );
-    report.validate().unwrap();
+    complete.validate().unwrap();
 }
 
 #[test]

@@ -563,20 +563,9 @@ async fn dashboard_turn_detail(
             PrivateTurnDetailLookup::NotCollected
             | PrivateTurnDetailLookup::Failed("invalid_turn_id"),
         ) => private_detail_not_found(),
-        Ok(PrivateTurnDetailLookup::Pending(code)) => private_detail_pending(code),
         Ok(PrivateTurnDetailLookup::Failed(code)) => private_detail_failed(code),
         Err(_) => private_detail_failed("lookup_failed"),
     }
-}
-
-fn private_detail_pending(code: &'static str) -> Response {
-    let body = format!(r#"{{"error":"capture_pending","code":"{code}"}}"#);
-    let mut response = (StatusCode::ACCEPTED, body).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json; charset=utf-8"),
-    );
-    response
 }
 
 fn private_detail_failed(code: &'static str) -> Response {
@@ -1983,42 +1972,6 @@ mod tests {
                 save(&guard, &config).unwrap();
                 drop(guard);
                 let digest = turn_id.strip_prefix("id:sha256:").unwrap();
-                let status_directory = layout.state.join("private-codex-turn-detail-statuses");
-                fs::create_dir_all(&status_directory).unwrap();
-                #[cfg(unix)]
-                fs::set_permissions(&status_directory, fs::Permissions::from_mode(0o700)).unwrap();
-                let status_path = status_directory.join(format!("{digest}.json"));
-                fs::write(
-                    &status_path,
-                    serde_json::to_vec(&serde_json::json!({
-                        "schema_version": "private_codex_turn_detail_status.v1",
-                        "turn_id": turn_id.clone(),
-                        "state": "queued",
-                        "code": "queued"
-                    }))
-                    .unwrap(),
-                )
-                .unwrap();
-                #[cfg(unix)]
-                fs::set_permissions(&status_path, fs::Permissions::from_mode(0o600)).unwrap();
-
-                let pending = app
-                    .clone()
-                    .oneshot(
-                        Request::builder()
-                            .uri(&detail_uri)
-                            .header(header::HOST, "127.0.0.1:43192")
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(pending.status(), StatusCode::ACCEPTED);
-                assert_eq!(
-                    to_bytes(pending.into_body(), 128).await.unwrap().as_ref(),
-                    br#"{"error":"capture_pending","code":"queued"}"#
-                );
-
                 let detail_directory = layout.state.join("private-codex-turn-details");
                 fs::create_dir_all(&detail_directory).unwrap();
                 #[cfg(unix)]

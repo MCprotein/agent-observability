@@ -72,7 +72,7 @@ integration mutation도 private UI session, exact Host와 Origin을 확인하고
 | Option | Default | Allowed | Purpose |
 | --- | ---: | ---: | --- |
 | `enabled` | `true` | `true`, `false` | manual import와 automatic collector ingest 허용 여부 |
-| `private-codex-details` | `false` | `true`, `false` | 이후 Codex notify가 제공하는 cwd, input messages, last assistant message를 authenticated localhost로 전달한다. Collector가 durable `queued` 상태를 먼저 기록한 뒤 64-slot queue와 단일 mutation-lock writer로 private 저장하며 상태는 별도 bounded diagnostic partition에 둔다. |
+| `private-codex-details` | `false` | `true`, `false` | 이후 Codex notify가 제공하는 cwd, input messages, last assistant message를 authenticated localhost로 전달한다. Collector가 bounded mutation lock 아래 detail과 terminal status를 동기화한 경우에만 성공하며, 상태는 별도 bounded diagnostic headroom에 둔다. |
 | `file-reconcile-ms` | `5000` | `1000..60000` | file source 재확인 간격 |
 | `flush-ms` | `5000` | `1000..60000` | bounded flush 간격 |
 | `batch-records` | `100` | `1..500` | batch당 최대 record 수 |
