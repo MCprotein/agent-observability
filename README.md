@@ -4,7 +4,11 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 외부 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.9.1 릴리스 후보.** 설정 명령을 `agentobs settings`로 명확히 하고 기존 `agentobs ui`는 호환
+> **v1.10.0 개발 중.** 현재 수집 데이터의 `unknown`을 필드별 가용성으로 설명하고, 검증된 Codex
+> metadata로 project/repository와 source location을 보강한다. 원문 request detail은 standalone에서만
+> 명시적으로 opt-in한 private detail 저장소와 별도 상세 화면을 사용하며 기본값은 계속 꺼짐이다.
+> assistant response 원문은 공식 source가 제공하지 않으면 `unavailable`로 표시하고 추측하거나
+> transcript를 스캔하지 않는다. v1.9.1에서 설정 명령을 `agentobs settings`로 명확히 하고 기존 `agentobs ui`는 호환
 > alias로 유지한다. self-contained report는 runtime별 고정 localhost origin에서 새로고침할 수 있고,
 > 설정 화면을 닫아도 독립된 bounded dashboard process가 유지된다. 기존 Codex,
 > Claude Code, Cursor private handoff import는 daemon이나
@@ -23,8 +27,8 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 > script는 `agentobs setup ~/.agent-observability --no-open`처럼 root를 명시한다. 자동 연결은 이후
 > 설정 UI 또는 고급 lifecycle 명령으로 언제든 추가할 수 있다.
 
-아래 빠른 시작은 v1.9.1 기준이다. PR 검토 중에는 installer URL이 아직 게시되지 않으며, tag와 GitHub
-Release가 완료된 뒤 같은 명령을 사용한다.
+아래 빠른 시작은 현재 공개된 stable v1.9.1 기준이다. v1.10.0은 PR 검토와 검증이 끝난 뒤 별도 tag와
+GitHub Release로 게시한다.
 
 ## 빠른 시작
 
