@@ -3,7 +3,7 @@
 v1.0.0 introduced the standalone local-only Rust runtime boundary. v1.2.0 added bounded local
 retention and private archive export; v1.4.0 added one-command setup, an isolated built-in demo,
 dashboard open, and atomic CLI configuration updates. v1.5.0 adds an explicit, ephemeral loopback
-settings UI. v1.8.4 is **Released** and provides optional Codex automatic local collection through a
+settings UI. The current stable release is v1.9.1; the v1.10.0 release candidate keeps optional Codex automatic local collection through a
 private-CA HTTPS IPv4 loopback receiver with an exact private random request header, plus a macOS LaunchAgent.
 This transport is not mTLS. Manual Codex, Claude Code and Cursor imports remain
 fully functional without a daemon, receiver, login or network. The automatic path makes no external request.
@@ -142,12 +142,20 @@ unowned edit made it an externally meaningful file. Restoration proceeds only wh
 and mode equal the recorded connected state at the commit checks. An edit observed by those checks fails closed and is preserved; the non-cooperating open-descriptor
 limitation above still applies. SQLite, JSONL and HTML data remain.
 
-The raw notify argument exists transiently only in the bounded foreground projector and is reduced before
-settings or socket access; the receiver sees only `ProjectedNotifyV1`. Raw OTLP requests can exist transiently in
-bounded receiver memory while JSON is decoded. Only explicitly allowlisted scalar identifiers, model/tool
-categories, decisions, timing, token counts and success state cross into the adapter. Raw prompt/response, tool
-arguments/output, command, cwd, path, account identity, unknown attributes and request bodies are never
-persisted, logged, projected, reported or exported.
+By default, the raw notify argument exists transiently only in the bounded foreground projector and is reduced
+before settings or socket access; the receiver sees only `ProjectedNotifyV1`. The projection may carry a bounded
+pseudonymous project reference derived from cwd, never the raw cwd or basename. Raw OTLP requests can exist transiently in bounded
+receiver memory while JSON is decoded. Only explicitly allowlisted scalar identifiers, model/tool categories,
+decisions, timing, token counts and success state cross into the canonical adapter.
+
+When `capture_private_codex_turn_details` is explicitly enabled, the foreground notify helper may also write a
+separate per-turn private detail artifact containing the source-provided cwd, input messages and last assistant
+message. It is correlated by the same hashed turn ID shown in the report and is fetched only from the
+capability-protected localhost dashboard route. It never enters the receiver payload, canonical observation,
+SQLite durable record, report DTO, static HTML, diagnostic, archive, export or team envelope. Disabling the
+option stops future capture and makes the dashboard detail route unavailable; it does not silently claim older
+turns were captured. API request/response wire bodies, tool arguments/output, commands, account identity and
+unknown attributes remain excluded.
 
 The collector transactionally commits source-ordered canonical observations and content-free dispositions
 through the same SQLite authority as manual import. Every current-record mutation, including retention, advances
@@ -201,6 +209,9 @@ Invalid updates leave the previous bytes unchanged. User-facing names, defaults,
 - Codex notify payload: raw input at most 64 KiB and a smaller closed projected wire object. Projection happens
   before I/O; one absolute foreground deadline constrains loopback connect, server-authenticated TLS handshake and the HTTP exchange
   before the helper returns a fail-open accepted, rejected or unavailable outcome without waiting for report work.
+- Opt-in Codex private turn detail: one validated JSON artifact per hashed turn ID, each at most 64 KiB, in a
+  private `0700` directory with `0600` files. The directory is pruned under a bounded total policy; this content
+  is not counted as or copied into the canonical report plane.
 - Raw foreground input: at most 1 MiB.
 - Privacy-projected local message: at most 64 KiB.
 - In-process ingress channel: 64 messages, one normalization writer, nonblocking admission. The

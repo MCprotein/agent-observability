@@ -8,6 +8,7 @@
   "properties": {
     "schema_version": { "const": "local_runtime.v2" },
     "enabled": { "type": "boolean" },
+    "capture_private_codex_turn_details": { "type": "boolean", "default": false },
     "collection": { "$ref": "#/$defs/collection" },
     "retention": { "$ref": "#/$defs/retention" }
   },

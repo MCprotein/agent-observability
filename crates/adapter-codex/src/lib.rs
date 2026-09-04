@@ -29,7 +29,9 @@ pub const MAX_RECENTLY_COMPLETED_OTLP_REQUESTS: usize = 1024;
 pub const MAX_PERSISTED_OTLP_CORRELATION_BYTES: usize = 512 * 1024;
 pub const OTLP_REQUEST_CORRELATION_TTL_MS: u64 = 5 * 60 * 1000;
 pub const PROJECTED_NOTIFY_SCHEMA_VERSION: &str = "codex_projected_notify.v1";
-pub const MAX_PROJECTED_NOTIFY_BYTES: usize = MAX_IDENTIFIER_BYTES * 2 + 256;
+pub const MAX_PROJECTED_NOTIFY_BYTES: usize = MAX_IDENTIFIER_BYTES * 3 + 320;
+pub const MAX_PRIVATE_TURN_DETAIL_BYTES: usize = MAX_HANDOFF_LINE_BYTES;
+pub const PRIVATE_TURN_DETAIL_SCHEMA_VERSION: &str = "agent_observability.private_turn_detail.v1";
 const KNOWN_CODEX_MODELS: &[&str] = &[
     "gpt-test",
     "gpt-5.4",
@@ -55,19 +57,18 @@ struct RawNotifyPayload {
     thread_id: String,
     #[serde(rename = "turn-id")]
     turn_id: String,
-    #[serde(rename = "cwd")]
-    _cwd: String,
+    cwd: String,
     #[serde(rename = "input-messages")]
-    _input_messages: Vec<String>,
+    input_messages: Vec<String>,
     #[serde(rename = "last-assistant-message")]
-    _last_assistant_message: Option<String>,
+    last_assistant_message: Option<String>,
 }
 
 /// Strict, bounded privacy projection for a Codex `agent-turn-complete` notification.
 ///
 /// This is the only notify representation that may cross a transport boundary. It contains the
-/// official event discriminator and opaque correlation identifiers, but no prompt, response, cwd,
-/// tool argument, or extension metadata.
+/// official event discriminator, opaque correlation identifiers, and a bounded cwd basename, but
+/// no prompt, response, raw cwd, tool argument, or extension metadata.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectedNotifyV1 {
@@ -75,20 +76,28 @@ pub struct ProjectedNotifyV1 {
     event_name: String,
     thread_id: String,
     turn_id: String,
+    project_name: String,
 }
 
 impl ProjectedNotifyV1 {
-    fn new(event_name: String, thread_id: String, turn_id: String) -> Result<Self, AdapterError> {
+    fn new(
+        event_name: String,
+        thread_id: String,
+        turn_id: String,
+        project_name: String,
+    ) -> Result<Self, AdapterError> {
         if event_name != "agent-turn-complete" {
             return Err(AdapterError::InvalidSchema);
         }
         parse_identifier::<SessionId>(&thread_id)?;
         parse_identifier::<TurnId>(&turn_id)?;
+        validate_project_name(&project_name)?;
         Ok(Self {
             schema_version: PROJECTED_NOTIFY_SCHEMA_VERSION.into(),
             event_name,
             thread_id,
             turn_id,
+            project_name,
         })
     }
 
@@ -96,7 +105,12 @@ impl ProjectedNotifyV1 {
         if self.schema_version != PROJECTED_NOTIFY_SCHEMA_VERSION {
             return Err(AdapterError::InvalidSchema);
         }
-        Self::new(self.event_name, self.thread_id, self.turn_id)
+        Self::new(
+            self.event_name,
+            self.thread_id,
+            self.turn_id,
+            self.project_name,
+        )
     }
 
     #[must_use]
@@ -114,6 +128,11 @@ impl ProjectedNotifyV1 {
         &self.turn_id
     }
 
+    #[must_use]
+    pub fn project_name(&self) -> &str {
+        &self.project_name
+    }
+
     /// Serializes the bounded allowlisted payload for local transport.
     ///
     /// # Errors
@@ -125,6 +144,102 @@ impl ProjectedNotifyV1 {
             return Err(AdapterError::RecordTooLarge);
         }
         Ok(encoded)
+    }
+}
+
+/// Local-only private detail extracted from the official Codex notify payload.
+///
+/// This value must never be embedded in a source observation, durable record, report, diagnostic,
+/// URL, or team envelope. Its JSON representation is intended only for the private per-turn file
+/// and authenticated localhost detail response.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PrivateCodexTurnDetailV1 {
+    schema_version: String,
+    turn_id: String,
+    cwd: String,
+    input_messages: Vec<String>,
+    last_assistant_message: Option<String>,
+}
+
+impl fmt::Debug for PrivateCodexTurnDetailV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateCodexTurnDetailV1")
+            .field("schema_version", &self.schema_version)
+            .field("turn_id", &self.turn_id)
+            .field("private_fields", &"redacted")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PrivateCodexTurnDetailV1 {
+    fn new(payload: RawNotifyPayload) -> Result<(ProjectedNotifyV1, Self), AdapterError> {
+        let project_name = project_name_from_cwd(&payload.cwd)?;
+        let projected = ProjectedNotifyV1::new(
+            payload.event_name,
+            payload.thread_id,
+            payload.turn_id.clone(),
+            project_name,
+        )?;
+        let detail = Self {
+            schema_version: PRIVATE_TURN_DETAIL_SCHEMA_VERSION.into(),
+            turn_id: hash_opaque_identifier(&payload.turn_id),
+            cwd: payload.cwd,
+            input_messages: payload.input_messages,
+            last_assistant_message: payload.last_assistant_message,
+        };
+        detail.validate()?;
+        Ok((projected, detail))
+    }
+
+    fn validate(&self) -> Result<(), AdapterError> {
+        if self.schema_version != PRIVATE_TURN_DETAIL_SCHEMA_VERSION
+            || !is_hashed_turn_id(&self.turn_id)
+            || self.cwd.is_empty()
+        {
+            return Err(AdapterError::InvalidSchema);
+        }
+        let encoded = serde_json::to_vec(self).map_err(|_| AdapterError::InvalidJson)?;
+        if encoded.len() > MAX_PRIVATE_TURN_DETAIL_BYTES {
+            return Err(AdapterError::RecordTooLarge);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    /// Serializes this validated local-only detail artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the detail violates its schema or size bound, or when JSON
+    /// serialization fails.
+    pub fn to_json(&self) -> Result<Vec<u8>, AdapterError> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|_| AdapterError::InvalidJson)
+    }
+
+    /// Parses and validates a bounded local-only detail artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the input exceeds the hard byte bound, is not valid JSON, or
+    /// does not satisfy the private-detail schema.
+    pub fn from_json(input: &[u8]) -> Result<Self, AdapterError> {
+        if input.len() > MAX_PRIVATE_TURN_DETAIL_BYTES {
+            return Err(AdapterError::RecordTooLarge);
+        }
+        let detail =
+            serde_json::from_slice::<Self>(input).map_err(|error| match error.classify() {
+                serde_json::error::Category::Data => AdapterError::InvalidSchema,
+                _ => AdapterError::InvalidJson,
+            })?;
+        detail.validate()?;
+        Ok(detail)
     }
 }
 
@@ -837,17 +952,40 @@ fn project_websocket_replay_identity(
 /// Returns [`AdapterError`] when the bounded JSON payload is malformed, contains unknown fields,
 /// lacks the supported event or identifiers, or exceeds the projected payload bound.
 pub fn project_notify_json(input: &[u8]) -> Result<ProjectedNotifyV1, AdapterError> {
+    let payload = parse_raw_notify(input)?;
+    let project_name = project_name_from_cwd(&payload.cwd)?;
+    let projected = ProjectedNotifyV1::new(
+        payload.event_name,
+        payload.thread_id,
+        payload.turn_id,
+        project_name,
+    )?;
+    projected.to_json()?;
+    Ok(projected)
+}
+
+/// Projects the normal content-free notify payload and its separate local-only private detail.
+///
+/// # Errors
+///
+/// Returns [`AdapterError`] when the official payload or either bounded projection is invalid.
+pub fn project_notify_with_private_detail(
+    input: &[u8],
+) -> Result<(ProjectedNotifyV1, PrivateCodexTurnDetailV1), AdapterError> {
+    let payload = parse_raw_notify(input)?;
+    let (projected, detail) = PrivateCodexTurnDetailV1::new(payload)?;
+    projected.to_json()?;
+    Ok((projected, detail))
+}
+
+fn parse_raw_notify(input: &[u8]) -> Result<RawNotifyPayload, AdapterError> {
     if input.len() as u64 > MAX_HANDOFF_LINE_BYTES as u64 {
         return Err(AdapterError::RecordTooLarge);
     }
-    let payload: RawNotifyPayload =
-        serde_json::from_slice(input).map_err(|error| match error.classify() {
-            serde_json::error::Category::Data => AdapterError::InvalidSchema,
-            _ => AdapterError::InvalidJson,
-        })?;
-    let projected = ProjectedNotifyV1::new(payload.event_name, payload.thread_id, payload.turn_id)?;
-    projected.to_json()?;
-    Ok(projected)
+    serde_json::from_slice(input).map_err(|error| match error.classify() {
+        serde_json::error::Category::Data => AdapterError::InvalidSchema,
+        _ => AdapterError::InvalidJson,
+    })
 }
 
 /// Maps a strictly projected Codex notify wire payload without retaining content fields.
@@ -877,6 +1015,10 @@ pub fn parse_projected_notify_json(
         Value::String(payload.thread_id().into()),
     );
     attributes.insert("turn_id".into(), Value::String(payload.turn_id().into()));
+    attributes.insert(
+        "project_name".into(),
+        Value::String(payload.project_name().into()),
+    );
     let record = HandoffRecord {
         schema_version: HANDOFF_SCHEMA_VERSION.into(),
         source_generation: source_generation.into(),
@@ -1290,6 +1432,10 @@ fn turn_observation(
 ) -> Result<Mapping, AdapterError> {
     let session = required_string(&record.attributes, "thread_id")?;
     let turn = required_string(&record.attributes, "turn_id")?;
+    let project = optional_string(&record.attributes, "project_name")?;
+    if let Some(project) = project.as_deref() {
+        validate_project_name(project)?;
+    }
     let correlation = CorrelationIds {
         session_id: Some(parse_identifier::<SessionId>(&session)?),
         turn_id: Some(parse_identifier::<TurnId>(&turn)?),
@@ -1302,11 +1448,39 @@ fn turn_observation(
         Some(&turn),
         "turn",
         correlation,
-        ObservationEvent::Turn,
+        match project {
+            Some(project) => ObservationEvent::TurnWithProject { project },
+            None => ObservationEvent::Turn,
+        },
         LifecycleState::Completed,
         TokenUsage::default(),
         None,
     )
+}
+
+fn project_name_from_cwd(cwd: &str) -> Result<String, AdapterError> {
+    if cwd.is_empty() {
+        return Err(AdapterError::InvalidSchema);
+    }
+    let project = hash_opaque_identifier(cwd);
+    validate_project_name(&project)?;
+    Ok(project)
+}
+
+fn validate_project_name(project: &str) -> Result<(), AdapterError> {
+    if project.is_empty() || project.len() > MAX_IDENTIFIER_BYTES {
+        return Err(AdapterError::InvalidIdentifier);
+    }
+    Ok(())
+}
+
+fn is_hashed_turn_id(value: &str) -> bool {
+    value.strip_prefix("id:sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }
 
 fn request_observation(
@@ -1633,9 +1807,10 @@ mod tests {
         MAX_HANDOFF_LINES, MAX_OTLP_LOG_RECORDS, MAX_PENDING_OTLP_REQUESTS,
         MAX_PROJECTED_NOTIFY_BYTES, MAX_RECENTLY_COMPLETED_OTLP_REQUESTS,
         OTLP_REQUEST_CORRELATION_TTL_MS, OtlpRequestCorrelationState,
-        PROJECTED_NOTIFY_SCHEMA_VERSION, parse_handoff_jsonl, parse_otlp_http_json,
+        PRIVATE_TURN_DETAIL_SCHEMA_VERSION, PROJECTED_NOTIFY_SCHEMA_VERSION,
+        PrivateCodexTurnDetailV1, parse_handoff_jsonl, parse_otlp_http_json,
         parse_otlp_http_json_with_state, parse_projected_notify_json, project_notify_json,
-        read_handoff_file,
+        project_notify_with_private_detail, read_handoff_file,
     };
     use agent_observability_contracts::ObservationEvent;
     use agent_observability_contracts::hash_opaque_identifier;
@@ -2551,7 +2726,7 @@ mod tests {
           "input-messages":["RAW_PROMPT_SECRET"],
           "last-assistant-message":"RAW_ASSISTANT_SECRET"
         }"#;
-        let projected = project_notify_json(input).unwrap();
+        let (projected, detail) = project_notify_with_private_detail(input).unwrap();
         let encoded = projected.to_json().unwrap();
         assert!(encoded.len() <= MAX_PROJECTED_NOTIFY_BYTES);
         assert_eq!(
@@ -2560,7 +2735,8 @@ mod tests {
                 "schema_version": PROJECTED_NOTIFY_SCHEMA_VERSION,
                 "event_name": "agent-turn-complete",
                 "thread_id": "conversation-1",
-                "turn_id": "turn-1"
+                "turn_id": "turn-1",
+                "project_name": hash_opaque_identifier("/SECRET/PRIVATE/REPO")
             })
         );
         for secret in [
@@ -2573,7 +2749,11 @@ mod tests {
 
         let batch = parse_projected_notify_json(&encoded, "codex-notify-v1", None, 1, 123).unwrap();
         let turn = batch.observations().next().unwrap();
-        assert!(matches!(turn.event, ObservationEvent::Turn));
+        assert!(matches!(
+            &turn.event,
+            ObservationEvent::TurnWithProject { project }
+                if project == &hash_opaque_identifier("/SECRET/PRIVATE/REPO")
+        ));
         assert_eq!(
             turn.correlation.session_id.as_ref().unwrap().as_str(),
             "conversation-1"
@@ -2590,6 +2770,44 @@ mod tests {
         ] {
             assert!(!debug.contains(secret));
         }
+
+        let detail_json = detail.to_json().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&detail_json).unwrap(),
+            serde_json::json!({
+                "schemaVersion": PRIVATE_TURN_DETAIL_SCHEMA_VERSION,
+                "turnId": hash_opaque_identifier("turn-1"),
+                "cwd": "/SECRET/PRIVATE/REPO",
+                "inputMessages": ["RAW_PROMPT_SECRET"],
+                "lastAssistantMessage": "RAW_ASSISTANT_SECRET"
+            })
+        );
+        assert_eq!(
+            PrivateCodexTurnDetailV1::from_json(&detail_json)
+                .unwrap()
+                .turn_id(),
+            hash_opaque_identifier("turn-1")
+        );
+        let detail_debug = format!("{detail:?}");
+        assert!(!detail_debug.contains("/SECRET/PRIVATE/REPO"));
+        assert!(!detail_debug.contains("RAW_PROMPT_SECRET"));
+        assert!(!detail_debug.contains("RAW_ASSISTANT_SECRET"));
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-codex-notify-project-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut store = agent_observability_local_store::LocalStore::open(&root).unwrap();
+        store.ingest_deferred_projection(turn).unwrap();
+        store.rebuild_projection().unwrap();
+        let durable = fs::read_to_string(store.projection_path()).unwrap();
+        assert!(durable.contains(&hash_opaque_identifier("/SECRET/PRIVATE/REPO")));
+        assert!(!durable.contains("REPO"));
+        assert!(!durable.contains("/SECRET/PRIVATE/REPO"));
+        assert!(!durable.contains("RAW_PROMPT_SECRET"));
+        assert!(!durable.contains("RAW_ASSISTANT_SECRET"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2620,6 +2838,16 @@ mod tests {
             project_notify_json(malformed),
             Err(AdapterError::InvalidSchema)
         ));
+
+        let root_cwd = br#"{
+          "type":"agent-turn-complete",
+          "thread-id":"conversation-1",
+          "turn-id":"turn-1",
+          "cwd":"/",
+          "input-messages":[],
+          "last-assistant-message":null
+        }"#;
+        assert!(project_notify_json(root_cwd).is_ok());
     }
 
     #[test]
@@ -2685,6 +2913,7 @@ mod tests {
           "event_name":"agent-turn-complete",
           "thread_id":"conversation-1",
           "turn_id":"turn-1",
+          "project_name":"tmp",
           "raw_content":"RAW_PROMPT_SECRET"
         }"#;
         assert!(matches!(
@@ -2717,7 +2946,12 @@ mod tests {
         );
         let turns = batch
             .observations()
-            .filter(|observation| matches!(observation.event, ObservationEvent::Turn))
+            .filter(|observation| {
+                matches!(
+                    observation.event,
+                    ObservationEvent::Turn | ObservationEvent::TurnWithProject { .. }
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].lifecycle, LifecycleState::Completed);

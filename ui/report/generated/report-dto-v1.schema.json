@@ -343,6 +343,9 @@
         "agent": {
           "$ref": "#/$defs/agent"
         },
+        "availability": {
+          "$ref": "#/$defs/availability"
+        },
         "sessionId": {
           "type": "string"
         },
@@ -378,6 +381,70 @@
         },
         "version": {
           "type": "string"
+        }
+      }
+    },
+    "field_availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "reason"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "available",
+            "source_unavailable",
+            "withheld",
+            "not_applicable",
+            "private_lookup"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96
+        }
+      }
+    },
+    "availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "turn",
+        "model",
+        "tokens",
+        "latency",
+        "sourceLocation",
+        "requestContent",
+        "responseContent"
+      ],
+      "properties": {
+        "repository": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "turn": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "model": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "tokens": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "latency": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "sourceLocation": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "requestContent": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "responseContent": {
+          "$ref": "#/$defs/field_availability"
         }
       }
     },

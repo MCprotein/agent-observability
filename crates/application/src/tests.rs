@@ -207,6 +207,60 @@ fn report_projection_is_ordered_aggregated_and_content_free() {
 }
 
 #[test]
+fn report_explains_missing_fields_and_propagates_verified_trace_repository() {
+    let mut session = full("gpt-test");
+    session.trace_id = "trace-project".into();
+    session.span_id = "session-project".into();
+    session.span_kind = SpanKind::AgentSession;
+    session.agent.model = None;
+    session.project = ProjectV1::default();
+    session.metrics = MetricsV1::default();
+
+    let mut turn = full("gpt-test");
+    turn.trace_id = "trace-project".into();
+    turn.span_id = "turn-project".into();
+    turn.span_kind = SpanKind::Turn;
+    turn.project.name = Some("agent-observability".into());
+    turn.attributes.turn_id = Some(ScalarValueV1::String("turn-private".into()));
+    turn.metrics = MetricsV1::default();
+
+    let report = project_report(
+        &[session, turn],
+        "2026-09-05T00:00:00Z",
+        "availability",
+        None,
+    )
+    .unwrap();
+    let session = report
+        .spans
+        .iter()
+        .find(|span| span.span_id == hash_opaque_identifier("session-project"))
+        .unwrap();
+    let turn = report
+        .spans
+        .iter()
+        .find(|span| span.span_id == hash_opaque_identifier("turn-project"))
+        .unwrap();
+    assert_eq!(session.repo, "agent-observability");
+    assert_eq!(
+        session.availability.repository.reason,
+        "derived_from_trace_context"
+    );
+    assert_eq!(
+        session.availability.turn.state,
+        agent_observability_contracts::AvailabilityStateV1::SourceUnavailable
+    );
+    assert_eq!(
+        turn.availability.source_location.state,
+        agent_observability_contracts::AvailabilityStateV1::PrivateLookup
+    );
+    assert_eq!(
+        turn.availability.request_content.reason,
+        "local_opt_in_lookup_required"
+    );
+}
+
+#[test]
 fn report_projection_rejects_any_invalid_input_record() {
     let mut invalid = full("gpt-test");
     invalid.metrics.input_tokens = Some(-1.0);
@@ -566,6 +620,9 @@ fn rust_report_matches_the_frozen_cross_agent_golden_contract() {
     .unwrap();
     let mut actual = serde_json::to_value(report).unwrap();
     let mut expected_report = expected["report_full"].clone();
+    for span in actual["spans"].as_array_mut().unwrap() {
+        span.as_object_mut().unwrap().remove("availability");
+    }
     normalize_integral_json_numbers(&mut actual);
     normalize_integral_json_numbers(&mut expected_report);
     assert_eq!(actual, expected_report);

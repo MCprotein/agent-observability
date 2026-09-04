@@ -3,7 +3,7 @@
 기본 설정 인터페이스는 local-only web UI다. `config.json`을 직접 편집하지 않고도 모든
 runtime option을 조회하고 변경할 수 있다. 기본 runtime은 `~/.agent-observability`다.
 
-v1.8.0은 **Released**다. 이 문서의 `config.json` option은 standalone runtime policy다.
+현재 안정판은 v1.9.1이고, 이 문서는 v1.10.0 릴리스 후보의 standalone runtime policy를 정의한다.
 Optional Codex automatic connection은 별도의 private collector settings와 exact Codex config ownership을
 사용하며 `connect`, `status`, `disconnect` 명령 또는 같은 local UI로 관리한다. Manual imports는 이
 연결 없이도 모두 동작한다.
@@ -40,6 +40,7 @@ deadline은 로컬 executor와 filesystem이 응답하는 동안 적용된다. �
 agentobs config show
 agentobs config set retention-days 90
 agentobs config set storage-bytes 2147483648
+agentobs config set private-codex-details true
 ```
 
 별도 runtime은 root를 option 앞에 둔다.
@@ -71,6 +72,7 @@ integration mutation도 private UI session, exact Host와 Origin을 확인하고
 | Option | Default | Allowed | Purpose |
 | --- | ---: | ---: | --- |
 | `enabled` | `true` | `true`, `false` | manual import와 automatic collector ingest 허용 여부 |
+| `private-codex-details` | `false` | `true`, `false` | 이후 Codex notify가 제공하는 cwd, input messages, last assistant message를 별도 private detail 저장소에 보관 |
 | `file-reconcile-ms` | `5000` | `1000..60000` | file source 재확인 간격 |
 | `flush-ms` | `5000` | `1000..60000` | bounded flush 간격 |
 | `batch-records` | `100` | `1..500` | batch당 최대 record 수 |
@@ -86,11 +88,18 @@ integration mutation도 private UI session, exact Host와 Origin을 확인하고
 않는다. `retention-days` 변경 후 실제 만료 대상은 `retention-plan`으로 확인하고
 `retention-apply`로 명시적으로 적용한다.
 
-`enabled`, `batch-records`, `batch-bytes`, `storage-bytes`는 v1.8.0 Codex automatic collector가
+`enabled`, `private-codex-details`, `batch-records`, `batch-bytes`, `storage-bytes`는 Codex automatic collector가
 요청마다 다시 읽고 적용하므로 UI나 CLI에서 바꾼 뒤 collector를 재시작할 필요가 없다. Codex
 receiver는 설정값과 별개로 요청당 1 MiB, 4096 log record의 절대 parser 상한을 유지하며 실제
 허용량은 설정 상한과 절대 상한 중 더 작은 값이다. `enabled=false`이면 인증된 요청을 수신하되
 parse하거나 저장하지 않는다.
+
+`private-codex-details`는 명시적 opt-in이며 이전 turn을 소급 수집하지 않는다. 켠 뒤 Codex의 공식
+`agent-turn-complete` notify를 agentobs가 실제로 받는 새 turn만 대상이다. 기존 외부 `notify` 명령을
+보존한 환경에서는 이 source가 agentobs로 오지 않으므로 상세는 `not collected`로 남는다. 여기서
+request/response는 API wire body가 아니라 notify가 제공하는 `input-messages`와
+`last-assistant-message`다. 원문은 일반 observation, SQLite durable record, report DTO, 정적 HTML,
+archive, diagnostic, export 또는 team envelope에 들어가지 않는다.
 
 `file-reconcile-ms`, `flush-ms`, heartbeat option은 동일한 bounded runtime contract를 사용하는
 producer embedding을 위한 값이다. retention과 archive 설정은 manual/automatic 경로가 공유하는

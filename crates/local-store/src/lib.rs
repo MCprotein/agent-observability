@@ -2749,7 +2749,8 @@ fn source_name(o: &SourceObservation) -> &'static str {
 fn kind(e: &agent_observability_contracts::ObservationEvent) -> SpanKind {
     match e {
         agent_observability_contracts::ObservationEvent::Session { .. } => SpanKind::AgentSession,
-        agent_observability_contracts::ObservationEvent::Turn => SpanKind::Turn,
+        agent_observability_contracts::ObservationEvent::Turn
+        | agent_observability_contracts::ObservationEvent::TurnWithProject { .. } => SpanKind::Turn,
         agent_observability_contracts::ObservationEvent::ModelRequest { .. } => {
             SpanKind::LlmRequest
         }

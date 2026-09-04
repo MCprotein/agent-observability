@@ -57,6 +57,7 @@ Automatic collection:
 Configuration:
   agentobs config show [root]
   agentobs config set [root] <option> <value>
+    private-codex-details accepts true|false
 
 Import and report:
   agentobs <codex|claude-code|cursor>-ingest <root> <handoff-jsonl>
@@ -777,6 +778,7 @@ fn set_config_value(
 
     match key {
         "enabled" => config.enabled = parse!(bool),
+        "private-codex-details" => config.capture_private_codex_turn_details = parse!(bool),
         "file-reconcile-ms" => config.collection.file_reconcile_interval_ms = parse!(u32),
         "flush-ms" => config.collection.flush_interval_ms = parse!(u32),
         "batch-records" => config.collection.max_batch_records = parse!(u16),
@@ -794,10 +796,11 @@ fn set_config_value(
 
 fn config_output(layout: &InstalledLayout, config: &LocalRuntimeConfigV2) -> String {
     format!(
-        "root={}\nconfig={}\nenabled={}\nfile-reconcile-ms={}\nflush-ms={}\nbatch-records={}\nbatch-bytes={}\nactive-heartbeat-ms={}\nidle-heartbeat-ms={}\nstorage-bytes={}\nretention-days={}\narchive-records={}\narchive-bytes={}",
+        "root={}\nconfig={}\nenabled={}\nprivate-codex-details={}\nfile-reconcile-ms={}\nflush-ms={}\nbatch-records={}\nbatch-bytes={}\nactive-heartbeat-ms={}\nidle-heartbeat-ms={}\nstorage-bytes={}\nretention-days={}\narchive-records={}\narchive-bytes={}",
         layout.root.display(),
         layout.config.display(),
         config.enabled,
+        config.capture_private_codex_turn_details,
         config.collection.file_reconcile_interval_ms,
         config.collection.flush_interval_ms,
         config.collection.max_batch_records,
@@ -1593,6 +1596,7 @@ mod tests {
         let root_arg = root.to_string_lossy().into_owned();
         let options = [
             ("enabled", "false"),
+            ("private-codex-details", "true"),
             ("file-reconcile-ms", "1000"),
             ("flush-ms", "2000"),
             ("batch-records", "50"),

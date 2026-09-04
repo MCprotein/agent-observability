@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn, type ChildProcessByStdio } from "node:child_process";
-import { access, chmod, copyFile, mkdtemp, rm } from "node:fs/promises";
+import { access, chmod, copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Readable } from "node:stream";
@@ -33,6 +33,25 @@ try {
     await chmod(fixturePath, 0o600);
     await execute(binary, [command, runtimeRoot, fixturePath]);
   }
+  await execute(binary, ["config", "set", runtimeRoot, "private-codex-details", "true"]);
+  const privateNotify = JSON.stringify({
+    type: "agent-turn-complete",
+    "thread-id": "conversation-1",
+    "turn-id": "turn-1",
+    cwd: "/private/project",
+    "input-messages": ["PRIVATE_BROWSER_REQUEST"],
+    "last-assistant-message": "PRIVATE_BROWSER_RESPONSE",
+  });
+  const privateNotifyResult = await execute(binary, ["codex-notify", runtimeRoot, privateNotify]);
+  assert.match(privateNotifyResult.stdout, /notify=unavailable/);
+  await execute(binary, ["report", runtimeRoot]);
+  const reportHtml = await readFile(
+    join(runtimeRoot, "logs", "agent-observability-report.html"),
+    "utf8",
+  );
+  assert.equal(reportHtml.includes("/private/project"), false);
+  assert.equal(reportHtml.includes("PRIVATE_BROWSER_REQUEST"), false);
+  assert.equal(reportHtml.includes("PRIVATE_BROWSER_RESPONSE"), false);
 
   const results = [];
   for (const testCase of [
@@ -73,8 +92,13 @@ try {
       assert.equal(page.url(), dashboardUrl);
       assert.equal(await page.locator("h1").textContent(), "Agent Observability Report");
       assert.notEqual(await page.locator("#span-count").textContent(), "0");
+      await page.locator("#agent-filter").selectOption({ label: "codex" });
       await page.locator(".trace-row:visible").first().click();
       assert.equal(await page.locator(".timeline-row").count() > 0, true);
+      await page.locator("#span-table .span-open", { hasText: "LLM request" }).first().click();
+      await page.locator("#private-detail", { hasText: "PRIVATE_BROWSER_REQUEST" }).waitFor();
+      assert.match((await page.locator("#private-detail").textContent()) ?? "", /\/private\/project/);
+      assert.match((await page.locator("#private-detail").textContent()) ?? "", /PRIVATE_BROWSER_RESPONSE/);
       assert.equal(
         await page.evaluate(
           () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,

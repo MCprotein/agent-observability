@@ -3,6 +3,7 @@
 export interface LocalRuntimeConfigV2 {
   schema_version: "local_runtime.v2";
   enabled: boolean;
+  capture_private_codex_turn_details?: boolean;
   collection: Collection;
   retention: Retention;
 }

@@ -6,7 +6,7 @@
 
 ## Current and target stack
 
-현재 `v1.8.4`는 **Released**다. macOS standalone은 Codex, Claude Code와 Cursor의 private
+현재 안정판은 `v1.9.1`이고, 이 문서는 `v1.10.0` 릴리스 후보의 경계를 함께 정의한다. macOS standalone은 Codex, Claude Code와 Cursor의 private
 handoff 수동 import를 daemon과 network 없이 계속 제공한다. 선택적 Codex automatic path는 private-CA
 HTTPS와 exact private random request header로 인증하는 `127.0.0.1` OTLP/HTTP JSON receiver,
 pre-transport projected notify supplement와 LaunchAgent를 추가한다. 이 transport는 mTLS가 아니다. Rust 경로는
@@ -222,11 +222,15 @@ anti-corruption layer다.
   `operation_id` 등을 명시적으로 채운다.
 - 원문 prompt, output, command, diff, file content를 canonical metadata로 가장하지 않는다.
 - Codex automatic notify helper는 raw notify를 settings/socket 접근 전에 closed content-free wire object로
-  축약한다. Receiver는 bounded raw OTLP JSON을 process memory에서 decode한 뒤 `conversation.id`,
+  축약한다. 이 projection에는 raw cwd/basename 대신 bounded pseudonymous project reference만 허용된다. Receiver는 bounded raw OTLP JSON을 process memory에서 decode한 뒤 `conversation.id`,
   `turn.id`, model, bounded tool category, request/call ID, decision, duration, token
   counts와 success처럼 명시적으로 소유한 scalar만 canonical adapter에 복사한다. Raw body, prompt,
-  response, tool arguments/output, command, cwd, path, account identity와 unknown attribute는 persist,
-  log, diagnostic, projection 또는 export하지 않는다.
+  response, tool arguments/output, command, cwd, path, account identity와 unknown attribute는 canonical
+  persist, log, diagnostic, projection 또는 export 경계를 통과하지 않는다.
+- Default-off private Codex detail capture는 공식 notify의 cwd, input messages, last assistant message만
+  per-turn private artifact에 분리한다. 동일 hashed turn ID로 localhost dashboard에서 요청할 때만 읽고,
+  canonical observation, SQLite durable record, report DTO/static HTML, archive/export/team envelope와
+  dependency를 만들지 않는다. API wire request/response capture나 transcript scan은 하지 않는다.
 - 같은 contract fixture suite를 모든 adapter에 적용한다.
 - Codex의 `api_request`와 `sse_event(response.completed)`는 같은 request ID로 correlate하되
   transport attempt와 completed response를 별도 span으로 유지한다. usage는 completed response에만

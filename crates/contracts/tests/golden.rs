@@ -3,8 +3,9 @@ use agent_observability_contracts::{
     DURABLE_RECORD_FIELDS, DURABLE_RECORD_SCHEMA, DURABLE_RECORD_VERSION, DurableRecordV1,
     MetricsV1, ObservationEvent, ProjectV1, REDACTION_RECORD_FIELDS, REPORT_DTO_FIELDS,
     REPORT_DTO_SCHEMA, REPORT_DTO_VERSION, RedactionV1, ReportAgentV1, ReportAttributesV1,
-    ReportDtoV1, ReportFiltersV1, ReportMetricsV1, ReportSpanV1, ReportSummaryV1, ScalarValueV1,
-    SourceObservation, StatusV1, TraceSummaryV1, project_durable_record, sanitize_durable_record,
+    ReportAvailabilityV1, ReportDtoV1, ReportFiltersV1, ReportMetricsV1, ReportSpanV1,
+    ReportSummaryV1, ScalarValueV1, SourceObservation, StatusV1, TraceSummaryV1,
+    project_durable_record, sanitize_durable_record,
 };
 use agent_observability_domain::{
     CorrelationIds, DomainSpanState, LifecycleState, ObservationId, SessionId, SourceCursor,
@@ -106,6 +107,7 @@ fn typed_contracts_preserve_complete_boundary_versions() {
         end_time_unix_ms: Some(f64::INFINITY),
         repo: String::new(),
         agent: ReportAgentV1::default(),
+        availability: ReportAvailabilityV1::default(),
         session_id: None,
         turn_id: None,
         tool_name: None,

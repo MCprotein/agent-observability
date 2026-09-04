@@ -1,6 +1,41 @@
 /* Generated from contracts/report-dto-v1.schema.json. Do not edit. */
 "use strict";
 (() => {
+  var __getOwnPropNames = Object.getOwnPropertyNames;
+  var __commonJS = (cb, mod) => function __require() {
+    try {
+      return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+    } catch (e) {
+      throw mod = 0, e;
+    }
+  };
+
+  // node_modules/ajv/dist/runtime/ucs2length.js
+  var require_ucs2length = __commonJS({
+    "node_modules/ajv/dist/runtime/ucs2length.js"(exports) {
+      "use strict";
+      Object.defineProperty(exports, "__esModule", { value: true });
+      function ucs2length(str) {
+        const len = str.length;
+        let length = 0;
+        let pos = 0;
+        let value;
+        while (pos < len) {
+          length++;
+          value = str.charCodeAt(pos++);
+          if (value >= 55296 && value <= 56319 && pos < len) {
+            value = str.charCodeAt(pos);
+            if ((value & 64512) === 56320)
+              pos++;
+          }
+        }
+        return length;
+      }
+      exports.default = ucs2length;
+      ucs2length.code = 'require("ajv/dist/runtime/ucs2length").default';
+    }
+  });
+
   // ui/report/generated/validate-report-dto-v1.js
   var validate_report_dto_v1_default = validate20;
   var schema32 = { "type": "object", "additionalProperties": false, "required": ["generatedSpans", "sessions", "turns", "llmRequests", "toolExecutions", "errors", "inputTokens", "outputTokens", "cachedInputTokens", "cacheCreationInputTokens", "reasoningOutputTokens", "latencyMs", "durationMs", "estimatedCost"], "properties": { "generatedSpans": { "type": "number" }, "sessions": { "type": "number" }, "turns": { "type": "number" }, "llmRequests": { "type": "number" }, "toolExecutions": { "type": "number" }, "errors": { "type": "number" }, "inputTokens": { "type": "number" }, "outputTokens": { "type": "number" }, "cachedInputTokens": { "type": "number" }, "cacheCreationInputTokens": { "type": "number" }, "reasoningOutputTokens": { "type": "number" }, "latencyMs": { "type": "number" }, "durationMs": { "type": "number" }, "estimatedCost": { "type": "number" } } };
@@ -777,10 +812,10 @@
     return errors === 0;
   }
   validate27.evaluated = { "props": true, "dynamicProps": false, "dynamicItems": false };
-  var schema47 = { "type": "object", "additionalProperties": false, "required": ["schemaVersion", "traceId", "spanId", "parentSpanId", "kind", "name", "status", "startTimeUnixMs", "endTimeUnixMs", "repo", "agent", "attributes", "metrics", "cost"], "properties": { "schemaVersion": { "type": "string" }, "traceId": { "type": "string" }, "spanId": { "type": "string" }, "parentSpanId": { "type": ["string", "null"] }, "kind": { "type": "string" }, "name": { "type": "string" }, "status": { "type": "string" }, "startTimeUnixMs": { "type": "number" }, "endTimeUnixMs": { "type": ["number", "null"] }, "repo": { "type": "string" }, "agent": { "$ref": "#/$defs/agent" }, "sessionId": { "type": "string" }, "turnId": { "type": "string" }, "toolName": { "type": "string" }, "attributes": { "$ref": "#/$defs/attributes" }, "metrics": { "$ref": "#/$defs/metrics" }, "estimatedCost": { "type": "number" }, "cost": { "$ref": "#/$defs/cost" } } };
-  var schema62 = { "type": "object", "additionalProperties": false, "properties": { "inputTokens": { "type": "number" }, "outputTokens": { "type": "number" }, "cachedInputTokens": { "type": "number" }, "cacheCreationInputTokens": { "type": "number" }, "reasoningOutputTokens": { "type": "number" }, "totalTokens": { "type": "number" }, "latencyMs": { "type": "number" }, "durationMs": { "type": "number" }, "totalInputTokens": { "type": "number" }, "totalOutputTokens": { "type": "number" }, "totalCachedInputTokens": { "type": "number" }, "totalReasoningOutputTokens": { "type": "number" }, "totalAccumulatedTokens": { "type": "number" }, "contextWindowTokens": { "type": "number" } } };
-  var schema49 = { "type": "object", "additionalProperties": false, "properties": { "source": { "$ref": "#/$defs/scalar" }, "event_type": { "$ref": "#/$defs/scalar" }, "envelope_type": { "$ref": "#/$defs/scalar" }, "session_id": { "$ref": "#/$defs/scalar" }, "turn_id": { "$ref": "#/$defs/scalar" }, "request_id": { "$ref": "#/$defs/scalar" }, "call_id": { "$ref": "#/$defs/scalar" }, "tool_name": { "$ref": "#/$defs/scalar" }, "phase": { "$ref": "#/$defs/scalar" }, "exit_code": { "$ref": "#/$defs/scalar" }, "sandbox": { "$ref": "#/$defs/scalar" }, "approval": { "$ref": "#/$defs/scalar" } } };
-  var schema50 = { "type": ["string", "number", "boolean"] };
+  var schema47 = { "type": "object", "additionalProperties": false, "required": ["schemaVersion", "traceId", "spanId", "parentSpanId", "kind", "name", "status", "startTimeUnixMs", "endTimeUnixMs", "repo", "agent", "attributes", "metrics", "cost"], "properties": { "schemaVersion": { "type": "string" }, "traceId": { "type": "string" }, "spanId": { "type": "string" }, "parentSpanId": { "type": ["string", "null"] }, "kind": { "type": "string" }, "name": { "type": "string" }, "status": { "type": "string" }, "startTimeUnixMs": { "type": "number" }, "endTimeUnixMs": { "type": ["number", "null"] }, "repo": { "type": "string" }, "agent": { "$ref": "#/$defs/agent" }, "availability": { "$ref": "#/$defs/availability" }, "sessionId": { "type": "string" }, "turnId": { "type": "string" }, "toolName": { "type": "string" }, "attributes": { "$ref": "#/$defs/attributes" }, "metrics": { "$ref": "#/$defs/metrics" }, "estimatedCost": { "type": "number" }, "cost": { "$ref": "#/$defs/cost" } } };
+  var schema71 = { "type": "object", "additionalProperties": false, "properties": { "inputTokens": { "type": "number" }, "outputTokens": { "type": "number" }, "cachedInputTokens": { "type": "number" }, "cacheCreationInputTokens": { "type": "number" }, "reasoningOutputTokens": { "type": "number" }, "totalTokens": { "type": "number" }, "latencyMs": { "type": "number" }, "durationMs": { "type": "number" }, "totalInputTokens": { "type": "number" }, "totalOutputTokens": { "type": "number" }, "totalCachedInputTokens": { "type": "number" }, "totalReasoningOutputTokens": { "type": "number" }, "totalAccumulatedTokens": { "type": "number" }, "contextWindowTokens": { "type": "number" } } };
+  var schema50 = { "type": "object", "additionalProperties": false, "required": ["state", "reason"], "properties": { "state": { "enum": ["available", "source_unavailable", "withheld", "not_applicable", "private_lookup"] }, "reason": { "type": "string", "minLength": 1, "maxLength": 96 } } };
+  var func4 = require_ucs2length().default;
   function validate30(data, { instancePath = "", parentData, parentDataProperty, rootData = data, dynamicAnchors = {} } = {}) {
     let vErrors = null;
     let errors = 0;
@@ -793,160 +828,562 @@
     }
     if (errors === 0) {
       if (data && typeof data == "object" && !Array.isArray(data)) {
-        const _errs1 = errors;
-        for (const key0 in data) {
-          if (!func1.call(schema49.properties, key0)) {
-            validate30.errors = [{ instancePath, schemaPath: "#/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key0 }, message: "must NOT have additional properties" }];
-            return false;
-            break;
-          }
-        }
-        if (_errs1 === errors) {
-          if (data.source !== void 0) {
-            let data0 = data.source;
-            const _errs2 = errors;
-            if (typeof data0 !== "string" && !(typeof data0 == "number" && isFinite(data0)) && typeof data0 !== "boolean") {
-              validate30.errors = [{ instancePath: instancePath + "/source", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema50.type }, message: "must be string,number,boolean" }];
+        let missing0;
+        if (data.repository === void 0 && (missing0 = "repository") || data.turn === void 0 && (missing0 = "turn") || data.model === void 0 && (missing0 = "model") || data.tokens === void 0 && (missing0 = "tokens") || data.latency === void 0 && (missing0 = "latency") || data.sourceLocation === void 0 && (missing0 = "sourceLocation") || data.requestContent === void 0 && (missing0 = "requestContent") || data.responseContent === void 0 && (missing0 = "responseContent")) {
+          validate30.errors = [{ instancePath, schemaPath: "#/required", keyword: "required", params: { missingProperty: missing0 }, message: "must have required property '" + missing0 + "'" }];
+          return false;
+        } else {
+          const _errs1 = errors;
+          for (const key0 in data) {
+            if (!(key0 === "repository" || key0 === "turn" || key0 === "model" || key0 === "tokens" || key0 === "latency" || key0 === "sourceLocation" || key0 === "requestContent" || key0 === "responseContent")) {
+              validate30.errors = [{ instancePath, schemaPath: "#/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key0 }, message: "must NOT have additional properties" }];
               return false;
+              break;
             }
-            var valid0 = _errs2 === errors;
-          } else {
-            var valid0 = true;
           }
-          if (valid0) {
-            if (data.event_type !== void 0) {
-              let data1 = data.event_type;
-              const _errs5 = errors;
-              if (typeof data1 !== "string" && !(typeof data1 == "number" && isFinite(data1)) && typeof data1 !== "boolean") {
-                validate30.errors = [{ instancePath: instancePath + "/event_type", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema50.type }, message: "must be string,number,boolean" }];
-                return false;
+          if (_errs1 === errors) {
+            if (data.repository !== void 0) {
+              let data0 = data.repository;
+              const _errs2 = errors;
+              const _errs3 = errors;
+              if (errors === _errs3) {
+                if (data0 && typeof data0 == "object" && !Array.isArray(data0)) {
+                  let missing1;
+                  if (data0.state === void 0 && (missing1 = "state") || data0.reason === void 0 && (missing1 = "reason")) {
+                    validate30.errors = [{ instancePath: instancePath + "/repository", schemaPath: "#/$defs/field_availability/required", keyword: "required", params: { missingProperty: missing1 }, message: "must have required property '" + missing1 + "'" }];
+                    return false;
+                  } else {
+                    const _errs5 = errors;
+                    for (const key1 in data0) {
+                      if (!(key1 === "state" || key1 === "reason")) {
+                        validate30.errors = [{ instancePath: instancePath + "/repository", schemaPath: "#/$defs/field_availability/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key1 }, message: "must NOT have additional properties" }];
+                        return false;
+                        break;
+                      }
+                    }
+                    if (_errs5 === errors) {
+                      if (data0.state !== void 0) {
+                        let data1 = data0.state;
+                        const _errs6 = errors;
+                        if (!(data1 === "available" || data1 === "source_unavailable" || data1 === "withheld" || data1 === "not_applicable" || data1 === "private_lookup")) {
+                          validate30.errors = [{ instancePath: instancePath + "/repository/state", schemaPath: "#/$defs/field_availability/properties/state/enum", keyword: "enum", params: { allowedValues: schema50.properties.state.enum }, message: "must be equal to one of the allowed values" }];
+                          return false;
+                        }
+                        var valid2 = _errs6 === errors;
+                      } else {
+                        var valid2 = true;
+                      }
+                      if (valid2) {
+                        if (data0.reason !== void 0) {
+                          let data2 = data0.reason;
+                          const _errs7 = errors;
+                          if (errors === _errs7) {
+                            if (typeof data2 === "string") {
+                              if (func4(data2) > 96) {
+                                validate30.errors = [{ instancePath: instancePath + "/repository/reason", schemaPath: "#/$defs/field_availability/properties/reason/maxLength", keyword: "maxLength", params: { limit: 96 }, message: "must NOT have more than 96 characters" }];
+                                return false;
+                              } else {
+                                if (func4(data2) < 1) {
+                                  validate30.errors = [{ instancePath: instancePath + "/repository/reason", schemaPath: "#/$defs/field_availability/properties/reason/minLength", keyword: "minLength", params: { limit: 1 }, message: "must NOT have fewer than 1 characters" }];
+                                  return false;
+                                }
+                              }
+                            } else {
+                              validate30.errors = [{ instancePath: instancePath + "/repository/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                              return false;
+                            }
+                          }
+                          var valid2 = _errs7 === errors;
+                        } else {
+                          var valid2 = true;
+                        }
+                      }
+                    }
+                  }
+                } else {
+                  validate30.errors = [{ instancePath: instancePath + "/repository", schemaPath: "#/$defs/field_availability/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                  return false;
+                }
               }
-              var valid0 = _errs5 === errors;
+              var valid0 = _errs2 === errors;
             } else {
               var valid0 = true;
             }
             if (valid0) {
-              if (data.envelope_type !== void 0) {
-                let data2 = data.envelope_type;
-                const _errs8 = errors;
-                if (typeof data2 !== "string" && !(typeof data2 == "number" && isFinite(data2)) && typeof data2 !== "boolean") {
-                  validate30.errors = [{ instancePath: instancePath + "/envelope_type", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema50.type }, message: "must be string,number,boolean" }];
-                  return false;
+              if (data.turn !== void 0) {
+                let data3 = data.turn;
+                const _errs9 = errors;
+                const _errs10 = errors;
+                if (errors === _errs10) {
+                  if (data3 && typeof data3 == "object" && !Array.isArray(data3)) {
+                    let missing2;
+                    if (data3.state === void 0 && (missing2 = "state") || data3.reason === void 0 && (missing2 = "reason")) {
+                      validate30.errors = [{ instancePath: instancePath + "/turn", schemaPath: "#/$defs/field_availability/required", keyword: "required", params: { missingProperty: missing2 }, message: "must have required property '" + missing2 + "'" }];
+                      return false;
+                    } else {
+                      const _errs12 = errors;
+                      for (const key2 in data3) {
+                        if (!(key2 === "state" || key2 === "reason")) {
+                          validate30.errors = [{ instancePath: instancePath + "/turn", schemaPath: "#/$defs/field_availability/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key2 }, message: "must NOT have additional properties" }];
+                          return false;
+                          break;
+                        }
+                      }
+                      if (_errs12 === errors) {
+                        if (data3.state !== void 0) {
+                          let data4 = data3.state;
+                          const _errs13 = errors;
+                          if (!(data4 === "available" || data4 === "source_unavailable" || data4 === "withheld" || data4 === "not_applicable" || data4 === "private_lookup")) {
+                            validate30.errors = [{ instancePath: instancePath + "/turn/state", schemaPath: "#/$defs/field_availability/properties/state/enum", keyword: "enum", params: { allowedValues: schema50.properties.state.enum }, message: "must be equal to one of the allowed values" }];
+                            return false;
+                          }
+                          var valid4 = _errs13 === errors;
+                        } else {
+                          var valid4 = true;
+                        }
+                        if (valid4) {
+                          if (data3.reason !== void 0) {
+                            let data5 = data3.reason;
+                            const _errs14 = errors;
+                            if (errors === _errs14) {
+                              if (typeof data5 === "string") {
+                                if (func4(data5) > 96) {
+                                  validate30.errors = [{ instancePath: instancePath + "/turn/reason", schemaPath: "#/$defs/field_availability/properties/reason/maxLength", keyword: "maxLength", params: { limit: 96 }, message: "must NOT have more than 96 characters" }];
+                                  return false;
+                                } else {
+                                  if (func4(data5) < 1) {
+                                    validate30.errors = [{ instancePath: instancePath + "/turn/reason", schemaPath: "#/$defs/field_availability/properties/reason/minLength", keyword: "minLength", params: { limit: 1 }, message: "must NOT have fewer than 1 characters" }];
+                                    return false;
+                                  }
+                                }
+                              } else {
+                                validate30.errors = [{ instancePath: instancePath + "/turn/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                                return false;
+                              }
+                            }
+                            var valid4 = _errs14 === errors;
+                          } else {
+                            var valid4 = true;
+                          }
+                        }
+                      }
+                    }
+                  } else {
+                    validate30.errors = [{ instancePath: instancePath + "/turn", schemaPath: "#/$defs/field_availability/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                    return false;
+                  }
                 }
-                var valid0 = _errs8 === errors;
+                var valid0 = _errs9 === errors;
               } else {
                 var valid0 = true;
               }
               if (valid0) {
-                if (data.session_id !== void 0) {
-                  let data3 = data.session_id;
-                  const _errs11 = errors;
-                  if (typeof data3 !== "string" && !(typeof data3 == "number" && isFinite(data3)) && typeof data3 !== "boolean") {
-                    validate30.errors = [{ instancePath: instancePath + "/session_id", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema50.type }, message: "must be string,number,boolean" }];
-                    return false;
+                if (data.model !== void 0) {
+                  let data6 = data.model;
+                  const _errs16 = errors;
+                  const _errs17 = errors;
+                  if (errors === _errs17) {
+                    if (data6 && typeof data6 == "object" && !Array.isArray(data6)) {
+                      let missing3;
+                      if (data6.state === void 0 && (missing3 = "state") || data6.reason === void 0 && (missing3 = "reason")) {
+                        validate30.errors = [{ instancePath: instancePath + "/model", schemaPath: "#/$defs/field_availability/required", keyword: "required", params: { missingProperty: missing3 }, message: "must have required property '" + missing3 + "'" }];
+                        return false;
+                      } else {
+                        const _errs19 = errors;
+                        for (const key3 in data6) {
+                          if (!(key3 === "state" || key3 === "reason")) {
+                            validate30.errors = [{ instancePath: instancePath + "/model", schemaPath: "#/$defs/field_availability/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key3 }, message: "must NOT have additional properties" }];
+                            return false;
+                            break;
+                          }
+                        }
+                        if (_errs19 === errors) {
+                          if (data6.state !== void 0) {
+                            let data7 = data6.state;
+                            const _errs20 = errors;
+                            if (!(data7 === "available" || data7 === "source_unavailable" || data7 === "withheld" || data7 === "not_applicable" || data7 === "private_lookup")) {
+                              validate30.errors = [{ instancePath: instancePath + "/model/state", schemaPath: "#/$defs/field_availability/properties/state/enum", keyword: "enum", params: { allowedValues: schema50.properties.state.enum }, message: "must be equal to one of the allowed values" }];
+                              return false;
+                            }
+                            var valid6 = _errs20 === errors;
+                          } else {
+                            var valid6 = true;
+                          }
+                          if (valid6) {
+                            if (data6.reason !== void 0) {
+                              let data8 = data6.reason;
+                              const _errs21 = errors;
+                              if (errors === _errs21) {
+                                if (typeof data8 === "string") {
+                                  if (func4(data8) > 96) {
+                                    validate30.errors = [{ instancePath: instancePath + "/model/reason", schemaPath: "#/$defs/field_availability/properties/reason/maxLength", keyword: "maxLength", params: { limit: 96 }, message: "must NOT have more than 96 characters" }];
+                                    return false;
+                                  } else {
+                                    if (func4(data8) < 1) {
+                                      validate30.errors = [{ instancePath: instancePath + "/model/reason", schemaPath: "#/$defs/field_availability/properties/reason/minLength", keyword: "minLength", params: { limit: 1 }, message: "must NOT have fewer than 1 characters" }];
+                                      return false;
+                                    }
+                                  }
+                                } else {
+                                  validate30.errors = [{ instancePath: instancePath + "/model/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                                  return false;
+                                }
+                              }
+                              var valid6 = _errs21 === errors;
+                            } else {
+                              var valid6 = true;
+                            }
+                          }
+                        }
+                      }
+                    } else {
+                      validate30.errors = [{ instancePath: instancePath + "/model", schemaPath: "#/$defs/field_availability/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                      return false;
+                    }
                   }
-                  var valid0 = _errs11 === errors;
+                  var valid0 = _errs16 === errors;
                 } else {
                   var valid0 = true;
                 }
                 if (valid0) {
-                  if (data.turn_id !== void 0) {
-                    let data4 = data.turn_id;
-                    const _errs14 = errors;
-                    if (typeof data4 !== "string" && !(typeof data4 == "number" && isFinite(data4)) && typeof data4 !== "boolean") {
-                      validate30.errors = [{ instancePath: instancePath + "/turn_id", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema50.type }, message: "must be string,number,boolean" }];
-                      return false;
+                  if (data.tokens !== void 0) {
+                    let data9 = data.tokens;
+                    const _errs23 = errors;
+                    const _errs24 = errors;
+                    if (errors === _errs24) {
+                      if (data9 && typeof data9 == "object" && !Array.isArray(data9)) {
+                        let missing4;
+                        if (data9.state === void 0 && (missing4 = "state") || data9.reason === void 0 && (missing4 = "reason")) {
+                          validate30.errors = [{ instancePath: instancePath + "/tokens", schemaPath: "#/$defs/field_availability/required", keyword: "required", params: { missingProperty: missing4 }, message: "must have required property '" + missing4 + "'" }];
+                          return false;
+                        } else {
+                          const _errs26 = errors;
+                          for (const key4 in data9) {
+                            if (!(key4 === "state" || key4 === "reason")) {
+                              validate30.errors = [{ instancePath: instancePath + "/tokens", schemaPath: "#/$defs/field_availability/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key4 }, message: "must NOT have additional properties" }];
+                              return false;
+                              break;
+                            }
+                          }
+                          if (_errs26 === errors) {
+                            if (data9.state !== void 0) {
+                              let data10 = data9.state;
+                              const _errs27 = errors;
+                              if (!(data10 === "available" || data10 === "source_unavailable" || data10 === "withheld" || data10 === "not_applicable" || data10 === "private_lookup")) {
+                                validate30.errors = [{ instancePath: instancePath + "/tokens/state", schemaPath: "#/$defs/field_availability/properties/state/enum", keyword: "enum", params: { allowedValues: schema50.properties.state.enum }, message: "must be equal to one of the allowed values" }];
+                                return false;
+                              }
+                              var valid8 = _errs27 === errors;
+                            } else {
+                              var valid8 = true;
+                            }
+                            if (valid8) {
+                              if (data9.reason !== void 0) {
+                                let data11 = data9.reason;
+                                const _errs28 = errors;
+                                if (errors === _errs28) {
+                                  if (typeof data11 === "string") {
+                                    if (func4(data11) > 96) {
+                                      validate30.errors = [{ instancePath: instancePath + "/tokens/reason", schemaPath: "#/$defs/field_availability/properties/reason/maxLength", keyword: "maxLength", params: { limit: 96 }, message: "must NOT have more than 96 characters" }];
+                                      return false;
+                                    } else {
+                                      if (func4(data11) < 1) {
+                                        validate30.errors = [{ instancePath: instancePath + "/tokens/reason", schemaPath: "#/$defs/field_availability/properties/reason/minLength", keyword: "minLength", params: { limit: 1 }, message: "must NOT have fewer than 1 characters" }];
+                                        return false;
+                                      }
+                                    }
+                                  } else {
+                                    validate30.errors = [{ instancePath: instancePath + "/tokens/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                                    return false;
+                                  }
+                                }
+                                var valid8 = _errs28 === errors;
+                              } else {
+                                var valid8 = true;
+                              }
+                            }
+                          }
+                        }
+                      } else {
+                        validate30.errors = [{ instancePath: instancePath + "/tokens", schemaPath: "#/$defs/field_availability/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                        return false;
+                      }
                     }
-                    var valid0 = _errs14 === errors;
+                    var valid0 = _errs23 === errors;
                   } else {
                     var valid0 = true;
                   }
                   if (valid0) {
-                    if (data.request_id !== void 0) {
-                      let data5 = data.request_id;
-                      const _errs17 = errors;
-                      if (typeof data5 !== "string" && !(typeof data5 == "number" && isFinite(data5)) && typeof data5 !== "boolean") {
-                        validate30.errors = [{ instancePath: instancePath + "/request_id", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema50.type }, message: "must be string,number,boolean" }];
-                        return false;
+                    if (data.latency !== void 0) {
+                      let data12 = data.latency;
+                      const _errs30 = errors;
+                      const _errs31 = errors;
+                      if (errors === _errs31) {
+                        if (data12 && typeof data12 == "object" && !Array.isArray(data12)) {
+                          let missing5;
+                          if (data12.state === void 0 && (missing5 = "state") || data12.reason === void 0 && (missing5 = "reason")) {
+                            validate30.errors = [{ instancePath: instancePath + "/latency", schemaPath: "#/$defs/field_availability/required", keyword: "required", params: { missingProperty: missing5 }, message: "must have required property '" + missing5 + "'" }];
+                            return false;
+                          } else {
+                            const _errs33 = errors;
+                            for (const key5 in data12) {
+                              if (!(key5 === "state" || key5 === "reason")) {
+                                validate30.errors = [{ instancePath: instancePath + "/latency", schemaPath: "#/$defs/field_availability/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key5 }, message: "must NOT have additional properties" }];
+                                return false;
+                                break;
+                              }
+                            }
+                            if (_errs33 === errors) {
+                              if (data12.state !== void 0) {
+                                let data13 = data12.state;
+                                const _errs34 = errors;
+                                if (!(data13 === "available" || data13 === "source_unavailable" || data13 === "withheld" || data13 === "not_applicable" || data13 === "private_lookup")) {
+                                  validate30.errors = [{ instancePath: instancePath + "/latency/state", schemaPath: "#/$defs/field_availability/properties/state/enum", keyword: "enum", params: { allowedValues: schema50.properties.state.enum }, message: "must be equal to one of the allowed values" }];
+                                  return false;
+                                }
+                                var valid10 = _errs34 === errors;
+                              } else {
+                                var valid10 = true;
+                              }
+                              if (valid10) {
+                                if (data12.reason !== void 0) {
+                                  let data14 = data12.reason;
+                                  const _errs35 = errors;
+                                  if (errors === _errs35) {
+                                    if (typeof data14 === "string") {
+                                      if (func4(data14) > 96) {
+                                        validate30.errors = [{ instancePath: instancePath + "/latency/reason", schemaPath: "#/$defs/field_availability/properties/reason/maxLength", keyword: "maxLength", params: { limit: 96 }, message: "must NOT have more than 96 characters" }];
+                                        return false;
+                                      } else {
+                                        if (func4(data14) < 1) {
+                                          validate30.errors = [{ instancePath: instancePath + "/latency/reason", schemaPath: "#/$defs/field_availability/properties/reason/minLength", keyword: "minLength", params: { limit: 1 }, message: "must NOT have fewer than 1 characters" }];
+                                          return false;
+                                        }
+                                      }
+                                    } else {
+                                      validate30.errors = [{ instancePath: instancePath + "/latency/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                                      return false;
+                                    }
+                                  }
+                                  var valid10 = _errs35 === errors;
+                                } else {
+                                  var valid10 = true;
+                                }
+                              }
+                            }
+                          }
+                        } else {
+                          validate30.errors = [{ instancePath: instancePath + "/latency", schemaPath: "#/$defs/field_availability/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                          return false;
+                        }
                       }
-                      var valid0 = _errs17 === errors;
+                      var valid0 = _errs30 === errors;
                     } else {
                       var valid0 = true;
                     }
                     if (valid0) {
-                      if (data.call_id !== void 0) {
-                        let data6 = data.call_id;
-                        const _errs20 = errors;
-                        if (typeof data6 !== "string" && !(typeof data6 == "number" && isFinite(data6)) && typeof data6 !== "boolean") {
-                          validate30.errors = [{ instancePath: instancePath + "/call_id", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema50.type }, message: "must be string,number,boolean" }];
-                          return false;
+                      if (data.sourceLocation !== void 0) {
+                        let data15 = data.sourceLocation;
+                        const _errs37 = errors;
+                        const _errs38 = errors;
+                        if (errors === _errs38) {
+                          if (data15 && typeof data15 == "object" && !Array.isArray(data15)) {
+                            let missing6;
+                            if (data15.state === void 0 && (missing6 = "state") || data15.reason === void 0 && (missing6 = "reason")) {
+                              validate30.errors = [{ instancePath: instancePath + "/sourceLocation", schemaPath: "#/$defs/field_availability/required", keyword: "required", params: { missingProperty: missing6 }, message: "must have required property '" + missing6 + "'" }];
+                              return false;
+                            } else {
+                              const _errs40 = errors;
+                              for (const key6 in data15) {
+                                if (!(key6 === "state" || key6 === "reason")) {
+                                  validate30.errors = [{ instancePath: instancePath + "/sourceLocation", schemaPath: "#/$defs/field_availability/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key6 }, message: "must NOT have additional properties" }];
+                                  return false;
+                                  break;
+                                }
+                              }
+                              if (_errs40 === errors) {
+                                if (data15.state !== void 0) {
+                                  let data16 = data15.state;
+                                  const _errs41 = errors;
+                                  if (!(data16 === "available" || data16 === "source_unavailable" || data16 === "withheld" || data16 === "not_applicable" || data16 === "private_lookup")) {
+                                    validate30.errors = [{ instancePath: instancePath + "/sourceLocation/state", schemaPath: "#/$defs/field_availability/properties/state/enum", keyword: "enum", params: { allowedValues: schema50.properties.state.enum }, message: "must be equal to one of the allowed values" }];
+                                    return false;
+                                  }
+                                  var valid12 = _errs41 === errors;
+                                } else {
+                                  var valid12 = true;
+                                }
+                                if (valid12) {
+                                  if (data15.reason !== void 0) {
+                                    let data17 = data15.reason;
+                                    const _errs42 = errors;
+                                    if (errors === _errs42) {
+                                      if (typeof data17 === "string") {
+                                        if (func4(data17) > 96) {
+                                          validate30.errors = [{ instancePath: instancePath + "/sourceLocation/reason", schemaPath: "#/$defs/field_availability/properties/reason/maxLength", keyword: "maxLength", params: { limit: 96 }, message: "must NOT have more than 96 characters" }];
+                                          return false;
+                                        } else {
+                                          if (func4(data17) < 1) {
+                                            validate30.errors = [{ instancePath: instancePath + "/sourceLocation/reason", schemaPath: "#/$defs/field_availability/properties/reason/minLength", keyword: "minLength", params: { limit: 1 }, message: "must NOT have fewer than 1 characters" }];
+                                            return false;
+                                          }
+                                        }
+                                      } else {
+                                        validate30.errors = [{ instancePath: instancePath + "/sourceLocation/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                                        return false;
+                                      }
+                                    }
+                                    var valid12 = _errs42 === errors;
+                                  } else {
+                                    var valid12 = true;
+                                  }
+                                }
+                              }
+                            }
+                          } else {
+                            validate30.errors = [{ instancePath: instancePath + "/sourceLocation", schemaPath: "#/$defs/field_availability/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                            return false;
+                          }
                         }
-                        var valid0 = _errs20 === errors;
+                        var valid0 = _errs37 === errors;
                       } else {
                         var valid0 = true;
                       }
                       if (valid0) {
-                        if (data.tool_name !== void 0) {
-                          let data7 = data.tool_name;
-                          const _errs23 = errors;
-                          if (typeof data7 !== "string" && !(typeof data7 == "number" && isFinite(data7)) && typeof data7 !== "boolean") {
-                            validate30.errors = [{ instancePath: instancePath + "/tool_name", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema50.type }, message: "must be string,number,boolean" }];
-                            return false;
+                        if (data.requestContent !== void 0) {
+                          let data18 = data.requestContent;
+                          const _errs44 = errors;
+                          const _errs45 = errors;
+                          if (errors === _errs45) {
+                            if (data18 && typeof data18 == "object" && !Array.isArray(data18)) {
+                              let missing7;
+                              if (data18.state === void 0 && (missing7 = "state") || data18.reason === void 0 && (missing7 = "reason")) {
+                                validate30.errors = [{ instancePath: instancePath + "/requestContent", schemaPath: "#/$defs/field_availability/required", keyword: "required", params: { missingProperty: missing7 }, message: "must have required property '" + missing7 + "'" }];
+                                return false;
+                              } else {
+                                const _errs47 = errors;
+                                for (const key7 in data18) {
+                                  if (!(key7 === "state" || key7 === "reason")) {
+                                    validate30.errors = [{ instancePath: instancePath + "/requestContent", schemaPath: "#/$defs/field_availability/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key7 }, message: "must NOT have additional properties" }];
+                                    return false;
+                                    break;
+                                  }
+                                }
+                                if (_errs47 === errors) {
+                                  if (data18.state !== void 0) {
+                                    let data19 = data18.state;
+                                    const _errs48 = errors;
+                                    if (!(data19 === "available" || data19 === "source_unavailable" || data19 === "withheld" || data19 === "not_applicable" || data19 === "private_lookup")) {
+                                      validate30.errors = [{ instancePath: instancePath + "/requestContent/state", schemaPath: "#/$defs/field_availability/properties/state/enum", keyword: "enum", params: { allowedValues: schema50.properties.state.enum }, message: "must be equal to one of the allowed values" }];
+                                      return false;
+                                    }
+                                    var valid14 = _errs48 === errors;
+                                  } else {
+                                    var valid14 = true;
+                                  }
+                                  if (valid14) {
+                                    if (data18.reason !== void 0) {
+                                      let data20 = data18.reason;
+                                      const _errs49 = errors;
+                                      if (errors === _errs49) {
+                                        if (typeof data20 === "string") {
+                                          if (func4(data20) > 96) {
+                                            validate30.errors = [{ instancePath: instancePath + "/requestContent/reason", schemaPath: "#/$defs/field_availability/properties/reason/maxLength", keyword: "maxLength", params: { limit: 96 }, message: "must NOT have more than 96 characters" }];
+                                            return false;
+                                          } else {
+                                            if (func4(data20) < 1) {
+                                              validate30.errors = [{ instancePath: instancePath + "/requestContent/reason", schemaPath: "#/$defs/field_availability/properties/reason/minLength", keyword: "minLength", params: { limit: 1 }, message: "must NOT have fewer than 1 characters" }];
+                                              return false;
+                                            }
+                                          }
+                                        } else {
+                                          validate30.errors = [{ instancePath: instancePath + "/requestContent/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                                          return false;
+                                        }
+                                      }
+                                      var valid14 = _errs49 === errors;
+                                    } else {
+                                      var valid14 = true;
+                                    }
+                                  }
+                                }
+                              }
+                            } else {
+                              validate30.errors = [{ instancePath: instancePath + "/requestContent", schemaPath: "#/$defs/field_availability/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                              return false;
+                            }
                           }
-                          var valid0 = _errs23 === errors;
+                          var valid0 = _errs44 === errors;
                         } else {
                           var valid0 = true;
                         }
                         if (valid0) {
-                          if (data.phase !== void 0) {
-                            let data8 = data.phase;
-                            const _errs26 = errors;
-                            if (typeof data8 !== "string" && !(typeof data8 == "number" && isFinite(data8)) && typeof data8 !== "boolean") {
-                              validate30.errors = [{ instancePath: instancePath + "/phase", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema50.type }, message: "must be string,number,boolean" }];
-                              return false;
-                            }
-                            var valid0 = _errs26 === errors;
-                          } else {
-                            var valid0 = true;
-                          }
-                          if (valid0) {
-                            if (data.exit_code !== void 0) {
-                              let data9 = data.exit_code;
-                              const _errs29 = errors;
-                              if (typeof data9 !== "string" && !(typeof data9 == "number" && isFinite(data9)) && typeof data9 !== "boolean") {
-                                validate30.errors = [{ instancePath: instancePath + "/exit_code", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema50.type }, message: "must be string,number,boolean" }];
+                          if (data.responseContent !== void 0) {
+                            let data21 = data.responseContent;
+                            const _errs51 = errors;
+                            const _errs52 = errors;
+                            if (errors === _errs52) {
+                              if (data21 && typeof data21 == "object" && !Array.isArray(data21)) {
+                                let missing8;
+                                if (data21.state === void 0 && (missing8 = "state") || data21.reason === void 0 && (missing8 = "reason")) {
+                                  validate30.errors = [{ instancePath: instancePath + "/responseContent", schemaPath: "#/$defs/field_availability/required", keyword: "required", params: { missingProperty: missing8 }, message: "must have required property '" + missing8 + "'" }];
+                                  return false;
+                                } else {
+                                  const _errs54 = errors;
+                                  for (const key8 in data21) {
+                                    if (!(key8 === "state" || key8 === "reason")) {
+                                      validate30.errors = [{ instancePath: instancePath + "/responseContent", schemaPath: "#/$defs/field_availability/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key8 }, message: "must NOT have additional properties" }];
+                                      return false;
+                                      break;
+                                    }
+                                  }
+                                  if (_errs54 === errors) {
+                                    if (data21.state !== void 0) {
+                                      let data22 = data21.state;
+                                      const _errs55 = errors;
+                                      if (!(data22 === "available" || data22 === "source_unavailable" || data22 === "withheld" || data22 === "not_applicable" || data22 === "private_lookup")) {
+                                        validate30.errors = [{ instancePath: instancePath + "/responseContent/state", schemaPath: "#/$defs/field_availability/properties/state/enum", keyword: "enum", params: { allowedValues: schema50.properties.state.enum }, message: "must be equal to one of the allowed values" }];
+                                        return false;
+                                      }
+                                      var valid16 = _errs55 === errors;
+                                    } else {
+                                      var valid16 = true;
+                                    }
+                                    if (valid16) {
+                                      if (data21.reason !== void 0) {
+                                        let data23 = data21.reason;
+                                        const _errs56 = errors;
+                                        if (errors === _errs56) {
+                                          if (typeof data23 === "string") {
+                                            if (func4(data23) > 96) {
+                                              validate30.errors = [{ instancePath: instancePath + "/responseContent/reason", schemaPath: "#/$defs/field_availability/properties/reason/maxLength", keyword: "maxLength", params: { limit: 96 }, message: "must NOT have more than 96 characters" }];
+                                              return false;
+                                            } else {
+                                              if (func4(data23) < 1) {
+                                                validate30.errors = [{ instancePath: instancePath + "/responseContent/reason", schemaPath: "#/$defs/field_availability/properties/reason/minLength", keyword: "minLength", params: { limit: 1 }, message: "must NOT have fewer than 1 characters" }];
+                                                return false;
+                                              }
+                                            }
+                                          } else {
+                                            validate30.errors = [{ instancePath: instancePath + "/responseContent/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                                            return false;
+                                          }
+                                        }
+                                        var valid16 = _errs56 === errors;
+                                      } else {
+                                        var valid16 = true;
+                                      }
+                                    }
+                                  }
+                                }
+                              } else {
+                                validate30.errors = [{ instancePath: instancePath + "/responseContent", schemaPath: "#/$defs/field_availability/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
                                 return false;
                               }
-                              var valid0 = _errs29 === errors;
-                            } else {
-                              var valid0 = true;
                             }
-                            if (valid0) {
-                              if (data.sandbox !== void 0) {
-                                let data10 = data.sandbox;
-                                const _errs32 = errors;
-                                if (typeof data10 !== "string" && !(typeof data10 == "number" && isFinite(data10)) && typeof data10 !== "boolean") {
-                                  validate30.errors = [{ instancePath: instancePath + "/sandbox", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema50.type }, message: "must be string,number,boolean" }];
-                                  return false;
-                                }
-                                var valid0 = _errs32 === errors;
-                              } else {
-                                var valid0 = true;
-                              }
-                              if (valid0) {
-                                if (data.approval !== void 0) {
-                                  let data11 = data.approval;
-                                  const _errs35 = errors;
-                                  if (typeof data11 !== "string" && !(typeof data11 == "number" && isFinite(data11)) && typeof data11 !== "boolean") {
-                                    validate30.errors = [{ instancePath: instancePath + "/approval", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema50.type }, message: "must be string,number,boolean" }];
-                                    return false;
-                                  }
-                                  var valid0 = _errs35 === errors;
-                                } else {
-                                  var valid0 = true;
-                                }
-                              }
-                            }
+                            var valid0 = _errs51 === errors;
+                          } else {
+                            var valid0 = true;
                           }
                         }
                       }
@@ -966,6 +1403,193 @@
     return errors === 0;
   }
   validate30.evaluated = { "props": true, "dynamicProps": false, "dynamicItems": false };
+  var schema58 = { "type": "object", "additionalProperties": false, "properties": { "source": { "$ref": "#/$defs/scalar" }, "event_type": { "$ref": "#/$defs/scalar" }, "envelope_type": { "$ref": "#/$defs/scalar" }, "session_id": { "$ref": "#/$defs/scalar" }, "turn_id": { "$ref": "#/$defs/scalar" }, "request_id": { "$ref": "#/$defs/scalar" }, "call_id": { "$ref": "#/$defs/scalar" }, "tool_name": { "$ref": "#/$defs/scalar" }, "phase": { "$ref": "#/$defs/scalar" }, "exit_code": { "$ref": "#/$defs/scalar" }, "sandbox": { "$ref": "#/$defs/scalar" }, "approval": { "$ref": "#/$defs/scalar" } } };
+  var schema59 = { "type": ["string", "number", "boolean"] };
+  function validate32(data, { instancePath = "", parentData, parentDataProperty, rootData = data, dynamicAnchors = {} } = {}) {
+    let vErrors = null;
+    let errors = 0;
+    const evaluated0 = validate32.evaluated;
+    if (evaluated0.dynamicProps) {
+      evaluated0.props = void 0;
+    }
+    if (evaluated0.dynamicItems) {
+      evaluated0.items = void 0;
+    }
+    if (errors === 0) {
+      if (data && typeof data == "object" && !Array.isArray(data)) {
+        const _errs1 = errors;
+        for (const key0 in data) {
+          if (!func1.call(schema58.properties, key0)) {
+            validate32.errors = [{ instancePath, schemaPath: "#/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key0 }, message: "must NOT have additional properties" }];
+            return false;
+            break;
+          }
+        }
+        if (_errs1 === errors) {
+          if (data.source !== void 0) {
+            let data0 = data.source;
+            const _errs2 = errors;
+            if (typeof data0 !== "string" && !(typeof data0 == "number" && isFinite(data0)) && typeof data0 !== "boolean") {
+              validate32.errors = [{ instancePath: instancePath + "/source", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema59.type }, message: "must be string,number,boolean" }];
+              return false;
+            }
+            var valid0 = _errs2 === errors;
+          } else {
+            var valid0 = true;
+          }
+          if (valid0) {
+            if (data.event_type !== void 0) {
+              let data1 = data.event_type;
+              const _errs5 = errors;
+              if (typeof data1 !== "string" && !(typeof data1 == "number" && isFinite(data1)) && typeof data1 !== "boolean") {
+                validate32.errors = [{ instancePath: instancePath + "/event_type", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema59.type }, message: "must be string,number,boolean" }];
+                return false;
+              }
+              var valid0 = _errs5 === errors;
+            } else {
+              var valid0 = true;
+            }
+            if (valid0) {
+              if (data.envelope_type !== void 0) {
+                let data2 = data.envelope_type;
+                const _errs8 = errors;
+                if (typeof data2 !== "string" && !(typeof data2 == "number" && isFinite(data2)) && typeof data2 !== "boolean") {
+                  validate32.errors = [{ instancePath: instancePath + "/envelope_type", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema59.type }, message: "must be string,number,boolean" }];
+                  return false;
+                }
+                var valid0 = _errs8 === errors;
+              } else {
+                var valid0 = true;
+              }
+              if (valid0) {
+                if (data.session_id !== void 0) {
+                  let data3 = data.session_id;
+                  const _errs11 = errors;
+                  if (typeof data3 !== "string" && !(typeof data3 == "number" && isFinite(data3)) && typeof data3 !== "boolean") {
+                    validate32.errors = [{ instancePath: instancePath + "/session_id", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema59.type }, message: "must be string,number,boolean" }];
+                    return false;
+                  }
+                  var valid0 = _errs11 === errors;
+                } else {
+                  var valid0 = true;
+                }
+                if (valid0) {
+                  if (data.turn_id !== void 0) {
+                    let data4 = data.turn_id;
+                    const _errs14 = errors;
+                    if (typeof data4 !== "string" && !(typeof data4 == "number" && isFinite(data4)) && typeof data4 !== "boolean") {
+                      validate32.errors = [{ instancePath: instancePath + "/turn_id", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema59.type }, message: "must be string,number,boolean" }];
+                      return false;
+                    }
+                    var valid0 = _errs14 === errors;
+                  } else {
+                    var valid0 = true;
+                  }
+                  if (valid0) {
+                    if (data.request_id !== void 0) {
+                      let data5 = data.request_id;
+                      const _errs17 = errors;
+                      if (typeof data5 !== "string" && !(typeof data5 == "number" && isFinite(data5)) && typeof data5 !== "boolean") {
+                        validate32.errors = [{ instancePath: instancePath + "/request_id", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema59.type }, message: "must be string,number,boolean" }];
+                        return false;
+                      }
+                      var valid0 = _errs17 === errors;
+                    } else {
+                      var valid0 = true;
+                    }
+                    if (valid0) {
+                      if (data.call_id !== void 0) {
+                        let data6 = data.call_id;
+                        const _errs20 = errors;
+                        if (typeof data6 !== "string" && !(typeof data6 == "number" && isFinite(data6)) && typeof data6 !== "boolean") {
+                          validate32.errors = [{ instancePath: instancePath + "/call_id", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema59.type }, message: "must be string,number,boolean" }];
+                          return false;
+                        }
+                        var valid0 = _errs20 === errors;
+                      } else {
+                        var valid0 = true;
+                      }
+                      if (valid0) {
+                        if (data.tool_name !== void 0) {
+                          let data7 = data.tool_name;
+                          const _errs23 = errors;
+                          if (typeof data7 !== "string" && !(typeof data7 == "number" && isFinite(data7)) && typeof data7 !== "boolean") {
+                            validate32.errors = [{ instancePath: instancePath + "/tool_name", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema59.type }, message: "must be string,number,boolean" }];
+                            return false;
+                          }
+                          var valid0 = _errs23 === errors;
+                        } else {
+                          var valid0 = true;
+                        }
+                        if (valid0) {
+                          if (data.phase !== void 0) {
+                            let data8 = data.phase;
+                            const _errs26 = errors;
+                            if (typeof data8 !== "string" && !(typeof data8 == "number" && isFinite(data8)) && typeof data8 !== "boolean") {
+                              validate32.errors = [{ instancePath: instancePath + "/phase", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema59.type }, message: "must be string,number,boolean" }];
+                              return false;
+                            }
+                            var valid0 = _errs26 === errors;
+                          } else {
+                            var valid0 = true;
+                          }
+                          if (valid0) {
+                            if (data.exit_code !== void 0) {
+                              let data9 = data.exit_code;
+                              const _errs29 = errors;
+                              if (typeof data9 !== "string" && !(typeof data9 == "number" && isFinite(data9)) && typeof data9 !== "boolean") {
+                                validate32.errors = [{ instancePath: instancePath + "/exit_code", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema59.type }, message: "must be string,number,boolean" }];
+                                return false;
+                              }
+                              var valid0 = _errs29 === errors;
+                            } else {
+                              var valid0 = true;
+                            }
+                            if (valid0) {
+                              if (data.sandbox !== void 0) {
+                                let data10 = data.sandbox;
+                                const _errs32 = errors;
+                                if (typeof data10 !== "string" && !(typeof data10 == "number" && isFinite(data10)) && typeof data10 !== "boolean") {
+                                  validate32.errors = [{ instancePath: instancePath + "/sandbox", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema59.type }, message: "must be string,number,boolean" }];
+                                  return false;
+                                }
+                                var valid0 = _errs32 === errors;
+                              } else {
+                                var valid0 = true;
+                              }
+                              if (valid0) {
+                                if (data.approval !== void 0) {
+                                  let data11 = data.approval;
+                                  const _errs35 = errors;
+                                  if (typeof data11 !== "string" && !(typeof data11 == "number" && isFinite(data11)) && typeof data11 !== "boolean") {
+                                    validate32.errors = [{ instancePath: instancePath + "/approval", schemaPath: "#/$defs/scalar/type", keyword: "type", params: { type: schema59.type }, message: "must be string,number,boolean" }];
+                                    return false;
+                                  }
+                                  var valid0 = _errs35 === errors;
+                                } else {
+                                  var valid0 = true;
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else {
+        validate32.errors = [{ instancePath, schemaPath: "#/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+        return false;
+      }
+    }
+    validate32.errors = vErrors;
+    return errors === 0;
+  }
+  validate32.evaluated = { "props": true, "dynamicProps": false, "dynamicItems": false };
   function validate29(data, { instancePath = "", parentData, parentDataProperty, rootData = data, dynamicAnchors = {} } = {}) {
     let vErrors = null;
     let errors = 0;
@@ -1165,277 +1789,289 @@
                                   var valid0 = true;
                                 }
                                 if (valid0) {
-                                  if (data.sessionId !== void 0) {
+                                  if (data.availability !== void 0) {
                                     const _errs32 = errors;
-                                    if (typeof data.sessionId !== "string") {
-                                      validate29.errors = [{ instancePath: instancePath + "/sessionId", schemaPath: "#/properties/sessionId/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
-                                      return false;
+                                    if (!validate30(data.availability, { instancePath: instancePath + "/availability", parentData: data, parentDataProperty: "availability", rootData, dynamicAnchors })) {
+                                      vErrors = vErrors === null ? validate30.errors : vErrors.concat(validate30.errors);
+                                      errors = vErrors.length;
                                     }
                                     var valid0 = _errs32 === errors;
                                   } else {
                                     var valid0 = true;
                                   }
                                   if (valid0) {
-                                    if (data.turnId !== void 0) {
-                                      const _errs34 = errors;
-                                      if (typeof data.turnId !== "string") {
-                                        validate29.errors = [{ instancePath: instancePath + "/turnId", schemaPath: "#/properties/turnId/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                                    if (data.sessionId !== void 0) {
+                                      const _errs33 = errors;
+                                      if (typeof data.sessionId !== "string") {
+                                        validate29.errors = [{ instancePath: instancePath + "/sessionId", schemaPath: "#/properties/sessionId/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
                                         return false;
                                       }
-                                      var valid0 = _errs34 === errors;
+                                      var valid0 = _errs33 === errors;
                                     } else {
                                       var valid0 = true;
                                     }
                                     if (valid0) {
-                                      if (data.toolName !== void 0) {
-                                        const _errs36 = errors;
-                                        if (typeof data.toolName !== "string") {
-                                          validate29.errors = [{ instancePath: instancePath + "/toolName", schemaPath: "#/properties/toolName/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                                      if (data.turnId !== void 0) {
+                                        const _errs35 = errors;
+                                        if (typeof data.turnId !== "string") {
+                                          validate29.errors = [{ instancePath: instancePath + "/turnId", schemaPath: "#/properties/turnId/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
                                           return false;
                                         }
-                                        var valid0 = _errs36 === errors;
+                                        var valid0 = _errs35 === errors;
                                       } else {
                                         var valid0 = true;
                                       }
                                       if (valid0) {
-                                        if (data.attributes !== void 0) {
-                                          const _errs38 = errors;
-                                          if (!validate30(data.attributes, { instancePath: instancePath + "/attributes", parentData: data, parentDataProperty: "attributes", rootData, dynamicAnchors })) {
-                                            vErrors = vErrors === null ? validate30.errors : vErrors.concat(validate30.errors);
-                                            errors = vErrors.length;
+                                        if (data.toolName !== void 0) {
+                                          const _errs37 = errors;
+                                          if (typeof data.toolName !== "string") {
+                                            validate29.errors = [{ instancePath: instancePath + "/toolName", schemaPath: "#/properties/toolName/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                                            return false;
                                           }
-                                          var valid0 = _errs38 === errors;
+                                          var valid0 = _errs37 === errors;
                                         } else {
                                           var valid0 = true;
                                         }
                                         if (valid0) {
-                                          if (data.metrics !== void 0) {
-                                            let data18 = data.metrics;
+                                          if (data.attributes !== void 0) {
                                             const _errs39 = errors;
-                                            const _errs40 = errors;
-                                            if (errors === _errs40) {
-                                              if (data18 && typeof data18 == "object" && !Array.isArray(data18)) {
-                                                const _errs42 = errors;
-                                                for (const key2 in data18) {
-                                                  if (!func1.call(schema62.properties, key2)) {
-                                                    validate29.errors = [{ instancePath: instancePath + "/metrics", schemaPath: "#/$defs/metrics/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key2 }, message: "must NOT have additional properties" }];
-                                                    return false;
-                                                    break;
-                                                  }
-                                                }
-                                                if (_errs42 === errors) {
-                                                  if (data18.inputTokens !== void 0) {
-                                                    let data19 = data18.inputTokens;
-                                                    const _errs43 = errors;
-                                                    if (!(typeof data19 == "number" && isFinite(data19))) {
-                                                      validate29.errors = [{ instancePath: instancePath + "/metrics/inputTokens", schemaPath: "#/$defs/metrics/properties/inputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                      return false;
-                                                    }
-                                                    var valid4 = _errs43 === errors;
-                                                  } else {
-                                                    var valid4 = true;
-                                                  }
-                                                  if (valid4) {
-                                                    if (data18.outputTokens !== void 0) {
-                                                      let data20 = data18.outputTokens;
-                                                      const _errs45 = errors;
-                                                      if (!(typeof data20 == "number" && isFinite(data20))) {
-                                                        validate29.errors = [{ instancePath: instancePath + "/metrics/outputTokens", schemaPath: "#/$defs/metrics/properties/outputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                        return false;
-                                                      }
-                                                      var valid4 = _errs45 === errors;
-                                                    } else {
-                                                      var valid4 = true;
-                                                    }
-                                                    if (valid4) {
-                                                      if (data18.cachedInputTokens !== void 0) {
-                                                        let data21 = data18.cachedInputTokens;
-                                                        const _errs47 = errors;
-                                                        if (!(typeof data21 == "number" && isFinite(data21))) {
-                                                          validate29.errors = [{ instancePath: instancePath + "/metrics/cachedInputTokens", schemaPath: "#/$defs/metrics/properties/cachedInputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                          return false;
-                                                        }
-                                                        var valid4 = _errs47 === errors;
-                                                      } else {
-                                                        var valid4 = true;
-                                                      }
-                                                      if (valid4) {
-                                                        if (data18.cacheCreationInputTokens !== void 0) {
-                                                          let data22 = data18.cacheCreationInputTokens;
-                                                          const _errs49 = errors;
-                                                          if (!(typeof data22 == "number" && isFinite(data22))) {
-                                                            validate29.errors = [{ instancePath: instancePath + "/metrics/cacheCreationInputTokens", schemaPath: "#/$defs/metrics/properties/cacheCreationInputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                            return false;
-                                                          }
-                                                          var valid4 = _errs49 === errors;
-                                                        } else {
-                                                          var valid4 = true;
-                                                        }
-                                                        if (valid4) {
-                                                          if (data18.reasoningOutputTokens !== void 0) {
-                                                            let data23 = data18.reasoningOutputTokens;
-                                                            const _errs51 = errors;
-                                                            if (!(typeof data23 == "number" && isFinite(data23))) {
-                                                              validate29.errors = [{ instancePath: instancePath + "/metrics/reasoningOutputTokens", schemaPath: "#/$defs/metrics/properties/reasoningOutputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                              return false;
-                                                            }
-                                                            var valid4 = _errs51 === errors;
-                                                          } else {
-                                                            var valid4 = true;
-                                                          }
-                                                          if (valid4) {
-                                                            if (data18.totalTokens !== void 0) {
-                                                              let data24 = data18.totalTokens;
-                                                              const _errs53 = errors;
-                                                              if (!(typeof data24 == "number" && isFinite(data24))) {
-                                                                validate29.errors = [{ instancePath: instancePath + "/metrics/totalTokens", schemaPath: "#/$defs/metrics/properties/totalTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                                return false;
-                                                              }
-                                                              var valid4 = _errs53 === errors;
-                                                            } else {
-                                                              var valid4 = true;
-                                                            }
-                                                            if (valid4) {
-                                                              if (data18.latencyMs !== void 0) {
-                                                                let data25 = data18.latencyMs;
-                                                                const _errs55 = errors;
-                                                                if (!(typeof data25 == "number" && isFinite(data25))) {
-                                                                  validate29.errors = [{ instancePath: instancePath + "/metrics/latencyMs", schemaPath: "#/$defs/metrics/properties/latencyMs/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                                  return false;
-                                                                }
-                                                                var valid4 = _errs55 === errors;
-                                                              } else {
-                                                                var valid4 = true;
-                                                              }
-                                                              if (valid4) {
-                                                                if (data18.durationMs !== void 0) {
-                                                                  let data26 = data18.durationMs;
-                                                                  const _errs57 = errors;
-                                                                  if (!(typeof data26 == "number" && isFinite(data26))) {
-                                                                    validate29.errors = [{ instancePath: instancePath + "/metrics/durationMs", schemaPath: "#/$defs/metrics/properties/durationMs/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                                    return false;
-                                                                  }
-                                                                  var valid4 = _errs57 === errors;
-                                                                } else {
-                                                                  var valid4 = true;
-                                                                }
-                                                                if (valid4) {
-                                                                  if (data18.totalInputTokens !== void 0) {
-                                                                    let data27 = data18.totalInputTokens;
-                                                                    const _errs59 = errors;
-                                                                    if (!(typeof data27 == "number" && isFinite(data27))) {
-                                                                      validate29.errors = [{ instancePath: instancePath + "/metrics/totalInputTokens", schemaPath: "#/$defs/metrics/properties/totalInputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                                      return false;
-                                                                    }
-                                                                    var valid4 = _errs59 === errors;
-                                                                  } else {
-                                                                    var valid4 = true;
-                                                                  }
-                                                                  if (valid4) {
-                                                                    if (data18.totalOutputTokens !== void 0) {
-                                                                      let data28 = data18.totalOutputTokens;
-                                                                      const _errs61 = errors;
-                                                                      if (!(typeof data28 == "number" && isFinite(data28))) {
-                                                                        validate29.errors = [{ instancePath: instancePath + "/metrics/totalOutputTokens", schemaPath: "#/$defs/metrics/properties/totalOutputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                                        return false;
-                                                                      }
-                                                                      var valid4 = _errs61 === errors;
-                                                                    } else {
-                                                                      var valid4 = true;
-                                                                    }
-                                                                    if (valid4) {
-                                                                      if (data18.totalCachedInputTokens !== void 0) {
-                                                                        let data29 = data18.totalCachedInputTokens;
-                                                                        const _errs63 = errors;
-                                                                        if (!(typeof data29 == "number" && isFinite(data29))) {
-                                                                          validate29.errors = [{ instancePath: instancePath + "/metrics/totalCachedInputTokens", schemaPath: "#/$defs/metrics/properties/totalCachedInputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                                          return false;
-                                                                        }
-                                                                        var valid4 = _errs63 === errors;
-                                                                      } else {
-                                                                        var valid4 = true;
-                                                                      }
-                                                                      if (valid4) {
-                                                                        if (data18.totalReasoningOutputTokens !== void 0) {
-                                                                          let data30 = data18.totalReasoningOutputTokens;
-                                                                          const _errs65 = errors;
-                                                                          if (!(typeof data30 == "number" && isFinite(data30))) {
-                                                                            validate29.errors = [{ instancePath: instancePath + "/metrics/totalReasoningOutputTokens", schemaPath: "#/$defs/metrics/properties/totalReasoningOutputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                                            return false;
-                                                                          }
-                                                                          var valid4 = _errs65 === errors;
-                                                                        } else {
-                                                                          var valid4 = true;
-                                                                        }
-                                                                        if (valid4) {
-                                                                          if (data18.totalAccumulatedTokens !== void 0) {
-                                                                            let data31 = data18.totalAccumulatedTokens;
-                                                                            const _errs67 = errors;
-                                                                            if (!(typeof data31 == "number" && isFinite(data31))) {
-                                                                              validate29.errors = [{ instancePath: instancePath + "/metrics/totalAccumulatedTokens", schemaPath: "#/$defs/metrics/properties/totalAccumulatedTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                                              return false;
-                                                                            }
-                                                                            var valid4 = _errs67 === errors;
-                                                                          } else {
-                                                                            var valid4 = true;
-                                                                          }
-                                                                          if (valid4) {
-                                                                            if (data18.contextWindowTokens !== void 0) {
-                                                                              let data32 = data18.contextWindowTokens;
-                                                                              const _errs69 = errors;
-                                                                              if (!(typeof data32 == "number" && isFinite(data32))) {
-                                                                                validate29.errors = [{ instancePath: instancePath + "/metrics/contextWindowTokens", schemaPath: "#/$defs/metrics/properties/contextWindowTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                                                return false;
-                                                                              }
-                                                                              var valid4 = _errs69 === errors;
-                                                                            } else {
-                                                                              var valid4 = true;
-                                                                            }
-                                                                          }
-                                                                        }
-                                                                      }
-                                                                    }
-                                                                  }
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              } else {
-                                                validate29.errors = [{ instancePath: instancePath + "/metrics", schemaPath: "#/$defs/metrics/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
-                                                return false;
-                                              }
+                                            if (!validate32(data.attributes, { instancePath: instancePath + "/attributes", parentData: data, parentDataProperty: "attributes", rootData, dynamicAnchors })) {
+                                              vErrors = vErrors === null ? validate32.errors : vErrors.concat(validate32.errors);
+                                              errors = vErrors.length;
                                             }
                                             var valid0 = _errs39 === errors;
                                           } else {
                                             var valid0 = true;
                                           }
                                           if (valid0) {
-                                            if (data.estimatedCost !== void 0) {
-                                              let data33 = data.estimatedCost;
-                                              const _errs71 = errors;
-                                              if (!(typeof data33 == "number" && isFinite(data33))) {
-                                                validate29.errors = [{ instancePath: instancePath + "/estimatedCost", schemaPath: "#/properties/estimatedCost/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
-                                                return false;
+                                            if (data.metrics !== void 0) {
+                                              let data19 = data.metrics;
+                                              const _errs40 = errors;
+                                              const _errs41 = errors;
+                                              if (errors === _errs41) {
+                                                if (data19 && typeof data19 == "object" && !Array.isArray(data19)) {
+                                                  const _errs43 = errors;
+                                                  for (const key2 in data19) {
+                                                    if (!func1.call(schema71.properties, key2)) {
+                                                      validate29.errors = [{ instancePath: instancePath + "/metrics", schemaPath: "#/$defs/metrics/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key2 }, message: "must NOT have additional properties" }];
+                                                      return false;
+                                                      break;
+                                                    }
+                                                  }
+                                                  if (_errs43 === errors) {
+                                                    if (data19.inputTokens !== void 0) {
+                                                      let data20 = data19.inputTokens;
+                                                      const _errs44 = errors;
+                                                      if (!(typeof data20 == "number" && isFinite(data20))) {
+                                                        validate29.errors = [{ instancePath: instancePath + "/metrics/inputTokens", schemaPath: "#/$defs/metrics/properties/inputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                        return false;
+                                                      }
+                                                      var valid4 = _errs44 === errors;
+                                                    } else {
+                                                      var valid4 = true;
+                                                    }
+                                                    if (valid4) {
+                                                      if (data19.outputTokens !== void 0) {
+                                                        let data21 = data19.outputTokens;
+                                                        const _errs46 = errors;
+                                                        if (!(typeof data21 == "number" && isFinite(data21))) {
+                                                          validate29.errors = [{ instancePath: instancePath + "/metrics/outputTokens", schemaPath: "#/$defs/metrics/properties/outputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                          return false;
+                                                        }
+                                                        var valid4 = _errs46 === errors;
+                                                      } else {
+                                                        var valid4 = true;
+                                                      }
+                                                      if (valid4) {
+                                                        if (data19.cachedInputTokens !== void 0) {
+                                                          let data22 = data19.cachedInputTokens;
+                                                          const _errs48 = errors;
+                                                          if (!(typeof data22 == "number" && isFinite(data22))) {
+                                                            validate29.errors = [{ instancePath: instancePath + "/metrics/cachedInputTokens", schemaPath: "#/$defs/metrics/properties/cachedInputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                            return false;
+                                                          }
+                                                          var valid4 = _errs48 === errors;
+                                                        } else {
+                                                          var valid4 = true;
+                                                        }
+                                                        if (valid4) {
+                                                          if (data19.cacheCreationInputTokens !== void 0) {
+                                                            let data23 = data19.cacheCreationInputTokens;
+                                                            const _errs50 = errors;
+                                                            if (!(typeof data23 == "number" && isFinite(data23))) {
+                                                              validate29.errors = [{ instancePath: instancePath + "/metrics/cacheCreationInputTokens", schemaPath: "#/$defs/metrics/properties/cacheCreationInputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                              return false;
+                                                            }
+                                                            var valid4 = _errs50 === errors;
+                                                          } else {
+                                                            var valid4 = true;
+                                                          }
+                                                          if (valid4) {
+                                                            if (data19.reasoningOutputTokens !== void 0) {
+                                                              let data24 = data19.reasoningOutputTokens;
+                                                              const _errs52 = errors;
+                                                              if (!(typeof data24 == "number" && isFinite(data24))) {
+                                                                validate29.errors = [{ instancePath: instancePath + "/metrics/reasoningOutputTokens", schemaPath: "#/$defs/metrics/properties/reasoningOutputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                                return false;
+                                                              }
+                                                              var valid4 = _errs52 === errors;
+                                                            } else {
+                                                              var valid4 = true;
+                                                            }
+                                                            if (valid4) {
+                                                              if (data19.totalTokens !== void 0) {
+                                                                let data25 = data19.totalTokens;
+                                                                const _errs54 = errors;
+                                                                if (!(typeof data25 == "number" && isFinite(data25))) {
+                                                                  validate29.errors = [{ instancePath: instancePath + "/metrics/totalTokens", schemaPath: "#/$defs/metrics/properties/totalTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                                  return false;
+                                                                }
+                                                                var valid4 = _errs54 === errors;
+                                                              } else {
+                                                                var valid4 = true;
+                                                              }
+                                                              if (valid4) {
+                                                                if (data19.latencyMs !== void 0) {
+                                                                  let data26 = data19.latencyMs;
+                                                                  const _errs56 = errors;
+                                                                  if (!(typeof data26 == "number" && isFinite(data26))) {
+                                                                    validate29.errors = [{ instancePath: instancePath + "/metrics/latencyMs", schemaPath: "#/$defs/metrics/properties/latencyMs/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                                    return false;
+                                                                  }
+                                                                  var valid4 = _errs56 === errors;
+                                                                } else {
+                                                                  var valid4 = true;
+                                                                }
+                                                                if (valid4) {
+                                                                  if (data19.durationMs !== void 0) {
+                                                                    let data27 = data19.durationMs;
+                                                                    const _errs58 = errors;
+                                                                    if (!(typeof data27 == "number" && isFinite(data27))) {
+                                                                      validate29.errors = [{ instancePath: instancePath + "/metrics/durationMs", schemaPath: "#/$defs/metrics/properties/durationMs/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                                      return false;
+                                                                    }
+                                                                    var valid4 = _errs58 === errors;
+                                                                  } else {
+                                                                    var valid4 = true;
+                                                                  }
+                                                                  if (valid4) {
+                                                                    if (data19.totalInputTokens !== void 0) {
+                                                                      let data28 = data19.totalInputTokens;
+                                                                      const _errs60 = errors;
+                                                                      if (!(typeof data28 == "number" && isFinite(data28))) {
+                                                                        validate29.errors = [{ instancePath: instancePath + "/metrics/totalInputTokens", schemaPath: "#/$defs/metrics/properties/totalInputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                                        return false;
+                                                                      }
+                                                                      var valid4 = _errs60 === errors;
+                                                                    } else {
+                                                                      var valid4 = true;
+                                                                    }
+                                                                    if (valid4) {
+                                                                      if (data19.totalOutputTokens !== void 0) {
+                                                                        let data29 = data19.totalOutputTokens;
+                                                                        const _errs62 = errors;
+                                                                        if (!(typeof data29 == "number" && isFinite(data29))) {
+                                                                          validate29.errors = [{ instancePath: instancePath + "/metrics/totalOutputTokens", schemaPath: "#/$defs/metrics/properties/totalOutputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                                          return false;
+                                                                        }
+                                                                        var valid4 = _errs62 === errors;
+                                                                      } else {
+                                                                        var valid4 = true;
+                                                                      }
+                                                                      if (valid4) {
+                                                                        if (data19.totalCachedInputTokens !== void 0) {
+                                                                          let data30 = data19.totalCachedInputTokens;
+                                                                          const _errs64 = errors;
+                                                                          if (!(typeof data30 == "number" && isFinite(data30))) {
+                                                                            validate29.errors = [{ instancePath: instancePath + "/metrics/totalCachedInputTokens", schemaPath: "#/$defs/metrics/properties/totalCachedInputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                                            return false;
+                                                                          }
+                                                                          var valid4 = _errs64 === errors;
+                                                                        } else {
+                                                                          var valid4 = true;
+                                                                        }
+                                                                        if (valid4) {
+                                                                          if (data19.totalReasoningOutputTokens !== void 0) {
+                                                                            let data31 = data19.totalReasoningOutputTokens;
+                                                                            const _errs66 = errors;
+                                                                            if (!(typeof data31 == "number" && isFinite(data31))) {
+                                                                              validate29.errors = [{ instancePath: instancePath + "/metrics/totalReasoningOutputTokens", schemaPath: "#/$defs/metrics/properties/totalReasoningOutputTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                                              return false;
+                                                                            }
+                                                                            var valid4 = _errs66 === errors;
+                                                                          } else {
+                                                                            var valid4 = true;
+                                                                          }
+                                                                          if (valid4) {
+                                                                            if (data19.totalAccumulatedTokens !== void 0) {
+                                                                              let data32 = data19.totalAccumulatedTokens;
+                                                                              const _errs68 = errors;
+                                                                              if (!(typeof data32 == "number" && isFinite(data32))) {
+                                                                                validate29.errors = [{ instancePath: instancePath + "/metrics/totalAccumulatedTokens", schemaPath: "#/$defs/metrics/properties/totalAccumulatedTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                                                return false;
+                                                                              }
+                                                                              var valid4 = _errs68 === errors;
+                                                                            } else {
+                                                                              var valid4 = true;
+                                                                            }
+                                                                            if (valid4) {
+                                                                              if (data19.contextWindowTokens !== void 0) {
+                                                                                let data33 = data19.contextWindowTokens;
+                                                                                const _errs70 = errors;
+                                                                                if (!(typeof data33 == "number" && isFinite(data33))) {
+                                                                                  validate29.errors = [{ instancePath: instancePath + "/metrics/contextWindowTokens", schemaPath: "#/$defs/metrics/properties/contextWindowTokens/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                                                  return false;
+                                                                                }
+                                                                                var valid4 = _errs70 === errors;
+                                                                              } else {
+                                                                                var valid4 = true;
+                                                                              }
+                                                                            }
+                                                                          }
+                                                                        }
+                                                                      }
+                                                                    }
+                                                                  }
+                                                                }
+                                                              }
+                                                            }
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  }
+                                                } else {
+                                                  validate29.errors = [{ instancePath: instancePath + "/metrics", schemaPath: "#/$defs/metrics/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                                                  return false;
+                                                }
                                               }
-                                              var valid0 = _errs71 === errors;
+                                              var valid0 = _errs40 === errors;
                                             } else {
                                               var valid0 = true;
                                             }
                                             if (valid0) {
-                                              if (data.cost !== void 0) {
-                                                const _errs73 = errors;
-                                                if (!validate21(data.cost, { instancePath: instancePath + "/cost", parentData: data, parentDataProperty: "cost", rootData, dynamicAnchors })) {
-                                                  vErrors = vErrors === null ? validate21.errors : vErrors.concat(validate21.errors);
-                                                  errors = vErrors.length;
+                                              if (data.estimatedCost !== void 0) {
+                                                let data34 = data.estimatedCost;
+                                                const _errs72 = errors;
+                                                if (!(typeof data34 == "number" && isFinite(data34))) {
+                                                  validate29.errors = [{ instancePath: instancePath + "/estimatedCost", schemaPath: "#/properties/estimatedCost/type", keyword: "type", params: { type: "number" }, message: "must be number" }];
+                                                  return false;
                                                 }
-                                                var valid0 = _errs73 === errors;
+                                                var valid0 = _errs72 === errors;
                                               } else {
                                                 var valid0 = true;
+                                              }
+                                              if (valid0) {
+                                                if (data.cost !== void 0) {
+                                                  const _errs74 = errors;
+                                                  if (!validate21(data.cost, { instancePath: instancePath + "/cost", parentData: data, parentDataProperty: "cost", rootData, dynamicAnchors })) {
+                                                    vErrors = vErrors === null ? validate21.errors : vErrors.concat(validate21.errors);
+                                                    errors = vErrors.length;
+                                                  }
+                                                  var valid0 = _errs74 === errors;
+                                                } else {
+                                                  var valid0 = true;
+                                                }
                                               }
                                             }
                                           }
@@ -2019,6 +2655,7 @@
   var FILTER_OPTION_LIMIT = 500;
   var SAVED_FILTER_LIMIT = 20;
   var SAVED_FILTER_KEY = "agent-observability.report.v1.saved-filters";
+  var PRIVATE_DETAIL_VERSION = "agent_observability.private_turn_detail.v1";
   var reportData = document.getElementById("report-data");
   if (!reportData) throw new Error("Missing report data");
   var candidate = parseReportData(reportData.textContent);
@@ -2046,6 +2683,8 @@
     let tracePageIndex = 0;
     let spanPageIndex = 0;
     let savedFilters = [];
+    let selectedSpanId;
+    let detailRequest = 0;
     const selects = {
       repo: element("repo-filter"),
       session: element("session-filter"),
@@ -2067,6 +2706,14 @@
     const traceNext = element("trace-next");
     const spanPrevious = element("span-previous");
     const spanNext = element("span-next");
+    const detailsBody = element("details-body");
+    const detailsHeading = element("details-heading");
+    const detailsClose = element("details-close");
+    detailsClose.addEventListener("click", () => {
+      selectedSpanId = void 0;
+      detailRequest += 1;
+      renderDetails(void 0);
+    });
     const allFilterValues = {
       repo: data.filters.repos,
       session: data.filters.sessions,
@@ -2170,6 +2817,8 @@
       tracePageIndex = tracePage.index;
       spanPageIndex = spanPage.index;
       const summary = summarizeVisible(visibleSpans);
+      const selectedSpan = visibleSpans.find((span) => span.spanId === selectedSpanId);
+      if (selectedSpanId !== void 0 && selectedSpan === void 0) selectedSpanId = void 0;
       setText("kpi-sessions", summary.sessions);
       setText("kpi-turns", summary.turns);
       setText("kpi-llm", summary.llmRequests);
@@ -2188,6 +2837,8 @@
       renderTraces(tracePage, view.spansByTrace);
       renderTimeline(visibleSpans, state.trace !== void 0);
       renderSpans(spanPage);
+      renderQuality(visibleSpans);
+      renderDetails(selectedSpan);
       renderPager("trace", tracePage, tracePrevious, traceNext, TRACE_PAGE_SIZE);
       renderPager("span", spanPage, spanPrevious, spanNext, SPAN_PAGE_SIZE);
     }
@@ -2227,7 +2878,10 @@
       timelineElement.replaceChildren(...items.map((item) => {
         const row = document.createElement("div");
         row.className = "timeline-row";
-        row.innerHTML = `<div class="timeline-label"><span>${escapeHtml(item.span.name)}</span><span class="timeline-details"><span class="badge timeline-span-status ${statusClass(item.span.status)}">${escapeHtml(item.span.status)}</span><span class="mono">${escapeHtml(formatDuration(item.span.metrics.latencyMs ?? item.span.metrics.durationMs))}</span></span></div><div class="timeline-track"><span class="timeline-bar ${statusClass(item.span.status)}" style="left:${item.leftPercent.toFixed(3)}%;width:${item.widthPercent.toFixed(3)}%"></span></div>`;
+        row.innerHTML = `<div class="timeline-label"><button class="span-open" type="button">${escapeHtml(item.span.name)}</button><span class="timeline-details"><span class="badge timeline-span-status ${statusClass(item.span.status)}">${escapeHtml(item.span.status)}</span><span class="mono">${escapeHtml(formatDuration(item.span.metrics.latencyMs ?? item.span.metrics.durationMs))}</span></span></div><div class="timeline-track"><span class="timeline-bar ${statusClass(item.span.status)}" style="left:${item.leftPercent.toFixed(3)}%;width:${item.widthPercent.toFixed(3)}%"></span></div>`;
+        row.querySelector(".span-open")?.addEventListener("click", (event) => {
+          openSpanDetails(item.span, event.currentTarget);
+        });
         return row;
       }));
       element("timeline-status").textContent = spans.length > TIMELINE_LIMIT ? `Showing first ${TIMELINE_LIMIT} of ${spans.length} spans.` : `${spans.length} spans.`;
@@ -2239,9 +2893,70 @@
       }
       tableElement.replaceChildren(...page.items.map((span) => {
         const row = document.createElement("tr");
-        row.innerHTML = `<td><span class="badge">${escapeHtml(span.kind)}</span></td><td>${escapeHtml(span.name)}${span.toolName ? `<div class="mono">${escapeHtml(span.toolName)}</div>` : ""}</td><td><span class="badge ${statusClass(span.status)}">${escapeHtml(span.status)}</span></td><td>${escapeHtml(span.repo)}</td><td class="mono">${escapeHtml(span.turnId ?? "")}</td><td>${formatNumber((span.metrics.inputTokens ?? 0) + (span.metrics.outputTokens ?? 0))}</td><td>${escapeHtml(formatCost(span.estimatedCost, span.cost))}</td><td>${formatDuration(span.metrics.latencyMs ?? span.metrics.durationMs)}</td><td class="mono">${escapeHtml(shortId(span.parentSpanId ?? ""))}</td>`;
+        const availability = availabilityOf(span);
+        row.innerHTML = `<td><span class="badge">${escapeHtml(span.kind)}</span></td><td><button class="span-open" type="button" aria-controls="span-details" aria-expanded="${selectedSpanId === span.spanId}">${escapeHtml(span.name)}</button>${span.toolName ? `<div class="mono">${escapeHtml(span.toolName)}</div>` : ""}</td><td><span class="badge ${statusClass(span.status)}">${escapeHtml(span.status)}</span></td><td>${escapeHtml(span.repo)}</td><td class="mono">${escapeHtml(span.turnId ?? "")}</td><td>${formatOptionalNumber(sumOptional(span.metrics.inputTokens, span.metrics.outputTokens), availability.tokens)}</td><td>${escapeHtml(formatCost(span.estimatedCost, span.cost))}</td><td>${formatOptionalDuration(span.metrics.latencyMs ?? span.metrics.durationMs, availability.latency)}</td><td class="mono">${escapeHtml(shortId(span.parentSpanId ?? ""))}</td>`;
+        row.querySelector(".span-open")?.addEventListener("click", (event) => {
+          openSpanDetails(span, event.currentTarget);
+        });
         return row;
       }));
+    }
+    function renderQuality(spans) {
+      const unavailable = spans.reduce((count, span) => count + Object.values(availabilityOf(span)).filter((field) => field.state === "source_unavailable").length, 0);
+      const privateLookup = spans.reduce((count, span) => count + Object.values(availabilityOf(span)).filter((field) => field.state === "private_lookup").length, 0);
+      setText("quality-summary", unavailable === 0 ? "Source fields are complete" : `${formatNumber(unavailable)} unavailable fields`);
+      setText(
+        "quality-detail",
+        privateLookup > 0 ? `${formatNumber(privateLookup)} private fields can be checked locally. Select a span for exact reasons.` : "Select a span to see exact availability reasons."
+      );
+    }
+    function openSpanDetails(span, trigger) {
+      selectedSpanId = span.spanId;
+      render();
+      trigger.setAttribute("aria-expanded", "true");
+      detailsHeading.focus();
+    }
+    function renderDetails(span) {
+      if (!span) {
+        detailsBody.innerHTML = '<p class="detail-empty">Select a span name to inspect source, availability, and private local details.</p>';
+        return;
+      }
+      const source = scalarText(span.attributes.source) ?? "Unavailable";
+      const eventType = scalarText(span.attributes.event_type) ?? "Unavailable";
+      const availability = availabilityOf(span);
+      detailsBody.innerHTML = `<section class="detail-section"><h3>Overview</h3><dl class="detail-grid">` + detailRow("Name", span.name) + detailRow("Kind", span.kind) + detailRow("Status", span.status) + detailRow("Repository", displayValue(span.repo, availability.repository)) + detailRow("Model", displayValue(span.agent.model, availability.model)) + detailRow("Tokens", displayValue(formatOptionalTokenTotal(span), availability.tokens)) + detailRow("Turn", displayValue(span.turnId, availability.turn)) + detailRow("Latency", displayValue(formatDuration(span.metrics.latencyMs ?? span.metrics.durationMs), availability.latency)) + `</dl></section><section class="detail-section"><h3>Source &amp; privacy</h3><dl class="detail-grid">` + detailRow("Agent", span.agent.name ?? "Unavailable") + detailRow("Surface", source) + detailRow("Event", eventType) + availabilityRow("Location", availability.sourceLocation) + availabilityRow("Request", availability.requestContent) + availabilityRow("Response", availability.responseContent) + `</dl></section><section class="detail-section" id="private-detail"><h3>Private local detail</h3><p class="detail-empty">Checking the capability-protected local store\u2026</p></section>`;
+      void loadPrivateDetail(span);
+    }
+    async function loadPrivateDetail(span) {
+      const request = ++detailRequest;
+      const target = document.getElementById("private-detail");
+      if (!target) return;
+      if (!span.turnId) {
+        target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Unavailable: this source did not provide turn correlation.</p>';
+        return;
+      }
+      if (!/^https?:$/.test(globalThis.location.protocol)) {
+        target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Unavailable in a file:// report. Open the localhost dashboard.</p>';
+        return;
+      }
+      try {
+        const response = await fetch(`${globalThis.location.pathname}/details/${encodeURIComponent(span.turnId)}`, {
+          cache: "no-store",
+          credentials: "same-origin"
+        });
+        if (request !== detailRequest || selectedSpanId !== span.spanId) return;
+        if (response.status === 404) {
+          target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Not collected. Enable private Codex turn details in Settings for future turns.</p>';
+          return;
+        }
+        if (!response.ok) throw new Error("private detail request failed");
+        const detail = await response.json();
+        if (!validPrivateDetail(detail, span.turnId)) throw new Error("private detail contract mismatch");
+        target.innerHTML = `<h3>Private local detail</h3><p class="private-banner">Sensitive content stored only in this private local runtime. Review before sharing screenshots.</p><dl class="detail-grid">${detailRow("Opened from", detail.cwd)}</dl><h3>Request</h3><pre class="private-content" tabindex="0">${escapeHtml(detail.inputMessages.join("\n\n"))}</pre><h3>Response</h3><pre class="private-content" tabindex="0">${escapeHtml(detail.lastAssistantMessage ?? "Unavailable: Codex did not provide an assistant response in this notification.")}</pre>`;
+      } catch {
+        if (request !== detailRequest || selectedSpanId !== span.spanId) return;
+        target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Temporarily unavailable. The normal report remains usable.</p>';
+      }
     }
     function renderPager(prefix, page, previous, next, pageSize) {
       previous.disabled = page.index === 0;
@@ -2268,6 +2983,8 @@
     }
     function resetSelection() {
       state.trace = void 0;
+      selectedSpanId = void 0;
+      detailRequest += 1;
       tracePageIndex = 0;
       spanPageIndex = 0;
       savedFilterSelect.value = ALL_OPTION;
@@ -2276,6 +2993,52 @@
     function hasActiveFilters() {
       return state.text.length > 0 || Object.keys(selects).some((key) => state[key] !== void 0);
     }
+  }
+  function validPrivateDetail(value, turnId) {
+    return value?.schemaVersion === PRIVATE_DETAIL_VERSION && value.turnId === turnId && typeof value.cwd === "string" && Array.isArray(value.inputMessages) && value.inputMessages.every((message) => typeof message === "string") && (value.lastAssistantMessage === null || typeof value.lastAssistantMessage === "string");
+  }
+  function availabilityLabel(field) {
+    const state = field.state.replaceAll("_", " ");
+    const reason = field.reason.replaceAll("_", " ");
+    return `${state} \u2014 ${reason}`;
+  }
+  function availabilityOf(span) {
+    const unavailable = { state: "source_unavailable", reason: "legacy_report_no_availability" };
+    return span.availability ?? {
+      repository: unavailable,
+      turn: unavailable,
+      model: unavailable,
+      tokens: unavailable,
+      latency: unavailable,
+      sourceLocation: unavailable,
+      requestContent: unavailable,
+      responseContent: unavailable
+    };
+  }
+  function availabilityRow(label, field) {
+    return `<dt>${escapeHtml(label)}</dt><dd><span class="availability ${escapeHtml(field.state)}">${escapeHtml(availabilityLabel(field))}</span></dd>`;
+  }
+  function detailRow(label, value) {
+    return `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`;
+  }
+  function displayValue(value, availability) {
+    return value && value !== UNKNOWN2 ? value : availabilityLabel(availability);
+  }
+  function scalarText(value) {
+    return value === void 0 ? void 0 : String(value);
+  }
+  function sumOptional(left, right) {
+    return left === void 0 && right === void 0 ? void 0 : (left ?? 0) + (right ?? 0);
+  }
+  function formatOptionalTokenTotal(span) {
+    const value = sumOptional(span.metrics.inputTokens, span.metrics.outputTokens);
+    return value === void 0 ? void 0 : formatNumber(value);
+  }
+  function formatOptionalNumber(value, availability) {
+    return value === void 0 ? availabilityLabel(availability) : formatNumber(value);
+  }
+  function formatOptionalDuration(value, availability) {
+    return value === void 0 ? availabilityLabel(availability) : formatDuration(value);
   }
   function emptyDimensions() {
     return { repo: void 0, session: void 0, agent: void 0, model: void 0 };

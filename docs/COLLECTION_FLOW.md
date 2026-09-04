@@ -6,7 +6,7 @@
 
 ## Scope Boundary
 
-| Boundary | v1.8.4 status |
+| Boundary | v1.10.0 candidate status |
 | --- | --- |
 | Private canonical handoff parser | Implemented for Codex, Claude Code, Cursor |
 | One-shot local ingest CLI | Implemented |
@@ -201,8 +201,12 @@ Codex automatic parsing에서 raw notify payload는 foreground helper가 pre-tra
 존재하고, raw OTLP/tool attribute는 bounded request를 decode하는 동안 receiver memory에 일시적으로
 들어올 수 있다. `conversation.id`, `turn.id`, bounded model/tool/decision,
 request/call ID, duration, token counts와 success처럼 adapter가 소유한 scalar만 다음 단계로 복사된다.
-Raw body, prompt, response, tool arguments/output, command, cwd, path, account identity와 unknown field는
-persist, log, diagnostic, projection, report 또는 export되지 않는다.
+Raw body, prompt, response, tool arguments/output, command, raw cwd/path, account identity와 unknown field는
+canonical persist, log, diagnostic, projection, report 또는 export 경계를 통과하지 않는다. Notify의 cwd는
+pseudonymous project reference로만 축약될 수 있다. 사용자가 private detail을 켠 경우에는 notify가 제공한 cwd,
+input messages, last assistant message를 hashed turn ID로 연결한 별도 private artifact에만 저장한다.
+Dashboard는 capability-protected localhost detail route로 선택한 turn만 읽으며 team path는 이 artifact를
+알지 못한다.
 
 ## Runtime and Backpressure
 

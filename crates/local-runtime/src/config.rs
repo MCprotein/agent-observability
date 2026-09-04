@@ -27,6 +27,7 @@ enum SaveStage {
 pub struct LocalRuntimeConfigV2 {
     pub schema_version: String,
     pub enabled: bool,
+    pub capture_private_codex_turn_details: bool,
     pub collection: CollectionPolicyV1,
     pub retention: RetentionPolicyV1,
 }
@@ -36,6 +37,8 @@ pub struct LocalRuntimeConfigV2 {
 struct StrictLocalRuntimeConfigV2 {
     schema_version: String,
     enabled: bool,
+    #[serde(default)]
+    capture_private_codex_turn_details: bool,
     collection: StrictCollectionPolicyV1,
     retention: StrictRetentionPolicyV1,
 }
@@ -70,6 +73,7 @@ impl<'de> Deserialize<'de> for LocalRuntimeConfigV2 {
         Ok(Self {
             schema_version: strict.schema_version,
             enabled: strict.enabled,
+            capture_private_codex_turn_details: strict.capture_private_codex_turn_details,
             collection: CollectionPolicyV1 {
                 file_reconcile_interval_ms: strict.collection.file_reconcile_interval_ms,
                 flush_interval_ms: strict.collection.flush_interval_ms,
@@ -93,6 +97,7 @@ impl Default for LocalRuntimeConfigV2 {
         Self {
             schema_version: LOCAL_RUNTIME_CONFIG_VERSION.into(),
             enabled: true,
+            capture_private_codex_turn_details: false,
             collection: CollectionPolicyV1::default(),
             retention: RetentionPolicyV1::default(),
         }
@@ -112,6 +117,7 @@ impl LocalRuntimeConfigV2 {
             Self {
                 schema_version: LOCAL_RUNTIME_CONFIG_VERSION.into(),
                 enabled: legacy.enabled,
+                capture_private_codex_turn_details: false,
                 collection: legacy.collection,
                 retention: RetentionPolicyV1::default(),
             }
@@ -563,7 +569,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy.schema_version, LOCAL_RUNTIME_CONFIG_VERSION);
+        assert!(!legacy.capture_private_codex_turn_details);
         assert_eq!(legacy.retention, RetentionPolicyV1::default());
+
+        let prior_v2 = LocalRuntimeConfigV2::from_json(
+            r#"{"schema_version":"local_runtime.v2","enabled":true,"collection":{"file_reconcile_interval_ms":5000,"flush_interval_ms":5000,"max_batch_records":100,"max_batch_bytes":524288,"active_heartbeat_interval_ms":60000,"idle_heartbeat_interval_ms":300000,"local_storage_budget_bytes":1073741824},"retention":{"max_record_age_days":30,"max_archive_records":10000,"max_archive_bytes":16777216}}"#,
+        )
+        .unwrap();
+        assert!(!prior_v2.capture_private_codex_turn_details);
+
+        let mut opted_in: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/local-runtime-config-v2.fixture.json"
+        ))
+        .unwrap();
+        opted_in["capture_private_codex_turn_details"] = serde_json::Value::Bool(true);
+        assert!(
+            LocalRuntimeConfigV2::from_json(&opted_in.to_string())
+                .unwrap()
+                .capture_private_codex_turn_details
+        );
     }
 
     #[test]

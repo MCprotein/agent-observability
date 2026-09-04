@@ -78,7 +78,7 @@ try {
     await page.goto(pathToFileURL(reportPath).href);
 
     assert.equal(await page.locator("h1").textContent(), "Agent Observability Report");
-    assert.equal(await page.locator("h2").count(), 3);
+    assert.equal(await page.locator("h2").count(), 4);
     assert.equal(await page.locator('[aria-labelledby="timeline-heading"]').count(), 1);
     assert.equal(await page.locator('[aria-labelledby="traces-heading"]').count(), 1);
     assert.equal(await page.locator('[aria-labelledby="spans-heading"]').count(), 1);
@@ -110,6 +110,13 @@ try {
     await page.locator(".trace-row:visible").first().click();
     assert.equal(await page.locator(".trace-row:visible").first().getAttribute("aria-pressed"), "true");
     assert.equal(await page.locator(".timeline-row").count() > 0, true);
+    await page.locator("#span-table .span-open:visible").first().click();
+    assert.match((await page.locator("#span-details").textContent()) ?? "", /Source & privacy/);
+    assert.match((await page.locator("#span-details").textContent()) ?? "", /Location/);
+    assert.match(
+      (await page.locator("#private-detail").textContent()) ?? "",
+      /Unavailable in a file:\/\/ report\. Open the localhost dashboard\./,
+    );
 
     if (testCase.name === "mobile") {
       const heights = await page.locator("select, input, button").evaluateAll((elements) =>
@@ -150,6 +157,8 @@ try {
   assert.equal(await largePage.locator("#session-filter option").count(), 502);
   await largePage.locator("#trace-list .trace-row").first().click();
   assert.equal(await largePage.locator(".timeline-row").count(), 120);
+  await largePage.locator("#span-table .span-open").first().click();
+  assert.match((await largePage.locator("#span-details").textContent()) ?? "", /Private local detail/);
   assert.deepEqual(largeConsoleErrors, []);
   assert.deepEqual(largeExternalRequests, []);
   assert.deepEqual(largeFailedRequests, []);
@@ -204,6 +213,16 @@ function largeReportFixture(): AgentObservabilityReportV1 {
     endTimeUnixMs: 1_005 + index * 10,
     repo: "agent-observability",
     agent: { name: "codex", model: index % 2 === 0 ? "gpt-test" : "other-model" },
+    availability: {
+      repository: { state: "available", reason: "fixture" },
+      turn: { state: "source_unavailable", reason: "fixture" },
+      model: { state: "available", reason: "fixture" },
+      tokens: { state: "source_unavailable", reason: "fixture" },
+      latency: { state: "available", reason: "fixture" },
+      sourceLocation: { state: "private_lookup", reason: "fixture" },
+      requestContent: { state: "private_lookup", reason: "fixture" },
+      responseContent: { state: "private_lookup", reason: "fixture" },
+    },
     sessionId: `session-${index % 501}`,
     toolName: "exec_command",
     attributes: { session_id: `session-${index % 501}`, tool_name: "exec_command" },

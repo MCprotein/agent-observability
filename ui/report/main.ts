@@ -1,4 +1,9 @@
-import type { AgentObservabilityReportV1, Span, Trace } from "./generated/report-dto-v1.js";
+import type {
+  AgentObservabilityReportV1,
+  FieldAvailability,
+  Span,
+  Trace,
+} from "./generated/report-dto-v1.js";
 import validateReportDtoV1 from "./generated/validate-report-dto-v1.js";
 import {
   buildFilteredView,
@@ -23,6 +28,7 @@ const TIMELINE_LIMIT = 120;
 const FILTER_OPTION_LIMIT = 500;
 const SAVED_FILTER_LIMIT = 20;
 const SAVED_FILTER_KEY = "agent-observability.report.v1.saved-filters";
+const PRIVATE_DETAIL_VERSION = "agent_observability.private_turn_detail.v1";
 const reportData = document.getElementById("report-data");
 
 if (!reportData) throw new Error("Missing report data");
@@ -54,6 +60,8 @@ function mount(data: AgentObservabilityReportV1): void {
   let tracePageIndex = 0;
   let spanPageIndex = 0;
   let savedFilters: DimensionFilters[] = [];
+  let selectedSpanId: string | undefined;
+  let detailRequest = 0;
   const selects = {
     repo: element<HTMLSelectElement>("repo-filter"),
     session: element<HTMLSelectElement>("session-filter"),
@@ -75,6 +83,15 @@ function mount(data: AgentObservabilityReportV1): void {
   const traceNext = element<HTMLButtonElement>("trace-next");
   const spanPrevious = element<HTMLButtonElement>("span-previous");
   const spanNext = element<HTMLButtonElement>("span-next");
+  const detailsBody = element<HTMLElement>("details-body");
+  const detailsHeading = element<HTMLElement>("details-heading");
+  const detailsClose = element<HTMLButtonElement>("details-close");
+
+  detailsClose.addEventListener("click", () => {
+    selectedSpanId = undefined;
+    detailRequest += 1;
+    renderDetails(undefined);
+  });
 
   const allFilterValues: Record<FilterKey, string[]> = {
     repo: data.filters.repos,
@@ -184,6 +201,8 @@ function mount(data: AgentObservabilityReportV1): void {
     tracePageIndex = tracePage.index;
     spanPageIndex = spanPage.index;
     const summary = summarizeVisible(visibleSpans);
+    const selectedSpan = visibleSpans.find((span) => span.spanId === selectedSpanId);
+    if (selectedSpanId !== undefined && selectedSpan === undefined) selectedSpanId = undefined;
 
     setText("kpi-sessions", summary.sessions);
     setText("kpi-turns", summary.turns);
@@ -205,6 +224,8 @@ function mount(data: AgentObservabilityReportV1): void {
     renderTraces(tracePage, view.spansByTrace);
     renderTimeline(visibleSpans, state.trace !== undefined);
     renderSpans(spanPage);
+    renderQuality(visibleSpans);
+    renderDetails(selectedSpan);
     renderPager("trace", tracePage, tracePrevious, traceNext, TRACE_PAGE_SIZE);
     renderPager("span", spanPage, spanPrevious, spanNext, SPAN_PAGE_SIZE);
   }
@@ -251,12 +272,15 @@ function mount(data: AgentObservabilityReportV1): void {
       const row = document.createElement("div");
       row.className = "timeline-row";
       row.innerHTML =
-        `<div class="timeline-label"><span>${escapeHtml(item.span.name)}</span>` +
+        `<div class="timeline-label"><button class="span-open" type="button">${escapeHtml(item.span.name)}</button>` +
         `<span class="timeline-details"><span class="badge timeline-span-status ${statusClass(item.span.status)}">` +
         `${escapeHtml(item.span.status)}</span><span class="mono">` +
         `${escapeHtml(formatDuration(item.span.metrics.latencyMs ?? item.span.metrics.durationMs))}</span></span></div>` +
         `<div class="timeline-track"><span class="timeline-bar ${statusClass(item.span.status)}" ` +
         `style="left:${item.leftPercent.toFixed(3)}%;width:${item.widthPercent.toFixed(3)}%"></span></div>`;
+      row.querySelector<HTMLButtonElement>(".span-open")?.addEventListener("click", (event) => {
+        openSpanDetails(item.span, event.currentTarget as HTMLButtonElement);
+      });
       return row;
     }));
     element("timeline-status").textContent = spans.length > TIMELINE_LIMIT
@@ -271,18 +295,105 @@ function mount(data: AgentObservabilityReportV1): void {
     }
     tableElement.replaceChildren(...page.items.map((span) => {
       const row = document.createElement("tr");
+      const availability = availabilityOf(span);
       row.innerHTML =
         `<td><span class="badge">${escapeHtml(span.kind)}</span></td>` +
-        `<td>${escapeHtml(span.name)}${span.toolName ? `<div class="mono">${escapeHtml(span.toolName)}</div>` : ""}</td>` +
+        `<td><button class="span-open" type="button" aria-controls="span-details" aria-expanded="${selectedSpanId === span.spanId}">${escapeHtml(span.name)}</button>${span.toolName ? `<div class="mono">${escapeHtml(span.toolName)}</div>` : ""}</td>` +
         `<td><span class="badge ${statusClass(span.status)}">${escapeHtml(span.status)}</span></td>` +
         `<td>${escapeHtml(span.repo)}</td>` +
         `<td class="mono">${escapeHtml(span.turnId ?? "")}</td>` +
-        `<td>${formatNumber((span.metrics.inputTokens ?? 0) + (span.metrics.outputTokens ?? 0))}</td>` +
+        `<td>${formatOptionalNumber(sumOptional(span.metrics.inputTokens, span.metrics.outputTokens), availability.tokens)}</td>` +
         `<td>${escapeHtml(formatCost(span.estimatedCost, span.cost))}</td>` +
-        `<td>${formatDuration(span.metrics.latencyMs ?? span.metrics.durationMs)}</td>` +
+        `<td>${formatOptionalDuration(span.metrics.latencyMs ?? span.metrics.durationMs, availability.latency)}</td>` +
         `<td class="mono">${escapeHtml(shortId(span.parentSpanId ?? ""))}</td>`;
+      row.querySelector<HTMLButtonElement>(".span-open")?.addEventListener("click", (event) => {
+        openSpanDetails(span, event.currentTarget as HTMLButtonElement);
+      });
       return row;
     }));
+  }
+
+  function renderQuality(spans: Span[]): void {
+    const unavailable = spans.reduce((count, span) => count + Object.values(availabilityOf(span))
+      .filter((field) => field.state === "source_unavailable").length, 0);
+    const privateLookup = spans.reduce((count, span) => count + Object.values(availabilityOf(span))
+      .filter((field) => field.state === "private_lookup").length, 0);
+    setText("quality-summary", unavailable === 0 ? "Source fields are complete" : `${formatNumber(unavailable)} unavailable fields`);
+    setText(
+      "quality-detail",
+      privateLookup > 0
+        ? `${formatNumber(privateLookup)} private fields can be checked locally. Select a span for exact reasons.`
+        : "Select a span to see exact availability reasons.",
+    );
+  }
+
+  function openSpanDetails(span: Span, trigger: HTMLButtonElement): void {
+    selectedSpanId = span.spanId;
+    render();
+    trigger.setAttribute("aria-expanded", "true");
+    detailsHeading.focus();
+  }
+
+  function renderDetails(span: Span | undefined): void {
+    if (!span) {
+      detailsBody.innerHTML = '<p class="detail-empty">Select a span name to inspect source, availability, and private local details.</p>';
+      return;
+    }
+    const source = scalarText(span.attributes.source) ?? "Unavailable";
+    const eventType = scalarText(span.attributes.event_type) ?? "Unavailable";
+    const availability = availabilityOf(span);
+    detailsBody.innerHTML =
+      `<section class="detail-section"><h3>Overview</h3><dl class="detail-grid">` +
+      detailRow("Name", span.name) + detailRow("Kind", span.kind) + detailRow("Status", span.status) +
+      detailRow("Repository", displayValue(span.repo, availability.repository)) +
+      detailRow("Model", displayValue(span.agent.model, availability.model)) +
+      detailRow("Tokens", displayValue(formatOptionalTokenTotal(span), availability.tokens)) +
+      detailRow("Turn", displayValue(span.turnId, availability.turn)) +
+      detailRow("Latency", displayValue(formatDuration(span.metrics.latencyMs ?? span.metrics.durationMs), availability.latency)) +
+      `</dl></section>` +
+      `<section class="detail-section"><h3>Source &amp; privacy</h3><dl class="detail-grid">` +
+      detailRow("Agent", span.agent.name ?? "Unavailable") + detailRow("Surface", source) +
+      detailRow("Event", eventType) + availabilityRow("Location", availability.sourceLocation) +
+      availabilityRow("Request", availability.requestContent) + availabilityRow("Response", availability.responseContent) +
+      `</dl></section>` +
+      `<section class="detail-section" id="private-detail"><h3>Private local detail</h3>` +
+      `<p class="detail-empty">Checking the capability-protected local store…</p></section>`;
+    void loadPrivateDetail(span);
+  }
+
+  async function loadPrivateDetail(span: Span): Promise<void> {
+    const request = ++detailRequest;
+    const target = document.getElementById("private-detail");
+    if (!target) return;
+    if (!span.turnId) {
+      target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Unavailable: this source did not provide turn correlation.</p>';
+      return;
+    }
+    if (!/^https?:$/.test(globalThis.location.protocol)) {
+      target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Unavailable in a file:// report. Open the localhost dashboard.</p>';
+      return;
+    }
+    try {
+      const response = await fetch(`${globalThis.location.pathname}/details/${encodeURIComponent(span.turnId)}`, {
+        cache: "no-store",
+        credentials: "same-origin",
+      });
+      if (request !== detailRequest || selectedSpanId !== span.spanId) return;
+      if (response.status === 404) {
+        target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Not collected. Enable private Codex turn details in Settings for future turns.</p>';
+        return;
+      }
+      if (!response.ok) throw new Error("private detail request failed");
+      const detail = await response.json() as PrivateTurnDetail;
+      if (!validPrivateDetail(detail, span.turnId)) throw new Error("private detail contract mismatch");
+      target.innerHTML = `<h3>Private local detail</h3><p class="private-banner">Sensitive content stored only in this private local runtime. Review before sharing screenshots.</p>` +
+        `<dl class="detail-grid">${detailRow("Opened from", detail.cwd)}</dl>` +
+        `<h3>Request</h3><pre class="private-content" tabindex="0">${escapeHtml(detail.inputMessages.join("\n\n"))}</pre>` +
+        `<h3>Response</h3><pre class="private-content" tabindex="0">${escapeHtml(detail.lastAssistantMessage ?? "Unavailable: Codex did not provide an assistant response in this notification.")}</pre>`;
+    } catch {
+      if (request !== detailRequest || selectedSpanId !== span.spanId) return;
+      target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Temporarily unavailable. The normal report remains usable.</p>';
+    }
   }
 
   function renderPager(
@@ -322,6 +433,8 @@ function mount(data: AgentObservabilityReportV1): void {
 
   function resetSelection(): void {
     state.trace = undefined;
+    selectedSpanId = undefined;
+    detailRequest += 1;
     tracePageIndex = 0;
     spanPageIndex = 0;
     savedFilterSelect.value = ALL_OPTION;
@@ -331,6 +444,76 @@ function mount(data: AgentObservabilityReportV1): void {
   function hasActiveFilters(): boolean {
     return state.text.length > 0 || (Object.keys(selects) as FilterKey[]).some((key) => state[key] !== undefined);
   }
+}
+
+interface PrivateTurnDetail {
+  schemaVersion: string;
+  turnId: string;
+  cwd: string;
+  inputMessages: string[];
+  lastAssistantMessage: string | null;
+}
+
+function validPrivateDetail(value: PrivateTurnDetail, turnId: string): boolean {
+  return value?.schemaVersion === PRIVATE_DETAIL_VERSION
+    && value.turnId === turnId
+    && typeof value.cwd === "string"
+    && Array.isArray(value.inputMessages)
+    && value.inputMessages.every((message) => typeof message === "string")
+    && (value.lastAssistantMessage === null || typeof value.lastAssistantMessage === "string");
+}
+
+function availabilityLabel(field: FieldAvailability): string {
+  const state = field.state.replaceAll("_", " ");
+  const reason = field.reason.replaceAll("_", " ");
+  return `${state} — ${reason}`;
+}
+
+function availabilityOf(span: Span): NonNullable<Span["availability"]> {
+  const unavailable = { state: "source_unavailable", reason: "legacy_report_no_availability" } as const;
+  return span.availability ?? {
+    repository: unavailable,
+    turn: unavailable,
+    model: unavailable,
+    tokens: unavailable,
+    latency: unavailable,
+    sourceLocation: unavailable,
+    requestContent: unavailable,
+    responseContent: unavailable,
+  };
+}
+
+function availabilityRow(label: string, field: FieldAvailability): string {
+  return `<dt>${escapeHtml(label)}</dt><dd><span class="availability ${escapeHtml(field.state)}">${escapeHtml(availabilityLabel(field))}</span></dd>`;
+}
+
+function detailRow(label: string, value: string): string {
+  return `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`;
+}
+
+function displayValue(value: string | undefined, availability: FieldAvailability): string {
+  return value && value !== UNKNOWN ? value : availabilityLabel(availability);
+}
+
+function scalarText(value: string | number | boolean | undefined): string | undefined {
+  return value === undefined ? undefined : String(value);
+}
+
+function sumOptional(left: number | undefined, right: number | undefined): number | undefined {
+  return left === undefined && right === undefined ? undefined : (left ?? 0) + (right ?? 0);
+}
+
+function formatOptionalTokenTotal(span: Span): string | undefined {
+  const value = sumOptional(span.metrics.inputTokens, span.metrics.outputTokens);
+  return value === undefined ? undefined : formatNumber(value);
+}
+
+function formatOptionalNumber(value: number | undefined, availability: FieldAvailability): string {
+  return value === undefined ? availabilityLabel(availability) : formatNumber(value);
+}
+
+function formatOptionalDuration(value: number | undefined, availability: FieldAvailability): string {
+  return value === undefined ? availabilityLabel(availability) : formatDuration(value);
 }
 
 function emptyDimensions(): DimensionFilters {

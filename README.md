@@ -4,8 +4,8 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 외부 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.10.0 개발 중.** 현재 수집 데이터의 `unknown`을 필드별 가용성으로 설명하고, 검증된 Codex
-> metadata로 project/repository와 source location을 보강한다. 원문 request detail은 standalone에서만
+> **v1.10.0 릴리스 후보.** 현재 수집 데이터의 `unknown`을 필드별 가용성으로 설명하고, 검증된 Codex
+> metadata로 pseudonymous project reference와 source location을 보강한다. 원문 request detail은 standalone에서만
 > 명시적으로 opt-in한 private detail 저장소와 별도 상세 화면을 사용하며 기본값은 계속 꺼짐이다.
 > assistant response 원문은 공식 source가 제공하지 않으면 `unavailable`로 표시하고 추측하거나
 > transcript를 스캔하지 않는다. v1.9.1에서 설정 명령을 `agentobs settings`로 명확히 하고 기존 `agentobs ui`는 호환
@@ -27,8 +27,7 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 > script는 `agentobs setup ~/.agent-observability --no-open`처럼 root를 명시한다. 자동 연결은 이후
 > 설정 UI 또는 고급 lifecycle 명령으로 언제든 추가할 수 있다.
 
-아래 빠른 시작은 현재 공개된 stable v1.9.1 기준이다. v1.10.0은 PR 검토와 검증이 끝난 뒤 별도 tag와
-GitHub Release로 게시한다.
+아래 빠른 시작은 v1.10.0 기준이다. 릴리스 후보 검증 중에는 installer URL이 tag 게시 뒤 활성화된다.
 
 ## 빠른 시작
 
@@ -38,14 +37,14 @@ GitHub Release로 게시한다.
 release checksum과 실행 파일 버전을 확인한 뒤 `~/.local/bin`에 원자적으로 설치하고, 현재 shell의
 profile에 PATH 블록을 한 번만 등록한다.
 
-게시된 v1.9.1 installer를 사용한다.
+릴리스 후 게시되는 v1.10.0 installer를 사용한다. 태그 게시 전에는 아래 URL이 아직 존재하지 않는다.
 
 ```bash
 (
   set -eu
   installer="$(mktemp)"
   trap 'rm -f "$installer"' 0
-  curl -fsSL https://github.com/MCprotein/agent-observability/releases/download/v1.9.1/install.sh -o "$installer"
+  curl -fsSL https://github.com/MCprotein/agent-observability/releases/download/v1.10.0/install.sh -o "$installer"
   sh "$installer"
 )
 ```
@@ -73,8 +72,8 @@ self-contained HTML 대시보드를 runtime-root별 `127.0.0.1` 주소로 기본
 agentobs settings
 ```
 
-Codex automatic 연결/해제와 상태 확인, report 열기, 수집 허용, 확인·반영 주기, batch, heartbeat,
-저장 한도, 보관 기간과 archive 한도를 한 화면에서 관리한다. `agentobs ui`는 기존 사용자를 위한
+Codex automatic 연결/해제와 상태 확인, report 열기, 수집 허용, 요청·응답 상세 opt-in,
+확인·반영 주기, batch, heartbeat, 저장 한도, 보관 기간과 archive 한도를 한 화면에서 관리한다. `agentobs ui`는 기존 사용자를 위한
 호환 alias다. 설정 화면은 실행 중에만 임의의
 `127.0.0.1` port를 사용하며 browser tab의 session token,
 Host와 Origin을 모두 확인한다. token은 같은 tab의 새로고침에서만 복구되며 세션 종료 시 삭제된다.
@@ -139,7 +138,7 @@ launchd가 로그인 후 다시 실행할 수 있도록 등록한 표시다. `ag
 | 로컬 설정 UI | 지원 | UI server는 `settings` 실행 중에만 존재하며 Codex 연결과 runtime config 관리 제공 |
 | 내장 sample 체험 | 지원 | 외부 파일 없이 `demo` 한 명령으로 확인 |
 | Canonical handoff 수동 import | 지원 | 세 agent 모두 daemon과 network 없이 private JSONL import 가능 |
-| Codex 자동 연결 | 실험적 (v1.9.0) | `setup`이 macOS Codex를 자동 연결하고, 기존 notify와 비소유 설정을 보존하며 loopback OTLP/HTTP JSON을 사용 |
+| Codex 자동 연결 | 지원 (experimental) | `setup`이 macOS Codex를 자동 연결하고, 기존 notify와 비소유 설정을 보존하며 loopback OTLP/HTTP JSON을 사용 |
 | Claude Code/Cursor 자동 연결 | TODO | 현재 자동 receiver/config 연결은 Codex만 지원 |
 | Commercial team profile | TODO | G0-G4 승인과 evidence 전에는 완료로 간주하지 않음 |
 
@@ -151,6 +150,8 @@ launchd가 로그인 후 다시 실행할 수 있도록 등록한 표시다. `ag
 | Cost | model별 예상 비용과 합계 | local rate table이 없으면 `unknown`, 일부 단가만 있으면 `incomplete` |
 | Performance | request latency, trace duration, 시간순 timeline | 입력에 timing이 있을 때만 표시 |
 | Agent activity | LLM request, tool lifecycle, permission, compaction, error | agent별 verified source 범위가 다름 |
+| Source context | pseudonymous project reference와 필드별 가용성 이유 | Codex notify의 cwd를 해시해 연결하며 정확한 경로는 opt-in 상세에서만 표시 |
+| Private turn detail | source-provided input messages와 last assistant message | 기본 OFF, 새 Codex notify부터 적용; API wire body나 transcript 수집이 아님 |
 | 탐색 | repo, session, agent, model filter와 saved view | 대용량 report도 bounded pagination 적용 |
 | Data lifecycle | 보관 기간, cleanup plan, private archive | 삭제는 자동이 아니라 plan 검토 후 명시적으로 실행 |
 
@@ -167,14 +168,20 @@ launchd가 로그인 후 다시 실행할 수 있도록 등록한 표시다. `ag
 receiver에 들어온다. Header 값은 runtime이 생성하는 private random 256-bit value다. Codex
 exporter에 client certificate나 client private-key field를 넣지 않으며, 이 transport는 mTLS가 아니다.
 기존 `notify`가 없을 때만 `agent-turn-complete` supplement를 설치하며, raw payload를 전송 전에 bounded
-allowlist로 축약해 turn 완료만 보완한다. 기존 notify가 있으면 OTEL이 기본 수집 경로가 된다. 어느 경로도
+allowlist로 축약해 turn 완료와 pseudonymous project reference를 보완한다. 기존 notify가 있으면 OTEL이 기본 수집 경로가 된다. 어느 경로도
 외부 network를 사용하지 않는다.
 
-Raw notify payload는 foreground helper의 bounded parsing 동안에만 process memory에 존재하며 receiver나
-socket에는 들어가지 않는다. Raw OTLP/tool field는 receiver의 bounded parsing 동안 일시적으로 존재할
-수 있다. Adapter boundary를 통과하는 값은 명시적으로 허용된 scalar뿐이다. Prompt, response, tool
-arguments/output, command, cwd, path, account identity와 unknown field는 persist, log, projection 또는
-export 전에 버려진다.
+기본값에서는 raw notify payload가 foreground helper의 bounded parsing 동안에만 process memory에
+존재하며 receiver에는 들어가지 않는다. Raw OTLP/tool field도 receiver의 bounded parsing 동안만
+일시적으로 존재한다. Adapter boundary를 통과하는 값은 명시적으로 허용된 scalar와 cwd에서 만든
+pseudonymous project reference뿐이다. 원문 path/content는 canonical store, 일반 report, archive, export와 team 전송에서
+제외된다.
+
+정확한 cwd와 Codex notify가 제공하는 input messages, last assistant message가 필요하면 Settings의
+`요청·응답 상세 저장`을 켠다. 기본값은 OFF이며 켠 이후 새 turn만 별도 `0600` private artifact에
+저장된다. 일반 report DTO/HTML에는 원문을 넣지 않고 선택한 turn에서 localhost 상세 endpoint로만
+읽는다. 이는 API wire request/response 캡처가 아니다. 기존 외부 `notify`를 보존한 환경에서는 해당
+callback을 agentobs가 받지 않으므로 상세가 수집되지 않는다.
 
 ### 수동 import
 
@@ -211,6 +218,9 @@ agentobs config set retention-days 90
 
 # 로컬 저장 공간을 2 GiB로 제한
 agentobs config set storage-bytes 2147483648
+
+# 이후 새 Codex turn의 cwd와 source-provided 요청·응답 상세 저장 (기본 false)
+agentobs config set private-codex-details true
 ```
 
 별도 runtime을 사용한다면 `config set <root> <option> <value>` 형식으로 root를 지정한다.
@@ -231,7 +241,7 @@ WebSocket 경로는
 `codex.websocket_request`를 시작 이벤트로 삼고 token usage가 있는 `response.completed`와 private
 correlation ID로 연결한다. v1.8.2에서 이 상관관계가 추가됐고, v1.8.3은 이후 비소유 Codex 설정을
 안전하게 ownership snapshot에 재조정한다. v1.8.4는 이 경계를 넓히지 않고 SQLite operational-error
-fidelity와 deterministic concurrency coverage를 보강했다. 게시된 최신 안정판은 v1.8.4이며 automatic
+fidelity와 deterministic concurrency coverage를 보강했다. 게시된 최신 안정판은 v1.9.1이며 automatic
 capability의 공식 release pin은 계속 Codex 0.152.1이다.
 
 | Agent | Pinned / verified version | 현재 지원 | 알려진 제한 |

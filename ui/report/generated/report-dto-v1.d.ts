@@ -88,6 +88,7 @@ export interface Span {
   endTimeUnixMs: number | null;
   repo: string;
   agent: Agent;
+  availability?: Availability;
   sessionId?: string;
   turnId?: string;
   toolName?: string;
@@ -100,6 +101,20 @@ export interface Agent {
   name?: string;
   model?: string;
   version?: string;
+}
+export interface Availability {
+  repository: FieldAvailability;
+  turn: FieldAvailability;
+  model: FieldAvailability;
+  tokens: FieldAvailability;
+  latency: FieldAvailability;
+  sourceLocation: FieldAvailability;
+  requestContent: FieldAvailability;
+  responseContent: FieldAvailability;
+}
+export interface FieldAvailability {
+  state: "available" | "source_unavailable" | "withheld" | "not_applicable" | "private_lookup";
+  reason: string;
 }
 export interface Attributes {
   source?: Scalar;

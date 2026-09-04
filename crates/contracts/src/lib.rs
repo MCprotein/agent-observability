@@ -452,6 +452,9 @@ pub enum ObservationEvent {
         project: Option<String>,
     },
     Turn,
+    TurnWithProject {
+        project: String,
+    },
     ModelRequest {
         model: Option<String>,
     },
@@ -648,6 +651,7 @@ fn project_attributes(observation: &SourceObservation, state: &DomainSpanState) 
         }
         ObservationEvent::Session { .. }
         | ObservationEvent::Turn
+        | ObservationEvent::TurnWithProject { .. }
         | ObservationEvent::ModelRequest { .. } => {}
     }
     attributes
@@ -909,6 +913,9 @@ fn event_projection(
             ("session", "session", model.as_deref(), project.as_deref())
         }
         ObservationEvent::Turn => ("turn", "turn", None, None),
+        ObservationEvent::TurnWithProject { project } => {
+            ("turn", "turn", None, Some(project.as_str()))
+        }
         ObservationEvent::ModelRequest { model } => {
             ("model_request", "llm.request", model.as_deref(), None)
         }
@@ -921,7 +928,7 @@ fn event_projection(
 fn kind_for_event(event: &ObservationEvent) -> SpanKind {
     match event {
         ObservationEvent::Session { .. } => SpanKind::AgentSession,
-        ObservationEvent::Turn => SpanKind::Turn,
+        ObservationEvent::Turn | ObservationEvent::TurnWithProject { .. } => SpanKind::Turn,
         ObservationEvent::ModelRequest { .. } => SpanKind::LlmRequest,
         ObservationEvent::ToolOperation { .. } => SpanKind::ToolExecution,
         ObservationEvent::Permission { .. } => SpanKind::Permission,
@@ -1320,6 +1327,48 @@ pub struct ReportAgentV1 {
     pub version: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AvailabilityStateV1 {
+    Available,
+    #[default]
+    SourceUnavailable,
+    Withheld,
+    NotApplicable,
+    PrivateLookup,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct FieldAvailabilityV1 {
+    pub state: AvailabilityStateV1,
+    pub reason: String,
+}
+
+impl Default for FieldAvailabilityV1 {
+    fn default() -> Self {
+        Self {
+            state: AvailabilityStateV1::SourceUnavailable,
+            reason: "not_evaluated".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReportAvailabilityV1 {
+    pub repository: FieldAvailabilityV1,
+    pub turn: FieldAvailabilityV1,
+    pub model: FieldAvailabilityV1,
+    pub tokens: FieldAvailabilityV1,
+    pub latency: FieldAvailabilityV1,
+    pub source_location: FieldAvailabilityV1,
+    pub request_content: FieldAvailabilityV1,
+    pub response_content: FieldAvailabilityV1,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReportAttributesV1 {
@@ -1366,6 +1415,8 @@ pub struct ReportSpanV1 {
     pub end_time_unix_ms: Option<f64>,
     pub repo: String,
     pub agent: ReportAgentV1,
+    #[serde(default)]
+    pub availability: ReportAvailabilityV1,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1436,6 +1487,19 @@ impl ReportDtoV1 {
             }
             validate_report_attributes(&span.attributes)?;
             validate_report_metrics(&span.metrics)?;
+            for field in [
+                &span.availability.repository,
+                &span.availability.turn,
+                &span.availability.model,
+                &span.availability.latency,
+                &span.availability.source_location,
+                &span.availability.request_content,
+                &span.availability.response_content,
+            ] {
+                if field.reason.is_empty() || field.reason.len() > 96 {
+                    return Err(ContractError::EmptyOptionalString);
+                }
+            }
             if let Some(amount) = span.estimated_cost {
                 validate_finite(amount)?;
             }
