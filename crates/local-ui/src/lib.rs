@@ -570,7 +570,6 @@ async fn open_dashboard(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DashboardOpenError {
-    #[cfg(target_os = "macos")]
     MissingReport,
     Platform(PlatformOpenError),
     TaskFailed,
@@ -663,7 +662,6 @@ fn integration_error() -> ApiError {
 
 fn dashboard_error(error: DashboardOpenError) -> ApiError {
     let (code, message) = match error {
-        #[cfg(target_os = "macos")]
         DashboardOpenError::MissingReport => (
             "dashboard_missing",
             "모니터링 리포트가 아직 생성되지 않았습니다.",
@@ -683,8 +681,8 @@ fn dashboard_error(error: DashboardOpenError) -> ApiError {
             | PlatformOpenError::TerminateFailed
             | PlatformOpenError::ReapFailed
             | PlatformOpenError::ReapTimedOut,
-        ) => ("dashboard_open_failed", "모니터링 리포트를 열 수 없습니다."),
-        DashboardOpenError::TaskFailed => {
+        )
+        | DashboardOpenError::TaskFailed => {
             ("dashboard_open_failed", "모니터링 리포트를 열 수 없습니다.")
         }
     };
