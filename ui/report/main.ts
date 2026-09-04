@@ -418,6 +418,12 @@ function mount(data: AgentObservabilityReportV2): void {
         target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Not collected. Enable private Codex turn details in Settings for future turns.</p>';
         return;
       }
+      if (response.status === 202) {
+        const pending = await response.json() as { error?: unknown; code?: unknown };
+        const code = typeof pending.code === "string" ? pending.code : "queued";
+        target.innerHTML = `<h3>Private local detail</h3><p class="detail-empty">Capture pending (${escapeHtml(code)}). Refresh shortly; the normal report remains usable.</p>`;
+        return;
+      }
       if (response.status === 503) {
         const failure = await response.json() as { error?: unknown; code?: unknown };
         const code = typeof failure.code === "string" ? failure.code : "lookup_failed";

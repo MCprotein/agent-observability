@@ -229,10 +229,12 @@ anti-corruption layer다.
   persist, log, diagnostic, projection 또는 export 경계를 통과하지 않는다.
 - Default-off private Codex detail capture는 공식 notify의 cwd, input messages, last assistant message만
   전용 authenticated localhost endpoint의 bounded envelope로 받아 per-turn private artifact에 분리한다.
-  Receiver는 content-free projection을 먼저 canonical ingest한 뒤 64-slot nonblocking detail queue에
-  상세를 넘긴다. 별도의 bounded content-free status queue가 admission 실패를 보존하며, collector-owned
-  background writer lane들은 같은 runtime mutation lock 아래 파일 기록·fsync·bounded scan·retention을
-  직렬화한다. 같은 hashed turn ID의 동일 detail 재시도는 no-op이고 다른 detail은 `conflict`로 fail-closed한다.
+  Receiver는 content-free projection을 먼저 canonical ingest하고 durable `queued` 상태를 기록한 뒤
+  64-slot nonblocking detail queue에 상세를 넘긴다. Queue 포화와 writer 단절은 같은 lock을 보유한 채
+  terminal 상태로 교체한다. 단일 collector-owned background writer는 bounded lock acquisition 아래 파일
+  기록·fsync·bounded scan·retention을 직렬화하며 무한 재시도하지 않는다. 상태는 일반 local storage budget과
+  분리된 최대 1,024개×1KiB diagnostic partition에 둔다. 같은 hashed turn ID의 동일 detail 재시도는 no-op이고
+  다른 detail은 `conflict`로 fail-closed한다.
   동일 hashed turn ID로 localhost dashboard에서 요청할 때만 읽고,
   canonical observation, SQLite durable record, report DTO/static HTML, archive/export/team envelope와
   dependency를 만들지 않는다. API wire request/response capture나 transcript scan은 하지 않는다.
@@ -247,8 +249,9 @@ anti-corruption layer다.
   같은 projection과 검증된 cwd/input/last-assistant 필드만 별도 closed envelope에 넣어 전용 localhost
   route로 전달한다. 두 경로 모두 private-CA HTTPS와 exact private request header를 사용하며 전체
   connect/TLS/HTTP deadline 뒤 항상 fail open한다. 외부 network, full transcript parse, report render나
-  queue drain, directory scan, fsync를 기다리지 않는다. Admission 성공은 queued receipt를 반환하며
-  포화는 busy로 노출한다. 실제 저장 결과는 per-turn status로 확인한다. Future file fallback은 persisted cursor와 source generation으로
+  queue drain, detail directory scan, detail fsync를 기다리지 않는다. Durable queued 상태 기록과 admission
+  성공 뒤에만 queued receipt를 반환하며 포화는 busy로 노출한다. 실제 저장 결과는 per-turn status와
+  collector health failure counter로 확인한다. Future file fallback은 persisted cursor와 source generation으로
   incrementally reconcile한다.
 - 제품별 공식 source 우선순위와 지원 evidence는
   [`ADAPTER_COMPATIBILITY.md`](ADAPTER_COMPATIBILITY.md)를 따른다.

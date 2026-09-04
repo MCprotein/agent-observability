@@ -151,10 +151,11 @@ decisions, timing, token counts and success state cross into the canonical adapt
 
 When `capture_private_codex_turn_details` is explicitly enabled, the foreground notify helper sends the
 content-free projection plus validated source-provided cwd, input messages and last assistant message to a
-dedicated capability-protected localhost endpoint. The collector commits the projection, performs nonblocking
-admission into a 64-slot detail queue, and lets collector-owned background writer lanes create the separate
-per-turn private artifact and content-free capture status.
-The callback itself performs no detail-file write, directory scan, pruning or fsync. The artifact is correlated by
+dedicated capability-protected localhost endpoint. The collector commits the projection, durably records a
+content-free `queued` status, and only then performs nonblocking admission into a 64-slot detail queue. A single
+collector-owned background writer creates the separate per-turn private artifact and terminal capture status.
+The callback performs one bounded content-free status publication before acknowledging the queue, but no raw-detail
+file write, raw-detail directory scan, raw-detail pruning or raw-detail fsync. The artifact is correlated by
 the same hashed turn ID shown in the report and is fetched only from the capability-protected localhost dashboard
 route. Raw detail can therefore exist transiently in this dedicated receiver request and writer queue, but it never
 enters the canonical observation, SQLite durable record, report DTO, static HTML, diagnostic, archive, export or
@@ -163,13 +164,16 @@ option stops future capture and makes the dashboard detail route unavailable; it
 turns were captured. API request/response wire bodies, tool arguments/output, commands, account identity and
 unknown attributes remain excluded.
 
-The background writer lanes own detail capture accounting and publication under the same runtime mutation lock;
-no status filesystem mutation runs without that guard. A separate 64-slot status admission lane records detail
-queue saturation and writer disconnection without retaining raw content. A bounded per-turn content-free status
-sidecar records the capture result (`ok`, conflict, admission/writer failure, storage budget, busy, size, runtime, or I/O failure), and the localhost panel
+Detail capture accounting and status publication use the same runtime mutation lock with bounded acquisition;
+no status filesystem mutation runs without that guard and no writer retries forever. Queue saturation and writer
+disconnection replace the already-durable queued state synchronously before the request returns. A bounded per-turn
+content-free status sidecar records the capture result (`queued`, `ok`, conflict, admission/writer failure, storage
+budget, busy, size, runtime, or I/O failure), and the localhost panel
 distinguishes capture failure from a turn that was never collected. Raw detail expiry runs at collector startup
 and after an explicit `retention-apply`; status sidecars follow the same bounded count, scan and age policy. An
-expired file therefore does not require another Codex turn to be removed.
+expired file therefore does not require another Codex turn to be removed. Status sidecars use a separate diagnostic
+partition capped at 1,024 files of at most 1 KiB each, so a full ordinary storage budget cannot erase the reason a
+detail was rejected.
 
 The collector transactionally commits source-ordered canonical observations and content-free dispositions
 through the same SQLite authority as manual import. Every current-record mutation, including retention, advances
@@ -226,9 +230,9 @@ Invalid updates leave the previous bytes unchanged. User-facing names, defaults,
 
 - Codex automatic OTLP/HTTP JSON request: at most 1 MiB and 4096 log records.
 - Codex notify payload: raw input at most 64 KiB and a smaller closed projected wire object. Projection happens
-  before I/O; opt-in detail uses one bounded closed localhost envelope, a 64-slot nonblocking detail admission,
-  and a separate bounded content-free status admission
-  queue. One absolute foreground deadline constrains loopback connect, server-authenticated TLS handshake and the HTTP exchange
+  before I/O; opt-in detail uses one bounded closed localhost envelope, a durable content-free queued status and a
+  64-slot nonblocking detail admission. One absolute foreground deadline constrains loopback connect,
+  server-authenticated TLS handshake and the HTTP exchange
   before the helper returns a fail-open accepted, rejected or unavailable outcome without waiting for report work.
 - Opt-in Codex private turn detail: one validated JSON artifact and one content-free capture-status sidecar per
   hashed turn ID, each bounded and stored in private `0700` directories with `0600` files. Both directories are
