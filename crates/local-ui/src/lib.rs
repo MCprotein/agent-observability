@@ -1305,7 +1305,6 @@ mod tests {
     };
     use agent_observability_codex_integration::{CodexIntegrationStatus, IntegrationError};
     use agent_observability_contracts::hash_opaque_identifier;
-    use agent_observability_local_collector::submit_notify;
     use agent_observability_local_runtime::{
         ConfigMutationGuard, LocalRuntimeConfigV3, install, load, revision, save,
     };
@@ -1972,16 +1971,33 @@ mod tests {
                 config.capture_private_codex_turn_details = true;
                 save(&guard, &config).unwrap();
                 drop(guard);
-                let raw_notify = serde_json::to_vec(&serde_json::json!({
-                    "type": "agent-turn-complete",
-                    "thread-id": "thread-private",
-                    "turn-id": "turn-private",
-                    "cwd": "/Users/private/exact-project",
-                    "input-messages": ["PRIVATE_INPUT_SENTINEL"],
-                    "last-assistant-message": "PRIVATE_OUTPUT_SENTINEL"
-                }))
+                let detail_directory = layout.state.join("private-codex-turn-details");
+                fs::create_dir_all(&detail_directory).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&detail_directory, fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                let digest = turn_id.strip_prefix("id:sha256:").unwrap();
+                let detail_path = detail_directory.join(format!("{digest}.json"));
+                fs::write(
+                    &detail_path,
+                    serde_json::to_vec(&serde_json::json!({
+                        "schemaVersion": "agent_observability.private_turn_detail.v1",
+                        "turnId": turn_id.clone(),
+                        "cwd": "/Users/private/exact-project",
+                        "inputMessages": ["PRIVATE_INPUT_SENTINEL"],
+                        "lastAssistantMessage": "PRIVATE_OUTPUT_SENTINEL"
+                    }))
+                    .unwrap(),
+                )
                 .unwrap();
-                let _ = submit_notify(&layout.root, &raw_notify);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&detail_path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
 
                 let present = app
                     .clone()
@@ -2015,15 +2031,7 @@ mod tests {
                 assert_eq!(detail["inputMessages"][0], "PRIVATE_INPUT_SENTINEL");
                 assert_eq!(detail["lastAssistantMessage"], "PRIVATE_OUTPUT_SENTINEL");
 
-                let digest = turn_id.strip_prefix("id:sha256:").unwrap();
-                fs::write(
-                    layout
-                        .state
-                        .join("private-codex-turn-details")
-                        .join(format!("{digest}.json")),
-                    b"{broken",
-                )
-                .unwrap();
+                fs::write(detail_path, b"{broken").unwrap();
                 let corrupt = app
                     .clone()
                     .oneshot(

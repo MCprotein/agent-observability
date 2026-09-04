@@ -398,33 +398,6 @@
                   {
                     "type": "object",
                     "properties": {
-                      "cachedInputTokens": true
-                    },
-                    "required": [
-                      "cachedInputTokens"
-                    ]
-                  },
-                  {
-                    "type": "object",
-                    "properties": {
-                      "cacheCreationInputTokens": true
-                    },
-                    "required": [
-                      "cacheCreationInputTokens"
-                    ]
-                  },
-                  {
-                    "type": "object",
-                    "properties": {
-                      "reasoningOutputTokens": true
-                    },
-                    "required": [
-                      "reasoningOutputTokens"
-                    ]
-                  },
-                  {
-                    "type": "object",
-                    "properties": {
                       "totalTokens": true
                     },
                     "required": [
@@ -452,37 +425,10 @@
                   {
                     "type": "object",
                     "properties": {
-                      "totalCachedInputTokens": true
-                    },
-                    "required": [
-                      "totalCachedInputTokens"
-                    ]
-                  },
-                  {
-                    "type": "object",
-                    "properties": {
-                      "totalReasoningOutputTokens": true
-                    },
-                    "required": [
-                      "totalReasoningOutputTokens"
-                    ]
-                  },
-                  {
-                    "type": "object",
-                    "properties": {
                       "totalAccumulatedTokens": true
                     },
                     "required": [
                       "totalAccumulatedTokens"
-                    ]
-                  },
-                  {
-                    "type": "object",
-                    "properties": {
-                      "contextWindowTokens": true
-                    },
-                    "required": [
-                      "contextWindowTokens"
                     ]
                   }
                 ]

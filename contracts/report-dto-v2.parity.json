@@ -21,5 +21,6 @@
   { "name": "token metrics cannot be marked unavailable", "operation": "set", "path": ["spans", "0", "availability", "tokens", "state"], "value": "source_unavailable", "valid": false },
   { "name": "missing token metrics cannot be marked available", "operation": "set", "path": ["spans", "0", "metrics"], "value": { "latencyMs": 12 }, "valid": false },
   { "name": "aggregate token metric is available", "operation": "set", "path": ["spans", "0", "metrics"], "value": { "totalInputTokens": 10 }, "valid": true },
+  { "name": "context window alone is not a displayable token total", "operation": "set", "path": ["spans", "0", "metrics"], "value": { "contextWindowTokens": 128000 }, "valid": false },
   { "name": "unsupported report version", "operation": "set", "path": ["schemaVersion"], "value": "agent_observability.report.v1", "valid": false }
 ]

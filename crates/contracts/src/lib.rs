@@ -1786,16 +1786,10 @@ fn report_token_metrics_present(metrics: &ReportMetricsV1) -> bool {
     [
         metrics.input_tokens,
         metrics.output_tokens,
-        metrics.cached_input_tokens,
-        metrics.cache_creation_input_tokens,
-        metrics.reasoning_output_tokens,
         metrics.total_tokens,
         metrics.total_input_tokens,
         metrics.total_output_tokens,
-        metrics.total_cached_input_tokens,
-        metrics.total_reasoning_output_tokens,
         metrics.total_accumulated_tokens,
-        metrics.context_window_tokens,
     ]
     .into_iter()
     .any(|value| value.is_some())

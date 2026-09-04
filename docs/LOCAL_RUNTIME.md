@@ -149,16 +149,21 @@ a bounded pseudonymous project reference derived from cwd, never the raw cwd or 
 receiver memory while JSON is decoded. Only explicitly allowlisted scalar identifiers, model/tool categories,
 decisions, timing, token counts and success state cross into the canonical adapter.
 
-When `capture_private_codex_turn_details` is explicitly enabled, the foreground notify helper may also write a
-separate per-turn private detail artifact containing the source-provided cwd, input messages and last assistant
-message. It is correlated by the same hashed turn ID shown in the report and is fetched only from the
-capability-protected localhost dashboard route. It never enters the receiver payload, canonical observation,
-SQLite durable record, report DTO, static HTML, diagnostic, archive, export or team envelope. Disabling the
+When `capture_private_codex_turn_details` is explicitly enabled, the foreground notify helper sends the
+content-free projection plus validated source-provided cwd, input messages and last assistant message to a
+dedicated capability-protected localhost endpoint. The collector commits the projection, performs nonblocking
+admission into a 64-slot queue, and lets one collector-owned writer create the separate per-turn private artifact.
+The callback itself performs no detail-file write, directory scan, pruning or fsync. The artifact is correlated by
+the same hashed turn ID shown in the report and is fetched only from the capability-protected localhost dashboard
+route. Raw detail can therefore exist transiently in this dedicated receiver request and writer queue, but it never
+enters the canonical observation, SQLite durable record, report DTO, static HTML, diagnostic, archive, export or
+team envelope. Disabling the
 option stops future capture and makes the dashboard detail route unavailable; it does not silently claim older
 turns were captured. API request/response wire bodies, tool arguments/output, commands, account identity and
 unknown attributes remain excluded.
 
-Detail capture accounting and publication share the runtime mutation lock. A bounded per-turn content-free status
+The single writer owns detail capture accounting and publication under the runtime mutation lock. A bounded
+per-turn content-free status
 sidecar records the capture result (`ok`, storage budget, busy, size, runtime, or I/O failure), and the localhost panel
 distinguishes capture failure from a turn that was never collected. Raw detail expiry runs at collector startup
 and after an explicit `retention-apply`; status sidecars follow the same bounded count, scan and age policy. An
@@ -219,7 +224,8 @@ Invalid updates leave the previous bytes unchanged. User-facing names, defaults,
 
 - Codex automatic OTLP/HTTP JSON request: at most 1 MiB and 4096 log records.
 - Codex notify payload: raw input at most 64 KiB and a smaller closed projected wire object. Projection happens
-  before I/O; one absolute foreground deadline constrains loopback connect, server-authenticated TLS handshake and the HTTP exchange
+  before I/O; opt-in detail uses one bounded closed localhost envelope and a 64-slot nonblocking writer admission
+  queue. One absolute foreground deadline constrains loopback connect, server-authenticated TLS handshake and the HTTP exchange
   before the helper returns a fail-open accepted, rejected or unavailable outcome without waiting for report work.
 - Opt-in Codex private turn detail: one validated JSON artifact and one content-free capture-status sidecar per
   hashed turn ID, each bounded and stored in private `0700` directories with `0600` files. Both directories are

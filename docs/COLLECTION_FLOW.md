@@ -22,8 +22,9 @@
 
 수동 import는 별도 producer가 공식 surface를 versioned canonical handoff로 변환한 private file부터
 지원한다. Codex automatic path에서 raw notify는 foreground helper가 transport 전에 projection하고,
-receiver는 bounded raw OTLP만 decode해 allowlisted scalar로 즉시 축소한다. Raw payload와 unknown field는
-저장하거나 출력하지 않는다.
+receiver는 bounded raw OTLP만 decode해 allowlisted scalar로 즉시 축소한다. Private detail opt-in 시에는
+검증된 cwd/input/last-assistant만 전용 authenticated localhost endpoint와 collector-owned bounded writer로
+분리한다. Raw payload와 unknown field는 canonical 저장소나 report에 저장하거나 출력하지 않는다.
 
 ## System Context
 
@@ -97,7 +98,13 @@ sequenceDiagram
         Config-->>Codex: install optional agentobs notify command
         Codex->>Notify: raw notify callback
         Notify->>Notify: strict allowlist projection
-        Notify->>Receiver: projected supplement over authenticated HTTPS
+        alt private detail disabled
+            Notify->>Receiver: projected supplement over authenticated HTTPS
+        else private detail enabled
+            Notify->>Receiver: projection + validated detail over dedicated authenticated route
+            Receiver->>Receiver: nonblocking 64-slot admission
+            Receiver->>Store: single writer persists private detail outside canonical store
+        end
     end
     Receiver->>Adapter: copy allowlisted scalars only
     Note over Receiver,Adapter: only bounded raw OTLP may exist transiently in receiver memory
@@ -204,7 +211,9 @@ request/call ID, duration, token counts와 success처럼 adapter가 소유한 sc
 Raw body, prompt, response, tool arguments/output, command, raw cwd/path, account identity와 unknown field는
 canonical persist, log, diagnostic, projection, report 또는 export 경계를 통과하지 않는다. Notify의 cwd는
 pseudonymous project reference로만 축약될 수 있다. 사용자가 private detail을 켠 경우에는 notify가 제공한 cwd,
-input messages, last assistant message를 hashed turn ID로 연결한 별도 private artifact에만 저장한다.
+input messages, last assistant message만 전용 authenticated localhost route의 bounded envelope로 전달하고,
+collector-owned 단일 writer가 hashed turn ID로 연결한 별도 private artifact에 저장한다. Foreground callback은
+detail 파일 기록·directory scan·prune·fsync를 수행하지 않는다.
 Dashboard는 capability-protected localhost detail route로 선택한 turn만 읽으며 team path는 이 artifact를
 알지 못한다.
 

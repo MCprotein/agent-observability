@@ -72,7 +72,7 @@ integration mutation도 private UI session, exact Host와 Origin을 확인하고
 | Option | Default | Allowed | Purpose |
 | --- | ---: | ---: | --- |
 | `enabled` | `true` | `true`, `false` | manual import와 automatic collector ingest 허용 여부 |
-| `private-codex-details` | `false` | `true`, `false` | 이후 Codex notify가 제공하는 cwd, input messages, last assistant message를 별도 private detail 저장소에 보관 |
+| `private-codex-details` | `false` | `true`, `false` | 이후 Codex notify가 제공하는 cwd, input messages, last assistant message를 authenticated localhost bounded queue와 단일 writer로 별도 private detail 저장소에 보관 |
 | `file-reconcile-ms` | `5000` | `1000..60000` | file source 재확인 간격 |
 | `flush-ms` | `5000` | `1000..60000` | bounded flush 간격 |
 | `batch-records` | `100` | `1..500` | batch당 최대 record 수 |

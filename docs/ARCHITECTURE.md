@@ -228,7 +228,10 @@ anti-corruption layer다.
   response, tool arguments/output, command, cwd, path, account identity와 unknown attribute는 canonical
   persist, log, diagnostic, projection 또는 export 경계를 통과하지 않는다.
 - Default-off private Codex detail capture는 공식 notify의 cwd, input messages, last assistant message만
-  per-turn private artifact에 분리한다. 동일 hashed turn ID로 localhost dashboard에서 요청할 때만 읽고,
+  전용 authenticated localhost endpoint의 bounded envelope로 받아 per-turn private artifact에 분리한다.
+  Receiver는 content-free projection을 먼저 canonical ingest한 뒤 64-slot nonblocking admission queue에
+  상세를 넘기고, collector-owned 단일 writer만 파일 기록·fsync·bounded scan·retention을 수행한다.
+  동일 hashed turn ID로 localhost dashboard에서 요청할 때만 읽고,
   canonical observation, SQLite durable record, report DTO/static HTML, archive/export/team envelope와
   dependency를 만들지 않는다. API wire request/response capture나 transcript scan은 하지 않는다.
 - 같은 contract fixture suite를 모든 adapter에 적용한다.
@@ -237,11 +240,13 @@ anti-corruption layer다.
   두며, 동일 canonical span의 재전달만 adapter에서 억제한다.
 - unsupported, content-ignored와 duplicate-suppressed 입력도 raw payload 없이 fixed enum만
   `adapter_dispositions`에 기록하며 같은 transaction에서 cursor를 진행한다.
-- Codex notify helper는 최대 64 KiB의 raw input을 받은 뒤 settings 또는 socket 접근 전에 더 작은 closed
-  content-free projection으로 축약한다. 이 projection만 private-CA HTTPS와 exact private request header로
-  loopback receiver에 전달하며 전체
+- Codex notify helper는 최대 64 KiB의 raw input을 받은 뒤 settings 또는 socket 접근 전에 closed
+  content-free projection으로 축약한다. 기본값에서는 이 projection만 전달한다. Private detail opt-in이면
+  같은 projection과 검증된 cwd/input/last-assistant 필드만 별도 closed envelope에 넣어 전용 localhost
+  route로 전달한다. 두 경로 모두 private-CA HTTPS와 exact private request header를 사용하며 전체
   connect/TLS/HTTP deadline 뒤 항상 fail open한다. 외부 network, full transcript parse, report render나
-  queue drain을 기다리지 않는다. Future file fallback은 persisted cursor와 source generation으로
+  queue drain, directory scan, fsync를 기다리지 않는다. Admission 성공은 queued receipt를 반환하며
+  포화는 busy로 노출한다. 실제 저장 결과는 per-turn status로 확인한다. Future file fallback은 persisted cursor와 source generation으로
   incrementally reconcile한다.
 - 제품별 공식 source 우선순위와 지원 evidence는
   [`ADAPTER_COMPATIBILITY.md`](ADAPTER_COMPATIBILITY.md)를 따른다.

@@ -398,6 +398,12 @@ function mount(data: AgentObservabilityReportV2): void {
       target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Unavailable: this source did not provide turn correlation.</p>';
       return;
     }
+    const availability = availabilityOf(span);
+    if (![availability.sourceLocation, availability.requestContent, availability.responseContent]
+      .every((field) => field.state === "private_lookup")) {
+      target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Not applicable: this span is not an eligible Codex notify turn.</p>';
+      return;
+    }
     if (!/^https?:$/.test(globalThis.location.protocol)) {
       target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Unavailable in a file:// report. Open the localhost dashboard.</p>';
       return;
@@ -530,7 +536,9 @@ function sumOptional(left: number | undefined, right: number | undefined): numbe
 }
 
 function formatOptionalTokenTotal(span: Span): string | undefined {
-  const value = sumOptional(span.metrics.inputTokens, span.metrics.outputTokens);
+  const direct = sumOptional(span.metrics.inputTokens, span.metrics.outputTokens);
+  const cumulative = sumOptional(span.metrics.totalInputTokens, span.metrics.totalOutputTokens);
+  const value = direct ?? span.metrics.totalTokens ?? cumulative ?? span.metrics.totalAccumulatedTokens;
   return value === undefined ? undefined : formatNumber(value);
 }
 

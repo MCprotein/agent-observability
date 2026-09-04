@@ -179,7 +179,10 @@ pseudonymous project reference뿐이다. 원문 path/content는 canonical store,
 
 정확한 cwd와 Codex notify가 제공하는 input messages, last assistant message가 필요하면 Settings의
 `요청·응답 상세 저장`을 켠다. 기본값은 OFF이며 켠 이후 새 turn만 별도 `0600` private artifact에
-저장된다. 일반 report DTO/HTML에는 원문을 넣지 않고 선택한 turn에서 localhost 상세 endpoint로만
+저장된다. 이때 foreground helper는 content-free projection과 검증된 상세를 하나의 bounded envelope로
+private-CA HTTPS localhost endpoint에 넘기기만 한다. Collector의 64-slot admission queue와 단일 writer가
+실제 파일 기록·fsync·retention을 처리하므로 Codex callback이 directory scan이나 disk flush를 수행하지
+않는다. 일반 report DTO/HTML에는 원문을 넣지 않고 선택한 turn에서 localhost 상세 endpoint로만
 읽는다. 이는 API wire request/response 캡처가 아니다. 기존 외부 `notify`를 보존한 환경에서는 해당
 callback을 agentobs가 받지 않으므로 상세가 수집되지 않는다.
 
@@ -332,7 +335,8 @@ Crash recovery와 replay 규칙은 [Local Runtime](docs/LOCAL_RUNTIME.md#retenti
 | --- | --- |
 | Prompt, response, tool output | durable storage와 report에 저장하지 않음 |
 | Command, cwd, path, raw email | allowlist contract 밖에서는 저장하지 않음 |
-| Raw notify | foreground helper에서 allowlist projection한 뒤에만 private-CA HTTPS와 exact private header로 전달 |
+| Raw notify (기본값) | foreground helper에서 allowlist projection하고 content-free 값만 receiver에 전달 |
+| Raw notify 상세 (명시적 opt-in) | 검증된 cwd/input/last assistant만 bounded localhost 전용 endpoint와 private writer로 전달; canonical/report/team에는 복사하지 않음 |
 | Raw OTLP/tool field | bounded parse 동안 memory에만 일시 존재할 수 있고 persist/log/project/export하지 않음 |
 | Runtime directory | `0700`만 허용 |
 | Config, archive, report | `0600`으로 기록 |

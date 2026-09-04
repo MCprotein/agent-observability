@@ -117,7 +117,7 @@ try {
     assert.match((await page.locator("#span-details").textContent()) ?? "", /Location/);
     assert.match(
       (await page.locator("#private-detail").textContent()) ?? "",
-      /Unavailable in a file:\/\/ report\. Open the localhost dashboard\./,
+      /Not applicable: this span is not an eligible Codex notify turn\./,
     );
 
     if (testCase.name === "mobile") {
