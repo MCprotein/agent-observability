@@ -11,8 +11,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub const LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v2";
+pub const LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v3";
 const LEGACY_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v1";
+const PRIOR_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v2";
 static UPDATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,7 +25,7 @@ enum SaveStage {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct LocalRuntimeConfigV2 {
+pub struct LocalRuntimeConfigV3 {
     pub schema_version: String,
     pub enabled: bool,
     pub capture_private_codex_turn_details: bool,
@@ -34,10 +35,9 @@ pub struct LocalRuntimeConfigV2 {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StrictLocalRuntimeConfigV2 {
+struct StrictLocalRuntimeConfigV3 {
     schema_version: String,
     enabled: bool,
-    #[serde(default)]
     capture_private_codex_turn_details: bool,
     collection: StrictCollectionPolicyV1,
     retention: StrictRetentionPolicyV1,
@@ -64,12 +64,12 @@ struct StrictRetentionPolicyV1 {
     max_archive_bytes: u64,
 }
 
-impl<'de> Deserialize<'de> for LocalRuntimeConfigV2 {
+impl<'de> Deserialize<'de> for LocalRuntimeConfigV3 {
     fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
     where
         Deserializer: serde::Deserializer<'de>,
     {
-        let strict = StrictLocalRuntimeConfigV2::deserialize(deserializer)?;
+        let strict = StrictLocalRuntimeConfigV3::deserialize(deserializer)?;
         Ok(Self {
             schema_version: strict.schema_version,
             enabled: strict.enabled,
@@ -92,7 +92,7 @@ impl<'de> Deserialize<'de> for LocalRuntimeConfigV2 {
     }
 }
 
-impl Default for LocalRuntimeConfigV2 {
+impl Default for LocalRuntimeConfigV3 {
     fn default() -> Self {
         Self {
             schema_version: LOCAL_RUNTIME_CONFIG_VERSION.into(),
@@ -104,7 +104,7 @@ impl Default for LocalRuntimeConfigV2 {
     }
 }
 
-impl LocalRuntimeConfigV2 {
+impl LocalRuntimeConfigV3 {
     pub fn from_json(input: &str) -> Result<Self, ConfigError> {
         let header: serde_json::Value = serde_json::from_str(input).map_err(ConfigError::Json)?;
         let version = header
@@ -120,6 +120,16 @@ impl LocalRuntimeConfigV2 {
                 capture_private_codex_turn_details: false,
                 collection: legacy.collection,
                 retention: RetentionPolicyV1::default(),
+            }
+        } else if version == PRIOR_LOCAL_RUNTIME_CONFIG_VERSION {
+            let prior: LegacyLocalRuntimeConfigV2 =
+                serde_json::from_str(input).map_err(ConfigError::Json)?;
+            Self {
+                schema_version: LOCAL_RUNTIME_CONFIG_VERSION.into(),
+                enabled: prior.enabled,
+                capture_private_codex_turn_details: false,
+                collection: prior.collection.into(),
+                retention: prior.retention.into(),
             }
         } else {
             serde_json::from_str(input).map_err(ConfigError::Json)?
@@ -148,6 +158,40 @@ struct LegacyLocalRuntimeConfigV1 {
     collection: CollectionPolicyV1,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyLocalRuntimeConfigV2 {
+    #[serde(rename = "schema_version")]
+    _schema_version: String,
+    enabled: bool,
+    collection: StrictCollectionPolicyV1,
+    retention: StrictRetentionPolicyV1,
+}
+
+impl From<StrictCollectionPolicyV1> for CollectionPolicyV1 {
+    fn from(strict: StrictCollectionPolicyV1) -> Self {
+        Self {
+            file_reconcile_interval_ms: strict.file_reconcile_interval_ms,
+            flush_interval_ms: strict.flush_interval_ms,
+            max_batch_records: strict.max_batch_records,
+            max_batch_bytes: strict.max_batch_bytes,
+            active_heartbeat_interval_ms: strict.active_heartbeat_interval_ms,
+            idle_heartbeat_interval_ms: strict.idle_heartbeat_interval_ms,
+            local_storage_budget_bytes: strict.local_storage_budget_bytes,
+        }
+    }
+}
+
+impl From<StrictRetentionPolicyV1> for RetentionPolicyV1 {
+    fn from(strict: StrictRetentionPolicyV1) -> Self {
+        Self {
+            max_record_age_days: strict.max_record_age_days,
+            max_archive_records: strict.max_archive_records,
+            max_archive_bytes: strict.max_archive_bytes,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstalledLayout {
     pub root: PathBuf,
@@ -165,7 +209,7 @@ pub struct LocalConfigService {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VersionedLocalConfig {
-    pub config: LocalRuntimeConfigV2,
+    pub config: LocalRuntimeConfigV3,
     pub revision: String,
 }
 
@@ -193,7 +237,7 @@ impl LocalConfigService {
     pub fn save(
         &self,
         expected_revision: &str,
-        config: &LocalRuntimeConfigV2,
+        config: &LocalRuntimeConfigV3,
     ) -> Result<VersionedLocalConfig, ConfigServiceError> {
         config.validate().map_err(|_| ConfigServiceError::Invalid)?;
         let mutation = ConfigMutationGuard::acquire(&self.layout).map_err(|error| match error {
@@ -303,7 +347,7 @@ pub fn install(root: &Path) -> Result<InstalledLayout, ConfigError> {
 
     reject_symlink(&layout.config)?;
     let body =
-        serde_json::to_vec_pretty(&LocalRuntimeConfigV2::default()).map_err(ConfigError::Json)?;
+        serde_json::to_vec_pretty(&LocalRuntimeConfigV3::default()).map_err(ConfigError::Json)?;
     let temporary = layout
         .root
         .join(format!(".config.json.tmp.{}", std::process::id()));
@@ -330,28 +374,28 @@ pub fn install(root: &Path) -> Result<InstalledLayout, ConfigError> {
     Ok(layout)
 }
 
-pub fn load(path: &Path) -> Result<LocalRuntimeConfigV2, ConfigError> {
+pub fn load(path: &Path) -> Result<LocalRuntimeConfigV3, ConfigError> {
     let mut file = open_private_read(path)?;
     let mut body = String::new();
     file.read_to_string(&mut body)?;
-    LocalRuntimeConfigV2::from_json(&body)
+    LocalRuntimeConfigV3::from_json(&body)
 }
 
-pub fn save(guard: &ConfigMutationGuard, config: &LocalRuntimeConfigV2) -> Result<(), ConfigError> {
+pub fn save(guard: &ConfigMutationGuard, config: &LocalRuntimeConfigV3) -> Result<(), ConfigError> {
     save_with_hook(&guard.config_path, config, None, |_| Ok(()))
 }
 
 pub fn save_if_revision(
     guard: &ConfigMutationGuard,
     expected_revision: &str,
-    config: &LocalRuntimeConfigV2,
+    config: &LocalRuntimeConfigV3,
 ) -> Result<(), ConfigError> {
     save_with_hook(&guard.config_path, config, Some(expected_revision), |_| {
         Ok(())
     })
 }
 
-pub fn revision(config: &LocalRuntimeConfigV2) -> Result<String, ConfigError> {
+pub fn revision(config: &LocalRuntimeConfigV3) -> Result<String, ConfigError> {
     let body = serde_json::to_vec(config).map_err(ConfigError::Json)?;
     let digest = Sha256::digest(body);
     Ok(hex(&digest))
@@ -359,7 +403,7 @@ pub fn revision(config: &LocalRuntimeConfigV2) -> Result<String, ConfigError> {
 
 fn save_with_hook(
     path: &Path,
-    config: &LocalRuntimeConfigV2,
+    config: &LocalRuntimeConfigV3,
     expected_revision: Option<&str>,
     mut before: impl FnMut(SaveStage) -> io::Result<()>,
 ) -> Result<(), ConfigError> {
@@ -553,18 +597,18 @@ mod tests {
 
     #[test]
     fn config_is_strict_and_versioned() {
-        let config = LocalRuntimeConfigV2::default();
+        let config = LocalRuntimeConfigV3::default();
         config.validate().unwrap();
         assert!(
-            LocalRuntimeConfigV2::from_json(
+            LocalRuntimeConfigV3::from_json(
                 r#"{"schema_version":"local_runtime.v1","unknown":true}"#
             )
             .is_err()
         );
         assert!(
-            LocalRuntimeConfigV2::from_json(r#"{"schema_version":"local_runtime.v3"}"#).is_err()
+            LocalRuntimeConfigV3::from_json(r#"{"schema_version":"local_runtime.v4"}"#).is_err()
         );
-        let legacy = LocalRuntimeConfigV2::from_json(
+        let legacy = LocalRuntimeConfigV3::from_json(
             r#"{"schema_version":"local_runtime.v1","enabled":true,"collection":{}}"#,
         )
         .unwrap();
@@ -572,19 +616,19 @@ mod tests {
         assert!(!legacy.capture_private_codex_turn_details);
         assert_eq!(legacy.retention, RetentionPolicyV1::default());
 
-        let prior_v2 = LocalRuntimeConfigV2::from_json(
+        let prior_v2 = LocalRuntimeConfigV3::from_json(
             r#"{"schema_version":"local_runtime.v2","enabled":true,"collection":{"file_reconcile_interval_ms":5000,"flush_interval_ms":5000,"max_batch_records":100,"max_batch_bytes":524288,"active_heartbeat_interval_ms":60000,"idle_heartbeat_interval_ms":300000,"local_storage_budget_bytes":1073741824},"retention":{"max_record_age_days":30,"max_archive_records":10000,"max_archive_bytes":16777216}}"#,
         )
         .unwrap();
         assert!(!prior_v2.capture_private_codex_turn_details);
 
         let mut opted_in: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../contracts/local-runtime-config-v2.fixture.json"
+            "../../../contracts/local-runtime-config-v3.fixture.json"
         ))
         .unwrap();
         opted_in["capture_private_codex_turn_details"] = serde_json::Value::Bool(true);
         assert!(
-            LocalRuntimeConfigV2::from_json(&opted_in.to_string())
+            LocalRuntimeConfigV3::from_json(&opted_in.to_string())
                 .unwrap()
                 .capture_private_codex_turn_details
         );
@@ -592,19 +636,19 @@ mod tests {
 
     #[test]
     fn versioned_fixture_matches_the_rust_default_and_bounds() {
-        let fixture = include_str!("../../../contracts/local-runtime-config-v2.fixture.json");
+        let fixture = include_str!("../../../contracts/local-runtime-config-v3.fixture.json");
         assert_eq!(
-            LocalRuntimeConfigV2::from_json(fixture).unwrap(),
-            LocalRuntimeConfigV2::default()
+            LocalRuntimeConfigV3::from_json(fixture).unwrap(),
+            LocalRuntimeConfigV3::default()
         );
         let cases: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../contracts/local-runtime-config-v2.parity.json"
+            "../../../contracts/local-runtime-config-v3.parity.json"
         ))
         .unwrap();
         for case in cases.as_array().unwrap() {
             let mut document: serde_json::Value = serde_json::from_str(fixture).unwrap();
             apply_parity_case(&mut document, case);
-            let accepted = LocalRuntimeConfigV2::from_json(&document.to_string()).is_ok();
+            let accepted = LocalRuntimeConfigV3::from_json(&document.to_string()).is_ok();
             assert_eq!(
                 accepted,
                 case["valid"].as_bool().unwrap(),
@@ -658,7 +702,7 @@ mod tests {
         );
         assert_eq!(
             load(&second.config).unwrap(),
-            LocalRuntimeConfigV2::default()
+            LocalRuntimeConfigV3::default()
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -737,7 +781,7 @@ mod tests {
         mismatched_layout.config = second_layout.config.clone();
         mismatched_layout.runtime = second_layout.runtime.clone();
         let guard = ConfigMutationGuard::acquire(&mismatched_layout).unwrap();
-        let mut update = LocalRuntimeConfigV2::default();
+        let mut update = LocalRuntimeConfigV3::default();
         update.retention.max_record_age_days = 90;
 
         save(&guard, &update).unwrap();
@@ -745,7 +789,7 @@ mod tests {
         assert_eq!(load(&first_layout.config).unwrap(), update);
         assert_eq!(
             load(&second_layout.config).unwrap(),
-            LocalRuntimeConfigV2::default()
+            LocalRuntimeConfigV3::default()
         );
         drop(guard);
         let _ = fs::remove_dir_all(first_root);
@@ -759,9 +803,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let layout = install(&root).unwrap();
         let expected = revision(&load(&layout.config).unwrap()).unwrap();
-        let mut update = LocalRuntimeConfigV2::default();
+        let mut update = LocalRuntimeConfigV3::default();
         update.retention.max_record_age_days = 90;
-        let mut external = LocalRuntimeConfigV2::default();
+        let mut external = LocalRuntimeConfigV3::default();
         external.retention.max_record_age_days = 45;
         let mut external_bytes = serde_json::to_vec_pretty(&external).unwrap();
         external_bytes.push(b'\n');
@@ -813,7 +857,7 @@ mod tests {
         assert!(matches!(
             save_with_hook(
                 &layout.config,
-                &LocalRuntimeConfigV2::default(),
+                &LocalRuntimeConfigV3::default(),
                 None,
                 |_| Ok(())
             ),
@@ -826,7 +870,7 @@ mod tests {
         assert!(matches!(
             save_with_hook(
                 &layout.config,
-                &LocalRuntimeConfigV2::default(),
+                &LocalRuntimeConfigV3::default(),
                 None,
                 |_| Ok(())
             ),
@@ -850,7 +894,7 @@ mod tests {
             let path = Arc::clone(&path);
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
-                let mut config = LocalRuntimeConfigV2::default();
+                let mut config = LocalRuntimeConfigV3::default();
                 config.retention.max_record_age_days = days;
                 barrier.wait();
                 save_with_hook(&path, &config, None, |_| Ok(()))
@@ -890,7 +934,7 @@ mod tests {
             .mode(0o600)
             .open(&stale)
             .unwrap();
-        let mut config = LocalRuntimeConfigV2::default();
+        let mut config = LocalRuntimeConfigV3::default();
         config.retention.max_record_age_days = 90;
         save_with_hook(&layout.config, &config, None, |_| Ok(())).unwrap();
         assert_eq!(load(&layout.config).unwrap(), config);
@@ -905,7 +949,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let layout = install(&root).unwrap();
         let original = fs::read(&layout.config).unwrap();
-        let mut config = LocalRuntimeConfigV2::default();
+        let mut config = LocalRuntimeConfigV3::default();
         config.retention.max_record_age_days = 90;
 
         for failed_stage in [SaveStage::Write, SaveStage::FileSync, SaveStage::Rename] {
@@ -935,7 +979,7 @@ mod tests {
         let root = root("save-parent-sync-failure");
         let _ = fs::remove_dir_all(&root);
         let layout = install(&root).unwrap();
-        let mut config = LocalRuntimeConfigV2::default();
+        let mut config = LocalRuntimeConfigV3::default();
         config.retention.max_record_age_days = 90;
 
         let result = save_with_hook(&layout.config, &config, None, |stage| {

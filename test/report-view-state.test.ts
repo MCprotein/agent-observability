@@ -10,7 +10,7 @@ import {
   serializeSavedFilters,
   type DimensionFilters,
 } from "../ui/report/view-state.ts";
-import type { Span, Trace } from "../ui/report/generated/report-dto-v1.js";
+import type { Span, Trace } from "../ui/report/generated/report-dto-v2.js";
 
 test("keeps large local report view work and rendered slices bounded", () => {
   const spans = Array.from({ length: 4_096 }, (_, index) => spanFixture(index));

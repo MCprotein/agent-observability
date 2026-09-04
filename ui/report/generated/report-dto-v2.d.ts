@@ -1,10 +1,31 @@
-/* Generated from contracts/report-dto-v1.schema.json. Do not edit. */
+/* Generated from contracts/report-dto-v2.schema.json. Do not edit. */
 
 export type Strings = string[];
+export type Span = {
+  schemaVersion: string;
+  traceId: string;
+  spanId: string;
+  parentSpanId: string | null;
+  kind: string;
+  name: string;
+  status: string;
+  startTimeUnixMs: number;
+  endTimeUnixMs: number | null;
+  repo: string;
+  agent: Agent;
+  availability: Availability;
+  sessionId?: string;
+  turnId?: string;
+  toolName?: string;
+  attributes: Attributes;
+  metrics: Metrics;
+  estimatedCost?: number;
+  cost: Cost;
+};
 export type Scalar = string | number | boolean;
 
-export interface AgentObservabilityReportV1 {
-  schemaVersion: "agent_observability.report.v1";
+export interface AgentObservabilityReportV2 {
+  schemaVersion: "agent_observability.report.v2";
   generatedAt: string;
   title: string;
   summary: Summary;
@@ -75,27 +96,6 @@ export interface Trace {
   endTimeUnixMs: number | null;
   sessions: Strings;
   turns: Strings;
-}
-export interface Span {
-  schemaVersion: string;
-  traceId: string;
-  spanId: string;
-  parentSpanId: string | null;
-  kind: string;
-  name: string;
-  status: string;
-  startTimeUnixMs: number;
-  endTimeUnixMs: number | null;
-  repo: string;
-  agent: Agent;
-  availability?: Availability;
-  sessionId?: string;
-  turnId?: string;
-  toolName?: string;
-  attributes: Attributes;
-  metrics: Metrics;
-  estimatedCost?: number;
-  cost: Cost;
 }
 export interface Agent {
   name?: string;

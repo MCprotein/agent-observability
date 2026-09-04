@@ -7,10 +7,10 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { chromium } from "playwright-core";
 import type {
-  AgentObservabilityReportV1,
+  AgentObservabilityReportV2,
   Span,
   Trace,
-} from "../ui/report/generated/report-dto-v1.js";
+} from "../ui/report/generated/report-dto-v2.js";
 
 const execute = promisify(execFile);
 
@@ -110,7 +110,9 @@ try {
     await page.locator(".trace-row:visible").first().click();
     assert.equal(await page.locator(".trace-row:visible").first().getAttribute("aria-pressed"), "true");
     assert.equal(await page.locator(".timeline-row").count() > 0, true);
-    await page.locator("#span-table .span-open:visible").first().click();
+    const spanOpener = page.locator("#span-table .span-open:visible").first();
+    await spanOpener.click();
+    assert.equal(await spanOpener.getAttribute("aria-expanded"), "true");
     assert.match((await page.locator("#span-details").textContent()) ?? "", /Source & privacy/);
     assert.match((await page.locator("#span-details").textContent()) ?? "", /Location/);
     assert.match(
@@ -119,6 +121,9 @@ try {
     );
 
     if (testCase.name === "mobile") {
+      await page.locator("#details-close").click();
+      assert.equal(await spanOpener.getAttribute("aria-expanded"), "false");
+      assert.equal(await spanOpener.evaluate((element) => document.activeElement === element), true);
       const heights = await page.locator("select, input, button").evaluateAll((elements) =>
         elements.map((element) => element.getBoundingClientRect().height),
       );
@@ -190,7 +195,7 @@ function rateTable() {
   };
 }
 
-function renderReportDto(shell: string, report: AgentObservabilityReportV1): string {
+function renderReportDto(shell: string, report: AgentObservabilityReportV2): string {
   return shell
     .replaceAll("__AGENT_OBSERVABILITY_REPORT_TITLE__", report.title)
     .replaceAll("__AGENT_OBSERVABILITY_REPORT_GENERATED_AT__", report.generatedAt)
@@ -200,7 +205,7 @@ function renderReportDto(shell: string, report: AgentObservabilityReportV1): str
     );
 }
 
-function largeReportFixture(): AgentObservabilityReportV1 {
+function largeReportFixture(): AgentObservabilityReportV2 {
   const spans: Span[] = Array.from({ length: 4_096 }, (_, index) => ({
     schemaVersion: "agent_observability.v1",
     traceId: index < 200 ? "trace-large-0" : `trace-large-${1 + (index % 255)}`,
@@ -250,7 +255,7 @@ function largeReportFixture(): AgentObservabilityReportV1 {
     };
   });
   return {
-    schemaVersion: "agent_observability.report.v1",
+    schemaVersion: "agent_observability.report.v2",
     generatedAt: "2026-07-10T00:00:00.000Z",
     title: "Agent Observability Report",
     summary: {

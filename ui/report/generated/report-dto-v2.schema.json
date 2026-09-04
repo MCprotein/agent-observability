@@ -1,4 +1,5 @@
 {
+  "title": "AgentObservabilityReportV2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -13,7 +14,7 @@
   ],
   "properties": {
     "schemaVersion": {
-      "const": "agent_observability.report.v1"
+      "const": "agent_observability.report.v2"
     },
     "generatedAt": {
       "type": "string"
@@ -299,6 +300,7 @@
         "endTimeUnixMs",
         "repo",
         "agent",
+        "availability",
         "attributes",
         "metrics",
         "cost"
@@ -367,7 +369,164 @@
         "cost": {
           "$ref": "#/$defs/cost"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "metrics": {
+                "type": "object",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "inputTokens": true
+                    },
+                    "required": [
+                      "inputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "outputTokens": true
+                    },
+                    "required": [
+                      "outputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "cachedInputTokens": true
+                    },
+                    "required": [
+                      "cachedInputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "cacheCreationInputTokens": true
+                    },
+                    "required": [
+                      "cacheCreationInputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "reasoningOutputTokens": true
+                    },
+                    "required": [
+                      "reasoningOutputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "totalTokens": true
+                    },
+                    "required": [
+                      "totalTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "totalInputTokens": true
+                    },
+                    "required": [
+                      "totalInputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "totalOutputTokens": true
+                    },
+                    "required": [
+                      "totalOutputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "totalCachedInputTokens": true
+                    },
+                    "required": [
+                      "totalCachedInputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "totalReasoningOutputTokens": true
+                    },
+                    "required": [
+                      "totalReasoningOutputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "totalAccumulatedTokens": true
+                    },
+                    "required": [
+                      "totalAccumulatedTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "contextWindowTokens": true
+                    },
+                    "required": [
+                      "contextWindowTokens"
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "availability": {
+                "type": "object",
+                "properties": {
+                  "tokens": {
+                    "type": "object",
+                    "properties": {
+                      "state": {
+                        "const": "available"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "availability": {
+                "type": "object",
+                "properties": {
+                  "tokens": {
+                    "type": "object",
+                    "properties": {
+                      "state": {
+                        "not": {
+                          "const": "available"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "agent": {
       "type": "object",

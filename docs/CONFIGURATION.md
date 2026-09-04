@@ -100,6 +100,10 @@ parse하거나 저장하지 않는다.
 request/response는 API wire body가 아니라 notify가 제공하는 `input-messages`와
 `last-assistant-message`다. 원문은 일반 observation, SQLite durable record, report DTO, 정적 HTML,
 archive, diagnostic, export 또는 team envelope에 들어가지 않는다.
+상세 artifact도 `retention-days`를 따르며 collector 시작 시와 성공적인 `retention-apply` 뒤에
+bounded cleanup을 수행한다. 저장 예산·잠금·파일 오류는 hashed turn별 bounded 상태 sidecar에 원문 없이
+기록되며, detail과 동일한 mutation lock 및 count/scan/retention 경계를 적용한다. localhost 상세 화면은
+이 상태를 읽어 `not collected`와 구분한다.
 
 `file-reconcile-ms`, `flush-ms`, heartbeat option은 동일한 bounded runtime contract를 사용하는
 producer embedding을 위한 값이다. retention과 archive 설정은 manual/automatic 경로가 공유하는

@@ -220,7 +220,10 @@ fn report_explains_missing_fields_and_propagates_verified_trace_repository() {
     turn.trace_id = "trace-project".into();
     turn.span_id = "turn-project".into();
     turn.span_kind = SpanKind::Turn;
+    turn.agent.name = Some("codex".into());
     turn.project.name = Some("agent-observability".into());
+    turn.attributes.source = Some(ScalarValueV1::String("codex".into()));
+    turn.attributes.event_type = Some(ScalarValueV1::String("turn".into()));
     turn.attributes.turn_id = Some(ScalarValueV1::String("turn-private".into()));
     turn.metrics = MetricsV1::default();
 
@@ -253,16 +256,112 @@ fn report_explains_missing_fields_and_propagates_verified_trace_repository() {
     );
     assert_eq!(
         session.availability.turn.state,
-        agent_observability_contracts::AvailabilityStateV1::SourceUnavailable
+        agent_observability_contracts::AvailabilityStateV2::SourceUnavailable
     );
     assert_eq!(
         turn.availability.source_location.state,
-        agent_observability_contracts::AvailabilityStateV1::PrivateLookup
+        agent_observability_contracts::AvailabilityStateV2::PrivateLookup
     );
     assert_eq!(
         turn.availability.request_content.reason,
         "local_opt_in_lookup_required"
     );
+}
+
+#[test]
+fn report_private_lookup_is_limited_to_current_codex_notify_turns() {
+    let mut codex_request = full("gpt-test");
+    codex_request.agent.name = Some("codex".into());
+    codex_request.attributes.source = Some(ScalarValueV1::String("codex".into()));
+    codex_request.attributes.event_type = Some(ScalarValueV1::String("model_request".into()));
+    codex_request.attributes.turn_id = Some(ScalarValueV1::String("turn-codex".into()));
+
+    let mut claude_turn = full("gpt-test");
+    claude_turn.span_id = "claude-turn".into();
+    claude_turn.span_kind = SpanKind::Turn;
+    claude_turn.agent.name = Some("claude-code".into());
+    claude_turn.attributes.source = Some(ScalarValueV1::String("claude-code".into()));
+    claude_turn.attributes.event_type = Some(ScalarValueV1::String("turn".into()));
+    claude_turn.attributes.turn_id = Some(ScalarValueV1::String("turn-claude".into()));
+
+    let mut cursor_turn = claude_turn.clone();
+    cursor_turn.span_id = "cursor-turn".into();
+    cursor_turn.agent.name = Some("cursor".into());
+    cursor_turn.attributes.source = Some(ScalarValueV1::String("cursor".into()));
+
+    let mut historical_codex_turn = claude_turn.clone();
+    historical_codex_turn.span_id = "historical-codex-turn".into();
+    historical_codex_turn.agent.name = Some("codex".into());
+    historical_codex_turn.attributes.source = Some(ScalarValueV1::String(
+        "codex.notify_or_session_jsonl".into(),
+    ));
+
+    let report = project_report(
+        &[
+            codex_request,
+            claude_turn,
+            cursor_turn,
+            historical_codex_turn,
+        ],
+        "2026-09-05T00:00:00Z",
+        "private lookup eligibility",
+        None,
+    )
+    .unwrap();
+    let reason = |span_id: &str| {
+        report
+            .spans
+            .iter()
+            .find(|span| span.span_id == hash_opaque_identifier(span_id))
+            .map(|span| {
+                (
+                    span.availability.source_location.state,
+                    span.availability.source_location.reason.as_str(),
+                )
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        reason("gpt-test"),
+        (
+            agent_observability_contracts::AvailabilityStateV2::NotApplicable,
+            "codex_span_not_notify_derived"
+        )
+    );
+    assert_eq!(
+        reason("claude-turn"),
+        (
+            agent_observability_contracts::AvailabilityStateV2::NotApplicable,
+            "claude_private_lookup_not_supported"
+        )
+    );
+    assert_eq!(
+        reason("cursor-turn"),
+        (
+            agent_observability_contracts::AvailabilityStateV2::NotApplicable,
+            "cursor_private_lookup_not_supported"
+        )
+    );
+    assert_eq!(
+        reason("historical-codex-turn"),
+        (
+            agent_observability_contracts::AvailabilityStateV2::SourceUnavailable,
+            "historical_codex_source_not_lookup_eligible"
+        )
+    );
+}
+
+#[test]
+fn report_marks_aggregate_only_token_metrics_available() {
+    let mut record = span("gpt-test", MetricsV1::default());
+    record.metrics.total_input_tokens = Some(10.0);
+    let report = project_report(&[record], "generated", "tokens", None).unwrap();
+
+    assert_eq!(
+        report.spans[0].availability.tokens.state,
+        agent_observability_contracts::AvailabilityStateV2::Available
+    );
+    report.validate().unwrap();
 }
 
 #[test]
@@ -298,12 +397,14 @@ fn report_keeps_unknown_repository_when_trace_has_conflicting_projects() {
     assert_eq!(session.repo, "unknown");
     assert_eq!(
         session.availability.repository.state,
-        agent_observability_contracts::AvailabilityStateV1::SourceUnavailable
+        agent_observability_contracts::AvailabilityStateV2::SourceUnavailable
     );
     assert_eq!(
         session.availability.repository.reason,
         "ambiguous_trace_repository"
     );
+    assert_eq!(report.traces.len(), 1);
+    assert_eq!(report.traces[0].repo, "unknown");
 }
 
 #[test]
@@ -666,12 +767,81 @@ fn rust_report_matches_the_frozen_cross_agent_golden_contract() {
     .unwrap();
     let mut actual = serde_json::to_value(report).unwrap();
     let mut expected_report = expected["report_full"].clone();
-    for span in actual["spans"].as_array_mut().unwrap() {
-        span.as_object_mut().unwrap().remove("availability");
+    for span in expected_report["spans"].as_array_mut().unwrap() {
+        span["availability"] = expected_cross_agent_availability(span);
     }
     normalize_integral_json_numbers(&mut actual);
     normalize_integral_json_numbers(&mut expected_report);
     assert_eq!(actual, expected_report);
+}
+
+fn expected_cross_agent_availability(span: &serde_json::Value) -> serde_json::Value {
+    let available = |reason: &str| serde_json::json!({"state": "available", "reason": reason});
+    let unavailable =
+        |reason: &str| serde_json::json!({"state": "source_unavailable", "reason": reason});
+    let not_applicable =
+        |reason: &str| serde_json::json!({"state": "not_applicable", "reason": reason});
+    let kind = span["kind"].as_str().unwrap();
+    let has_tokens = span["metrics"].as_object().unwrap().keys().any(|key| {
+        matches!(
+            key.as_str(),
+            "inputTokens"
+                | "outputTokens"
+                | "cachedInputTokens"
+                | "cacheCreationInputTokens"
+                | "reasoningOutputTokens"
+                | "totalTokens"
+                | "totalInputTokens"
+                | "totalOutputTokens"
+                | "totalCachedInputTokens"
+                | "totalReasoningOutputTokens"
+                | "totalAccumulatedTokens"
+                | "contextWindowTokens"
+        )
+    });
+    let private_detail = match span["attributes"]["source"].as_str() {
+        Some("codex.notify_or_session_jsonl") => {
+            unavailable("historical_codex_source_not_lookup_eligible")
+        }
+        Some("claude_code.hook" | "claude_code.transcript") => {
+            not_applicable("claude_private_lookup_not_supported")
+        }
+        _ => not_applicable("agent_private_lookup_not_supported"),
+    };
+    serde_json::json!({
+        "repository": available("reported_by_adapter"),
+        "turn": if span.get("turnId").is_some() {
+            available("reported_by_adapter")
+        } else {
+            unavailable("source_not_provided")
+        },
+        "model": if span["agent"].get("model").is_some() {
+            available("reported_by_adapter")
+        } else if matches!(kind, "llm.request" | "agent.session") {
+            unavailable("source_not_provided")
+        } else {
+            not_applicable("span_kind_not_model_backed")
+        },
+        "tokens": if has_tokens {
+            available("reported_by_adapter")
+        } else if kind == "llm.request" {
+            unavailable("source_not_provided")
+        } else {
+            not_applicable("span_kind_has_no_token_usage")
+        },
+        "latency": if span["metrics"].get("latencyMs").is_some()
+            || span["metrics"].get("durationMs").is_some()
+        {
+            available("reported_by_adapter")
+        } else if matches!(kind, "llm.request" | "tool.execution") {
+            unavailable("source_not_provided")
+        } else {
+            not_applicable("span_kind_has_no_latency")
+        },
+        "sourceLocation": private_detail,
+        "requestContent": private_detail,
+        "responseContent": private_detail
+    })
 }
 
 fn normalize_integral_json_numbers(value: &mut serde_json::Value) {

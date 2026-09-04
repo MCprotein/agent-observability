@@ -143,8 +143,9 @@ and mode equal the recorded connected state at the commit checks. An edit observ
 limitation above still applies. SQLite, JSONL and HTML data remain.
 
 By default, the raw notify argument exists transiently only in the bounded foreground projector and is reduced
-before settings or socket access; the receiver sees only `ProjectedNotifyV1`. The projection may carry a bounded
-pseudonymous project reference derived from cwd, never the raw cwd or basename. Raw OTLP requests can exist transiently in bounded
+before settings or socket access; the receiver writes `ProjectedNotifyV2`. During a rolling local upgrade the
+receiver also accepts the frozen content-free v1 shape, which has no project context. The v2 projection may carry
+a bounded pseudonymous project reference derived from cwd, never the raw cwd or basename. Raw OTLP requests can exist transiently in bounded
 receiver memory while JSON is decoded. Only explicitly allowlisted scalar identifiers, model/tool categories,
 decisions, timing, token counts and success state cross into the canonical adapter.
 
@@ -156,6 +157,12 @@ SQLite durable record, report DTO, static HTML, diagnostic, archive, export or t
 option stops future capture and makes the dashboard detail route unavailable; it does not silently claim older
 turns were captured. API request/response wire bodies, tool arguments/output, commands, account identity and
 unknown attributes remain excluded.
+
+Detail capture accounting and publication share the runtime mutation lock. A bounded per-turn content-free status
+sidecar records the capture result (`ok`, storage budget, busy, size, runtime, or I/O failure), and the localhost panel
+distinguishes capture failure from a turn that was never collected. Raw detail expiry runs at collector startup
+and after an explicit `retention-apply`; status sidecars follow the same bounded count, scan and age policy. An
+expired file therefore does not require another Codex turn to be removed.
 
 The collector transactionally commits source-ordered canonical observations and content-free dispositions
 through the same SQLite authority as manual import. Every current-record mutation, including retention, advances
@@ -179,8 +186,9 @@ The installed configuration is intentionally small:
 
 ~~~json
 {
-  "schema_version": "local_runtime.v2",
+  "schema_version": "local_runtime.v3",
   "enabled": true,
+  "capture_private_codex_turn_details": false,
   "collection": {
     "file_reconcile_interval_ms": 5000,
     "flush_interval_ms": 5000,
@@ -198,6 +206,10 @@ The installed configuration is intentionally small:
 }
 ~~~
 
+The runtime reads strict `local_runtime.v1` and `local_runtime.v2` documents through explicit
+migrations. Both migrate to v3 with private Codex turn-detail capture disabled; v2 remains a frozen
+compatibility schema and current writes always emit v3.
+
 `config set [root] <option> <value>` acquires the runtime singleton, validates the complete updated
 configuration, writes a private temporary file, syncs it, and atomically replaces `config.json`.
 Invalid updates leave the previous bytes unchanged. User-facing names, defaults, and bounds are in
@@ -209,9 +221,10 @@ Invalid updates leave the previous bytes unchanged. User-facing names, defaults,
 - Codex notify payload: raw input at most 64 KiB and a smaller closed projected wire object. Projection happens
   before I/O; one absolute foreground deadline constrains loopback connect, server-authenticated TLS handshake and the HTTP exchange
   before the helper returns a fail-open accepted, rejected or unavailable outcome without waiting for report work.
-- Opt-in Codex private turn detail: one validated JSON artifact per hashed turn ID, each at most 64 KiB, in a
-  private `0700` directory with `0600` files. The directory is pruned under a bounded total policy; this content
-  is not counted as or copied into the canonical report plane.
+- Opt-in Codex private turn detail: one validated JSON artifact and one content-free capture-status sidecar per
+  hashed turn ID, each bounded and stored in private `0700` directories with `0600` files. Both directories are
+  pruned under bounded count, scan and retention policies; raw content is never copied into the canonical report
+  plane.
 - Raw foreground input: at most 1 MiB.
 - Privacy-projected local message: at most 64 KiB.
 - In-process ingress channel: 64 messages, one normalization writer, nonblocking admission. The

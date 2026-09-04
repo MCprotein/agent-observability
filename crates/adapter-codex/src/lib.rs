@@ -28,7 +28,8 @@ pub const MAX_PENDING_OTLP_REQUESTS: usize = 1024;
 pub const MAX_RECENTLY_COMPLETED_OTLP_REQUESTS: usize = 1024;
 pub const MAX_PERSISTED_OTLP_CORRELATION_BYTES: usize = 512 * 1024;
 pub const OTLP_REQUEST_CORRELATION_TTL_MS: u64 = 5 * 60 * 1000;
-pub const PROJECTED_NOTIFY_SCHEMA_VERSION: &str = "codex_projected_notify.v1";
+pub const PROJECTED_NOTIFY_SCHEMA_VERSION: &str = "codex_projected_notify.v2";
+const LEGACY_PROJECTED_NOTIFY_SCHEMA_VERSION: &str = "codex_projected_notify.v1";
 pub const MAX_PROJECTED_NOTIFY_BYTES: usize = MAX_IDENTIFIER_BYTES * 3 + 320;
 pub const MAX_PRIVATE_TURN_DETAIL_BYTES: usize = MAX_HANDOFF_LINE_BYTES;
 pub const PRIVATE_TURN_DETAIL_SCHEMA_VERSION: &str = "agent_observability.private_turn_detail.v1";
@@ -67,11 +68,12 @@ struct RawNotifyPayload {
 /// Strict, bounded privacy projection for a Codex `agent-turn-complete` notification.
 ///
 /// This is the only notify representation that may cross a transport boundary. It contains the
-/// official event discriminator, opaque correlation identifiers, and a bounded cwd basename, but
+/// official event discriminator, opaque correlation identifiers, and a bounded pseudonymous cwd
+/// reference, but
 /// no prompt, response, raw cwd, tool argument, or extension metadata.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectedNotifyV1 {
+pub struct ProjectedNotifyV2 {
     schema_version: String,
     event_name: String,
     thread_id: String,
@@ -79,7 +81,7 @@ pub struct ProjectedNotifyV1 {
     project_name: String,
 }
 
-impl ProjectedNotifyV1 {
+impl ProjectedNotifyV2 {
     fn new(
         event_name: String,
         thread_id: String,
@@ -147,6 +149,28 @@ impl ProjectedNotifyV1 {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct LegacyProjectedNotifyV1 {
+    schema_version: String,
+    event_name: String,
+    thread_id: String,
+    turn_id: String,
+}
+
+impl LegacyProjectedNotifyV1 {
+    fn validate(self) -> Result<Self, AdapterError> {
+        if self.schema_version != LEGACY_PROJECTED_NOTIFY_SCHEMA_VERSION
+            || self.event_name != "agent-turn-complete"
+        {
+            return Err(AdapterError::InvalidSchema);
+        }
+        parse_identifier::<SessionId>(&self.thread_id)?;
+        parse_identifier::<TurnId>(&self.turn_id)?;
+        Ok(self)
+    }
+}
+
 /// Local-only private detail extracted from the official Codex notify payload.
 ///
 /// This value must never be embedded in a source observation, durable record, report, diagnostic,
@@ -174,9 +198,9 @@ impl fmt::Debug for PrivateCodexTurnDetailV1 {
 }
 
 impl PrivateCodexTurnDetailV1 {
-    fn new(payload: RawNotifyPayload) -> Result<(ProjectedNotifyV1, Self), AdapterError> {
+    fn new(payload: RawNotifyPayload) -> Result<(ProjectedNotifyV2, Self), AdapterError> {
         let project_name = project_name_from_cwd(&payload.cwd)?;
-        let projected = ProjectedNotifyV1::new(
+        let projected = ProjectedNotifyV2::new(
             payload.event_name,
             payload.thread_id,
             payload.turn_id.clone(),
@@ -951,10 +975,10 @@ fn project_websocket_replay_identity(
 ///
 /// Returns [`AdapterError`] when the bounded JSON payload is malformed, contains unknown fields,
 /// lacks the supported event or identifiers, or exceeds the projected payload bound.
-pub fn project_notify_json(input: &[u8]) -> Result<ProjectedNotifyV1, AdapterError> {
+pub fn project_notify_json(input: &[u8]) -> Result<ProjectedNotifyV2, AdapterError> {
     let payload = parse_raw_notify(input)?;
     let project_name = project_name_from_cwd(&payload.cwd)?;
-    let projected = ProjectedNotifyV1::new(
+    let projected = ProjectedNotifyV2::new(
         payload.event_name,
         payload.thread_id,
         payload.turn_id,
@@ -971,7 +995,7 @@ pub fn project_notify_json(input: &[u8]) -> Result<ProjectedNotifyV1, AdapterErr
 /// Returns [`AdapterError`] when the official payload or either bounded projection is invalid.
 pub fn project_notify_with_private_detail(
     input: &[u8],
-) -> Result<(ProjectedNotifyV1, PrivateCodexTurnDetailV1), AdapterError> {
+) -> Result<(ProjectedNotifyV2, PrivateCodexTurnDetailV1), AdapterError> {
     let payload = parse_raw_notify(input)?;
     let (projected, detail) = PrivateCodexTurnDetailV1::new(payload)?;
     projected.to_json()?;
@@ -1003,22 +1027,40 @@ pub fn parse_projected_notify_json(
     if input.len() > MAX_PROJECTED_NOTIFY_BYTES {
         return Err(AdapterError::RecordTooLarge);
     }
-    let payload = serde_json::from_slice::<ProjectedNotifyV1>(input)
-        .map_err(|error| match error.classify() {
-            serde_json::error::Category::Data => AdapterError::InvalidSchema,
-            _ => AdapterError::InvalidJson,
-        })?
-        .validate()?;
+    let header: Value = serde_json::from_slice(input).map_err(|error| match error.classify() {
+        serde_json::error::Category::Data => AdapterError::InvalidSchema,
+        _ => AdapterError::InvalidJson,
+    })?;
+    let version = header
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .ok_or(AdapterError::InvalidSchema)?;
+    let (event_name, thread_id, turn_id, project_name) = match version {
+        PROJECTED_NOTIFY_SCHEMA_VERSION => {
+            let payload = serde_json::from_value::<ProjectedNotifyV2>(header)
+                .map_err(|_| AdapterError::InvalidSchema)?
+                .validate()?;
+            (
+                payload.event_name().to_owned(),
+                payload.thread_id().to_owned(),
+                payload.turn_id().to_owned(),
+                Some(payload.project_name().to_owned()),
+            )
+        }
+        LEGACY_PROJECTED_NOTIFY_SCHEMA_VERSION => {
+            let payload = serde_json::from_value::<LegacyProjectedNotifyV1>(header)
+                .map_err(|_| AdapterError::InvalidSchema)?
+                .validate()?;
+            (payload.event_name, payload.thread_id, payload.turn_id, None)
+        }
+        _ => return Err(AdapterError::InvalidSchema),
+    };
     let mut attributes = BTreeMap::new();
-    attributes.insert(
-        "thread_id".into(),
-        Value::String(payload.thread_id().into()),
-    );
-    attributes.insert("turn_id".into(), Value::String(payload.turn_id().into()));
-    attributes.insert(
-        "project_name".into(),
-        Value::String(payload.project_name().into()),
-    );
+    attributes.insert("thread_id".into(), Value::String(thread_id));
+    attributes.insert("turn_id".into(), Value::String(turn_id));
+    if let Some(project_name) = project_name {
+        attributes.insert("project_name".into(), Value::String(project_name));
+    }
     let record = HandoffRecord {
         schema_version: HANDOFF_SCHEMA_VERSION.into(),
         source_generation: source_generation.into(),
@@ -1026,7 +1068,7 @@ pub fn parse_projected_notify_json(
         cursor: cursor.to_string(),
         surface: SourceSurface::Notify,
         received_at_unix_ms,
-        event_name: payload.event_name().into(),
+        event_name,
         attributes,
     };
     let json = serde_json::to_string(&record).map_err(|_| AdapterError::InvalidJson)?;
@@ -2920,6 +2962,19 @@ mod tests {
             parse_projected_notify_json(extended, "generation", None, 1, 123),
             Err(AdapterError::InvalidSchema)
         ));
+    }
+
+    #[test]
+    fn projected_notify_parser_accepts_legacy_v1_without_inventing_project_context() {
+        let legacy = br#"{
+          "schema_version":"codex_projected_notify.v1",
+          "event_name":"agent-turn-complete",
+          "thread_id":"conversation-1",
+          "turn_id":"turn-1"
+        }"#;
+        let batch = parse_projected_notify_json(legacy, "generation", None, 1, 123).unwrap();
+        let turn = batch.observations().next().unwrap();
+        assert!(matches!(turn.event, ObservationEvent::Turn));
     }
 
     #[test]

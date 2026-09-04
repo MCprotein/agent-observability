@@ -1,4 +1,4 @@
-/* Generated from contracts/local-runtime-config-v2.schema.json. Do not edit. */
+/* Generated from contracts/local-runtime-config-v3.schema.json. Do not edit. */
 "use strict";
 (() => {
   // node_modules/lucide/dist/esm/defaultAttributes.mjs
@@ -307,8 +307,8 @@
     }
   };
 
-  // ui/settings/generated/validate-local-runtime-config-v2.js
-  var validate_local_runtime_config_v2_default = validate20;
+  // ui/settings/generated/validate-local-runtime-config-v3.js
+  var validate_local_runtime_config_v3_default = validate20;
   function validate20(data, { instancePath = "", parentData, parentDataProperty, rootData = data, dynamicAnchors = {} } = {}) {
     let vErrors = null;
     let errors = 0;
@@ -322,7 +322,7 @@
     if (errors === 0) {
       if (data && typeof data == "object" && !Array.isArray(data)) {
         let missing0;
-        if (data.schema_version === void 0 && (missing0 = "schema_version") || data.enabled === void 0 && (missing0 = "enabled") || data.collection === void 0 && (missing0 = "collection") || data.retention === void 0 && (missing0 = "retention")) {
+        if (data.schema_version === void 0 && (missing0 = "schema_version") || data.enabled === void 0 && (missing0 = "enabled") || data.capture_private_codex_turn_details === void 0 && (missing0 = "capture_private_codex_turn_details") || data.collection === void 0 && (missing0 = "collection") || data.retention === void 0 && (missing0 = "retention")) {
           validate20.errors = [{ instancePath, schemaPath: "#/required", keyword: "required", params: { missingProperty: missing0 }, message: "must have required property '" + missing0 + "'" }];
           return false;
         } else {
@@ -337,8 +337,8 @@
           if (_errs1 === errors) {
             if (data.schema_version !== void 0) {
               const _errs2 = errors;
-              if ("local_runtime.v2" !== data.schema_version) {
-                validate20.errors = [{ instancePath: instancePath + "/schema_version", schemaPath: "#/properties/schema_version/const", keyword: "const", params: { allowedValue: "local_runtime.v2" }, message: "must be equal to constant" }];
+              if ("local_runtime.v3" !== data.schema_version) {
+                validate20.errors = [{ instancePath: instancePath + "/schema_version", schemaPath: "#/properties/schema_version/const", keyword: "const", params: { allowedValue: "local_runtime.v3" }, message: "must be equal to constant" }];
                 return false;
               }
               var valid0 = _errs2 === errors;
@@ -1356,8 +1356,8 @@
       showToast("\uBE44\uC5B4 \uC788\uAC70\uB098 \uD5C8\uC6A9 \uBC94\uC704\uB97C \uBC97\uC5B4\uB09C \uAC12\uC744 \uD655\uC778\uD558\uC138\uC694.", "error");
       return;
     }
-    if (!validate_local_runtime_config_v2_default(draft)) {
-      const errors = validate_local_runtime_config_v2_default.errors ?? [];
+    if (!validate_local_runtime_config_v3_default(draft)) {
+      const errors = validate_local_runtime_config_v3_default.errors ?? [];
       for (const error of errors) {
         const path = error.instancePath?.replace(/^\//, "").replaceAll("/", ".");
         if (path in fields) showFieldError(path, error.message ?? "\uD5C8\uC6A9 \uBC94\uC704\uB97C \uD655\uC778\uD558\uC138\uC694.");

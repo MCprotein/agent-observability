@@ -2,10 +2,10 @@ use agent_observability_contracts::{
     AgentSource, AgentV1, AttributesV1, ContentV1, ContractError, CostEstimateV1,
     DURABLE_RECORD_FIELDS, DURABLE_RECORD_SCHEMA, DURABLE_RECORD_VERSION, DurableRecordV1,
     MetricsV1, ObservationEvent, ProjectV1, REDACTION_RECORD_FIELDS, REPORT_DTO_FIELDS,
-    REPORT_DTO_SCHEMA, REPORT_DTO_VERSION, RedactionV1, ReportAgentV1, ReportAttributesV1,
-    ReportAvailabilityV1, ReportDtoV1, ReportFiltersV1, ReportMetricsV1, ReportSpanV1,
-    ReportSummaryV1, ScalarValueV1, SourceObservation, StatusV1, TraceSummaryV1,
-    project_durable_record, sanitize_durable_record,
+    REPORT_DTO_SCHEMA, REPORT_DTO_V1_SCHEMA, REPORT_DTO_VERSION, RedactionV1, ReportAgentV1,
+    ReportAttributesV1, ReportAvailabilityV2, ReportDtoV1, ReportDtoV2, ReportFiltersV1,
+    ReportMetricsV1, ReportSpanV2, ReportSummaryV1, ScalarValueV1, SourceObservation, StatusV1,
+    TraceSummaryV1, project_durable_record, sanitize_durable_record,
 };
 use agent_observability_domain::{
     CorrelationIds, DomainSpanState, LifecycleState, ObservationId, SessionId, SourceCursor,
@@ -22,7 +22,7 @@ const CROSS_AGENT_CONTRACT: &[u8] =
 fn javascript_migration_baseline_is_byte_locked() {
     assert_eq!(fnv1a64(CODEX_SOURCE), 0xfae4_e9d6_12ec_5bea);
     assert_eq!(fnv1a64(CLAUDE_SOURCE), 0xcd0f_27e2_36f7_ab05);
-    assert_eq!(fnv1a64(CROSS_AGENT_CONTRACT), 0xea40_6190_5e72_c7af);
+    assert_eq!(fnv1a64(CROSS_AGENT_CONTRACT), 0x100d_f6cb_6a2b_8d97);
 }
 
 #[test]
@@ -47,7 +47,7 @@ fn typed_contracts_preserve_complete_boundary_versions() {
         content: ContentV1::default(),
         redaction: RedactionV1::default(),
     };
-    let report = ReportDtoV1 {
+    let report = ReportDtoV2 {
         schema_version: REPORT_DTO_VERSION.into(),
         generated_at: "2026-08-28T00:00:00.000Z".into(),
         title: "Golden".into(),
@@ -95,7 +95,7 @@ fn typed_contracts_preserve_complete_boundary_versions() {
     });
     assert!(non_finite_trace.validate().is_err());
     let mut non_finite_span = report.clone();
-    non_finite_span.spans.push(ReportSpanV1 {
+    non_finite_span.spans.push(ReportSpanV2 {
         schema_version: DURABLE_RECORD_VERSION.into(),
         trace_id: "trace".into(),
         span_id: "span".into(),
@@ -107,7 +107,7 @@ fn typed_contracts_preserve_complete_boundary_versions() {
         end_time_unix_ms: Some(f64::INFINITY),
         repo: String::new(),
         agent: ReportAgentV1::default(),
-        availability: ReportAvailabilityV1::default(),
+        availability: ReportAvailabilityV2::default(),
         session_id: None,
         turn_id: None,
         tool_name: None,
@@ -449,7 +449,7 @@ fn durable_json_is_schema_shaped_and_round_trips() {
 
 #[test]
 fn report_json_uses_camel_case_and_omits_optional_nested_fields() {
-    let report = ReportDtoV1 {
+    let report = ReportDtoV2 {
         schema_version: REPORT_DTO_VERSION.into(),
         generated_at: "2026-08-28T00:00:00.000Z".into(),
         title: "Golden".into(),
@@ -471,7 +471,7 @@ fn report_json_uses_camel_case_and_omits_optional_nested_fields() {
     assert_eq!(value["summary"]["generatedSpans"], 1);
     assert!(value["summary"].get("generated_spans").is_none());
     assert!(value["cost"].get("reason").is_none());
-    let decoded: ReportDtoV1 = serde_json::from_value(value).expect("report deserializes");
+    let decoded: ReportDtoV2 = serde_json::from_value(value).expect("report deserializes");
     assert_eq!(decoded, report);
     let mut legacy = serde_json::to_value(&report).expect("legacy report serializes");
     let filters = legacy["filters"]
@@ -479,9 +479,105 @@ fn report_json_uses_camel_case_and_omits_optional_nested_fields() {
         .expect("filters are an object");
     filters.remove("agents");
     filters.remove("models");
-    let decoded: ReportDtoV1 =
+    let decoded: ReportDtoV2 =
         serde_json::from_value(legacy).expect("pre-v0.12 report deserializes");
     assert_eq!(decoded, report);
+}
+
+#[test]
+fn strict_v1_report_fixture_migrates_to_explicit_v2_availability() {
+    let fixture = include_str!("../../../contracts/report-dto-v1.compatibility.fixture.json");
+    let legacy: ReportDtoV1 = serde_json::from_str(fixture).expect("strict v1 fixture parses");
+    legacy.validate().expect("strict v1 fixture validates");
+    let mut changed: serde_json::Value = serde_json::from_str(fixture).unwrap();
+    changed["spans"][0]["availability"] = serde_json::json!({});
+    assert!(serde_json::from_value::<ReportDtoV1>(changed).is_err());
+
+    let migrated = ReportDtoV2::try_from(legacy).expect("v1 report migrates");
+    assert_eq!(migrated.schema_version, REPORT_DTO_VERSION);
+    let availability = &migrated.spans[0].availability;
+    for field in [
+        &availability.repository,
+        &availability.turn,
+        &availability.model,
+        &availability.tokens,
+        &availability.latency,
+        &availability.source_location,
+        &availability.request_content,
+        &availability.response_content,
+    ] {
+        assert_eq!(field.reason, "legacy_v1_report");
+    }
+    assert!(REPORT_DTO_V1_SCHEMA.contains("agent_observability.report.v1"));
+    assert!(!REPORT_DTO_V1_SCHEMA.contains("availability"));
+}
+
+#[test]
+fn report_v2_fixture_matches_availability_parity_corpus() {
+    let fixture = include_str!("../../../contracts/report-dto-v2.fixture.json");
+    let report: ReportDtoV2 = serde_json::from_str(fixture).expect("v2 fixture parses");
+    report.validate().expect("v2 fixture validates");
+    let cases: serde_json::Value =
+        serde_json::from_str(include_str!("../../../contracts/report-dto-v2.parity.json")).unwrap();
+    for case in cases.as_array().unwrap() {
+        let mut document: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        apply_json_parity_case(&mut document, case);
+        let accepted = serde_json::from_value::<ReportDtoV2>(document)
+            .is_ok_and(|report| report.validate().is_ok());
+        assert_eq!(
+            accepted,
+            case["valid"].as_bool().unwrap(),
+            "{}",
+            case["name"]
+        );
+    }
+}
+
+#[test]
+fn report_v2_rejects_token_availability_that_contradicts_metrics() {
+    let fixture = include_str!("../../../contracts/report-dto-v2.fixture.json");
+    let report: ReportDtoV2 = serde_json::from_str(fixture).expect("v2 fixture parses");
+
+    let mut unavailable_with_metrics = report.clone();
+    unavailable_with_metrics.spans[0].availability.tokens.state =
+        agent_observability_contracts::AvailabilityStateV2::SourceUnavailable;
+    assert_eq!(
+        unavailable_with_metrics.validate(),
+        Err(ContractError::ContradictoryReportAvailability)
+    );
+
+    let mut available_without_metrics = report;
+    available_without_metrics.spans[0].metrics = ReportMetricsV1::default();
+    assert_eq!(
+        available_without_metrics.validate(),
+        Err(ContractError::ContradictoryReportAvailability)
+    );
+}
+
+fn apply_json_parity_case(document: &mut serde_json::Value, case: &serde_json::Value) {
+    let path = case["path"].as_array().unwrap();
+    if path.is_empty() {
+        return;
+    }
+    let pointer = path[..path.len() - 1]
+        .iter()
+        .map(|segment| segment.as_str().unwrap())
+        .fold(String::new(), |mut pointer, segment| {
+            pointer.push('/');
+            pointer.push_str(segment);
+            pointer
+        });
+    let parent = document.pointer_mut(&pointer).unwrap();
+    let field = path.last().unwrap().as_str().unwrap();
+    match (case["operation"].as_str().unwrap(), parent) {
+        ("set", serde_json::Value::Object(object)) => {
+            object.insert(field.into(), case["value"].clone());
+        }
+        ("remove", serde_json::Value::Object(object)) => {
+            object.remove(field);
+        }
+        (operation, _) => panic!("unsupported parity operation: {operation}"),
+    }
 }
 
 #[test]

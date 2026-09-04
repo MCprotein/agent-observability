@@ -10,7 +10,7 @@ use agent_observability_application::ReportProjector;
 #[cfg(test)]
 use agent_observability_application::project_report;
 use agent_observability_local_runtime::{
-    Admission, InstalledLayout, LocalRuntimeConfigV2, MutationGuard, PressureSample,
+    Admission, InstalledLayout, LocalRuntimeConfigV3, MutationGuard, PressureSample,
     RuntimeControl, Singleton, SingletonError, StorageBudget, install, load,
 };
 use agent_observability_local_store::{LocalStore, StoreBatchItem};
@@ -77,7 +77,10 @@ const MAX_CREDENTIAL_PATH_BYTES: usize = 256;
 static SETTINGS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const REPORT_DIRTY_FILE_NAME: &str = "report-dirty";
 const PRIVATE_TURN_DETAIL_DIRECTORY: &str = "private-codex-turn-details";
+const PRIVATE_TURN_DETAIL_STATUS_DIRECTORY: &str = "private-codex-turn-detail-statuses";
+const PRIVATE_TURN_DETAIL_STATUS_VERSION: &str = "private_codex_turn_detail_status.v1";
 const MAX_PRIVATE_TURN_DETAIL_FILES: usize = 1_024;
+const MAX_PRIVATE_TURN_DETAIL_STATUS_BYTES: u64 = 1_024;
 const MAX_PRIVATE_TURN_DETAIL_SCAN_ENTRIES: usize = 4_096;
 const REPORT_RETRY_LIMIT: u32 = 4;
 const REPORT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
@@ -240,6 +243,22 @@ pub enum HealthOutcome {
     Ready,
     Degraded,
     Unavailable,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum PrivateTurnDetailLookup {
+    Available(Vec<u8>),
+    NotCollected,
+    Failed(&'static str),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateTurnDetailCaptureStatusV1 {
+    schema_version: String,
+    turn_id: String,
+    state: String,
+    code: String,
 }
 
 #[derive(Debug)]
@@ -1342,6 +1361,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let singleton = Singleton::acquire(&layout.runtime.join("collector")).map_err(runtime_error)?;
     let mutation = try_collector_mutation(&layout.runtime)?;
     let config = load(&layout.config).map_err(runtime_error)?;
+    maintain_private_turn_details_locked(&layout, &config, SystemTime::now())?;
     let store = open_store(&mutation, &layout, &config)?;
     let report_status = store.report_status().map_err(runtime_error)?;
     let report_missing = !layout.logs.join(REPORT_FILE_NAME).is_file();
@@ -1884,7 +1904,7 @@ fn try_collector_mutation(runtime: &Path) -> Result<MutationGuard, CollectorErro
 fn admit_request(
     state: &CollectorState,
     body_bytes: usize,
-) -> Result<Option<LocalRuntimeConfigV2>, IngestError> {
+) -> Result<Option<LocalRuntimeConfigV3>, IngestError> {
     let config = load(&state.layout.config).map_err(runtime_error)?;
     if !config.enabled {
         return Ok(None);
@@ -1927,7 +1947,7 @@ fn admit_request(
 
 fn enforce_batch_policy(
     batch: &AdapterBatch,
-    config: &LocalRuntimeConfigV2,
+    config: &LocalRuntimeConfigV3,
 ) -> Result<(), IngestError> {
     if batch.items.len() > usize::from(config.collection.max_batch_records) {
         return Err(IngestError::Policy);
@@ -2242,15 +2262,18 @@ pub fn submit_notify(root: &Path, payload: &[u8]) -> NotifyOutcome {
     let Ok(body) = serde_json::to_vec(&projected) else {
         return NotifyOutcome::Rejected;
     };
-    if let Ok(config) = load(&root.join("config.json"))
-        && config.enabled
-        && config.capture_private_codex_turn_details
-        && let Ok(layout) = install(root).map_err(runtime_error)
-        && let Ok((_, private_detail)) = project_notify_with_private_detail(payload)
-    {
-        let _ = persist_private_turn_detail(&layout, &private_detail, &config);
-    }
-    match authenticated_request(
+    let capture_status_publication_failed = load(&root.join("config.json")).is_ok_and(|config| {
+        config.enabled
+            && config.capture_private_codex_turn_details
+            && (|| {
+                let layout = install(root).map_err(runtime_error)?;
+                let (_, private_detail) =
+                    project_notify_with_private_detail(payload).map_err(runtime_error)?;
+                capture_private_turn_detail(&layout, &private_detail, &config)
+            })()
+            .is_err()
+    });
+    let notify_outcome = match authenticated_request(
         root,
         "POST",
         "/v1/notify",
@@ -2261,36 +2284,119 @@ pub fn submit_notify(root: &Path, payload: &[u8]) -> NotifyOutcome {
         Ok(response) if response.status == 200 => NotifyOutcome::Accepted,
         Ok(_) => NotifyOutcome::Rejected,
         Err(_) => NotifyOutcome::Unavailable,
+    };
+    if capture_status_publication_failed {
+        NotifyOutcome::Unavailable
+    } else {
+        notify_outcome
     }
 }
 
 /// Reads one opt-in private Codex turn detail by the same hashed turn ID emitted in reports.
 pub fn read_private_turn_detail(root: &Path, turn_id: &str) -> Result<Vec<u8>, CollectorError> {
-    let config = load(&root.join("config.json")).map_err(runtime_error)?;
-    if !config.enabled || !config.capture_private_codex_turn_details {
-        return Err(CollectorError::Runtime(
-            "private turn detail is unavailable".into(),
-        ));
+    match lookup_private_turn_detail(root, turn_id) {
+        PrivateTurnDetailLookup::Available(bytes) => Ok(bytes),
+        PrivateTurnDetailLookup::NotCollected => Err(CollectorError::Runtime(
+            "private turn detail was not collected".into(),
+        )),
+        PrivateTurnDetailLookup::Failed(code) => Err(CollectorError::Runtime(format!(
+            "private turn detail unavailable: {code}"
+        ))),
     }
-    let directory = root.join("state").join(PRIVATE_TURN_DETAIL_DIRECTORY);
-    validate_private_directory_tree(&root.join("state"), &directory)?;
-    let path = private_turn_detail_path(&directory, turn_id)?;
-    let max_detail_bytes = u64::try_from(MAX_PRIVATE_TURN_DETAIL_BYTES)
-        .map_err(|_| CollectorError::Runtime("private detail size bound overflow".into()))?;
-    let bytes = read_private_bounded(&path, max_detail_bytes)?;
-    let detail = PrivateCodexTurnDetailV1::from_json(&bytes).map_err(runtime_error)?;
-    if detail.turn_id() != turn_id {
-        return Err(CollectorError::Runtime(
-            "private turn detail identity mismatch".into(),
-        ));
-    }
-    Ok(bytes)
 }
 
+#[must_use]
+pub fn lookup_private_turn_detail(root: &Path, turn_id: &str) -> PrivateTurnDetailLookup {
+    match lookup_private_turn_detail_inner(root, turn_id) {
+        Ok(Some(bytes)) => PrivateTurnDetailLookup::Available(bytes),
+        Ok(None) => PrivateTurnDetailLookup::NotCollected,
+        Err(code) => PrivateTurnDetailLookup::Failed(code),
+    }
+}
+
+fn lookup_private_turn_detail_inner(
+    root: &Path,
+    turn_id: &str,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    let config = load(&root.join("config.json")).map_err(|_| "config_unavailable")?;
+    if !config.enabled || !config.capture_private_codex_turn_details {
+        return Ok(None);
+    }
+    let directory = root.join("state").join(PRIVATE_TURN_DETAIL_DIRECTORY);
+    match fs::symlink_metadata(&directory) {
+        Ok(_) => validate_private_directory_tree(&root.join("state"), &directory)
+            .map_err(|_| "storage_unavailable")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match read_private_turn_detail_status(root, turn_id) {
+                Some(code) if code != "ok" => Err(code),
+                _ => Ok(None),
+            };
+        }
+        Err(_) => return Err("storage_unavailable"),
+    }
+    let path = private_turn_detail_path(&directory, turn_id).map_err(|_| "invalid_turn_id")?;
+    let max_detail_bytes =
+        u64::try_from(MAX_PRIVATE_TURN_DETAIL_BYTES).map_err(|_| "size_bound")?;
+    let bytes = match read_private_bounded(&path, max_detail_bytes) {
+        Ok(bytes) => bytes,
+        Err(CollectorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match read_private_turn_detail_status(root, turn_id) {
+                Some(code) if code != "ok" => Err(code),
+                _ => Ok(None),
+            };
+        }
+        Err(_) => return Err("storage_unavailable"),
+    };
+    let detail = PrivateCodexTurnDetailV1::from_json(&bytes).map_err(|_| "artifact_invalid")?;
+    if detail.turn_id() != turn_id {
+        return Err("artifact_invalid");
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(test)]
 fn persist_private_turn_detail(
     layout: &InstalledLayout,
     detail: &PrivateCodexTurnDetailV1,
-    config: &LocalRuntimeConfigV2,
+    config: &LocalRuntimeConfigV3,
+) -> Result<(), CollectorError> {
+    let _mutation = MutationGuard::try_acquire(&layout.runtime).map_err(runtime_error)?;
+    persist_private_turn_detail_locked(layout, detail, config, 0)
+}
+
+fn capture_private_turn_detail(
+    layout: &InstalledLayout,
+    detail: &PrivateCodexTurnDetailV1,
+    config: &LocalRuntimeConfigV3,
+) -> Result<(), CollectorError> {
+    let _mutation = MutationGuard::try_acquire(&layout.runtime).map_err(runtime_error)?;
+    let result = persist_private_turn_detail_locked(
+        layout,
+        detail,
+        config,
+        MAX_PRIVATE_TURN_DETAIL_STATUS_BYTES,
+    );
+    let code = result
+        .as_ref()
+        .map_or_else(|error| private_turn_detail_error_code(error), |()| "ok");
+    write_private_turn_detail_status_locked(
+        layout,
+        detail.turn_id(),
+        if result.is_ok() {
+            "available"
+        } else {
+            "failed"
+        },
+        code,
+        config,
+    )
+}
+
+fn persist_private_turn_detail_locked(
+    layout: &InstalledLayout,
+    detail: &PrivateCodexTurnDetailV1,
+    config: &LocalRuntimeConfigV3,
+    additional_reservation: u64,
 ) -> Result<(), CollectorError> {
     let directory = layout.state.join(PRIVATE_TURN_DETAIL_DIRECTORY);
     ensure_private_directory_tree(&layout.state, &directory)?;
@@ -2303,9 +2409,11 @@ fn persist_private_turn_detail(
         Err(error) => return Err(error.into()),
     }
     let bytes = detail.to_json().map_err(runtime_error)?;
-    prune_private_turn_details(&directory, &path, config, SystemTime::now())?;
+    prune_private_turn_details(&directory, Some(&path), config, SystemTime::now())?;
     let reservation = u64::try_from(MAX_PRIVATE_TURN_DETAIL_BYTES)
-        .map_err(|_| CollectorError::Runtime("private detail size bound overflow".into()))?;
+        .map_err(|_| CollectorError::Runtime("private detail size bound overflow".into()))?
+        .checked_add(additional_reservation)
+        .ok_or_else(|| CollectorError::Runtime("private detail size bound overflow".into()))?;
     let control = RuntimeControl::new(config).map_err(runtime_error)?;
     if control
         .admit(&layout.root, reservation)
@@ -2339,8 +2447,8 @@ fn persist_private_turn_detail(
 
 fn prune_private_turn_details(
     directory: &Path,
-    replacement: &Path,
-    config: &LocalRuntimeConfigV2,
+    replacement: Option<&Path>,
+    config: &LocalRuntimeConfigV3,
     now: SystemTime,
 ) -> Result<(), CollectorError> {
     prune_private_turn_details_with_limit(
@@ -2354,10 +2462,30 @@ fn prune_private_turn_details(
 
 fn prune_private_turn_details_with_limit(
     directory: &Path,
-    replacement: &Path,
-    config: &LocalRuntimeConfigV2,
+    replacement: Option<&Path>,
+    config: &LocalRuntimeConfigV3,
     now: SystemTime,
     max_files: usize,
+) -> Result<(), CollectorError> {
+    let max_detail_bytes = u64::try_from(MAX_PRIVATE_TURN_DETAIL_BYTES)
+        .map_err(|_| CollectorError::Runtime("private detail size bound overflow".into()))?;
+    prune_private_turn_files_with_limit(
+        directory,
+        replacement,
+        config,
+        now,
+        max_files,
+        max_detail_bytes,
+    )
+}
+
+fn prune_private_turn_files_with_limit(
+    directory: &Path,
+    replacement: Option<&Path>,
+    config: &LocalRuntimeConfigV3,
+    now: SystemTime,
+    max_files: usize,
+    max_file_bytes: u64,
 ) -> Result<(), CollectorError> {
     if max_files == 0 || max_files > MAX_PRIVATE_TURN_DETAIL_FILES {
         return Err(CollectorError::Runtime(
@@ -2369,8 +2497,6 @@ fn prune_private_turn_details_with_limit(
             .checked_mul(24 * 60 * 60)
             .ok_or_else(|| CollectorError::Runtime("private detail retention overflow".into()))?,
     );
-    let max_detail_bytes = u64::try_from(MAX_PRIVATE_TURN_DETAIL_BYTES)
-        .map_err(|_| CollectorError::Runtime("private detail size bound overflow".into()))?;
     let mut retained = Vec::new();
     let mut expired = Vec::new();
     for (index, entry) in fs::read_dir(directory)?.enumerate() {
@@ -2381,7 +2507,7 @@ fn prune_private_turn_details_with_limit(
         }
         let entry = entry?;
         let path = entry.path();
-        if path == replacement {
+        if replacement.is_some_and(|replacement| path == replacement) {
             continue;
         }
         if path
@@ -2390,7 +2516,7 @@ fn prune_private_turn_details_with_limit(
         {
             let file = open_private_read(&path)?;
             let metadata = file.metadata()?;
-            if metadata.len() > max_detail_bytes {
+            if metadata.len() > max_file_bytes {
                 return Err(CollectorError::Runtime(
                     "private turn detail temporary exceeds size bound".into(),
                 ));
@@ -2415,7 +2541,7 @@ fn prune_private_turn_details_with_limit(
         let _ = private_turn_detail_path(directory, &format!("id:sha256:{digest}"))?;
         let file = open_private_read(&path)?;
         let metadata = file.metadata()?;
-        if metadata.len() > max_detail_bytes {
+        if metadata.len() > max_file_bytes {
             return Err(CollectorError::Runtime(
                 "private turn detail exceeds size bound".into(),
             ));
@@ -2428,7 +2554,8 @@ fn prune_private_turn_details_with_limit(
         }
     }
     retained.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    for (_, path) in retained.into_iter().skip(max_files - 1) {
+    let retained_limit = max_files.saturating_sub(usize::from(replacement.is_some()));
+    for (_, path) in retained.into_iter().skip(retained_limit) {
         expired.push(path);
     }
     if expired.is_empty() {
@@ -2439,6 +2566,146 @@ fn prune_private_turn_details_with_limit(
     }
     File::open(directory)?.sync_all()?;
     Ok(())
+}
+
+/// Applies the configured age/count policy to local-only raw Codex detail files.
+///
+/// This is invoked at collector startup and by explicit retention apply, so expiry does not depend
+/// on a subsequent private capture.
+pub fn maintain_private_turn_details(root: &Path) -> Result<(), CollectorError> {
+    let layout = install(root).map_err(runtime_error)?;
+    let config = load(&layout.config).map_err(runtime_error)?;
+    let _mutation = MutationGuard::acquire(&layout.runtime).map_err(runtime_error)?;
+    maintain_private_turn_details_locked(&layout, &config, SystemTime::now())
+}
+
+fn maintain_private_turn_details_locked(
+    layout: &InstalledLayout,
+    config: &LocalRuntimeConfigV3,
+    now: SystemTime,
+) -> Result<(), CollectorError> {
+    let directory = layout.state.join(PRIVATE_TURN_DETAIL_DIRECTORY);
+    maintain_private_turn_directory_locked(layout, &directory, config, now, None)?;
+    let status_directory = private_turn_detail_status_directory(layout);
+    maintain_private_turn_directory_locked(
+        layout,
+        &status_directory,
+        config,
+        now,
+        Some(MAX_PRIVATE_TURN_DETAIL_STATUS_BYTES),
+    )
+}
+
+fn maintain_private_turn_directory_locked(
+    layout: &InstalledLayout,
+    directory: &Path,
+    config: &LocalRuntimeConfigV3,
+    now: SystemTime,
+    max_file_bytes: Option<u64>,
+) -> Result<(), CollectorError> {
+    match fs::symlink_metadata(directory) {
+        Ok(_) => validate_private_directory_tree(&layout.state, directory)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(max_file_bytes) = max_file_bytes {
+        prune_private_turn_files_with_limit(
+            directory,
+            None,
+            config,
+            now,
+            MAX_PRIVATE_TURN_DETAIL_FILES,
+            max_file_bytes,
+        )
+    } else {
+        prune_private_turn_details(directory, None, config, now)
+    }
+}
+
+fn private_turn_detail_error_code(error: &CollectorError) -> &'static str {
+    match error {
+        CollectorError::Runtime(message) if message.contains("storage budget") => "storage_budget",
+        CollectorError::Runtime(message) if message.contains("already running") => "busy",
+        CollectorError::Runtime(message) if message.contains("size") => "size_bound",
+        CollectorError::Runtime(_) => "runtime_error",
+        CollectorError::Io(_) | CollectorError::RequestIo { .. } => "io_error",
+    }
+}
+
+fn private_turn_detail_status_directory(layout: &InstalledLayout) -> PathBuf {
+    layout.state.join(PRIVATE_TURN_DETAIL_STATUS_DIRECTORY)
+}
+
+fn private_turn_detail_status_path(
+    directory: &Path,
+    turn_id: &str,
+) -> Result<PathBuf, CollectorError> {
+    private_turn_detail_path(directory, turn_id)
+}
+
+fn write_private_turn_detail_status_locked(
+    layout: &InstalledLayout,
+    turn_id: &str,
+    state: &str,
+    code: &str,
+    config: &LocalRuntimeConfigV3,
+) -> Result<(), CollectorError> {
+    let directory = private_turn_detail_status_directory(layout);
+    ensure_private_directory_tree(&layout.state, &directory)?;
+    let path = private_turn_detail_status_path(&directory, turn_id)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let _ = open_private_read(&path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    prune_private_turn_files_with_limit(
+        &directory,
+        Some(&path),
+        config,
+        SystemTime::now(),
+        MAX_PRIVATE_TURN_DETAIL_FILES,
+        MAX_PRIVATE_TURN_DETAIL_STATUS_BYTES,
+    )?;
+    let control = RuntimeControl::new(config).map_err(runtime_error)?;
+    if control
+        .admit(&layout.root, MAX_PRIVATE_TURN_DETAIL_STATUS_BYTES)
+        .map_err(runtime_error)?
+        == Admission::Denied
+    {
+        return Err(CollectorError::Runtime(
+            "private turn detail status exceeds local storage budget".into(),
+        ));
+    }
+    let status = PrivateTurnDetailCaptureStatusV1 {
+        schema_version: PRIVATE_TURN_DETAIL_STATUS_VERSION.into(),
+        turn_id: turn_id.into(),
+        state: state.into(),
+        code: code.into(),
+    };
+    write_private_json(&path, &status)
+}
+
+fn read_private_turn_detail_status(root: &Path, turn_id: &str) -> Option<&'static str> {
+    let state = root.join("state");
+    let directory = state.join(PRIVATE_TURN_DETAIL_STATUS_DIRECTORY);
+    validate_private_directory_tree(&state, &directory).ok()?;
+    let path = private_turn_detail_status_path(&directory, turn_id).ok()?;
+    let bytes = read_private_bounded(&path, MAX_PRIVATE_TURN_DETAIL_STATUS_BYTES).ok()?;
+    let status: PrivateTurnDetailCaptureStatusV1 = serde_json::from_slice(&bytes).ok()?;
+    if status.schema_version != PRIVATE_TURN_DETAIL_STATUS_VERSION || status.turn_id != turn_id {
+        return None;
+    }
+    match status.code.as_str() {
+        "ok" => Some("ok"),
+        "storage_budget" => Some("storage_budget"),
+        "busy" => Some("busy"),
+        "size_bound" => Some("size_bound"),
+        "runtime_error" => Some("runtime_error"),
+        "io_error" => Some("io_error"),
+        _ => None,
+    }
 }
 
 fn private_turn_detail_path(directory: &Path, turn_id: &str) -> Result<PathBuf, CollectorError> {
@@ -2760,7 +3027,7 @@ fn refresh_report(
 fn open_store(
     _mutation: &MutationGuard,
     layout: &InstalledLayout,
-    config: &LocalRuntimeConfigV2,
+    config: &LocalRuntimeConfigV3,
 ) -> Result<LocalStore, CollectorError> {
     let control = RuntimeControl::new(config).map_err(runtime_error)?;
     let headroom = control
@@ -2842,16 +3109,20 @@ mod tests {
     use super::{
         AUTH_HEADER_NAME, AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome,
         OtlpRejectionCategory, OtlpRequestCorrelationState, OtlpSubmissionOutcome,
-        REPORT_FILE_NAME, ReportFailure, admit_request, authenticated_request, build_client_config,
-        build_server_config, classify_otlp_rejection, enforce_batch_policy, ingest_locked,
-        ingest_notify_locked, install_settings, is_json, load_settings, open_store,
-        parse_complete_http_response, persist_private_turn_detail, private_turn_detail_path,
-        project_report, prune_private_turn_details_with_limit, read_private_snapshot,
-        read_private_turn_detail, reconcile_report_state, recover_occupied_persisted_port,
+        PrivateTurnDetailLookup, REPORT_FILE_NAME, ReportFailure, admit_request,
+        authenticated_request, build_client_config, build_server_config,
+        capture_private_turn_detail, classify_otlp_rejection, enforce_batch_policy,
+        ensure_private_directory_tree, ingest_locked, ingest_notify_locked, install_settings,
+        is_json, load_settings, lookup_private_turn_detail, maintain_private_turn_details_locked,
+        open_store, parse_complete_http_response, persist_private_turn_detail,
+        private_turn_detail_error_code, private_turn_detail_path,
+        private_turn_detail_status_directory, project_report,
+        prune_private_turn_details_with_limit, read_private_snapshot, read_private_turn_detail,
+        read_private_turn_detail_status, reconcile_report_state, recover_occupied_persisted_port,
         refresh_report_from_root, report_dirty_path, router, schedule_report_refresh,
         settings_path, submit_notify, submit_otlp_json_outcome, timestamp_from_unix_ms,
         token_matches, watch_report_authority, write_private, write_private_json,
-        write_private_json_if_unchanged,
+        write_private_json_if_unchanged, write_private_turn_detail_status_locked,
     };
     use agent_observability_adapter_codex::{
         MAX_HANDOFF_BYTES, parse_otlp_http_json, project_notify_with_private_detail,
@@ -2993,7 +3264,7 @@ mod tests {
 
     fn open_store_for_test(
         layout: &agent_observability_local_runtime::InstalledLayout,
-        config: &agent_observability_local_runtime::LocalRuntimeConfigV2,
+        config: &agent_observability_local_runtime::LocalRuntimeConfigV3,
     ) -> agent_observability_local_store::LocalStore {
         let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
         open_store(&mutation, layout, config).unwrap()
@@ -3141,7 +3412,7 @@ mod tests {
 
     fn projected_notify(thread: &str, turn: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
-            "schema_version": "codex_projected_notify.v1",
+            "schema_version": "codex_projected_notify.v2",
             "event_name": "agent-turn-complete",
             "thread_id": thread,
             "turn_id": turn,
@@ -4147,6 +4418,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn private_turn_detail_status_publication_failure_is_observable_in_notify_outcome() {
+        let root = test_root("private-turn-detail-status-publication-failure");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let status_directory = private_turn_detail_status_directory(&layout);
+        write_private_test_file(&status_directory, b"not-a-directory");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (server_config, _) = test_tls_configs(&root);
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            configure_port(&root, listener.local_addr().unwrap().port());
+            let transport =
+                super::TransportListener::new(listener, server_config, Duration::from_secs(1), 2);
+            let state = app_state(&root);
+            let app = router(state.clone());
+            let server = tokio::spawn(async move { axum::serve(transport, app).await });
+            tokio::task::yield_now().await;
+
+            let notify_root = root.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                submit_notify(
+                    &notify_root,
+                    &raw_notify("thread-status-failure", "turn-status-failure"),
+                )
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(outcome, NotifyOutcome::Unavailable);
+            assert_eq!(state.collector.lock().await.accepted_requests, 1);
+            server.abort();
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn private_turn_detail_pruning_keeps_the_replacement_inside_the_file_bound() {
         let root = test_root("private-turn-detail-prune");
         let _ = fs::remove_dir_all(&root);
@@ -4165,7 +4480,7 @@ mod tests {
 
         prune_private_turn_details_with_limit(
             &directory,
-            &paths[0],
+            Some(&paths[0]),
             &config,
             std::time::SystemTime::now(),
             2,
@@ -4187,7 +4502,7 @@ mod tests {
 
         prune_private_turn_details_with_limit(
             &directory,
-            &paths[0],
+            Some(&paths[0]),
             &config,
             std::time::SystemTime::now() + Duration::from_hours(31 * 24),
             2,
@@ -4205,6 +4520,123 @@ mod tests {
             .count();
         assert_eq!(retained_after_age_prune, 1);
         assert!(paths[0].is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_turn_detail_maintenance_expires_without_a_later_capture_at_exact_boundary() {
+        let root = test_root("private-turn-detail-maintenance");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let config = load(&layout.config).unwrap();
+        let (_, detail) =
+            project_notify_with_private_detail(&raw_notify("thread-expire", "turn-expire"))
+                .unwrap();
+        persist_private_turn_detail(&layout, &detail, &config).unwrap();
+        let directory = layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY);
+        let path = private_turn_detail_path(&directory, detail.turn_id()).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let max_age =
+            Duration::from_secs(u64::from(config.retention.max_record_age_days) * 24 * 60 * 60);
+
+        maintain_private_turn_details_locked(&layout, &config, modified + max_age).unwrap();
+        assert!(path.is_file(), "the exact retention boundary is inclusive");
+
+        maintain_private_turn_details_locked(
+            &layout,
+            &config,
+            modified + max_age + Duration::from_nanos(1),
+        )
+        .unwrap();
+        assert!(
+            !path.exists(),
+            "startup/retention maintenance expires detail without another capture"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_turn_detail_capture_lock_serializes_accounting_and_publication() {
+        let root = test_root("private-turn-detail-concurrent-lock");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let config = load(&layout.config).unwrap();
+        let (_, detail) =
+            project_notify_with_private_detail(&raw_notify("thread-lock", "turn-lock")).unwrap();
+        let guard = MutationGuard::acquire(&layout.runtime).unwrap();
+        let error = capture_private_turn_detail(&layout, &detail, &config).unwrap_err();
+        assert_eq!(private_turn_detail_error_code(&error), "busy");
+        assert_eq!(
+            read_private_turn_detail_status(&root, detail.turn_id()),
+            None
+        );
+        drop(guard);
+        capture_private_turn_detail(&layout, &detail, &config).unwrap();
+        assert!(read_private_turn_detail(&root, detail.turn_id()).is_ok());
+        assert_eq!(
+            read_private_turn_detail_status(&root, detail.turn_id()),
+            Some("ok")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_turn_detail_lookup_distinguishes_not_collected_capture_failure_and_corruption() {
+        let root = test_root("private-turn-detail-health");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let (_, detail) =
+            project_notify_with_private_detail(&raw_notify("thread-health", "turn-health"))
+                .unwrap();
+        let (_, other_detail) =
+            project_notify_with_private_detail(&raw_notify("thread-health", "turn-other")).unwrap();
+        assert_eq!(
+            lookup_private_turn_detail(&root, detail.turn_id()),
+            PrivateTurnDetailLookup::NotCollected
+        );
+
+        let config = load(&layout.config).unwrap();
+        let guard = MutationGuard::acquire(&layout.runtime).unwrap();
+        write_private_turn_detail_status_locked(
+            &layout,
+            detail.turn_id(),
+            "failed",
+            "storage_budget",
+            &config,
+        )
+        .unwrap();
+        write_private_turn_detail_status_locked(
+            &layout,
+            other_detail.turn_id(),
+            "failed",
+            "io_error",
+            &config,
+        )
+        .unwrap();
+        drop(guard);
+        assert_eq!(
+            lookup_private_turn_detail(&root, detail.turn_id()),
+            PrivateTurnDetailLookup::Failed("storage_budget")
+        );
+        assert_eq!(
+            lookup_private_turn_detail(&root, other_detail.turn_id()),
+            PrivateTurnDetailLookup::Failed("io_error")
+        );
+
+        let directory = layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY);
+        ensure_private_directory_tree(&layout.state, &directory).unwrap();
+        let path = private_turn_detail_path(&directory, detail.turn_id()).unwrap();
+        write_private_test_file(&path, b"{broken");
+        assert_eq!(
+            lookup_private_turn_detail(&root, detail.turn_id()),
+            PrivateTurnDetailLookup::Failed("artifact_invalid")
+        );
         let _ = fs::remove_dir_all(root);
     }
 

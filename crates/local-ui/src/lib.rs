@@ -6,9 +6,11 @@ use agent_observability_codex_integration::{
     disconnect as disconnect_codex, status as codex_status,
 };
 use agent_observability_contracts::MAX_REPORT_ARTIFACT_BYTES;
-use agent_observability_local_collector::{REPORT_FILE_NAME, read_private_turn_detail};
+use agent_observability_local_collector::{
+    PrivateTurnDetailLookup, REPORT_FILE_NAME, lookup_private_turn_detail,
+};
 use agent_observability_local_runtime::{
-    ConfigServiceError, InstalledLayout, LocalConfigService, LocalRuntimeConfigV2, Singleton,
+    ConfigServiceError, InstalledLayout, LocalConfigService, LocalRuntimeConfigV3, Singleton,
     VersionedLocalConfig,
 };
 use axum::{
@@ -328,8 +330,8 @@ struct DashboardState {
 
 #[derive(Debug, Serialize)]
 struct ConfigEnvelope {
-    config: LocalRuntimeConfigV2,
-    defaults: LocalRuntimeConfigV2,
+    config: LocalRuntimeConfigV3,
+    defaults: LocalRuntimeConfigV3,
     revision: String,
     collection_mode: &'static str,
 }
@@ -337,7 +339,7 @@ struct ConfigEnvelope {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateRequest {
-    config: LocalRuntimeConfigV2,
+    config: LocalRuntimeConfigV3,
     revision: String,
 }
 
@@ -548,8 +550,8 @@ async fn dashboard_turn_detail(
         return private_detail_not_found();
     }
     let root = state.root;
-    match tokio::task::spawn_blocking(move || read_private_turn_detail(&root, &turn_id)).await {
-        Ok(Ok(detail)) => {
+    match tokio::task::spawn_blocking(move || lookup_private_turn_detail(&root, &turn_id)).await {
+        Ok(PrivateTurnDetailLookup::Available(detail)) => {
             let mut response = Body::from(detail).into_response();
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -557,8 +559,23 @@ async fn dashboard_turn_detail(
             );
             response
         }
-        Ok(Err(_)) | Err(_) => private_detail_not_found(),
+        Ok(
+            PrivateTurnDetailLookup::NotCollected
+            | PrivateTurnDetailLookup::Failed("invalid_turn_id"),
+        ) => private_detail_not_found(),
+        Ok(PrivateTurnDetailLookup::Failed(code)) => private_detail_failed(code),
+        Err(_) => private_detail_failed("lookup_failed"),
     }
+}
+
+fn private_detail_failed(code: &'static str) -> Response {
+    let body = format!(r#"{{"error":"capture_failed","code":"{code}"}}"#);
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response
 }
 
 fn private_detail_not_found() -> Response {
@@ -1173,7 +1190,7 @@ async fn read_envelope(config: LocalConfigService) -> Result<ConfigEnvelope, Api
 fn envelope(versioned: VersionedLocalConfig) -> ConfigEnvelope {
     ConfigEnvelope {
         config: versioned.config,
-        defaults: LocalRuntimeConfigV2::default(),
+        defaults: LocalRuntimeConfigV3::default(),
         revision: versioned.revision,
         collection_mode: "automatic_codex",
     }
@@ -1290,7 +1307,7 @@ mod tests {
     use agent_observability_contracts::hash_opaque_identifier;
     use agent_observability_local_collector::submit_notify;
     use agent_observability_local_runtime::{
-        ConfigMutationGuard, LocalRuntimeConfigV2, install, load, revision, save,
+        ConfigMutationGuard, LocalRuntimeConfigV3, install, load, revision, save,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -1326,7 +1343,7 @@ mod tests {
 
     #[test]
     fn config_revision_is_stable_and_change_sensitive() {
-        let first = LocalRuntimeConfigV2::default();
+        let first = LocalRuntimeConfigV3::default();
         let mut second = first.clone();
         second.enabled = false;
         assert_eq!(revision(&first).unwrap(), revision(&first).unwrap());
@@ -1684,7 +1701,7 @@ mod tests {
                 let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
                 let envelope: Value = serde_json::from_slice(&bytes).unwrap();
                 let stale_revision = envelope["revision"].as_str().unwrap().to_owned();
-                let mut config: LocalRuntimeConfigV2 =
+                let mut config: LocalRuntimeConfigV3 =
                     serde_json::from_value(envelope["config"].clone()).unwrap();
                 config.enabled = false;
                 let update = serde_json::json!({
@@ -1997,6 +2014,32 @@ mod tests {
                 assert_eq!(detail["cwd"], "/Users/private/exact-project");
                 assert_eq!(detail["inputMessages"][0], "PRIVATE_INPUT_SENTINEL");
                 assert_eq!(detail["lastAssistantMessage"], "PRIVATE_OUTPUT_SENTINEL");
+
+                let digest = turn_id.strip_prefix("id:sha256:").unwrap();
+                fs::write(
+                    layout
+                        .state
+                        .join("private-codex-turn-details")
+                        .join(format!("{digest}.json")),
+                    b"{broken",
+                )
+                .unwrap();
+                let corrupt = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(&detail_uri)
+                            .header(header::HOST, "127.0.0.1:43192")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(corrupt.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    to_bytes(corrupt.into_body(), 128).await.unwrap().as_ref(),
+                    br#"{"error":"capture_failed","code":"artifact_invalid"}"#
+                );
 
                 let invalid = app
                     .clone()

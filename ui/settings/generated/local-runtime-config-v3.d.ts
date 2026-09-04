@@ -1,9 +1,9 @@
-/* Generated from contracts/local-runtime-config-v2.schema.json. Do not edit. */
+/* Generated from contracts/local-runtime-config-v3.schema.json. Do not edit. */
 
-export interface LocalRuntimeConfigV2 {
-  schema_version: "local_runtime.v2";
+export interface LocalRuntimeConfigV3 {
+  schema_version: "local_runtime.v3";
   enabled: boolean;
-  capture_private_codex_turn_details?: boolean;
+  capture_private_codex_turn_details: boolean;
   collection: Collection;
   retention: Retention;
 }

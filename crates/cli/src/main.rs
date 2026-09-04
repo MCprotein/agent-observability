@@ -19,10 +19,12 @@ use agent_observability_contracts::{
     SourceObservation,
 };
 use agent_observability_contracts::{CONTRACT_MANIFEST, ContractManifest};
-use agent_observability_local_collector::{NotifyOutcome, load_settings, serve, submit_notify};
+use agent_observability_local_collector::{
+    NotifyOutcome, load_settings, maintain_private_turn_details, serve, submit_notify,
+};
 use agent_observability_local_runtime::{
     Admission, ConfigMutationGuard, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION,
-    LocalRuntimeConfigV2, MutationGuard, PressureSample, RuntimeControl, Singleton, StorageBudget,
+    LocalRuntimeConfigV3, MutationGuard, PressureSample, RuntimeControl, Singleton, StorageBudget,
     install, load, save,
 };
 use agent_observability_local_store::{
@@ -764,7 +766,7 @@ fn update_config(root: &Path, key: &str, value: &str) -> Result<String, String> 
 }
 
 fn set_config_value(
-    config: &mut LocalRuntimeConfigV2,
+    config: &mut LocalRuntimeConfigV3,
     key: &str,
     value: &str,
 ) -> Result<(), String> {
@@ -794,7 +796,7 @@ fn set_config_value(
     config.validate().map_err(|error| error.to_string())
 }
 
-fn config_output(layout: &InstalledLayout, config: &LocalRuntimeConfigV2) -> String {
+fn config_output(layout: &InstalledLayout, config: &LocalRuntimeConfigV3) -> String {
     format!(
         "root={}\nconfig={}\nenabled={}\nprivate-codex-details={}\nfile-reconcile-ms={}\nflush-ms={}\nbatch-records={}\nbatch-bytes={}\nactive-heartbeat-ms={}\nidle-heartbeat-ms={}\nstorage-bytes={}\nretention-days={}\narchive-records={}\narchive-bytes={}",
         layout.root.display(),
@@ -829,7 +831,7 @@ fn storage_check(root: &Path) -> Result<String, String> {
 fn open_store(
     _mutation: &MutationGuard,
     layout: &InstalledLayout,
-    config: &LocalRuntimeConfigV2,
+    config: &LocalRuntimeConfigV3,
 ) -> Result<LocalStore, String> {
     let control = RuntimeControl::new(config).map_err(|error| error.to_string())?;
     let migration_headroom = control
@@ -865,11 +867,11 @@ fn retention(root: &Path, apply: Option<(&str, &Path)>) -> Result<String, String
                 archive_path,
             )
             .map_err(|error| error.to_string())?;
-        return Ok(retention_output(
-            &result.plan,
-            result.archive_path.as_deref(),
-            true,
-        ));
+        let output = retention_output(&result.plan, result.archive_path.as_deref(), true);
+        drop(store);
+        drop(mutation);
+        maintain_private_turn_details(root).map_err(|error| error.to_string())?;
+        return Ok(output);
     }
     let plan = store
         .retention_plan(
@@ -1322,7 +1324,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         let init = run(["init".into(), root.to_string_lossy().into_owned()].into_iter()).unwrap();
-        assert!(init.contains("config_schema=local_runtime.v2"));
+        assert!(init.contains("config_schema=local_runtime.v3"));
         let config = root.join("config.json");
         let check = run(["config-check".into(), config.to_string_lossy().into_owned()].into_iter())
             .unwrap();
@@ -1709,7 +1711,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let output = run(["report".into(), root.to_string_lossy().into_owned()].into_iter())
             .expect("report command succeeds");
-        assert!(output.contains("report_schema=agent_observability.report.v1"));
+        assert!(output.contains("report_schema=agent_observability.report.v2"));
         assert!(output.contains("records=0"));
         assert!(output.contains("cost_status=unknown"));
         let report = root.join("logs").join(REPORT_FILE_NAME);

@@ -1,13 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "local_runtime.v2",
-  "title": "LocalRuntimeConfigV2",
+  "$id": "local_runtime.v3",
+  "title": "LocalRuntimeConfigV3",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "enabled", "collection", "retention"],
+  "required": ["schema_version", "enabled", "capture_private_codex_turn_details", "collection", "retention"],
   "properties": {
-    "schema_version": { "const": "local_runtime.v2" },
+    "schema_version": { "const": "local_runtime.v3" },
     "enabled": { "type": "boolean" },
+    "capture_private_codex_turn_details": { "type": "boolean" },
     "collection": { "$ref": "#/$defs/collection" },
     "retention": { "$ref": "#/$defs/retention" }
   },

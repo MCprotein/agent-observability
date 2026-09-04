@@ -1,4 +1,4 @@
-/* Generated from contracts/report-dto-v1.schema.json. Do not edit. */
+/* Generated from contracts/report-dto-v2.schema.json. Do not edit. */
 
 // ui/report/view-summary.ts
 var TOKEN_METRICS = [

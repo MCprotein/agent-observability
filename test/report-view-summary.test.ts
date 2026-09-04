@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { aggregateCostStatus, summarizeVisible, type CostStatus } from "../ui/report/view-summary.ts";
-import type { Metrics, Span } from "../ui/report/generated/report-dto-v1.js";
+import type { Metrics, Span } from "../ui/report/generated/report-dto-v2.js";
 
 const fixture = JSON.parse(
   await readFile(new URL("../contracts/report-view-reduction-v1.fixture.json", import.meta.url), "utf8"),

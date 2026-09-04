@@ -19,8 +19,8 @@ import {
   XCircle,
   createIcons,
 } from "lucide";
-import validateConfig from "./generated/validate-local-runtime-config-v2.js";
-import type { LocalRuntimeConfigV2 } from "./generated/local-runtime-config-v2.js";
+import validateConfig from "./generated/validate-local-runtime-config-v3.js";
+import type { LocalRuntimeConfigV3 } from "./generated/local-runtime-config-v3.js";
 
 type FieldPath =
   | "collection.file_reconcile_interval_ms"
@@ -35,8 +35,8 @@ type FieldPath =
   | "retention.max_archive_bytes";
 
 type Envelope = {
-  config: LocalRuntimeConfigV2;
-  defaults: LocalRuntimeConfigV2;
+  config: LocalRuntimeConfigV3;
+  defaults: LocalRuntimeConfigV3;
   revision: string;
   collection_mode: "automatic_codex" | "manual_import";
 };
@@ -175,9 +175,9 @@ const fragmentToken = new URLSearchParams(location.hash.slice(1)).get("session")
 let token = fragmentToken || readSessionToken();
 if (fragmentToken) writeSessionToken(fragmentToken);
 history.replaceState(null, "", `${location.pathname}${location.search}`);
-let persisted: LocalRuntimeConfigV2 | null = null;
-let draft: LocalRuntimeConfigV2 | null = null;
-let defaults: LocalRuntimeConfigV2 | null = null;
+let persisted: LocalRuntimeConfigV3 | null = null;
+let draft: LocalRuntimeConfigV3 | null = null;
+let defaults: LocalRuntimeConfigV3 | null = null;
 let revision = "";
 let integration: IntegrationStatus | null = null;
 let integrationUnavailable = false;
@@ -346,7 +346,7 @@ function renderSettings(focusTarget?: string): void {
   }
 }
 
-function overviewSection(config: LocalRuntimeConfigV2): string {
+function overviewSection(config: LocalRuntimeConfigV3): string {
   const storage = fields["collection.local_storage_budget_bytes"].format(
     config.collection.local_storage_budget_bytes,
   );
@@ -420,7 +420,7 @@ function collectorNavigationStatus(): string {
   return "collector 중지됨";
 }
 
-function collectionSection(config: LocalRuntimeConfigV2): string {
+function collectionSection(config: LocalRuntimeConfigV3): string {
   return `<section class="settings-section" id="collection" aria-labelledby="collection-title">
     ${sectionTitle("activity", "수집", "파일 확인과 durable 기록 반영 간격")}
     <div class="section-grid">
@@ -450,7 +450,7 @@ function collectionSection(config: LocalRuntimeConfigV2): string {
   </section>`;
 }
 
-function storageSection(config: LocalRuntimeConfigV2): string {
+function storageSection(config: LocalRuntimeConfigV3): string {
   return `<section class="settings-section" id="storage" aria-labelledby="storage-title">
     ${sectionTitle("database", "저장소", "로컬 데이터가 넘지 못하는 디스크 예산")}
     <div class="section-grid">
@@ -460,7 +460,7 @@ function storageSection(config: LocalRuntimeConfigV2): string {
   </section>`;
 }
 
-function privacySection(config: LocalRuntimeConfigV2): string {
+function privacySection(config: LocalRuntimeConfigV3): string {
   const enabled = config.capture_private_codex_turn_details ?? false;
   return `<section class="settings-section" id="privacy" aria-labelledby="privacy-title">
     <div class="section-title"><span class="section-icon"><i data-lucide="shield-check"></i></span><div><h2 id="privacy-title">개인정보</h2><p>Codex 작업 경로와 대화 내용을 별도 로컬 상세 저장소에 보관할지 선택합니다.</p></div></div>
@@ -473,7 +473,7 @@ function privacySection(config: LocalRuntimeConfigV2): string {
   </section>`;
 }
 
-function retentionSection(config: LocalRuntimeConfigV2): string {
+function retentionSection(config: LocalRuntimeConfigV3): string {
   return `<section class="settings-section" id="retention" aria-labelledby="retention-title">
     ${sectionTitle("archive", "보관", "만료 대상과 private archive 크기 정책")}
     <div class="section-grid">
@@ -496,7 +496,7 @@ function summaryItem(icon: string, label: string, value: string): string {
   return `<div class="summary-item"><i data-lucide="${icon}"></i><span>${label}</span><strong>${value}</strong></div>`;
 }
 
-function fieldControl(field: Field, config: LocalRuntimeConfigV2): string {
+function fieldControl(field: Field, config: LocalRuntimeConfigV3): string {
   const value = getValue(config, field.path);
   const id = field.path.replaceAll(".", "-");
   return `<div class="field" data-field="${field.path}">
@@ -1090,23 +1090,23 @@ function mountIcons(): void {
   });
 }
 
-function getValue(config: LocalRuntimeConfigV2, path: FieldPath): number {
+function getValue(config: LocalRuntimeConfigV3, path: FieldPath): number {
   const [group, key] = path.split(".") as ["collection" | "retention", string];
   return Number((config[group] as unknown as Record<string, number>)[key]);
 }
 
-function setValue(config: LocalRuntimeConfigV2, path: FieldPath, value: number): void {
+function setValue(config: LocalRuntimeConfigV3, path: FieldPath, value: number): void {
   const [group, key] = path.split(".") as ["collection" | "retention", string];
   (config[group] as unknown as Record<string, number>)[key] = value;
 }
 
-function changedPaths(left: LocalRuntimeConfigV2, right: LocalRuntimeConfigV2): FieldPath[] {
+function changedPaths(left: LocalRuntimeConfigV3, right: LocalRuntimeConfigV3): FieldPath[] {
   return (Object.keys(fields) as FieldPath[]).filter(
     (path) => getValue(left, path) !== getValue(right, path),
   );
 }
 
-function booleanChangeCount(left: LocalRuntimeConfigV2, right: LocalRuntimeConfigV2): number {
+function booleanChangeCount(left: LocalRuntimeConfigV3, right: LocalRuntimeConfigV3): number {
   return Number(left.enabled !== right.enabled)
     + Number(
       (left.capture_private_codex_turn_details ?? false)

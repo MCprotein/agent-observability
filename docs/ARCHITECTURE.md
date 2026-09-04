@@ -270,8 +270,8 @@ anti-corruption layer다.
 
 ### Local Runtime
 
-- standalone 설정은 `local_runtime.v2` strict JSON이다. 기존 v1은 retention 기본값으로 호환
-  로드한다. 팀 identity, 이메일, endpoint와 transport
+- standalone 설정은 `local_runtime.v3` strict JSON이다. 기존 v1/v2는 명시적 migration으로
+  private Codex detail capture를 끈 v3로 로드한다. 팀 identity, 이메일, endpoint와 transport
   설정은 포함하지 않는다.
 - Codex automatic integration은 별도 private `runtime/collector.json`,
   `runtime/integrations/codex/tls` credential tree와
@@ -402,7 +402,7 @@ Web UI는 TypeScript `strict` mode를 사용한다.
   read-only path capability를 쓰는 reloadable ephemeral IPv4 loopback server다. report-only router는
   `GET`/`HEAD`만 허용하고 idle/hard deadline에 종료된다.
 - agent별 예외 처리는 UI가 아니라 canonical contract나 adapter에서 해결한다.
-- Rust outbound infrastructure는 빌드된 TypeScript UI asset과 `ReportDtoV1`을 하나의
+- Rust outbound infrastructure는 빌드된 TypeScript UI asset과 `ReportDtoV2`를 하나의
   self-contained HTML artifact로 조립한다. `report <runtime-root> [rate-table-json]`은 SQLite의 typed
   snapshot을 bounded transaction과 generation fence로 record batch 단위로 읽고, SQLite read lock을
   닫은 뒤 privacy-safe span으로 즉시 축소한다. source record 전체를 별도 vector로 유지하지 않으며,

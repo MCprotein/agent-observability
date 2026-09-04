@@ -1,10 +1,10 @@
 //! Pure application use cases for local pricing and cost aggregation.
 
 use agent_observability_contracts::{
-    AttributesV1, AvailabilityStateV1, CostComponentV1, CostDetailV1, CostEstimateV1,
-    DurableRecordV1, FieldAvailabilityV1, MetricsV1, REPORT_DTO_VERSION, RateTableRefV1,
-    ReportAgentV1, ReportAttributesV1, ReportAvailabilityV1, ReportDtoV1, ReportFiltersV1,
-    ReportMetricsV1, ReportSpanV1, ReportSummaryV1, ScalarValueV1, TraceSummaryV1,
+    AttributesV1, AvailabilityStateV2, CostComponentV1, CostDetailV1, CostEstimateV1,
+    DurableRecordV1, FieldAvailabilityV2, MetricsV1, REPORT_DTO_VERSION, RateTableRefV1,
+    ReportAgentV1, ReportAttributesV1, ReportAvailabilityV2, ReportDtoV2, ReportFiltersV1,
+    ReportMetricsV1, ReportSpanV2, ReportSummaryV1, ScalarValueV1, TraceSummaryV1,
     hash_opaque_identifier, redact_sensitive_text, sanitize_durable_record,
     sanitize_owned_durable_record,
 };
@@ -186,7 +186,7 @@ impl Error for ReportProjectionError {}
 /// Incrementally projects durable records without retaining the source records.
 #[derive(Debug)]
 pub struct ReportProjector<'a> {
-    spans: Vec<ReportSpanV1>,
+    spans: Vec<ReportSpanV2>,
     table: Option<&'a RateTable>,
 }
 
@@ -240,7 +240,7 @@ impl<'a> ReportProjector<'a> {
         mut self,
         generated_at: impl Into<String>,
         title: impl Into<String>,
-    ) -> Result<ReportDtoV1, ReportProjectionError> {
+    ) -> Result<ReportDtoV2, ReportProjectionError> {
         self.spans.sort_by(|left, right| {
             left.start_time_unix_ms
                 .total_cmp(&right.start_time_unix_ms)
@@ -250,7 +250,7 @@ impl<'a> ReportProjector<'a> {
         propagate_trace_repositories(&mut self.spans);
         let summary = summarize_report(&self.spans)?;
         let cost = estimate_cost_for_spans(&self.spans, self.table);
-        let report = ReportDtoV1 {
+        let report = ReportDtoV2 {
             schema_version: REPORT_DTO_VERSION.into(),
             generated_at: generated_at.into(),
             title: redact_sensitive_text(&title.into(), "title"),
@@ -280,7 +280,7 @@ pub fn project_report(
     generated_at: impl Into<String>,
     title: impl Into<String>,
     table: Option<&RateTable>,
-) -> Result<ReportDtoV1, ReportProjectionError> {
+) -> Result<ReportDtoV2, ReportProjectionError> {
     let mut projector = ReportProjector::new(records.len(), table);
     for (index, record) in records.iter().enumerate() {
         projector.push(index, record)?;
@@ -288,7 +288,7 @@ pub fn project_report(
     projector.finish(generated_at, title)
 }
 
-fn report_span(record: &DurableRecordV1, table: Option<&RateTable>) -> ReportSpanV1 {
+fn report_span(record: &DurableRecordV1, table: Option<&RateTable>) -> ReportSpanV2 {
     let attributes = report_attributes(&record.attributes);
     let metrics = report_metrics(&record.metrics);
     let cost = estimate_span_cost(record, table);
@@ -296,14 +296,15 @@ fn report_span(record: &DurableRecordV1, table: Option<&RateTable>) -> ReportSpa
     let session_id = scalar_string(attributes.session_id.as_ref());
     let turn_id = scalar_string(attributes.turn_id.as_ref());
     let model = record.agent.model.clone();
-    let tokens_present = metrics.input_tokens.is_some()
-        || metrics.output_tokens.is_some()
-        || metrics.cached_input_tokens.is_some()
-        || metrics.cache_creation_input_tokens.is_some()
-        || metrics.reasoning_output_tokens.is_some()
-        || metrics.total_tokens.is_some();
+    let tokens_present = report_token_metrics_present(&metrics);
     let latency_present = metrics.latency_ms.is_some() || metrics.duration_ms.is_some();
-    ReportSpanV1 {
+    let private_detail = private_lookup_availability(
+        record.agent.name.as_deref(),
+        &attributes,
+        turn_id.as_deref(),
+        record.span_kind,
+    );
+    ReportSpanV2 {
         schema_version: record.schema_version.clone(),
         trace_id: hash_opaque_identifier(&record.trace_id),
         span_id: hash_opaque_identifier(&record.span_id),
@@ -326,6 +327,7 @@ fn report_span(record: &DurableRecordV1, table: Option<&RateTable>) -> ReportSpa
             tokens_present,
             latency_present,
             record.span_kind,
+            private_detail,
         ),
         session_id,
         turn_id,
@@ -337,8 +339,8 @@ fn report_span(record: &DurableRecordV1, table: Option<&RateTable>) -> ReportSpa
     }
 }
 
-fn field_availability(state: AvailabilityStateV1, reason: &str) -> FieldAvailabilityV1 {
-    FieldAvailabilityV1 {
+fn field_availability(state: AvailabilityStateV2, reason: &str) -> FieldAvailabilityV2 {
+    FieldAvailabilityV2 {
         state,
         reason: reason.into(),
     }
@@ -351,74 +353,64 @@ fn report_availability(
     tokens_present: bool,
     latency_present: bool,
     kind: SpanKind,
-) -> ReportAvailabilityV1 {
+    private_detail: FieldAvailabilityV2,
+) -> ReportAvailabilityV2 {
     let repository = if repo == "unknown" {
         field_availability(
-            AvailabilityStateV1::SourceUnavailable,
+            AvailabilityStateV2::SourceUnavailable,
             "source_not_provided",
         )
     } else {
-        field_availability(AvailabilityStateV1::Available, "reported_by_adapter")
+        field_availability(AvailabilityStateV2::Available, "reported_by_adapter")
     };
     let turn = if turn_id.is_some() {
-        field_availability(AvailabilityStateV1::Available, "reported_by_adapter")
+        field_availability(AvailabilityStateV2::Available, "reported_by_adapter")
     } else {
         field_availability(
-            AvailabilityStateV1::SourceUnavailable,
+            AvailabilityStateV2::SourceUnavailable,
             "source_not_provided",
         )
     };
     let model = if model.is_some() {
-        field_availability(AvailabilityStateV1::Available, "reported_by_adapter")
+        field_availability(AvailabilityStateV2::Available, "reported_by_adapter")
     } else if matches!(kind, SpanKind::LlmRequest | SpanKind::AgentSession) {
         field_availability(
-            AvailabilityStateV1::SourceUnavailable,
+            AvailabilityStateV2::SourceUnavailable,
             "source_not_provided",
         )
     } else {
         field_availability(
-            AvailabilityStateV1::NotApplicable,
+            AvailabilityStateV2::NotApplicable,
             "span_kind_not_model_backed",
         )
     };
     let latency = if latency_present {
-        field_availability(AvailabilityStateV1::Available, "reported_by_adapter")
+        field_availability(AvailabilityStateV2::Available, "reported_by_adapter")
     } else if matches!(kind, SpanKind::LlmRequest | SpanKind::ToolExecution) {
         field_availability(
-            AvailabilityStateV1::SourceUnavailable,
+            AvailabilityStateV2::SourceUnavailable,
             "source_not_provided",
         )
     } else {
         field_availability(
-            AvailabilityStateV1::NotApplicable,
+            AvailabilityStateV2::NotApplicable,
             "span_kind_has_no_latency",
         )
     };
     let tokens = if tokens_present {
-        field_availability(AvailabilityStateV1::Available, "reported_by_adapter")
+        field_availability(AvailabilityStateV2::Available, "reported_by_adapter")
     } else if matches!(kind, SpanKind::LlmRequest) {
         field_availability(
-            AvailabilityStateV1::SourceUnavailable,
+            AvailabilityStateV2::SourceUnavailable,
             "source_not_provided",
         )
     } else {
         field_availability(
-            AvailabilityStateV1::NotApplicable,
+            AvailabilityStateV2::NotApplicable,
             "span_kind_has_no_token_usage",
         )
     };
-    let private_detail = if turn_id.is_some() {
-        field_availability(
-            AvailabilityStateV1::PrivateLookup,
-            "local_opt_in_lookup_required",
-        )
-    } else {
-        field_availability(
-            AvailabilityStateV1::SourceUnavailable,
-            "turn_correlation_unavailable",
-        )
-    };
-    ReportAvailabilityV1 {
+    ReportAvailabilityV2 {
         repository,
         turn,
         model,
@@ -430,7 +422,77 @@ fn report_availability(
     }
 }
 
-fn propagate_trace_repositories(spans: &mut [ReportSpanV1]) {
+fn private_lookup_availability(
+    agent_name: Option<&str>,
+    attributes: &ReportAttributesV1,
+    turn_id: Option<&str>,
+    kind: SpanKind,
+) -> FieldAvailabilityV2 {
+    let source = scalar_string(attributes.source.as_ref());
+    let event_type = scalar_string(attributes.event_type.as_ref());
+    if source.as_deref() == Some("codex.notify_or_session_jsonl") {
+        return field_availability(
+            AvailabilityStateV2::SourceUnavailable,
+            "historical_codex_source_not_lookup_eligible",
+        );
+    }
+    match agent_name {
+        Some("claude-code") => field_availability(
+            AvailabilityStateV2::NotApplicable,
+            "claude_private_lookup_not_supported",
+        ),
+        Some("cursor") => field_availability(
+            AvailabilityStateV2::NotApplicable,
+            "cursor_private_lookup_not_supported",
+        ),
+        Some("codex")
+            if source.as_deref() == Some("codex")
+                && event_type.as_deref() == Some("turn")
+                && kind == SpanKind::Turn =>
+        {
+            if turn_id.is_some() {
+                field_availability(
+                    AvailabilityStateV2::PrivateLookup,
+                    "local_opt_in_lookup_required",
+                )
+            } else {
+                field_availability(
+                    AvailabilityStateV2::SourceUnavailable,
+                    "codex_notify_turn_correlation_unavailable",
+                )
+            }
+        }
+        Some("codex") => field_availability(
+            AvailabilityStateV2::NotApplicable,
+            "codex_span_not_notify_derived",
+        ),
+        _ => field_availability(
+            AvailabilityStateV2::NotApplicable,
+            "agent_private_lookup_not_supported",
+        ),
+    }
+}
+
+fn report_token_metrics_present(metrics: &ReportMetricsV1) -> bool {
+    [
+        metrics.input_tokens,
+        metrics.output_tokens,
+        metrics.cached_input_tokens,
+        metrics.cache_creation_input_tokens,
+        metrics.reasoning_output_tokens,
+        metrics.total_tokens,
+        metrics.total_input_tokens,
+        metrics.total_output_tokens,
+        metrics.total_cached_input_tokens,
+        metrics.total_reasoning_output_tokens,
+        metrics.total_accumulated_tokens,
+        metrics.context_window_tokens,
+    ]
+    .into_iter()
+    .any(|value| value.is_some())
+}
+
+fn propagate_trace_repositories(spans: &mut [ReportSpanV2]) {
     let mut known = BTreeMap::<_, BTreeSet<_>>::new();
     for span in spans.iter().filter(|span| span.repo != "unknown") {
         known
@@ -447,13 +509,13 @@ fn propagate_trace_repositories(spans: &mut [ReportSpanV1]) {
                 span.repo
                     .clone_from(repos.first().expect("single repository"));
                 span.availability.repository = field_availability(
-                    AvailabilityStateV1::Available,
+                    AvailabilityStateV2::Available,
                     "derived_from_trace_context",
                 );
             }
             Some(_) => {
                 span.availability.repository = field_availability(
-                    AvailabilityStateV1::SourceUnavailable,
+                    AvailabilityStateV2::SourceUnavailable,
                     "ambiguous_trace_repository",
                 );
             }
@@ -548,7 +610,7 @@ fn scalar_string(value: Option<&ScalarValueV1>) -> Option<String> {
     }
 }
 
-fn summarize_report(spans: &[ReportSpanV1]) -> Result<ReportSummaryV1, ReportProjectionError> {
+fn summarize_report(spans: &[ReportSpanV2]) -> Result<ReportSummaryV1, ReportProjectionError> {
     Ok(ReportSummaryV1 {
         generated_spans: spans.len() as u64,
         sessions: count_kind(spans, SpanKind::AgentSession),
@@ -585,12 +647,12 @@ fn summarize_report(spans: &[ReportSpanV1]) -> Result<ReportSummaryV1, ReportPro
     })
 }
 
-fn count_kind(spans: &[ReportSpanV1], kind: SpanKind) -> u64 {
+fn count_kind(spans: &[ReportSpanV2], kind: SpanKind) -> u64 {
     spans.iter().filter(|span| span.kind == kind).count() as u64
 }
 
 fn sum_integer_metric(
-    spans: &[ReportSpanV1],
+    spans: &[ReportSpanV2],
     get: impl Fn(&ReportMetricsV1) -> Option<f64>,
     field: &'static str,
 ) -> Result<u64, ReportProjectionError> {
@@ -609,7 +671,7 @@ fn sum_integer_metric(
     Ok(total)
 }
 
-fn report_filters(spans: &[ReportSpanV1]) -> ReportFiltersV1 {
+fn report_filters(spans: &[ReportSpanV2]) -> ReportFiltersV1 {
     ReportFiltersV1 {
         repos: unique_sorted(spans.iter().map(|span| span.repo.clone())),
         sessions: unique_sorted(spans.iter().filter_map(|span| span.session_id.clone())),
@@ -634,14 +696,21 @@ fn unique_sorted(values: impl Iterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
-fn trace_summaries(spans: &[ReportSpanV1]) -> Vec<TraceSummaryV1> {
+fn trace_summaries(spans: &[ReportSpanV2]) -> Vec<TraceSummaryV1> {
     let mut groups = BTreeMap::<String, TraceSummaryV1>::new();
+    let mut repositories = BTreeMap::<String, BTreeSet<String>>::new();
     for span in spans {
+        if span.repo != "unknown" {
+            repositories
+                .entry(span.trace_id.clone())
+                .or_default()
+                .insert(span.repo.clone());
+        }
         let group = groups
             .entry(span.trace_id.clone())
             .or_insert_with(|| TraceSummaryV1 {
                 trace_id: span.trace_id.clone(),
-                repo: span.repo.clone(),
+                repo: "unknown".into(),
                 start_time_unix_ms: span.start_time_unix_ms,
                 end_time_unix_ms: span.end_time_unix_ms,
                 ..TraceSummaryV1::default()
@@ -662,6 +731,13 @@ fn trace_summaries(spans: &[ReportSpanV1]) -> Vec<TraceSummaryV1> {
     }
     let mut traces = groups.into_values().collect::<Vec<_>>();
     for trace in &mut traces {
+        if let Some(repos) = repositories.get(&trace.trace_id)
+            && repos.len() == 1
+        {
+            trace
+                .repo
+                .clone_from(repos.first().expect("single repository"));
+        }
         trace.sessions.sort();
         trace.sessions.dedup();
         trace.turns.sort();
@@ -920,7 +996,7 @@ pub fn estimate_cost_for_records(
     }
 }
 
-fn estimate_cost_for_spans(spans: &[ReportSpanV1], table: Option<&RateTable>) -> CostEstimateV1 {
+fn estimate_cost_for_spans(spans: &[ReportSpanV2], table: Option<&RateTable>) -> CostEstimateV1 {
     let Some(table) = table else {
         return unknown_cost("missing_rate_table");
     };

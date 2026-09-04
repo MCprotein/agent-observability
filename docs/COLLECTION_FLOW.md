@@ -245,7 +245,7 @@ sequenceDiagram
     CLI->>Store: typed ordered snapshot
     Store-->>App: privacy-safe durable records
     App->>App: sanitize + map + price + aggregate
-    App-->>CLI: validated ReportDtoV1
+    App-->>CLI: validated ReportDtoV2
     Note over CLI,Assembler: built TypeScript asset embedded at compile time
     CLI->>Assembler: validated DTO
     Assembler->>HTML: atomic 0600 assembly

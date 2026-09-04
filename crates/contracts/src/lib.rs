@@ -11,15 +11,19 @@ use std::fmt::{self, Display, Formatter};
 pub const CONTRACT_MANIFEST: &str = include_str!("../../../contracts/contract-manifest.v1");
 pub const DURABLE_RECORD_SCHEMA: &str =
     include_str!("../../../contracts/durable-record-v1.schema.json");
-pub const REPORT_DTO_SCHEMA: &str = include_str!("../../../contracts/report-dto-v1.schema.json");
+pub const REPORT_DTO_V1_SCHEMA: &str = include_str!("../../../contracts/report-dto-v1.schema.json");
+pub const REPORT_DTO_SCHEMA: &str = include_str!("../../../contracts/report-dto-v2.schema.json");
 pub const RATE_TABLE_SCHEMA: &str = include_str!("../../../contracts/rate-table-v1.schema.json");
 pub const RETENTION_ARCHIVE_SCHEMA: &str =
     include_str!("../../../contracts/retention-archive-entry-v1.schema.json");
-pub const LOCAL_RUNTIME_CONFIG_SCHEMA: &str =
+pub const LOCAL_RUNTIME_CONFIG_V2_SCHEMA: &str =
     include_str!("../../../contracts/local-runtime-config-v2.schema.json");
+pub const LOCAL_RUNTIME_CONFIG_SCHEMA: &str =
+    include_str!("../../../contracts/local-runtime-config-v3.schema.json");
 pub const ADAPTER_CAPABILITY_V1: &str = include_str!("../capabilities/adapter-capability-v1.yaml");
 pub const DURABLE_RECORD_VERSION: &str = "agent_observability.v1";
-pub const REPORT_DTO_VERSION: &str = "agent_observability.report.v1";
+pub const REPORT_DTO_V1_VERSION: &str = "agent_observability.report.v1";
+pub const REPORT_DTO_VERSION: &str = "agent_observability.report.v2";
 pub const MAX_REPORT_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 pub const RETENTION_ARCHIVE_VERSION: &str = "agent_observability.retention_archive.v1";
 
@@ -1329,7 +1333,7 @@ pub struct ReportAgentV1 {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AvailabilityStateV1 {
+pub enum AvailabilityStateV2 {
     Available,
     #[default]
     SourceUnavailable,
@@ -1341,15 +1345,15 @@ pub enum AvailabilityStateV1 {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
-pub struct FieldAvailabilityV1 {
-    pub state: AvailabilityStateV1,
+pub struct FieldAvailabilityV2 {
+    pub state: AvailabilityStateV2,
     pub reason: String,
 }
 
-impl Default for FieldAvailabilityV1 {
+impl Default for FieldAvailabilityV2 {
     fn default() -> Self {
         Self {
-            state: AvailabilityStateV1::SourceUnavailable,
+            state: AvailabilityStateV2::SourceUnavailable,
             reason: "not_evaluated".into(),
         }
     }
@@ -1358,15 +1362,15 @@ impl Default for FieldAvailabilityV1 {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
-pub struct ReportAvailabilityV1 {
-    pub repository: FieldAvailabilityV1,
-    pub turn: FieldAvailabilityV1,
-    pub model: FieldAvailabilityV1,
-    pub tokens: FieldAvailabilityV1,
-    pub latency: FieldAvailabilityV1,
-    pub source_location: FieldAvailabilityV1,
-    pub request_content: FieldAvailabilityV1,
-    pub response_content: FieldAvailabilityV1,
+pub struct ReportAvailabilityV2 {
+    pub repository: FieldAvailabilityV2,
+    pub turn: FieldAvailabilityV2,
+    pub model: FieldAvailabilityV2,
+    pub tokens: FieldAvailabilityV2,
+    pub latency: FieldAvailabilityV2,
+    pub source_location: FieldAvailabilityV2,
+    pub request_content: FieldAvailabilityV2,
+    pub response_content: FieldAvailabilityV2,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -1401,6 +1405,37 @@ pub struct ReportAttributesV1 {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub struct ReportSpanV2 {
+    pub schema_version: String,
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
+    #[serde(with = "span_kind_serde")]
+    pub kind: SpanKind,
+    pub name: String,
+    #[serde(with = "status_code_serde")]
+    pub status: StatusCode,
+    pub start_time_unix_ms: f64,
+    pub end_time_unix_ms: Option<f64>,
+    pub repo: String,
+    pub agent: ReportAgentV1,
+    pub availability: ReportAvailabilityV2,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    pub attributes: ReportAttributesV1,
+    pub metrics: ReportMetricsV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost: Option<f64>,
+    pub cost: CostEstimateV1,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReportSpanV1 {
     pub schema_version: String,
     pub trace_id: String,
@@ -1415,8 +1450,6 @@ pub struct ReportSpanV1 {
     pub end_time_unix_ms: Option<f64>,
     pub repo: String,
     pub agent: ReportAgentV1,
-    #[serde(default)]
-    pub availability: ReportAvailabilityV1,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1468,6 +1501,55 @@ impl ReportDtoV1 {
     ///
     /// Returns [`ContractError`] for a wrong version or invalid nested number/status.
     pub fn validate(&self) -> Result<(), ContractError> {
+        if self.schema_version != REPORT_DTO_V1_VERSION {
+            return Err(ContractError::InvalidReportVersion);
+        }
+        validate_finite(self.summary.estimated_cost)?;
+        validate_cost(&self.cost)?;
+        for trace in &self.traces {
+            validate_finite(trace.estimated_cost)?;
+            validate_finite(trace.start_time_unix_ms)?;
+            if let Some(end) = trace.end_time_unix_ms {
+                validate_finite(end)?;
+            }
+        }
+        for span in &self.spans {
+            validate_finite(span.start_time_unix_ms)?;
+            if let Some(end) = span.end_time_unix_ms {
+                validate_finite(end)?;
+            }
+            validate_report_attributes(&span.attributes)?;
+            validate_report_metrics(&span.metrics)?;
+            if let Some(amount) = span.estimated_cost {
+                validate_finite(amount)?;
+            }
+            validate_cost(&span.cost)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReportDtoV2 {
+    pub schema_version: String,
+    pub generated_at: String,
+    pub title: String,
+    pub summary: ReportSummaryV1,
+    pub cost: CostEstimateV1,
+    pub filters: ReportFiltersV1,
+    pub traces: Vec<TraceSummaryV1>,
+    pub spans: Vec<ReportSpanV2>,
+}
+
+impl ReportDtoV2 {
+    /// Validates the current closed report wire contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractError`] for a wrong version or invalid nested value.
+    pub fn validate(&self) -> Result<(), ContractError> {
         if self.schema_version != REPORT_DTO_VERSION {
             return Err(ContractError::InvalidReportVersion);
         }
@@ -1487,10 +1569,17 @@ impl ReportDtoV1 {
             }
             validate_report_attributes(&span.attributes)?;
             validate_report_metrics(&span.metrics)?;
+            let token_metrics_present = report_token_metrics_present(&span.metrics);
+            if (span.availability.tokens.state == AvailabilityStateV2::Available)
+                != token_metrics_present
+            {
+                return Err(ContractError::ContradictoryReportAvailability);
+            }
             for field in [
                 &span.availability.repository,
                 &span.availability.turn,
                 &span.availability.model,
+                &span.availability.tokens,
                 &span.availability.latency,
                 &span.availability.source_location,
                 &span.availability.request_content,
@@ -1506,6 +1595,80 @@ impl ReportDtoV1 {
             validate_cost(&span.cost)?;
         }
         Ok(())
+    }
+}
+
+impl TryFrom<ReportDtoV1> for ReportDtoV2 {
+    type Error = ContractError;
+
+    fn try_from(legacy: ReportDtoV1) -> Result<Self, Self::Error> {
+        legacy.validate()?;
+        let report = Self {
+            schema_version: REPORT_DTO_VERSION.into(),
+            generated_at: legacy.generated_at,
+            title: legacy.title,
+            summary: legacy.summary,
+            cost: legacy.cost,
+            filters: legacy.filters,
+            traces: legacy.traces,
+            spans: legacy.spans.into_iter().map(ReportSpanV2::from).collect(),
+        };
+        report.validate()?;
+        Ok(report)
+    }
+}
+
+impl From<ReportSpanV1> for ReportSpanV2 {
+    fn from(legacy: ReportSpanV1) -> Self {
+        let availability = ReportAvailabilityV2::legacy_v1(&legacy.metrics);
+        Self {
+            schema_version: legacy.schema_version,
+            trace_id: legacy.trace_id,
+            span_id: legacy.span_id,
+            parent_span_id: legacy.parent_span_id,
+            kind: legacy.kind,
+            name: legacy.name,
+            status: legacy.status,
+            start_time_unix_ms: legacy.start_time_unix_ms,
+            end_time_unix_ms: legacy.end_time_unix_ms,
+            repo: legacy.repo,
+            agent: legacy.agent,
+            availability,
+            session_id: legacy.session_id,
+            turn_id: legacy.turn_id,
+            tool_name: legacy.tool_name,
+            attributes: legacy.attributes,
+            metrics: legacy.metrics,
+            estimated_cost: legacy.estimated_cost,
+            cost: legacy.cost,
+        }
+    }
+}
+
+impl ReportAvailabilityV2 {
+    fn legacy_v1(metrics: &ReportMetricsV1) -> Self {
+        let unavailable = FieldAvailabilityV2 {
+            state: AvailabilityStateV2::SourceUnavailable,
+            reason: "legacy_v1_report".into(),
+        };
+        let tokens = FieldAvailabilityV2 {
+            state: if report_token_metrics_present(metrics) {
+                AvailabilityStateV2::Available
+            } else {
+                AvailabilityStateV2::SourceUnavailable
+            },
+            reason: "legacy_v1_report".into(),
+        };
+        Self {
+            repository: unavailable.clone(),
+            turn: unavailable.clone(),
+            model: unavailable.clone(),
+            tokens,
+            latency: unavailable.clone(),
+            source_location: unavailable.clone(),
+            request_content: unavailable.clone(),
+            response_content: unavailable,
+        }
     }
 }
 
@@ -1619,6 +1782,25 @@ fn validate_report_metrics(metrics: &ReportMetricsV1) -> Result<(), ContractErro
     Ok(())
 }
 
+fn report_token_metrics_present(metrics: &ReportMetricsV1) -> bool {
+    [
+        metrics.input_tokens,
+        metrics.output_tokens,
+        metrics.cached_input_tokens,
+        metrics.cache_creation_input_tokens,
+        metrics.reasoning_output_tokens,
+        metrics.total_tokens,
+        metrics.total_input_tokens,
+        metrics.total_output_tokens,
+        metrics.total_cached_input_tokens,
+        metrics.total_reasoning_output_tokens,
+        metrics.total_accumulated_tokens,
+        metrics.context_window_tokens,
+    ]
+    .into_iter()
+    .any(|value| value.is_some())
+}
+
 fn validate_scalar(value: &ScalarValueV1) -> Result<(), ContractError> {
     if let ScalarValueV1::Number(number) = value {
         validate_finite(*number)?;
@@ -1714,9 +1896,19 @@ impl ContractManifest {
             "retention_archive",
             "agent_observability.retention_archive.v1",
         )?;
-        self.expect("local_runtime_config", "local_runtime.v2")?;
+        self.expect("local_runtime_config", "local_runtime.v3")?;
         self.expect("durable_schema", "contracts/durable-record-v1.schema.json")?;
-        self.expect("report_schema", "contracts/report-dto-v1.schema.json")?;
+        self.expect("report_schema", "contracts/report-dto-v2.schema.json")?;
+        self.expect(
+            "report_compatibility_schema",
+            "contracts/report-dto-v1.schema.json",
+        )?;
+        self.expect(
+            "report_compatibility_fixture",
+            "contracts/report-dto-v1.compatibility.fixture.json",
+        )?;
+        self.expect("report_fixture", "contracts/report-dto-v2.fixture.json")?;
+        self.expect("report_parity", "contracts/report-dto-v2.parity.json")?;
         self.expect("rate_table_schema", "contracts/rate-table-v1.schema.json")?;
         self.expect(
             "retention_archive_schema",
@@ -1724,15 +1916,19 @@ impl ContractManifest {
         )?;
         self.expect(
             "local_runtime_config_schema",
+            "contracts/local-runtime-config-v3.schema.json",
+        )?;
+        self.expect(
+            "local_runtime_config_compatibility_schema",
             "contracts/local-runtime-config-v2.schema.json",
         )?;
         self.expect(
             "local_runtime_config_fixture",
-            "contracts/local-runtime-config-v2.fixture.json",
+            "contracts/local-runtime-config-v3.fixture.json",
         )?;
         self.expect(
             "local_runtime_config_parity",
-            "contracts/local-runtime-config-v2.parity.json",
+            "contracts/local-runtime-config-v3.parity.json",
         )?;
         self.expect("team_ingest", "disabled")?;
         Ok(())
@@ -1759,6 +1955,7 @@ pub enum ContractError {
     InvalidDurableHeader,
     MissingDurableIdentity,
     InvalidReportVersion,
+    ContradictoryReportAvailability,
     EmptyOptionalString,
     InvalidCostStatus,
     NonFiniteNumber,
@@ -1788,6 +1985,9 @@ impl Display for ContractError {
                 formatter.write_str("durable identity fields are required")
             }
             Self::InvalidReportVersion => formatter.write_str("invalid report DTO version"),
+            Self::ContradictoryReportAvailability => {
+                formatter.write_str("report availability contradicts report metrics")
+            }
             Self::EmptyOptionalString => {
                 formatter.write_str("optional contract strings must not be empty")
             }

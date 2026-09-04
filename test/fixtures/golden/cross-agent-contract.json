@@ -88,7 +88,7 @@
     ]
   },
   "report": {
-    "schemaVersion": "agent_observability.report.v1",
+    "schemaVersion": "agent_observability.report.v2",
     "sessions": 2,
     "turns": 2,
     "llmRequests": 2,
@@ -351,7 +351,7 @@
     ]
   },
   "report_full": {
-    "schemaVersion": "agent_observability.report.v1",
+    "schemaVersion": "agent_observability.report.v2",
     "generatedAt": "2026-08-01T01:00:00.000Z",
     "title": "Agent Observability Report",
     "summary": {

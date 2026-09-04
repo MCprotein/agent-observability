@@ -1,10 +1,10 @@
 import type {
-  AgentObservabilityReportV1,
+  AgentObservabilityReportV2,
   FieldAvailability,
   Span,
   Trace,
-} from "./generated/report-dto-v1.js";
-import validateReportDtoV1 from "./generated/validate-report-dto-v1.js";
+} from "./generated/report-dto-v2.js";
+import validateReportDtoV2 from "./generated/validate-report-dto-v2.js";
 import {
   buildFilteredView,
   buildTimeline,
@@ -34,10 +34,10 @@ const reportData = document.getElementById("report-data");
 if (!reportData) throw new Error("Missing report data");
 
 const candidate = parseReportData(reportData.textContent);
-if (candidate === undefined || !validateReportDtoV1(candidate)) {
-  document.body.replaceChildren(errorState("Report data does not match agent_observability.report.v1."));
+if (candidate === undefined || !validateReportDtoV2(candidate)) {
+  document.body.replaceChildren(errorState("Report data does not match agent_observability.report.v2."));
 } else {
-  mount(candidate as unknown as AgentObservabilityReportV1);
+  mount(candidate as unknown as AgentObservabilityReportV2);
 }
 
 function parseReportData(value: string | null): unknown | undefined {
@@ -48,7 +48,7 @@ function parseReportData(value: string | null): unknown | undefined {
   }
 }
 
-function mount(data: AgentObservabilityReportV1): void {
+function mount(data: AgentObservabilityReportV2): void {
   const state: FilterState = {
     repo: undefined,
     session: undefined,
@@ -61,6 +61,7 @@ function mount(data: AgentObservabilityReportV1): void {
   let spanPageIndex = 0;
   let savedFilters: DimensionFilters[] = [];
   let selectedSpanId: string | undefined;
+  let detailsOpenerSurface: "timeline" | "table" | undefined;
   let detailRequest = 0;
   const selects = {
     repo: element<HTMLSelectElement>("repo-filter"),
@@ -88,9 +89,13 @@ function mount(data: AgentObservabilityReportV1): void {
   const detailsClose = element<HTMLButtonElement>("details-close");
 
   detailsClose.addEventListener("click", () => {
+    const opener = visibleSpanOpener(selectedSpanId, detailsOpenerSurface) ?? visibleSpanOpener();
     selectedSpanId = undefined;
+    detailsOpenerSurface = undefined;
     detailRequest += 1;
+    syncExpandedSpanOpeners();
     renderDetails(undefined);
+    opener?.focus();
   });
 
   const allFilterValues: Record<FilterKey, string[]> = {
@@ -224,6 +229,7 @@ function mount(data: AgentObservabilityReportV1): void {
     renderTraces(tracePage, view.spansByTrace);
     renderTimeline(visibleSpans, state.trace !== undefined);
     renderSpans(spanPage);
+    syncExpandedSpanOpeners();
     renderQuality(visibleSpans);
     renderDetails(selectedSpan);
     renderPager("trace", tracePage, tracePrevious, traceNext, TRACE_PAGE_SIZE);
@@ -272,7 +278,9 @@ function mount(data: AgentObservabilityReportV1): void {
       const row = document.createElement("div");
       row.className = "timeline-row";
       row.innerHTML =
-        `<div class="timeline-label"><button class="span-open" type="button">${escapeHtml(item.span.name)}</button>` +
+        `<div class="timeline-label"><button class="span-open" type="button" aria-controls="span-details" ` +
+        `aria-expanded="${selectedSpanId === item.span.spanId}" data-span-id="${escapeHtml(item.span.spanId)}" ` +
+        `data-opener-surface="timeline">${escapeHtml(item.span.name)}</button>` +
         `<span class="timeline-details"><span class="badge timeline-span-status ${statusClass(item.span.status)}">` +
         `${escapeHtml(item.span.status)}</span><span class="mono">` +
         `${escapeHtml(formatDuration(item.span.metrics.latencyMs ?? item.span.metrics.durationMs))}</span></span></div>` +
@@ -298,7 +306,9 @@ function mount(data: AgentObservabilityReportV1): void {
       const availability = availabilityOf(span);
       row.innerHTML =
         `<td><span class="badge">${escapeHtml(span.kind)}</span></td>` +
-        `<td><button class="span-open" type="button" aria-controls="span-details" aria-expanded="${selectedSpanId === span.spanId}">${escapeHtml(span.name)}</button>${span.toolName ? `<div class="mono">${escapeHtml(span.toolName)}</div>` : ""}</td>` +
+        `<td><button class="span-open" type="button" aria-controls="span-details" aria-expanded="${selectedSpanId === span.spanId}" ` +
+        `data-span-id="${escapeHtml(span.spanId)}" data-opener-surface="table">${escapeHtml(span.name)}</button>` +
+        `${span.toolName ? `<div class="mono">${escapeHtml(span.toolName)}</div>` : ""}</td>` +
         `<td><span class="badge ${statusClass(span.status)}">${escapeHtml(span.status)}</span></td>` +
         `<td>${escapeHtml(span.repo)}</td>` +
         `<td class="mono">${escapeHtml(span.turnId ?? "")}</td>` +
@@ -329,9 +339,28 @@ function mount(data: AgentObservabilityReportV1): void {
 
   function openSpanDetails(span: Span, trigger: HTMLButtonElement): void {
     selectedSpanId = span.spanId;
-    render();
-    trigger.setAttribute("aria-expanded", "true");
+    detailsOpenerSurface = trigger.dataset.openerSurface === "timeline" ? "timeline" : "table";
+    syncExpandedSpanOpeners();
+    renderDetails(span);
     detailsHeading.focus();
+  }
+
+  function visibleSpanOpener(
+    spanId?: string,
+    surface?: "timeline" | "table",
+  ): HTMLButtonElement | undefined {
+    const candidates = [...document.querySelectorAll<HTMLButtonElement>(".span-open")]
+      .filter((candidate) => candidate.getClientRects().length > 0 && !candidate.disabled);
+    const matching = spanId === undefined
+      ? candidates
+      : candidates.filter((candidate) => candidate.dataset.spanId === spanId);
+    return matching.find((candidate) => candidate.dataset.openerSurface === surface) ?? matching[0];
+  }
+
+  function syncExpandedSpanOpeners(): void {
+    for (const opener of document.querySelectorAll<HTMLButtonElement>(".span-open[aria-expanded]")) {
+      opener.setAttribute("aria-expanded", String(selectedSpanId !== undefined && opener.dataset.spanId === selectedSpanId));
+    }
   }
 
   function renderDetails(span: Span | undefined): void {
@@ -381,6 +410,12 @@ function mount(data: AgentObservabilityReportV1): void {
       if (request !== detailRequest || selectedSpanId !== span.spanId) return;
       if (response.status === 404) {
         target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Not collected. Enable private Codex turn details in Settings for future turns.</p>';
+        return;
+      }
+      if (response.status === 503) {
+        const failure = await response.json() as { error?: unknown; code?: unknown };
+        const code = typeof failure.code === "string" ? failure.code : "lookup_failed";
+        target.innerHTML = `<h3>Private local detail</h3><p class="detail-empty">Capture failed (${escapeHtml(code)}). Check Settings and local storage health; the normal report remains usable.</p>`;
         return;
       }
       if (!response.ok) throw new Error("private detail request failed");
@@ -434,6 +469,7 @@ function mount(data: AgentObservabilityReportV1): void {
   function resetSelection(): void {
     state.trace = undefined;
     selectedSpanId = undefined;
+    detailsOpenerSurface = undefined;
     detailRequest += 1;
     tracePageIndex = 0;
     spanPageIndex = 0;
@@ -470,17 +506,7 @@ function availabilityLabel(field: FieldAvailability): string {
 }
 
 function availabilityOf(span: Span): NonNullable<Span["availability"]> {
-  const unavailable = { state: "source_unavailable", reason: "legacy_report_no_availability" } as const;
-  return span.availability ?? {
-    repository: unavailable,
-    turn: unavailable,
-    model: unavailable,
-    tokens: unavailable,
-    latency: unavailable,
-    sourceLocation: unavailable,
-    requestContent: unavailable,
-    responseContent: unavailable,
-  };
+  return span.availability;
 }
 
 function availabilityRow(label: string, field: FieldAvailability): string {

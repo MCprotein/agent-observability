@@ -1,4 +1,4 @@
-import type { Span } from "./generated/report-dto-v1.js";
+import type { Span } from "./generated/report-dto-v2.js";
 
 export type CostStatus = "estimated" | "incomplete" | "unknown";
 

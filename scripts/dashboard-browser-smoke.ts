@@ -88,6 +88,13 @@ try {
       });
       page.on("requestfailed", (request) => failedRequests.push(request.url()));
 
+      if (testCase.name === "mobile") {
+        await page.route(dashboardUrl, async (route) => {
+          const response = await route.fetch();
+          await route.fulfill({ response, body: addPaginationCoverage(await response.text()) });
+        });
+      }
+
       await page.goto(dashboardUrl, { waitUntil: "load" });
       assert.equal(page.url(), dashboardUrl);
       assert.equal(await page.locator("h1").textContent(), "Agent Observability Report");
@@ -99,6 +106,53 @@ try {
       await page.locator("#private-detail", { hasText: "PRIVATE_BROWSER_REQUEST" }).waitFor();
       assert.match((await page.locator("#private-detail").textContent()) ?? "", /\/private\/project/);
       assert.match((await page.locator("#private-detail").textContent()) ?? "", /PRIVATE_BROWSER_RESPONSE/);
+      if (testCase.name === "mobile") {
+        const originalOpener = await page.locator("#span-table .span-open", { hasText: "LLM request" }).first().elementHandle();
+        const openedSpanId = await originalOpener?.getAttribute("data-span-id");
+        assert.ok(originalOpener);
+        assert.ok(openedSpanId);
+        await page.locator(".trace-row[aria-pressed='true']").click();
+        assert.equal(await originalOpener.evaluate((element) => element.isConnected), false);
+        const rerenderedOpener = page.locator(`#span-table .span-open[data-span-id="${openedSpanId}"]`);
+        assert.equal(await rerenderedOpener.getAttribute("aria-expanded"), "true");
+        assert.equal(
+          await page.locator(`.span-open[data-span-id="${openedSpanId}"]:not([aria-expanded='true'])`).count(),
+          0,
+        );
+        await page.locator("#details-close").click();
+        assert.equal(await rerenderedOpener.getAttribute("aria-expanded"), "false");
+        assert.equal(await rerenderedOpener.evaluate((element) => document.activeElement === element), true);
+
+        await rerenderedOpener.click();
+        await page.locator("#model-filter").selectOption({ label: "gpt-test" });
+        assert.equal(await page.locator(".span-open[aria-expanded='true']").count(), 0);
+        await page.locator("#details-close").click();
+        assert.equal(await page.locator(".span-open[aria-expanded='true']").count(), 0);
+        assert.equal(
+          await page.evaluate(() => document.activeElement?.classList.contains("span-open")),
+          true,
+        );
+
+        await page.locator("#clear-filters").click();
+        await page.locator(".trace-row:visible").first().click();
+        assert.equal(await page.locator("#span-next").isEnabled(), true);
+        const paginatedOpener = page.locator("#span-table .span-open").nth(150);
+        const paginatedSpanId = await paginatedOpener.getAttribute("data-span-id");
+        assert.ok(paginatedSpanId);
+        await paginatedOpener.click();
+        await page.locator("#span-next").click();
+        assert.equal(
+          await page.locator(`.span-open[data-span-id="${paginatedSpanId}"]:visible`).count(),
+          0,
+        );
+        assert.equal(await page.locator(".span-open[aria-expanded='true']").count(), 0);
+        await page.locator("#details-close").click();
+        assert.equal(await page.locator(".span-open[aria-expanded='true']").count(), 0);
+        assert.equal(
+          await page.evaluate(() => document.activeElement?.classList.contains("span-open")),
+          true,
+        );
+      }
       assert.equal(
         await page.evaluate(
           () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
@@ -176,4 +230,25 @@ function readUrl(child: DashboardProcess): Promise<string> {
       reject(new Error("dashboard exited before URL emission (" + code + ")"));
     });
   });
+}
+
+function addPaginationCoverage(html: string): string {
+  const pattern = /(<script id="report-data" type="application\/json">)([^<]+)(<\/script>)/;
+  const match = html.match(pattern);
+  if (!match?.[2]) throw new Error("dashboard report data was not found");
+  const report = JSON.parse(match[2]) as {
+    spans: Array<Record<string, unknown> & { spanId: string; traceId: string }>;
+    traces: Array<Record<string, unknown> & { traceId: string; spans: number }>;
+  };
+  const firstByTrace = new Map<string, (typeof report.spans)[number]>();
+  for (const span of report.spans) firstByTrace.set(span.traceId, firstByTrace.get(span.traceId) ?? span);
+  const clones = [...firstByTrace.values()].flatMap((span) =>
+    Array.from({ length: 200 }, (_, index) => ({
+      ...span,
+      spanId: `${span.spanId}-pagination-${index}`,
+    })),
+  );
+  report.spans.push(...clones);
+  for (const trace of report.traces) trace.spans += 200;
+  return html.replace(pattern, `$1${JSON.stringify(report).replaceAll("<", "\\u003c")}$3`);
 }

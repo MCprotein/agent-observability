@@ -1,11 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "agent_observability.report.v1",
+  "$id": "agent_observability.report.v2",
+  "title": "AgentObservabilityReportV2",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "generatedAt", "title", "summary", "cost", "filters", "traces", "spans"],
   "properties": {
-    "schemaVersion": { "const": "agent_observability.report.v1" },
+    "schemaVersion": { "const": "agent_observability.report.v2" },
     "generatedAt": { "type": "string" },
     "title": { "type": "string" },
     "summary": { "$ref": "#/$defs/summary" },
@@ -66,17 +67,77 @@
     },
     "span": {
       "type": "object", "additionalProperties": false,
-      "required": ["schemaVersion", "traceId", "spanId", "parentSpanId", "kind", "name", "status", "startTimeUnixMs", "endTimeUnixMs", "repo", "agent", "attributes", "metrics", "cost"],
+      "required": ["schemaVersion", "traceId", "spanId", "parentSpanId", "kind", "name", "status", "startTimeUnixMs", "endTimeUnixMs", "repo", "agent", "availability", "attributes", "metrics", "cost"],
       "properties": {
         "schemaVersion": { "type": "string" }, "traceId": { "type": "string" }, "spanId": { "type": "string" }, "parentSpanId": { "type": ["string", "null"] },
         "kind": { "type": "string" }, "name": { "type": "string" }, "status": { "type": "string" }, "startTimeUnixMs": { "type": "number" }, "endTimeUnixMs": { "type": ["number", "null"] },
-        "repo": { "type": "string" }, "agent": { "$ref": "#/$defs/agent" }, "sessionId": { "type": "string" }, "turnId": { "type": "string" }, "toolName": { "type": "string" },
+        "repo": { "type": "string" }, "agent": { "$ref": "#/$defs/agent" }, "availability": { "$ref": "#/$defs/availability" }, "sessionId": { "type": "string" }, "turnId": { "type": "string" }, "toolName": { "type": "string" },
         "attributes": { "$ref": "#/$defs/attributes" }, "metrics": { "$ref": "#/$defs/metrics" }, "estimatedCost": { "type": "number" }, "cost": { "$ref": "#/$defs/cost" }
-      }
+      },
+      "allOf": [{
+        "if": {
+          "properties": {
+            "metrics": {
+              "type": "object",
+              "anyOf": [
+                { "type": "object", "properties": { "inputTokens": true }, "required": ["inputTokens"] },
+                { "type": "object", "properties": { "outputTokens": true }, "required": ["outputTokens"] },
+                { "type": "object", "properties": { "cachedInputTokens": true }, "required": ["cachedInputTokens"] },
+                { "type": "object", "properties": { "cacheCreationInputTokens": true }, "required": ["cacheCreationInputTokens"] },
+                { "type": "object", "properties": { "reasoningOutputTokens": true }, "required": ["reasoningOutputTokens"] },
+                { "type": "object", "properties": { "totalTokens": true }, "required": ["totalTokens"] },
+                { "type": "object", "properties": { "totalInputTokens": true }, "required": ["totalInputTokens"] },
+                { "type": "object", "properties": { "totalOutputTokens": true }, "required": ["totalOutputTokens"] },
+                { "type": "object", "properties": { "totalCachedInputTokens": true }, "required": ["totalCachedInputTokens"] },
+                { "type": "object", "properties": { "totalReasoningOutputTokens": true }, "required": ["totalReasoningOutputTokens"] },
+                { "type": "object", "properties": { "totalAccumulatedTokens": true }, "required": ["totalAccumulatedTokens"] },
+                { "type": "object", "properties": { "contextWindowTokens": true }, "required": ["contextWindowTokens"] }
+              ]
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "availability": {
+              "type": "object",
+              "properties": { "tokens": { "type": "object", "properties": { "state": { "const": "available" } } } }
+            }
+          }
+        },
+        "else": {
+          "properties": {
+            "availability": {
+              "type": "object",
+              "properties": { "tokens": { "type": "object", "properties": { "state": { "not": { "const": "available" } } } } }
+            }
+          }
+        }
+      }]
     },
     "agent": {
       "type": "object", "additionalProperties": false,
       "properties": { "name": { "type": "string" }, "model": { "type": "string" }, "version": { "type": "string" } }
+    },
+    "field_availability": {
+      "type": "object", "additionalProperties": false, "required": ["state", "reason"],
+      "properties": {
+        "state": { "enum": ["available", "source_unavailable", "withheld", "not_applicable", "private_lookup"] },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 96 }
+      }
+    },
+    "availability": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "turn", "model", "tokens", "latency", "sourceLocation", "requestContent", "responseContent"],
+      "properties": {
+        "repository": { "$ref": "#/$defs/field_availability" },
+        "turn": { "$ref": "#/$defs/field_availability" },
+        "model": { "$ref": "#/$defs/field_availability" },
+        "tokens": { "$ref": "#/$defs/field_availability" },
+        "latency": { "$ref": "#/$defs/field_availability" },
+        "sourceLocation": { "$ref": "#/$defs/field_availability" },
+        "requestContent": { "$ref": "#/$defs/field_availability" },
+        "responseContent": { "$ref": "#/$defs/field_availability" }
+      }
     },
     "attributes": {
       "type": "object", "additionalProperties": false,
