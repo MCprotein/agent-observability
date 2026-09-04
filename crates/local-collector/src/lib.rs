@@ -279,7 +279,6 @@ struct PrivateNotifyEnvelopeV1 {
 #[serde(rename_all = "snake_case")]
 enum PrivateTurnDetailReceiptState {
     Available,
-    Queued,
     Failed,
     Busy,
 }
@@ -2486,11 +2485,7 @@ pub fn submit_notify(root: &Path, payload: &[u8]) -> NotifyOutcome {
             match serde_json::from_slice::<PrivateTurnDetailReceiptV1>(&response.body) {
                 Ok(receipt)
                     if receipt.schema_version == PRIVATE_TURN_DETAIL_RECEIPT_VERSION
-                        && matches!(
-                            receipt.state,
-                            PrivateTurnDetailReceiptState::Available
-                                | PrivateTurnDetailReceiptState::Queued
-                        ) =>
+                        && receipt.state == PrivateTurnDetailReceiptState::Available =>
                 {
                     NotifyOutcome::Accepted
                 }
@@ -4769,7 +4764,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn private_turn_detail_status_failure_refuses_queue_acknowledgement() {
+    fn private_turn_detail_status_failure_refuses_success_acknowledgement() {
         let root = test_root("private-turn-detail-status-publication-failure");
         let _ = fs::remove_dir_all(&root);
         let layout = install(&root).unwrap();
