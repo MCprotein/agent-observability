@@ -798,6 +798,7 @@
   if (!(rootElement instanceof HTMLDivElement)) throw new Error("settings root is missing");
   var app = rootElement;
   var SESSION_TOKEN_KEY = "agent-observability.settings.session.v1";
+  var INITIAL_INTEGRATION_RETRY_MS = 1500;
   var fragmentToken = new URLSearchParams(location.hash.slice(1)).get("session") ?? "";
   var token = fragmentToken || readSessionToken();
   if (fragmentToken) writeSessionToken(fragmentToken);
@@ -808,6 +809,7 @@
   var revision = "";
   var integration = null;
   var integrationUnavailable = false;
+  var integrationRequestGeneration = 0;
   var busy = false;
   var conflicted = false;
   var heartbeatTimer;
@@ -823,6 +825,9 @@
     event.preventDefault();
     event.returnValue = "";
   });
+  window.addEventListener("focus", () => {
+    void refreshIntegrationStatus();
+  });
   void bootstrap();
   async function bootstrap() {
     renderLoading();
@@ -833,17 +838,19 @@
     try {
       const envelope = await api("/api/config");
       applyEnvelope(envelope);
+      let shouldRenderSettings = false;
       try {
-        integration = await api("/api/integrations/codex");
-        integrationUnavailable = false;
+        shouldRenderSettings = await loadInitialIntegrationStatus();
       } catch (error) {
         const apiError = error;
         if (apiError.code === "invalid_session") throw error;
         integration = null;
         integrationUnavailable = true;
+        shouldRenderSettings = true;
       }
-      renderSettings();
-      heartbeatTimer = window.setInterval(() => void heartbeat(), 2e4);
+      if (!token) return;
+      if (shouldRenderSettings) renderSettings();
+      heartbeatTimer ??= window.setInterval(() => void heartbeat(), 2e4);
     } catch (error) {
       const apiError = error;
       if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
@@ -851,6 +858,20 @@
       } else {
         renderUnavailable(messageOf(error));
       }
+    }
+  }
+  async function loadInitialIntegrationStatus() {
+    const generation = ++integrationRequestGeneration;
+    try {
+      const initial = await api("/api/integrations/codex");
+      const next = initial.config === "connected" && initial.collector === "unavailable" ? await new Promise((resolve) => window.setTimeout(resolve, INITIAL_INTEGRATION_RETRY_MS)).then(() => api("/api/integrations/codex")) : initial;
+      if (generation !== integrationRequestGeneration || !token) return false;
+      integration = next;
+      integrationUnavailable = false;
+      return true;
+    } catch (error) {
+      if (generation !== integrationRequestGeneration) return false;
+      throw error;
     }
   }
   function renderLoading() {
@@ -1112,11 +1133,12 @@
   async function toggleIntegration() {
     if (busy || !integration) return;
     const lifecycleToken = token;
+    const generation = ++integrationRequestGeneration;
     setBusy(true);
     try {
       const method = integration.config === "connected" ? "DELETE" : "POST";
       const nextIntegration = await api("/api/integrations/codex", { method });
-      if (token !== lifecycleToken) return;
+      if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
       integration = nextIntegration;
       renderSettings("toggle-integration");
       showToast(
@@ -1131,9 +1153,12 @@
   }
   async function refreshIntegration() {
     if (busy) return;
+    const generation = ++integrationRequestGeneration;
     setBusy(true);
     try {
-      integration = await api("/api/integrations/codex");
+      const next = await api("/api/integrations/codex");
+      if (generation !== integrationRequestGeneration || !token) return;
+      integration = next;
       integrationUnavailable = false;
       renderSettings("toggle-integration");
       showToast("Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC\uB97C \uD655\uC778\uD588\uC2B5\uB2C8\uB2E4.", "success");
@@ -1146,6 +1171,34 @@
       setBusy(false);
       showToast(messageOf(error), "error");
     }
+  }
+  async function refreshIntegrationStatus() {
+    if (busy || !persisted || !token) return;
+    const generation = ++integrationRequestGeneration;
+    const previous = integration;
+    const wasUnavailable = integrationUnavailable;
+    try {
+      const next = await api("/api/integrations/codex");
+      if (!token || generation !== integrationRequestGeneration) return;
+      integration = next;
+      integrationUnavailable = false;
+      if (wasUnavailable || !sameIntegrationStatus(previous, next)) {
+        renderSettings();
+      }
+    } catch (error) {
+      if (generation !== integrationRequestGeneration) return;
+      const apiError = error;
+      if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
+        expireSession();
+        return;
+      }
+      integration = null;
+      integrationUnavailable = true;
+      if (!wasUnavailable || previous !== null) renderSettings();
+    }
+  }
+  function sameIntegrationStatus(left, right) {
+    return left !== null && left.config === right.config && left.collector === right.collector && left.endpoint === right.endpoint && left.service === right.service && left.data_retained === right.data_retained;
   }
   async function openDashboard() {
     if (busy) return;
@@ -1393,6 +1446,7 @@
     if (Date.now() - lastUserActivity >= 6e4) return;
     try {
       await api("/api/heartbeat", { method: "POST" });
+      await refreshIntegrationStatus();
     } catch {
       expireSession();
     }

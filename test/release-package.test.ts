@@ -12,11 +12,14 @@ import {
 } from "../scripts/publish-release.ts";
 
 const rootPackage = JSON.parse(readFileSync("package.json", "utf8"));
+const rootPackageLock = JSON.parse(readFileSync("package-lock.json", "utf8"));
+const cargoLock = readFileSync("Cargo.lock", "utf8");
 const releasePackage = JSON.parse(
   readFileSync("distribution/npm/package.json", "utf8"),
 );
 const releaseWorkflow = readFileSync(".github/workflows/release.yml", "utf8");
 const ciWorkflow = readFileSync(".github/workflows/ci.yml", "utf8");
+const readme = readFileSync("README.md", "utf8");
 const cargoMetadata = JSON.parse(
   execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
     encoding: "utf8",
@@ -29,9 +32,24 @@ assert.ok(workspaceVersion);
 
 test("release metadata has one synchronized Apache-2.0 version", () => {
   assert.equal(rootPackage.version, workspaceVersion);
+  assert.equal(rootPackageLock.version, workspaceVersion);
+  assert.equal(rootPackageLock.packages[""].version, workspaceVersion);
   assert.equal(releasePackage.version, workspaceVersion);
   assert.equal(releasePackage.license, "Apache-2.0");
   assert.equal(releasePackage.repository.url, "git+https://github.com/MCprotein/agent-observability.git");
+  const localCargoPackages = [...cargoLock.matchAll(
+    /\[\[package\]\]\nname = "(agent-observability-[^"]+|xtask)"\nversion = "([^"]+)"/g,
+  )];
+  assert.ok(localCargoPackages.length > 0);
+  assert.deepEqual(
+    [...new Set(localCargoPackages.map((match) => match[2]))],
+    [workspaceVersion],
+  );
+  const escapedWorkspaceVersion = workspaceVersion.replaceAll(".", "\\.");
+  assert.match(readme, new RegExp(`\\*\\*v${escapedWorkspaceVersion} 릴리스 후보\\.\\*\\*`));
+  assert.match(readme, new RegExp(`빠른 시작은 v${escapedWorkspaceVersion} 기준`));
+  const installerVersion = readme.match(/releases\/download\/v(\d+\.\d+\.\d+)\/install\.sh/)?.[1];
+  assert.equal(installerVersion, workspaceVersion);
 });
 
 test("GitHub package exposes only the universal native macOS CLI", () => {

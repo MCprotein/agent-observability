@@ -67,6 +67,110 @@ try {
   assert.equal(await optionalIntegrationFailurePage.evaluate(() => sessionStorage.length), 1);
   await optionalIntegrationFailurePage.close();
 
+  const recoveringIntegrationPage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const recoveringIntegration = await mockCodexApi(recoveringIntegrationPage, {
+    startConnected: true,
+    firstStatusUnavailable: true,
+  });
+  await recoveringIntegrationPage.goto(url, { waitUntil: "networkidle" });
+  await recoveringIntegrationPage.locator(".integration-panel[data-state='ready']").waitFor();
+  assert.equal(recoveringIntegration.methods.filter((method) => method === "GET").length, 2);
+  assert.equal(recoveringIntegration.getTimestamps.length, 2);
+  assert.ok(
+    recoveringIntegration.getTimestamps[1]! - recoveringIntegration.getTimestamps[0]! >= 1_450,
+  );
+  await recoveringIntegrationPage.close();
+
+  const persistentlyUnavailablePage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  await persistentlyUnavailablePage.addInitScript(() => {
+    const nativeAddEventListener = window.addEventListener.bind(window);
+    window.addEventListener = ((type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions) => {
+      if (type !== "focus") nativeAddEventListener(type, listener, options);
+    }) as typeof window.addEventListener;
+  });
+  const persistentlyUnavailable = await mockCodexApi(persistentlyUnavailablePage, {
+    startConnected: true,
+    unavailableStatusCount: 2,
+  });
+  await persistentlyUnavailablePage.goto(url, { waitUntil: "networkidle" });
+  await persistentlyUnavailablePage
+    .locator(".integration-panel[data-config-state='connected'][data-collector-state='unavailable']")
+    .waitFor();
+  await persistentlyUnavailablePage.waitForTimeout(1_750);
+  assert.equal(persistentlyUnavailable.methods.filter((method) => method === "GET").length, 2);
+  await persistentlyUnavailablePage.close();
+
+  const outOfOrderPage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  let integrationGetCount = 0;
+  let releaseInitialStatus: (() => void) | undefined;
+  const initialStatusRelease = new Promise<void>((resolve) => {
+    releaseInitialStatus = resolve;
+  });
+  await outOfOrderPage.route("**/api/integrations/codex", async (route) => {
+    integrationGetCount += 1;
+    if (integrationGetCount === 1) {
+      await initialStatusRelease;
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(disconnectedStatus()) });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(connectedStatus()) });
+  });
+  await outOfOrderPage.goto(url, { waitUntil: "domcontentloaded" });
+  while (integrationGetCount < 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  await outOfOrderPage.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await outOfOrderPage.waitForFunction(() => document.querySelector("#settings-form") !== null);
+  if (!releaseInitialStatus) throw new Error("initial status release was not initialized");
+  releaseInitialStatus();
+  await outOfOrderPage.locator(".integration-panel[data-state='ready']").waitFor();
+  await outOfOrderPage.waitForTimeout(100);
+  assert.equal(await outOfOrderPage.locator(".integration-panel").getAttribute("data-state"), "ready");
+  await outOfOrderPage.close();
+
+  const expiredRacePage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  await expiredRacePage.addInitScript(() => {
+    const nativeSetInterval = window.setInterval.bind(window);
+    (window as typeof window & { __agentobsIntervalCount?: number }).__agentobsIntervalCount = 0;
+    window.setInterval = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      (window as typeof window & { __agentobsIntervalCount?: number }).__agentobsIntervalCount! += 1;
+      return nativeSetInterval(handler, timeout, ...args);
+    }) as typeof window.setInterval;
+  });
+  let expiredRaceGetCount = 0;
+  let releaseExpiredRaceInitial: (() => void) | undefined;
+  const expiredRaceInitialRelease = new Promise<void>((resolve) => {
+    releaseExpiredRaceInitial = resolve;
+  });
+  await expiredRacePage.route("**/api/integrations/codex", async (route) => {
+    expiredRaceGetCount += 1;
+    if (expiredRaceGetCount === 1) {
+      await expiredRaceInitialRelease;
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(disconnectedStatus()) });
+      return;
+    }
+    await route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      body: JSON.stringify({ code: "invalid_session", message: "expired race session" }),
+    });
+  });
+  await expiredRacePage.goto(url, { waitUntil: "domcontentloaded" });
+  while (expiredRaceGetCount < 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  await expiredRacePage.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expiredRacePage.locator("text=설정 세션이 종료되었습니다").waitFor();
+  if (!releaseExpiredRaceInitial) throw new Error("expired race release was not initialized");
+  releaseExpiredRaceInitial();
+  await expiredRacePage.waitForTimeout(100);
+  assert.equal(await expiredRacePage.locator("text=설정 세션이 종료되었습니다").count(), 1);
+  assert.equal(await expiredRacePage.locator("#settings-form").count(), 0);
+  assert.equal(await expiredRacePage.evaluate(() => sessionStorage.length), 0);
+  assert.equal(
+    await expiredRacePage.evaluate(
+      () => (window as typeof window & { __agentobsIntervalCount?: number }).__agentobsIntervalCount,
+    ),
+    0,
+  );
+  await expiredRacePage.close();
+
   const mutationFailurePage = await browser.newPage({ viewport: { width: 800, height: 600 } });
   await mockCodexApi(mutationFailurePage);
   await mutationFailurePage.route(`${origin}/api/config`, (route) => {
@@ -122,7 +226,11 @@ try {
   assert.equal(await lifecyclePage.locator("#toggle-integration").innerText(), "연결 해제");
 
   lifecycle.status = degradedStatus();
-  await lifecyclePage.reload({ waitUntil: "networkidle" });
+  const documentIdentity = await lifecyclePage.evaluate(() => performance.timeOrigin);
+  const navigationCount = await lifecyclePage.evaluate(
+    () => performance.getEntriesByType("navigation").length,
+  );
+  await lifecyclePage.evaluate(() => window.dispatchEvent(new Event("focus")));
   await lifecyclePage.locator(".integration-panel[data-state='degraded']").waitFor();
   assert.match(
     await lifecyclePage.locator(".integration-identity strong").innerText(),
@@ -131,6 +239,47 @@ try {
   assert.match(await lifecyclePage.locator(".integration-meta").innerText(), /리포트 지연/);
   assert.doesNotMatch(await lifecyclePage.locator(".integration-meta").innerText(), /정상/);
   assert.equal(await lifecyclePage.locator("#toggle-integration").innerText(), "연결 해제");
+  assert.equal(await lifecyclePage.evaluate(() => performance.timeOrigin), documentIdentity);
+  assert.equal(
+    await lifecyclePage.evaluate(() => performance.getEntriesByType("navigation").length),
+    navigationCount,
+  );
+
+  const heartbeatPage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  await heartbeatPage.addInitScript(() => {
+    const nativeSetInterval = window.setInterval.bind(window);
+    window.setInterval = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 20_000 && typeof handler === "function") {
+        (window as typeof window & { __agentobsHeartbeat?: () => void }).__agentobsHeartbeat = () => {
+          handler(...args);
+        };
+        return 1;
+      }
+      return nativeSetInterval(handler, timeout, ...args);
+    }) as typeof window.setInterval;
+  });
+  const heartbeatIntegration = await mockCodexApi(heartbeatPage, { startConnected: true });
+  let heartbeatCount = 0;
+  await heartbeatPage.route(`${origin}/api/heartbeat`, async (route) => {
+    heartbeatCount += 1;
+    heartbeatIntegration.status = degradedStatus();
+    await route.fulfill({ status: 204 });
+  });
+  await heartbeatPage.goto(url, { waitUntil: "networkidle" });
+  const heartbeatDocumentIdentity = await heartbeatPage.evaluate(() => performance.timeOrigin);
+  await heartbeatPage.evaluate(() => {
+    const callback = (window as typeof window & { __agentobsHeartbeat?: () => void }).__agentobsHeartbeat;
+    if (!callback) throw new Error("heartbeat callback was not captured");
+    callback();
+  });
+  await heartbeatPage.locator(".integration-panel[data-state='degraded']").waitFor();
+  assert.equal(heartbeatCount, 1);
+  assert.equal(await heartbeatPage.evaluate(() => performance.timeOrigin), heartbeatDocumentIdentity);
+  assert.equal(
+    heartbeatIntegration.methods.filter((method) => method === "GET").length,
+    2,
+  );
+  await heartbeatPage.close();
 
   await lifecyclePage.locator("#overview-dashboard").click();
   await lifecyclePage.locator("#toast").filter({ hasText: "injected report failure" }).waitFor();
@@ -589,6 +738,8 @@ type MockCodexOptions = {
   conflictDisconnect?: boolean;
   delayedMethod?: "POST" | "DELETE";
   failStatus?: boolean;
+  firstStatusUnavailable?: boolean;
+  unavailableStatusCount?: number;
 };
 
 async function mockCodexApi(page: Page, options: MockCodexOptions = {}) {
@@ -612,20 +763,42 @@ async function mockCodexApi(page: Page, options: MockCodexOptions = {}) {
         : disconnectedStatus(),
     launchAgentRunning: options.startConnected ?? false,
     methods: [] as string[],
+    getTimestamps: [] as number[],
     waitForStart: () => lifecycleStarted,
     complete: () => releaseLifecycle?.(),
     waitForCompletion: () => lifecycleCompletion,
   };
   let failConnect = options.failConnect ?? false;
   let conflictDisconnect = options.conflictDisconnect ?? false;
+  let firstStatusUnavailable = options.firstStatusUnavailable ?? false;
+  let unavailableStatusCount = options.unavailableStatusCount ?? 0;
   await page.route("**/api/integrations/codex", async (route) => {
     const method = route.request().method();
     lifecycle.methods.push(method);
+    if (method === "GET") lifecycle.getTimestamps.push(Date.now());
     if (method === "GET" && options.failStatus) {
       await route.fulfill({
         status: 500,
         contentType: "application/json",
         body: JSON.stringify({ code: "integration_failed", message: "fixed integration failure" }),
+      });
+      return;
+    }
+    if (method === "GET" && firstStatusUnavailable) {
+      firstStatusUnavailable = false;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ...connectedStatus(), collector: "unavailable" }),
+      });
+      return;
+    }
+    if (method === "GET" && unavailableStatusCount > 0) {
+      unavailableStatusCount -= 1;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ...connectedStatus(), collector: "unavailable" }),
       });
       return;
     }

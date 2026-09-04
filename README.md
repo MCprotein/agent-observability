@@ -4,7 +4,7 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 외부 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.9.0 릴리스 후보.** 설정 명령을 `agentobs settings`로 명확히 하고 기존 `agentobs ui`는 호환
+> **v1.9.1 릴리스 후보.** 설정 명령을 `agentobs settings`로 명확히 하고 기존 `agentobs ui`는 호환
 > alias로 유지한다. self-contained report는 runtime별 고정 localhost origin에서 새로고침할 수 있고,
 > 설정 화면을 닫아도 독립된 bounded dashboard process가 유지된다. 기존 Codex,
 > Claude Code, Cursor private handoff import는 daemon이나
@@ -23,7 +23,7 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 > script는 `agentobs setup ~/.agent-observability --no-open`처럼 root를 명시한다. 자동 연결은 이후
 > 설정 UI 또는 고급 lifecycle 명령으로 언제든 추가할 수 있다.
 
-아래 빠른 시작은 v1.9.0 기준이다. PR 검토 중에는 installer URL이 아직 게시되지 않으며, tag와 GitHub
+아래 빠른 시작은 v1.9.1 기준이다. PR 검토 중에는 installer URL이 아직 게시되지 않으며, tag와 GitHub
 Release가 완료된 뒤 같은 명령을 사용한다.
 
 ## 빠른 시작
@@ -34,14 +34,14 @@ Release가 완료된 뒤 같은 명령을 사용한다.
 release checksum과 실행 파일 버전을 확인한 뒤 `~/.local/bin`에 원자적으로 설치하고, 현재 shell의
 profile에 PATH 블록을 한 번만 등록한다.
 
-게시된 v1.9.0 installer를 사용한다.
+게시된 v1.9.1 installer를 사용한다.
 
 ```bash
 (
   set -eu
   installer="$(mktemp)"
   trap 'rm -f "$installer"' 0
-  curl -fsSL https://github.com/MCprotein/agent-observability/releases/download/v1.9.0/install.sh -o "$installer"
+  curl -fsSL https://github.com/MCprotein/agent-observability/releases/download/v1.9.1/install.sh -o "$installer"
   sh "$installer"
 )
 ```
