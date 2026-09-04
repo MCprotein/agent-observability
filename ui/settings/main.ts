@@ -256,7 +256,7 @@ function renderExpired(): void {
   app.innerHTML = `<main class="center-state" role="alert">
     <i data-lucide="shield-check" aria-hidden="true"></i>
     <h1>설정 세션이 종료되었습니다</h1>
-    <p>터미널에서 <code>agent-observability ui</code>를 실행해 새 세션을 여세요.</p>
+    <p>터미널에서 <code>agentobs settings</code>를 실행해 새 세션을 여세요.</p>
   </main>`;
   mountIcons();
 }

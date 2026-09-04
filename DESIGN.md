@@ -88,7 +88,8 @@ Standalone file-open uses hash navigation or internal view state so it works fro
 - `#/overview`, `#/activity`, `#/traces`, `#/traces/:traceId`
 - `#/projects`, `#/costs`, `#/privacy`, `#/exports`
 
-Standalone settings use an ephemeral loopback route opened by `agent-observability ui`:
+Standalone settings use an ephemeral loopback route opened by `agentobs settings`
+(`agentobs ui` remains a compatibility alias):
 
 - `/` renders overview, collection, storage and retention controls in one responsive workspace
 - `/api/config` reads and atomically replaces the Rust-validated local configuration
@@ -96,6 +97,18 @@ Standalone settings use an ephemeral loopback route opened by `agent-observabili
   keeps it only in same-tab session storage for reload recovery, sends it only in a private request header and
   removes it after a confirmed explicit close or an invalid-session/network failure during bootstrap,
   heartbeat, or config mutation. A failed shutdown request retains it only so the user can retry closing.
+
+Standalone monitoring remains one self-contained report artifact. `agentobs dashboard` delivers that artifact
+through a separate private read-only path capability on a runtime-root-derived stable `127.0.0.1` origin. Its report-only router exposes no
+settings or integration API and remains reloadable while the foreground command is alive. It expires after
+ten idle minutes or a one-hour hard deadline; the self-contained artifact continues to work through the file
+path without a server. This local transport does not add team scope; hosted team routes still require
+server-resolved tenant/workspace authorization.
+
+The stable report origin preserves sanitized browser-local saved views across dashboard process restarts; the
+private capability path remains separate from browser storage. A settings-triggered dashboard is owned by a
+separate child process and repeated opens reuse the live process. Report generation and loopback delivery share
+one 32 MiB artifact limit.
 
 The settings process binds an operating-system-selected port on `127.0.0.1`, rejects non-loopback host and
 origin values, sends no CORS permission, makes no external request and expires after inactivity. Closing it
@@ -311,7 +324,7 @@ implementation tutorials and keyboard-shortcut copy inside the main product surf
   320px reflow, clean and dirty reload recovery, keyboard/a11y checks, long-text overflow and
   empty/partial/offline/quota fixtures.
 - v0.12 provisions the Chromium revision paired with lockfile-pinned `playwright-core` in `npm test` pretest,
-  then runs file-open browser checks without a local server. It asserts desktop/mobile overflow, 44px mobile
+  then runs both file-open compatibility checks and real reloadable loopback delivery checks. It asserts desktop/mobile overflow, 44px mobile
   controls, headings/landmarks, first-tab focus, filter/trace state, console errors and external network requests.
 
 ## Open questions

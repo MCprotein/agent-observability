@@ -11,14 +11,14 @@ Optional Codex automatic connection은 별도의 private collector settings와 e
 ## 사용법
 
 ```bash
-agentobs ui
+agentobs settings
 ```
 
 별도 runtime은 root를 지정한다. 브라우저를 자동으로 열 수 없는 환경에서는 출력된 URL을 직접 연다.
 
 ```bash
-agentobs ui /private/runtime
-agentobs ui /private/runtime --no-open
+agentobs settings /private/runtime
+agentobs settings /private/runtime --no-open
 ```
 
 UI는 `127.0.0.1`의 임의 port에만 bind하고 URL fragment의 session capability를 private header로
@@ -31,6 +31,8 @@ cookie, local storage, 외부 전송에는 저장하지 않는다. API는 정확
 멈추며, 화면 연결이 10분 동안 끊기거나 설정 server 시작 후 1시간이 지나면 종료를 요청한다. 이
 deadline은 로컬 executor와 filesystem이 응답하는 동안 적용된다. 정적 report에는
 영향을 주지 않는다.
+
+기존 `agentobs ui` 명령은 호환 alias로 유지되며 `settings`와 같은 화면과 보안 계약을 사용한다.
 
 자동화와 headless 환경에서는 CLI를 사용한다.
 
@@ -58,7 +60,9 @@ UI process는 UI 중복 실행만 막는 전용 lock을 유지한다. 실제 저
 실행할 수 있고, 지원 writer끼리 동시에 바뀐 설정을 조용히 덮어쓰지 않는다. 충돌이 나면 최신
 설정 위에 browser에서 바꾼 필드만 다시 적용하고 사용자가 재검토 후 저장한다.
 
-같은 UI에서 Codex integration status를 확인하고 연결/해제하며 기존 dashboard를 열 수 있다. 이
+같은 UI에서 Codex integration status를 확인하고 연결/해제하며 기존 dashboard를 열 수 있다. Dashboard는
+설정 server 내부 task가 아니라 별도 process가 소유하므로 설정 세션을 닫아도 자신의 bounded lifetime까지
+새로고침할 수 있다. 반복 open은 같은 runtime의 살아 있는 dashboard process를 재사용한다. 이
 integration mutation도 private UI session, exact Host와 Origin을 확인하고 Rust blocking executor에서
 실행한다. UI를 닫아도 이미 연결된 LaunchAgent는 계속 실행되며, 연결 해제는 명시적으로 수행해야 한다.
 

@@ -3,7 +3,7 @@
 v1.0.0 introduced the standalone local-only Rust runtime boundary. v1.2.0 added bounded local
 retention and private archive export; v1.4.0 added one-command setup, an isolated built-in demo,
 dashboard open, and atomic CLI configuration updates. v1.5.0 adds an explicit, ephemeral loopback
-settings UI. v1.8.1 is **Released** and provides optional Codex automatic local collection through a
+settings UI. v1.8.4 is **Released** and provides optional Codex automatic local collection through a
 private-CA HTTPS IPv4 loopback receiver with an exact private random request header, plus a macOS LaunchAgent.
 This transport is not mTLS. Manual Codex, Claude Code and Cursor imports remain
 fully functional without a daemon, receiver, login or network. The automatic path makes no external request.
@@ -25,7 +25,7 @@ agentobs setup
 agentobs connect codex
 agentobs status codex
 agentobs disconnect codex
-agentobs ui
+agentobs settings
 agentobs config show
 agentobs config set retention-days 90
 agentobs dashboard
@@ -38,20 +38,30 @@ agentobs report ~/.agent-observability /path/to/private-rate-table.json
 ~~~
 
 `setup` without an explicit root first performs read-only detection of a real Codex home or executable, then
-composes private install, store initialization, report generation and macOS browser open. A detected Codex
+composes private install, store initialization, report generation, Codex connection and ephemeral loopback
+browser delivery. A detected Codex
 installation is connected automatically for `~/.agent-observability`; otherwise setup reports `codex=not_detected` without
 creating a Codex home, config, or collector service. Dashboard preparation failure stops
-before integration mutation; connection failure can leave the already-open private dashboard in place.
+before integration mutation; loopback delivery starts only after connection succeeds.
 `setup --no-open` performs the same
 work without opening a browser. `setup <root> [--no-open]` initializes an explicit root in manual-import mode;
 run `connect codex <root>` separately to enable automatic Codex collection there.
 `demo` uses an isolated default root and embedded content-free fixture; it never reads an agent log.
-`ui` holds only a settings-UI instance singleton, embeds the generated TypeScript application, and
+`settings` holds only a settings-UI instance singleton, embeds the generated TypeScript application, and
 delegates all configuration validation and atomic save behavior back to Rust. Every supported CLI/UI writer
 and installed-root ingest path acquires the same cross-process mutation lock. The CLI reads and writes while
 holding its typed guard; the UI additionally verifies the
 browser revision immediately before the atomic replace. Both release the guard before the next operation.
 Direct config file editing is unsupported.
+`ui` remains a compatibility alias for `settings`. `dashboard` renders the same private self-contained report
+artifact, exposes it through a separate private read-only capability on a runtime-root-derived stable IPv4
+loopback port, and keeps a report-only foreground server available for reload until ten idle minutes or a
+one-hour hard deadline. The stable origin preserves sanitized browser-local saved views across process restarts.
+Settings launches this server as an independently owned child process and reuses it on repeated opens, so closing
+settings does not cancel dashboard delivery. Report production and delivery enforce the same 32 MiB artifact limit.
+The capability remains only in the private URL path; no cookie or browser storage is added by the transport,
+and the report sends no referrer or external request. The generated file remains independently usable without
+the server.
 The same authenticated UI exposes Codex status/connect/disconnect and opens an existing report through Rust
 handlers. Integration mutations require the private session, exact Host and Origin, and run on the blocking
 executor. Closing the ephemeral UI does not stop a LaunchAgent that the user connected.

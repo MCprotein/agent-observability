@@ -5,6 +5,7 @@ use agent_observability_codex_integration::{
     CodexIntegrationStatus, IntegrationError, connect as connect_codex,
     disconnect as disconnect_codex, status as codex_status,
 };
+use agent_observability_contracts::MAX_REPORT_ARTIFACT_BYTES;
 use agent_observability_local_collector::REPORT_FILE_NAME;
 use agent_observability_local_runtime::{
     ConfigServiceError, InstalledLayout, LocalConfigService, LocalRuntimeConfigV2, Singleton,
@@ -13,8 +14,8 @@ use agent_observability_local_runtime::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, FromRequest, State, rejection::JsonRejection},
-    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
+    extract::{DefaultBodyLimit, FromRequest, Path as AxumPath, State, rejection::JsonRejection},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -22,13 +23,15 @@ use axum::{
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
-#[cfg(any(target_os = "macos", test))]
-use std::process::{Child, Command, Stdio};
+use sha2::{Digest, Sha256};
 use std::{
     env,
     ffi::OsStr,
     fs,
+    io::{Read, Write},
+    net::{Ipv4Addr, SocketAddrV4, TcpStream},
     path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -41,6 +44,12 @@ use tower::ServiceExt;
 
 const SESSION_HEADER: &str = "x-agent-observability-session";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const DASHBOARD_PORT_BASE: u16 = 49_152;
+const DASHBOARD_PORT_SPAN: u16 = 12_000;
+const DASHBOARD_START_TIMEOUT: Duration = Duration::from_secs(5);
+const DASHBOARD_PROBE_INTERVAL: Duration = Duration::from_millis(25);
+const DASHBOARD_CAPABILITY_FILE: &str = "capability";
+const DASHBOARD_IDENTITY_HEADER: &str = "x-agent-observability-dashboard";
 const IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 const MAX_SESSION_LIFETIME: Duration = Duration::from_hours(1);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -62,6 +71,7 @@ pub enum UiError {
     Io(std::io::Error),
     Runtime(String),
     Random(String),
+    DashboardArtifact(DashboardArtifactError),
 }
 
 impl std::fmt::Display for UiError {
@@ -70,11 +80,37 @@ impl std::fmt::Display for UiError {
             Self::Io(error) => write!(formatter, "local settings UI I/O error: {error}"),
             Self::Runtime(message) => formatter.write_str(message),
             Self::Random(message) => write!(formatter, "local settings session error: {message}"),
+            Self::DashboardArtifact(error) => {
+                write!(formatter, "local dashboard artifact error: {error}")
+            }
         }
     }
 }
 
 impl std::error::Error for UiError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DashboardArtifactError {
+    Missing,
+    Unsafe,
+    TooLarge,
+    Unsupported,
+    Io,
+}
+
+impl std::fmt::Display for DashboardArtifactError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Missing => "report is missing",
+            Self::Unsafe => "report is not a private regular file",
+            Self::TooLarge => "report exceeds the 32 MiB contract",
+            Self::Unsupported => "private report serving is unsupported on this platform",
+            Self::Io => "report could not be read",
+        })
+    }
+}
+
+impl std::error::Error for DashboardArtifactError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlatformOpenError {
@@ -146,74 +182,146 @@ impl PreparedUi {
             _ui_singleton,
             ..
         } = self;
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let mut connections = JoinSet::new();
-        let connection_slots = Arc::new(Semaphore::new(max_connections));
-        let shutdown = shutdown_signal(shutdown, last_seen);
-        tokio::pin!(shutdown);
-
-        loop {
-            tokio::select! {
-                () = &mut shutdown => break,
-                joined = connections.join_next(), if !connections.is_empty() => {
-                    let _ = joined;
-                }
-                accepted = listener.accept() => {
-                    let (stream, _) = accepted?;
-                    let Ok(connection_slot) = Arc::clone(&connection_slots).try_acquire_owned() else {
-                        drop(stream);
-                        continue;
-                    };
-                    let router = router.clone();
-                    let mut stop_rx = stop_rx.clone();
-                    connections.spawn(async move {
-                        let _connection_slot = connection_slot;
-                        let service = service_fn(move |request: Request<Incoming>| {
-                            router.clone().oneshot(request.map(Body::new))
-                        });
-                        let mut builder = http1::Builder::new();
-                        builder
-                            .timer(TokioTimer::new())
-                            .header_read_timeout(header_read_timeout);
-                        let connection = builder.serve_connection(TokioIo::new(stream), service);
-                        tokio::pin!(connection);
-                        tokio::select! {
-                            _ = &mut connection => {}
-                            changed = stop_rx.changed() => {
-                                if changed.is_ok() {
-                                    connection.as_mut().graceful_shutdown();
-                                    let _ = tokio::time::timeout(drain_timeout, &mut connection).await;
-                                }
-                            }
-                        }
-                    });
-                }
-            }
-        }
-
-        let _ = stop_tx.send(true);
-        drop(listener);
-        if tokio::time::timeout(drain_timeout, async {
-            while connections.join_next().await.is_some() {}
-        })
+        serve_transport(
+            listener,
+            router,
+            shutdown,
+            last_seen,
+            header_read_timeout,
+            drain_timeout,
+            max_connections,
+        )
         .await
-        .is_err()
-        {
-            connections.abort_all();
-            while connections.join_next().await.is_some() {}
-        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedDashboard {
+    listener: TcpListener,
+    router: Router,
+    url: String,
+    shutdown: Arc<Notify>,
+    last_seen: Arc<Mutex<Instant>>,
+    _dashboard_singleton: Singleton,
+}
+
+impl PreparedDashboard {
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub async fn serve(self) -> Result<(), UiError> {
+        let Self {
+            listener,
+            router,
+            shutdown,
+            last_seen,
+            _dashboard_singleton: dashboard_singleton,
+            ..
+        } = self;
+        serve_transport(
+            listener,
+            router,
+            shutdown,
+            last_seen,
+            HEADER_READ_TIMEOUT,
+            GRACEFUL_DRAIN_TIMEOUT,
+            MAX_CONNECTIONS,
+        )
+        .await?;
+        drop(dashboard_singleton);
         Ok(())
     }
+}
+
+async fn serve_transport(
+    listener: TcpListener,
+    router: Router,
+    shutdown: Arc<Notify>,
+    last_seen: Arc<Mutex<Instant>>,
+    header_read_timeout: Duration,
+    drain_timeout: Duration,
+    max_connections: usize,
+) -> Result<(), UiError> {
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let mut connections = JoinSet::new();
+    let connection_slots = Arc::new(Semaphore::new(max_connections));
+    let shutdown = shutdown_signal(shutdown, last_seen);
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            () = &mut shutdown => break,
+            joined = connections.join_next(), if !connections.is_empty() => {
+                let _ = joined;
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let Ok(connection_slot) = Arc::clone(&connection_slots).try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
+                let router = router.clone();
+                let mut stop_rx = stop_rx.clone();
+                connections.spawn(async move {
+                    let _connection_slot = connection_slot;
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        router.clone().oneshot(request.map(Body::new))
+                    });
+                    let mut builder = http1::Builder::new();
+                    builder
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(header_read_timeout);
+                    let connection = builder.serve_connection(TokioIo::new(stream), service);
+                    tokio::pin!(connection);
+                    tokio::select! {
+                        _ = &mut connection => {}
+                        changed = stop_rx.changed() => {
+                            if changed.is_ok() {
+                                connection.as_mut().graceful_shutdown();
+                                let _ = tokio::time::timeout(drain_timeout, &mut connection).await;
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    let _ = stop_tx.send(true);
+    drop(listener);
+    if tokio::time::timeout(drain_timeout, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
 struct AppState {
     config: LocalConfigService,
     root: PathBuf,
+    runtime: PathBuf,
     host: String,
     origin: String,
     token: String,
     shutdown: Arc<Notify>,
+    last_seen: Arc<Mutex<Instant>>,
+    dashboard_child: Arc<Mutex<Option<Child>>>,
+}
+
+#[derive(Clone, Debug)]
+struct DashboardState {
+    host: String,
+    origin: String,
+    token: String,
+    report: PathBuf,
     last_seen: Arc<Mutex<Instant>>,
 }
 
@@ -289,11 +397,13 @@ pub async fn prepare(layout: &InstalledLayout) -> Result<PreparedUi, UiError> {
     let state = AppState {
         config: LocalConfigService::new(layout),
         root: layout.root.clone(),
+        runtime: layout.runtime.clone(),
         host,
         origin: origin.clone(),
         token: token.clone(),
         shutdown: Arc::clone(&shutdown),
         last_seen: Arc::clone(&last_seen),
+        dashboard_child: Arc::new(Mutex::new(None)),
     };
     let router = router(state);
 
@@ -304,6 +414,46 @@ pub async fn prepare(layout: &InstalledLayout) -> Result<PreparedUi, UiError> {
         shutdown,
         last_seen,
         _ui_singleton: ui_singleton,
+    })
+}
+
+pub async fn prepare_dashboard(layout: &InstalledLayout) -> Result<PreparedDashboard, UiError> {
+    let dashboard_singleton = Singleton::acquire(&layout.runtime.join("dashboard-ui"))
+        .map_err(|error| UiError::Runtime(error.to_string()))?;
+    prepare_dashboard_path(layout, dashboard_singleton).await
+}
+
+async fn prepare_dashboard_path(
+    layout: &InstalledLayout,
+    dashboard_singleton: Singleton,
+) -> Result<PreparedDashboard, UiError> {
+    let path = layout.root.join("logs").join(REPORT_FILE_NAME);
+    let report = path.clone();
+    tokio::task::spawn_blocking(move || validate_private_report(&path))
+        .await
+        .map_err(|_| UiError::Runtime("local dashboard artifact task failed".into()))?
+        .map_err(UiError::DashboardArtifact)?;
+    let token = load_or_create_dashboard_token(&layout.runtime.join("dashboard-ui"))?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, dashboard_port(&layout.root))).await?;
+    let address = listener.local_addr()?;
+    let host = address.to_string();
+    let origin = format!("http://{host}");
+    let shutdown = Arc::new(Notify::new());
+    let last_seen = Arc::new(Mutex::new(Instant::now()));
+    let state = DashboardState {
+        host,
+        origin: origin.clone(),
+        token: token.clone(),
+        report,
+        last_seen: Arc::clone(&last_seen),
+    };
+    Ok(PreparedDashboard {
+        listener,
+        router: dashboard_router(state),
+        url: format!("{origin}/report/{token}"),
+        shutdown,
+        last_seen,
+        _dashboard_singleton: dashboard_singleton,
     })
 }
 
@@ -331,6 +481,16 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+fn dashboard_router(state: DashboardState) -> Router {
+    Router::new()
+        .route("/report/{token}", get(dashboard_document))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            dashboard_security_boundary,
+        ))
+        .with_state(state)
+}
+
 async fn index() -> Html<&'static str> {
     Html(SETTINGS_SHELL)
 }
@@ -345,6 +505,30 @@ async fn style() -> Response {
 
 async fn empty() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+async fn dashboard_document(
+    State(state): State<DashboardState>,
+    AxumPath(token): AxumPath<String>,
+) -> Result<Response, StatusCode> {
+    if !constant_time_equal(token.as_bytes(), state.token.as_bytes()) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    touch_last_seen(&state.last_seen).map_err(|()| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let report = state.report;
+    let html = tokio::task::spawn_blocking(move || read_private_report(&report))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let mut response = Body::from(html).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(DASHBOARD_IDENTITY_HEADER, HeaderValue::from_static("1"));
+    Ok(response)
 }
 
 fn static_asset(body: &'static str, content_type: &'static str) -> Response {
@@ -430,32 +614,38 @@ async fn open_dashboard(
 ) -> Result<StatusCode, ApiError> {
     authorize(&state, &headers, true)?;
     touch(&state)?;
-    let report = state.root.join("logs").join(REPORT_FILE_NAME);
-    tokio::task::spawn_blocking(move || open_dashboard_file(&report))
+    let root = state.root;
+    let runtime = state.runtime;
+    let dashboard_child = state.dashboard_child;
+    let dashboard_url = tokio::task::spawn_blocking(move || {
+        launch_or_reuse_dashboard(&root, &runtime, &dashboard_child)
+    })
+    .await
+    .map_err(|_| dashboard_error(DashboardOpenError::TaskFailed))?
+    .map_err(dashboard_error)?;
+    let open_result = tokio::task::spawn_blocking(move || open_dashboard_target(&dashboard_url))
         .await
-        .map_err(|_| dashboard_error(DashboardOpenError::TaskFailed))?
-        .map_err(dashboard_error)?;
+        .map_err(|_| DashboardOpenError::TaskFailed)
+        .and_then(|result| result)
+        .map_err(dashboard_error);
+    open_result?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DashboardOpenError {
-    #[cfg(target_os = "macos")]
-    MissingReport,
+    Artifact(DashboardArtifactError),
     Platform(PlatformOpenError),
     TaskFailed,
 }
 
 #[cfg(target_os = "macos")]
-fn open_dashboard_file(path: &Path) -> Result<(), DashboardOpenError> {
-    if !path.is_file() {
-        return Err(DashboardOpenError::MissingReport);
-    }
-    open_local_target(path).map_err(DashboardOpenError::Platform)
+fn open_dashboard_target(target: &str) -> Result<(), DashboardOpenError> {
+    open_local_target(target).map_err(DashboardOpenError::Platform)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn open_dashboard_file(_path: &Path) -> Result<(), DashboardOpenError> {
+fn open_dashboard_target(_target: &str) -> Result<(), DashboardOpenError> {
     Err(DashboardOpenError::Platform(
         PlatformOpenError::UnsupportedPlatform,
     ))
@@ -536,10 +726,25 @@ fn integration_error() -> ApiError {
 
 fn dashboard_error(error: DashboardOpenError) -> ApiError {
     let (code, message) = match error {
-        #[cfg(target_os = "macos")]
-        DashboardOpenError::MissingReport => (
+        DashboardOpenError::Artifact(DashboardArtifactError::Missing) => (
             "dashboard_missing",
             "모니터링 리포트가 아직 생성되지 않았습니다.",
+        ),
+        DashboardOpenError::Artifact(DashboardArtifactError::Unsafe) => (
+            "dashboard_unsafe",
+            "모니터링 리포트의 로컬 보안 조건을 확인할 수 없습니다.",
+        ),
+        DashboardOpenError::Artifact(DashboardArtifactError::TooLarge) => (
+            "dashboard_too_large",
+            "모니터링 리포트가 32 MiB 제한을 초과했습니다.",
+        ),
+        DashboardOpenError::Artifact(DashboardArtifactError::Unsupported) => (
+            "dashboard_unsupported",
+            "이 운영체제에서는 private 모니터링 리포트를 제공할 수 없습니다.",
+        ),
+        DashboardOpenError::Artifact(DashboardArtifactError::Io) => (
+            "dashboard_unavailable",
+            "모니터링 리포트를 안전하게 읽을 수 없습니다.",
         ),
         DashboardOpenError::Platform(PlatformOpenError::UnsupportedPlatform) => (
             "dashboard_unsupported",
@@ -556,8 +761,8 @@ fn dashboard_error(error: DashboardOpenError) -> ApiError {
             | PlatformOpenError::TerminateFailed
             | PlatformOpenError::ReapFailed
             | PlatformOpenError::ReapTimedOut,
-        ) => ("dashboard_open_failed", "모니터링 리포트를 열 수 없습니다."),
-        DashboardOpenError::TaskFailed => {
+        )
+        | DashboardOpenError::TaskFailed => {
             ("dashboard_open_failed", "모니터링 리포트를 열 수 없습니다.")
         }
     };
@@ -611,16 +816,47 @@ async fn security_boundary(
         )
         .into_response()
     };
-    apply_security_headers(response.headers_mut());
+    apply_security_headers(response.headers_mut(), false);
     response
 }
 
-fn apply_security_headers(headers: &mut HeaderMap) {
+async fn dashboard_security_boundary(
+    State(state): State<DashboardState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let valid_method = matches!(*request.method(), Method::GET | Method::HEAD);
+    let valid_host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == state.host);
+    let valid_origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|value| value == state.origin);
+    let mut response = if valid_method && valid_host && valid_origin {
+        next.run(request).await
+    } else {
+        StatusCode::FORBIDDEN.into_response()
+    };
+    apply_security_headers(response.headers_mut(), true);
+    response
+}
+
+fn apply_security_headers(headers: &mut HeaderMap, is_dashboard: bool) {
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
-        ),
+        if is_dashboard {
+            HeaderValue::from_static(
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+            )
+        } else {
+            HeaderValue::from_static(
+                "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+            )
+        },
     );
     headers.insert(
         header::CACHE_CONTROL,
@@ -635,6 +871,233 @@ fn apply_security_headers(headers: &mut HeaderMap) {
         HeaderValue::from_static("no-referrer"),
     );
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+}
+
+fn dashboard_port(root: &Path) -> u16 {
+    let digest = Sha256::digest(root.to_string_lossy().as_bytes());
+    let offset = u16::from_be_bytes([digest[0], digest[1]]) % DASHBOARD_PORT_SPAN;
+    DASHBOARD_PORT_BASE + offset
+}
+
+fn dashboard_url(runtime: &Path, root: &Path) -> Result<Option<String>, DashboardArtifactError> {
+    let Some(token) = read_dashboard_token(&runtime.join("dashboard-ui"))? else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "http://127.0.0.1:{}/report/{token}",
+        dashboard_port(root)
+    )))
+}
+
+fn launch_or_reuse_dashboard(
+    root: &Path,
+    runtime: &Path,
+    child_slot: &Mutex<Option<Child>>,
+) -> Result<String, DashboardOpenError> {
+    validate_private_report(&root.join("logs").join(REPORT_FILE_NAME))
+        .map_err(DashboardOpenError::Artifact)?;
+    if let Some(url) = dashboard_url(runtime, root).map_err(DashboardOpenError::Artifact)?
+        && dashboard_probe(&url)
+    {
+        return Ok(url);
+    }
+
+    let executable = env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|_| DashboardOpenError::TaskFailed)?;
+    let mut child = Command::new(executable)
+        .arg("dashboard-serve")
+        .arg(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| DashboardOpenError::TaskFailed)?;
+    let deadline = Instant::now() + DASHBOARD_START_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Some(url) = dashboard_url(runtime, root).map_err(DashboardOpenError::Artifact)?
+            && dashboard_probe(&url)
+        {
+            *child_slot
+                .lock()
+                .map_err(|_| DashboardOpenError::TaskFailed)? = Some(child);
+            return Ok(url);
+        }
+        if child
+            .try_wait()
+            .map_err(|_| DashboardOpenError::TaskFailed)?
+            .is_some()
+        {
+            return Err(DashboardOpenError::TaskFailed);
+        }
+        std::thread::sleep(DASHBOARD_PROBE_INTERVAL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(DashboardOpenError::TaskFailed)
+}
+
+fn dashboard_probe(url: &str) -> bool {
+    let Some(authority) = url.strip_prefix("http://127.0.0.1:") else {
+        return false;
+    };
+    let Some((port, path)) = authority.split_once('/') else {
+        return false;
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return false;
+    };
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+    let Ok(mut stream) = TcpStream::connect_timeout(&address.into(), Duration::from_millis(150))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(150)));
+    let request =
+        format!("GET /{path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 256];
+    while response.len() < 2048 {
+        let Ok(count) = stream.read(&mut chunk) else {
+            return false;
+        };
+        if count == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..count]);
+        if response.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    response.starts_with(b"HTTP/1.1 200")
+        && response
+            .windows(b"x-agent-observability-dashboard: 1".len())
+            .any(|window| window == b"x-agent-observability-dashboard: 1")
+}
+
+#[cfg(unix)]
+fn read_dashboard_token(dir: &Path) -> Result<Option<String>, DashboardArtifactError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = dir.join(DASHBOARD_CAPABILITY_FILE);
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(DashboardArtifactError::Unsafe),
+    };
+    let metadata = file.metadata().map_err(|_| DashboardArtifactError::Io)?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 || metadata.len() > 65 {
+        return Err(DashboardArtifactError::Unsafe);
+    }
+    let mut token = String::new();
+    file.read_to_string(&mut token)
+        .map_err(|_| DashboardArtifactError::Io)?;
+    let token = token.trim_end();
+    if token.len() != 64
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(DashboardArtifactError::Unsafe);
+    }
+    Ok(Some(token.to_owned()))
+}
+
+#[cfg(not(unix))]
+fn read_dashboard_token(_dir: &Path) -> Result<Option<String>, DashboardArtifactError> {
+    Err(DashboardArtifactError::Unsupported)
+}
+
+#[cfg(unix)]
+fn load_or_create_dashboard_token(dir: &Path) -> Result<String, UiError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if let Some(token) = read_dashboard_token(dir).map_err(UiError::DashboardArtifact)? {
+        return Ok(token);
+    }
+    let token = session_token()?;
+    let path = dir.join(DASHBOARD_CAPABILITY_FILE);
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(token.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(token)
+}
+
+#[cfg(not(unix))]
+fn load_or_create_dashboard_token(_dir: &Path) -> Result<String, UiError> {
+    Err(UiError::DashboardArtifact(
+        DashboardArtifactError::Unsupported,
+    ))
+}
+
+#[cfg(unix)]
+fn read_private_report(path: &Path) -> Result<Vec<u8>, DashboardArtifactError> {
+    let (file, length) = open_private_report(path)?;
+    let mut html = Vec::with_capacity(usize::try_from(length).unwrap_or_default());
+    file.take(MAX_REPORT_ARTIFACT_BYTES + 1)
+        .read_to_end(&mut html)
+        .map_err(|_| DashboardArtifactError::Io)?;
+    if u64::try_from(html.len()).unwrap_or(u64::MAX) > MAX_REPORT_ARTIFACT_BYTES {
+        return Err(DashboardArtifactError::TooLarge);
+    }
+    Ok(html)
+}
+
+#[cfg(unix)]
+fn validate_private_report(path: &Path) -> Result<(), DashboardArtifactError> {
+    open_private_report(path).map(|_| ())
+}
+
+#[cfg(unix)]
+fn open_private_report(path: &Path) -> Result<(fs::File, u64), DashboardArtifactError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                DashboardArtifactError::Unsafe
+            } else {
+                match error.kind() {
+                    std::io::ErrorKind::NotFound => DashboardArtifactError::Missing,
+                    std::io::ErrorKind::PermissionDenied => DashboardArtifactError::Unsafe,
+                    _ => DashboardArtifactError::Io,
+                }
+            }
+        })?;
+    let metadata = file.metadata().map_err(|_| DashboardArtifactError::Io)?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(DashboardArtifactError::Unsafe);
+    }
+    if metadata.len() > MAX_REPORT_ARTIFACT_BYTES {
+        return Err(DashboardArtifactError::TooLarge);
+    }
+    Ok((file, metadata.len()))
+}
+
+#[cfg(not(unix))]
+fn read_private_report(_path: &Path) -> Result<Vec<u8>, DashboardArtifactError> {
+    Err(DashboardArtifactError::Unsupported)
+}
+
+#[cfg(not(unix))]
+fn validate_private_report(_path: &Path) -> Result<(), DashboardArtifactError> {
+    Err(DashboardArtifactError::Unsupported)
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap, mutation: bool) -> Result<(), ApiError> {
@@ -731,13 +1194,17 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn touch(state: &AppState) -> Result<(), ApiError> {
-    let mut last_seen = state.last_seen.lock().map_err(|_| {
+    touch_last_seen(&state.last_seen).map_err(|()| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "session_state_failed",
             "설정 세션 상태를 갱신할 수 없습니다.",
         )
-    })?;
+    })
+}
+
+fn touch_last_seen(last_seen: &Mutex<Instant>) -> Result<(), ()> {
+    let mut last_seen = last_seen.lock().map_err(|_| ())?;
     *last_seen = Instant::now();
     Ok(())
 }
@@ -774,9 +1241,11 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, DashboardOpenError, LocalConfigService, PlatformOpenError, constant_time_equal,
-        dashboard_error, platform_open_command, prepare, router, run_integration,
-        run_platform_opener, session_token,
+        AppState, DASHBOARD_IDENTITY_HEADER, DashboardArtifactError, DashboardOpenError,
+        DashboardState, LocalConfigService, MAX_REPORT_ARTIFACT_BYTES, PlatformOpenError,
+        REPORT_FILE_NAME, constant_time_equal, dashboard_error, dashboard_router,
+        platform_open_command, prepare, prepare_dashboard, read_private_report, router,
+        run_integration, run_platform_opener, session_token,
     };
     use agent_observability_codex_integration::{CodexIntegrationStatus, IntegrationError};
     use agent_observability_local_runtime::{LocalRuntimeConfigV2, install, revision};
@@ -1102,11 +1571,13 @@ mod tests {
                 let state = AppState {
                     config: LocalConfigService::new(&layout),
                     root: layout.root.clone(),
+                    runtime: layout.runtime.clone(),
                     host: "127.0.0.1:43191".into(),
                     origin: "http://127.0.0.1:43191".into(),
                     token: "test-session".into(),
                     shutdown: Arc::new(Notify::new()),
                     last_seen: Arc::new(Mutex::new(Instant::now())),
+                    dashboard_child: Arc::new(Mutex::new(None)),
                 };
                 let app = router(state);
 
@@ -1231,6 +1702,210 @@ mod tests {
                     "로컬 설정을 읽거나 저장할 수 없습니다."
                 );
                 assert!(!unavailable_body.windows(5).any(|window| window == b"/tmp/"));
+                let _ = fs::remove_dir_all(root);
+            });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_artifact_failures_remain_typed() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-artifact-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let report = root.join("report.html");
+        assert_eq!(
+            read_private_report(&report).unwrap_err(),
+            DashboardArtifactError::Missing
+        );
+
+        fs::write(&report, b"private").unwrap();
+        fs::set_permissions(&report, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            read_private_report(&report).unwrap_err(),
+            DashboardArtifactError::Unsafe
+        );
+        fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&report)
+            .unwrap()
+            .set_len(MAX_REPORT_ARTIFACT_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            read_private_report(&report).unwrap_err(),
+            DashboardArtifactError::TooLarge
+        );
+
+        fs::remove_file(&report).unwrap();
+        let target = root.join("target.html");
+        fs::write(&target, b"private").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &report).unwrap();
+        assert_eq!(
+            read_private_report(&report).unwrap_err(),
+            DashboardArtifactError::Unsafe
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dashboard_surface_is_private_read_only_and_separate_from_settings() {
+        use std::os::unix::fs::PermissionsExt;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let root = std::env::temp_dir().join(format!(
+                    "agent-observability-dashboard-ui-test-{}",
+                    std::process::id()
+                ));
+                let _ = fs::remove_dir_all(&root);
+                let layout = install(&root).unwrap();
+                let report = layout.root.join("logs").join(REPORT_FILE_NAME);
+                fs::write(&report, b"<!doctype html><title>Private dashboard</title>").unwrap();
+                fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).unwrap();
+                let settings_server = prepare(&layout).await.unwrap();
+                let dashboard_server = prepare_dashboard(&layout).await.unwrap();
+                assert!(settings_server.url().contains("/#session="));
+                assert!(dashboard_server.url().contains("/report/"));
+                drop(settings_server);
+                drop(dashboard_server);
+                let state = DashboardState {
+                    host: "127.0.0.1:43192".into(),
+                    origin: "http://127.0.0.1:43192".into(),
+                    token: "dashboard-session".into(),
+                    report: report.clone(),
+                    last_seen: Arc::new(Mutex::new(Instant::now())),
+                };
+                let app = dashboard_router(state);
+
+                let initial_dashboard = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/report/dashboard-session")
+                            .header(header::HOST, "127.0.0.1:43192")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let initial_body = to_bytes(initial_dashboard.into_body(), 1024).await.unwrap();
+                assert_eq!(
+                    initial_body.as_ref(),
+                    b"<!doctype html><title>Private dashboard</title>"
+                );
+                let replacement = report.with_extension("replacement");
+                fs::write(&replacement, b"<!doctype html><title>Replacement</title>").unwrap();
+                fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::rename(replacement, &report).unwrap();
+
+                let wrong_token = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/report/settings-session")
+                            .header(header::HOST, "127.0.0.1:43192")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(wrong_token.status(), StatusCode::NOT_FOUND);
+
+                let wrong_host = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/report/dashboard-session")
+                            .header(header::HOST, "localhost:43192")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(wrong_host.status(), StatusCode::FORBIDDEN);
+
+                let wrong_origin = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/report/dashboard-session")
+                            .header(header::HOST, "127.0.0.1:43192")
+                            .header(header::ORIGIN, "http://example.invalid")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(wrong_origin.status(), StatusCode::FORBIDDEN);
+
+                let dashboard = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/report/dashboard-session")
+                            .header(header::HOST, "127.0.0.1:43192")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(dashboard.status(), StatusCode::OK);
+                let csp = dashboard
+                    .headers()
+                    .get(header::CONTENT_SECURITY_POLICY)
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                assert!(csp.contains("connect-src 'none'"));
+                assert!(csp.contains("frame-ancestors 'none'"));
+                assert_eq!(
+                    dashboard
+                        .headers()
+                        .get(DASHBOARD_IDENTITY_HEADER)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("1")
+                );
+                let body = to_bytes(dashboard.into_body(), 1024).await.unwrap();
+                assert_eq!(body.as_ref(), b"<!doctype html><title>Replacement</title>");
+
+                let settings_api_is_absent = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/config")
+                            .header(header::HOST, "127.0.0.1:43192")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(settings_api_is_absent.status(), StatusCode::NOT_FOUND);
+
+                let mutation_is_rejected = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/report/dashboard-session")
+                            .header(header::HOST, "127.0.0.1:43192")
+                            .header(header::ORIGIN, "http://127.0.0.1:43192")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(mutation_is_rejected.status(), StatusCode::FORBIDDEN);
                 let _ = fs::remove_dir_all(root);
             });
     }

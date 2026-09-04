@@ -36,14 +36,20 @@ collection의 Rust collector는 같은 executable의 private `collector-serve` m
 배포 형식은 transport일 뿐 domain/application/runtime 책임을 소유하지 않는다.
 
 TypeScript UI는 브라우저에서 직접 원본 event log를 읽지 않고 Rust가 만든 sanitized report 또는
-versioned config DTO만 사용한다. report는 self-contained static HTML이며 runtime web server를
-요구하지 않는다. 설정 UI는 CLI가 명시적으로 시작한 동안에만 `127.0.0.1:0`에 bind하는 ephemeral
-inbound adapter를 사용한다. token, exact Host/Origin, body bound, no-store와 optimistic revision을
+versioned config DTO만 사용한다. report는 self-contained static HTML이며 상시 web server를
+요구하지 않는다. `dashboard`는 별도 read-only path capability로 report를 runtime-root에서 결정되는
+고정 IPv4 loopback port에 제공한다. 이 stable origin은 sanitized saved view의 browser-local persistence를
+프로세스 재시작 사이에도 보존한다. report-only router, capability, process lifetime은 settings surface와
+분리되며 설정·integration API를 등록하지 않는다. 설정에서 연 dashboard도 별도 자식 프로세스가 소유하고,
+반복 open은 살아 있는 동일 process를 재사용한다. 생성기와 transport는 같은 32 MiB artifact 상한을
+공유하며, foreground process는 10분 idle 또는 1시간 hard deadline에 종료된다.
+설정 UI는 CLI가 명시적으로 시작한 동안에만 `127.0.0.1:0`에 bind하는 ephemeral
+inbound adapter를 사용한다. settings token, exact Host/Origin, body bound, no-store와 optimistic revision을
 검증한다. HTTP/1 header read는 5초, 동시 연결은 64개, 종료 drain은 1초로 제한해 불완전한
 network 연결이 connection task와 drain을 무한히 늘리지 못하게 한다. token은 같은 tab의 reload
 복구를 위한 session storage에만 유지한다. 확인된 명시적 종료, invalid session,
 bootstrap/heartbeat/config mutation network failure에는 삭제하고 종료 요청 실패에는 재시도를 위해 유지한다.
-persistent daemon이나 외부 network 경로를 만들지 않는다. CLI composition root가 private
+persistent dashboard daemon이나 외부 network 경로를 만들지 않는다. CLI composition root가 private
 runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui는 UI instance lock만 유지하고
 모든 지원 CLI/UI writer는 설정 mutation 동안 타입으로 강제된 shared guard를 획득한 뒤 그 안에서
 읽기와 atomic replace를 수행한다. UI는 추가로 browser revision을 atomic replace 직전에 확인한다.
@@ -388,7 +394,9 @@ Web UI는 TypeScript `strict` mode를 사용한다.
   authoritative source로 사용한다.
 - Rust가 생성한 sanitized report DTO만 입력으로 받는다.
 - DTO type은 versioned schema에서 생성하거나 runtime validation으로 확인한다.
-- 브라우저에서 외부 network 요청이나 상시 server 없이 동작한다.
+- 브라우저에서 외부 network 요청이나 상시 server 없이 동작한다. 기본 CLI 전달은 random
+  read-only path capability를 쓰는 reloadable ephemeral IPv4 loopback server다. report-only router는
+  `GET`/`HEAD`만 허용하고 idle/hard deadline에 종료된다.
 - agent별 예외 처리는 UI가 아니라 canonical contract나 adapter에서 해결한다.
 - Rust outbound infrastructure는 빌드된 TypeScript UI asset과 `ReportDtoV1`을 하나의
   self-contained HTML artifact로 조립한다. `report <runtime-root> [rate-table-json]`은 SQLite의 typed

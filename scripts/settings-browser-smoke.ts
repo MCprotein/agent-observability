@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { access, chmod, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, chmod, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
@@ -17,7 +18,7 @@ const directory = await mkdtemp(join(tmpdir(), "agent-observability-settings-bro
 await chmod(directory, 0o700);
 const runtimeRoot = join(directory, "runtime");
 const binary = join(process.cwd(), "target", "debug", "agent-observability");
-const child = spawn(binary, ["ui", runtimeRoot, "--no-open"], {
+const child = spawn(binary, ["settings", runtimeRoot, "--no-open"], {
   stdio: ["ignore", "pipe", "pipe"],
 });
 type SettingsProcess = typeof child;
@@ -186,6 +187,29 @@ try {
     assert.equal(await delayedLifecyclePage.evaluate(() => sessionStorage.length), 0);
     await delayedLifecyclePage.close();
   }
+
+  const dashboardLauncherPage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+  await dashboardLauncherPage.goto(url, { waitUntil: "networkidle" });
+  const expectedDashboardOpenStatus = process.platform === "darwin" ? 204 : 409;
+  const firstOpenResponse = dashboardLauncherPage.waitForResponse(
+    (response) => response.url() === `${origin}/api/dashboard/open`
+      && response.request().method() === "POST",
+  );
+  await dashboardLauncherPage.locator("#open-dashboard").click();
+  assert.equal((await firstOpenResponse).status(), expectedDashboardOpenStatus);
+  const dashboardUrl = await waitForDashboardUrl(runtimeRoot);
+  const dashboardPid = await readDashboardPid(runtimeRoot);
+  const secondOpenResponse = dashboardLauncherPage.waitForResponse(
+    (response) => response.url() === `${origin}/api/dashboard/open`
+      && response.request().method() === "POST",
+  );
+  await dashboardLauncherPage.locator("#open-dashboard").click();
+  assert.equal((await secondOpenResponse).status(), expectedDashboardOpenStatus);
+  assert.equal(await readDashboardPid(runtimeRoot), dashboardPid, "repeated opens must reuse one server");
+  const independentDashboardPage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+  await independentDashboardPage.goto(dashboardUrl, { waitUntil: "load" });
+  assert.equal(await independentDashboardPage.locator("h1").textContent(), "Agent Observability Report");
+  await dashboardLauncherPage.close();
 
   for (const testCase of [
     { name: "desktop", viewport: { width: 1440, height: 900 } },
@@ -447,6 +471,11 @@ try {
 
   const exitCode = await waitForExit(child);
   assert.equal(exitCode, 0, stderr);
+  await independentDashboardPage.reload({ waitUntil: "load" });
+  assert.equal(await independentDashboardPage.locator("h1").textContent(), "Agent Observability Report");
+  results.push({ name: "independent-dashboard", reloadAfterSettingsExit: true });
+  await independentDashboardPage.close();
+  await stopDashboardProcess(runtimeRoot);
   console.log(JSON.stringify({ executablePath, results }));
 } finally {
   if (child.exitCode === null) child.kill("SIGTERM");
@@ -454,6 +483,48 @@ try {
   if (!process.env.SETTINGS_SCREENSHOT_DIR) {
     await rm(directory, { recursive: true, force: true });
   }
+}
+
+async function waitForDashboardUrl(root: string): Promise<string> {
+  const canonicalRoot = await realpath(root);
+  const digest = createHash("sha256").update(canonicalRoot).digest();
+  const port = 49_152 + (digest.readUInt16BE(0) % 12_000);
+  const capabilityPath = join(canonicalRoot, "runtime", "dashboard-ui", "capability");
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const token = await readFile(capabilityPath, "utf8").then((value) => value.trim()).catch(() => "");
+    if (/^[0-9a-f]{64}$/.test(token)) {
+      return `http://127.0.0.1:${port}/report/${token}`;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("settings-launched dashboard capability was not created");
+}
+
+async function stopDashboardProcess(root: string): Promise<void> {
+  const pid = await readDashboardPid(root);
+  process.kill(pid, "SIGTERM");
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } catch {
+      return;
+    }
+  }
+  throw new Error("settings-launched dashboard process did not stop");
+}
+
+async function readDashboardPid(root: string): Promise<number> {
+  const canonicalRoot = await realpath(root);
+  const metadata = await readFile(
+    join(canonicalRoot, "runtime", "dashboard-ui", "runtime.meta"),
+    "utf8",
+  );
+  const pid = Number.parseInt(metadata.match(/^pid=(\d+)$/m)?.[1] ?? "", 10);
+  if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error("invalid dashboard process metadata");
+  return pid;
 }
 
 function readUrl(process: SettingsProcess): Promise<string> {

@@ -1,5 +1,6 @@
 use agent_observability_local_runtime::{ConfigMutationGuard, StorageBudget, install, load, save};
 use agent_observability_local_store::LocalStore;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -78,14 +79,15 @@ fn help_distinguishes_monitoring_from_settings() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("agentobs dashboard"));
-    assert!(stdout.contains("monitoring dashboard"));
+    assert!(stdout.contains("Serve monitoring on private localhost"));
+    assert!(stdout.contains("agentobs settings"));
     assert!(stdout.contains("agentobs ui"));
-    assert!(stdout.contains("settings only"));
+    assert!(stdout.contains("Compatibility alias for settings"));
     assert!(stdout.contains("legacy alias: `agent-observability`"));
 }
 
 #[test]
-fn nested_ui_help_has_no_runtime_or_browser_side_effect() {
+fn nested_settings_help_and_ui_alias_have_no_side_effect() {
     let working = std::env::temp_dir().join(format!(
         "agent-observability-cli-ui-help-{}",
         std::process::id()
@@ -93,17 +95,47 @@ fn nested_ui_help_has_no_runtime_or_browser_side_effect() {
     let _ = std::fs::remove_dir_all(&working);
     std::fs::create_dir(&working).unwrap();
 
-    let output = binary()
-        .args(["ui", "--help"])
-        .current_dir(&working)
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("agentobs ui"));
-    assert!(output.stderr.is_empty());
+    for command in ["settings", "ui"] {
+        let output = binary()
+            .args([command, "--help"])
+            .current_dir(&working)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("agentobs settings"));
+        assert!(stdout.contains("agentobs ui"));
+        assert!(output.stderr.is_empty());
+    }
     assert_eq!(std::fs::read_dir(&working).unwrap().count(), 0);
     let _ = std::fs::remove_dir_all(working);
+}
+
+#[cfg(unix)]
+#[test]
+fn settings_and_ui_alias_start_the_same_private_surface() {
+    for command in ["settings", "ui"] {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-{command}-alias-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut child = binary()
+            .args([command, root.to_str().unwrap(), "--no-open"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut lines = BufReader::new(stdout).lines();
+        assert_eq!(lines.next().unwrap().unwrap(), "status=settings_ready");
+        let url = lines.next().unwrap().unwrap();
+        assert!(url.starts_with("url=http://127.0.0.1:"));
+        assert!(url.contains("/#session="));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 fn installed_store(root: &Path) -> PathBuf {
@@ -298,7 +330,7 @@ fn setup_and_config_set_work_end_to_end_in_the_real_process() {
 
     fs::remove_file(&dashboard).unwrap();
     let dashboard_command = binary()
-        .args(["dashboard", root.to_str().unwrap(), "--no-open"])
+        .args(["report", root.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
@@ -306,7 +338,7 @@ fn setup_and_config_set_work_end_to_end_in_the_real_process() {
         "{}",
         String::from_utf8_lossy(&dashboard_command.stderr)
     );
-    assert!(String::from_utf8_lossy(&dashboard_command.stdout).contains("opened=false"));
+    assert!(String::from_utf8_lossy(&dashboard_command.stdout).contains("report="));
     assert_eq!(
         fs::metadata(&dashboard).unwrap().permissions().mode() & 0o777,
         0o600
@@ -490,7 +522,7 @@ fn retention_plan_is_read_only_and_apply_writes_one_private_archive() {
     );
 
     let refresh = binary()
-        .args(["dashboard", runtime.to_str().unwrap(), "--no-open"])
+        .args(["report", runtime.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(

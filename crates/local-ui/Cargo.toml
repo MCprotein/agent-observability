@@ -7,14 +7,17 @@ rust-version.workspace = true
 
 [dependencies]
 agent-observability-codex-integration = { path = "../codex-integration" }
+agent-observability-contracts = { path = "../contracts" }
 agent-observability-local-collector = { path = "../local-collector" }
 agent-observability-local-runtime = { path = "../local-runtime" }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 getrandom = "0.3"
 hyper = { version = "1", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["io-util", "net", "rt", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
 

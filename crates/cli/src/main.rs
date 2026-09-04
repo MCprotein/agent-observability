@@ -28,7 +28,9 @@ use agent_observability_local_runtime::{
 use agent_observability_local_store::{
     IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore, RetentionPlan,
 };
-use agent_observability_local_ui::{PlatformOpenError, PreparedUi, open_local_target};
+use agent_observability_local_ui::{
+    PlatformOpenError, PreparedDashboard, PreparedUi, open_local_target,
+};
 use agent_observability_static_report::write_private;
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -43,8 +45,9 @@ Quick start:
   agentobs demo [root] [--no-open]       Open the sample monitoring dashboard
   agentobs setup [--no-open]             One-click Codex setup and monitoring
   agentobs setup <root> [--no-open]      Initialize a manual-import runtime
-  agentobs dashboard [root] [--no-open]  Refresh and open the monitoring dashboard
-  agentobs ui [root] [--no-open]         Open settings only
+  agentobs dashboard [root] [--no-open]  Serve monitoring on private localhost
+  agentobs settings [root] [--no-open]   Open settings on private localhost
+  agentobs ui [root] [--no-open]         Compatibility alias for settings
 
 Automatic collection:
   agentobs connect codex [root]
@@ -216,17 +219,106 @@ fn run_notify_command(arguments: &[String]) -> Option<&'static str> {
 
 fn run_ui_command(arguments: &[String]) -> Option<Result<(), String>> {
     let result = match arguments {
-        [command] if command == "ui" => default_root().and_then(|root| settings_ui(&root, true)),
-        [command, flag] if command == "ui" && flag == "--no-open" => {
+        [command] if command == "demo" => default_demo_root().and_then(|root| demo_ui(&root)),
+        [command, root] if command == "demo" && root != "--no-open" => demo_ui(Path::new(root)),
+        [command] if command == "setup" => default_root().and_then(|root| setup_ui(&root, true)),
+        [command, root] if command == "setup" && root != "--no-open" => {
+            setup_ui(Path::new(root), false)
+        }
+        [command] if matches!(command.as_str(), "settings" | "ui") => {
+            default_root().and_then(|root| settings_ui(&root, true))
+        }
+        [command, flag] if matches!(command.as_str(), "settings" | "ui") && flag == "--no-open" => {
             default_root().and_then(|root| settings_ui(&root, false))
         }
-        [command, root] if command == "ui" => settings_ui(Path::new(root), true),
-        [command, root, flag] if command == "ui" && flag == "--no-open" => {
+        [command, root] if matches!(command.as_str(), "settings" | "ui") => {
+            settings_ui(Path::new(root), true)
+        }
+        [command, root, flag]
+            if matches!(command.as_str(), "settings" | "ui") && flag == "--no-open" =>
+        {
             settings_ui(Path::new(root), false)
+        }
+        [command] if command == "dashboard" => {
+            default_root().and_then(|root| dashboard_ui(&root, true))
+        }
+        [command, flag] if command == "dashboard" && flag == "--no-open" => {
+            default_root().and_then(|root| dashboard_ui(&root, false))
+        }
+        [command, root] if command == "dashboard" => dashboard_ui(Path::new(root), true),
+        [command, root, flag] if command == "dashboard" && flag == "--no-open" => {
+            dashboard_ui(Path::new(root), false)
+        }
+        [command, root] if command == "dashboard-serve" => {
+            serve_existing_dashboard(Path::new(root), false, None)
         }
         _ => return None,
     };
     Some(result)
+}
+
+fn demo_ui(root: &Path) -> Result<(), String> {
+    let output = demo(root, false)?;
+    serve_existing_dashboard(root, true, Some(&output))
+}
+
+fn setup_ui(root: &Path, automatic: bool) -> Result<(), String> {
+    let output = setup(root, false, automatic)?;
+    serve_existing_dashboard(root, true, Some(&output))
+}
+
+fn dashboard_ui(root: &Path, open: bool) -> Result<(), String> {
+    let _ = prepare_dashboard(root, false)?;
+    serve_existing_dashboard(root, open, None)
+}
+
+fn serve_existing_dashboard(root: &Path, open: bool, context: Option<&str>) -> Result<(), String> {
+    let layout = install(root).map_err(|error| error.to_string())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("dashboard runtime failed: {error}"))?;
+    runtime.block_on(async {
+        let ui = agent_observability_local_ui::prepare_dashboard(&layout)
+            .await
+            .map_err(|error| error.to_string())?;
+        announce_dashboard(&ui, open, context)?;
+        ui.serve().await.map_err(|error| error.to_string())
+    })
+}
+
+fn announce_dashboard(
+    ui: &PreparedDashboard,
+    open: bool,
+    context: Option<&str>,
+) -> Result<(), String> {
+    let opened = if open {
+        match open_settings_url(ui.url()) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("{error}");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    println!("status=dashboard_ready");
+    if let Some(context) = context {
+        for line in context.lines() {
+            if !line.starts_with("status=") && !line.starts_with("opened=") {
+                println!("{line}");
+            }
+        }
+    }
+    if !opened {
+        println!("url={}", ui.url());
+    }
+    println!("opened={opened}");
+    std::io::stdout()
+        .flush()
+        .map_err(|error| format!("dashboard output failed: {error}"))?;
+    Ok(())
 }
 
 fn settings_ui(root: &Path, open: bool) -> Result<(), String> {
@@ -423,16 +515,6 @@ fn run_onboarding(arguments: &[String]) -> Option<Result<String, String>> {
         [command, source, root] if command == "status" && source == "codex" => {
             codex_status(Path::new(root))
         }
-        [command] if command == "dashboard" => {
-            default_root().and_then(|root| dashboard(&root, true))
-        }
-        [command, flag] if command == "dashboard" && flag == "--no-open" => {
-            default_root().and_then(|root| dashboard(&root, false))
-        }
-        [command, root] if command == "dashboard" => dashboard(Path::new(root), true),
-        [command, root, flag] if command == "dashboard" && flag == "--no-open" => {
-            dashboard(Path::new(root), false)
-        }
         [command] if command == "config" => default_root().and_then(|root| show_config(&root)),
         [command, action] if command == "config" && action == "show" => {
             default_root().and_then(|root| show_config(&root))
@@ -619,11 +701,6 @@ const fn collector_status(status: CollectorStatus) -> &'static str {
         CollectorStatus::Degraded => "degraded",
         CollectorStatus::Unavailable => "unavailable",
     }
-}
-
-fn dashboard(root: &Path, open: bool) -> Result<String, String> {
-    let dashboard = prepare_dashboard(root, open)?;
-    Ok(format!("dashboard={}\nopened={open}", dashboard.display()))
 }
 
 fn prepare_dashboard(root: &Path, open: bool) -> Result<PathBuf, String> {
@@ -1171,7 +1248,7 @@ mod tests {
     use super::{
         IngestBlock, IngestResult, LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME, USAGE,
         format_codex_status, open_dashboard_with, open_settings_url_with, prepare_dashboard_with,
-        require_demo_ingest, run, setup_with, timestamp_from_duration,
+        require_demo_ingest, run, run_ui_command, setup_with, timestamp_from_duration,
     };
     use agent_observability_codex_integration::{
         CodexIntegrationStatus, CollectorStatus, ConnectionStatus,
@@ -1203,6 +1280,16 @@ mod tests {
             vec!["disconnect".into(), "codex".into(), "-h".into()],
         ] {
             assert_eq!(run(arguments.into_iter()).unwrap(), USAGE);
+        }
+    }
+
+    #[test]
+    fn no_open_onboarding_stays_in_the_non_server_command_path() {
+        for command in ["demo", "setup"] {
+            assert!(
+                run_ui_command(&[command.into(), "--no-open".into()]).is_none(),
+                "{command} --no-open must not start the loopback UI path"
+            );
         }
     }
 

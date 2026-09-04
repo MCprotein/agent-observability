@@ -1,6 +1,6 @@
 //! Self-contained, private HTML artifact assembly for validated report DTOs.
 
-use agent_observability_contracts::{ContractError, ReportDtoV1};
+use agent_observability_contracts::{ContractError, MAX_REPORT_ARTIFACT_BYTES, ReportDtoV1};
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -21,6 +21,7 @@ pub enum ReportArtifactError {
     InvalidTemplate,
     InvalidPath,
     InsecurePermissions,
+    TooLarge,
     Symlink,
     UnsupportedPlatform,
 }
@@ -34,6 +35,7 @@ impl Display for ReportArtifactError {
             Self::InvalidTemplate => "embedded report template is invalid",
             Self::InvalidPath => "report artifact path has the wrong file type",
             Self::InsecurePermissions => "report artifact path is not private",
+            Self::TooLarge => "report artifact exceeds the 32 MiB contract",
             Self::Symlink => "report artifact path must not be a symbolic link",
             Self::UnsupportedPlatform => {
                 "private report artifacts are unsupported on this platform"
@@ -86,6 +88,7 @@ pub fn write_private(path: &Path, report: &ReportDtoV1) -> Result<u64, ReportArt
         let bytes = write_rendered(&mut writer, report)?;
         writer.flush()?;
         drop(writer);
+        validate_artifact_size(bytes)?;
         file.sync_all()?;
         Ok(bytes)
     })();
@@ -103,6 +106,14 @@ pub fn write_private(path: &Path, report: &ReportDtoV1) -> Result<u64, ReportArt
     private_file(path)?;
     File::open(parent)?.sync_all()?;
     Ok(bytes)
+}
+
+fn validate_artifact_size(bytes: u64) -> Result<(), ReportArtifactError> {
+    if bytes > MAX_REPORT_ARTIFACT_BYTES {
+        Err(ReportArtifactError::TooLarge)
+    } else {
+        Ok(())
+    }
 }
 
 fn write_rendered(
@@ -310,6 +321,15 @@ mod tests {
             traces: Vec::new(),
             spans: Vec::new(),
         }
+    }
+
+    #[test]
+    fn private_artifact_size_contract_accepts_boundary_and_rejects_overflow() {
+        assert!(validate_artifact_size(MAX_REPORT_ARTIFACT_BYTES).is_ok());
+        assert!(matches!(
+            validate_artifact_size(MAX_REPORT_ARTIFACT_BYTES + 1),
+            Err(ReportArtifactError::TooLarge)
+        ));
     }
 
     #[test]

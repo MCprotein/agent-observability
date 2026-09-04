@@ -4,8 +4,9 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 외부 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.8.4 출시.** SQLite lock과 I/O 오류를 schema corruption으로 잘못 표시하지 않고 실제 storage
-> error로 유지하며, report concurrency 검증을 scheduler timing에 의존하지 않도록 고쳤다. 기존 Codex,
+> **v1.9.0 릴리스 후보.** 설정 명령을 `agentobs settings`로 명확히 하고 기존 `agentobs ui`는 호환
+> alias로 유지한다. self-contained report는 runtime별 고정 localhost origin에서 새로고침할 수 있고,
+> 설정 화면을 닫아도 독립된 bounded dashboard process가 유지된다. 기존 Codex,
 > Claude Code, Cursor private handoff import는 daemon이나
 > network 없이 계속 동작한다. v1.8.2에서 추가된 선택적 Codex WebSocket 자동 수집은 private CA HTTPS와
 > exact private random request header로 보호한 `127.0.0.1` OTLP/HTTP JSON receiver와 macOS
@@ -22,7 +23,8 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 > script는 `agentobs setup ~/.agent-observability --no-open`처럼 root를 명시한다. 자동 연결은 이후
 > 설정 UI 또는 고급 lifecycle 명령으로 언제든 추가할 수 있다.
 
-아래 automatic 명령과 설치 경로는 게시된 최신 안정판 v1.8.4 기준이다.
+아래 빠른 시작은 v1.9.0 기준이다. PR 검토 중에는 installer URL이 아직 게시되지 않으며, tag와 GitHub
+Release가 완료된 뒤 같은 명령을 사용한다.
 
 ## 빠른 시작
 
@@ -32,14 +34,14 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 release checksum과 실행 파일 버전을 확인한 뒤 `~/.local/bin`에 원자적으로 설치하고, 현재 shell의
 profile에 PATH 블록을 한 번만 등록한다.
 
-검증된 v1.8.4 installer를 사용한다.
+게시된 v1.9.0 installer를 사용한다.
 
 ```bash
 (
   set -eu
   installer="$(mktemp)"
   trap 'rm -f "$installer"' 0
-  curl -fsSL https://github.com/MCprotein/agent-observability/releases/download/v1.8.4/install.sh -o "$installer"
+  curl -fsSL https://github.com/MCprotein/agent-observability/releases/download/v1.9.0/install.sh -o "$installer"
   sh "$installer"
 )
 ```
@@ -57,17 +59,19 @@ agentobs demo
 ```
 
 이 명령 하나가 content-free sample을 별도 `~/.agent-observability-demo` runtime에 넣고,
-self-contained HTML 대시보드를 생성해 기본 브라우저에서 연다. 실제 데이터나 계정은 사용하지
-않는다.
+self-contained HTML 대시보드를 runtime-root별 `127.0.0.1` 주소로 기본 브라우저에 전달한다. HTML 전달이
+끝난 뒤에도 CLI가 실행되는 동안 새로고침할 수 있고, 10분 idle 또는 1시간 뒤 자동 종료된다.
+실제 데이터나 계정은 사용하지 않는다.
 
 ### 3. 설정 화면 열기
 
 ```bash
-agentobs ui
+agentobs settings
 ```
 
 Codex automatic 연결/해제와 상태 확인, report 열기, 수집 허용, 확인·반영 주기, batch, heartbeat,
-저장 한도, 보관 기간과 archive 한도를 한 화면에서 관리한다. UI 자체는 실행 중에만 임의의
+저장 한도, 보관 기간과 archive 한도를 한 화면에서 관리한다. `agentobs ui`는 기존 사용자를 위한
+호환 alias다. 설정 화면은 실행 중에만 임의의
 `127.0.0.1` port를 사용하며 browser tab의 session token,
 Host와 Origin을 모두 확인한다. token은 같은 tab의 새로고침에서만 복구되며 세션 종료 시 삭제된다.
 사용자가 1분 이상 화면을 조작하지 않으면 heartbeat를 멈추고,
@@ -82,11 +86,14 @@ agentobs setup
 ```
 
 이 한 명령은 로컬 Codex 환경을 감지해 기본 위치 `~/.agent-observability`에 private runtime과 embedded
-SQLite transactional store를 만들고, 초기 대시보드를 생성해 연 다음 필요한 OTEL 설정과 local collector
-LaunchAgent를 연결한다. Codex가 감지되지 않으면 runtime과 dashboard만 준비하고 `codex=not_detected`를
+SQLite transactional store를 만들고, 필요한 OTEL 설정과 local collector를 연결한 다음 초기
+대시보드를 localhost로 전달한다. 보고서 전달용 서버는 local collector와 별개이고, CLI가 실행되는
+동안 새로고침을 지원한 뒤 idle/deadline에 종료된다. 설정 화면에서 연 대시보드는 별도 foreground
+자식 프로세스가 소유하므로 설정 세션을 닫아도 자신의 idle/deadline까지 유지된다.
+Codex가 감지되지 않으면 runtime과 dashboard만 준비하고 `codex=not_detected`를
 출력하며 Codex 디렉터리, 설정, collector service는 만들지 않는다. 이미 Codex 앱이나 다른 로컬 도구가
-`notify`를 사용 중이면 그 명령은 건드리지 않고 `notify=external_preserved`로 알린다. 대시보드 생성이나
-열기에 실패하면 연결을 시작하지 않으며, 반대로 연결이 실패하면 이미 연 로컬 대시보드는 남을 수 있다. 브라우저를 열지
+`notify`를 사용 중이면 그 명령은 건드리지 않고 `notify=external_preserved`로 알린다. 대시보드 생성에
+실패하면 연결을 시작하지 않으며, 연결이 완료된 뒤에만 localhost 전달을 시작한다. 브라우저를 열지
 않는 환경에서는 `agentobs setup --no-open`을 사용한다. 처음에는 수집된 데이터가 없으므로 빈
 화면이 정상이다.
 
@@ -119,15 +126,16 @@ launchd가 로그인 후 다시 실행할 수 있도록 등록한 표시다. `ag
 연결 전 상태로 복원한다.
 
 사용자 문서의 권장 명령은 `agentobs`다. 모니터링 화면은 `agentobs dashboard`, 설정 화면은
-`agentobs ui`로 연다. 배포 파일명인 `agent-observability`도 호환 명령으로 계속 제공한다.
+`agentobs settings`로 연다. `agentobs ui`와 배포 파일명 `agent-observability`도 호환 명령으로
+계속 제공한다.
 
 | 현재 경로 | 상태 | 의미 |
 | --- | --- | --- |
-| 로컬 runtime과 HTML 대시보드 | 지원 | 서버, login, web daemon 없이 `file://`로 실행 |
-| 로컬 설정 UI | 지원 | UI server는 `ui` 실행 중에만 존재하며 Codex 연결과 runtime config 관리 제공 |
+| 로컬 runtime과 HTML 대시보드 | 지원 | login이나 상시 web daemon 없이 일회성 loopback 전달 후 독립 실행 |
+| 로컬 설정 UI | 지원 | UI server는 `settings` 실행 중에만 존재하며 Codex 연결과 runtime config 관리 제공 |
 | 내장 sample 체험 | 지원 | 외부 파일 없이 `demo` 한 명령으로 확인 |
 | Canonical handoff 수동 import | 지원 | 세 agent 모두 daemon과 network 없이 private JSONL import 가능 |
-| Codex 자동 연결 | 실험적 (v1.8.4 최신) | `setup`이 macOS Codex를 자동 연결하고, 기존 notify와 비소유 설정을 보존하며 loopback OTLP/HTTP JSON을 사용 |
+| Codex 자동 연결 | 실험적 (v1.9.0) | `setup`이 macOS Codex를 자동 연결하고, 기존 notify와 비소유 설정을 보존하며 loopback OTLP/HTTP JSON을 사용 |
 | Claude Code/Cursor 자동 연결 | TODO | 현재 자동 receiver/config 연결은 Codex만 지원 |
 | Commercial team profile | TODO | G0-G4 승인과 evidence 전에는 완료로 간주하지 않음 |
 
@@ -185,7 +193,7 @@ handoff 생성 규격과 허용 source는 [Adapter Compatibility](docs/ADAPTER_C
 시각적으로 비교하고 저장하면 Rust가 전체 config를 다시 검증해 원자적으로 교체한다.
 
 ```bash
-agentobs ui
+agentobs settings
 ```
 
 headless 환경이나 자동화에서는 같은 계약을 CLI로 사용할 수 있다.
@@ -244,12 +252,13 @@ flowchart TB
     Domain --> Store[("Local SQLite authority")]
     Store --> Report["Privacy and cost projection"]
     Report --> HTML["Self-contained private HTML"]
-    HTML --> Browser["Local browser via file"]
+    HTML --> Delivery["Reloadable authenticated loopback delivery"]
+    Delivery --> Browser["Self-contained local dashboard"]
     Connect["setup auto-detection"] --> LaunchAgent["macOS LaunchAgent"]
     Connect --> Ownership["Exact Codex OTEL config ownership"]
     LaunchAgent --> Receiver
     Ownership --> Codex
-    Settings["ui command"] --> Config["Authenticated ephemeral settings UI"]
+    Settings["settings command"] --> Config["Authenticated ephemeral settings UI"]
 ```
 
 - Codex automatic path와 manual handoff path는 같은 adapter, domain, store와 report contract로 합류한다.
@@ -257,8 +266,12 @@ flowchart TB
 - agent별 차이는 adapter에서 끝나고 이후 저장·비용·UI contract는 하나다.
 - Embedded SQLite store가 로컬 권위 저장소이며 JSONL archive와 HTML은 다시 만들 수 있는 projection이다.
 - TypeScript UI는 원본 agent payload가 아니라 Rust가 검증한 report DTO만 받는다.
-- report는 endpoint 없이 `file://`로 열린다. 자동 collector와 설정 UI는 서로 다른 인증된 loopback
-  endpoint이며 외부 interface에 bind하지 않는다.
+- report artifact는 계속 self-contained private HTML로 남는다. 기본 dashboard 명령은 별도
+  read-only capability로 이를 runtime-root별 고정 `127.0.0.1` origin에서 제공하며, CLI가 실행되는 동안
+  새로고침할 수 있다. 고정 origin은 content-free saved view가 프로세스 재시작 뒤에도 유지되게 하며,
+  capability path와 report artifact는 private runtime에 남는다. 생성과 전달은 같은 32 MiB 상한을 적용한다.
+  10분 동안 사용하지 않거나 최대 1시간이 지나면 서버가 종료되고 기존 HTML 파일은 그대로 남는다.
+  자동 collector와 설정 UI도 외부 interface에 bind하지 않는다.
 - 설정 화면은 별도 UI instance lock만 유지한다. 저장할 때만 runtime lock을 짧게 획득하므로 열린
   화면이 ingest, report, CLI 설정 변경을 계속 막지 않는다. 지원되는 다른 설정 명령과 revision이
   충돌하면 최신 값 위에 화면의 변경만 다시 적용하고 재확인을 요구한다. `config.json` 직접 편집은
@@ -357,8 +370,9 @@ cargo run -p agent-observability-cli -- demo
 | `connect codex [root]` | Codex 설정과 local collector 연결 |
 | `status codex [root]` | Codex config ownership과 collector health 확인 |
 | `disconnect codex [root]` | Codex 설정 복원, collector 중지, local data 유지 |
-| `dashboard [root] [--no-open]` | 최신 report를 만들고 필요하면 브라우저에서 열기 |
-| `ui [root] [--no-open]` | 임시 local-only 설정 화면 열기 |
+| `dashboard [root] [--no-open]` | 최신 report를 만들고 reload 가능한 localhost 주소로 전달 |
+| `settings [root] [--no-open]` | 임시 local-only 설정 화면 열기 |
+| `ui [root] [--no-open]` | `settings` 호환 alias |
 | `config show [root]` | 현재 설정 확인 |
 | `config set [root] <option> <value>` | 검증 후 설정 원자 교체 |
 | `<agent>-ingest <root> <handoff>` | private canonical handoff import |
