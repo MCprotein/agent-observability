@@ -18,6 +18,8 @@ await chmod(directory, 0o700);
 const runtimeRoot = join(directory, "runtime");
 const binary = join(process.cwd(), "target", "debug", "agent-observability");
 const browser = await chromium.launch({ executablePath, headless: true });
+const browserContext = await browser.newContext();
+let stableOrigin: string | undefined;
 
 try {
   await execute("cargo", ["build", "-q", "-p", "agent-observability-cli"]);
@@ -49,8 +51,11 @@ try {
       assert.equal(parsed.hostname, "127.0.0.1");
       assert.notEqual(parsed.port, "");
       assert.match(parsed.pathname, /^\/report\/[0-9a-f]{64}$/);
+      stableOrigin ??= parsed.origin;
+      assert.equal(parsed.origin, stableOrigin, "dashboard origin must survive process restarts");
 
-      const page = await browser.newPage({ viewport: testCase.viewport });
+      const page = await browserContext.newPage();
+      await page.setViewportSize(testCase.viewport);
       const consoleErrors: string[] = [];
       const pageErrors: string[] = [];
       const externalRequests: string[] = [];
@@ -87,6 +92,16 @@ try {
         (await page.locator("#filter-status").textContent()) ?? "",
         /^\d+ spans match the active filters\.$/,
       );
+      if (testCase.name === "desktop") {
+        await page.locator("#save-filter").click();
+        assert.equal(await page.locator("#saved-filter option").count(), 2);
+      } else {
+        assert.equal(
+          await page.locator("#saved-filter option").count(),
+          2,
+          "saved views must survive a dashboard process restart",
+        );
+      }
       await page.reload({ waitUntil: "load" });
       assert.notEqual(await page.locator("#span-count").textContent(), "0");
       assert.deepEqual(consoleErrors, []);
@@ -97,15 +112,28 @@ try {
       await page.close();
     } finally {
       if (child.exitCode === null) child.kill();
+      await waitForExit(child);
     }
   }
   console.log(JSON.stringify({ executablePath, results }));
 } finally {
+  await browserContext.close();
   await browser.close();
   await rm(directory, { recursive: true, force: true });
 }
 
 type DashboardProcess = ChildProcessByStdio<null, Readable, Readable>;
+
+function waitForExit(child: DashboardProcess): Promise<number | null> {
+  if (child.exitCode !== null) return Promise.resolve(child.exitCode);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("dashboard process did not exit")), 5_000);
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+}
 
 function readUrl(child: DashboardProcess): Promise<string> {
   return new Promise((resolve, reject) => {

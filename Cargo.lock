@@ -154,6 +154,7 @@ name = "agent-observability-local-ui"
 version = "1.9.0"
 dependencies = [
  "agent-observability-codex-integration",
+ "agent-observability-contracts",
  "agent-observability-local-collector",
  "agent-observability-local-runtime",
  "axum",
@@ -163,6 +164,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower",
 ]

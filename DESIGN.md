@@ -99,11 +99,16 @@ Standalone settings use an ephemeral loopback route opened by `agentobs settings
   heartbeat, or config mutation. A failed shutdown request retains it only so the user can retry closing.
 
 Standalone monitoring remains one self-contained report artifact. `agentobs dashboard` delivers that artifact
-through a separate random read-only path capability on `127.0.0.1:0`. Its report-only router exposes no
+through a separate private read-only path capability on a runtime-root-derived stable `127.0.0.1` origin. Its report-only router exposes no
 settings or integration API and remains reloadable while the foreground command is alive. It expires after
 ten idle minutes or a one-hour hard deadline; the self-contained artifact continues to work through the file
 path without a server. This local transport does not add team scope; hosted team routes still require
 server-resolved tenant/workspace authorization.
+
+The stable report origin preserves sanitized browser-local saved views across dashboard process restarts; the
+private capability path remains separate from browser storage. A settings-triggered dashboard is owned by a
+separate child process and repeated opens reuse the live process. Report generation and loopback delivery share
+one 32 MiB artifact limit.
 
 The settings process binds an operating-system-selected port on `127.0.0.1`, rejects non-loopback host and
 origin values, sends no CORS permission, makes no external request and expires after inactivity. Closing it

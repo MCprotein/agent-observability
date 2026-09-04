@@ -249,6 +249,9 @@ fn run_ui_command(arguments: &[String]) -> Option<Result<(), String>> {
         [command, root, flag] if command == "dashboard" && flag == "--no-open" => {
             dashboard_ui(Path::new(root), false)
         }
+        [command, root] if command == "dashboard-serve" => {
+            serve_existing_dashboard(Path::new(root), false, None)
+        }
         _ => return None,
     };
     Some(result)
@@ -256,18 +259,20 @@ fn run_ui_command(arguments: &[String]) -> Option<Result<(), String>> {
 
 fn demo_ui(root: &Path) -> Result<(), String> {
     let output = demo(root, false)?;
-    println!("{output}");
-    dashboard_ui(root, true)
+    serve_existing_dashboard(root, true, Some(&output))
 }
 
 fn setup_ui(root: &Path, automatic: bool) -> Result<(), String> {
     let output = setup(root, false, automatic)?;
-    println!("{output}");
-    dashboard_ui(root, true)
+    serve_existing_dashboard(root, true, Some(&output))
 }
 
 fn dashboard_ui(root: &Path, open: bool) -> Result<(), String> {
     let _ = prepare_dashboard(root, false)?;
+    serve_existing_dashboard(root, open, None)
+}
+
+fn serve_existing_dashboard(root: &Path, open: bool, context: Option<&str>) -> Result<(), String> {
     let layout = install(root).map_err(|error| error.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -277,12 +282,16 @@ fn dashboard_ui(root: &Path, open: bool) -> Result<(), String> {
         let ui = agent_observability_local_ui::prepare_dashboard(&layout)
             .await
             .map_err(|error| error.to_string())?;
-        announce_dashboard(&ui, open)?;
+        announce_dashboard(&ui, open, context)?;
         ui.serve().await.map_err(|error| error.to_string())
     })
 }
 
-fn announce_dashboard(ui: &PreparedDashboard, open: bool) -> Result<(), String> {
+fn announce_dashboard(
+    ui: &PreparedDashboard,
+    open: bool,
+    context: Option<&str>,
+) -> Result<(), String> {
     let opened = if open {
         match open_settings_url(ui.url()) {
             Ok(()) => true,
@@ -295,7 +304,16 @@ fn announce_dashboard(ui: &PreparedDashboard, open: bool) -> Result<(), String> 
         false
     };
     println!("status=dashboard_ready");
-    println!("url={}", ui.url());
+    if let Some(context) = context {
+        for line in context.lines() {
+            if !line.starts_with("status=") && !line.starts_with("opened=") {
+                println!("{line}");
+            }
+        }
+    }
+    if !opened {
+        println!("url={}", ui.url());
+    }
     println!("opened={opened}");
     std::io::stdout()
         .flush()

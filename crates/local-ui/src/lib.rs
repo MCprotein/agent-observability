@@ -5,6 +5,7 @@ use agent_observability_codex_integration::{
     CodexIntegrationStatus, IntegrationError, connect as connect_codex,
     disconnect as disconnect_codex, status as codex_status,
 };
+use agent_observability_contracts::MAX_REPORT_ARTIFACT_BYTES;
 use agent_observability_local_collector::REPORT_FILE_NAME;
 use agent_observability_local_runtime::{
     ConfigServiceError, InstalledLayout, LocalConfigService, LocalRuntimeConfigV2, Singleton,
@@ -22,13 +23,15 @@ use axum::{
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
-#[cfg(any(target_os = "macos", test))]
-use std::process::{Child, Command, Stdio};
+use sha2::{Digest, Sha256};
 use std::{
     env,
     ffi::OsStr,
     fs,
+    io::{Read, Write},
+    net::{Ipv4Addr, SocketAddrV4, TcpStream},
     path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -41,7 +44,12 @@ use tower::ServiceExt;
 
 const SESSION_HEADER: &str = "x-agent-observability-session";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
-const MAX_REPORT_BYTES: u64 = 32 * 1024 * 1024;
+const DASHBOARD_PORT_BASE: u16 = 49_152;
+const DASHBOARD_PORT_SPAN: u16 = 12_000;
+const DASHBOARD_START_TIMEOUT: Duration = Duration::from_secs(5);
+const DASHBOARD_PROBE_INTERVAL: Duration = Duration::from_millis(25);
+const DASHBOARD_CAPABILITY_FILE: &str = "capability";
+const DASHBOARD_IDENTITY_HEADER: &str = "x-agent-observability-dashboard";
 const IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 const MAX_SESSION_LIFETIME: Duration = Duration::from_hours(1);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -63,6 +71,7 @@ pub enum UiError {
     Io(std::io::Error),
     Runtime(String),
     Random(String),
+    DashboardArtifact(DashboardArtifactError),
 }
 
 impl std::fmt::Display for UiError {
@@ -71,11 +80,37 @@ impl std::fmt::Display for UiError {
             Self::Io(error) => write!(formatter, "local settings UI I/O error: {error}"),
             Self::Runtime(message) => formatter.write_str(message),
             Self::Random(message) => write!(formatter, "local settings session error: {message}"),
+            Self::DashboardArtifact(error) => {
+                write!(formatter, "local dashboard artifact error: {error}")
+            }
         }
     }
 }
 
 impl std::error::Error for UiError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DashboardArtifactError {
+    Missing,
+    Unsafe,
+    TooLarge,
+    Unsupported,
+    Io,
+}
+
+impl std::fmt::Display for DashboardArtifactError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Missing => "report is missing",
+            Self::Unsafe => "report is not a private regular file",
+            Self::TooLarge => "report exceeds the 32 MiB contract",
+            Self::Unsupported => "private report serving is unsupported on this platform",
+            Self::Io => "report could not be read",
+        })
+    }
+}
+
+impl std::error::Error for DashboardArtifactError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlatformOpenError {
@@ -167,6 +202,7 @@ pub struct PreparedDashboard {
     url: String,
     shutdown: Arc<Notify>,
     last_seen: Arc<Mutex<Instant>>,
+    _dashboard_singleton: Singleton,
 }
 
 impl PreparedDashboard {
@@ -176,16 +212,26 @@ impl PreparedDashboard {
     }
 
     pub async fn serve(self) -> Result<(), UiError> {
+        let Self {
+            listener,
+            router,
+            shutdown,
+            last_seen,
+            _dashboard_singleton: dashboard_singleton,
+            ..
+        } = self;
         serve_transport(
-            self.listener,
-            self.router,
-            self.shutdown,
-            self.last_seen,
+            listener,
+            router,
+            shutdown,
+            last_seen,
             HEADER_READ_TIMEOUT,
             GRACEFUL_DRAIN_TIMEOUT,
             MAX_CONNECTIONS,
         )
-        .await
+        .await?;
+        drop(dashboard_singleton);
+        Ok(())
     }
 }
 
@@ -261,11 +307,13 @@ async fn serve_transport(
 struct AppState {
     config: LocalConfigService,
     root: PathBuf,
+    runtime: PathBuf,
     host: String,
     origin: String,
     token: String,
     shutdown: Arc<Notify>,
     last_seen: Arc<Mutex<Instant>>,
+    dashboard_child: Arc<Mutex<Option<Child>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -349,11 +397,13 @@ pub async fn prepare(layout: &InstalledLayout) -> Result<PreparedUi, UiError> {
     let state = AppState {
         config: LocalConfigService::new(layout),
         root: layout.root.clone(),
+        runtime: layout.runtime.clone(),
         host,
         origin: origin.clone(),
         token: token.clone(),
         shutdown: Arc::clone(&shutdown),
         last_seen: Arc::clone(&last_seen),
+        dashboard_child: Arc::new(Mutex::new(None)),
     };
     let router = router(state);
 
@@ -368,18 +418,25 @@ pub async fn prepare(layout: &InstalledLayout) -> Result<PreparedUi, UiError> {
 }
 
 pub async fn prepare_dashboard(layout: &InstalledLayout) -> Result<PreparedDashboard, UiError> {
-    prepare_dashboard_path(layout.root.join("logs").join(REPORT_FILE_NAME)).await
+    let dashboard_singleton = Singleton::acquire(&layout.runtime.join("dashboard-ui"))
+        .map_err(|error| UiError::Runtime(error.to_string()))?;
+    prepare_dashboard_path(layout, dashboard_singleton).await
 }
 
-async fn prepare_dashboard_path(path: PathBuf) -> Result<PreparedDashboard, UiError> {
+async fn prepare_dashboard_path(
+    layout: &InstalledLayout,
+    dashboard_singleton: Singleton,
+) -> Result<PreparedDashboard, UiError> {
+    let path = layout.root.join("logs").join(REPORT_FILE_NAME);
     let html = tokio::task::spawn_blocking(move || read_private_report(&path))
         .await
-        .map_err(|_| UiError::Runtime("local dashboard artifact task failed".into()))??;
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        .map_err(|_| UiError::Runtime("local dashboard artifact task failed".into()))?
+        .map_err(UiError::DashboardArtifact)?;
+    let token = load_or_create_dashboard_token(&layout.runtime.join("dashboard-ui"))?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, dashboard_port(&layout.root))).await?;
     let address = listener.local_addr()?;
     let host = address.to_string();
     let origin = format!("http://{host}");
-    let token = session_token()?;
     let shutdown = Arc::new(Notify::new());
     let last_seen = Arc::new(Mutex::new(Instant::now()));
     let state = DashboardState {
@@ -395,6 +452,7 @@ async fn prepare_dashboard_path(path: PathBuf) -> Result<PreparedDashboard, UiEr
         url: format!("{origin}/report/{token}"),
         shutdown,
         last_seen,
+        _dashboard_singleton: dashboard_singleton,
     })
 }
 
@@ -461,6 +519,9 @@ async fn dashboard_document(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
+    response
+        .headers_mut()
+        .insert(DASHBOARD_IDENTITY_HEADER, HeaderValue::from_static("1"));
     Ok(response)
 }
 
@@ -547,30 +608,27 @@ async fn open_dashboard(
 ) -> Result<StatusCode, ApiError> {
     authorize(&state, &headers, true)?;
     touch(&state)?;
-    let report = state.root.join("logs").join(REPORT_FILE_NAME);
-    let dashboard = prepare_dashboard_path(report)
-        .await
-        .map_err(|_| dashboard_error(DashboardOpenError::MissingReport))?;
-    let dashboard_url = dashboard.url().to_owned();
-    let dashboard_shutdown = Arc::clone(&dashboard.shutdown);
-    tokio::spawn(async move {
-        let _ = dashboard.serve().await;
-    });
+    let root = state.root;
+    let runtime = state.runtime;
+    let dashboard_child = state.dashboard_child;
+    let dashboard_url = tokio::task::spawn_blocking(move || {
+        launch_or_reuse_dashboard(&root, &runtime, &dashboard_child)
+    })
+    .await
+    .map_err(|_| dashboard_error(DashboardOpenError::TaskFailed))?
+    .map_err(dashboard_error)?;
     let open_result = tokio::task::spawn_blocking(move || open_dashboard_target(&dashboard_url))
         .await
         .map_err(|_| DashboardOpenError::TaskFailed)
         .and_then(|result| result)
         .map_err(dashboard_error);
-    if open_result.is_err() {
-        dashboard_shutdown.notify_one();
-    }
     open_result?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DashboardOpenError {
-    MissingReport,
+    Artifact(DashboardArtifactError),
     Platform(PlatformOpenError),
     TaskFailed,
 }
@@ -662,9 +720,25 @@ fn integration_error() -> ApiError {
 
 fn dashboard_error(error: DashboardOpenError) -> ApiError {
     let (code, message) = match error {
-        DashboardOpenError::MissingReport => (
+        DashboardOpenError::Artifact(DashboardArtifactError::Missing) => (
             "dashboard_missing",
             "모니터링 리포트가 아직 생성되지 않았습니다.",
+        ),
+        DashboardOpenError::Artifact(DashboardArtifactError::Unsafe) => (
+            "dashboard_unsafe",
+            "모니터링 리포트의 로컬 보안 조건을 확인할 수 없습니다.",
+        ),
+        DashboardOpenError::Artifact(DashboardArtifactError::TooLarge) => (
+            "dashboard_too_large",
+            "모니터링 리포트가 32 MiB 제한을 초과했습니다.",
+        ),
+        DashboardOpenError::Artifact(DashboardArtifactError::Unsupported) => (
+            "dashboard_unsupported",
+            "이 운영체제에서는 private 모니터링 리포트를 제공할 수 없습니다.",
+        ),
+        DashboardOpenError::Artifact(DashboardArtifactError::Io) => (
+            "dashboard_unavailable",
+            "모니터링 리포트를 안전하게 읽을 수 없습니다.",
         ),
         DashboardOpenError::Platform(PlatformOpenError::UnsupportedPlatform) => (
             "dashboard_unsupported",
@@ -793,42 +867,231 @@ fn apply_security_headers(headers: &mut HeaderMap, is_dashboard: bool) {
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
 }
 
+fn dashboard_port(root: &Path) -> u16 {
+    let digest = Sha256::digest(root.to_string_lossy().as_bytes());
+    let offset = u16::from_be_bytes([digest[0], digest[1]]) % DASHBOARD_PORT_SPAN;
+    DASHBOARD_PORT_BASE + offset
+}
+
+fn dashboard_url(runtime: &Path, root: &Path) -> Result<Option<String>, DashboardArtifactError> {
+    let Some(token) = read_dashboard_token(&runtime.join("dashboard-ui"))? else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "http://127.0.0.1:{}/report/{token}",
+        dashboard_port(root)
+    )))
+}
+
+fn launch_or_reuse_dashboard(
+    root: &Path,
+    runtime: &Path,
+    child_slot: &Mutex<Option<Child>>,
+) -> Result<String, DashboardOpenError> {
+    validate_private_report(&root.join("logs").join(REPORT_FILE_NAME))
+        .map_err(DashboardOpenError::Artifact)?;
+    if let Some(url) = dashboard_url(runtime, root).map_err(DashboardOpenError::Artifact)?
+        && dashboard_probe(&url)
+    {
+        return Ok(url);
+    }
+
+    let executable = env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|_| DashboardOpenError::TaskFailed)?;
+    let mut child = Command::new(executable)
+        .arg("dashboard-serve")
+        .arg(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| DashboardOpenError::TaskFailed)?;
+    let deadline = Instant::now() + DASHBOARD_START_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Some(url) = dashboard_url(runtime, root).map_err(DashboardOpenError::Artifact)?
+            && dashboard_probe(&url)
+        {
+            *child_slot
+                .lock()
+                .map_err(|_| DashboardOpenError::TaskFailed)? = Some(child);
+            return Ok(url);
+        }
+        if child
+            .try_wait()
+            .map_err(|_| DashboardOpenError::TaskFailed)?
+            .is_some()
+        {
+            return Err(DashboardOpenError::TaskFailed);
+        }
+        std::thread::sleep(DASHBOARD_PROBE_INTERVAL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(DashboardOpenError::TaskFailed)
+}
+
+fn dashboard_probe(url: &str) -> bool {
+    let Some(authority) = url.strip_prefix("http://127.0.0.1:") else {
+        return false;
+    };
+    let Some((port, path)) = authority.split_once('/') else {
+        return false;
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return false;
+    };
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+    let Ok(mut stream) = TcpStream::connect_timeout(&address.into(), Duration::from_millis(150))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(150)));
+    let request =
+        format!("GET /{path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 256];
+    while response.len() < 2048 {
+        let Ok(count) = stream.read(&mut chunk) else {
+            return false;
+        };
+        if count == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..count]);
+        if response.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    response.starts_with(b"HTTP/1.1 200")
+        && response
+            .windows(b"x-agent-observability-dashboard: 1".len())
+            .any(|window| window == b"x-agent-observability-dashboard: 1")
+}
+
 #[cfg(unix)]
-fn read_private_report(path: &Path) -> Result<Vec<u8>, std::io::Error> {
-    use std::io::Read;
+fn read_dashboard_token(dir: &Path) -> Result<Option<String>, DashboardArtifactError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = dir.join(DASHBOARD_CAPABILITY_FILE);
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(DashboardArtifactError::Unsafe),
+    };
+    let metadata = file.metadata().map_err(|_| DashboardArtifactError::Io)?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 || metadata.len() > 65 {
+        return Err(DashboardArtifactError::Unsafe);
+    }
+    let mut token = String::new();
+    file.read_to_string(&mut token)
+        .map_err(|_| DashboardArtifactError::Io)?;
+    let token = token.trim_end();
+    if token.len() != 64
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(DashboardArtifactError::Unsafe);
+    }
+    Ok(Some(token.to_owned()))
+}
+
+#[cfg(not(unix))]
+fn read_dashboard_token(_dir: &Path) -> Result<Option<String>, DashboardArtifactError> {
+    Err(DashboardArtifactError::Unsupported)
+}
+
+#[cfg(unix)]
+fn load_or_create_dashboard_token(dir: &Path) -> Result<String, UiError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if let Some(token) = read_dashboard_token(dir).map_err(UiError::DashboardArtifact)? {
+        return Ok(token);
+    }
+    let token = session_token()?;
+    let path = dir.join(DASHBOARD_CAPABILITY_FILE);
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(token.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(token)
+}
+
+#[cfg(not(unix))]
+fn load_or_create_dashboard_token(_dir: &Path) -> Result<String, UiError> {
+    Err(UiError::DashboardArtifact(
+        DashboardArtifactError::Unsupported,
+    ))
+}
+
+#[cfg(unix)]
+fn read_private_report(path: &Path) -> Result<Vec<u8>, DashboardArtifactError> {
+    let (file, length) = open_private_report(path)?;
+    let mut html = Vec::with_capacity(usize::try_from(length).unwrap_or_default());
+    file.take(MAX_REPORT_ARTIFACT_BYTES + 1)
+        .read_to_end(&mut html)
+        .map_err(|_| DashboardArtifactError::Io)?;
+    if u64::try_from(html.len()).unwrap_or(u64::MAX) > MAX_REPORT_ARTIFACT_BYTES {
+        return Err(DashboardArtifactError::TooLarge);
+    }
+    Ok(html)
+}
+
+#[cfg(unix)]
+fn validate_private_report(path: &Path) -> Result<(), DashboardArtifactError> {
+    open_private_report(path).map(|_| ())
+}
+
+#[cfg(unix)]
+fn open_private_report(path: &Path) -> Result<(fs::File, u64), DashboardArtifactError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.permissions().mode() & 0o077 != 0
-        || metadata.len() > MAX_REPORT_BYTES
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "report path is not a bounded private regular file",
-        ));
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                DashboardArtifactError::Unsafe
+            } else {
+                match error.kind() {
+                    std::io::ErrorKind::NotFound => DashboardArtifactError::Missing,
+                    std::io::ErrorKind::PermissionDenied => DashboardArtifactError::Unsafe,
+                    _ => DashboardArtifactError::Io,
+                }
+            }
+        })?;
+    let metadata = file.metadata().map_err(|_| DashboardArtifactError::Io)?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(DashboardArtifactError::Unsafe);
     }
-    let mut html = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or_default());
-    file.take(MAX_REPORT_BYTES + 1).read_to_end(&mut html)?;
-    if u64::try_from(html.len()).unwrap_or(u64::MAX) > MAX_REPORT_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "report exceeds the delivery bound",
-        ));
+    if metadata.len() > MAX_REPORT_ARTIFACT_BYTES {
+        return Err(DashboardArtifactError::TooLarge);
     }
-    Ok(html)
+    Ok((file, metadata.len()))
 }
 
 #[cfg(not(unix))]
-fn read_private_report(_path: &Path) -> Result<Vec<u8>, std::io::Error> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "private report serving is unsupported on this platform",
-    ))
+fn read_private_report(_path: &Path) -> Result<Vec<u8>, DashboardArtifactError> {
+    Err(DashboardArtifactError::Unsupported)
+}
+
+#[cfg(not(unix))]
+fn validate_private_report(_path: &Path) -> Result<(), DashboardArtifactError> {
+    Err(DashboardArtifactError::Unsupported)
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap, mutation: bool) -> Result<(), ApiError> {
@@ -972,7 +1235,8 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, DashboardOpenError, DashboardState, LocalConfigService, PlatformOpenError,
+        AppState, DASHBOARD_IDENTITY_HEADER, DashboardArtifactError, DashboardOpenError,
+        DashboardState, LocalConfigService, MAX_REPORT_ARTIFACT_BYTES, PlatformOpenError,
         REPORT_FILE_NAME, constant_time_equal, dashboard_error, dashboard_router,
         platform_open_command, prepare, prepare_dashboard, read_private_report, router,
         run_integration, run_platform_opener, session_token,
@@ -1301,11 +1565,13 @@ mod tests {
                 let state = AppState {
                     config: LocalConfigService::new(&layout),
                     root: layout.root.clone(),
+                    runtime: layout.runtime.clone(),
                     host: "127.0.0.1:43191".into(),
                     origin: "http://127.0.0.1:43191".into(),
                     token: "test-session".into(),
                     shutdown: Arc::new(Notify::new()),
                     last_seen: Arc::new(Mutex::new(Instant::now())),
+                    dashboard_child: Arc::new(Mutex::new(None)),
                 };
                 let app = router(state);
 
@@ -1436,6 +1702,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn dashboard_artifact_failures_remain_typed() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-artifact-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let report = root.join("report.html");
+        assert_eq!(
+            read_private_report(&report).unwrap_err(),
+            DashboardArtifactError::Missing
+        );
+
+        fs::write(&report, b"private").unwrap();
+        fs::set_permissions(&report, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            read_private_report(&report).unwrap_err(),
+            DashboardArtifactError::Unsafe
+        );
+        fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&report)
+            .unwrap()
+            .set_len(MAX_REPORT_ARTIFACT_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            read_private_report(&report).unwrap_err(),
+            DashboardArtifactError::TooLarge
+        );
+
+        fs::remove_file(&report).unwrap();
+        let target = root.join("target.html");
+        fs::write(&target, b"private").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &report).unwrap();
+        assert_eq!(
+            read_private_report(&report).unwrap_err(),
+            DashboardArtifactError::Unsafe
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn dashboard_surface_is_private_read_only_and_separate_from_settings() {
         use std::os::unix::fs::PermissionsExt;
@@ -1530,6 +1844,13 @@ mod tests {
                     .unwrap();
                 assert!(csp.contains("connect-src 'none'"));
                 assert!(csp.contains("frame-ancestors 'none'"));
+                assert_eq!(
+                    dashboard
+                        .headers()
+                        .get(DASHBOARD_IDENTITY_HEADER)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("1")
+                );
                 let body = to_bytes(dashboard.into_body(), 1024).await.unwrap();
                 assert_eq!(
                     body.as_ref(),

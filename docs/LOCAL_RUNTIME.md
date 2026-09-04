@@ -54,8 +54,11 @@ holding its typed guard; the UI additionally verifies the
 browser revision immediately before the atomic replace. Both release the guard before the next operation.
 Direct config file editing is unsupported.
 `ui` remains a compatibility alias for `settings`. `dashboard` renders the same private self-contained report
-artifact, exposes it through a separate random read-only capability on an OS-selected IPv4 loopback port, and
-keeps a report-only foreground server available for reload until ten idle minutes or a one-hour hard deadline.
+artifact, exposes it through a separate private read-only capability on a runtime-root-derived stable IPv4
+loopback port, and keeps a report-only foreground server available for reload until ten idle minutes or a
+one-hour hard deadline. The stable origin preserves sanitized browser-local saved views across process restarts.
+Settings launches this server as an independently owned child process and reuses it on repeated opens, so closing
+settings does not cancel dashboard delivery. Report production and delivery enforce the same 32 MiB artifact limit.
 The capability remains only in the private URL path; no cookie or browser storage is added by the transport,
 and the report sends no referrer or external request. The generated file remains independently usable without
 the server.

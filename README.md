@@ -57,7 +57,7 @@ agentobs demo
 ```
 
 이 명령 하나가 content-free sample을 별도 `~/.agent-observability-demo` runtime에 넣고,
-self-contained HTML 대시보드를 임시 `127.0.0.1` 주소로 기본 브라우저에 전달한다. HTML 전달이
+self-contained HTML 대시보드를 runtime-root별 `127.0.0.1` 주소로 기본 브라우저에 전달한다. HTML 전달이
 끝난 뒤에도 CLI가 실행되는 동안 새로고침할 수 있고, 10분 idle 또는 1시간 뒤 자동 종료된다.
 실제 데이터나 계정은 사용하지 않는다.
 
@@ -86,7 +86,8 @@ agentobs setup
 이 한 명령은 로컬 Codex 환경을 감지해 기본 위치 `~/.agent-observability`에 private runtime과 embedded
 SQLite transactional store를 만들고, 필요한 OTEL 설정과 local collector를 연결한 다음 초기
 대시보드를 localhost로 전달한다. 보고서 전달용 서버는 local collector와 별개이고, CLI가 실행되는
-동안 새로고침을 지원한 뒤 idle/deadline에 종료된다.
+동안 새로고침을 지원한 뒤 idle/deadline에 종료된다. 설정 화면에서 연 대시보드는 별도 foreground
+자식 프로세스가 소유하므로 설정 세션을 닫아도 자신의 idle/deadline까지 유지된다.
 Codex가 감지되지 않으면 runtime과 dashboard만 준비하고 `codex=not_detected`를
 출력하며 Codex 디렉터리, 설정, collector service는 만들지 않는다. 이미 Codex 앱이나 다른 로컬 도구가
 `notify`를 사용 중이면 그 명령은 건드리지 않고 `notify=external_preserved`로 알린다. 대시보드 생성에
@@ -264,7 +265,9 @@ flowchart TB
 - Embedded SQLite store가 로컬 권위 저장소이며 JSONL archive와 HTML은 다시 만들 수 있는 projection이다.
 - TypeScript UI는 원본 agent payload가 아니라 Rust가 검증한 report DTO만 받는다.
 - report artifact는 계속 self-contained private HTML로 남는다. 기본 dashboard 명령은 별도
-  read-only capability로 이를 임시 `127.0.0.1` endpoint에서 제공하며, CLI가 실행되는 동안 새로고침할 수 있다.
+  read-only capability로 이를 runtime-root별 고정 `127.0.0.1` origin에서 제공하며, CLI가 실행되는 동안
+  새로고침할 수 있다. 고정 origin은 content-free saved view가 프로세스 재시작 뒤에도 유지되게 하며,
+  capability path와 report artifact는 private runtime에 남는다. 생성과 전달은 같은 32 MiB 상한을 적용한다.
   10분 동안 사용하지 않거나 최대 1시간이 지나면 서버가 종료되고 기존 HTML 파일은 그대로 남는다.
   자동 collector와 설정 UI도 외부 interface에 bind하지 않는다.
 - 설정 화면은 별도 UI instance lock만 유지한다. 저장할 때만 runtime lock을 짧게 획득하므로 열린

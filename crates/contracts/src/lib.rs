@@ -20,6 +20,7 @@ pub const LOCAL_RUNTIME_CONFIG_SCHEMA: &str =
 pub const ADAPTER_CAPABILITY_V1: &str = include_str!("../capabilities/adapter-capability-v1.yaml");
 pub const DURABLE_RECORD_VERSION: &str = "agent_observability.v1";
 pub const REPORT_DTO_VERSION: &str = "agent_observability.report.v1";
+pub const MAX_REPORT_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 pub const RETENTION_ARCHIVE_VERSION: &str = "agent_observability.retention_archive.v1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

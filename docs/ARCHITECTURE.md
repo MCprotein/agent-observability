@@ -37,9 +37,12 @@ collection의 Rust collector는 같은 executable의 private `collector-serve` m
 
 TypeScript UI는 브라우저에서 직접 원본 event log를 읽지 않고 Rust가 만든 sanitized report 또는
 versioned config DTO만 사용한다. report는 self-contained static HTML이며 상시 web server를
-요구하지 않는다. `dashboard`는 별도 read-only path capability로 report를 임시 `127.0.0.1:0` endpoint에서
-제공한다. report-only router, capability, 수명은 settings surface와 분리되며 설정·integration API를
-등록하지 않는다. foreground command 동안 새로고침할 수 있고 10분 idle 또는 1시간 hard deadline에 종료된다.
+요구하지 않는다. `dashboard`는 별도 read-only path capability로 report를 runtime-root에서 결정되는
+고정 IPv4 loopback port에 제공한다. 이 stable origin은 sanitized saved view의 browser-local persistence를
+프로세스 재시작 사이에도 보존한다. report-only router, capability, process lifetime은 settings surface와
+분리되며 설정·integration API를 등록하지 않는다. 설정에서 연 dashboard도 별도 자식 프로세스가 소유하고,
+반복 open은 살아 있는 동일 process를 재사용한다. 생성기와 transport는 같은 32 MiB artifact 상한을
+공유하며, foreground process는 10분 idle 또는 1시간 hard deadline에 종료된다.
 설정 UI는 CLI가 명시적으로 시작한 동안에만 `127.0.0.1:0`에 bind하는 ephemeral
 inbound adapter를 사용한다. settings token, exact Host/Origin, body bound, no-store와 optimistic revision을
 검증한다. HTTP/1 header read는 5초, 동시 연결은 64개, 종료 drain은 1초로 제한해 불완전한
