@@ -224,8 +224,13 @@ fn report_explains_missing_fields_and_propagates_verified_trace_repository() {
     turn.attributes.turn_id = Some(ScalarValueV1::String("turn-private".into()));
     turn.metrics = MetricsV1::default();
 
+    let mut request = full("gpt-test");
+    request.trace_id = "trace-project".into();
+    request.span_id = "request-project".into();
+    request.project.name = Some("agent-observability".into());
+
     let report = project_report(
-        &[session, turn],
+        &[session, turn, request],
         "2026-09-05T00:00:00Z",
         "availability",
         None,
@@ -257,6 +262,47 @@ fn report_explains_missing_fields_and_propagates_verified_trace_repository() {
     assert_eq!(
         turn.availability.request_content.reason,
         "local_opt_in_lookup_required"
+    );
+}
+
+#[test]
+fn report_keeps_unknown_repository_when_trace_has_conflicting_projects() {
+    let mut session = full("gpt-test");
+    session.trace_id = "trace-project".into();
+    session.span_id = "session-project".into();
+    session.project = ProjectV1::default();
+
+    let mut first = full("gpt-test");
+    first.trace_id = "trace-project".into();
+    first.span_id = "first-project".into();
+    first.project.name = Some("agent-observability".into());
+
+    let mut second = full("gpt-test");
+    second.trace_id = "trace-project".into();
+    second.span_id = "second-project".into();
+    second.project.name = Some("different-project".into());
+
+    let report = project_report(
+        &[session, first, second],
+        "2026-09-05T00:00:00Z",
+        "availability",
+        None,
+    )
+    .unwrap();
+    let session = report
+        .spans
+        .iter()
+        .find(|span| span.span_id == hash_opaque_identifier("session-project"))
+        .unwrap();
+
+    assert_eq!(session.repo, "unknown");
+    assert_eq!(
+        session.availability.repository.state,
+        agent_observability_contracts::AvailabilityStateV1::SourceUnavailable
+    );
+    assert_eq!(
+        session.availability.repository.reason,
+        "ambiguous_trace_repository"
     );
 }
 

@@ -14,7 +14,7 @@ use agent_observability_domain::{
     DomainError, DomainSpanState, LifecycleReducer, validate_topology,
 };
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -431,18 +431,33 @@ fn report_availability(
 }
 
 fn propagate_trace_repositories(spans: &mut [ReportSpanV1]) {
-    let known = spans
-        .iter()
-        .filter(|span| span.repo != "unknown")
-        .map(|span| (span.trace_id.clone(), span.repo.clone()))
-        .collect::<BTreeMap<_, _>>();
+    let mut known = BTreeMap::<_, BTreeSet<_>>::new();
+    for span in spans.iter().filter(|span| span.repo != "unknown") {
+        known
+            .entry(span.trace_id.clone())
+            .or_default()
+            .insert(span.repo.clone());
+    }
     for span in spans {
-        if span.repo == "unknown"
-            && let Some(repo) = known.get(&span.trace_id)
-        {
-            span.repo.clone_from(repo);
-            span.availability.repository =
-                field_availability(AvailabilityStateV1::Available, "derived_from_trace_context");
+        if span.repo != "unknown" {
+            continue;
+        }
+        match known.get(&span.trace_id) {
+            Some(repos) if repos.len() == 1 => {
+                span.repo
+                    .clone_from(repos.first().expect("single repository"));
+                span.availability.repository = field_availability(
+                    AvailabilityStateV1::Available,
+                    "derived_from_trace_context",
+                );
+            }
+            Some(_) => {
+                span.availability.repository = field_availability(
+                    AvailabilityStateV1::SourceUnavailable,
+                    "ambiguous_trace_repository",
+                );
+            }
+            None => {}
         }
     }
 }
