@@ -11,14 +11,14 @@ Optional Codex automatic connection은 별도의 private collector settings와 e
 ## 사용법
 
 ```bash
-agentobs ui
+agentobs settings
 ```
 
 별도 runtime은 root를 지정한다. 브라우저를 자동으로 열 수 없는 환경에서는 출력된 URL을 직접 연다.
 
 ```bash
-agentobs ui /private/runtime
-agentobs ui /private/runtime --no-open
+agentobs settings /private/runtime
+agentobs settings /private/runtime --no-open
 ```
 
 UI는 `127.0.0.1`의 임의 port에만 bind하고 URL fragment의 session capability를 private header로
@@ -31,6 +31,8 @@ cookie, local storage, 외부 전송에는 저장하지 않는다. API는 정확
 멈추며, 화면 연결이 10분 동안 끊기거나 설정 server 시작 후 1시간이 지나면 종료를 요청한다. 이
 deadline은 로컬 executor와 filesystem이 응답하는 동안 적용된다. 정적 report에는
 영향을 주지 않는다.
+
+기존 `agentobs ui` 명령은 호환 alias로 유지되며 `settings`와 같은 화면과 보안 계약을 사용한다.
 
 자동화와 headless 환경에서는 CLI를 사용한다.
 

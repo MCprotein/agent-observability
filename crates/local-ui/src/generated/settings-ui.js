@@ -877,7 +877,7 @@
     app.innerHTML = `<main class="center-state" role="alert">
     <i data-lucide="shield-check" aria-hidden="true"></i>
     <h1>\uC124\uC815 \uC138\uC158\uC774 \uC885\uB8CC\uB418\uC5C8\uC2B5\uB2C8\uB2E4</h1>
-    <p>\uD130\uBBF8\uB110\uC5D0\uC11C <code>agent-observability ui</code>\uB97C \uC2E4\uD589\uD574 \uC0C8 \uC138\uC158\uC744 \uC5EC\uC138\uC694.</p>
+    <p>\uD130\uBBF8\uB110\uC5D0\uC11C <code>agentobs settings</code>\uB97C \uC2E4\uD589\uD574 \uC0C8 \uC138\uC158\uC744 \uC5EC\uC138\uC694.</p>
   </main>`;
     mountIcons();
   }

@@ -17,7 +17,7 @@ const directory = await mkdtemp(join(tmpdir(), "agent-observability-settings-bro
 await chmod(directory, 0o700);
 const runtimeRoot = join(directory, "runtime");
 const binary = join(process.cwd(), "target", "debug", "agent-observability");
-const child = spawn(binary, ["ui", runtimeRoot, "--no-open"], {
+const child = spawn(binary, ["settings", runtimeRoot, "--no-open"], {
   stdio: ["ignore", "pipe", "pipe"],
 });
 type SettingsProcess = typeof child;

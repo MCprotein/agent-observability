@@ -1,6 +1,6 @@
 {
   "name": "agent-observability",
-  "version": "1.8.4",
+  "version": "1.9.0",
   "private": true,
   "type": "module",
   "description": "Local-first observability primitives for coding agents.",
@@ -11,11 +11,12 @@
     "setup:browser": "playwright-core install chromium --no-shell",
     "pretest": "npm run setup:browser",
     "test:browser": "tsx scripts/browser-smoke.ts",
+    "test:dashboard-browser": "tsx scripts/dashboard-browser-smoke.ts",
     "test:settings-browser": "cargo build -q -p agent-observability-cli && tsx scripts/settings-browser-smoke.ts",
     "check:authored-js": "tsx scripts/check-authored-js.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test:unit": "node --import tsx --test test/*.test.ts",
-    "test": "npm run build:ui && npm run check:authored-js && npm run typecheck && npm run test:unit && npm run test:browser && npm run test:settings-browser"
+    "test": "npm run build:ui && npm run check:authored-js && npm run typecheck && npm run test:unit && npm run test:browser && npm run test:dashboard-browser && npm run test:settings-browser"
   },
   "engines": {
     "node": ">=20"
