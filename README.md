@@ -182,11 +182,13 @@ pseudonymous project reference뿐이다. 원문 path/content는 canonical store,
 저장된다. Foreground helper는 content-free projection과 검증된 상세를 하나의 bounded envelope로
 private-CA HTTPS localhost endpoint에 넘긴다. Collector는 bounded mutation-lock 구간에서 raw detail과
 content-free terminal status를 모두 원자 파일로 동기화한 뒤에만 `available` 성공을 반환한다. 별도 메모리
-queue나 재시작 후 남는 pending 상태는 없다. Callback 전체에는 250ms 절대 deadline이 있어 느리거나 잠긴
-runtime에서는 Codex를 막지 않고 명시적 unavailable로 fail open한다.
+queue나 재시작 후 남는 pending 상태는 없다. Foreground helper 진입 시 250ms 절대 deadline을 설정하며
+bounded parsing과 config 확인에 쓴 시간은 이후 loopback connect/TLS/HTTP 예산에서 차감된다. 느리거나 잠긴
+runtime은 명시적 unavailable로 fail open한다.
 상태 파일은 최대 1,024개×1KiB의 별도 bounded diagnostic headroom이라 일반 저장 예산이 가득 차도 실패 이유를
 남길 수 있다. 동일 turn의 같은 detail은 no-op이며 서로 다른 detail은
-기존 원문을 덮어쓰지 않고 `conflict`로 표시한다. 일반 report DTO/HTML에는 원문을 넣지 않고 선택한 turn에서 localhost 상세 endpoint로만
+기존 원문을 덮어쓰지 않고 `conflict`로 표시한다. 시작 시 terminal status가 정확히 `ok`가 아닌 고아 상세는
+제거된다. 일반 report DTO/HTML에는 원문을 넣지 않고 선택한 turn에서 localhost 상세 endpoint로만
 읽는다. 이는 API wire request/response 캡처가 아니다. 기존 외부 `notify`를 보존한 환경에서는 해당
 callback을 agentobs가 받지 않으므로 상세가 수집되지 않는다.
 

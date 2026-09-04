@@ -32,7 +32,8 @@ test("reduces only already-priced billable span scalars", () => {
   assert.equal(summary.estimatedCost, 0.25);
   assert.equal(summary.inputTokens, 12);
   assert.equal(summary.outputTokens, 3);
-  assert.equal(summary.totalTokens, 15);
+  assert.equal(summary.totalTokens, undefined);
+  assert.equal(summary.tokenStatus, "incomplete");
 });
 
 test("reduces every displayable token-total shape with stable precedence", () => {
@@ -54,7 +55,8 @@ test("reduces every displayable token-total shape with stable precedence", () =>
   const summary = summarizeVisible(cases.slice(0, 6).map(([, metrics]) =>
     viewSpan("estimated", 0, metrics),
   ));
-  assert.equal(summary.totalTokens, 112);
+  assert.equal(summary.totalTokens, undefined);
+  assert.equal(summary.tokenStatus, "incomplete");
   assert.equal(summary.costStatus, "estimated");
 });
 

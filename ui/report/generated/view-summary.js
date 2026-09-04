@@ -18,10 +18,14 @@ function summarizeVisible(spans) {
     errors: 0,
     inputTokens: 0,
     outputTokens: 0,
-    totalTokens: 0,
+    totalTokens: void 0,
+    tokenStatus: "unavailable",
     estimatedCost: 0,
     costStatus: aggregateCostStatus(billable.map((span) => span.cost.status))
   };
+  let completeTokenTotal = 0;
+  let completeTokenSpans = 0;
+  let incompleteTokenSpans = 0;
   for (const span of spans) {
     if (span.sessionId) sessions.add(span.sessionId);
     if (span.turnId) turns.add(span.turnId);
@@ -30,11 +34,19 @@ function summarizeVisible(spans) {
     if (span.status === "error") summary.errors += 1;
     summary.inputTokens += span.metrics.inputTokens ?? 0;
     summary.outputTokens += span.metrics.outputTokens ?? 0;
-    summary.totalTokens += tokenTotal(span.metrics) ?? 0;
+    const spanTokenTotal = tokenTotal(span.metrics);
+    if (spanTokenTotal !== void 0 && span.availability.tokens.state === "available") {
+      completeTokenTotal += spanTokenTotal;
+      completeTokenSpans += 1;
+    } else if (span.availability.tokens.state !== "not_applicable") {
+      incompleteTokenSpans += 1;
+    }
     summary.estimatedCost += span.estimatedCost ?? 0;
   }
   summary.sessions = sessions.size;
   summary.turns = turns.size;
+  summary.tokenStatus = incompleteTokenSpans > 0 ? "incomplete" : completeTokenSpans > 0 ? "complete" : "unavailable";
+  summary.totalTokens = summary.tokenStatus === "complete" ? completeTokenTotal : void 0;
   return summary;
 }
 function tokenTotal(metrics) {

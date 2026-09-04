@@ -1998,6 +1998,31 @@ mod tests {
                     use std::os::unix::fs::PermissionsExt;
                     fs::set_permissions(&detail_path, fs::Permissions::from_mode(0o600)).unwrap();
                 }
+                let status_directory = layout.state.join("private-codex-turn-detail-statuses");
+                fs::create_dir_all(&status_directory).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&status_directory, fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                let status_path = status_directory.join(format!("{digest}.json"));
+                fs::write(
+                    &status_path,
+                    serde_json::to_vec(&serde_json::json!({
+                        "schema_version": "private_codex_turn_detail_status.v1",
+                        "turn_id": turn_id.clone(),
+                        "state": "available",
+                        "code": "ok"
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&status_path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
 
                 let present = app
                     .clone()

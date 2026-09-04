@@ -156,8 +156,11 @@ try {
   });
   largePage.on("requestfailed", (request) => largeFailedRequests.push(request.url()));
   await largePage.goto(pathToFileURL(largeReportPath).href);
-  assert.equal(await largePage.locator("#kpi-tokens").textContent(), "112");
-  assert.match((await largePage.locator("#trace-list .trace-row").first().textContent()) ?? "", /112 tokens/);
+  assert.equal(await largePage.locator("#kpi-tokens").textContent(), "Incomplete");
+  assert.match(
+    (await largePage.locator("#trace-list .trace-row").first().textContent()) ?? "",
+    /Incomplete tokens/,
+  );
   for (const [name, total] of [
     ["operation-0", "15"],
     ["operation-1", "20"],

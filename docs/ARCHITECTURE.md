@@ -233,7 +233,8 @@ anti-corruption layer다.
   terminal status를 동기화한 경우에만 available 성공을 반환한다. 메모리 queue나 restart-stranded pending은
   없다. 파일 기록·fsync·bounded scan·retention은 무한 재시도 없이 제한되며 상태는 일반 local storage
   budget과 분리된 최대 1,024개×1KiB diagnostic headroom에 둔다. 같은 hashed turn ID의 동일 detail 재시도는 no-op이고
-  다른 detail은 `conflict`로 fail-closed한다.
+  다른 detail은 `conflict`로 fail-closed한다. Startup reconciliation은 terminal status가 정확히 `ok`가 아닌
+  고아 detail artifact를 제거해 중단된 publication을 완료된 상세로 노출하지 않는다.
   동일 hashed turn ID로 localhost dashboard에서 요청할 때만 읽고,
   canonical observation, SQLite durable record, report DTO/static HTML, archive/export/team envelope와
   dependency를 만들지 않는다. API wire request/response capture나 transcript scan은 하지 않는다.
@@ -248,7 +249,8 @@ anti-corruption layer다.
   같은 projection과 검증된 cwd/input/last-assistant 필드만 별도 closed envelope에 넣어 전용 localhost
   route로 전달한다. 두 경로 모두 private-CA HTTPS와 exact private request header를 사용하며 전체
   connect/TLS/HTTP deadline 뒤 항상 fail open한다. 외부 network, full transcript parse, report render나
-  별도 queue drain은 없으며 전체 loopback/TLS/HTTP 요청은 250ms absolute deadline 뒤 fail open한다.
+  별도 queue drain은 없다. Helper 진입 시 만든 250ms absolute deadline에서 bounded parse/config 시간을
+  차감한 나머지만 loopback connect/TLS/HTTP가 공유하며, 예산이 없으면 전송 전에 fail open한다.
   available receipt는 detail과 terminal status가 모두 durable한 경우에만 반환한다. 실패 횟수는 collector
   health counter로 확인한다. Future file fallback은 persisted cursor와 source generation으로
   incrementally reconcile한다.

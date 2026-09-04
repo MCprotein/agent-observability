@@ -552,6 +552,24 @@ fn report_v2_rejects_token_availability_that_contradicts_metrics() {
         available_without_metrics.validate(),
         Err(ContractError::ContradictoryReportAvailability)
     );
+
+    let mut partial = serde_json::from_str::<ReportDtoV2>(include_str!(
+        "../../../contracts/report-dto-v2.fixture.json"
+    ))
+    .unwrap();
+    partial.spans[0].metrics = ReportMetricsV1 {
+        total_input_tokens: Some(10.0),
+        ..ReportMetricsV1::default()
+    };
+    partial.spans[0].availability.tokens.state =
+        agent_observability_contracts::AvailabilityStateV2::SourceUnavailable;
+    partial.spans[0].availability.tokens.reason = "partial_token_metrics".into();
+    partial.validate().unwrap();
+    partial.spans[0].availability.tokens.reason = "source_not_provided".into();
+    assert_eq!(
+        partial.validate(),
+        Err(ContractError::ContradictoryReportAvailability)
+    );
 }
 
 fn apply_json_parity_case(document: &mut serde_json::Value, case: &serde_json::Value) {

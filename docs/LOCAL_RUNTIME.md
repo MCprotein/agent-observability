@@ -155,8 +155,8 @@ dedicated capability-protected localhost endpoint. The collector commits the pro
 the per-turn private artifact and content-free terminal status under a bounded mutation-lock acquisition in a blocking
 task outside the collector event loop. It returns
 `available` only after both publications complete; there is no ephemeral detail queue or restart-stranded pending
-state. The helper's absolute 250 ms loopback/TLS/HTTP deadline keeps a slow or contended opt-in write fail-open for
-Codex. The artifact is correlated by
+state. A 250 ms deadline is established at helper entry; bounded parse/config time reduces the remaining shared
+loopback connect/TLS/HTTP budget, and an exhausted budget fails open before transport. The artifact is correlated by
 the same hashed turn ID shown in the report and is fetched only from the capability-protected localhost dashboard
 route. Raw detail can therefore exist transiently in this dedicated receiver request and synchronous write path, but it never
 enters the canonical observation, SQLite durable record, report DTO, static HTML, diagnostic, archive, export or
@@ -171,7 +171,9 @@ status sidecar records the terminal capture result (`ok`, conflict, storage budg
 failure), and the localhost panel
 distinguishes capture failure from a turn that was never collected. Raw detail expiry runs at collector startup
 and after an explicit `retention-apply`; status sidecars follow the same bounded count, scan and age policy. An
-expired file therefore does not require another Codex turn to be removed. Status sidecars use a separate diagnostic
+expired file therefore does not require another Codex turn to be removed. Startup reconciliation also deletes a
+detail artifact unless its matching terminal status is exactly `ok`, so an interrupted publication cannot later be
+exposed as completed. Status sidecars use a separate diagnostic
 headroom capped at 1,024 files of at most 1 KiB each, so a full ordinary storage budget cannot erase the reason a
 detail was rejected.
 

@@ -61,6 +61,20 @@ try {
     { mode: 0o600 },
   );
   await chmod(privateDetailPath, 0o600);
+  const privateStatusDirectory = join(runtimeRoot, "state", "private-codex-turn-detail-statuses");
+  await mkdir(privateStatusDirectory, { recursive: true, mode: 0o700 });
+  const privateStatusPath = join(privateStatusDirectory, `${privateTurnDigest}.json`);
+  await writeFile(
+    privateStatusPath,
+    JSON.stringify({
+      schema_version: "private_codex_turn_detail_status.v1",
+      turn_id: `id:sha256:${privateTurnDigest}`,
+      state: "available",
+      code: "ok",
+    }),
+    { mode: 0o600 },
+  );
+  await chmod(privateStatusPath, 0o600);
   await execute(binary, ["report", runtimeRoot]);
   const reportHtml = await readFile(
     join(runtimeRoot, "logs", "agent-observability-report.html"),

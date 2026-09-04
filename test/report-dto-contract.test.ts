@@ -31,6 +31,24 @@ test("authoritative report schema matches the Rust availability parity corpus", 
   }
 });
 
+test("partial token metrics require the explicit incomplete availability reason", () => {
+  const partial = structuredClone(fixture);
+  partial.spans[0].metrics = { totalInputTokens: 10 };
+  partial.spans[0].availability.tokens = {
+    state: "source_unavailable",
+    reason: "partial_token_metrics",
+  };
+  assert.equal(validateReport(partial), true);
+
+  const wrongState = structuredClone(partial);
+  wrongState.spans[0].availability.tokens.state = "withheld";
+  assert.equal(validateReport(wrongState), false);
+
+  const wrongReason = structuredClone(partial);
+  wrongReason.spans[0].availability.tokens.reason = "source_not_provided";
+  assert.equal(validateReport(wrongReason), false);
+});
+
 function applyParityCase(document: unknown, parityCase: ParityCase): void {
   if (parityCase.operation === "none") return;
   let parent = document as Record<string, unknown> | unknown[];

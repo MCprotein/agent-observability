@@ -213,7 +213,7 @@ function mount(data: AgentObservabilityReportV2): void {
     setText("kpi-turns", summary.turns);
     setText("kpi-llm", summary.llmRequests);
     setText("kpi-tools", summary.toolExecutions);
-    setText("kpi-tokens", formatNumber(summary.totalTokens));
+    setText("kpi-tokens", formatTokenSummary(summary.totalTokens, summary.tokenStatus));
     setText("kpi-cost", formatCost(summary.estimatedCost, {
       status: summary.costStatus,
       currency: data.cost.currency,
@@ -257,7 +257,7 @@ function mount(data: AgentObservabilityReportV2): void {
         `<div class="trace-main"><span class="mono">${escapeHtml(shortId(trace.traceId))}</span>` +
         `<span class="badge ${traceSummary.errors ? "error" : "ok"}">${traceSummary.errors ? `${traceSummary.errors} error` : "ok"}</span></div>` +
         `<div class="trace-meta"><span>${escapeHtml(trace.repo)}</span><span>${traceSpans.length} spans</span>` +
-        `<span>${formatNumber(traceSummary.totalTokens)} tokens</span></div>`;
+        `<span>${escapeHtml(formatTokenSummary(traceSummary.totalTokens, traceSummary.tokenStatus))} tokens</span></div>`;
       return button;
     }));
   }
@@ -537,6 +537,12 @@ function formatOptionalNumberValue(value: number | undefined): string | undefine
 
 function formatOptionalNumber(value: number | undefined, availability: FieldAvailability): string {
   return value === undefined ? availabilityLabel(availability) : formatNumber(value);
+}
+
+function formatTokenSummary(value: number | undefined, status: "complete" | "incomplete" | "unavailable"): string {
+  if (status === "incomplete") return "Incomplete";
+  if (status === "unavailable" || value === undefined) return "Unavailable";
+  return formatNumber(value);
 }
 
 function formatOptionalDuration(value: number | undefined, availability: FieldAvailability): string {

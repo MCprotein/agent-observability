@@ -88,6 +88,8 @@ const PRIVATE_NOTIFY_ENVELOPE_VERSION: &str = "private_codex_notify_envelope.v1"
 const PRIVATE_TURN_DETAIL_RECEIPT_VERSION: &str = "private_codex_turn_detail_receipt.v1";
 const PRIVATE_TURN_DETAIL_LOCK_RETRIES: usize = 4;
 const PRIVATE_TURN_DETAIL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
+const PRIVATE_NOTIFY_FOREGROUND_DEADLINE: Duration = Duration::from_millis(250);
+const PRIVATE_NOTIFY_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 const REPORT_RETRY_LIMIT: u32 = 4;
 const REPORT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
 const REPORT_DEBOUNCE_DELAY: Duration = Duration::from_millis(200);
@@ -2477,6 +2479,7 @@ fn refresh_report_from_root(root: &Path) -> Result<bool, ReportFailure> {
 /// Projection happens before any settings or network I/O.
 #[must_use]
 pub fn submit_notify(root: &Path, payload: &[u8]) -> NotifyOutcome {
+    let deadline = StdInstant::now() + PRIVATE_NOTIFY_FOREGROUND_DEADLINE;
     let Ok(projected) = project_notify_json(payload) else {
         return NotifyOutcome::Rejected;
     };
@@ -2491,13 +2494,13 @@ pub fn submit_notify(root: &Path, payload: &[u8]) -> NotifyOutcome {
         .map_or(("/v1/notify", body.as_slice()), |private_body| {
             ("/v1/notify/private-detail", private_body)
         });
-    match authenticated_request(
+    match authenticated_request_until(
         root,
         "POST",
         path,
         Some(body),
-        Duration::from_millis(50),
-        Duration::from_millis(250),
+        PRIVATE_NOTIFY_CONNECT_TIMEOUT,
+        deadline,
     ) {
         Ok(response) if path == "/v1/notify" && response.status == 200 => NotifyOutcome::Accepted,
         Ok(response) if path == "/v1/notify/private-detail" => {
@@ -2591,9 +2594,9 @@ fn lookup_private_turn_detail_inner(
             .map_err(|_| "storage_unavailable")?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return match read_private_turn_detail_status(root, turn_id) {
-                Ok(Some(code)) if code != "ok" => Err(code),
-                Ok(_) => Ok(None),
-                Err(code) => Err(code),
+                Ok(Some("ok")) => Err("artifact_missing"),
+                Ok(Some(code)) | Err(code) => Err(code),
+                Ok(None) => Ok(None),
             };
         }
         Err(_) => return Err("storage_unavailable"),
@@ -2605,9 +2608,9 @@ fn lookup_private_turn_detail_inner(
         Ok(bytes) => bytes,
         Err(CollectorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return match read_private_turn_detail_status(root, turn_id) {
-                Ok(Some(code)) if code != "ok" => Err(code),
-                Ok(_) => Ok(None),
-                Err(code) => Err(code),
+                Ok(Some("ok")) => Err("artifact_missing"),
+                Ok(Some(code)) | Err(code) => Err(code),
+                Ok(None) => Ok(None),
             };
         }
         Err(_) => return Err("storage_unavailable"),
@@ -2617,9 +2620,9 @@ fn lookup_private_turn_detail_inner(
         return Err("artifact_invalid");
     }
     match read_private_turn_detail_status(root, turn_id) {
-        Ok(Some(code)) if code != "ok" => return Err(code),
-        Ok(_) => {}
-        Err(code) => return Err(code),
+        Ok(Some("ok")) => {}
+        Ok(Some(code)) | Err(code) => return Err(code),
+        Ok(None) => return Err("status_missing"),
     }
     Ok(Some(bytes))
 }
@@ -2886,7 +2889,56 @@ fn maintain_private_turn_details_locked(
         config,
         now,
         Some(MAX_PRIVATE_TURN_DETAIL_STATUS_BYTES),
-    )
+    )?;
+    reconcile_private_turn_detail_pairs_locked(layout)
+}
+
+fn reconcile_private_turn_detail_pairs_locked(
+    layout: &InstalledLayout,
+) -> Result<(), CollectorError> {
+    let directory = layout.state.join(PRIVATE_TURN_DETAIL_DIRECTORY);
+    match fs::symlink_metadata(&directory) {
+        Ok(_) => validate_private_directory_tree(&layout.state, &directory)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let mut removed = false;
+    for (index, entry) in fs::read_dir(&directory)?.enumerate() {
+        if index >= MAX_PRIVATE_TURN_DETAIL_SCAN_ENTRIES {
+            return Err(CollectorError::Runtime(
+                "private turn detail directory exceeds scan bound".into(),
+            ));
+        }
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Err(CollectorError::Runtime(
+                "private turn detail entry is invalid".into(),
+            ));
+        };
+        if name.starts_with(".collector.json.tmp.") {
+            continue;
+        }
+        let digest = name.strip_suffix(".json").ok_or_else(|| {
+            CollectorError::Runtime("private turn detail entry is invalid".into())
+        })?;
+        let turn_id = format!("id:sha256:{digest}");
+        let expected = private_turn_detail_path(&directory, &turn_id)?;
+        if expected != path {
+            return Err(CollectorError::Runtime(
+                "private turn detail entry is invalid".into(),
+            ));
+        }
+        let _ = open_private_read(&path)?;
+        if read_private_turn_detail_status(&layout.root, &turn_id) != Ok(Some("ok")) {
+            fs::remove_file(path)?;
+            removed = true;
+        }
+    }
+    if removed {
+        File::open(directory)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn maintain_private_turn_directory_locked(
@@ -3163,6 +3215,17 @@ fn authenticated_request(
     io_timeout: Duration,
 ) -> Result<AuthenticatedResponse, CollectorError> {
     let deadline = StdInstant::now() + connect_timeout + io_timeout;
+    authenticated_request_until(root, method, path, body, connect_timeout, deadline)
+}
+
+fn authenticated_request_until(
+    root: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    connect_timeout: Duration,
+    deadline: StdInstant,
+) -> Result<AuthenticatedResponse, CollectorError> {
     let layout = inspect(root).map_err(runtime_error)?;
     let settings = load_settings_from_layout(&layout)?;
     let config = build_client_config(&layout, &settings.credentials)?;
@@ -3421,15 +3484,15 @@ mod tests {
         ingest_notify_with_private_detail, install_settings, is_json, load_settings,
         lookup_private_turn_detail, maintain_private_turn_details_locked, open_store,
         parse_complete_http_response, persist_private_turn_detail,
-        persist_private_turn_detail_request, private_turn_detail_error_code,
-        private_turn_detail_path, private_turn_detail_status_directory,
-        private_turn_detail_status_path, project_report, prune_private_turn_details_with_limit,
-        read_private_snapshot, read_private_turn_detail, read_private_turn_detail_status,
-        reconcile_report_state, recover_occupied_persisted_port, refresh_report_from_root,
-        report_dirty_path, router, schedule_report_refresh, settings_path, submit_notify,
-        submit_otlp_json_outcome, timestamp_from_unix_ms, token_matches, watch_report_authority,
-        write_private, write_private_json, write_private_json_if_unchanged,
-        write_private_turn_detail_status_locked,
+        persist_private_turn_detail_locked, persist_private_turn_detail_request,
+        private_turn_detail_error_code, private_turn_detail_path,
+        private_turn_detail_status_directory, private_turn_detail_status_path, project_report,
+        prune_private_turn_details_with_limit, read_private_snapshot, read_private_turn_detail,
+        read_private_turn_detail_status, reconcile_report_state, recover_occupied_persisted_port,
+        refresh_report_from_root, report_dirty_path, router, schedule_report_refresh,
+        settings_path, submit_notify, submit_otlp_json_outcome, timestamp_from_unix_ms,
+        token_matches, watch_report_authority, write_private, write_private_json,
+        write_private_json_if_unchanged, write_private_turn_detail_status_locked,
     };
     use agent_observability_adapter_codex::{
         MAX_HANDOFF_BYTES, parse_otlp_http_json, project_notify_with_private_detail,
@@ -3452,7 +3515,7 @@ mod tests {
             atomic::{AtomicBool, AtomicU64, Ordering},
         },
         thread,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime},
     };
     use tokio::sync::Mutex;
 
@@ -4689,7 +4752,7 @@ mod tests {
 
         set_private_turn_details(&root, true);
         let config = load(&layout.config).unwrap();
-        persist_private_turn_detail(&layout, &first_detail, &config).unwrap();
+        capture_private_turn_detail(&layout, &first_detail, &config).unwrap();
 
         let directory = layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY);
         let path = private_turn_detail_path(&directory, &turn_id).unwrap();
@@ -5041,7 +5104,7 @@ mod tests {
         let (_, detail) =
             project_notify_with_private_detail(&raw_notify("thread-expire", "turn-expire"))
                 .unwrap();
-        persist_private_turn_detail(&layout, &detail, &config).unwrap();
+        capture_private_turn_detail(&layout, &detail, &config).unwrap();
         let directory = layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY);
         let path = private_turn_detail_path(&directory, detail.turn_id()).unwrap();
         let modified = fs::metadata(&path).unwrap().modified().unwrap();
@@ -5087,6 +5150,69 @@ mod tests {
         assert_eq!(
             read_private_turn_detail_status(&root, detail.turn_id()),
             Ok(Some("ok"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn private_turn_detail_without_terminal_status_is_not_exposed() {
+        let root = test_root("private-turn-detail-missing-status");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let config = load(&layout.config).unwrap();
+        let (_, detail) = project_notify_with_private_detail(&raw_notify(
+            "thread-missing-status",
+            "turn-missing-status",
+        ))
+        .unwrap();
+        let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+        persist_private_turn_detail_locked(&layout, &detail, &config, 0).unwrap();
+        drop(mutation);
+
+        assert_eq!(
+            lookup_private_turn_detail(&root, detail.turn_id()),
+            PrivateTurnDetailLookup::Failed("status_missing")
+        );
+        let detail_path = private_turn_detail_path(
+            &layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY),
+            detail.turn_id(),
+        )
+        .unwrap();
+        assert!(detail_path.is_file());
+
+        maintain_private_turn_details_locked(&layout, &config, SystemTime::now()).unwrap();
+        assert!(!detail_path.exists());
+        assert_eq!(
+            lookup_private_turn_detail(&root, detail.turn_id()),
+            PrivateTurnDetailLookup::NotCollected
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn private_turn_detail_success_status_without_artifact_is_explicit() {
+        let root = test_root("private-turn-detail-missing-artifact");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let config = load(&layout.config).unwrap();
+        let (_, detail) = project_notify_with_private_detail(&raw_notify(
+            "thread-missing-artifact",
+            "turn-missing-artifact",
+        ))
+        .unwrap();
+        capture_private_turn_detail(&layout, &detail, &config).unwrap();
+        let detail_path = private_turn_detail_path(
+            &layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY),
+            detail.turn_id(),
+        )
+        .unwrap();
+        fs::remove_file(detail_path).unwrap();
+
+        assert_eq!(
+            lookup_private_turn_detail(&root, detail.turn_id()),
+            PrivateTurnDetailLookup::Failed("artifact_missing")
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -5141,7 +5267,7 @@ mod tests {
         let elapsed = started.elapsed();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            elapsed < Duration::from_millis(100),
+            elapsed < super::PRIVATE_NOTIFY_FOREGROUND_DEADLINE,
             "contended private capture exceeded bounded retries: {elapsed:?}"
         );
         drop(guard);

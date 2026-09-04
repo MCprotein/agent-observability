@@ -80,19 +80,52 @@
             "metrics": {
               "type": "object",
               "anyOf": [
+                { "type": "object", "properties": { "inputTokens": true }, "required": ["inputTokens"] },
+                { "type": "object", "properties": { "outputTokens": true }, "required": ["outputTokens"] },
                 { "type": "object", "properties": { "totalTokens": true }, "required": ["totalTokens"] },
-                { "type": "object", "properties": { "totalAccumulatedTokens": true }, "required": ["totalAccumulatedTokens"] },
-                { "type": "object", "properties": { "inputTokens": true, "outputTokens": true }, "required": ["inputTokens", "outputTokens"] },
-                { "type": "object", "properties": { "totalInputTokens": true, "totalOutputTokens": true }, "required": ["totalInputTokens", "totalOutputTokens"] }
+                { "type": "object", "properties": { "totalInputTokens": true }, "required": ["totalInputTokens"] },
+                { "type": "object", "properties": { "totalOutputTokens": true }, "required": ["totalOutputTokens"] },
+                { "type": "object", "properties": { "totalAccumulatedTokens": true }, "required": ["totalAccumulatedTokens"] }
               ]
             }
           }
         },
         "then": {
-          "properties": {
-            "availability": {
-              "type": "object",
-              "properties": { "tokens": { "type": "object", "properties": { "state": { "const": "available" } } } }
+          "if": {
+            "properties": {
+              "metrics": {
+                "type": "object",
+                "anyOf": [
+                  { "type": "object", "properties": { "totalTokens": true }, "required": ["totalTokens"] },
+                  { "type": "object", "properties": { "totalAccumulatedTokens": true }, "required": ["totalAccumulatedTokens"] },
+                  { "type": "object", "properties": { "inputTokens": true, "outputTokens": true }, "required": ["inputTokens", "outputTokens"] },
+                  { "type": "object", "properties": { "totalInputTokens": true, "totalOutputTokens": true }, "required": ["totalInputTokens", "totalOutputTokens"] }
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "availability": {
+                "type": "object",
+                "properties": { "tokens": { "type": "object", "properties": { "state": { "const": "available" } } } }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "availability": {
+                "type": "object",
+                "properties": {
+                  "tokens": {
+                    "type": "object",
+                    "properties": {
+                      "state": { "const": "source_unavailable" },
+                      "reason": { "const": "partial_token_metrics" }
+                    }
+                  }
+                }
+              }
             }
           }
         },
