@@ -13,7 +13,7 @@ use agent_observability_local_runtime::{
 };
 use axum::{
     Json, Router,
-    body::{Body, Bytes},
+    body::Body,
     extract::{DefaultBodyLimit, FromRequest, Path as AxumPath, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
     middleware::{self, Next},
@@ -321,7 +321,7 @@ struct DashboardState {
     host: String,
     origin: String,
     token: String,
-    html: Arc<[u8]>,
+    report: PathBuf,
     last_seen: Arc<Mutex<Instant>>,
 }
 
@@ -428,7 +428,8 @@ async fn prepare_dashboard_path(
     dashboard_singleton: Singleton,
 ) -> Result<PreparedDashboard, UiError> {
     let path = layout.root.join("logs").join(REPORT_FILE_NAME);
-    let html = tokio::task::spawn_blocking(move || read_private_report(&path))
+    let report = path.clone();
+    tokio::task::spawn_blocking(move || validate_private_report(&path))
         .await
         .map_err(|_| UiError::Runtime("local dashboard artifact task failed".into()))?
         .map_err(UiError::DashboardArtifact)?;
@@ -443,7 +444,7 @@ async fn prepare_dashboard_path(
         host,
         origin: origin.clone(),
         token: token.clone(),
-        html: Arc::from(html),
+        report,
         last_seen: Arc::clone(&last_seen),
     };
     Ok(PreparedDashboard {
@@ -514,7 +515,12 @@ async fn dashboard_document(
         return Err(StatusCode::NOT_FOUND);
     }
     touch_last_seen(&state.last_seen).map_err(|()| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut response = Body::from(Bytes::from_owner(Arc::clone(&state.html))).into_response();
+    let report = state.report;
+    let html = tokio::task::spawn_blocking(move || read_private_report(&report))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let mut response = Body::from(html).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
@@ -1778,11 +1784,31 @@ mod tests {
                     host: "127.0.0.1:43192".into(),
                     origin: "http://127.0.0.1:43192".into(),
                     token: "dashboard-session".into(),
-                    html: Arc::from(read_private_report(&report).unwrap()),
+                    report: report.clone(),
                     last_seen: Arc::new(Mutex::new(Instant::now())),
                 };
-                fs::write(&report, b"<!doctype html><title>Replacement</title>").unwrap();
                 let app = dashboard_router(state);
+
+                let initial_dashboard = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/report/dashboard-session")
+                            .header(header::HOST, "127.0.0.1:43192")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let initial_body = to_bytes(initial_dashboard.into_body(), 1024).await.unwrap();
+                assert_eq!(
+                    initial_body.as_ref(),
+                    b"<!doctype html><title>Private dashboard</title>"
+                );
+                let replacement = report.with_extension("replacement");
+                fs::write(&replacement, b"<!doctype html><title>Replacement</title>").unwrap();
+                fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::rename(replacement, &report).unwrap();
 
                 let wrong_token = app
                     .clone()
@@ -1852,10 +1878,7 @@ mod tests {
                     Some("1")
                 );
                 let body = to_bytes(dashboard.into_body(), 1024).await.unwrap();
-                assert_eq!(
-                    body.as_ref(),
-                    b"<!doctype html><title>Private dashboard</title>"
-                );
+                assert_eq!(body.as_ref(), b"<!doctype html><title>Replacement</title>");
 
                 let settings_api_is_absent = app
                     .clone()
