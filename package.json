@@ -1,6 +1,6 @@
 {
   "name": "agent-observability",
-  "version": "1.9.0",
+  "version": "1.9.1",
   "private": true,
   "type": "module",
   "description": "Local-first observability primitives for coding agents.",
@@ -16,7 +16,7 @@
     "check:authored-js": "tsx scripts/check-authored-js.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test:unit": "node --import tsx --test test/*.test.ts",
-    "test": "npm run build:ui && npm run check:authored-js && npm run typecheck && npm run test:unit && npm run test:browser && npm run test:dashboard-browser && npm run test:settings-browser"
+    "test": "npm run check:authored-js && npm run typecheck && npm run test:unit && npm run build:ui && npm run test:browser && npm run test:dashboard-browser && npm run test:settings-browser"
   },
   "engines": {
     "node": ">=20"

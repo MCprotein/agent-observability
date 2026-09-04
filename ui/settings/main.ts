@@ -170,6 +170,7 @@ if (!(rootElement instanceof HTMLDivElement)) throw new Error("settings root is 
 const app = rootElement;
 
 const SESSION_TOKEN_KEY = "agent-observability.settings.session.v1";
+const INITIAL_INTEGRATION_RETRY_MS = 1_500;
 const fragmentToken = new URLSearchParams(location.hash.slice(1)).get("session") ?? "";
 let token = fragmentToken || readSessionToken();
 if (fragmentToken) writeSessionToken(fragmentToken);
@@ -180,6 +181,7 @@ let defaults: LocalRuntimeConfigV2 | null = null;
 let revision = "";
 let integration: IntegrationStatus | null = null;
 let integrationUnavailable = false;
+let integrationRequestGeneration = 0;
 let busy = false;
 let conflicted = false;
 let heartbeatTimer: number | undefined;
@@ -198,6 +200,10 @@ window.addEventListener("beforeunload", (event) => {
   event.returnValue = "";
 });
 
+window.addEventListener("focus", () => {
+  void refreshIntegrationStatus();
+});
+
 void bootstrap();
 
 async function bootstrap(): Promise<void> {
@@ -209,17 +215,19 @@ async function bootstrap(): Promise<void> {
   try {
     const envelope = await api<Envelope>("/api/config");
     applyEnvelope(envelope);
+    let shouldRenderSettings = false;
     try {
-      integration = await api<IntegrationStatus>("/api/integrations/codex");
-      integrationUnavailable = false;
+      shouldRenderSettings = await loadInitialIntegrationStatus();
     } catch (error) {
       const apiError = error as Error & { code?: string };
       if (apiError.code === "invalid_session") throw error;
       integration = null;
       integrationUnavailable = true;
+      shouldRenderSettings = true;
     }
-    renderSettings();
-    heartbeatTimer = window.setInterval(() => void heartbeat(), 20_000);
+    if (!token) return;
+    if (shouldRenderSettings) renderSettings();
+    heartbeatTimer ??= window.setInterval(() => void heartbeat(), 20_000);
   } catch (error) {
     const apiError = error as Error & { code?: string };
     if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
@@ -227,6 +235,24 @@ async function bootstrap(): Promise<void> {
     } else {
       renderUnavailable(messageOf(error));
     }
+  }
+}
+
+async function loadInitialIntegrationStatus(): Promise<boolean> {
+  const generation = ++integrationRequestGeneration;
+  try {
+    const initial = await api<IntegrationStatus>("/api/integrations/codex");
+    const next = initial.config === "connected" && initial.collector === "unavailable"
+      ? await new Promise<void>((resolve) => window.setTimeout(resolve, INITIAL_INTEGRATION_RETRY_MS))
+        .then(() => api<IntegrationStatus>("/api/integrations/codex"))
+      : initial;
+    if (generation !== integrationRequestGeneration || !token) return false;
+    integration = next;
+    integrationUnavailable = false;
+    return true;
+  } catch (error) {
+    if (generation !== integrationRequestGeneration) return false;
+    throw error;
   }
 }
 
@@ -532,11 +558,12 @@ function bindEvents(): void {
 async function toggleIntegration(): Promise<void> {
   if (busy || !integration) return;
   const lifecycleToken = token;
+  const generation = ++integrationRequestGeneration;
   setBusy(true);
   try {
     const method = integration.config === "connected" ? "DELETE" : "POST";
     const nextIntegration = await api<IntegrationStatus>("/api/integrations/codex", { method });
-    if (token !== lifecycleToken) return;
+    if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
     integration = nextIntegration;
     renderSettings("toggle-integration");
     showToast(
@@ -552,9 +579,12 @@ async function toggleIntegration(): Promise<void> {
 
 async function refreshIntegration(): Promise<void> {
   if (busy) return;
+  const generation = ++integrationRequestGeneration;
   setBusy(true);
   try {
-    integration = await api<IntegrationStatus>("/api/integrations/codex");
+    const next = await api<IntegrationStatus>("/api/integrations/codex");
+    if (generation !== integrationRequestGeneration || !token) return;
+    integration = next;
     integrationUnavailable = false;
     renderSettings("toggle-integration");
     showToast("Codex 자동 수집 상태를 확인했습니다.", "success");
@@ -567,6 +597,44 @@ async function refreshIntegration(): Promise<void> {
     setBusy(false);
     showToast(messageOf(error), "error");
   }
+}
+
+async function refreshIntegrationStatus(): Promise<void> {
+  if (busy || !persisted || !token) return;
+  const generation = ++integrationRequestGeneration;
+  const previous = integration;
+  const wasUnavailable = integrationUnavailable;
+  try {
+    const next = await api<IntegrationStatus>("/api/integrations/codex");
+    if (!token || generation !== integrationRequestGeneration) return;
+    integration = next;
+    integrationUnavailable = false;
+    if (wasUnavailable || !sameIntegrationStatus(previous, next)) {
+      renderSettings();
+    }
+  } catch (error) {
+    if (generation !== integrationRequestGeneration) return;
+    const apiError = error as Error & { code?: string };
+    if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
+      expireSession();
+      return;
+    }
+    integration = null;
+    integrationUnavailable = true;
+    if (!wasUnavailable || previous !== null) renderSettings();
+  }
+}
+
+function sameIntegrationStatus(
+  left: IntegrationStatus | null,
+  right: IntegrationStatus,
+): boolean {
+  return left !== null
+    && left.config === right.config
+    && left.collector === right.collector
+    && left.endpoint === right.endpoint
+    && left.service === right.service
+    && left.data_retained === right.data_retained;
 }
 
 async function openDashboard(): Promise<void> {
@@ -836,6 +904,7 @@ async function heartbeat(): Promise<void> {
   if (Date.now() - lastUserActivity >= 60_000) return;
   try {
     await api<void>("/api/heartbeat", { method: "POST" });
+    await refreshIntegrationStatus();
   } catch {
     expireSession();
   }

@@ -1526,23 +1526,41 @@ fn stop_launch_agent(
     launchctl: &impl Launchctl,
     service: &CollectorService,
 ) -> Result<(), IntegrationError> {
+    stop_launch_agent_with(launchctl, service, 40, std::thread::sleep)
+}
+
+#[cfg(target_os = "macos")]
+fn stop_launch_agent_with(
+    launchctl: &impl Launchctl,
+    service: &CollectorService,
+    max_checks: usize,
+    mut wait: impl FnMut(Duration),
+) -> Result<(), IntegrationError> {
     if !launchctl.is_loaded(&service.target)? {
         return Ok(());
     }
     let bootout = launchctl.bootout(&service.target);
-    match launchctl.is_loaded(&service.target) {
-        Ok(false) => Ok(()),
-        Ok(true) => match bootout {
-            Ok(_) => Err(IntegrationError::Runtime(format!(
-                "LaunchAgent stop failed for {}",
-                service.target
-            ))),
-            Err(error) => Err(error),
-        },
-        Err(status_error) => match bootout {
-            Ok(_) => Err(status_error),
-            Err(error) => Err(rollback_error(&error, &status_error)),
-        },
+    for check in 0..max_checks.max(1) {
+        match launchctl.is_loaded(&service.target) {
+            Ok(false) => return Ok(()),
+            Ok(true) if check + 1 < max_checks.max(1) => {
+                wait(Duration::from_millis(25));
+            }
+            Ok(true) => break,
+            Err(status_error) => {
+                return match bootout {
+                    Ok(_) => Err(status_error),
+                    Err(error) => Err(rollback_error(&error, &status_error)),
+                };
+            }
+        }
+    }
+    match bootout {
+        Ok(_) => Err(IntegrationError::Runtime(format!(
+            "LaunchAgent stop failed for {}",
+            service.target
+        ))),
+        Err(error) => Err(error),
     }
 }
 
@@ -2061,7 +2079,7 @@ mod tests {
         MAX_LAUNCH_AGENT_PLIST_BYTES, apply_launch_agent_desired_with,
         commit_collector_service_install, commit_collector_service_uninstall,
         install_collector_service_with, load_launch_agent_transaction, read_launch_agent_file,
-        recover_launch_agent_transaction, save_launch_agent_transaction,
+        recover_launch_agent_transaction, save_launch_agent_transaction, stop_launch_agent_with,
         uninstall_collector_service_with,
     };
     use agent_observability_codex_config::{CodexConfigManager, ExporterSecurity};
@@ -3529,6 +3547,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     struct FakeLaunchctl {
         loaded: Cell<bool>,
+        pending_unload_checks: Cell<Option<usize>>,
+        bootout_unload_delay_checks: Cell<usize>,
         bootstrap_marks_loaded: Cell<bool>,
         bootstrap_results: RefCell<VecDeque<Result<(), &'static str>>>,
         kickstart_results: RefCell<VecDeque<Result<(), &'static str>>>,
@@ -3541,6 +3561,8 @@ mod tests {
         fn new(loaded: bool) -> Self {
             Self {
                 loaded: Cell::new(loaded),
+                pending_unload_checks: Cell::new(None),
+                bootout_unload_delay_checks: Cell::new(0),
                 bootstrap_marks_loaded: Cell::new(true),
                 bootstrap_results: RefCell::new(VecDeque::new()),
                 kickstart_results: RefCell::new(VecDeque::new()),
@@ -3560,13 +3582,26 @@ mod tests {
                 .pop_front()
                 .unwrap_or(Ok(true));
             if matches!(result, Ok(true)) {
-                self.loaded.set(false);
+                let delay = self.bootout_unload_delay_checks.get();
+                if delay == 0 {
+                    self.loaded.set(false);
+                } else {
+                    self.pending_unload_checks.set(Some(delay));
+                }
             }
             result.map_err(|message| IntegrationError::Runtime(message.into()))
         }
 
         fn is_loaded(&self, _target: &str) -> Result<bool, IntegrationError> {
             self.events.borrow_mut().push("is-loaded");
+            if let Some(remaining) = self.pending_unload_checks.get() {
+                if remaining == 0 {
+                    self.pending_unload_checks.set(None);
+                    self.loaded.set(false);
+                } else {
+                    self.pending_unload_checks.set(Some(remaining - 1));
+                }
+            }
             Ok(self.loaded.get())
         }
 
@@ -3595,6 +3630,49 @@ mod tests {
             }
             result.map_err(|message| IntegrationError::Runtime(message.into()))
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_agent_stop_waits_for_asynchronous_bootout_convergence() {
+        let root = temporary_root("asynchronous-bootout");
+        let service = test_service(&root);
+        let launchctl = FakeLaunchctl::new(true);
+        launchctl.bootout_unload_delay_checks.set(2);
+
+        stop_launch_agent_with(&launchctl, &service, 4, |_| {}).unwrap();
+
+        assert!(!launchctl.loaded.get());
+        assert_eq!(
+            *launchctl.events.borrow(),
+            [
+                "is-loaded",
+                "bootout",
+                "is-loaded",
+                "is-loaded",
+                "is-loaded"
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_agent_stop_fails_closed_after_bounded_checks() {
+        let root = temporary_root("asynchronous-bootout-timeout");
+        let service = test_service(&root);
+        let launchctl = FakeLaunchctl::new(true);
+        launchctl.bootout_unload_delay_checks.set(3);
+
+        let error = stop_launch_agent_with(&launchctl, &service, 2, |_| {}).unwrap_err();
+
+        assert!(error.to_string().contains("LaunchAgent stop failed"));
+        assert!(launchctl.loaded.get());
+        assert_eq!(
+            *launchctl.events.borrow(),
+            ["is-loaded", "bootout", "is-loaded", "is-loaded"]
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "macos")]
