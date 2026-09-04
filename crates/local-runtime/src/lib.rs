@@ -30,5 +30,5 @@ pub const NORMALIZATION_WORKERS: usize = 1;
 pub use config::{
     ConfigError, ConfigMutationGuard, ConfigServiceError, InstalledLayout,
     LOCAL_RUNTIME_CONFIG_VERSION, LocalConfigService, LocalRuntimeConfigV3, VersionedLocalConfig,
-    install, load, revision, save, save_if_revision,
+    inspect, install, load, revision, save, save_if_revision,
 };

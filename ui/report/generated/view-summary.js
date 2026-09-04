@@ -1,9 +1,7 @@
 /* Generated from contracts/report-dto-v2.schema.json. Do not edit. */
 
 // ui/report/view-summary.ts
-var TOKEN_METRICS = [
-  "inputTokens",
-  "outputTokens",
+var NON_TOTAL_TOKEN_METRICS = [
   "cachedInputTokens",
   "cacheCreationInputTokens",
   "reasoningOutputTokens"
@@ -20,6 +18,7 @@ function summarizeVisible(spans) {
     errors: 0,
     inputTokens: 0,
     outputTokens: 0,
+    totalTokens: 0,
     estimatedCost: 0,
     costStatus: aggregateCostStatus(billable.map((span) => span.cost.status))
   };
@@ -31,11 +30,17 @@ function summarizeVisible(spans) {
     if (span.status === "error") summary.errors += 1;
     summary.inputTokens += span.metrics.inputTokens ?? 0;
     summary.outputTokens += span.metrics.outputTokens ?? 0;
+    summary.totalTokens += tokenTotal(span.metrics) ?? 0;
     summary.estimatedCost += span.estimatedCost ?? 0;
   }
   summary.sessions = sessions.size;
   summary.turns = turns.size;
   return summary;
+}
+function tokenTotal(metrics) {
+  const direct = sumOptional(metrics.inputTokens, metrics.outputTokens);
+  const cumulative = sumOptional(metrics.totalInputTokens, metrics.totalOutputTokens);
+  return direct ?? metrics.totalTokens ?? cumulative ?? metrics.totalAccumulatedTokens;
 }
 function aggregateCostStatus(statuses) {
   const estimated = statuses.filter((status) => status === "estimated").length;
@@ -46,9 +51,13 @@ function aggregateCostStatus(statuses) {
   return "estimated";
 }
 function hasTokenMetrics(span) {
-  return TOKEN_METRICS.some((key) => span.metrics[key] !== void 0);
+  return tokenTotal(span.metrics) !== void 0 || NON_TOTAL_TOKEN_METRICS.some((key) => span.metrics[key] !== void 0);
+}
+function sumOptional(left, right) {
+  return left === void 0 && right === void 0 ? void 0 : (left ?? 0) + (right ?? 0);
 }
 export {
   aggregateCostStatus,
-  summarizeVisible
+  summarizeVisible,
+  tokenTotal
 };

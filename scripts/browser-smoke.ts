@@ -156,6 +156,17 @@ try {
   });
   largePage.on("requestfailed", (request) => largeFailedRequests.push(request.url()));
   await largePage.goto(pathToFileURL(largeReportPath).href);
+  assert.equal(await largePage.locator("#kpi-tokens").textContent(), "112");
+  assert.match((await largePage.locator("#trace-list .trace-row").first().textContent()) ?? "", /112 tokens/);
+  for (const [name, total] of [
+    ["operation-0", "15"],
+    ["operation-1", "20"],
+    ["operation-2", "37"],
+    ["operation-3", "40"],
+  ] as const) {
+    const row = largePage.locator("#span-table tr", { hasText: name });
+    assert.equal(await row.locator("td").nth(5).textContent(), total);
+  }
   assert.equal(await largePage.locator("#span-count").textContent(), "4096");
   assert.equal(await largePage.locator("#span-table tr").count(), 200);
   assert.equal(await largePage.locator("#trace-list .trace-row").count(), 100);
@@ -222,7 +233,9 @@ function largeReportFixture(): AgentObservabilityReportV2 {
       repository: { state: "available", reason: "fixture" },
       turn: { state: "source_unavailable", reason: "fixture" },
       model: { state: "available", reason: "fixture" },
-      tokens: { state: "source_unavailable", reason: "fixture" },
+      tokens: index < 4
+        ? { state: "available", reason: "fixture" }
+        : { state: "source_unavailable", reason: "fixture" },
       latency: { state: "available", reason: "fixture" },
       sourceLocation: { state: "private_lookup", reason: "fixture" },
       requestContent: { state: "private_lookup", reason: "fixture" },
@@ -231,7 +244,7 @@ function largeReportFixture(): AgentObservabilityReportV2 {
     sessionId: `session-${index % 501}`,
     toolName: "exec_command",
     attributes: { session_id: `session-${index % 501}`, tool_name: "exec_command" },
-    metrics: { durationMs: 5 },
+    metrics: aggregateTokenMetrics(index),
     cost: { status: "unknown", rate_table: {}, cost: { assumption: "fixture" } },
   }));
   const traceIds = [...new Set(spans.map((span) => span.traceId))];
@@ -285,4 +298,14 @@ function largeReportFixture(): AgentObservabilityReportV2 {
     traces,
     spans,
   };
+}
+
+function aggregateTokenMetrics(index: number): Span["metrics"] {
+  const tokens = [
+    { inputTokens: 10, outputTokens: 5 },
+    { totalTokens: 20 },
+    { totalInputTokens: 30, totalOutputTokens: 7 },
+    { totalAccumulatedTokens: 40 },
+  ][index];
+  return { durationMs: 5, ...tokens };
 }

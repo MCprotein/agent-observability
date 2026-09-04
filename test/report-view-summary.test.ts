@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { aggregateCostStatus, summarizeVisible, type CostStatus } from "../ui/report/view-summary.ts";
+import {
+  aggregateCostStatus,
+  summarizeVisible,
+  tokenTotal,
+  type CostStatus,
+} from "../ui/report/view-summary.ts";
 import type { Metrics, Span } from "../ui/report/generated/report-dto-v2.js";
 
 const fixture = JSON.parse(
@@ -27,6 +32,30 @@ test("reduces only already-priced billable span scalars", () => {
   assert.equal(summary.estimatedCost, 0.25);
   assert.equal(summary.inputTokens, 12);
   assert.equal(summary.outputTokens, 3);
+  assert.equal(summary.totalTokens, 15);
+});
+
+test("reduces every displayable token-total shape with stable precedence", () => {
+  const cases: Array<[string, Metrics, number | undefined]> = [
+    ["direct input and output", { inputTokens: 12, outputTokens: 3 }, 15],
+    ["direct partial", { outputTokens: 3 }, 3],
+    ["reported total", { totalTokens: 20 }, 20],
+    ["cumulative input and output", { totalInputTokens: 30, totalOutputTokens: 7 }, 37],
+    ["cumulative partial", { totalInputTokens: 30 }, 30],
+    ["accumulated total", { totalAccumulatedTokens: 40 }, 40],
+    ["direct before aggregate", { inputTokens: 1, outputTokens: 2, totalTokens: 99 }, 3],
+    ["no displayable total", { cachedInputTokens: 8, contextWindowTokens: 128_000 }, undefined],
+  ];
+
+  for (const [name, metrics, expected] of cases) {
+    assert.equal(tokenTotal(metrics), expected, name);
+  }
+
+  const summary = summarizeVisible(cases.slice(0, 6).map(([, metrics]) =>
+    viewSpan("estimated", 0, metrics),
+  ));
+  assert.equal(summary.totalTokens, 145);
+  assert.equal(summary.costStatus, "estimated");
 });
 
 function viewSpan(status: CostStatus, estimatedCost: number | undefined, metrics: Metrics): Span {

@@ -50,8 +50,9 @@ JSONL/HTML, reported, archived, exported or sent to team ingest. It is not an AP
   representation before any I/O, and performs only a bounded local private-CA HTTPS + exact-header handoff. Accepted, rejected and
   unavailable outcomes all exit successfully so observation cannot block Codex work. It does not call team
   endpoints, render reports, scan transcripts or wait for background flush completion.
-- If local private detail capture is enabled, the same bounded helper stores only the official notify fields in
-  a separate private artifact before returning. An existing external Codex `notify` is preserved, so this detail
+- If local private detail capture is enabled, the same bounded helper sends only the official notify fields to a
+  dedicated authenticated localhost route and returns after bounded queue admission. Collector-owned background
+  writers publish the private artifact and its content-free status asynchronously. An existing external Codex `notify` is preserved, so this detail
   source is unavailable unless agentobs owns and receives the callback.
 - The Codex OTLP receiver binds only IPv4 loopback. Clients validate its private-CA server certificate and
   loopback IP SAN; every request must carry the exact `x-agent-observability-token` header containing the

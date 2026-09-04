@@ -282,6 +282,18 @@ impl InstalledLayout {
     }
 }
 
+/// Resolves and validates an already-installed private runtime without creating or updating it.
+pub fn inspect(root: &Path) -> Result<InstalledLayout, ConfigError> {
+    private_dir(root, false)?;
+    let root = fs::canonicalize(root)?;
+    let layout = InstalledLayout::at(&root);
+    for directory in [&layout.logs, &layout.queue, &layout.state, &layout.runtime] {
+        private_dir(directory, false)?;
+    }
+    let _ = load(&layout.config)?;
+    Ok(layout)
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
     Io(io::Error),
@@ -720,6 +732,22 @@ mod tests {
             install(&root),
             Err(ConfigError::InsecurePermissions)
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_validates_existing_layout_without_creating_missing_paths() {
+        let root = root("inspect");
+        let _ = fs::remove_dir_all(&root);
+        assert!(inspect(&root).is_err());
+        assert!(!root.exists());
+
+        let layout = install(&root).unwrap();
+        assert_eq!(inspect(&root).unwrap(), layout);
+        fs::remove_dir(&layout.queue).unwrap();
+        assert!(inspect(&root).is_err());
+        assert!(!layout.queue.exists());
         let _ = fs::remove_dir_all(root);
     }
 

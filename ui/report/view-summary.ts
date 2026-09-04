@@ -1,4 +1,4 @@
-import type { Span } from "./generated/report-dto-v2.js";
+import type { Metrics, Span } from "./generated/report-dto-v2.js";
 
 export type CostStatus = "estimated" | "incomplete" | "unknown";
 
@@ -10,13 +10,12 @@ export interface ViewSummary {
   errors: number;
   inputTokens: number;
   outputTokens: number;
+  totalTokens: number;
   estimatedCost: number;
   costStatus: CostStatus;
 }
 
-const TOKEN_METRICS = [
-  "inputTokens",
-  "outputTokens",
+const NON_TOTAL_TOKEN_METRICS = [
   "cachedInputTokens",
   "cacheCreationInputTokens",
   "reasoningOutputTokens",
@@ -34,6 +33,7 @@ export function summarizeVisible(spans: Span[]): ViewSummary {
     errors: 0,
     inputTokens: 0,
     outputTokens: 0,
+    totalTokens: 0,
     estimatedCost: 0,
     costStatus: aggregateCostStatus(billable.map((span) => span.cost.status)),
   };
@@ -45,11 +45,18 @@ export function summarizeVisible(spans: Span[]): ViewSummary {
     if (span.status === "error") summary.errors += 1;
     summary.inputTokens += span.metrics.inputTokens ?? 0;
     summary.outputTokens += span.metrics.outputTokens ?? 0;
+    summary.totalTokens += tokenTotal(span.metrics) ?? 0;
     summary.estimatedCost += span.estimatedCost ?? 0;
   }
   summary.sessions = sessions.size;
   summary.turns = turns.size;
   return summary;
+}
+
+export function tokenTotal(metrics: Metrics): number | undefined {
+  const direct = sumOptional(metrics.inputTokens, metrics.outputTokens);
+  const cumulative = sumOptional(metrics.totalInputTokens, metrics.totalOutputTokens);
+  return direct ?? metrics.totalTokens ?? cumulative ?? metrics.totalAccumulatedTokens;
 }
 
 export function aggregateCostStatus(statuses: string[]): CostStatus {
@@ -62,5 +69,10 @@ export function aggregateCostStatus(statuses: string[]): CostStatus {
 }
 
 function hasTokenMetrics(span: Span): boolean {
-  return TOKEN_METRICS.some((key) => span.metrics[key] !== undefined);
+  return tokenTotal(span.metrics) !== undefined
+    || NON_TOTAL_TOKEN_METRICS.some((key) => span.metrics[key] !== undefined);
+}
+
+function sumOptional(left: number | undefined, right: number | undefined): number | undefined {
+  return left === undefined && right === undefined ? undefined : (left ?? 0) + (right ?? 0);
 }

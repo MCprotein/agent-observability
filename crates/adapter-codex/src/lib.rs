@@ -236,6 +236,12 @@ impl PrivateCodexTurnDetailV1 {
         &self.turn_id
     }
 
+    /// Confirms that this local-only detail belongs to the same projected notify turn.
+    #[must_use]
+    pub fn matches_projected_turn(&self, projected: &ProjectedNotifyV2) -> bool {
+        self.turn_id == hash_opaque_identifier(projected.turn_id())
+    }
+
     /// Serializes this validated local-only detail artifact.
     ///
     /// # Errors

@@ -18,7 +18,7 @@ import {
   type FilterState,
   type Page,
 } from "./view-state.js";
-import { summarizeVisible } from "./view-summary.js";
+import { summarizeVisible, tokenTotal } from "./view-summary.js";
 
 const ALL_OPTION = "-1";
 const UNKNOWN = "unknown";
@@ -213,7 +213,7 @@ function mount(data: AgentObservabilityReportV2): void {
     setText("kpi-turns", summary.turns);
     setText("kpi-llm", summary.llmRequests);
     setText("kpi-tools", summary.toolExecutions);
-    setText("kpi-tokens", formatNumber(summary.inputTokens + summary.outputTokens));
+    setText("kpi-tokens", formatNumber(summary.totalTokens));
     setText("kpi-cost", formatCost(summary.estimatedCost, {
       status: summary.costStatus,
       currency: data.cost.currency,
@@ -257,7 +257,7 @@ function mount(data: AgentObservabilityReportV2): void {
         `<div class="trace-main"><span class="mono">${escapeHtml(shortId(trace.traceId))}</span>` +
         `<span class="badge ${traceSummary.errors ? "error" : "ok"}">${traceSummary.errors ? `${traceSummary.errors} error` : "ok"}</span></div>` +
         `<div class="trace-meta"><span>${escapeHtml(trace.repo)}</span><span>${traceSpans.length} spans</span>` +
-        `<span>${formatNumber(traceSummary.inputTokens + traceSummary.outputTokens)} tokens</span></div>`;
+        `<span>${formatNumber(traceSummary.totalTokens)} tokens</span></div>`;
       return button;
     }));
   }
@@ -312,7 +312,7 @@ function mount(data: AgentObservabilityReportV2): void {
         `<td><span class="badge ${statusClass(span.status)}">${escapeHtml(span.status)}</span></td>` +
         `<td>${escapeHtml(span.repo)}</td>` +
         `<td class="mono">${escapeHtml(span.turnId ?? "")}</td>` +
-        `<td>${formatOptionalNumber(sumOptional(span.metrics.inputTokens, span.metrics.outputTokens), availability.tokens)}</td>` +
+        `<td>${formatOptionalNumber(tokenTotal(span.metrics), availability.tokens)}</td>` +
         `<td>${escapeHtml(formatCost(span.estimatedCost, span.cost))}</td>` +
         `<td>${formatOptionalDuration(span.metrics.latencyMs ?? span.metrics.durationMs, availability.latency)}</td>` +
         `<td class="mono">${escapeHtml(shortId(span.parentSpanId ?? ""))}</td>`;
@@ -376,7 +376,7 @@ function mount(data: AgentObservabilityReportV2): void {
       detailRow("Name", span.name) + detailRow("Kind", span.kind) + detailRow("Status", span.status) +
       detailRow("Repository", displayValue(span.repo, availability.repository)) +
       detailRow("Model", displayValue(span.agent.model, availability.model)) +
-      detailRow("Tokens", displayValue(formatOptionalTokenTotal(span), availability.tokens)) +
+      detailRow("Tokens", displayValue(formatOptionalNumberValue(tokenTotal(span.metrics)), availability.tokens)) +
       detailRow("Turn", displayValue(span.turnId, availability.turn)) +
       detailRow("Latency", displayValue(formatDuration(span.metrics.latencyMs ?? span.metrics.durationMs), availability.latency)) +
       `</dl></section>` +
@@ -531,14 +531,7 @@ function scalarText(value: string | number | boolean | undefined): string | unde
   return value === undefined ? undefined : String(value);
 }
 
-function sumOptional(left: number | undefined, right: number | undefined): number | undefined {
-  return left === undefined && right === undefined ? undefined : (left ?? 0) + (right ?? 0);
-}
-
-function formatOptionalTokenTotal(span: Span): string | undefined {
-  const direct = sumOptional(span.metrics.inputTokens, span.metrics.outputTokens);
-  const cumulative = sumOptional(span.metrics.totalInputTokens, span.metrics.totalOutputTokens);
-  const value = direct ?? span.metrics.totalTokens ?? cumulative ?? span.metrics.totalAccumulatedTokens;
+function formatOptionalNumberValue(value: number | undefined): string | undefined {
   return value === undefined ? undefined : formatNumber(value);
 }
 

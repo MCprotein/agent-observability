@@ -103,7 +103,7 @@ sequenceDiagram
         else private detail enabled
             Notify->>Receiver: projection + validated detail over dedicated authenticated route
             Receiver->>Receiver: nonblocking 64-slot admission
-            Receiver->>Store: single writer persists private detail outside canonical store
+            Receiver->>Store: guarded background writer persists private detail outside canonical store
         end
     end
     Receiver->>Adapter: copy allowlisted scalars only
@@ -212,8 +212,9 @@ Raw body, prompt, response, tool arguments/output, command, raw cwd/path, accoun
 canonical persist, log, diagnostic, projection, report 또는 export 경계를 통과하지 않는다. Notify의 cwd는
 pseudonymous project reference로만 축약될 수 있다. 사용자가 private detail을 켠 경우에는 notify가 제공한 cwd,
 input messages, last assistant message만 전용 authenticated localhost route의 bounded envelope로 전달하고,
-collector-owned 단일 writer가 hashed turn ID로 연결한 별도 private artifact에 저장한다. Foreground callback은
-detail 파일 기록·directory scan·prune·fsync를 수행하지 않는다.
+collector-owned bounded detail/status writer lane이 같은 mutation lock 아래 hashed turn ID로 연결한 별도
+private artifact와 content-free 결과를 저장한다. Foreground callback은 detail 파일 기록·directory
+scan·prune·fsync를 수행하지 않는다.
 Dashboard는 capability-protected localhost detail route로 선택한 turn만 읽으며 team path는 이 artifact를
 알지 못한다.
 

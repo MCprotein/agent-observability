@@ -3,15 +3,16 @@
 
 use agent_observability_adapter_codex::{
     AdapterBatch, AdapterItem, MAX_HANDOFF_BYTES, MAX_PRIVATE_TURN_DETAIL_BYTES,
-    OtlpRequestCorrelationState, PrivateCodexTurnDetailV1, parse_otlp_http_json_with_state,
-    parse_projected_notify_json, project_notify_json, project_notify_with_private_detail,
+    OtlpRequestCorrelationState, PrivateCodexTurnDetailV1, ProjectedNotifyV2,
+    parse_otlp_http_json_with_state, parse_projected_notify_json, project_notify_json,
+    project_notify_with_private_detail,
 };
 use agent_observability_application::ReportProjector;
 #[cfg(test)]
 use agent_observability_application::project_report;
 use agent_observability_local_runtime::{
     Admission, InstalledLayout, LocalRuntimeConfigV3, MutationGuard, PressureSample,
-    RuntimeControl, Singleton, SingletonError, StorageBudget, install, load,
+    RuntimeControl, Singleton, SingletonError, StorageBudget, inspect, install, load,
 };
 use agent_observability_local_store::{LocalStore, StoreBatchItem};
 use agent_observability_static_report::write_private;
@@ -85,6 +86,7 @@ const MAX_PRIVATE_TURN_DETAIL_FILES: usize = 1_024;
 const MAX_PRIVATE_TURN_DETAIL_STATUS_BYTES: u64 = 1_024;
 const MAX_PRIVATE_TURN_DETAIL_SCAN_ENTRIES: usize = 4_096;
 const PRIVATE_TURN_DETAIL_ADMISSION_CAPACITY: usize = 64;
+const PRIVATE_TURN_DETAIL_STATUS_ADMISSION_CAPACITY: usize = 64;
 const PRIVATE_NOTIFY_ENVELOPE_VERSION: &str = "private_codex_notify_envelope.v1";
 const PRIVATE_TURN_DETAIL_RECEIPT_VERSION: &str = "private_codex_turn_detail_receipt.v1";
 const PRIVATE_TURN_DETAIL_LOCK_RETRIES: usize = 4;
@@ -272,7 +274,7 @@ struct PrivateTurnDetailCaptureStatusV1 {
 #[serde(deny_unknown_fields)]
 struct PrivateNotifyEnvelopeV1 {
     schema_version: String,
-    projected: serde_json::Value,
+    projected: ProjectedNotifyV2,
     private_detail: serde_json::Value,
 }
 
@@ -296,6 +298,19 @@ struct PrivateTurnDetailReceiptV1 {
 #[derive(Debug)]
 struct PrivateTurnDetailAdmission {
     detail: PrivateCodexTurnDetailV1,
+}
+
+#[derive(Debug)]
+struct PrivateTurnDetailStatusAdmission {
+    turn_id: String,
+    state: &'static str,
+    code: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct PrivateTurnDetailAdmissions {
+    detail: sync_mpsc::SyncSender<PrivateTurnDetailAdmission>,
+    status: sync_mpsc::SyncSender<PrivateTurnDetailStatusAdmission>,
 }
 
 #[derive(Debug)]
@@ -570,10 +585,16 @@ fn available_port() -> Result<u16, CollectorError> {
 /// Loads and validates the private local collector settings.
 pub fn load_settings(root: &Path) -> Result<CollectorSettings, CollectorError> {
     let layout = install(root).map_err(runtime_error)?;
-    let path = settings_path(&layout);
+    load_settings_from_layout(&layout)
+}
+
+fn load_settings_from_layout(
+    layout: &InstalledLayout,
+) -> Result<CollectorSettings, CollectorError> {
+    let path = settings_path(layout);
     let snapshot = read_private_snapshot(&path, MAX_SETTINGS_BYTES)?;
     let settings = parse_current_settings(&snapshot.bytes)?;
-    validate_owned_credentials(&layout, &settings)?;
+    validate_owned_credentials(layout, &settings)?;
     Ok(settings)
 }
 
@@ -1355,7 +1376,7 @@ enum ReportFailure {
 struct AppState {
     collector: Arc<Mutex<CollectorState>>,
     auth_token: Arc<str>,
-    private_detail_admission: sync_mpsc::SyncSender<PrivateTurnDetailAdmission>,
+    private_detail_admissions: PrivateTurnDetailAdmissions,
     report_refresh_scheduled: Arc<AtomicBool>,
     report_refresh_requested: Arc<AtomicU64>,
     #[cfg(test)]
@@ -1421,7 +1442,8 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), options.port);
     let initial_bind = TcpListener::bind(address).await;
     let listener = bind_persisted_port(initial_bind)?;
-    let private_detail_admission = spawn_private_turn_detail_writer(layout.clone(), config.clone());
+    let private_detail_admissions =
+        spawn_private_turn_detail_writers(layout.clone(), config.clone());
     let collector = Arc::new(Mutex::new(CollectorState {
         layout,
         store,
@@ -1440,7 +1462,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let state = AppState {
         collector,
         auth_token: Arc::from(options.auth_token),
-        private_detail_admission,
+        private_detail_admissions,
         report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
         report_refresh_requested: Arc::new(AtomicU64::new(0)),
         #[cfg(test)]
@@ -1784,29 +1806,9 @@ async fn ingest_notify_with_private_detail(State(state): State<AppState>, body: 
                 collector.accepted_requests = collector.accepted_requests.saturating_add(1);
                 match load(&collector.layout.config) {
                     Ok(config) if config.enabled && config.capture_private_codex_turn_details => {
-                        let admission = PrivateTurnDetailAdmission {
-                            detail: private_detail,
-                        };
-                        match state.private_detail_admission.try_send(admission) {
-                            Ok(()) => (
-                                StatusCode::ACCEPTED,
-                                PrivateTurnDetailReceiptState::Queued,
-                                "queued",
-                                true,
-                            ),
-                            Err(sync_mpsc::TrySendError::Full(_)) => (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                PrivateTurnDetailReceiptState::Busy,
-                                "admission_full",
-                                true,
-                            ),
-                            Err(sync_mpsc::TrySendError::Disconnected(_)) => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                PrivateTurnDetailReceiptState::Failed,
-                                "writer_unavailable",
-                                true,
-                            ),
-                        }
+                        let (status, receipt_state, code) =
+                            admit_private_turn_detail(&state, private_detail);
+                        (status, receipt_state, code, true)
                     }
                     Ok(_) => (
                         StatusCode::CONFLICT,
@@ -1857,15 +1859,60 @@ async fn ingest_notify_with_private_detail(State(state): State<AppState>, body: 
     private_turn_detail_receipt_response(status, receipt_state, code)
 }
 
+fn admit_private_turn_detail(
+    state: &AppState,
+    private_detail: PrivateCodexTurnDetailV1,
+) -> (StatusCode, PrivateTurnDetailReceiptState, &'static str) {
+    let admission = PrivateTurnDetailAdmission {
+        detail: private_detail,
+    };
+    match state.private_detail_admissions.detail.try_send(admission) {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            PrivateTurnDetailReceiptState::Queued,
+            "queued",
+        ),
+        Err(sync_mpsc::TrySendError::Full(admission)) => {
+            let code = enqueue_private_turn_detail_status(
+                &state.private_detail_admissions,
+                admission.detail.turn_id(),
+                "busy",
+                "admission_full",
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                PrivateTurnDetailReceiptState::Busy,
+                code,
+            )
+        }
+        Err(sync_mpsc::TrySendError::Disconnected(admission)) => {
+            let code = enqueue_private_turn_detail_status(
+                &state.private_detail_admissions,
+                admission.detail.turn_id(),
+                "failed",
+                "writer_unavailable",
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                PrivateTurnDetailReceiptState::Failed,
+                code,
+            )
+        }
+    }
+}
+
 fn parse_private_notify_envelope(body: &[u8]) -> Option<(Vec<u8>, PrivateCodexTurnDetailV1)> {
     let envelope = serde_json::from_slice::<PrivateNotifyEnvelopeV1>(body).ok()?;
     if envelope.schema_version != PRIVATE_NOTIFY_ENVELOPE_VERSION {
         return None;
     }
-    let projected = serde_json::to_vec(&envelope.projected).ok()?;
     let private_detail = serde_json::to_vec(&envelope.private_detail)
         .ok()
         .and_then(|bytes| PrivateCodexTurnDetailV1::from_json(&bytes).ok())?;
+    if !private_detail.matches_projected_turn(&envelope.projected) {
+        return None;
+    }
+    let projected = serde_json::to_vec(&envelope.projected).ok()?;
     Some((projected, private_detail))
 }
 
@@ -2482,25 +2529,103 @@ fn capture_private_turn_detail_if_enabled(
         .map_err(runtime_error)
 }
 
-fn spawn_private_turn_detail_writer(
+fn enqueue_private_turn_detail_status(
+    admissions: &PrivateTurnDetailAdmissions,
+    turn_id: &str,
+    state: &'static str,
+    code: &'static str,
+) -> &'static str {
+    let admission = PrivateTurnDetailStatusAdmission {
+        turn_id: turn_id.into(),
+        state,
+        code,
+    };
+    match admissions.status.try_send(admission) {
+        Ok(()) => code,
+        Err(sync_mpsc::TrySendError::Full(_)) => "status_admission_full",
+        Err(sync_mpsc::TrySendError::Disconnected(_)) => "status_writer_unavailable",
+    }
+}
+
+fn spawn_private_turn_detail_writers(
     layout: InstalledLayout,
     fallback_config: LocalRuntimeConfigV3,
-) -> sync_mpsc::SyncSender<PrivateTurnDetailAdmission> {
-    let (sender, receiver) = sync_mpsc::sync_channel(PRIVATE_TURN_DETAIL_ADMISSION_CAPACITY);
+) -> PrivateTurnDetailAdmissions {
+    let (detail_sender, detail_receiver) =
+        sync_mpsc::sync_channel(PRIVATE_TURN_DETAIL_ADMISSION_CAPACITY);
+    let (status_sender, status_receiver) =
+        sync_mpsc::sync_channel(PRIVATE_TURN_DETAIL_STATUS_ADMISSION_CAPACITY);
+    let detail_status_sender = status_sender.clone();
+    let status_layout = layout.clone();
+    let status_config = fallback_config.clone();
     thread::Builder::new()
         .name("agentobs-private-detail-writer".into())
-        .spawn(move || run_private_turn_detail_writer(&layout, &fallback_config, receiver))
+        .spawn(move || {
+            run_private_turn_detail_writer(
+                &layout,
+                &fallback_config,
+                detail_receiver,
+                &detail_status_sender,
+            );
+        })
         .expect("collector private detail writer must start");
-    sender
+    thread::Builder::new()
+        .name("agentobs-private-status-writer".into())
+        .spawn(move || {
+            run_private_turn_detail_status_writer(&status_layout, &status_config, status_receiver);
+        })
+        .expect("collector private detail status writer must start");
+    PrivateTurnDetailAdmissions {
+        detail: detail_sender,
+        status: status_sender,
+    }
 }
 
 fn run_private_turn_detail_writer(
     layout: &InstalledLayout,
     fallback_config: &LocalRuntimeConfigV3,
     receiver: sync_mpsc::Receiver<PrivateTurnDetailAdmission>,
+    status_sender: &sync_mpsc::SyncSender<PrivateTurnDetailStatusAdmission>,
 ) {
     for admission in receiver {
-        let _ = process_private_turn_detail_attempt(layout, fallback_config, &admission.detail);
+        let _ = process_private_turn_detail_attempt(
+            layout,
+            fallback_config,
+            &admission.detail,
+            status_sender,
+        );
+    }
+}
+
+fn run_private_turn_detail_status_writer(
+    layout: &InstalledLayout,
+    fallback_config: &LocalRuntimeConfigV3,
+    receiver: sync_mpsc::Receiver<PrivateTurnDetailStatusAdmission>,
+) {
+    for admission in receiver {
+        let Some(_mutation) = wait_for_private_turn_detail_mutation(&layout.runtime) else {
+            continue;
+        };
+        let config = load(&layout.config).unwrap_or_else(|_| fallback_config.clone());
+        let _ = write_private_turn_detail_status_locked(
+            layout,
+            &admission.turn_id,
+            admission.state,
+            admission.code,
+            &config,
+        );
+    }
+}
+
+fn wait_for_private_turn_detail_mutation(runtime: &Path) -> Option<MutationGuard> {
+    loop {
+        match MutationGuard::try_acquire(runtime) {
+            Ok(mutation) => return Some(mutation),
+            Err(SingletonError::AlreadyRunning) => {
+                thread::sleep(PRIVATE_TURN_DETAIL_LOCK_RETRY_DELAY);
+            }
+            Err(_) => return None,
+        }
     }
 }
 
@@ -2508,32 +2633,25 @@ fn process_private_turn_detail_attempt(
     layout: &InstalledLayout,
     fallback_config: &LocalRuntimeConfigV3,
     detail: &PrivateCodexTurnDetailV1,
+    status_sender: &sync_mpsc::SyncSender<PrivateTurnDetailStatusAdmission>,
 ) -> (PrivateTurnDetailReceiptState, &'static str) {
     let mutation = match acquire_private_turn_detail_mutation(&layout.runtime) {
         Ok(Some(mutation)) => mutation,
         Ok(None) => {
-            return match write_private_turn_detail_status_locked(
-                layout,
-                detail.turn_id(),
-                "busy",
-                "busy",
-                fallback_config,
-            ) {
-                Ok(()) => (PrivateTurnDetailReceiptState::Busy, "busy"),
-                Err(_) => (PrivateTurnDetailReceiptState::Failed, "status_publication"),
-            };
+            let _ = status_sender.try_send(PrivateTurnDetailStatusAdmission {
+                turn_id: detail.turn_id().into(),
+                state: "busy",
+                code: "busy",
+            });
+            return (PrivateTurnDetailReceiptState::Busy, "busy");
         }
         Err(_) => {
-            return match write_private_turn_detail_status_locked(
-                layout,
-                detail.turn_id(),
-                "failed",
-                "runtime_error",
-                fallback_config,
-            ) {
-                Ok(()) => (PrivateTurnDetailReceiptState::Failed, "runtime_error"),
-                Err(_) => (PrivateTurnDetailReceiptState::Failed, "status_publication"),
-            };
+            let _ = status_sender.try_send(PrivateTurnDetailStatusAdmission {
+                turn_id: detail.turn_id().into(),
+                state: "failed",
+                code: "runtime_error",
+            });
+            return (PrivateTurnDetailReceiptState::Failed, "runtime_error");
         }
     };
     let Ok(config) = load(&layout.config) else {
@@ -2646,6 +2764,11 @@ fn lookup_private_turn_detail_inner(
     if detail.turn_id() != turn_id {
         return Err("artifact_invalid");
     }
+    if let Ok(Some(code)) = read_private_turn_detail_status(root, turn_id)
+        && code != "ok"
+    {
+        return Err(code);
+    }
     Ok(Some(bytes))
 }
 
@@ -2713,14 +2836,25 @@ fn persist_private_turn_detail_locked(
     let directory = layout.state.join(PRIVATE_TURN_DETAIL_DIRECTORY);
     ensure_private_directory_tree(&layout.state, &directory)?;
     let path = private_turn_detail_path(&directory, detail.turn_id())?;
+    let bytes = detail.to_json().map_err(runtime_error)?;
     match fs::symlink_metadata(&path) {
         Ok(_) => {
-            let _ = open_private_read(&path)?;
+            let existing = read_private_bounded(
+                &path,
+                u64::try_from(MAX_PRIVATE_TURN_DETAIL_BYTES).map_err(|_| {
+                    CollectorError::Runtime("private detail size bound overflow".into())
+                })?,
+            )?;
+            if existing == bytes {
+                return Ok(());
+            }
+            return Err(CollectorError::Runtime(
+                "private turn detail conflict".into(),
+            ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let bytes = detail.to_json().map_err(runtime_error)?;
     prune_private_turn_details(&directory, Some(&path), config, SystemTime::now())?;
     let reservation = u64::try_from(MAX_PRIVATE_TURN_DETAIL_BYTES)
         .map_err(|_| CollectorError::Runtime("private detail size bound overflow".into()))?
@@ -2936,6 +3070,7 @@ fn maintain_private_turn_directory_locked(
 
 fn private_turn_detail_error_code(error: &CollectorError) -> &'static str {
     match error {
+        CollectorError::Runtime(message) if message.contains("conflict") => "conflict",
         CollectorError::Runtime(message) if message.contains("storage budget") => "storage_budget",
         CollectorError::Runtime(message) if message.contains("already running") => "busy",
         CollectorError::Runtime(message) if message.contains("size") => "size_bound",
@@ -3034,6 +3169,11 @@ fn read_private_turn_detail_status(
         "io_error" => "io_error",
         "config_unavailable" => "config_unavailable",
         "capture_disabled" => "capture_disabled",
+        "admission_full" => "admission_full",
+        "writer_unavailable" => "writer_unavailable",
+        "status_admission_full" => "status_admission_full",
+        "status_writer_unavailable" => "status_writer_unavailable",
+        "conflict" => "conflict",
         _ => return Err("status_artifact_invalid"),
     };
     Ok(Some(code))
@@ -3190,8 +3330,8 @@ fn authenticated_request(
     io_timeout: Duration,
 ) -> Result<AuthenticatedResponse, CollectorError> {
     let deadline = StdInstant::now() + connect_timeout + io_timeout;
-    let settings = load_settings(root)?;
-    let layout = install(root).map_err(runtime_error)?;
+    let layout = inspect(root).map_err(runtime_error)?;
+    let settings = load_settings_from_layout(&layout)?;
     let config = build_client_config(&layout, &settings.credentials)?;
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), settings.port);
     let remaining = deadline.saturating_duration_since(StdInstant::now());
@@ -3440,19 +3580,20 @@ mod tests {
     use super::{
         AUTH_HEADER_NAME, AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome,
         OtlpRejectionCategory, OtlpRequestCorrelationState, OtlpSubmissionOutcome,
-        PrivateTurnDetailLookup, REPORT_FILE_NAME, ReportFailure, admit_request,
-        authenticated_request, build_client_config, build_server_config,
+        PrivateTurnDetailAdmissions, PrivateTurnDetailLookup, REPORT_FILE_NAME, ReportFailure,
+        admit_request, authenticated_request, build_client_config, build_server_config,
         capture_private_turn_detail, capture_private_turn_detail_if_enabled,
-        classify_otlp_rejection, enforce_batch_policy, ensure_private_directory_tree,
-        ingest_locked, ingest_notify_locked, ingest_notify_with_private_detail, install_settings,
-        is_json, load_settings, lookup_private_turn_detail, maintain_private_turn_details_locked,
+        capture_private_turn_detail_locked, classify_otlp_rejection, enforce_batch_policy,
+        enqueue_private_turn_detail_status, ensure_private_directory_tree, ingest_locked,
+        ingest_notify_locked, ingest_notify_with_private_detail, install_settings, is_json,
+        load_settings, lookup_private_turn_detail, maintain_private_turn_details_locked,
         open_store, parse_complete_http_response, persist_private_turn_detail,
         private_turn_detail_error_code, private_turn_detail_path,
         private_turn_detail_status_directory, private_turn_detail_status_path, project_report,
         prune_private_turn_details_with_limit, read_private_snapshot, read_private_turn_detail,
         read_private_turn_detail_status, reconcile_report_state, recover_occupied_persisted_port,
         refresh_report_from_root, report_dirty_path, router, schedule_report_refresh,
-        settings_path, spawn_private_turn_detail_writer, submit_notify, submit_otlp_json_outcome,
+        settings_path, spawn_private_turn_detail_writers, submit_notify, submit_otlp_json_outcome,
         timestamp_from_unix_ms, token_matches, watch_report_authority, write_private,
         write_private_json, write_private_json_if_unchanged,
         write_private_turn_detail_status_locked,
@@ -3610,7 +3751,7 @@ mod tests {
         AppState {
             collector: Arc::new(Mutex::new(collector_state(root))),
             auth_token: Arc::from(auth_token),
-            private_detail_admission: spawn_private_turn_detail_writer(layout, config),
+            private_detail_admissions: spawn_private_turn_detail_writers(layout, config),
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
             report_refresh_requested: Arc::new(AtomicU64::new(0)),
             report_refresh_attempts: Arc::new(AtomicU64::new(0)),
@@ -4612,6 +4753,11 @@ mod tests {
         let missing = test_root("notify-missing");
         let _ = fs::remove_dir_all(&missing);
         assert_eq!(submit_notify(&missing, b"{}"), NotifyOutcome::Rejected);
+        assert_eq!(
+            submit_notify(&missing, &raw_notify("thread-missing", "turn-missing")),
+            NotifyOutcome::Unavailable
+        );
+        assert!(!missing.exists());
 
         let refused = test_root("notify-refused");
         let _ = fs::remove_dir_all(&refused);
@@ -4740,15 +4886,66 @@ mod tests {
         }))
         .unwrap();
         let (_, replacement_detail) = project_notify_with_private_detail(&replacement).unwrap();
-        persist_private_turn_detail(&layout, &replacement_detail, &config).unwrap();
-        let replaced: serde_json::Value =
+        assert!(persist_private_turn_detail(&layout, &replacement_detail, &config).is_err());
+        persist_private_turn_detail(&layout, &first_detail, &config).unwrap();
+        let preserved: serde_json::Value =
             serde_json::from_slice(&read_private_turn_detail(&root, &turn_id).unwrap()).unwrap();
-        assert_eq!(replaced["cwd"], "/second/project");
-        assert_eq!(replaced["inputMessages"][0], "SECOND_INPUT_SECRET");
-        assert!(replaced["lastAssistantMessage"].is_null());
+        assert_eq!(preserved["cwd"], "/RAW_PATH_SECRET");
+        assert_eq!(preserved["inputMessages"][0], "RAW_INPUT_SECRET");
+        assert_eq!(preserved["lastAssistantMessage"], "RAW_OUTPUT_SECRET");
 
         set_private_turn_details(&root, false);
         assert!(read_private_turn_detail(&root, &turn_id).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_turn_detail_conflicting_retry_preserves_first_artifact_and_is_explicit() {
+        let root = test_root("private-turn-detail-conflict");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let config = load(&layout.config).unwrap();
+        let (_, first) =
+            project_notify_with_private_detail(&raw_notify("thread-conflict", "turn-conflict"))
+                .unwrap();
+        let replacement = serde_json::to_vec(&serde_json::json!({
+            "type": "agent-turn-complete",
+            "thread-id": "thread-conflict",
+            "turn-id": "turn-conflict",
+            "cwd": "/different/project",
+            "input-messages": ["DIFFERENT_PRIVATE_INPUT"],
+            "last-assistant-message": null,
+        }))
+        .unwrap();
+        let (_, conflicting) = project_notify_with_private_detail(&replacement).unwrap();
+        let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+        assert_eq!(
+            capture_private_turn_detail_locked(&layout, &first, &config).unwrap(),
+            (super::PrivateTurnDetailReceiptState::Available, "ok")
+        );
+        assert_eq!(
+            capture_private_turn_detail_locked(&layout, &first, &config).unwrap(),
+            (super::PrivateTurnDetailReceiptState::Available, "ok")
+        );
+        assert_eq!(
+            capture_private_turn_detail_locked(&layout, &conflicting, &config).unwrap(),
+            (super::PrivateTurnDetailReceiptState::Failed, "conflict")
+        );
+        assert_eq!(
+            lookup_private_turn_detail(&root, first.turn_id()),
+            PrivateTurnDetailLookup::Failed("conflict")
+        );
+        let path = private_turn_detail_path(
+            &layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY),
+            first.turn_id(),
+        )
+        .unwrap();
+        let preserved = fs::read_to_string(path).unwrap();
+        assert!(preserved.contains("RAW_INPUT_SECRET"));
+        assert!(!preserved.contains("DIFFERENT_PRIVATE_INPUT"));
+        drop(mutation);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4841,7 +5038,14 @@ mod tests {
         let state = AppState {
             collector: Arc::new(Mutex::new(collector_state(&root))),
             auth_token: Arc::from("a".repeat(64)),
-            private_detail_admission: sender,
+            private_detail_admissions: PrivateTurnDetailAdmissions {
+                detail: sender,
+                status: spawn_private_turn_detail_writers(
+                    layout.clone(),
+                    load(&layout.config).unwrap(),
+                )
+                .status,
+            },
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
             report_refresh_requested: Arc::new(AtomicU64::new(0)),
             report_refresh_attempts: Arc::new(AtomicU64::new(0)),
@@ -4867,6 +5071,22 @@ mod tests {
             assert_eq!(receipt["state"], "busy");
             assert_eq!(receipt["code"], "admission_full");
             assert_eq!(state.collector.lock().await.accepted_requests, 1);
+            let (_, overflow_detail) =
+                project_notify_with_private_detail(&raw_notify("thread-overflow", "turn-overflow"))
+                    .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if matches!(
+                        lookup_private_turn_detail(&root, overflow_detail.turn_id()),
+                        PrivateTurnDetailLookup::Failed("admission_full")
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
         });
         drop(receiver);
         assert!(
@@ -4875,6 +5095,99 @@ mod tests {
                 .join(super::PRIVATE_TURN_DETAIL_DIRECTORY)
                 .exists()
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn private_turn_detail_endpoint_records_disconnected_writer_failure() {
+        let root = test_root("private-turn-detail-writer-disconnected");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let (disconnected_sender, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+        let status =
+            spawn_private_turn_detail_writers(layout.clone(), load(&layout.config).unwrap()).status;
+        let state = AppState {
+            collector: Arc::new(Mutex::new(collector_state(&root))),
+            auth_token: Arc::from("a".repeat(64)),
+            private_detail_admissions: PrivateTurnDetailAdmissions {
+                detail: disconnected_sender,
+                status,
+            },
+            report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
+            report_refresh_requested: Arc::new(AtomicU64::new(0)),
+            report_refresh_attempts: Arc::new(AtomicU64::new(0)),
+        };
+        let body = capture_private_turn_detail_if_enabled(
+            &root,
+            &raw_notify("thread-disconnected", "turn-disconnected"),
+        )
+        .unwrap()
+        .unwrap();
+        let (_, detail) = project_notify_with_private_detail(&raw_notify(
+            "thread-disconnected",
+            "turn-disconnected",
+        ))
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response =
+                ingest_notify_with_private_detail(State(state.clone()), body.into()).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if matches!(
+                        lookup_private_turn_detail(&root, detail.turn_id()),
+                        PrivateTurnDetailLookup::Failed("writer_unavailable")
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn private_detail_envelope_rejects_cross_turn_correlation() {
+        let root = test_root("private-detail-cross-turn");
+        let _ = fs::remove_dir_all(&root);
+        set_private_turn_details(&root, true);
+        let state = app_state(&root);
+        let (projected, _) =
+            project_notify_with_private_detail(&raw_notify("thread-correlation", "turn-canonical"))
+                .unwrap();
+        let (_, other_detail) = project_notify_with_private_detail(&raw_notify(
+            "thread-correlation",
+            "turn-private-other",
+        ))
+        .unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schema_version": super::PRIVATE_NOTIFY_ENVELOPE_VERSION,
+            "projected": serde_json::to_value(projected).unwrap(),
+            "private_detail": serde_json::from_slice::<serde_json::Value>(
+                &other_detail.to_json().unwrap(),
+            )
+            .unwrap(),
+        }))
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response =
+                ingest_notify_with_private_detail(State(state.clone()), body.into()).await;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(state.collector.lock().await.accepted_requests, 0);
+        });
         let _ = fs::remove_dir_all(root);
     }
 
@@ -5079,6 +5392,49 @@ mod tests {
             read_private_turn_detail_status(&root, detail.turn_id()),
             Ok(Some("ok"))
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_turn_detail_status_writer_defers_until_it_owns_the_mutation_lock() {
+        let root = test_root("private-turn-detail-status-lock");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let config = load(&layout.config).unwrap();
+        let (_, detail) = project_notify_with_private_detail(&raw_notify(
+            "thread-status-lock",
+            "turn-status-lock",
+        ))
+        .unwrap();
+        let guard = MutationGuard::acquire(&layout.runtime).unwrap();
+        let admissions = spawn_private_turn_detail_writers(layout.clone(), config);
+        assert_eq!(
+            enqueue_private_turn_detail_status(
+                &admissions,
+                detail.turn_id(),
+                "busy",
+                "admission_full",
+            ),
+            "admission_full"
+        );
+        thread::sleep(Duration::from_millis(75));
+        assert_eq!(
+            read_private_turn_detail_status(&root, detail.turn_id()),
+            Ok(None)
+        );
+        drop(guard);
+        let started = std::time::Instant::now();
+        loop {
+            if read_private_turn_detail_status(&root, detail.turn_id())
+                == Ok(Some("admission_full"))
+            {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(10));
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6597,14 +6953,14 @@ mod tests {
         assert!(reconcile_report_state(&restarted.layout, true));
         restarted.report_dirty = true;
         restarted.report_degraded = true;
-        let private_detail_admission = spawn_private_turn_detail_writer(
+        let private_detail_admissions = spawn_private_turn_detail_writers(
             restarted.layout.clone(),
             load(&restarted.layout.config).unwrap(),
         );
         let state = AppState {
             collector: Arc::new(Mutex::new(restarted)),
             auth_token: Arc::from("a".repeat(64)),
-            private_detail_admission,
+            private_detail_admissions,
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
             report_refresh_requested: Arc::new(AtomicU64::new(0)),
             report_refresh_attempts: Arc::new(AtomicU64::new(0)),
