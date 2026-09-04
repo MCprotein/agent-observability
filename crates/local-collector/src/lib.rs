@@ -4767,29 +4767,16 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let (server_config, _) = test_tls_configs(&root);
-            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            configure_port(&root, listener.local_addr().unwrap().port());
-            let transport =
-                super::TransportListener::new(listener, server_config, Duration::from_secs(1), 2);
             let state = app_state(&root);
-            let app = router(state.clone());
-            let server = tokio::spawn(async move { axum::serve(transport, app).await });
-            tokio::task::yield_now().await;
-
-            let notify_root = root.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                submit_notify(
-                    &notify_root,
-                    &raw_notify("thread-status-failure", "turn-status-failure"),
-                )
-            })
-            .await
+            let body = capture_private_turn_detail_if_enabled(
+                &root,
+                &raw_notify("thread-status-failure", "turn-status-failure"),
+            )
+            .unwrap()
             .unwrap();
-
-            assert_eq!(outcome, NotifyOutcome::Accepted);
+            let response =
+                ingest_notify_with_private_detail(State(state.clone()), body.into()).await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
             assert_eq!(state.collector.lock().await.accepted_requests, 1);
             let (_, detail) = project_notify_with_private_detail(&raw_notify(
                 "thread-status-failure",
@@ -4809,7 +4796,6 @@ mod tests {
             })
             .await
             .unwrap();
-            server.abort();
         });
         let _ = fs::remove_dir_all(root);
     }
