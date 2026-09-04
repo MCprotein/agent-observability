@@ -190,11 +190,13 @@ try {
 
   const dashboardLauncherPage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
   await dashboardLauncherPage.goto(url, { waitUntil: "networkidle" });
+  const expectedDashboardOpenStatus = process.platform === "darwin" ? 204 : 409;
+  const firstOpenResponse = dashboardLauncherPage.waitForResponse(
+    (response) => response.url() === `${origin}/api/dashboard/open`
+      && response.request().method() === "POST",
+  );
   await dashboardLauncherPage.locator("#open-dashboard").click();
-  await dashboardLauncherPage
-    .locator("#toast")
-    .filter({ hasText: "모니터링 리포트를 열었습니다" })
-    .waitFor();
+  assert.equal((await firstOpenResponse).status(), expectedDashboardOpenStatus);
   const dashboardUrl = await waitForDashboardUrl(runtimeRoot);
   const dashboardPid = await readDashboardPid(runtimeRoot);
   const secondOpenResponse = dashboardLauncherPage.waitForResponse(
@@ -202,7 +204,7 @@ try {
       && response.request().method() === "POST",
   );
   await dashboardLauncherPage.locator("#open-dashboard").click();
-  assert.equal((await secondOpenResponse).status(), 204);
+  assert.equal((await secondOpenResponse).status(), expectedDashboardOpenStatus);
   assert.equal(await readDashboardPid(runtimeRoot), dashboardPid, "repeated opens must reuse one server");
   const independentDashboardPage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
   await independentDashboardPage.goto(dashboardUrl, { waitUntil: "load" });
