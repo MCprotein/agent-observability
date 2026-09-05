@@ -513,6 +513,31 @@ fn strict_v1_report_fixture_migrates_to_explicit_v2_availability() {
 }
 
 #[test]
+fn partial_v1_token_metrics_migrate_without_claiming_a_complete_total() {
+    let fixture = include_str!("../../../contracts/report-dto-v1.compatibility.fixture.json");
+    for field in [
+        "totalInputTokens",
+        "totalOutputTokens",
+        "inputTokens",
+        "outputTokens",
+    ] {
+        let mut document: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        document["spans"][0]["metrics"] = serde_json::json!({field: 10});
+        let legacy: ReportDtoV1 = serde_json::from_value(document).unwrap();
+        legacy.validate().unwrap();
+        let migrated = ReportDtoV2::try_from(legacy).expect("valid partial v1 report migrates");
+        assert_eq!(
+            migrated.spans[0].availability.tokens.state,
+            agent_observability_contracts::AvailabilityStateV2::SourceUnavailable
+        );
+        assert_eq!(
+            migrated.spans[0].availability.tokens.reason,
+            "partial_token_metrics"
+        );
+    }
+}
+
+#[test]
 fn report_v2_fixture_matches_availability_parity_corpus() {
     let fixture = include_str!("../../../contracts/report-dto-v2.fixture.json");
     let report: ReportDtoV2 = serde_json::from_str(fixture).expect("v2 fixture parses");

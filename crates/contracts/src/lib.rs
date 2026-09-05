@@ -1682,12 +1682,18 @@ impl ReportAvailabilityV2 {
             reason: "legacy_v1_report".into(),
         };
         let tokens = FieldAvailabilityV2 {
-            state: if report_token_metrics_present(metrics) {
+            state: if report_token_total_present(metrics) {
                 AvailabilityStateV2::Available
             } else {
                 AvailabilityStateV2::SourceUnavailable
             },
-            reason: "legacy_v1_report".into(),
+            reason:
+                if report_token_metrics_present(metrics) && !report_token_total_present(metrics) {
+                    "partial_token_metrics"
+                } else {
+                    "legacy_v1_report"
+                }
+                .into(),
         };
         Self {
             repository: unavailable.clone(),
