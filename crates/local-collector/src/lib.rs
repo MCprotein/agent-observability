@@ -293,6 +293,15 @@ struct PrivateTurnDetailReceiptV1 {
     code: String,
 }
 
+impl PrivateTurnDetailReceiptV1 {
+    fn is_available(&self, http_status: u16) -> bool {
+        http_status == 200
+            && self.schema_version == PRIVATE_TURN_DETAIL_RECEIPT_VERSION
+            && self.state == PrivateTurnDetailReceiptState::Available
+            && self.code == "ok"
+    }
+}
+
 #[derive(Debug)]
 pub enum CollectorError {
     Io(std::io::Error),
@@ -2505,12 +2514,7 @@ pub fn submit_notify(root: &Path, payload: &[u8]) -> NotifyOutcome {
         Ok(response) if path == "/v1/notify" && response.status == 200 => NotifyOutcome::Accepted,
         Ok(response) if path == "/v1/notify/private-detail" => {
             match serde_json::from_slice::<PrivateTurnDetailReceiptV1>(&response.body) {
-                Ok(receipt)
-                    if receipt.schema_version == PRIVATE_TURN_DETAIL_RECEIPT_VERSION
-                        && receipt.state == PrivateTurnDetailReceiptState::Available =>
-                {
-                    NotifyOutcome::Accepted
-                }
+                Ok(receipt) if receipt.is_available(response.status) => NotifyOutcome::Accepted,
                 Ok(_) | Err(_) => NotifyOutcome::Unavailable,
             }
         }
@@ -3046,7 +3050,15 @@ fn read_private_turn_detail_status(
     };
     let status: PrivateTurnDetailCaptureStatusV1 =
         serde_json::from_slice(&bytes).map_err(|_| "status_artifact_invalid")?;
-    if status.schema_version != PRIVATE_TURN_DETAIL_STATUS_VERSION || status.turn_id != turn_id {
+    if status.schema_version != PRIVATE_TURN_DETAIL_STATUS_VERSION
+        || status.turn_id != turn_id
+        || status.state
+            != if status.code == "ok" {
+                "available"
+            } else {
+                "failed"
+            }
+    {
         return Err("status_artifact_invalid");
     }
     let code = match status.code.as_str() {
@@ -5187,6 +5199,66 @@ mod tests {
             lookup_private_turn_detail(&root, detail.turn_id()),
             PrivateTurnDetailLookup::NotCollected
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn private_turn_detail_receipt_requires_consistent_success_tuple() {
+        for http_status in [200, 202, 400, 503] {
+            for state in [
+                super::PrivateTurnDetailReceiptState::Available,
+                super::PrivateTurnDetailReceiptState::Failed,
+                super::PrivateTurnDetailReceiptState::Busy,
+            ] {
+                for code in ["ok", "busy", "conflict", "future_code"] {
+                    let receipt = super::PrivateTurnDetailReceiptV1 {
+                        schema_version: super::PRIVATE_TURN_DETAIL_RECEIPT_VERSION.into(),
+                        state,
+                        code: code.into(),
+                    };
+                    assert_eq!(
+                        receipt.is_available(http_status),
+                        http_status == 200
+                            && state == super::PrivateTurnDetailReceiptState::Available
+                            && code == "ok"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn private_turn_detail_contradictory_status_is_not_exposed_or_retained() {
+        let root = test_root("private-turn-detail-contradictory-status");
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let config = load(&layout.config).unwrap();
+        let (_, detail) =
+            project_notify_with_private_detail(&raw_notify("thread-tuple", "turn-tuple")).unwrap();
+        for (state, code) in [("failed", "ok"), ("available", "busy"), ("future", "ok")] {
+            capture_private_turn_detail(&layout, &detail, &config).unwrap();
+            super::write_private_turn_detail_status_locked(
+                &layout,
+                detail.turn_id(),
+                state,
+                code,
+                &config,
+            )
+            .unwrap();
+            assert_eq!(
+                lookup_private_turn_detail(&root, detail.turn_id()),
+                PrivateTurnDetailLookup::Failed("status_artifact_invalid")
+            );
+            maintain_private_turn_details_locked(&layout, &config, SystemTime::now()).unwrap();
+            assert!(
+                !private_turn_detail_path(
+                    &layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY),
+                    detail.turn_id()
+                )
+                .unwrap()
+                .exists()
+            );
+        }
         let _ = fs::remove_dir_all(root);
     }
 
