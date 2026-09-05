@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-observability.local/contracts/private-codex-turn-detail-v1.schema.json",
+  "title": "PrivateCodexTurnDetailV1",
+  "description": "Local-only private Codex turn detail. This contract must not be promoted to canonical reports, durable records, diagnostics, exports, or team transport.",
+  "$comment": "The complete compact UTF-8 JSON representation is additionally limited to 65536 bytes by both Rust and the generated TypeScript validator.",
+  "x-agent-observability-max-serialized-utf8-bytes": 65536,
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "turnId", "cwd", "inputMessages", "lastAssistantMessage"],
+  "properties": {
+    "schemaVersion": { "const": "agent_observability.private_turn_detail.v1" },
+    "turnId": {
+      "type": "string",
+      "pattern": "^id:sha256:[0-9a-f]{64}$"
+    },
+    "cwd": { "type": "string", "not": { "const": "" } },
+    "inputMessages": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "lastAssistantMessage": { "type": ["string", "null"] }
+  }
+}

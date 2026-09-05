@@ -29,6 +29,7 @@ export type FieldAvailability = {
     | "derived_from_trace_context"
     | "legacy_v1_report"
     | "source_not_provided"
+    | "not_evaluated"
     | "partial_token_metrics"
     | "historical_codex_source_not_lookup_eligible"
     | "codex_notify_turn_correlation_unavailable"
@@ -53,6 +54,7 @@ export type FieldAvailability1 =
       state?: "source_unavailable";
       reason?:
         | "source_not_provided"
+        | "not_evaluated"
         | "partial_token_metrics"
         | "historical_codex_source_not_lookup_eligible"
         | "codex_notify_turn_correlation_unavailable"

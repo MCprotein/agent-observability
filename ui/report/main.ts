@@ -4,7 +4,9 @@ import type {
   Span,
   Trace,
 } from "./generated/report-dto-v2.js";
+import type { PrivateCodexTurnDetailV1 } from "./generated/private-codex-turn-detail-v1.js";
 import validateReportDtoV2 from "./generated/validate-report-dto-v2.js";
+import validatePrivateCodexTurnDetailV1 from "./generated/validate-private-codex-turn-detail-v1.js";
 import {
   buildFilteredView,
   buildTimeline,
@@ -28,7 +30,6 @@ const TIMELINE_LIMIT = 120;
 const FILTER_OPTION_LIMIT = 500;
 const SAVED_FILTER_LIMIT = 20;
 const SAVED_FILTER_KEY = "agent-observability.report.v1.saved-filters";
-const PRIVATE_DETAIL_VERSION = "agent_observability.private_turn_detail.v1";
 const reportData = document.getElementById("report-data");
 
 if (!reportData) throw new Error("Missing report data");
@@ -425,12 +426,15 @@ function mount(data: AgentObservabilityReportV2): void {
         return;
       }
       if (!response.ok) throw new Error("private detail request failed");
-      const detail = await response.json() as PrivateTurnDetail;
-      if (!validPrivateDetail(detail, span.turnId)) throw new Error("private detail contract mismatch");
+      const detail: unknown = await response.json();
+      if (!validatePrivateCodexTurnDetailV1(detail) || detail.turnId !== span.turnId) {
+        throw new Error("private detail contract mismatch");
+      }
+      const privateDetail: PrivateCodexTurnDetailV1 = detail;
       target.innerHTML = `<h3>Private local detail</h3><p class="private-banner">Sensitive content stored only in this private local runtime. Review before sharing screenshots.</p>` +
-        `<dl class="detail-grid">${detailRow("Opened from", detail.cwd)}</dl>` +
-        `<h3>Request</h3><pre class="private-content" tabindex="0">${escapeHtml(detail.inputMessages.join("\n\n"))}</pre>` +
-        `<h3>Response</h3><pre class="private-content" tabindex="0">${escapeHtml(detail.lastAssistantMessage ?? "Unavailable: Codex did not provide an assistant response in this notification.")}</pre>`;
+        `<dl class="detail-grid">${detailRow("Opened from", privateDetail.cwd)}</dl>` +
+        `<h3>Request</h3><pre class="private-content" tabindex="0">${escapeHtml(privateDetail.inputMessages.join("\n\n"))}</pre>` +
+        `<h3>Response</h3><pre class="private-content" tabindex="0">${escapeHtml(privateDetail.lastAssistantMessage ?? "Unavailable: Codex did not provide an assistant response in this notification.")}</pre>`;
     } catch {
       if (request !== detailRequest || selectedSpanId !== span.spanId) return;
       target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Temporarily unavailable. The normal report remains usable.</p>';
@@ -486,23 +490,6 @@ function mount(data: AgentObservabilityReportV2): void {
   function hasActiveFilters(): boolean {
     return state.text.length > 0 || (Object.keys(selects) as FilterKey[]).some((key) => state[key] !== undefined);
   }
-}
-
-interface PrivateTurnDetail {
-  schemaVersion: string;
-  turnId: string;
-  cwd: string;
-  inputMessages: string[];
-  lastAssistantMessage: string | null;
-}
-
-function validPrivateDetail(value: PrivateTurnDetail, turnId: string): boolean {
-  return value?.schemaVersion === PRIVATE_DETAIL_VERSION
-    && value.turnId === turnId
-    && typeof value.cwd === "string"
-    && Array.isArray(value.inputMessages)
-    && value.inputMessages.every((message) => typeof message === "string")
-    && (value.lastAssistantMessage === null || typeof value.lastAssistantMessage === "string");
 }
 
 function availabilityLabel(field: FieldAvailability): string {

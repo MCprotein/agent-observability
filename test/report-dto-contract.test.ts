@@ -31,6 +31,20 @@ test("authoritative report schema matches the Rust availability parity corpus", 
   }
 });
 
+test("shared reason corpus covers every schema state and reason combination", () => {
+  const field = schema.$defs.field_availability;
+  const covered = new Set(parityCases.flatMap((entry) => {
+    if (entry.operation !== "set" || entry.path.join("/") !== "spans/0/availability/repository") return [];
+    const value = entry.value as {state?: string; reason?: string} | undefined;
+    return value?.state && value.reason ? [`${value.state}/${value.reason}`] : [];
+  }));
+  for (const state of field.properties.state.enum as string[]) {
+    for (const reason of field.properties.reason.enum as string[]) {
+      assert.ok(covered.has(`${state}/${reason}`), `missing parity: ${state}/${reason}`);
+    }
+  }
+});
+
 test("partial token metrics require the explicit incomplete availability reason", () => {
   const partial = structuredClone(fixture);
   partial.spans[0].metrics = { totalInputTokens: 10 };

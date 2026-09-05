@@ -409,6 +409,13 @@ Web UI는 TypeScript `strict` mode를 사용한다.
   authoritative source로 사용한다.
 - Rust가 생성한 sanitized report DTO만 입력으로 받는다.
 - DTO type은 versioned schema에서 생성하거나 runtime validation으로 확인한다.
+- Report v2의 availability reason은 schema에 열거된 state/reason 조합만 허용한다.
+  기본값 `source_unavailable/not_evaluated`는 아직 평가되지 않은 필드이며 값이 있다는 뜻이
+  아니다. source 평가 뒤에는 구체적인 사유를 사용한다. 원문 경로, 오류나 임의 설명을 reason에
+  넣지 않으며 Rust와 TypeScript는 모든 state/reason 조합을 같은 parity fixture로 검증한다.
+- 별도 로컬 private-detail 응답도 versioned schema에서 TypeScript 타입과 validator를 생성한다.
+  `lastAssistantMessage`는 필수 nullable 필드이고, 전체 compact UTF-8 JSON은 64 KiB 이하이다.
+  이 계약은 standalone 로컬 조회 전용이며 report DTO나 team 전송 필드를 확장하지 않는다.
 - 브라우저에서 외부 network 요청이나 상시 server 없이 동작한다. 기본 CLI 전달은 random
   read-only path capability를 쓰는 reloadable ephemeral IPv4 loopback server다. report-only router는
   `GET`/`HEAD`만 허용하고 idle/hard deadline에 종료된다.

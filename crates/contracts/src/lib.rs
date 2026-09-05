@@ -1640,6 +1640,7 @@ fn valid_availability_reason(field: &FieldAvailabilityV2) -> bool {
         ) | (
             SourceUnavailable,
             "source_not_provided"
+                | "not_evaluated"
                 | "partial_token_metrics"
                 | "historical_codex_source_not_lookup_eligible"
                 | "codex_notify_turn_correlation_unavailable"
@@ -1977,6 +1978,19 @@ impl ContractManifest {
         )?;
         self.expect("report_fixture", "contracts/report-dto-v2.fixture.json")?;
         self.expect("report_parity", "contracts/report-dto-v2.parity.json")?;
+        self.expect(
+            "private_codex_turn_detail",
+            "agent_observability.private_turn_detail.v1",
+        )?;
+        self.expect(
+            "private_codex_turn_detail_schema",
+            "contracts/private-codex-turn-detail-v1.schema.json",
+        )?;
+        self.expect(
+            "private_codex_turn_detail_parity",
+            "contracts/private-codex-turn-detail-v1.parity.json",
+        )?;
+        self.expect("private_codex_turn_detail_scope", "standalone_local_only")?;
         self.expect("rate_table_schema", "contracts/rate-table-v1.schema.json")?;
         self.expect(
             "retention_archive_schema",

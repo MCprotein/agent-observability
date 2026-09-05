@@ -1,4 +1,9 @@
 [
+  { "name":"unevaluated cannot be withheld", "operation":"set", "path":["spans","0","availability","repository"], "value":{"state":"withheld","reason":"not_evaluated"}, "valid":false },
+  { "name":"unevaluated cannot be private lookup", "operation":"set", "path":["spans","0","availability","repository"], "value":{"state":"private_lookup","reason":"not_evaluated"}, "valid":false },
+  { "name":"unevaluated cannot be not applicable", "operation":"set", "path":["spans","0","availability","repository"], "value":{"state":"not_applicable","reason":"not_evaluated"}, "valid":false },
+  { "name":"default reason", "operation":"set", "path":["spans","0","availability","repository"], "value":{"state":"source_unavailable","reason":"not_evaluated"}, "valid":true },
+  { "name":"unevaluated cannot be available", "operation":"set", "path":["spans","0","availability","repository"], "value":{"state":"available","reason":"not_evaluated"}, "valid":false },
   {"name":"reason parity available/reported_by_adapter","operation":"set","path":["spans","0","availability","repository"],"value":{"state":"available","reason":"reported_by_adapter"},"valid":true},
   {"name":"reason parity available/derived_from_trace_context","operation":"set","path":["spans","0","availability","repository"],"value":{"state":"available","reason":"derived_from_trace_context"},"valid":true},
   {"name":"reason parity available/legacy_v1_report","operation":"set","path":["spans","0","availability","repository"],"value":{"state":"available","reason":"legacy_v1_report"},"valid":true},

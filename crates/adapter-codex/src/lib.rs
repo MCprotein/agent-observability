@@ -183,7 +183,17 @@ pub struct PrivateCodexTurnDetailV1 {
     turn_id: String,
     cwd: String,
     input_messages: Vec<String>,
+    #[serde(deserialize_with = "deserialize_required_last_assistant_message")]
     last_assistant_message: Option<String>,
+}
+
+fn deserialize_required_last_assistant_message<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
 }
 
 impl fmt::Debug for PrivateCodexTurnDetailV1 {
@@ -1853,12 +1863,12 @@ mod tests {
     use super::{
         AdapterError, AdapterItem, DiagnosticCode, MAX_HANDOFF_BYTES, MAX_HANDOFF_LINE_BYTES,
         MAX_HANDOFF_LINES, MAX_OTLP_LOG_RECORDS, MAX_PENDING_OTLP_REQUESTS,
-        MAX_PROJECTED_NOTIFY_BYTES, MAX_RECENTLY_COMPLETED_OTLP_REQUESTS,
-        OTLP_REQUEST_CORRELATION_TTL_MS, OtlpRequestCorrelationState,
-        PRIVATE_TURN_DETAIL_SCHEMA_VERSION, PROJECTED_NOTIFY_SCHEMA_VERSION,
-        PrivateCodexTurnDetailV1, parse_handoff_jsonl, parse_otlp_http_json,
-        parse_otlp_http_json_with_state, parse_projected_notify_json, project_notify_json,
-        project_notify_with_private_detail, read_handoff_file,
+        MAX_PRIVATE_TURN_DETAIL_BYTES, MAX_PROJECTED_NOTIFY_BYTES,
+        MAX_RECENTLY_COMPLETED_OTLP_REQUESTS, OTLP_REQUEST_CORRELATION_TTL_MS,
+        OtlpRequestCorrelationState, PRIVATE_TURN_DETAIL_SCHEMA_VERSION,
+        PROJECTED_NOTIFY_SCHEMA_VERSION, PrivateCodexTurnDetailV1, parse_handoff_jsonl,
+        parse_otlp_http_json, parse_otlp_http_json_with_state, parse_projected_notify_json,
+        project_notify_json, project_notify_with_private_detail, read_handoff_file,
     };
     use agent_observability_contracts::ObservationEvent;
     use agent_observability_contracts::hash_opaque_identifier;
@@ -1868,6 +1878,8 @@ mod tests {
 
     const FIXTURE: &str = include_str!("../tests/fixtures/codex-handoff.jsonl");
     const EXPECTED_PROJECTION: &str = include_str!("../tests/fixtures/codex-projection.jsonl");
+    const PRIVATE_DETAIL_PARITY: &str =
+        include_str!("../../../contracts/private-codex-turn-detail-v1.parity.json");
     const EXPECTED_HANDOFF_HASH: &str =
         "sha256:0b30a1810b6e34152310691a3a660ecf33e98d4940fc63fe9b340811241f526c";
     const EXPECTED_PROJECTION_HASH: &str =
@@ -2856,6 +2868,69 @@ mod tests {
         assert!(!durable.contains("RAW_PROMPT_SECRET"));
         assert!(!durable.contains("RAW_ASSISTANT_SECRET"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn private_turn_detail_matches_shared_rust_typescript_parity_corpus() {
+        let corpus: serde_json::Value = serde_json::from_str(PRIVATE_DETAIL_PARITY).unwrap();
+        let base = corpus.get("base").unwrap();
+        for parity_case in corpus.get("cases").unwrap().as_array().unwrap() {
+            let mut document = base.clone();
+            apply_private_detail_parity_case(&mut document, parity_case);
+            let encoded = serde_json::to_vec(&document).unwrap();
+            let valid = parity_case.get("valid").unwrap().as_bool().unwrap();
+            assert_eq!(
+                PrivateCodexTurnDetailV1::from_json(&encoded).is_ok(),
+                valid,
+                "{}",
+                parity_case.get("name").unwrap().as_str().unwrap()
+            );
+        }
+    }
+
+    fn apply_private_detail_parity_case(
+        document: &mut serde_json::Value,
+        parity_case: &serde_json::Value,
+    ) {
+        let operation = parity_case.get("operation").unwrap().as_str().unwrap();
+        if operation == "none" {
+            return;
+        }
+        let path = parity_case.get("path").unwrap().as_array().unwrap();
+        assert_eq!(path.len(), 1);
+        let field = path[0].as_str().unwrap();
+        let object = document.as_object_mut().unwrap();
+        match operation {
+            "set" => {
+                object.insert(field.into(), parity_case.get("value").unwrap().clone());
+            }
+            "remove" => {
+                object.remove(field);
+            }
+            "set_serialized_size" => {
+                object.insert(field.into(), serde_json::Value::String(String::new()));
+                let empty_size = serde_json::to_vec(document).unwrap().len();
+                let target_size =
+                    usize::try_from(parity_case.get("size").unwrap().as_u64().unwrap()).unwrap();
+                assert!(target_size >= empty_size);
+                document.as_object_mut().unwrap().insert(
+                    field.into(),
+                    serde_json::Value::String("x".repeat(target_size - empty_size)),
+                );
+                assert_eq!(serde_json::to_vec(document).unwrap().len(), target_size);
+                assert!(target_size >= MAX_PRIVATE_TURN_DETAIL_BYTES);
+            }
+            "set_repeated_string" => {
+                let value = parity_case.get("value").unwrap().as_str().unwrap();
+                let count =
+                    usize::try_from(parity_case.get("count").unwrap().as_u64().unwrap()).unwrap();
+                document
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(field.into(), serde_json::Value::String(value.repeat(count)));
+            }
+            _ => panic!("unsupported private-detail parity operation: {operation}"),
+        }
     }
 
     #[test]

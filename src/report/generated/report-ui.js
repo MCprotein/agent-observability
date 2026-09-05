@@ -779,7 +779,7 @@
   validate27.evaluated = { "props": true, "dynamicProps": false, "dynamicItems": false };
   var schema47 = { "type": "object", "additionalProperties": false, "required": ["schemaVersion", "traceId", "spanId", "parentSpanId", "kind", "name", "status", "startTimeUnixMs", "endTimeUnixMs", "repo", "agent", "availability", "attributes", "metrics", "cost"], "properties": { "schemaVersion": { "type": "string" }, "traceId": { "type": "string" }, "spanId": { "type": "string" }, "parentSpanId": { "type": ["string", "null"] }, "kind": { "type": "string" }, "name": { "type": "string" }, "status": { "type": "string" }, "startTimeUnixMs": { "type": "number" }, "endTimeUnixMs": { "type": ["number", "null"] }, "repo": { "type": "string" }, "agent": { "$ref": "#/$defs/agent" }, "availability": { "$ref": "#/$defs/availability" }, "sessionId": { "type": "string" }, "turnId": { "type": "string" }, "toolName": { "type": "string" }, "attributes": { "$ref": "#/$defs/attributes" }, "metrics": { "$ref": "#/$defs/metrics" }, "estimatedCost": { "type": "number" }, "cost": { "$ref": "#/$defs/cost" } }, "allOf": [{ "if": { "properties": { "metrics": { "type": "object", "anyOf": [{ "type": "object", "properties": { "inputTokens": true }, "required": ["inputTokens"] }, { "type": "object", "properties": { "outputTokens": true }, "required": ["outputTokens"] }, { "type": "object", "properties": { "totalTokens": true }, "required": ["totalTokens"] }, { "type": "object", "properties": { "totalInputTokens": true }, "required": ["totalInputTokens"] }, { "type": "object", "properties": { "totalOutputTokens": true }, "required": ["totalOutputTokens"] }, { "type": "object", "properties": { "totalAccumulatedTokens": true }, "required": ["totalAccumulatedTokens"] }] } } }, "then": { "if": { "properties": { "metrics": { "type": "object", "anyOf": [{ "type": "object", "properties": { "totalTokens": true }, "required": ["totalTokens"] }, { "type": "object", "properties": { "totalAccumulatedTokens": true }, "required": ["totalAccumulatedTokens"] }, { "type": "object", "properties": { "inputTokens": true, "outputTokens": true }, "required": ["inputTokens", "outputTokens"] }, { "type": "object", "properties": { "totalInputTokens": true, "totalOutputTokens": true }, "required": ["totalInputTokens", "totalOutputTokens"] }] } } }, "then": { "properties": { "availability": { "type": "object", "properties": { "tokens": { "type": "object", "properties": { "state": { "const": "available" } } } } } } }, "else": { "properties": { "availability": { "type": "object", "properties": { "tokens": { "type": "object", "properties": { "state": { "const": "source_unavailable" }, "reason": { "const": "partial_token_metrics" } } } } } } } }, "else": { "properties": { "availability": { "type": "object", "properties": { "tokens": { "type": "object", "properties": { "state": { "not": { "const": "available" } } } } } } } } }] };
   var schema71 = { "type": "object", "additionalProperties": false, "properties": { "inputTokens": { "type": "number" }, "outputTokens": { "type": "number" }, "cachedInputTokens": { "type": "number" }, "cacheCreationInputTokens": { "type": "number" }, "reasoningOutputTokens": { "type": "number" }, "totalTokens": { "type": "number" }, "latencyMs": { "type": "number" }, "durationMs": { "type": "number" }, "totalInputTokens": { "type": "number" }, "totalOutputTokens": { "type": "number" }, "totalCachedInputTokens": { "type": "number" }, "totalReasoningOutputTokens": { "type": "number" }, "totalAccumulatedTokens": { "type": "number" }, "contextWindowTokens": { "type": "number" } } };
-  var schema50 = { "type": "object", "additionalProperties": false, "required": ["state", "reason"], "properties": { "state": { "enum": ["available", "source_unavailable", "withheld", "not_applicable", "private_lookup"] }, "reason": { "type": "string", "enum": ["reported_by_adapter", "derived_from_trace_context", "legacy_v1_report", "source_not_provided", "partial_token_metrics", "historical_codex_source_not_lookup_eligible", "codex_notify_turn_correlation_unavailable", "ambiguous_trace_repository", "span_kind_not_model_backed", "span_kind_has_no_latency", "span_kind_has_no_token_usage", "claude_private_lookup_not_supported", "cursor_private_lookup_not_supported", "codex_span_not_notify_derived", "agent_private_lookup_not_supported", "local_opt_in_lookup_required", "withheld_by_privacy_policy"] } }, "oneOf": [{ "properties": { "state": { "const": "available" }, "reason": { "enum": ["reported_by_adapter", "derived_from_trace_context", "legacy_v1_report"] } } }, { "properties": { "state": { "const": "source_unavailable" }, "reason": { "enum": ["source_not_provided", "partial_token_metrics", "historical_codex_source_not_lookup_eligible", "codex_notify_turn_correlation_unavailable", "ambiguous_trace_repository", "legacy_v1_report"] } } }, { "properties": { "state": { "const": "not_applicable" }, "reason": { "enum": ["span_kind_not_model_backed", "span_kind_has_no_latency", "span_kind_has_no_token_usage", "claude_private_lookup_not_supported", "cursor_private_lookup_not_supported", "codex_span_not_notify_derived", "agent_private_lookup_not_supported"] } } }, { "properties": { "state": { "const": "private_lookup" }, "reason": { "const": "local_opt_in_lookup_required" } } }, { "properties": { "state": { "const": "withheld" }, "reason": { "const": "withheld_by_privacy_policy" } } }] };
+  var schema50 = { "type": "object", "additionalProperties": false, "required": ["state", "reason"], "properties": { "state": { "enum": ["available", "source_unavailable", "withheld", "not_applicable", "private_lookup"] }, "reason": { "type": "string", "enum": ["reported_by_adapter", "derived_from_trace_context", "legacy_v1_report", "source_not_provided", "not_evaluated", "partial_token_metrics", "historical_codex_source_not_lookup_eligible", "codex_notify_turn_correlation_unavailable", "ambiguous_trace_repository", "span_kind_not_model_backed", "span_kind_has_no_latency", "span_kind_has_no_token_usage", "claude_private_lookup_not_supported", "cursor_private_lookup_not_supported", "codex_span_not_notify_derived", "agent_private_lookup_not_supported", "local_opt_in_lookup_required", "withheld_by_privacy_policy"] } }, "oneOf": [{ "properties": { "state": { "const": "available" }, "reason": { "enum": ["reported_by_adapter", "derived_from_trace_context", "legacy_v1_report"] } } }, { "properties": { "state": { "const": "source_unavailable" }, "reason": { "enum": ["source_not_provided", "not_evaluated", "partial_token_metrics", "historical_codex_source_not_lookup_eligible", "codex_notify_turn_correlation_unavailable", "ambiguous_trace_repository", "legacy_v1_report"] } } }, { "properties": { "state": { "const": "not_applicable" }, "reason": { "enum": ["span_kind_not_model_backed", "span_kind_has_no_latency", "span_kind_has_no_token_usage", "claude_private_lookup_not_supported", "cursor_private_lookup_not_supported", "codex_span_not_notify_derived", "agent_private_lookup_not_supported"] } } }, { "properties": { "state": { "const": "private_lookup" }, "reason": { "const": "local_opt_in_lookup_required" } } }, { "properties": { "state": { "const": "withheld" }, "reason": { "const": "withheld_by_privacy_policy" } } }] };
   function validate30(data, { instancePath = "", parentData, parentDataProperty, rootData = data, dynamicAnchors = {} } = {}) {
     let vErrors = null;
     let errors = 0;
@@ -878,7 +878,7 @@
                   if (data0.reason !== void 0) {
                     let data4 = data0.reason;
                     const _errs11 = errors;
-                    if (!(data4 === "source_not_provided" || data4 === "partial_token_metrics" || data4 === "historical_codex_source_not_lookup_eligible" || data4 === "codex_notify_turn_correlation_unavailable" || data4 === "ambiguous_trace_repository" || data4 === "legacy_v1_report")) {
+                    if (!(data4 === "source_not_provided" || data4 === "not_evaluated" || data4 === "partial_token_metrics" || data4 === "historical_codex_source_not_lookup_eligible" || data4 === "codex_notify_turn_correlation_unavailable" || data4 === "ambiguous_trace_repository" || data4 === "legacy_v1_report")) {
                       const err3 = { instancePath: instancePath + "/repository/reason", schemaPath: "#/$defs/field_availability/oneOf/1/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.oneOf[1].properties.reason.enum }, message: "must be equal to one of the allowed values" };
                       if (vErrors === null) {
                         vErrors = [err3];
@@ -1114,7 +1114,7 @@
                             validate30.errors = [{ instancePath: instancePath + "/repository/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
                             return false;
                           }
-                          if (!(data12 === "reported_by_adapter" || data12 === "derived_from_trace_context" || data12 === "legacy_v1_report" || data12 === "source_not_provided" || data12 === "partial_token_metrics" || data12 === "historical_codex_source_not_lookup_eligible" || data12 === "codex_notify_turn_correlation_unavailable" || data12 === "ambiguous_trace_repository" || data12 === "span_kind_not_model_backed" || data12 === "span_kind_has_no_latency" || data12 === "span_kind_has_no_token_usage" || data12 === "claude_private_lookup_not_supported" || data12 === "cursor_private_lookup_not_supported" || data12 === "codex_span_not_notify_derived" || data12 === "agent_private_lookup_not_supported" || data12 === "local_opt_in_lookup_required" || data12 === "withheld_by_privacy_policy")) {
+                          if (!(data12 === "reported_by_adapter" || data12 === "derived_from_trace_context" || data12 === "legacy_v1_report" || data12 === "source_not_provided" || data12 === "not_evaluated" || data12 === "partial_token_metrics" || data12 === "historical_codex_source_not_lookup_eligible" || data12 === "codex_notify_turn_correlation_unavailable" || data12 === "ambiguous_trace_repository" || data12 === "span_kind_not_model_backed" || data12 === "span_kind_has_no_latency" || data12 === "span_kind_has_no_token_usage" || data12 === "claude_private_lookup_not_supported" || data12 === "cursor_private_lookup_not_supported" || data12 === "codex_span_not_notify_derived" || data12 === "agent_private_lookup_not_supported" || data12 === "local_opt_in_lookup_required" || data12 === "withheld_by_privacy_policy")) {
                             validate30.errors = [{ instancePath: instancePath + "/repository/reason", schemaPath: "#/$defs/field_availability/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.properties.reason.enum }, message: "must be equal to one of the allowed values" }];
                             return false;
                           }
@@ -1207,7 +1207,7 @@
                     if (data13.reason !== void 0) {
                       let data17 = data13.reason;
                       const _errs34 = errors;
-                      if (!(data17 === "source_not_provided" || data17 === "partial_token_metrics" || data17 === "historical_codex_source_not_lookup_eligible" || data17 === "codex_notify_turn_correlation_unavailable" || data17 === "ambiguous_trace_repository" || data17 === "legacy_v1_report")) {
+                      if (!(data17 === "source_not_provided" || data17 === "not_evaluated" || data17 === "partial_token_metrics" || data17 === "historical_codex_source_not_lookup_eligible" || data17 === "codex_notify_turn_correlation_unavailable" || data17 === "ambiguous_trace_repository" || data17 === "legacy_v1_report")) {
                         const err14 = { instancePath: instancePath + "/turn/reason", schemaPath: "#/$defs/field_availability/oneOf/1/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.oneOf[1].properties.reason.enum }, message: "must be equal to one of the allowed values" };
                         if (vErrors === null) {
                           vErrors = [err14];
@@ -1443,7 +1443,7 @@
                               validate30.errors = [{ instancePath: instancePath + "/turn/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
                               return false;
                             }
-                            if (!(data25 === "reported_by_adapter" || data25 === "derived_from_trace_context" || data25 === "legacy_v1_report" || data25 === "source_not_provided" || data25 === "partial_token_metrics" || data25 === "historical_codex_source_not_lookup_eligible" || data25 === "codex_notify_turn_correlation_unavailable" || data25 === "ambiguous_trace_repository" || data25 === "span_kind_not_model_backed" || data25 === "span_kind_has_no_latency" || data25 === "span_kind_has_no_token_usage" || data25 === "claude_private_lookup_not_supported" || data25 === "cursor_private_lookup_not_supported" || data25 === "codex_span_not_notify_derived" || data25 === "agent_private_lookup_not_supported" || data25 === "local_opt_in_lookup_required" || data25 === "withheld_by_privacy_policy")) {
+                            if (!(data25 === "reported_by_adapter" || data25 === "derived_from_trace_context" || data25 === "legacy_v1_report" || data25 === "source_not_provided" || data25 === "not_evaluated" || data25 === "partial_token_metrics" || data25 === "historical_codex_source_not_lookup_eligible" || data25 === "codex_notify_turn_correlation_unavailable" || data25 === "ambiguous_trace_repository" || data25 === "span_kind_not_model_backed" || data25 === "span_kind_has_no_latency" || data25 === "span_kind_has_no_token_usage" || data25 === "claude_private_lookup_not_supported" || data25 === "cursor_private_lookup_not_supported" || data25 === "codex_span_not_notify_derived" || data25 === "agent_private_lookup_not_supported" || data25 === "local_opt_in_lookup_required" || data25 === "withheld_by_privacy_policy")) {
                               validate30.errors = [{ instancePath: instancePath + "/turn/reason", schemaPath: "#/$defs/field_availability/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.properties.reason.enum }, message: "must be equal to one of the allowed values" }];
                               return false;
                             }
@@ -1536,7 +1536,7 @@
                       if (data26.reason !== void 0) {
                         let data30 = data26.reason;
                         const _errs57 = errors;
-                        if (!(data30 === "source_not_provided" || data30 === "partial_token_metrics" || data30 === "historical_codex_source_not_lookup_eligible" || data30 === "codex_notify_turn_correlation_unavailable" || data30 === "ambiguous_trace_repository" || data30 === "legacy_v1_report")) {
+                        if (!(data30 === "source_not_provided" || data30 === "not_evaluated" || data30 === "partial_token_metrics" || data30 === "historical_codex_source_not_lookup_eligible" || data30 === "codex_notify_turn_correlation_unavailable" || data30 === "ambiguous_trace_repository" || data30 === "legacy_v1_report")) {
                           const err25 = { instancePath: instancePath + "/model/reason", schemaPath: "#/$defs/field_availability/oneOf/1/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.oneOf[1].properties.reason.enum }, message: "must be equal to one of the allowed values" };
                           if (vErrors === null) {
                             vErrors = [err25];
@@ -1772,7 +1772,7 @@
                                 validate30.errors = [{ instancePath: instancePath + "/model/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
                                 return false;
                               }
-                              if (!(data38 === "reported_by_adapter" || data38 === "derived_from_trace_context" || data38 === "legacy_v1_report" || data38 === "source_not_provided" || data38 === "partial_token_metrics" || data38 === "historical_codex_source_not_lookup_eligible" || data38 === "codex_notify_turn_correlation_unavailable" || data38 === "ambiguous_trace_repository" || data38 === "span_kind_not_model_backed" || data38 === "span_kind_has_no_latency" || data38 === "span_kind_has_no_token_usage" || data38 === "claude_private_lookup_not_supported" || data38 === "cursor_private_lookup_not_supported" || data38 === "codex_span_not_notify_derived" || data38 === "agent_private_lookup_not_supported" || data38 === "local_opt_in_lookup_required" || data38 === "withheld_by_privacy_policy")) {
+                              if (!(data38 === "reported_by_adapter" || data38 === "derived_from_trace_context" || data38 === "legacy_v1_report" || data38 === "source_not_provided" || data38 === "not_evaluated" || data38 === "partial_token_metrics" || data38 === "historical_codex_source_not_lookup_eligible" || data38 === "codex_notify_turn_correlation_unavailable" || data38 === "ambiguous_trace_repository" || data38 === "span_kind_not_model_backed" || data38 === "span_kind_has_no_latency" || data38 === "span_kind_has_no_token_usage" || data38 === "claude_private_lookup_not_supported" || data38 === "cursor_private_lookup_not_supported" || data38 === "codex_span_not_notify_derived" || data38 === "agent_private_lookup_not_supported" || data38 === "local_opt_in_lookup_required" || data38 === "withheld_by_privacy_policy")) {
                                 validate30.errors = [{ instancePath: instancePath + "/model/reason", schemaPath: "#/$defs/field_availability/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.properties.reason.enum }, message: "must be equal to one of the allowed values" }];
                                 return false;
                               }
@@ -1865,7 +1865,7 @@
                         if (data39.reason !== void 0) {
                           let data43 = data39.reason;
                           const _errs80 = errors;
-                          if (!(data43 === "source_not_provided" || data43 === "partial_token_metrics" || data43 === "historical_codex_source_not_lookup_eligible" || data43 === "codex_notify_turn_correlation_unavailable" || data43 === "ambiguous_trace_repository" || data43 === "legacy_v1_report")) {
+                          if (!(data43 === "source_not_provided" || data43 === "not_evaluated" || data43 === "partial_token_metrics" || data43 === "historical_codex_source_not_lookup_eligible" || data43 === "codex_notify_turn_correlation_unavailable" || data43 === "ambiguous_trace_repository" || data43 === "legacy_v1_report")) {
                             const err36 = { instancePath: instancePath + "/tokens/reason", schemaPath: "#/$defs/field_availability/oneOf/1/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.oneOf[1].properties.reason.enum }, message: "must be equal to one of the allowed values" };
                             if (vErrors === null) {
                               vErrors = [err36];
@@ -2101,7 +2101,7 @@
                                   validate30.errors = [{ instancePath: instancePath + "/tokens/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
                                   return false;
                                 }
-                                if (!(data51 === "reported_by_adapter" || data51 === "derived_from_trace_context" || data51 === "legacy_v1_report" || data51 === "source_not_provided" || data51 === "partial_token_metrics" || data51 === "historical_codex_source_not_lookup_eligible" || data51 === "codex_notify_turn_correlation_unavailable" || data51 === "ambiguous_trace_repository" || data51 === "span_kind_not_model_backed" || data51 === "span_kind_has_no_latency" || data51 === "span_kind_has_no_token_usage" || data51 === "claude_private_lookup_not_supported" || data51 === "cursor_private_lookup_not_supported" || data51 === "codex_span_not_notify_derived" || data51 === "agent_private_lookup_not_supported" || data51 === "local_opt_in_lookup_required" || data51 === "withheld_by_privacy_policy")) {
+                                if (!(data51 === "reported_by_adapter" || data51 === "derived_from_trace_context" || data51 === "legacy_v1_report" || data51 === "source_not_provided" || data51 === "not_evaluated" || data51 === "partial_token_metrics" || data51 === "historical_codex_source_not_lookup_eligible" || data51 === "codex_notify_turn_correlation_unavailable" || data51 === "ambiguous_trace_repository" || data51 === "span_kind_not_model_backed" || data51 === "span_kind_has_no_latency" || data51 === "span_kind_has_no_token_usage" || data51 === "claude_private_lookup_not_supported" || data51 === "cursor_private_lookup_not_supported" || data51 === "codex_span_not_notify_derived" || data51 === "agent_private_lookup_not_supported" || data51 === "local_opt_in_lookup_required" || data51 === "withheld_by_privacy_policy")) {
                                   validate30.errors = [{ instancePath: instancePath + "/tokens/reason", schemaPath: "#/$defs/field_availability/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.properties.reason.enum }, message: "must be equal to one of the allowed values" }];
                                   return false;
                                 }
@@ -2194,7 +2194,7 @@
                           if (data52.reason !== void 0) {
                             let data56 = data52.reason;
                             const _errs103 = errors;
-                            if (!(data56 === "source_not_provided" || data56 === "partial_token_metrics" || data56 === "historical_codex_source_not_lookup_eligible" || data56 === "codex_notify_turn_correlation_unavailable" || data56 === "ambiguous_trace_repository" || data56 === "legacy_v1_report")) {
+                            if (!(data56 === "source_not_provided" || data56 === "not_evaluated" || data56 === "partial_token_metrics" || data56 === "historical_codex_source_not_lookup_eligible" || data56 === "codex_notify_turn_correlation_unavailable" || data56 === "ambiguous_trace_repository" || data56 === "legacy_v1_report")) {
                               const err47 = { instancePath: instancePath + "/latency/reason", schemaPath: "#/$defs/field_availability/oneOf/1/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.oneOf[1].properties.reason.enum }, message: "must be equal to one of the allowed values" };
                               if (vErrors === null) {
                                 vErrors = [err47];
@@ -2430,7 +2430,7 @@
                                     validate30.errors = [{ instancePath: instancePath + "/latency/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
                                     return false;
                                   }
-                                  if (!(data64 === "reported_by_adapter" || data64 === "derived_from_trace_context" || data64 === "legacy_v1_report" || data64 === "source_not_provided" || data64 === "partial_token_metrics" || data64 === "historical_codex_source_not_lookup_eligible" || data64 === "codex_notify_turn_correlation_unavailable" || data64 === "ambiguous_trace_repository" || data64 === "span_kind_not_model_backed" || data64 === "span_kind_has_no_latency" || data64 === "span_kind_has_no_token_usage" || data64 === "claude_private_lookup_not_supported" || data64 === "cursor_private_lookup_not_supported" || data64 === "codex_span_not_notify_derived" || data64 === "agent_private_lookup_not_supported" || data64 === "local_opt_in_lookup_required" || data64 === "withheld_by_privacy_policy")) {
+                                  if (!(data64 === "reported_by_adapter" || data64 === "derived_from_trace_context" || data64 === "legacy_v1_report" || data64 === "source_not_provided" || data64 === "not_evaluated" || data64 === "partial_token_metrics" || data64 === "historical_codex_source_not_lookup_eligible" || data64 === "codex_notify_turn_correlation_unavailable" || data64 === "ambiguous_trace_repository" || data64 === "span_kind_not_model_backed" || data64 === "span_kind_has_no_latency" || data64 === "span_kind_has_no_token_usage" || data64 === "claude_private_lookup_not_supported" || data64 === "cursor_private_lookup_not_supported" || data64 === "codex_span_not_notify_derived" || data64 === "agent_private_lookup_not_supported" || data64 === "local_opt_in_lookup_required" || data64 === "withheld_by_privacy_policy")) {
                                     validate30.errors = [{ instancePath: instancePath + "/latency/reason", schemaPath: "#/$defs/field_availability/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.properties.reason.enum }, message: "must be equal to one of the allowed values" }];
                                     return false;
                                   }
@@ -2523,7 +2523,7 @@
                             if (data65.reason !== void 0) {
                               let data69 = data65.reason;
                               const _errs126 = errors;
-                              if (!(data69 === "source_not_provided" || data69 === "partial_token_metrics" || data69 === "historical_codex_source_not_lookup_eligible" || data69 === "codex_notify_turn_correlation_unavailable" || data69 === "ambiguous_trace_repository" || data69 === "legacy_v1_report")) {
+                              if (!(data69 === "source_not_provided" || data69 === "not_evaluated" || data69 === "partial_token_metrics" || data69 === "historical_codex_source_not_lookup_eligible" || data69 === "codex_notify_turn_correlation_unavailable" || data69 === "ambiguous_trace_repository" || data69 === "legacy_v1_report")) {
                                 const err58 = { instancePath: instancePath + "/sourceLocation/reason", schemaPath: "#/$defs/field_availability/oneOf/1/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.oneOf[1].properties.reason.enum }, message: "must be equal to one of the allowed values" };
                                 if (vErrors === null) {
                                   vErrors = [err58];
@@ -2759,7 +2759,7 @@
                                       validate30.errors = [{ instancePath: instancePath + "/sourceLocation/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
                                       return false;
                                     }
-                                    if (!(data77 === "reported_by_adapter" || data77 === "derived_from_trace_context" || data77 === "legacy_v1_report" || data77 === "source_not_provided" || data77 === "partial_token_metrics" || data77 === "historical_codex_source_not_lookup_eligible" || data77 === "codex_notify_turn_correlation_unavailable" || data77 === "ambiguous_trace_repository" || data77 === "span_kind_not_model_backed" || data77 === "span_kind_has_no_latency" || data77 === "span_kind_has_no_token_usage" || data77 === "claude_private_lookup_not_supported" || data77 === "cursor_private_lookup_not_supported" || data77 === "codex_span_not_notify_derived" || data77 === "agent_private_lookup_not_supported" || data77 === "local_opt_in_lookup_required" || data77 === "withheld_by_privacy_policy")) {
+                                    if (!(data77 === "reported_by_adapter" || data77 === "derived_from_trace_context" || data77 === "legacy_v1_report" || data77 === "source_not_provided" || data77 === "not_evaluated" || data77 === "partial_token_metrics" || data77 === "historical_codex_source_not_lookup_eligible" || data77 === "codex_notify_turn_correlation_unavailable" || data77 === "ambiguous_trace_repository" || data77 === "span_kind_not_model_backed" || data77 === "span_kind_has_no_latency" || data77 === "span_kind_has_no_token_usage" || data77 === "claude_private_lookup_not_supported" || data77 === "cursor_private_lookup_not_supported" || data77 === "codex_span_not_notify_derived" || data77 === "agent_private_lookup_not_supported" || data77 === "local_opt_in_lookup_required" || data77 === "withheld_by_privacy_policy")) {
                                       validate30.errors = [{ instancePath: instancePath + "/sourceLocation/reason", schemaPath: "#/$defs/field_availability/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.properties.reason.enum }, message: "must be equal to one of the allowed values" }];
                                       return false;
                                     }
@@ -2852,7 +2852,7 @@
                               if (data78.reason !== void 0) {
                                 let data82 = data78.reason;
                                 const _errs149 = errors;
-                                if (!(data82 === "source_not_provided" || data82 === "partial_token_metrics" || data82 === "historical_codex_source_not_lookup_eligible" || data82 === "codex_notify_turn_correlation_unavailable" || data82 === "ambiguous_trace_repository" || data82 === "legacy_v1_report")) {
+                                if (!(data82 === "source_not_provided" || data82 === "not_evaluated" || data82 === "partial_token_metrics" || data82 === "historical_codex_source_not_lookup_eligible" || data82 === "codex_notify_turn_correlation_unavailable" || data82 === "ambiguous_trace_repository" || data82 === "legacy_v1_report")) {
                                   const err69 = { instancePath: instancePath + "/requestContent/reason", schemaPath: "#/$defs/field_availability/oneOf/1/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.oneOf[1].properties.reason.enum }, message: "must be equal to one of the allowed values" };
                                   if (vErrors === null) {
                                     vErrors = [err69];
@@ -3088,7 +3088,7 @@
                                         validate30.errors = [{ instancePath: instancePath + "/requestContent/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
                                         return false;
                                       }
-                                      if (!(data90 === "reported_by_adapter" || data90 === "derived_from_trace_context" || data90 === "legacy_v1_report" || data90 === "source_not_provided" || data90 === "partial_token_metrics" || data90 === "historical_codex_source_not_lookup_eligible" || data90 === "codex_notify_turn_correlation_unavailable" || data90 === "ambiguous_trace_repository" || data90 === "span_kind_not_model_backed" || data90 === "span_kind_has_no_latency" || data90 === "span_kind_has_no_token_usage" || data90 === "claude_private_lookup_not_supported" || data90 === "cursor_private_lookup_not_supported" || data90 === "codex_span_not_notify_derived" || data90 === "agent_private_lookup_not_supported" || data90 === "local_opt_in_lookup_required" || data90 === "withheld_by_privacy_policy")) {
+                                      if (!(data90 === "reported_by_adapter" || data90 === "derived_from_trace_context" || data90 === "legacy_v1_report" || data90 === "source_not_provided" || data90 === "not_evaluated" || data90 === "partial_token_metrics" || data90 === "historical_codex_source_not_lookup_eligible" || data90 === "codex_notify_turn_correlation_unavailable" || data90 === "ambiguous_trace_repository" || data90 === "span_kind_not_model_backed" || data90 === "span_kind_has_no_latency" || data90 === "span_kind_has_no_token_usage" || data90 === "claude_private_lookup_not_supported" || data90 === "cursor_private_lookup_not_supported" || data90 === "codex_span_not_notify_derived" || data90 === "agent_private_lookup_not_supported" || data90 === "local_opt_in_lookup_required" || data90 === "withheld_by_privacy_policy")) {
                                         validate30.errors = [{ instancePath: instancePath + "/requestContent/reason", schemaPath: "#/$defs/field_availability/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.properties.reason.enum }, message: "must be equal to one of the allowed values" }];
                                         return false;
                                       }
@@ -3181,7 +3181,7 @@
                                 if (data91.reason !== void 0) {
                                   let data95 = data91.reason;
                                   const _errs172 = errors;
-                                  if (!(data95 === "source_not_provided" || data95 === "partial_token_metrics" || data95 === "historical_codex_source_not_lookup_eligible" || data95 === "codex_notify_turn_correlation_unavailable" || data95 === "ambiguous_trace_repository" || data95 === "legacy_v1_report")) {
+                                  if (!(data95 === "source_not_provided" || data95 === "not_evaluated" || data95 === "partial_token_metrics" || data95 === "historical_codex_source_not_lookup_eligible" || data95 === "codex_notify_turn_correlation_unavailable" || data95 === "ambiguous_trace_repository" || data95 === "legacy_v1_report")) {
                                     const err80 = { instancePath: instancePath + "/responseContent/reason", schemaPath: "#/$defs/field_availability/oneOf/1/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.oneOf[1].properties.reason.enum }, message: "must be equal to one of the allowed values" };
                                     if (vErrors === null) {
                                       vErrors = [err80];
@@ -3417,7 +3417,7 @@
                                           validate30.errors = [{ instancePath: instancePath + "/responseContent/reason", schemaPath: "#/$defs/field_availability/properties/reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
                                           return false;
                                         }
-                                        if (!(data103 === "reported_by_adapter" || data103 === "derived_from_trace_context" || data103 === "legacy_v1_report" || data103 === "source_not_provided" || data103 === "partial_token_metrics" || data103 === "historical_codex_source_not_lookup_eligible" || data103 === "codex_notify_turn_correlation_unavailable" || data103 === "ambiguous_trace_repository" || data103 === "span_kind_not_model_backed" || data103 === "span_kind_has_no_latency" || data103 === "span_kind_has_no_token_usage" || data103 === "claude_private_lookup_not_supported" || data103 === "cursor_private_lookup_not_supported" || data103 === "codex_span_not_notify_derived" || data103 === "agent_private_lookup_not_supported" || data103 === "local_opt_in_lookup_required" || data103 === "withheld_by_privacy_policy")) {
+                                        if (!(data103 === "reported_by_adapter" || data103 === "derived_from_trace_context" || data103 === "legacy_v1_report" || data103 === "source_not_provided" || data103 === "not_evaluated" || data103 === "partial_token_metrics" || data103 === "historical_codex_source_not_lookup_eligible" || data103 === "codex_notify_turn_correlation_unavailable" || data103 === "ambiguous_trace_repository" || data103 === "span_kind_not_model_backed" || data103 === "span_kind_has_no_latency" || data103 === "span_kind_has_no_token_usage" || data103 === "claude_private_lookup_not_supported" || data103 === "cursor_private_lookup_not_supported" || data103 === "codex_span_not_notify_derived" || data103 === "agent_private_lookup_not_supported" || data103 === "local_opt_in_lookup_required" || data103 === "withheld_by_privacy_policy")) {
                                           validate30.errors = [{ instancePath: instancePath + "/responseContent/reason", schemaPath: "#/$defs/field_availability/properties/reason/enum", keyword: "enum", params: { allowedValues: schema50.properties.reason.enum }, message: "must be equal to one of the allowed values" }];
                                           return false;
                                         }
@@ -5116,6 +5116,166 @@
   }
   validate20.evaluated = { "props": true, "dynamicProps": false, "dynamicItems": false };
 
+  // ui/report/generated/validate-private-codex-turn-detail-v1.ts
+  var validatePrivateDetailShape = validate202;
+  var schema31 = { "title": "PrivateCodexTurnDetailV1", "description": "Local-only private Codex turn detail. This contract must not be promoted to canonical reports, durable records, diagnostics, exports, or team transport.", "$comment": "The complete compact UTF-8 JSON representation is additionally limited to 65536 bytes by both Rust and the generated TypeScript validator.", "x-agent-observability-max-serialized-utf8-bytes": 65536, "type": "object", "additionalProperties": false, "required": ["schemaVersion", "turnId", "cwd", "inputMessages", "lastAssistantMessage"], "properties": { "schemaVersion": { "const": "agent_observability.private_turn_detail.v1" }, "turnId": { "type": "string", "pattern": "^id:sha256:[0-9a-f]{64}$" }, "cwd": { "type": "string", "not": { "const": "" } }, "inputMessages": { "type": "array", "items": { "type": "string" } }, "lastAssistantMessage": { "type": ["string", "null"] } } };
+  var pattern4 = new RegExp("^id:sha256:[0-9a-f]{64}$", "u");
+  function validate202(data, { instancePath = "", parentData, parentDataProperty, rootData = data, dynamicAnchors = {} } = {}) {
+    let vErrors = null;
+    let errors = 0;
+    const evaluated0 = validate202.evaluated;
+    if (evaluated0.dynamicProps) {
+      evaluated0.props = void 0;
+    }
+    if (evaluated0.dynamicItems) {
+      evaluated0.items = void 0;
+    }
+    if (errors === 0) {
+      if (data && typeof data == "object" && !Array.isArray(data)) {
+        let missing0;
+        if (data.schemaVersion === void 0 && (missing0 = "schemaVersion") || data.turnId === void 0 && (missing0 = "turnId") || data.cwd === void 0 && (missing0 = "cwd") || data.inputMessages === void 0 && (missing0 = "inputMessages") || data.lastAssistantMessage === void 0 && (missing0 = "lastAssistantMessage")) {
+          validate202.errors = [{ instancePath, schemaPath: "#/required", keyword: "required", params: { missingProperty: missing0 }, message: "must have required property '" + missing0 + "'" }];
+          return false;
+        } else {
+          const _errs3 = errors;
+          for (const key0 in data) {
+            if (!(key0 === "schemaVersion" || key0 === "turnId" || key0 === "cwd" || key0 === "inputMessages" || key0 === "lastAssistantMessage")) {
+              validate202.errors = [{ instancePath, schemaPath: "#/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key0 }, message: "must NOT have additional properties" }];
+              return false;
+              break;
+            }
+          }
+          if (_errs3 === errors) {
+            if (data.schemaVersion !== void 0) {
+              const _errs4 = errors;
+              if ("agent_observability.private_turn_detail.v1" !== data.schemaVersion) {
+                validate202.errors = [{ instancePath: instancePath + "/schemaVersion", schemaPath: "#/properties/schemaVersion/const", keyword: "const", params: { allowedValue: "agent_observability.private_turn_detail.v1" }, message: "must be equal to constant" }];
+                return false;
+              }
+              var valid0 = _errs4 === errors;
+            } else {
+              var valid0 = true;
+            }
+            if (valid0) {
+              if (data.turnId !== void 0) {
+                let data1 = data.turnId;
+                const _errs5 = errors;
+                if (errors === _errs5) {
+                  if (typeof data1 === "string") {
+                    if (!pattern4.test(data1)) {
+                      validate202.errors = [{ instancePath: instancePath + "/turnId", schemaPath: "#/properties/turnId/pattern", keyword: "pattern", params: { pattern: "^id:sha256:[0-9a-f]{64}$" }, message: 'must match pattern "^id:sha256:[0-9a-f]{64}$"' }];
+                      return false;
+                    }
+                  } else {
+                    validate202.errors = [{ instancePath: instancePath + "/turnId", schemaPath: "#/properties/turnId/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                    return false;
+                  }
+                }
+                var valid0 = _errs5 === errors;
+              } else {
+                var valid0 = true;
+              }
+              if (valid0) {
+                if (data.cwd !== void 0) {
+                  let data2 = data.cwd;
+                  const _errs7 = errors;
+                  if (typeof data2 !== "string") {
+                    validate202.errors = [{ instancePath: instancePath + "/cwd", schemaPath: "#/properties/cwd/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                    return false;
+                  }
+                  const _errs9 = errors;
+                  const _errs10 = errors;
+                  if ("" !== data2) {
+                    const err0 = {};
+                    if (vErrors === null) {
+                      vErrors = [err0];
+                    } else {
+                      vErrors.push(err0);
+                    }
+                    errors++;
+                  }
+                  var valid1 = _errs10 === errors;
+                  if (valid1) {
+                    validate202.errors = [{ instancePath: instancePath + "/cwd", schemaPath: "#/properties/cwd/not", keyword: "not", params: {}, message: "must NOT be valid" }];
+                    return false;
+                  } else {
+                    errors = _errs9;
+                    if (vErrors !== null) {
+                      if (_errs9) {
+                        vErrors.length = _errs9;
+                      } else {
+                        vErrors = null;
+                      }
+                    }
+                  }
+                  var valid0 = _errs7 === errors;
+                } else {
+                  var valid0 = true;
+                }
+                if (valid0) {
+                  if (data.inputMessages !== void 0) {
+                    let data3 = data.inputMessages;
+                    const _errs11 = errors;
+                    if (errors === _errs11) {
+                      if (Array.isArray(data3)) {
+                        var valid2 = true;
+                        const len0 = data3.length;
+                        for (let i0 = 0; i0 < len0; i0++) {
+                          const _errs13 = errors;
+                          if (typeof data3[i0] !== "string") {
+                            validate202.errors = [{ instancePath: instancePath + "/inputMessages/" + i0, schemaPath: "#/properties/inputMessages/items/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                            return false;
+                          }
+                          var valid2 = _errs13 === errors;
+                          if (!valid2) {
+                            break;
+                          }
+                        }
+                      } else {
+                        validate202.errors = [{ instancePath: instancePath + "/inputMessages", schemaPath: "#/properties/inputMessages/type", keyword: "type", params: { type: "array" }, message: "must be array" }];
+                        return false;
+                      }
+                    }
+                    var valid0 = _errs11 === errors;
+                  } else {
+                    var valid0 = true;
+                  }
+                  if (valid0) {
+                    if (data.lastAssistantMessage !== void 0) {
+                      let data5 = data.lastAssistantMessage;
+                      const _errs15 = errors;
+                      if (typeof data5 !== "string" && data5 !== null) {
+                        validate202.errors = [{ instancePath: instancePath + "/lastAssistantMessage", schemaPath: "#/properties/lastAssistantMessage/type", keyword: "type", params: { type: schema31.properties.lastAssistantMessage.type }, message: "must be string,null" }];
+                        return false;
+                      }
+                      var valid0 = _errs15 === errors;
+                    } else {
+                      var valid0 = true;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else {
+        validate202.errors = [{ instancePath, schemaPath: "#/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+        return false;
+      }
+    }
+    validate202.errors = vErrors;
+    return errors === 0;
+  }
+  validate202.evaluated = { "props": true, "dynamicProps": false, "dynamicItems": false };
+  function validatePrivateCodexTurnDetailV1(value) {
+    if (!validatePrivateDetailShape(value)) return false;
+    try {
+      return new TextEncoder().encode(JSON.stringify(value)).byteLength <= 65536;
+    } catch {
+      return false;
+    }
+  }
+
   // ui/report/view-state.ts
   var UNKNOWN = "unknown";
   function buildFilteredView(spans, traces, state) {
@@ -5323,7 +5483,6 @@
   var FILTER_OPTION_LIMIT = 500;
   var SAVED_FILTER_LIMIT = 20;
   var SAVED_FILTER_KEY = "agent-observability.report.v1.saved-filters";
-  var PRIVATE_DETAIL_VERSION = "agent_observability.private_turn_detail.v1";
   var reportData = document.getElementById("report-data");
   if (!reportData) throw new Error("Missing report data");
   var candidate = parseReportData(reportData.textContent);
@@ -5647,8 +5806,11 @@
         }
         if (!response.ok) throw new Error("private detail request failed");
         const detail = await response.json();
-        if (!validPrivateDetail(detail, span.turnId)) throw new Error("private detail contract mismatch");
-        target.innerHTML = `<h3>Private local detail</h3><p class="private-banner">Sensitive content stored only in this private local runtime. Review before sharing screenshots.</p><dl class="detail-grid">${detailRow("Opened from", detail.cwd)}</dl><h3>Request</h3><pre class="private-content" tabindex="0">${escapeHtml(detail.inputMessages.join("\n\n"))}</pre><h3>Response</h3><pre class="private-content" tabindex="0">${escapeHtml(detail.lastAssistantMessage ?? "Unavailable: Codex did not provide an assistant response in this notification.")}</pre>`;
+        if (!validatePrivateCodexTurnDetailV1(detail) || detail.turnId !== span.turnId) {
+          throw new Error("private detail contract mismatch");
+        }
+        const privateDetail = detail;
+        target.innerHTML = `<h3>Private local detail</h3><p class="private-banner">Sensitive content stored only in this private local runtime. Review before sharing screenshots.</p><dl class="detail-grid">${detailRow("Opened from", privateDetail.cwd)}</dl><h3>Request</h3><pre class="private-content" tabindex="0">${escapeHtml(privateDetail.inputMessages.join("\n\n"))}</pre><h3>Response</h3><pre class="private-content" tabindex="0">${escapeHtml(privateDetail.lastAssistantMessage ?? "Unavailable: Codex did not provide an assistant response in this notification.")}</pre>`;
       } catch {
         if (request !== detailRequest || selectedSpanId !== span.spanId) return;
         target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Temporarily unavailable. The normal report remains usable.</p>';
@@ -5690,9 +5852,6 @@
     function hasActiveFilters() {
       return state.text.length > 0 || Object.keys(selects).some((key) => state[key] !== void 0);
     }
-  }
-  function validPrivateDetail(value, turnId) {
-    return value?.schemaVersion === PRIVATE_DETAIL_VERSION && value.turnId === turnId && typeof value.cwd === "string" && Array.isArray(value.inputMessages) && value.inputMessages.every((message) => typeof message === "string") && (value.lastAssistantMessage === null || typeof value.lastAssistantMessage === "string");
   }
   function availabilityLabel(field) {
     const state = field.state.replaceAll("_", " ");
