@@ -1615,8 +1615,8 @@ impl ReportDtoV2 {
                 &span.availability.request_content,
                 &span.availability.response_content,
             ] {
-                if field.reason.is_empty() || field.reason.len() > 96 {
-                    return Err(ContractError::EmptyOptionalString);
+                if !valid_availability_reason(field) {
+                    return Err(ContractError::ContradictoryReportAvailability);
                 }
             }
             if let Some(amount) = span.estimated_cost {
@@ -1626,6 +1626,37 @@ impl ReportDtoV2 {
         }
         Ok(())
     }
+}
+
+fn valid_availability_reason(field: &FieldAvailabilityV2) -> bool {
+    use AvailabilityStateV2::{
+        Available, NotApplicable, PrivateLookup, SourceUnavailable, Withheld,
+    };
+    matches!(
+        (field.state, field.reason.as_str()),
+        (
+            Available,
+            "reported_by_adapter" | "derived_from_trace_context" | "legacy_v1_report"
+        ) | (
+            SourceUnavailable,
+            "source_not_provided"
+                | "partial_token_metrics"
+                | "historical_codex_source_not_lookup_eligible"
+                | "codex_notify_turn_correlation_unavailable"
+                | "ambiguous_trace_repository"
+                | "legacy_v1_report"
+        ) | (
+            NotApplicable,
+            "span_kind_not_model_backed"
+                | "span_kind_has_no_latency"
+                | "span_kind_has_no_token_usage"
+                | "claude_private_lookup_not_supported"
+                | "cursor_private_lookup_not_supported"
+                | "codex_span_not_notify_derived"
+                | "agent_private_lookup_not_supported"
+        ) | (PrivateLookup, "local_opt_in_lookup_required")
+            | (Withheld, "withheld_by_privacy_policy")
+    )
 }
 
 impl TryFrom<ReportDtoV1> for ReportDtoV2 {

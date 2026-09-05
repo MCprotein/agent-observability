@@ -42,14 +42,14 @@
     "repo": "repo",
     "agent": { "name": "codex", "model": "gpt" },
     "availability": {
-      "repository": { "state": "available", "reason": "fixture" },
-      "turn": { "state": "available", "reason": "fixture" },
-      "model": { "state": "available", "reason": "fixture" },
-      "tokens": { "state": "available", "reason": "fixture" },
-      "latency": { "state": "available", "reason": "fixture" },
-      "sourceLocation": { "state": "private_lookup", "reason": "fixture" },
-      "requestContent": { "state": "private_lookup", "reason": "fixture" },
-      "responseContent": { "state": "private_lookup", "reason": "fixture" }
+      "repository": { "state": "available", "reason": "reported_by_adapter" },
+      "turn": { "state": "available", "reason": "reported_by_adapter" },
+      "model": { "state": "available", "reason": "reported_by_adapter" },
+      "tokens": { "state": "available", "reason": "reported_by_adapter" },
+      "latency": { "state": "available", "reason": "reported_by_adapter" },
+      "sourceLocation": { "state": "private_lookup", "reason": "local_opt_in_lookup_required" },
+      "requestContent": { "state": "private_lookup", "reason": "local_opt_in_lookup_required" },
+      "responseContent": { "state": "private_lookup", "reason": "local_opt_in_lookup_required" }
     },
     "sessionId": "session",
     "turnId": "turn",

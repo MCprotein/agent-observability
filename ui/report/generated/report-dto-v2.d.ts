@@ -22,6 +22,66 @@ export type Span = {
   estimatedCost?: number;
   cost: Cost;
 };
+export type FieldAvailability = {
+  state: "available" | "source_unavailable" | "withheld" | "not_applicable" | "private_lookup";
+  reason:
+    | "reported_by_adapter"
+    | "derived_from_trace_context"
+    | "legacy_v1_report"
+    | "source_not_provided"
+    | "partial_token_metrics"
+    | "historical_codex_source_not_lookup_eligible"
+    | "codex_notify_turn_correlation_unavailable"
+    | "ambiguous_trace_repository"
+    | "span_kind_not_model_backed"
+    | "span_kind_has_no_latency"
+    | "span_kind_has_no_token_usage"
+    | "claude_private_lookup_not_supported"
+    | "cursor_private_lookup_not_supported"
+    | "codex_span_not_notify_derived"
+    | "agent_private_lookup_not_supported"
+    | "local_opt_in_lookup_required"
+    | "withheld_by_privacy_policy";
+} & FieldAvailability1;
+export type FieldAvailability1 =
+  | {
+      state?: "available";
+      reason?: "reported_by_adapter" | "derived_from_trace_context" | "legacy_v1_report";
+      [k: string]: unknown;
+    }
+  | {
+      state?: "source_unavailable";
+      reason?:
+        | "source_not_provided"
+        | "partial_token_metrics"
+        | "historical_codex_source_not_lookup_eligible"
+        | "codex_notify_turn_correlation_unavailable"
+        | "ambiguous_trace_repository"
+        | "legacy_v1_report";
+      [k: string]: unknown;
+    }
+  | {
+      state?: "not_applicable";
+      reason?:
+        | "span_kind_not_model_backed"
+        | "span_kind_has_no_latency"
+        | "span_kind_has_no_token_usage"
+        | "claude_private_lookup_not_supported"
+        | "cursor_private_lookup_not_supported"
+        | "codex_span_not_notify_derived"
+        | "agent_private_lookup_not_supported";
+      [k: string]: unknown;
+    }
+  | {
+      state?: "private_lookup";
+      reason?: "local_opt_in_lookup_required";
+      [k: string]: unknown;
+    }
+  | {
+      state?: "withheld";
+      reason?: "withheld_by_privacy_policy";
+      [k: string]: unknown;
+    };
 export type Scalar = string | number | boolean;
 
 export interface AgentObservabilityReportV2 {
@@ -111,10 +171,6 @@ export interface Availability {
   sourceLocation: FieldAvailability;
   requestContent: FieldAvailability;
   responseContent: FieldAvailability;
-}
-export interface FieldAvailability {
-  state: "available" | "source_unavailable" | "withheld" | "not_applicable" | "private_lookup";
-  reason: string;
 }
 export interface Attributes {
   source?: Scalar;
