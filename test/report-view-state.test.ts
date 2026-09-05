@@ -10,7 +10,7 @@ import {
   serializeSavedFilters,
   type DimensionFilters,
 } from "../ui/report/view-state.ts";
-import type { Span, Trace } from "../ui/report/generated/report-dto-v1.js";
+import type { Span, Trace } from "../ui/report/generated/report-dto-v2.js";
 
 test("keeps large local report view work and rendered slices bounded", () => {
   const spans = Array.from({ length: 4_096 }, (_, index) => spanFixture(index));
@@ -126,6 +126,16 @@ function spanFixture(index: number): Span {
     endTimeUnixMs: 1_005 + index * 10,
     repo: "repo-a",
     agent: { name: "codex", model: index % 2 === 0 ? "model-a" : "model-b" },
+    availability: {
+      repository: { state: "available", reason: "reported_by_adapter" },
+      turn: { state: "source_unavailable", reason: "source_not_provided" },
+      model: { state: "available", reason: "reported_by_adapter" },
+      tokens: { state: "source_unavailable", reason: "source_not_provided" },
+      latency: { state: "available", reason: "reported_by_adapter" },
+      sourceLocation: { state: "private_lookup", reason: "local_opt_in_lookup_required" },
+      requestContent: { state: "private_lookup", reason: "local_opt_in_lookup_required" },
+      responseContent: { state: "private_lookup", reason: "local_opt_in_lookup_required" },
+    },
     sessionId: `session-${traceIndex}`,
     attributes: {},
     metrics: { durationMs: 5 },

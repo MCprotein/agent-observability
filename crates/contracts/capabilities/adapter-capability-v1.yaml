@@ -208,7 +208,7 @@
   ],
   "automatic_local_capabilities": [
     {
-      "capability_version": "codex_automatic_local.v3",
+      "capability_version": "codex_automatic_local.v4",
       "adapter_family": "codex",
       "support_status": "experimental",
       "platforms": ["macos"],
@@ -219,7 +219,7 @@
         "https://developers.openai.com/codex/config-advanced",
         "https://developers.openai.com/codex/config-reference"
       ],
-      "receiver_boundary": "private_ca_https_exact_header_ipv4_loopback_otlp_http_json_v3",
+      "receiver_boundary": "private_ca_https_exact_header_ipv4_loopback_otlp_http_json_v4",
       "source_generation": "codex-otel-v1",
       "source_surfaces": [
         {
@@ -227,6 +227,7 @@
           "role": "primary",
           "transport": "ipv4_loopback_private_ca_https_exact_header_json",
           "endpoint": "/v1/logs",
+          "owned_fields": ["session.model", "request.status", "request.duration_ms", "request.tokens", "tool.category", "tool.status", "tool.duration_ms", "permission.decision"],
           "events": [
             "codex.conversation_starts",
             "codex.api_request",
@@ -241,11 +242,22 @@
           "role": "supplement",
           "transport": "ipv4_loopback_private_ca_https_exact_header_projected_json",
           "endpoint": "/v1/notify",
+          "owned_fields": ["turn.lifecycle", "project.pseudonymous_reference"],
+          "events": ["agent-turn-complete"]
+        },
+        {
+          "id": "codex_notify_private_turn_detail_v1",
+          "role": "optional_private_detail",
+          "transport": "ipv4_loopback_private_ca_https_exact_header_closed_json",
+          "endpoint": "/v1/notify/private-detail",
+          "owned_fields": ["source.cwd", "request.input_messages", "response.last_assistant_message"],
           "events": ["agent-turn-complete"]
         }
       ],
       "privacy": {
-        "content_fields_durable": false,
+        "canonical_content_fields_durable": false,
+        "opt_in_private_detail_fields_durable": true,
+        "private_detail_scope": "standalone_local_only_default_off",
         "raw_identifiers_durable": false,
         "raw_request_bodies_durable": false,
         "unknown_fields": {

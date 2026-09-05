@@ -6,9 +6,11 @@ use agent_observability_codex_integration::{
     disconnect as disconnect_codex, status as codex_status,
 };
 use agent_observability_contracts::MAX_REPORT_ARTIFACT_BYTES;
-use agent_observability_local_collector::REPORT_FILE_NAME;
+use agent_observability_local_collector::{
+    PrivateTurnDetailLookup, REPORT_FILE_NAME, lookup_private_turn_detail,
+};
 use agent_observability_local_runtime::{
-    ConfigServiceError, InstalledLayout, LocalConfigService, LocalRuntimeConfigV2, Singleton,
+    ConfigServiceError, InstalledLayout, LocalConfigService, LocalRuntimeConfigV3, Singleton,
     VersionedLocalConfig,
 };
 use axum::{
@@ -322,13 +324,14 @@ struct DashboardState {
     origin: String,
     token: String,
     report: PathBuf,
+    root: PathBuf,
     last_seen: Arc<Mutex<Instant>>,
 }
 
 #[derive(Debug, Serialize)]
 struct ConfigEnvelope {
-    config: LocalRuntimeConfigV2,
-    defaults: LocalRuntimeConfigV2,
+    config: LocalRuntimeConfigV3,
+    defaults: LocalRuntimeConfigV3,
     revision: String,
     collection_mode: &'static str,
 }
@@ -336,7 +339,7 @@ struct ConfigEnvelope {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateRequest {
-    config: LocalRuntimeConfigV2,
+    config: LocalRuntimeConfigV3,
     revision: String,
 }
 
@@ -445,6 +448,7 @@ async fn prepare_dashboard_path(
         origin: origin.clone(),
         token: token.clone(),
         report,
+        root: layout.root.clone(),
         last_seen: Arc::clone(&last_seen),
     };
     Ok(PreparedDashboard {
@@ -484,6 +488,10 @@ fn router(state: AppState) -> Router {
 fn dashboard_router(state: DashboardState) -> Router {
     Router::new()
         .route("/report/{token}", get(dashboard_document))
+        .route(
+            "/report/{token}/details/{turn_id}",
+            get(dashboard_turn_detail),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             dashboard_security_boundary,
@@ -529,6 +537,54 @@ async fn dashboard_document(
         .headers_mut()
         .insert(DASHBOARD_IDENTITY_HEADER, HeaderValue::from_static("1"));
     Ok(response)
+}
+
+async fn dashboard_turn_detail(
+    State(state): State<DashboardState>,
+    AxumPath((token, turn_id)): AxumPath<(String, String)>,
+) -> Response {
+    if !constant_time_equal(token.as_bytes(), state.token.as_bytes()) {
+        return private_detail_not_found();
+    }
+    if touch_last_seen(&state.last_seen).is_err() {
+        return private_detail_not_found();
+    }
+    let root = state.root;
+    match tokio::task::spawn_blocking(move || lookup_private_turn_detail(&root, &turn_id)).await {
+        Ok(PrivateTurnDetailLookup::Available(detail)) => {
+            let mut response = Body::from(detail).into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json; charset=utf-8"),
+            );
+            response
+        }
+        Ok(
+            PrivateTurnDetailLookup::NotCollected
+            | PrivateTurnDetailLookup::Failed("invalid_turn_id"),
+        ) => private_detail_not_found(),
+        Ok(PrivateTurnDetailLookup::Failed(code)) => private_detail_failed(code),
+        Err(_) => private_detail_failed("lookup_failed"),
+    }
+}
+
+fn private_detail_failed(code: &'static str) -> Response {
+    let body = format!(r#"{{"error":"capture_failed","code":"{code}"}}"#);
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response
+}
+
+fn private_detail_not_found() -> Response {
+    let mut response = (StatusCode::NOT_FOUND, r#"{"error":"not_found"}"#).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response
 }
 
 fn static_asset(body: &'static str, content_type: &'static str) -> Response {
@@ -850,7 +906,7 @@ fn apply_security_headers(headers: &mut HeaderMap, is_dashboard: bool) {
         header::CONTENT_SECURITY_POLICY,
         if is_dashboard {
             HeaderValue::from_static(
-                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
             )
         } else {
             HeaderValue::from_static(
@@ -1134,7 +1190,7 @@ async fn read_envelope(config: LocalConfigService) -> Result<ConfigEnvelope, Api
 fn envelope(versioned: VersionedLocalConfig) -> ConfigEnvelope {
     ConfigEnvelope {
         config: versioned.config,
-        defaults: LocalRuntimeConfigV2::default(),
+        defaults: LocalRuntimeConfigV3::default(),
         revision: versioned.revision,
         collection_mode: "automatic_codex",
     }
@@ -1248,7 +1304,10 @@ mod tests {
         run_integration, run_platform_opener, session_token,
     };
     use agent_observability_codex_integration::{CodexIntegrationStatus, IntegrationError};
-    use agent_observability_local_runtime::{LocalRuntimeConfigV2, install, revision};
+    use agent_observability_contracts::hash_opaque_identifier;
+    use agent_observability_local_runtime::{
+        ConfigMutationGuard, LocalRuntimeConfigV3, install, load, revision, save,
+    };
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
@@ -1283,7 +1342,7 @@ mod tests {
 
     #[test]
     fn config_revision_is_stable_and_change_sensitive() {
-        let first = LocalRuntimeConfigV2::default();
+        let first = LocalRuntimeConfigV3::default();
         let mut second = first.clone();
         second.enabled = false;
         assert_eq!(revision(&first).unwrap(), revision(&first).unwrap());
@@ -1641,7 +1700,7 @@ mod tests {
                 let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
                 let envelope: Value = serde_json::from_slice(&bytes).unwrap();
                 let stale_revision = envelope["revision"].as_str().unwrap().to_owned();
-                let mut config: LocalRuntimeConfigV2 =
+                let mut config: LocalRuntimeConfigV3 =
                     serde_json::from_value(envelope["config"].clone()).unwrap();
                 config.enabled = false;
                 let update = serde_json::json!({
@@ -1785,6 +1844,7 @@ mod tests {
                     origin: "http://127.0.0.1:43192".into(),
                     token: "dashboard-session".into(),
                     report: report.clone(),
+                    root: layout.root.clone(),
                     last_seen: Arc::new(Mutex::new(Instant::now())),
                 };
                 let app = dashboard_router(state);
@@ -1868,7 +1928,7 @@ mod tests {
                     .unwrap()
                     .to_str()
                     .unwrap();
-                assert!(csp.contains("connect-src 'none'"));
+                assert!(csp.contains("connect-src 'self'"));
                 assert!(csp.contains("frame-ancestors 'none'"));
                 assert_eq!(
                     dashboard
@@ -1879,6 +1939,157 @@ mod tests {
                 );
                 let body = to_bytes(dashboard.into_body(), 1024).await.unwrap();
                 assert_eq!(body.as_ref(), b"<!doctype html><title>Replacement</title>");
+
+                let turn_id = hash_opaque_identifier("turn-private");
+                let detail_uri = format!("/report/dashboard-session/details/{turn_id}");
+                let absent = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(&detail_uri)
+                            .header(header::HOST, "127.0.0.1:43192")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+                assert_eq!(
+                    absent
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("no-store, max-age=0")
+                );
+                assert_eq!(
+                    to_bytes(absent.into_body(), 128).await.unwrap().as_ref(),
+                    br#"{"error":"not_found"}"#
+                );
+
+                let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+                let mut config = load(&layout.config).unwrap();
+                config.capture_private_codex_turn_details = true;
+                save(&guard, &config).unwrap();
+                drop(guard);
+                let digest = turn_id.strip_prefix("id:sha256:").unwrap();
+                let detail_directory = layout.state.join("private-codex-turn-details");
+                fs::create_dir_all(&detail_directory).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&detail_directory, fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                let detail_path = detail_directory.join(format!("{digest}.json"));
+                fs::write(
+                    &detail_path,
+                    serde_json::to_vec(&serde_json::json!({
+                        "schemaVersion": "agent_observability.private_turn_detail.v1",
+                        "turnId": turn_id.clone(),
+                        "cwd": "/Users/private/exact-project",
+                        "inputMessages": ["PRIVATE_INPUT_SENTINEL"],
+                        "lastAssistantMessage": "PRIVATE_OUTPUT_SENTINEL"
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&detail_path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                let status_directory = layout.state.join("private-codex-turn-detail-statuses");
+                fs::create_dir_all(&status_directory).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&status_directory, fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                let status_path = status_directory.join(format!("{digest}.json"));
+                fs::write(
+                    &status_path,
+                    serde_json::to_vec(&serde_json::json!({
+                        "schema_version": "private_codex_turn_detail_status.v1",
+                        "turn_id": turn_id.clone(),
+                        "state": "available",
+                        "code": "ok"
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&status_path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+
+                let present = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(&detail_uri)
+                            .header(header::HOST, "127.0.0.1:43192")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(present.status(), StatusCode::OK);
+                assert_eq!(
+                    present
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("no-store, max-age=0")
+                );
+                let detail: serde_json::Value = serde_json::from_slice(
+                    &to_bytes(present.into_body(), 64 * 1024).await.unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    detail["schemaVersion"],
+                    "agent_observability.private_turn_detail.v1"
+                );
+                assert_eq!(detail["turnId"], turn_id);
+                assert_eq!(detail["cwd"], "/Users/private/exact-project");
+                assert_eq!(detail["inputMessages"][0], "PRIVATE_INPUT_SENTINEL");
+                assert_eq!(detail["lastAssistantMessage"], "PRIVATE_OUTPUT_SENTINEL");
+
+                fs::write(detail_path, b"{broken").unwrap();
+                let corrupt = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(&detail_uri)
+                            .header(header::HOST, "127.0.0.1:43192")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(corrupt.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    to_bytes(corrupt.into_body(), 128).await.unwrap().as_ref(),
+                    br#"{"error":"capture_failed","code":"artifact_invalid"}"#
+                );
+
+                let invalid = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/report/dashboard-session/details/not-a-hash")
+                            .header(header::HOST, "127.0.0.1:43192")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
+                assert_eq!(
+                    to_bytes(invalid.into_body(), 128).await.unwrap().as_ref(),
+                    br#"{"error":"not_found"}"#
+                );
 
                 let settings_api_is_absent = app
                     .clone()

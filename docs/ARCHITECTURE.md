@@ -6,7 +6,7 @@
 
 ## Current and target stack
 
-현재 `v1.8.4`는 **Released**다. macOS standalone은 Codex, Claude Code와 Cursor의 private
+현재 안정판은 `v1.9.1`이고, 이 문서는 `v1.10.0` 릴리스 후보의 경계를 함께 정의한다. macOS standalone은 Codex, Claude Code와 Cursor의 private
 handoff 수동 import를 daemon과 network 없이 계속 제공한다. 선택적 Codex automatic path는 private-CA
 HTTPS와 exact private random request header로 인증하는 `127.0.0.1` OTLP/HTTP JSON receiver,
 pre-transport projected notify supplement와 LaunchAgent를 추가한다. 이 transport는 mTLS가 아니다. Rust 경로는
@@ -222,22 +222,37 @@ anti-corruption layer다.
   `operation_id` 등을 명시적으로 채운다.
 - 원문 prompt, output, command, diff, file content를 canonical metadata로 가장하지 않는다.
 - Codex automatic notify helper는 raw notify를 settings/socket 접근 전에 closed content-free wire object로
-  축약한다. Receiver는 bounded raw OTLP JSON을 process memory에서 decode한 뒤 `conversation.id`,
+  축약한다. 이 projection에는 raw cwd/basename 대신 bounded pseudonymous project reference만 허용된다. Receiver는 bounded raw OTLP JSON을 process memory에서 decode한 뒤 `conversation.id`,
   `turn.id`, model, bounded tool category, request/call ID, decision, duration, token
   counts와 success처럼 명시적으로 소유한 scalar만 canonical adapter에 복사한다. Raw body, prompt,
-  response, tool arguments/output, command, cwd, path, account identity와 unknown attribute는 persist,
-  log, diagnostic, projection 또는 export하지 않는다.
+  response, tool arguments/output, command, cwd, path, account identity와 unknown attribute는 canonical
+  persist, log, diagnostic, projection 또는 export 경계를 통과하지 않는다.
+- Default-off private Codex detail capture는 공식 notify의 cwd, input messages, last assistant message만
+  전용 authenticated localhost endpoint의 bounded envelope로 받아 per-turn private artifact에 분리한다.
+  Receiver는 content-free projection을 먼저 canonical ingest하고 event loop 밖의 bounded blocking task에서 mutation lock 아래 private detail과
+  terminal status를 동기화한 경우에만 available 성공을 반환한다. 메모리 queue나 restart-stranded pending은
+  없다. 파일 기록·fsync·bounded scan·retention은 무한 재시도 없이 제한되며 상태는 일반 local storage
+  budget과 분리된 최대 1,024개×1KiB diagnostic headroom에 둔다. 같은 hashed turn ID의 동일 detail 재시도는 no-op이고
+  다른 detail은 `conflict`로 fail-closed한다. Startup reconciliation은 terminal status가 정확히 `ok`가 아닌
+  고아 detail artifact를 제거해 중단된 publication을 완료된 상세로 노출하지 않는다.
+  동일 hashed turn ID로 localhost dashboard에서 요청할 때만 읽고,
+  canonical observation, SQLite durable record, report DTO/static HTML, archive/export/team envelope와
+  dependency를 만들지 않는다. API wire request/response capture나 transcript scan은 하지 않는다.
 - 같은 contract fixture suite를 모든 adapter에 적용한다.
 - Codex의 `api_request`와 `sse_event(response.completed)`는 같은 request ID로 correlate하되
   transport attempt와 completed response를 별도 span으로 유지한다. usage는 completed response에만
   두며, 동일 canonical span의 재전달만 adapter에서 억제한다.
 - unsupported, content-ignored와 duplicate-suppressed 입력도 raw payload 없이 fixed enum만
   `adapter_dispositions`에 기록하며 같은 transaction에서 cursor를 진행한다.
-- Codex notify helper는 최대 64 KiB의 raw input을 받은 뒤 settings 또는 socket 접근 전에 더 작은 closed
-  content-free projection으로 축약한다. 이 projection만 private-CA HTTPS와 exact private request header로
-  loopback receiver에 전달하며 전체
+- Codex notify helper는 최대 64 KiB의 raw input을 받은 뒤 settings 또는 socket 접근 전에 closed
+  content-free projection으로 축약한다. 기본값에서는 이 projection만 전달한다. Private detail opt-in이면
+  같은 projection과 검증된 cwd/input/last-assistant 필드만 별도 closed envelope에 넣어 전용 localhost
+  route로 전달한다. 두 경로 모두 private-CA HTTPS와 exact private request header를 사용하며 전체
   connect/TLS/HTTP deadline 뒤 항상 fail open한다. 외부 network, full transcript parse, report render나
-  queue drain을 기다리지 않는다. Future file fallback은 persisted cursor와 source generation으로
+  별도 queue drain은 없다. Helper 진입 시 만든 250ms absolute deadline에서 bounded parse/config 시간을
+  차감한 나머지만 loopback connect/TLS/HTTP가 공유하며, 예산이 없으면 전송 전에 fail open한다.
+  available receipt는 detail과 terminal status가 모두 durable한 경우에만 반환한다. 실패 횟수는 collector
+  health counter로 확인한다. Future file fallback은 persisted cursor와 source generation으로
   incrementally reconcile한다.
 - 제품별 공식 source 우선순위와 지원 evidence는
   [`ADAPTER_COMPATIBILITY.md`](ADAPTER_COMPATIBILITY.md)를 따른다.
@@ -266,8 +281,8 @@ anti-corruption layer다.
 
 ### Local Runtime
 
-- standalone 설정은 `local_runtime.v2` strict JSON이다. 기존 v1은 retention 기본값으로 호환
-  로드한다. 팀 identity, 이메일, endpoint와 transport
+- standalone 설정은 `local_runtime.v3` strict JSON이다. 기존 v1/v2는 명시적 migration으로
+  private Codex detail capture를 끈 v3로 로드한다. 팀 identity, 이메일, endpoint와 transport
   설정은 포함하지 않는다.
 - Codex automatic integration은 별도 private `runtime/collector.json`,
   `runtime/integrations/codex/tls` credential tree와
@@ -394,11 +409,18 @@ Web UI는 TypeScript `strict` mode를 사용한다.
   authoritative source로 사용한다.
 - Rust가 생성한 sanitized report DTO만 입력으로 받는다.
 - DTO type은 versioned schema에서 생성하거나 runtime validation으로 확인한다.
+- Report v2의 availability reason은 schema에 열거된 state/reason 조합만 허용한다.
+  기본값 `source_unavailable/not_evaluated`는 아직 평가되지 않은 필드이며 값이 있다는 뜻이
+  아니다. source 평가 뒤에는 구체적인 사유를 사용한다. 원문 경로, 오류나 임의 설명을 reason에
+  넣지 않으며 Rust와 TypeScript는 모든 state/reason 조합을 같은 parity fixture로 검증한다.
+- 별도 로컬 private-detail 응답도 versioned schema에서 TypeScript 타입과 validator를 생성한다.
+  `lastAssistantMessage`는 필수 nullable 필드이고, 전체 compact UTF-8 JSON은 64 KiB 이하이다.
+  이 계약은 standalone 로컬 조회 전용이며 report DTO나 team 전송 필드를 확장하지 않는다.
 - 브라우저에서 외부 network 요청이나 상시 server 없이 동작한다. 기본 CLI 전달은 random
   read-only path capability를 쓰는 reloadable ephemeral IPv4 loopback server다. report-only router는
   `GET`/`HEAD`만 허용하고 idle/hard deadline에 종료된다.
 - agent별 예외 처리는 UI가 아니라 canonical contract나 adapter에서 해결한다.
-- Rust outbound infrastructure는 빌드된 TypeScript UI asset과 `ReportDtoV1`을 하나의
+- Rust outbound infrastructure는 빌드된 TypeScript UI asset과 `ReportDtoV2`를 하나의
   self-contained HTML artifact로 조립한다. `report <runtime-root> [rate-table-json]`은 SQLite의 typed
   snapshot을 bounded transaction과 generation fence로 record batch 단위로 읽고, SQLite read lock을
   닫은 뒤 privacy-safe span으로 즉시 축소한다. source record 전체를 별도 vector로 유지하지 않으며,

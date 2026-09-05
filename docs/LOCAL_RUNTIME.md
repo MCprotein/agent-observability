@@ -3,7 +3,7 @@
 v1.0.0 introduced the standalone local-only Rust runtime boundary. v1.2.0 added bounded local
 retention and private archive export; v1.4.0 added one-command setup, an isolated built-in demo,
 dashboard open, and atomic CLI configuration updates. v1.5.0 adds an explicit, ephemeral loopback
-settings UI. v1.8.4 is **Released** and provides optional Codex automatic local collection through a
+settings UI. The current stable release is v1.9.1; the v1.10.0 release candidate keeps optional Codex automatic local collection through a
 private-CA HTTPS IPv4 loopback receiver with an exact private random request header, plus a macOS LaunchAgent.
 This transport is not mTLS. Manual Codex, Claude Code and Cursor imports remain
 fully functional without a daemon, receiver, login or network. The automatic path makes no external request.
@@ -142,12 +142,40 @@ unowned edit made it an externally meaningful file. Restoration proceeds only wh
 and mode equal the recorded connected state at the commit checks. An edit observed by those checks fails closed and is preserved; the non-cooperating open-descriptor
 limitation above still applies. SQLite, JSONL and HTML data remain.
 
-The raw notify argument exists transiently only in the bounded foreground projector and is reduced before
-settings or socket access; the receiver sees only `ProjectedNotifyV1`. Raw OTLP requests can exist transiently in
-bounded receiver memory while JSON is decoded. Only explicitly allowlisted scalar identifiers, model/tool
-categories, decisions, timing, token counts and success state cross into the adapter. Raw prompt/response, tool
-arguments/output, command, cwd, path, account identity, unknown attributes and request bodies are never
-persisted, logged, projected, reported or exported.
+By default, the raw notify argument exists transiently only in the bounded foreground projector and is reduced
+before settings or socket access; the receiver writes `ProjectedNotifyV2`. During a rolling local upgrade the
+receiver also accepts the frozen content-free v1 shape, which has no project context. The v2 projection may carry
+a bounded pseudonymous project reference derived from cwd, never the raw cwd or basename. Raw OTLP requests can exist transiently in bounded
+receiver memory while JSON is decoded. Only explicitly allowlisted scalar identifiers, model/tool categories,
+decisions, timing, token counts and success state cross into the canonical adapter.
+
+When `capture_private_codex_turn_details` is explicitly enabled, the foreground notify helper sends the
+content-free projection plus validated source-provided cwd, input messages and last assistant message to a
+dedicated capability-protected localhost endpoint. The collector commits the projection, then synchronously writes
+the per-turn private artifact and content-free terminal status under a bounded mutation-lock acquisition in a blocking
+task outside the collector event loop. It returns
+`available` only after both publications complete; there is no ephemeral detail queue or restart-stranded pending
+state. A 250 ms deadline is established at helper entry; bounded parse/config time reduces the remaining shared
+loopback connect/TLS/HTTP budget, and an exhausted budget fails open before transport. The artifact is correlated by
+the same hashed turn ID shown in the report and is fetched only from the capability-protected localhost dashboard
+route. Raw detail can therefore exist transiently in this dedicated receiver request and synchronous write path, but it never
+enters the canonical observation, SQLite durable record, report DTO, static HTML, diagnostic, archive, export or
+team envelope. Disabling the
+option stops future capture and makes the dashboard detail route unavailable; it does not silently claim older
+turns were captured. API request/response wire bodies, tool arguments/output, commands, account identity and
+unknown attributes remain excluded.
+
+Detail capture accounting and status publication use the same runtime mutation lock with bounded acquisition;
+no status filesystem mutation runs without that guard and no path retries forever. A bounded per-turn content-free
+status sidecar records the terminal capture result (`ok`, conflict, storage budget, busy, size, runtime, or I/O
+failure), and the localhost panel
+distinguishes capture failure from a turn that was never collected. Raw detail expiry runs at collector startup
+and after an explicit `retention-apply`; status sidecars follow the same bounded count, scan and age policy. An
+expired file therefore does not require another Codex turn to be removed. Startup reconciliation also deletes a
+detail artifact unless its matching terminal status is exactly `ok`, so an interrupted publication cannot later be
+exposed as completed. Status sidecars use a separate diagnostic
+headroom capped at 1,024 files of at most 1 KiB each, so a full ordinary storage budget cannot erase the reason a
+detail was rejected.
 
 The collector transactionally commits source-ordered canonical observations and content-free dispositions
 through the same SQLite authority as manual import. Every current-record mutation, including retention, advances
@@ -171,8 +199,9 @@ The installed configuration is intentionally small:
 
 ~~~json
 {
-  "schema_version": "local_runtime.v2",
+  "schema_version": "local_runtime.v3",
   "enabled": true,
+  "capture_private_codex_turn_details": false,
   "collection": {
     "file_reconcile_interval_ms": 5000,
     "flush_interval_ms": 5000,
@@ -190,6 +219,10 @@ The installed configuration is intentionally small:
 }
 ~~~
 
+The runtime reads strict `local_runtime.v1` and `local_runtime.v2` documents through explicit
+migrations. Both migrate to v3 with private Codex turn-detail capture disabled; v2 remains a frozen
+compatibility schema and current writes always emit v3.
+
 `config set [root] <option> <value>` acquires the runtime singleton, validates the complete updated
 configuration, writes a private temporary file, syncs it, and atomically replaces `config.json`.
 Invalid updates leave the previous bytes unchanged. User-facing names, defaults, and bounds are in
@@ -199,8 +232,14 @@ Invalid updates leave the previous bytes unchanged. User-facing names, defaults,
 
 - Codex automatic OTLP/HTTP JSON request: at most 1 MiB and 4096 log records.
 - Codex notify payload: raw input at most 64 KiB and a smaller closed projected wire object. Projection happens
-  before I/O; one absolute foreground deadline constrains loopback connect, server-authenticated TLS handshake and the HTTP exchange
+  before I/O; opt-in detail uses one bounded closed localhost envelope and a bounded synchronous private publication.
+  One absolute foreground deadline constrains loopback connect,
+  server-authenticated TLS handshake and the HTTP exchange
   before the helper returns a fail-open accepted, rejected or unavailable outcome without waiting for report work.
+- Opt-in Codex private turn detail: one validated JSON artifact and one content-free capture-status sidecar per
+  hashed turn ID, each bounded and stored in private `0700` directories with `0600` files. Both directories are
+  pruned under bounded count, scan and retention policies; raw content is never copied into the canonical report
+  plane.
 - Raw foreground input: at most 1 MiB.
 - Privacy-projected local message: at most 64 KiB.
 - In-process ingress channel: 64 messages, one normalization writer, nonblocking admission. The

@@ -1,0 +1,64 @@
+{
+  "schemaVersion": "agent_observability.report.v2",
+  "generatedAt": "2026-09-05T00:00:00Z",
+  "title": "Current report fixture",
+  "summary": {
+    "generatedSpans": 1,
+    "sessions": 1,
+    "turns": 1,
+    "llmRequests": 1,
+    "toolExecutions": 0,
+    "errors": 0,
+    "inputTokens": 10,
+    "outputTokens": 4,
+    "cachedInputTokens": 0,
+    "cacheCreationInputTokens": 0,
+    "reasoningOutputTokens": 0,
+    "latencyMs": 12,
+    "durationMs": 12,
+    "estimatedCost": 0
+  },
+  "cost": {
+    "status": "unknown",
+    "rate_table": {},
+    "cost": { "assumption": "current fixture" }
+  },
+  "filters": {
+    "repos": ["repo"],
+    "sessions": ["session"],
+    "turns": ["turn"]
+  },
+  "traces": [],
+  "spans": [{
+    "schemaVersion": "agent_observability.v1",
+    "traceId": "trace",
+    "spanId": "span",
+    "parentSpanId": null,
+    "kind": "llm.request",
+    "name": "request",
+    "status": "ok",
+    "startTimeUnixMs": 1,
+    "endTimeUnixMs": 2,
+    "repo": "repo",
+    "agent": { "name": "codex", "model": "gpt" },
+    "availability": {
+      "repository": { "state": "available", "reason": "reported_by_adapter" },
+      "turn": { "state": "available", "reason": "reported_by_adapter" },
+      "model": { "state": "available", "reason": "reported_by_adapter" },
+      "tokens": { "state": "available", "reason": "reported_by_adapter" },
+      "latency": { "state": "available", "reason": "reported_by_adapter" },
+      "sourceLocation": { "state": "private_lookup", "reason": "local_opt_in_lookup_required" },
+      "requestContent": { "state": "private_lookup", "reason": "local_opt_in_lookup_required" },
+      "responseContent": { "state": "private_lookup", "reason": "local_opt_in_lookup_required" }
+    },
+    "sessionId": "session",
+    "turnId": "turn",
+    "attributes": {},
+    "metrics": { "inputTokens": 10, "outputTokens": 4, "latencyMs": 12 },
+    "cost": {
+      "status": "unknown",
+      "rate_table": {},
+      "cost": { "assumption": "current fixture" }
+    }
+  }]
+}

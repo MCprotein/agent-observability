@@ -1,5 +1,5 @@
 use crate::{
-    Admission, CollectionPolicyV1, LocalRuntimeConfigV2, PressureSample, Schedule, Scheduler,
+    Admission, CollectionPolicyV1, LocalRuntimeConfigV3, PressureSample, Schedule, Scheduler,
     StorageAccountingError, StorageBudget, StorageError,
 };
 use std::path::Path;
@@ -12,7 +12,7 @@ pub struct RuntimeControl {
 }
 
 impl RuntimeControl {
-    pub fn new(config: &LocalRuntimeConfigV2) -> Result<Self, ControlError> {
+    pub fn new(config: &LocalRuntimeConfigV3) -> Result<Self, ControlError> {
         config.validate().map_err(ControlError::Config)?;
         let storage = StorageBudget::calculate(config.collection.local_storage_budget_bytes, false)
             .map_err(ControlError::Storage)?;
@@ -96,7 +96,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("runtime-control-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let mut control = RuntimeControl::new(&LocalRuntimeConfigV2::default()).unwrap();
+        let mut control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
         assert!(matches!(
             control.admit(&root, 1).unwrap(),
             Admission::Allowed { .. }
@@ -123,7 +123,7 @@ mod tests {
             std::env::temp_dir().join(format!("runtime-control-denied-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let control = RuntimeControl::new(&LocalRuntimeConfigV2::default()).unwrap();
+        let control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
         assert_eq!(
             control
                 .admit(&root, control.storage_budget().total + 1)
@@ -139,7 +139,7 @@ mod tests {
             std::env::temp_dir().join(format!("runtime-migration-headroom-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let control = RuntimeControl::new(&LocalRuntimeConfigV2::default()).unwrap();
+        let control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
         let headroom = control.migration_headroom(&root).unwrap();
         assert!(headroom <= control.storage_budget().total);
         let _ = fs::remove_dir_all(root);

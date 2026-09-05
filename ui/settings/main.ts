@@ -19,8 +19,8 @@ import {
   XCircle,
   createIcons,
 } from "lucide";
-import validateConfig from "./generated/validate-local-runtime-config-v2.js";
-import type { LocalRuntimeConfigV2 } from "./generated/local-runtime-config-v2.js";
+import validateConfig from "./generated/validate-local-runtime-config-v3.js";
+import type { LocalRuntimeConfigV3 } from "./generated/local-runtime-config-v3.js";
 
 type FieldPath =
   | "collection.file_reconcile_interval_ms"
@@ -35,8 +35,8 @@ type FieldPath =
   | "retention.max_archive_bytes";
 
 type Envelope = {
-  config: LocalRuntimeConfigV2;
-  defaults: LocalRuntimeConfigV2;
+  config: LocalRuntimeConfigV3;
+  defaults: LocalRuntimeConfigV3;
   revision: string;
   collection_mode: "automatic_codex" | "manual_import";
 };
@@ -175,9 +175,9 @@ const fragmentToken = new URLSearchParams(location.hash.slice(1)).get("session")
 let token = fragmentToken || readSessionToken();
 if (fragmentToken) writeSessionToken(fragmentToken);
 history.replaceState(null, "", `${location.pathname}${location.search}`);
-let persisted: LocalRuntimeConfigV2 | null = null;
-let draft: LocalRuntimeConfigV2 | null = null;
-let defaults: LocalRuntimeConfigV2 | null = null;
+let persisted: LocalRuntimeConfigV3 | null = null;
+let draft: LocalRuntimeConfigV3 | null = null;
+let defaults: LocalRuntimeConfigV3 | null = null;
 let revision = "";
 let integration: IntegrationStatus | null = null;
 let integrationUnavailable = false;
@@ -303,6 +303,7 @@ function renderSettings(focusTarget?: string): void {
         <p class="nav-label">설정</p>
         <a href="#overview" class="active" aria-current="page"><i data-lucide="gauge"></i>개요</a>
         <a href="#collection"><i data-lucide="activity"></i>수집</a>
+        <a href="#privacy"><i data-lucide="shield-check"></i>개인정보</a>
         <a href="#storage"><i data-lucide="database"></i>저장소</a>
         <a href="#retention"><i data-lucide="archive"></i>보관</a>
         <div class="nav-note"><strong>Codex</strong><span>${configNavigationStatus()}</span><span>${collectorNavigationStatus()}</span></div>
@@ -311,6 +312,7 @@ function renderSettings(focusTarget?: string): void {
         <form id="settings-form" novalidate>
           ${overviewSection(draft)}
           ${collectionSection(draft)}
+          ${privacySection(draft)}
           ${storageSection(draft)}
           ${retentionSection(draft)}
         </form>
@@ -344,7 +346,7 @@ function renderSettings(focusTarget?: string): void {
   }
 }
 
-function overviewSection(config: LocalRuntimeConfigV2): string {
+function overviewSection(config: LocalRuntimeConfigV3): string {
   const storage = fields["collection.local_storage_budget_bytes"].format(
     config.collection.local_storage_budget_bytes,
   );
@@ -418,7 +420,7 @@ function collectorNavigationStatus(): string {
   return "collector 중지됨";
 }
 
-function collectionSection(config: LocalRuntimeConfigV2): string {
+function collectionSection(config: LocalRuntimeConfigV3): string {
   return `<section class="settings-section" id="collection" aria-labelledby="collection-title">
     ${sectionTitle("activity", "수집", "파일 확인과 durable 기록 반영 간격")}
     <div class="section-grid">
@@ -448,7 +450,7 @@ function collectionSection(config: LocalRuntimeConfigV2): string {
   </section>`;
 }
 
-function storageSection(config: LocalRuntimeConfigV2): string {
+function storageSection(config: LocalRuntimeConfigV3): string {
   return `<section class="settings-section" id="storage" aria-labelledby="storage-title">
     ${sectionTitle("database", "저장소", "로컬 데이터가 넘지 못하는 디스크 예산")}
     <div class="section-grid">
@@ -458,7 +460,20 @@ function storageSection(config: LocalRuntimeConfigV2): string {
   </section>`;
 }
 
-function retentionSection(config: LocalRuntimeConfigV2): string {
+function privacySection(config: LocalRuntimeConfigV3): string {
+  const enabled = config.capture_private_codex_turn_details ?? false;
+  return `<section class="settings-section" id="privacy" aria-labelledby="privacy-title">
+    <div class="section-title"><span class="section-icon"><i data-lucide="shield-check"></i></span><div><h2 id="privacy-title">개인정보</h2><p>Codex 작업 경로와 대화 내용을 별도 로컬 상세 저장소에 보관할지 선택합니다.</p></div></div>
+    <label class="collection-toggle privacy-toggle" data-boolean-field="capture_private_codex_turn_details">
+      <span><strong>요청·응답 상세 저장</strong><small id="private-details-copy">${enabled ? "새 Codex turn의 경로와 요청·응답을 로컬에 저장합니다" : "꺼짐 · 일반 지표와 해시 식별자만 저장합니다"}</small></span>
+      <input type="checkbox" id="capture-private-codex-turn-details" ${enabled ? "checked" : ""}>
+      <span class="toggle-track" aria-hidden="true"><span></span></span>
+    </label>
+    <div class="privacy-warning"><i data-lucide="shield-check"></i><div><strong>명시적으로 켠 이후의 새 turn부터 적용됩니다.</strong><span>원문은 team 전송·일반 리포트·export에 포함되지 않으며, 이 Mac의 private localhost 상세 화면에서만 요청할 때 읽습니다. 민감정보가 포함될 수 있습니다.</span></div></div>
+  </section>`;
+}
+
+function retentionSection(config: LocalRuntimeConfigV3): string {
   return `<section class="settings-section" id="retention" aria-labelledby="retention-title">
     ${sectionTitle("archive", "보관", "만료 대상과 private archive 크기 정책")}
     <div class="section-grid">
@@ -481,7 +496,7 @@ function summaryItem(icon: string, label: string, value: string): string {
   return `<div class="summary-item"><i data-lucide="${icon}"></i><span>${label}</span><strong>${value}</strong></div>`;
 }
 
-function fieldControl(field: Field, config: LocalRuntimeConfigV2): string {
+function fieldControl(field: Field, config: LocalRuntimeConfigV3): string {
   const value = getValue(config, field.path);
   const id = field.path.replaceAll(".", "-");
   return `<div class="field" data-field="${field.path}">
@@ -523,6 +538,7 @@ function bindEvents(): void {
   });
   form?.addEventListener("input", handleInput);
   document.querySelector("#enabled")?.addEventListener("change", handleEnabled);
+  document.querySelector("#capture-private-codex-turn-details")?.addEventListener("change", handlePrivateDetails);
   document.querySelector("#discard")?.addEventListener("click", discardChanges);
   document.querySelector("#reset")?.addEventListener("click", openResetDialog);
   document.querySelector("#cancel-reset")?.addEventListener("click", closeResetDialog);
@@ -692,6 +708,19 @@ function handleEnabled(event: Event): void {
   updateDirtyState();
 }
 
+function handlePrivateDetails(event: Event): void {
+  const input = event.target;
+  if (!(input instanceof HTMLInputElement) || !draft) return;
+  draft.capture_private_codex_turn_details = input.checked;
+  setText(
+    "private-details-copy",
+    input.checked
+      ? "새 Codex turn의 경로와 요청·응답을 로컬에 저장합니다"
+      : "꺼짐 · 일반 지표와 해시 식별자만 저장합니다",
+  );
+  updateDirtyState();
+}
+
 function updateAllVisuals(): void {
   if (!draft) return;
   document.querySelectorAll<HTMLElement>("[data-visual-value]").forEach((output) => {
@@ -743,9 +772,10 @@ function updateOverviewSummary(): void {
 function updateDirtyState(): void {
   if (!draft || !persisted) return;
   const changed = changedPaths(draft, persisted);
-  const dirty = draft.enabled !== persisted.enabled || changed.length > 0;
+  const booleanChanges = booleanChangeCount(draft, persisted);
+  const dirty = booleanChanges > 0 || changed.length > 0;
   document.querySelector<HTMLElement>("#save-band")?.classList.toggle("dirty", dirty);
-  setText("save-title", conflicted ? "외부 변경 감지" : dirty ? `${changed.length + Number(draft.enabled !== persisted.enabled)}개 변경` : "저장됨");
+  setText("save-title", conflicted ? "외부 변경 감지" : dirty ? `${changed.length + booleanChanges}개 변경` : "저장됨");
   setText("save-detail", conflicted ? "최신 설정을 다시 불러온 뒤 편집하세요." : dirty ? "저장 전까지 이 브라우저에만 유지됩니다." : "현재 설정과 같습니다.");
   setDisabled("save", !dirty || busy || conflicted);
   setDisabled("discard", !dirty || busy);
@@ -821,11 +851,16 @@ async function rebaseDraftOnLatest(): Promise<void> {
   const localBase = structuredClone(persisted);
   const changed = changedPaths(localDraft, localBase);
   const enabledChanged = localDraft.enabled !== localBase.enabled;
+  const privateDetailsChanged = (localDraft.capture_private_codex_turn_details ?? false)
+    !== (localBase.capture_private_codex_turn_details ?? false);
   const latest = await api<Envelope>("/api/config");
   applyEnvelope(latest);
   if (!draft) return;
   for (const path of changed) setValue(draft, path, getValue(localDraft, path));
   if (enabledChanged) draft.enabled = localDraft.enabled;
+  if (privateDetailsChanged) {
+    draft.capture_private_codex_turn_details = localDraft.capture_private_codex_turn_details ?? false;
+  }
   conflicted = false;
   renderSettings("save-title");
 }
@@ -953,7 +988,7 @@ function setActiveNavigation(hash: string): void {
 function isDirty(): boolean {
   return Boolean(
     draft && persisted &&
-      (draft.enabled !== persisted.enabled || changedPaths(draft, persisted).length > 0),
+      (booleanChangeCount(draft, persisted) > 0 || changedPaths(draft, persisted).length > 0),
   );
 }
 
@@ -1055,20 +1090,28 @@ function mountIcons(): void {
   });
 }
 
-function getValue(config: LocalRuntimeConfigV2, path: FieldPath): number {
+function getValue(config: LocalRuntimeConfigV3, path: FieldPath): number {
   const [group, key] = path.split(".") as ["collection" | "retention", string];
   return Number((config[group] as unknown as Record<string, number>)[key]);
 }
 
-function setValue(config: LocalRuntimeConfigV2, path: FieldPath, value: number): void {
+function setValue(config: LocalRuntimeConfigV3, path: FieldPath, value: number): void {
   const [group, key] = path.split(".") as ["collection" | "retention", string];
   (config[group] as unknown as Record<string, number>)[key] = value;
 }
 
-function changedPaths(left: LocalRuntimeConfigV2, right: LocalRuntimeConfigV2): FieldPath[] {
+function changedPaths(left: LocalRuntimeConfigV3, right: LocalRuntimeConfigV3): FieldPath[] {
   return (Object.keys(fields) as FieldPath[]).filter(
     (path) => getValue(left, path) !== getValue(right, path),
   );
+}
+
+function booleanChangeCount(left: LocalRuntimeConfigV3, right: LocalRuntimeConfigV3): number {
+  return Number(left.enabled !== right.enabled)
+    + Number(
+      (left.capture_private_codex_turn_details ?? false)
+        !== (right.capture_private_codex_turn_details ?? false),
+    );
 }
 
 function position(value: number, min: number, max: number, logarithmic: boolean): number {
