@@ -69,6 +69,10 @@ integration mutation도 private UI session, exact Host와 Origin을 확인하고
 
 ## Options
 
+The table below describes published v1.10.0. Opt-in lifecycle settings for v1.11.0 are under
+development and tracked separately in [Storage Lifecycle](STORAGE_LIFECYCLE.md); they must not be
+confused with the existing manual `retention-days` cutoff.
+
 | Option | Default | Allowed | Purpose |
 | --- | ---: | ---: | --- |
 | `enabled` | `true` | `true`, `false` | manual import와 automatic collector ingest 허용 여부 |

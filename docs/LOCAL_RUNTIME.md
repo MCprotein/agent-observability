@@ -293,6 +293,10 @@ accepted observations.
 
 ## Retention and private archive
 
+This section describes published v1.10.0 manual retention. The next version's opt-in automatic
+Hot/Warm/Cold lifecycle is in progress; see [Storage Lifecycle](STORAGE_LIFECYCLE.md) for its
+separate managed-data policy, safety limits and acceptance gates.
+
 `retention-plan` computes a cutoff from the current clock and `max_record_age_days`, then reports a
 deterministic bounded selection without writing an archive or changing retention authority. The CLI
 still installs and validates the private layout and opens the store, so first open may initialize or

@@ -307,6 +307,10 @@ flowchart TB
 
 ## Retention
 
+> 개발 중: 다음 버전의 Hot/Warm/Cold 전환과 자동 만료 정책은
+> [Storage Lifecycle](docs/STORAGE_LIFECYCLE.md)에 정리하고 있다. 아래는 공개 안정판 v1.10.0의
+> 수동 정리 동작이며, 개발 중인 자동 삭제 기능과 구분한다.
+
 보관 기간은 언제든 변경할 수 있지만 실제 정리는 자동 실행되지 않는다.
 
 ```mermaid

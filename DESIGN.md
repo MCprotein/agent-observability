@@ -177,6 +177,19 @@ Each item shows `not started`, `blocked`, `ready` or `verified`; percent-complet
 
 ## Design principles
 
+### Storage lifecycle controls — v1.11.0 in progress
+
+Reuse the existing standalone storage settings controls and tokens; do not introduce a separate
+design system. Show a Hot → Warm → Cold → Delete age timeline with cumulative day thresholds,
+an explicit automatic-maintenance toggle (off for migrated installations), independent raw-detail
+retention, cadence, and bounded pass size. See [Storage Lifecycle](docs/STORAGE_LIFECYCLE.md).
+The destructive consequence must be visible before saving: enabling maintenance or shortening
+retention applies to existing eligible data on the next pass and deletion cannot be undone.
+Do not display a fabricated affected-record count when a preview has not been computed.
+Keep validation messages beside the relevant fields and preserve unsaved values on conflict.
+Distinguish disabled, enabled, failed and storage-pressure states; configuration saved is not
+evidence that cleanup has run or that disk space has already been reclaimed.
+
 1. Scope before data: workspace, filters, time range and freshness precede every metric.
 2. Evidence over decoration: tables, timelines, distributions and links to traces carry the interface.
 3. Unknown is a state: zero, unknown, incomplete, stale and unauthorized are never conflated.

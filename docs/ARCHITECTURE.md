@@ -539,6 +539,16 @@ identity, unknown model, alias, snapshot, cache breakdown, pricing modifier를 �
 
 ## Maintainability and extensibility gates
 
+### v1.11.0 storage lifecycle work in progress
+
+[Storage Lifecycle](STORAGE_LIFECYCLE.md) defines the next standalone retention extension.
+Rust local-store owns atomic tier transitions and replay protection; local-runtime owns versioned
+policy and migration; the collector owns a quiet-period, bounded blocking maintenance task; CLI
+provides the same one-shot operation; TypeScript settings display the validated policy and deletion
+consequences. No Elasticsearch service, external archive sink or team transport is added.
+The current-release manual retention contract above remains the v1.10.0 reference until the new
+implementation and its migration, privacy, crash and performance gates pass.
+
 - canonical schema 변경에는 migration note와 이전 schema fixture가 필요하다.
 - adapter 추가에는 공통 parity suite와 unsupported-event fixture가 필요하다.
 - privacy 변경에는 raw sentinel이 log, report, snapshot 어디에도 남지 않는 fixture가 필요하다.

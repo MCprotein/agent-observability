@@ -268,6 +268,9 @@ filter하고 시각화할 뿐이며 가격을 다시 계산하지 않는다.
 
 ## Retention Flow
 
+Published v1.10.0 manual flow is shown below. The proposed automatic Hot/Warm/Cold flow is tracked
+in [Storage Lifecycle](STORAGE_LIFECYCLE.md) and is not yet a released collector behavior.
+
 ```mermaid
 flowchart TD
     Start["retention-plan"] --> Cutoff["UTC-day cutoff"]

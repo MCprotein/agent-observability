@@ -55,7 +55,7 @@ gate를 통과해 추가한다.
 | v0.x | Completed | Local-only PoC를 작은 minor release로 쪼개 검증했다. |
 | v1.x | Active | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
 
-## Active Train: v0.1.0-v1.10.0
+## Active Train: v0.1.0-v1.11.0
 
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
@@ -96,6 +96,16 @@ gate를 통과해 추가한다.
 | v1.9.0 | Released | Human-friendly local web entrypoints | `settings` is the primary configuration command with `ui` compatibility; the self-contained dashboard is served through a capability-separated, reloadable, runtime-stable `127.0.0.1` origin with saved-view and private file compatibility; settings-launched dashboards have an independent bounded process lifetime; commercial team remains TODO | Exact-source evidence run `33841633136`, independent review in `docs/reviews/v1.9.0.md`, merge `da79a47e5fe2ed30d51e6747f293846addd21b52`, and release run `33843371911` attempt 3 passed; universal arm64/x64 artifacts, GitHub Package, public Release, checksums, and attestations published |
 | v1.9.1 | Released | Settings status and LaunchAgent recovery hotfix | Refresh Codex integration status without page reload, ignore stale overlapping responses, keep session expiry authoritative, retry one transient startup-unavailable state, and tolerate bounded asynchronous `launchctl bootout` convergence | Exact-source evidence run `33879838197`, independent review in `docs/reviews/v1.9.1.md`, merge `494ddbb8d8d78c6da74d9f30b167ade302616fb3`, and release run `33878650227` passed; public Release, Package, checksums, attestations, fresh v1.9.1 install, Settings QA, and live Codex dashboard growth verified |
 | v1.10.0 | Released | Explainable source context and private detail visibility | Replace ambiguous `unknown` rendering with field-level availability reasons, populate verified project/repository and bounded source-location metadata, and add standalone-only explicit opt-in private request detail storage and inspection; assistant response content remains unavailable unless an official source supplies it | Exact-source evidence run `33979306300`, independent review in `docs/reviews/v1.10.0.md`, merge `4996ece47c179fe47d0ce8dadb65a9621e3abf62`, and release run `34021039994` passed; public Release, Package publication step, all distributable checksums, universal archive attestation, public installer upgrade, and live Chrome dashboard growth verified |
+
+### v1.11.0 — Local storage lifecycle (In Progress)
+
+Configurable Hot/Warm/Cold ages, managed-data expiry, independent raw-detail retention and
+bounded automatic maintenance. Existing installations keep automatic deletion disabled until
+explicitly enabled. No Elasticsearch or external storage dependency is introduced.
+
+Scope and release gates: [Storage Lifecycle](docs/STORAGE_LIFECYCLE.md). Completion requires actual
+tier movement/deletion, versioned configuration parity, replay/crash/pressure safety, settings QA,
+measured performance and independent review. Published stable version remains v1.10.0.
 
 ## Branch Strategy
 

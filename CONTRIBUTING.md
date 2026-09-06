@@ -46,6 +46,15 @@ agent-observability는 버전 단위의 작은 pull request로 변경을 검토�
 
 ## Required Checks
 
+### Documentation impact check
+
+Every feature PR records the affected documentation and verifies each changed claim against code
+and fresh tests. Update ROADMAP scope/status, configuration examples, architecture/process flows
+and DESIGN when their contracts change; update README only where user-facing behavior changes.
+Do not rewrite historical release evidence or describe unimplemented plans as available features.
+Run `anamnesis context diagnose`, then review semantic freshness: a valid path alone does not prove
+the behavior described by a document. Record known warnings and remaining verification gaps in the PR.
+
 PR에 적용되는 명령은 버전 scope에 따라 달라질 수 있지만, 최소한 다음 저장소 검증을
 실행한다.
 
