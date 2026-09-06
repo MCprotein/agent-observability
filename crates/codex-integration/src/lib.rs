@@ -2043,7 +2043,7 @@ fn xml_escape(input: &str) -> String {
 mod tests {
     use super::{
         CodexIntegrationStatus, CollectorLifecycle, CollectorService, CollectorStatus,
-        ConfigConnectionStatus, ConfigLifecycle, ConnectionStatus, IntegrationError,
+        ConfigConnectionStatus, ConfigError, ConfigLifecycle, ConnectionStatus, IntegrationError,
         LaunchAgentOwnershipStatus, NotifyOwnership, NotifyStatus, codex_detected_at,
         collector_status, connect_prepared, connect_with_reloaded_settings,
         disconnect_owned_prepared, disconnect_prepared, ensure_codex_home, exporter_security,
@@ -3046,6 +3046,148 @@ mod tests {
         );
         assert_eq!(status.config, ConnectionStatus::Connected);
         assert_eq!(*lifecycle.events.borrow(), ["install", "health", "commit"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_setup_connect_rebases_only_unowned_config_edits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("automatic-setup-unowned-rebase");
+        let layout = install(&root).unwrap();
+        let settings = install_settings(&root).unwrap();
+        let config_path = root.join("codex-config.toml");
+        let original = b"notify = ['/external/notify']\nmodel = 'before'\n";
+        fs::write(&config_path, original).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        CodexConfigManager::new(
+            &config_path,
+            layout.runtime.join("integrations/codex"),
+            Path::new("/bin/agentobs"),
+            &root,
+            settings.port,
+            exporter_security(&layout, &settings).unwrap(),
+        )
+        .unwrap()
+        .connect()
+        .unwrap();
+
+        let mut edited = fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("model = 'before'", "model = 'after'")
+            .into_bytes();
+        edited.extend_from_slice(b"\n[features]\nnew_unowned_flag = true\n");
+        fs::write(&config_path, &edited).unwrap();
+
+        let lifecycle = FakeLifecycle::ready();
+        let status = connect_with_reloaded_settings(
+            &root,
+            Path::new("/bin/agentobs"),
+            &lifecycle,
+            false,
+            || load_settings(&root).map_err(Into::into),
+            |settings| {
+                CodexConfigManager::new(
+                    &config_path,
+                    layout.runtime.join("integrations/codex"),
+                    Path::new("/bin/agentobs"),
+                    &root,
+                    settings.port,
+                    exporter_security(&layout, settings)?,
+                )
+                .map_err(Into::into)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(status.config, ConnectionStatus::Connected);
+        assert_eq!(status.notify, Some(NotifyStatus::ExternalPreserved));
+        assert_eq!(fs::read(&config_path).unwrap(), edited);
+        assert_eq!(*lifecycle.events.borrow(), ["install", "health", "commit"]);
+
+        let manager = CodexConfigManager::new(
+            &config_path,
+            layout.runtime.join("integrations/codex"),
+            Path::new("/bin/agentobs"),
+            &root,
+            settings.port,
+            exporter_security(&layout, &settings).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manager.status().unwrap(), ConfigConnectionStatus::Connected);
+        assert_eq!(
+            manager.disconnect().unwrap(),
+            ConfigConnectionStatus::Disconnected
+        );
+        let disconnected = fs::read_to_string(&config_path).unwrap();
+        assert!(disconnected.contains("notify = ['/external/notify']"));
+        assert!(disconnected.contains("model = 'after'"));
+        assert!(disconnected.contains("[features]\nnew_unowned_flag = true"));
+        assert!(!disconnected.contains("[otel]"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_setup_connect_rejects_owned_otel_edits_without_rewriting_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("automatic-setup-owned-conflict");
+        let layout = install(&root).unwrap();
+        let settings = install_settings(&root).unwrap();
+        let config_path = root.join("codex-config.toml");
+        fs::write(&config_path, b"model = 'before'\n").unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        CodexConfigManager::new(
+            &config_path,
+            layout.runtime.join("integrations/codex"),
+            Path::new("/bin/agentobs"),
+            &root,
+            settings.port,
+            exporter_security(&layout, &settings).unwrap(),
+        )
+        .unwrap()
+        .connect()
+        .unwrap();
+
+        let edited = fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("environment = \"local\"", "environment = \"changed\"")
+            .into_bytes();
+        fs::write(&config_path, &edited).unwrap();
+
+        let lifecycle = FakeLifecycle::ready();
+        let error = connect_with_reloaded_settings(
+            &root,
+            Path::new("/bin/agentobs"),
+            &lifecycle,
+            false,
+            || load_settings(&root).map_err(Into::into),
+            |settings| {
+                CodexConfigManager::new(
+                    &config_path,
+                    layout.runtime.join("integrations/codex"),
+                    Path::new("/bin/agentobs"),
+                    &root,
+                    settings.port,
+                    exporter_security(&layout, settings)?,
+                )
+                .map_err(Into::into)
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IntegrationError::Config(ConfigError::Conflict)
+        ));
+        assert_eq!(fs::read(&config_path).unwrap(), edited);
+        assert_eq!(*lifecycle.events.borrow(), ["install", "health"]);
+
         let _ = fs::remove_dir_all(root);
     }
 

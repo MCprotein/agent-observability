@@ -107,6 +107,11 @@ Scope and release gates: [Storage Lifecycle](docs/STORAGE_LIFECYCLE.md). Complet
 tier movement/deletion, versioned configuration parity, replay/crash/pressure safety, settings QA,
 measured performance and independent review. Published stable version remains v1.10.0.
 
+The baseline `dd09e6d` long GitHub performance run passed. Live QA subsequently identified report
+refresh contention; the development fix uses an adaptive quiet window without weakening snapshot or
+deletion fences. Final-head checks, independent review and live recovery must pass before merging;
+the baseline measurement is not evidence for later code changes.
+
 ## Branch Strategy
 
 - `main` is the stable line. It should only receive verified version work.

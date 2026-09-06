@@ -429,8 +429,10 @@ Web UI는 TypeScript `strict` mode를 사용한다.
   완성된 중간 문자열 없이 private temporary file로 streaming한 뒤 고정된 logs 경로에 원자 기록한다.
   Node.js는 build/test에서만 사용된다.
 - Automatic collector의 report refresh는 ingest quiet period 뒤 최신 generation을 한 번 렌더한다.
-  연속 ingest 중 성장하는 전체 report를 주기적으로 다시 만들지 않으며, 새 commit이 render와
-  겹치면 stale generation을 acknowledge하지 않고 quiet-period 수렴을 다시 예약한다.
+  새 commit이 render와 겹치면 stale generation을 acknowledge하지 않는다. v1.11 개발 경로는
+  이 충돌을 데이터 오류와 구분하고, 직전 시도 시간에 비례하는 quiet period(최대 30초)를
+  같은 작업과 후속 작업에 유지해 빠른 전체 재스캔 반복을 억제한다. 입력이 계속되면 report는
+  pending/degraded 상태로 남을 수 있으며, 입력이 잠잠해진 뒤 최신 generation으로 수렴한다.
 - team profile의 hosted UI도 같은 `ReportDtoVx` schema와 UI component를 사용한다. transport와
   authentication/authorization만 profile별 composition root에서 달라진다. hosted query는
   server-resolved tenant/workspace scope 밖의 DTO를 생성할 수 없다.

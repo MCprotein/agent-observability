@@ -94,6 +94,7 @@ const PRIVATE_NOTIFY_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 const REPORT_RETRY_LIMIT: u32 = 4;
 const REPORT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
 const REPORT_DEBOUNCE_DELAY: Duration = Duration::from_millis(200);
+const REPORT_CONTENTION_QUIET_LIMIT: Duration = Duration::from_secs(30);
 const REPORT_AUTHORITY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const LIFECYCLE_POLICY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const LIFECYCLE_QUIET_PERIOD_MS: u64 = 30_000;
@@ -1362,6 +1363,10 @@ enum ReportFailure {
     Clock,
     RenderGuard,
     Snapshot,
+    // Preserve the v1 public stage code; distinguish transient contention internally without
+    // leaking database diagnostics or treating it as a persistent snapshot corruption failure.
+    #[serde(rename = "snapshot")]
+    SnapshotChanged,
     Projection,
     Publish,
     Acknowledge,
@@ -1377,8 +1382,18 @@ struct AppState {
     lifecycle_storage_pressure: Arc<AtomicBool>,
     report_refresh_scheduled: Arc<AtomicBool>,
     report_refresh_requested: Arc<AtomicU64>,
+    report_contention_quiet_ms: Arc<AtomicU64>,
     #[cfg(test)]
     report_refresh_attempts: Arc<AtomicU64>,
+    #[cfg(test)]
+    report_snapshot_test: Arc<ReportSnapshotTest>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ReportSnapshotTest {
+    delay_ms: AtomicU64,
+    started: AtomicBool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1481,8 +1496,11 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         lifecycle_storage_pressure: Arc::new(AtomicBool::new(false)),
         report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
         report_refresh_requested: Arc::new(AtomicU64::new(0)),
+        report_contention_quiet_ms: Arc::new(AtomicU64::new(0)),
         #[cfg(test)]
         report_refresh_attempts: Arc::new(AtomicU64::new(0)),
+        #[cfg(test)]
+        report_snapshot_test: Arc::default(),
     };
     let app = router(state.clone());
     if report_wakeup {
@@ -2520,27 +2538,17 @@ fn schedule_report_refresh_with_timing(state: &AppState, timing: ReportRefreshTi
     tokio::spawn(async move {
         let mut failure_attempts = 0;
         let mut retry_delay = timing.retry_initial;
+        let mut quiet_period = timing.debounce.max(Duration::from_millis(
+            state.report_contention_quiet_ms.load(Ordering::Acquire),
+        ));
         loop {
             if failure_attempts == 0 {
-                await_report_debounce(&state, timing).await;
+                await_report_debounce(&state, quiet_period).await;
             } else {
                 tokio::time::sleep(retry_delay).await;
             }
             let attempt_epoch = state.report_refresh_requested.load(Ordering::Acquire);
-            let root = {
-                let collector = state.collector.lock().await;
-                collector.layout.root.clone()
-            };
-            #[cfg(test)]
-            state
-                .report_refresh_attempts
-                .fetch_add(1, Ordering::Release);
-            let (refresh, mut failure) =
-                match tokio::task::spawn_blocking(move || refresh_report_from_root(&root)).await {
-                    Ok(Ok(refreshed)) => (Some(refreshed), None),
-                    Ok(Err(report_failure)) => (None, Some(report_failure)),
-                    Err(_) => (None, Some(ReportFailure::Task)),
-                };
+            let (refresh, mut failure, attempt_duration) = run_report_refresh_attempt(&state).await;
             let mut collector = state.collector.lock().await;
             let pending = if let Ok(status) = collector.store.report_status() {
                 status.pending()
@@ -2573,17 +2581,29 @@ fn schedule_report_refresh_with_timing(state: &AppState, timing: ReportRefreshTi
                 }
                 return;
             }
-            if refresh.is_some() {
-                collector.report_refresh_failures = 0;
-                collector.report_failure = failure;
+            if failure == Some(ReportFailure::SnapshotChanged)
+                || (refresh.is_some() && failure.is_none())
+            {
+                // A concurrent commit invalidated this read/publication. Preserve the same
+                // scheduled task and its learned quiet period across new wakeups: restarting
+                // the ordinary short retry cycle would repeatedly scan a growing store.
+                quiet_period = contention_quiet_period(quiet_period, attempt_duration);
+                state.report_contention_quiet_ms.store(
+                    u64::try_from(quiet_period.as_millis()).unwrap_or(u64::MAX),
+                    Ordering::Release,
+                );
                 failure_attempts = 0;
                 retry_delay = timing.retry_initial;
-            } else {
-                collector.report_refresh_failures =
-                    collector.report_refresh_failures.saturating_add(1);
-                collector.report_failure = failure;
-                failure_attempts += 1;
+                collector.report_degraded = true;
+                if collector.report_failure.is_none() {
+                    collector.report_failure = Some(ReportFailure::SnapshotChanged);
+                }
+                drop(collector);
+                continue;
             }
+            collector.report_refresh_failures = collector.report_refresh_failures.saturating_add(1);
+            collector.report_failure = failure;
+            failure_attempts += 1;
             if failure_attempts == REPORT_RETRY_LIMIT {
                 collector.report_degraded = true;
                 state
@@ -2598,17 +2618,59 @@ fn schedule_report_refresh_with_timing(state: &AppState, timing: ReportRefreshTi
                 return;
             }
             drop(collector);
-            if refresh.is_none() {
-                retry_delay = retry_delay.saturating_mul(2);
-            }
+            retry_delay = retry_delay.saturating_mul(2);
         }
     });
 }
 
-async fn await_report_debounce(state: &AppState, timing: ReportRefreshTiming) {
+async fn run_report_refresh_attempt(
+    state: &AppState,
+) -> (Option<bool>, Option<ReportFailure>, Duration) {
+    let root = state.collector.lock().await.layout.root.clone();
+    #[cfg(test)]
+    state
+        .report_refresh_attempts
+        .fetch_add(1, Ordering::Release);
+    #[cfg(test)]
+    let snapshot_test = Arc::clone(&state.report_snapshot_test);
+    let started = StdInstant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        #[cfg(not(test))]
+        {
+            refresh_report_from_root(&root)
+        }
+        #[cfg(test)]
+        {
+            refresh_report_from_root_observing(&root, |index| {
+                if index == 0 {
+                    snapshot_test.started.store(true, Ordering::Release);
+                    std::thread::sleep(Duration::from_millis(
+                        snapshot_test.delay_ms.load(Ordering::Acquire),
+                    ));
+                }
+            })
+        }
+    })
+    .await;
+    let (published, failure) = match result {
+        Ok(Ok(published)) => (Some(published), None),
+        Ok(Err(failure)) => (None, Some(failure)),
+        Err(_) => (None, Some(ReportFailure::Task)),
+    };
+    (published, failure, started.elapsed())
+}
+
+fn contention_quiet_period(previous: Duration, attempt: Duration) -> Duration {
+    previous
+        .saturating_mul(2)
+        .max(attempt.saturating_mul(4))
+        .min(REPORT_CONTENTION_QUIET_LIMIT)
+}
+
+async fn await_report_debounce(state: &AppState, quiet_period: Duration) {
     let mut observed = state.report_refresh_requested.load(Ordering::Acquire);
     loop {
-        tokio::time::sleep(timing.debounce).await;
+        tokio::time::sleep(quiet_period).await;
         let latest = state.report_refresh_requested.load(Ordering::Acquire);
         if latest == observed {
             return;
@@ -2677,11 +2739,18 @@ fn clear_report_dirty(layout: &InstalledLayout) -> Result<(), CollectorError> {
 }
 
 fn refresh_report_from_root(root: &Path) -> Result<bool, ReportFailure> {
+    refresh_report_from_root_observing(root, |_| {})
+}
+
+fn refresh_report_from_root_observing(
+    root: &Path,
+    on_record: impl FnMut(usize),
+) -> Result<bool, ReportFailure> {
     let layout = install(root).map_err(|_| ReportFailure::Install)?;
     let store = LocalStore::open_current(layout.state.join("store"))
         .map_err(|_| ReportFailure::OpenStore)?;
     let now_unix_ms = current_unix_ms().map_err(|_| ReportFailure::Clock)?;
-    refresh_report(&layout, &store, now_unix_ms)
+    refresh_report_observing(&layout, &store, now_unix_ms, on_record)
 }
 
 /// Projects and sends a raw notify argument with bounded foreground deadlines.
@@ -3598,10 +3667,11 @@ fn parse_complete_http_response(
     }))
 }
 
-fn refresh_report(
+fn refresh_report_observing(
     layout: &InstalledLayout,
     store: &LocalStore,
     now_unix_ms: u64,
+    mut on_record: impl FnMut(usize),
 ) -> Result<bool, ReportFailure> {
     let _render_guard = store
         .acquire_report_render_guard()
@@ -3612,11 +3682,17 @@ fn refresh_report(
     let mut projection_failure = false;
     let visit = store
         .visit_report_snapshot(|index, record| {
+            on_record(index);
             if !projection_failure && projector.push_owned(index, record).is_err() {
                 projection_failure = true;
             }
         })
-        .map_err(|_| ReportFailure::Snapshot)?;
+        .map_err(|error| match error {
+            agent_observability_local_store::StoreError::ReportSnapshotChanged => {
+                ReportFailure::SnapshotChanged
+            }
+            _ => ReportFailure::Snapshot,
+        })?;
     if projection_failure {
         return Err(ReportFailure::Projection);
     }
@@ -4030,6 +4106,7 @@ mod tests {
             (ReportFailure::Clock, "\"clock\""),
             (ReportFailure::RenderGuard, "\"render_guard\""),
             (ReportFailure::Snapshot, "\"snapshot\""),
+            (ReportFailure::SnapshotChanged, "\"snapshot\""),
             (ReportFailure::Projection, "\"projection\""),
             (ReportFailure::Publish, "\"publish\""),
             (ReportFailure::Acknowledge, "\"acknowledge\""),
@@ -4153,7 +4230,9 @@ mod tests {
             lifecycle_storage_pressure: Arc::new(AtomicBool::new(false)),
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
             report_refresh_requested: Arc::new(AtomicU64::new(0)),
+            report_contention_quiet_ms: Arc::new(AtomicU64::new(0)),
             report_refresh_attempts: Arc::new(AtomicU64::new(0)),
+            report_snapshot_test: Arc::default(),
         }
     }
 
@@ -7138,6 +7217,90 @@ mod tests {
     }
 
     #[test]
+    fn report_refresh_contention_waits_for_render_sized_quiet_period() {
+        let root = test_root("report-refresh-slow-snapshot-contention");
+        let state = app_state(&root);
+        state
+            .report_snapshot_test
+            .delay_ms
+            .store(120, Ordering::Release);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            {
+                let mut collector = state.collector.lock().await;
+                ingest_notify_locked(&mut collector, &projected_notify("initial", "turn-1"))
+                    .unwrap();
+            }
+            super::schedule_report_refresh_with_timing(&state, fast_report_timing());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !state.report_snapshot_test.started.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // Commits are farther apart than debounce but closer than a slow snapshot.
+            // The first conflict must not start repeated full scans during the stream.
+            for event in 0..8 {
+                {
+                    let mut collector = state.collector.lock().await;
+                    ingest_notify_locked(
+                        &mut collector,
+                        &projected_notify(&format!("slow-{event}"), "turn-1"),
+                    )
+                    .unwrap();
+                }
+                super::schedule_report_refresh_with_timing(&state, fast_report_timing());
+                tokio::time::sleep(Duration::from_millis(45)).await;
+            }
+            assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 1);
+            assert!(
+                state
+                    .collector
+                    .lock()
+                    .await
+                    .store
+                    .report_status()
+                    .unwrap()
+                    .pending()
+            );
+            assert!(state.collector.lock().await.report_degraded);
+            assert_eq!(state.collector.lock().await.report_refresh_failures, 0);
+            assert!(state.report_contention_quiet_ms.load(Ordering::Acquire) >= 480);
+            state
+                .report_snapshot_test
+                .delay_ms
+                .store(0, Ordering::Release);
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while state.report_refresh_scheduled.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let collector = state.collector.lock().await;
+            assert!(!collector.store.report_status().unwrap().pending());
+            assert_eq!(collector.report_refresh_failures, 0);
+            assert!(!collector.report_degraded);
+            drop(collector);
+            // A successful cycle and a new wakeup must not discard the learned quiet window.
+            let attempts = state.report_refresh_attempts.load(Ordering::Acquire);
+            super::schedule_report_refresh_with_timing(&state, fast_report_timing());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                state.report_refresh_attempts.load(Ordering::Acquire),
+                attempts
+            );
+        });
+        let html = fs::read_to_string(root.join("logs").join(REPORT_FILE_NAME)).unwrap();
+        assert!(html.contains(r#""generatedSpans":9"#));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn request_would_block_is_reported_as_a_staged_timeout() {
         let error = super::request_io(
             "response-read",
@@ -7453,7 +7616,9 @@ mod tests {
             lifecycle_storage_pressure: Arc::new(AtomicBool::new(false)),
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
             report_refresh_requested: Arc::new(AtomicU64::new(0)),
+            report_contention_quiet_ms: Arc::new(AtomicU64::new(0)),
             report_refresh_attempts: Arc::new(AtomicU64::new(0)),
+            report_snapshot_test: Arc::default(),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

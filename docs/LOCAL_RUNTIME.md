@@ -183,8 +183,13 @@ a durable SQLite report generation. A renderer reads a generation-consistent sna
 exact generation written to `logs/agent-observability-report.html`; a private marker is only a best-effort wakeup.
 Startup reconciles every unacknowledged generation. Refresh uses bounded exponential retries and reports a
 degraded health state after exhaustion. CLI and UI preserve that state instead of presenting the report as
-current. Burst refresh is quiet-period coalesced; continuous ingest does not repeatedly rebuild a growing full
-report. The latest generation is rendered once input becomes quiet, while explicit report commands and startup
+current. In v1.11 development, a snapshot superseded by a concurrent commit is distinguished internally from
+JSON/schema/storage failures. It keeps the report pending/degraded without incrementing the genuine-failure
+counter. The next quiet window is the larger of twice the previous window and four times the last attempt's
+elapsed time, capped at 30 seconds. This learned window survives task handoffs for the collector lifetime;
+new ingest wakeups cannot reset it into rapid full-scan retries. The initial window remains 200 ms. The public
+v1 health stage remains `snapshot`; no database message or record content is exposed. A prior genuine failure
+is retained until successful publication. The latest generation is rendered once input becomes quiet, while explicit report commands and startup
 recovery retain their convergence paths. HTML/projection fsync therefore does not occupy the foreground notify
 path indefinitely. A failure never turns raw input into a fallback log or file.
 
@@ -432,7 +437,8 @@ smoke remains available while the diagnostic commit is being prepared.
 
 ## Static report
 
-`report` holds the singleton lock, reads a typed ordered snapshot from SQLite authority, applies the
+`report` prepares the store under the singleton lock, releases it, then holds the report publication lock
+while reading a typed ordered snapshot from SQLite authority. It applies the
 Rust privacy/cost projector, and writes `logs/agent-observability-report.html` atomically with mode
 0600. The optional rate table must satisfy `agent_observability.rate_table.v1`, be at most 1 MiB,
 and be a private regular file opened without following symlinks. The generated report is
