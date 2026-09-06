@@ -7,7 +7,7 @@ const generatedJavaScript = new Set([
   "ui/report/generated/validate-report-dto-v2.js",
   "ui/report/generated/view-state.js",
   "ui/report/generated/view-summary.js",
-  "ui/settings/generated/validate-local-runtime-config-v3.js",
+  "ui/settings/generated/validate-local-runtime-config-v4.js",
 ]);
 const managedToolingPrefixes = [".anamnesis/", ".claude/", ".codex/", ".cursor/"];
 

@@ -189,6 +189,9 @@ Do not display a fabricated affected-record count when a preview has not been co
 Keep validation messages beside the relevant fields and preserve unsaved values on conflict.
 Distinguish disabled, enabled, failed and storage-pressure states; configuration saved is not
 evidence that cleanup has run or that disk space has already been reclaimed.
+Until the health contract exposes typed lifecycle-failure and storage-pressure reasons, the settings
+surface must use generic degraded copy. Dedicated reason labels remain an acceptance gate and must
+not be inferred from the coarse collector status.
 
 1. Scope before data: workspace, filters, time range and freshness precede every metric.
 2. Evidence over decoration: tables, timelines, distributions and links to traces carry the interface.

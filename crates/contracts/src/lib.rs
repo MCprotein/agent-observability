@@ -18,8 +18,10 @@ pub const RETENTION_ARCHIVE_SCHEMA: &str =
     include_str!("../../../contracts/retention-archive-entry-v1.schema.json");
 pub const LOCAL_RUNTIME_CONFIG_V2_SCHEMA: &str =
     include_str!("../../../contracts/local-runtime-config-v2.schema.json");
-pub const LOCAL_RUNTIME_CONFIG_SCHEMA: &str =
+pub const LOCAL_RUNTIME_CONFIG_V3_SCHEMA: &str =
     include_str!("../../../contracts/local-runtime-config-v3.schema.json");
+pub const LOCAL_RUNTIME_CONFIG_SCHEMA: &str =
+    include_str!("../../../contracts/local-runtime-config-v4.schema.json");
 pub const ADAPTER_CAPABILITY_V1: &str = include_str!("../capabilities/adapter-capability-v1.yaml");
 pub const DURABLE_RECORD_VERSION: &str = "agent_observability.v1";
 pub const REPORT_DTO_V1_VERSION: &str = "agent_observability.report.v1";
@@ -1965,7 +1967,8 @@ impl ContractManifest {
             "retention_archive",
             "agent_observability.retention_archive.v1",
         )?;
-        self.expect("local_runtime_config", "local_runtime.v3")?;
+        self.expect("local_runtime_config", "local_runtime.v4")?;
+        self.expect("local_state", "local_state.v5")?;
         self.expect("durable_schema", "contracts/durable-record-v1.schema.json")?;
         self.expect("report_schema", "contracts/report-dto-v2.schema.json")?;
         self.expect(
@@ -1998,19 +2001,19 @@ impl ContractManifest {
         )?;
         self.expect(
             "local_runtime_config_schema",
-            "contracts/local-runtime-config-v3.schema.json",
+            "contracts/local-runtime-config-v4.schema.json",
         )?;
         self.expect(
             "local_runtime_config_compatibility_schema",
-            "contracts/local-runtime-config-v2.schema.json",
+            "contracts/local-runtime-config-v3.schema.json",
         )?;
         self.expect(
             "local_runtime_config_fixture",
-            "contracts/local-runtime-config-v3.fixture.json",
+            "contracts/local-runtime-config-v4.fixture.json",
         )?;
         self.expect(
             "local_runtime_config_parity",
-            "contracts/local-runtime-config-v3.parity.json",
+            "contracts/local-runtime-config-v4.parity.json",
         )?;
         self.expect("team_ingest", "disabled")?;
         Ok(())

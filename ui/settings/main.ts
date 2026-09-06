@@ -19,8 +19,8 @@ import {
   XCircle,
   createIcons,
 } from "lucide";
-import validateConfig from "./generated/validate-local-runtime-config-v3.js";
-import type { LocalRuntimeConfigV3 } from "./generated/local-runtime-config-v3.js";
+import { validateLocalRuntimeConfig } from "./config-validation.js";
+import type { LocalRuntimeConfigV4 } from "./generated/local-runtime-config-v4.js";
 
 type FieldPath =
   | "collection.file_reconcile_interval_ms"
@@ -32,11 +32,17 @@ type FieldPath =
   | "collection.local_storage_budget_bytes"
   | "retention.max_record_age_days"
   | "retention.max_archive_records"
-  | "retention.max_archive_bytes";
+  | "retention.max_archive_bytes"
+  | "lifecycle.hot_days"
+  | "lifecycle.warm_days"
+  | "lifecycle.delete_after_days"
+  | "lifecycle.private_raw_days"
+  | "lifecycle.maintenance_interval_seconds"
+  | "lifecycle.max_traces_per_pass";
 
 type Envelope = {
-  config: LocalRuntimeConfigV3;
-  defaults: LocalRuntimeConfigV3;
+  config: LocalRuntimeConfigV4;
+  defaults: LocalRuntimeConfigV4;
   revision: string;
   collection_mode: "automatic_codex" | "manual_import";
 };
@@ -135,8 +141,8 @@ const fields: Record<FieldPath, Field> = {
   },
   "retention.max_record_age_days": {
     path: "retention.max_record_age_days",
-    label: "보관 기간",
-    description: "이 기간보다 오래된 trace는 만료 대상",
+    label: "수동 정리 기준일",
+    description: "자동 삭제 기준과 별개로, 이 기간보다 오래된 trace를 수동 정리 대상으로 선택",
     min: 1,
     max: 3_650,
     step: 1,
@@ -145,8 +151,8 @@ const fields: Record<FieldPath, Field> = {
   },
   "retention.max_archive_records": {
     path: "retention.max_archive_records",
-    label: "archive 레코드",
-    description: "하나의 private archive에 담을 최대 레코드 수",
+    label: "정리 레코드 상한",
+    description: "한 번의 수동 정리 작업에서 archive로 옮길 수 있는 전체 레코드 상한",
     min: 1,
     max: 100_000,
     step: 1,
@@ -155,13 +161,73 @@ const fields: Record<FieldPath, Field> = {
   },
   "retention.max_archive_bytes": {
     path: "retention.max_archive_bytes",
-    label: "archive 크기",
-    description: "하나의 private archive에 담을 최대 크기",
+    label: "정리 크기 상한",
+    description: "한 번의 수동 정리 작업에서 생성하는 archive의 전체 크기 상한",
     min: 65_536,
     max: 268_435_456,
     step: 1,
     unit: "bytes",
     format: formatBytes,
+  },
+  "lifecycle.hot_days": {
+    path: "lifecycle.hot_days",
+    label: "Hot(최근) 기준일",
+    description: "원본 관측 이력은 제거하고 리포트용 기록은 유지하는 Warm(이력 축소) 단계로 이동",
+    min: 1,
+    max: 3_650,
+    step: 1,
+    unit: "days",
+    format: (value) => `${formatNumber(value)}일`,
+  },
+  "lifecycle.warm_days": {
+    path: "lifecycle.warm_days",
+    label: "Warm(이력 축소) 기준일",
+    description: "일반 리포트에서 제외하고 압축하지 않은 trace별 JSON 묶음으로 보관하는 Cold(장기 보관) 단계로 이동",
+    min: 1,
+    max: 3_650,
+    step: 1,
+    unit: "days",
+    format: (value) => `${formatNumber(value)}일`,
+  },
+  "lifecycle.delete_after_days": {
+    path: "lifecycle.delete_after_days",
+    label: "완전 삭제 기준일",
+    description: "최신 관측 이후 관리 대상 trace가 영구 삭제되는 시점",
+    min: 1,
+    max: 3_650,
+    step: 1,
+    unit: "days",
+    format: (value) => `${formatNumber(value)}일`,
+  },
+  "lifecycle.private_raw_days": {
+    path: "lifecycle.private_raw_days",
+    label: "원문 상세 보관",
+    description: "데이터 보관 정책을 켰을 때 private 요청·응답 원문 보관 기간",
+    min: 1,
+    max: 3_650,
+    step: 1,
+    unit: "days",
+    format: (value) => `${formatNumber(value)}일`,
+  },
+  "lifecycle.maintenance_interval_seconds": {
+    path: "lifecycle.maintenance_interval_seconds",
+    label: "유지관리 주기",
+    description: "로컬 수집기가 다음 정리 작업을 확인하는 간격",
+    min: 60,
+    max: 86_400,
+    step: 1,
+    unit: "seconds",
+    format: formatDurationSeconds,
+  },
+  "lifecycle.max_traces_per_pass": {
+    path: "lifecycle.max_traces_per_pass",
+    label: "정리 작업당 trace",
+    description: "한 번의 정리 작업에서 처리할 최대 trace 수",
+    min: 1,
+    max: 128,
+    step: 1,
+    unit: "traces",
+    format: (value) => `${formatNumber(value)}개`,
   },
 };
 
@@ -175,9 +241,9 @@ const fragmentToken = new URLSearchParams(location.hash.slice(1)).get("session")
 let token = fragmentToken || readSessionToken();
 if (fragmentToken) writeSessionToken(fragmentToken);
 history.replaceState(null, "", `${location.pathname}${location.search}`);
-let persisted: LocalRuntimeConfigV3 | null = null;
-let draft: LocalRuntimeConfigV3 | null = null;
-let defaults: LocalRuntimeConfigV3 | null = null;
+let persisted: LocalRuntimeConfigV4 | null = null;
+let draft: LocalRuntimeConfigV4 | null = null;
+let defaults: LocalRuntimeConfigV4 | null = null;
 let revision = "";
 let integration: IntegrationStatus | null = null;
 let integrationUnavailable = false;
@@ -305,7 +371,8 @@ function renderSettings(focusTarget?: string): void {
         <a href="#collection"><i data-lucide="activity"></i>수집</a>
         <a href="#privacy"><i data-lucide="shield-check"></i>개인정보</a>
         <a href="#storage"><i data-lucide="database"></i>저장소</a>
-        <a href="#retention"><i data-lucide="archive"></i>보관</a>
+        <a href="#lifecycle"><i data-lucide="heart-pulse"></i>데이터 보관</a>
+        <a href="#retention"><i data-lucide="archive"></i>수동 정리</a>
         <div class="nav-note"><strong>Codex</strong><span>${configNavigationStatus()}</span><span>${collectorNavigationStatus()}</span></div>
       </nav>
       <main class="settings-main">
@@ -314,6 +381,7 @@ function renderSettings(focusTarget?: string): void {
           ${collectionSection(draft)}
           ${privacySection(draft)}
           ${storageSection(draft)}
+          ${lifecycleSection(draft)}
           ${retentionSection(draft)}
         </form>
       </main>
@@ -346,7 +414,7 @@ function renderSettings(focusTarget?: string): void {
   }
 }
 
-function overviewSection(config: LocalRuntimeConfigV3): string {
+function overviewSection(config: LocalRuntimeConfigV4): string {
   const storage = fields["collection.local_storage_budget_bytes"].format(
     config.collection.local_storage_budget_bytes,
   );
@@ -375,7 +443,7 @@ function integrationPanel(): string {
     : conflicted
     ? "설정 충돌"
     : connected && degraded
-      ? "리포트 반영 지연"
+      ? "수집기 상태 저하"
       : connected && ready
         ? "수집 중"
         : connected
@@ -386,7 +454,7 @@ function integrationPanel(): string {
     : conflicted
     ? "Codex 설정이 연결 후 변경되어 자동 복원을 중단했습니다."
     : connected && degraded
-      ? "이벤트 수집은 가능하지만 모니터링 리포트가 최신 상태가 아닙니다."
+      ? "이벤트 수집은 가능하지만 리포트 반영 또는 데이터 보관 정리가 지연될 수 있습니다."
       : connected && ready
         ? "Codex 이벤트를 private local runtime에 반영합니다."
         : connected
@@ -398,7 +466,7 @@ function integrationPanel(): string {
     ? `<button class="button secondary" id="toggle-integration" type="button"><i data-lucide="power"></i>연결 해제</button>`
     : `<button class="button primary" id="toggle-integration" type="button"><i data-lucide="cable"></i>Codex 연결</button>`;
   const panelState = integrationUnavailable ? "unavailable" : conflicted ? "conflict" : degraded ? "degraded" : ready ? "ready" : "idle";
-  const collectorLabel = integrationUnavailable ? "확인 불가" : degraded ? "리포트 지연" : ready ? "정상" : "중지";
+  const collectorLabel = integrationUnavailable ? "확인 불가" : degraded ? "상태 저하" : ready ? "정상" : "중지";
   return `<div class="integration-panel" data-state="${panelState}" data-config-state="${integration?.config ?? "disconnected"}" data-collector-state="${integration?.collector ?? "unavailable"}">
     <div class="integration-identity"><span class="integration-icon"><i data-lucide="activity"></i></span><div><span>Codex</span><strong>${state}</strong><small>${detail}</small></div></div>
     <div class="integration-meta"><span><b>수집기</b>${collectorLabel}</span><span><b>저장</b>로컬 전용</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
@@ -416,13 +484,13 @@ function configNavigationStatus(): string {
 function collectorNavigationStatus(): string {
   if (integrationUnavailable) return "collector 상태 확인 불가";
   if (integration?.collector === "ready") return "collector 실행 중";
-  if (integration?.collector === "degraded") return "collector 실행 중 · 리포트 지연";
+  if (integration?.collector === "degraded") return "collector 실행 중 · 상태 저하";
   return "collector 중지됨";
 }
 
-function collectionSection(config: LocalRuntimeConfigV3): string {
+function collectionSection(config: LocalRuntimeConfigV4): string {
   return `<section class="settings-section" id="collection" aria-labelledby="collection-title">
-    ${sectionTitle("activity", "수집", "파일 확인과 durable 기록 반영 간격")}
+    ${sectionTitle("collection", "activity", "수집", "파일 확인과 durable 기록 반영 간격")}
     <div class="section-grid">
       <div class="field-grid">${fieldControl(fields["collection.file_reconcile_interval_ms"], config)}${fieldControl(fields["collection.flush_interval_ms"], config)}</div>
       ${dualTimeline(
@@ -450,9 +518,9 @@ function collectionSection(config: LocalRuntimeConfigV3): string {
   </section>`;
 }
 
-function storageSection(config: LocalRuntimeConfigV3): string {
+function storageSection(config: LocalRuntimeConfigV4): string {
   return `<section class="settings-section" id="storage" aria-labelledby="storage-title">
-    ${sectionTitle("database", "저장소", "로컬 데이터가 넘지 못하는 디스크 예산")}
+    ${sectionTitle("storage", "database", "저장소", "로컬 데이터가 넘지 못하는 디스크 예산")}
     <div class="section-grid">
       <div class="field-grid single">${fieldControl(fields["collection.local_storage_budget_bytes"], config)}</div>
       ${singleRuler("storage-visual", "설정 저장 한도", fields["collection.local_storage_budget_bytes"], "256 MiB", "20 GiB", true, "현재 사용량이 아닌 허용 한도")}
@@ -460,7 +528,7 @@ function storageSection(config: LocalRuntimeConfigV3): string {
   </section>`;
 }
 
-function privacySection(config: LocalRuntimeConfigV3): string {
+function privacySection(config: LocalRuntimeConfigV4): string {
   const enabled = config.capture_private_codex_turn_details ?? false;
   return `<section class="settings-section" id="privacy" aria-labelledby="privacy-title">
     <div class="section-title"><span class="section-icon"><i data-lucide="shield-check"></i></span><div><h2 id="privacy-title">개인정보</h2><p>Codex 작업 경로와 대화 내용을 별도 로컬 상세 저장소에 보관할지 선택합니다.</p></div></div>
@@ -473,30 +541,60 @@ function privacySection(config: LocalRuntimeConfigV3): string {
   </section>`;
 }
 
-function retentionSection(config: LocalRuntimeConfigV3): string {
-  return `<section class="settings-section" id="retention" aria-labelledby="retention-title">
-    ${sectionTitle("archive", "보관", "만료 대상과 private archive 크기 정책")}
-    <div class="section-grid">
-      <div class="field-grid">${fieldControl(fields["retention.max_record_age_days"], config)}${fieldControl(fields["retention.max_archive_records"], config)}${fieldControl(fields["retention.max_archive_bytes"], config)}</div>
-      <div class="visual-stack">
-        ${singleRuler("retention-visual", "보관 기간", fields["retention.max_record_age_days"], "1일", "10년", true, "cutoff보다 오래된 trace는 만료 대상")}
-        ${singleRuler("archive-records-visual", "Archive 레코드 상한", fields["retention.max_archive_records"], "1", "100k", true)}
-        ${singleRuler("archive-bytes-visual", "Archive 크기 상한", fields["retention.max_archive_bytes"], "64 KiB", "256 MiB", true)}
-      </div>
+function lifecycleSection(config: LocalRuntimeConfigV4): string {
+  const enabled = config.lifecycle.enabled;
+  return `<section class="settings-section" id="lifecycle" aria-labelledby="lifecycle-title">
+    <div class="section-title"><span class="section-icon"><i data-lucide="heart-pulse"></i></span><div><h2 id="lifecycle-title">데이터 보관 정책</h2><p>최신 trace 관측 시점부터 누적된 경과 기간으로 Hot(최근) → Warm(이력 축소) → Cold(장기 보관) → Delete(삭제)를 적용합니다.</p></div></div>
+    <label class="collection-toggle lifecycle-toggle" data-boolean-field="lifecycle.enabled">
+      <span><strong>자동 정리</strong><small id="lifecycle-enabled-copy">${enabled ? "켜짐 · 다음 정리 작업부터 보관 기준을 지난 기존 데이터에도 적용됩니다" : "꺼짐 · 기존 수동 보관 설정과 원문 보관 동작을 유지합니다"}</small></span>
+      <input type="checkbox" id="lifecycle-enabled" ${enabled ? "checked" : ""}>
+      <span class="toggle-track" aria-hidden="true"><span></span></span>
+    </label>
+    <div class="section-grid lifecycle-grid">
+      <div class="field-grid">${fieldControl(fields["lifecycle.hot_days"], config)}${fieldControl(fields["lifecycle.warm_days"], config)}${fieldControl(fields["lifecycle.delete_after_days"], config)}${fieldControl(fields["lifecycle.private_raw_days"], config)}${fieldControl(fields["lifecycle.maintenance_interval_seconds"], config)}${fieldControl(fields["lifecycle.max_traces_per_pass"], config)}</div>
+      ${lifecycleTimeline(config)}
     </div>
-    <div class="retention-note"><i data-lucide="archive"></i><span>보관 기간을 줄여도 즉시 삭제하지 않습니다. cleanup은 별도의 retention plan/apply 경계를 따릅니다.</span></div>
+    <div class="retention-note lifecycle-warning" role="note"><i data-lucide="archive"></i><span><strong>삭제는 되돌릴 수 없습니다.</strong> 자동 정리를 켜거나 기준일을 줄이면 보관 기준을 지난 기존 데이터가 다음 정리 작업에서 이동하거나 영구 삭제될 수 있습니다. 설정 저장 완료는 정리 실행이나 디스크 공간 회수를 의미하지 않습니다.</span></div>
   </section>`;
 }
 
-function sectionTitle(icon: string, title: string, description: string): string {
-  return `<div class="section-title"><span class="section-icon"><i data-lucide="${icon}"></i></span><div><h2 id="${title === "수집" ? "collection" : title === "저장소" ? "storage" : "retention"}-title">${title}</h2><p>${description}</p></div></div>`;
+function lifecycleTimeline(config: LocalRuntimeConfigV4): string {
+  return `<figure class="policy-visual timeline lifecycle-timeline" data-min="1" data-max="3650" data-log="true">
+    <figcaption><span>누적 경과 기간</span><strong data-lifecycle-value>Hot(최근) → Warm(이력 축소) → Cold(장기 보관) → Delete(삭제)</strong></figcaption>
+    <div class="timeline-track" aria-hidden="true">
+      <span class="timeline-marker first" data-marker data-path="lifecycle.hot_days"><b>Warm ${config.lifecycle.hot_days}일</b></span>
+      <span class="timeline-marker second" data-marker data-path="lifecycle.warm_days"><b>Cold ${config.lifecycle.warm_days}일</b></span>
+      <span class="timeline-marker third" data-marker data-path="lifecycle.delete_after_days"><b>Delete ${config.lifecycle.delete_after_days}일</b></span>
+    </div>
+    <div class="ruler-labels"><span>최신 관측</span><span>10년</span></div>
+    <p>각 값은 단계별 추가 기간이 아니라 최신 trace 관측 이후의 누적 경과 기간입니다.</p>
+  </figure>`;
+}
+
+function retentionSection(config: LocalRuntimeConfigV4): string {
+  return `<section class="settings-section" id="retention" aria-labelledby="retention-title">
+    ${sectionTitle("retention", "archive", "수동 정리", "자동 삭제와 별개인 수동 대상 기준 및 작업별 archive 상한")}
+    <div class="section-grid">
+      <div class="field-grid">${fieldControl(fields["retention.max_record_age_days"], config)}${fieldControl(fields["retention.max_archive_records"], config)}${fieldControl(fields["retention.max_archive_bytes"], config)}</div>
+      <div class="visual-stack">
+        ${singleRuler("retention-visual", "수동 정리 기준일", fields["retention.max_record_age_days"], "1일", "10년", true, "기준일보다 오래된 trace는 수동 정리 대상")}
+        ${singleRuler("archive-records-visual", "작업별 Archive 레코드 상한", fields["retention.max_archive_records"], "1", "100k", true)}
+        ${singleRuler("archive-bytes-visual", "작업별 Archive 크기 상한", fields["retention.max_archive_bytes"], "64 KiB", "256 MiB", true)}
+      </div>
+    </div>
+    <div class="retention-note"><i data-lucide="archive"></i><span>수동 정리 기준 ${config.retention.max_record_age_days}일은 자동 완전 삭제 기준 ${config.lifecycle.delete_after_days}일과 별개입니다. 레코드·크기 상한은 한 번의 수동 정리 작업에 함께 적용됩니다. 기준일을 줄여도 즉시 삭제하지 않으며 별도의 계획 생성·적용 절차를 따릅니다.</span></div>
+  </section>`;
+}
+
+function sectionTitle(id: "collection" | "storage" | "retention", icon: string, title: string, description: string): string {
+  return `<div class="section-title"><span class="section-icon"><i data-lucide="${icon}"></i></span><div><h2 id="${id}-title">${title}</h2><p>${description}</p></div></div>`;
 }
 
 function summaryItem(icon: string, label: string, value: string): string {
   return `<div class="summary-item"><i data-lucide="${icon}"></i><span>${label}</span><strong>${value}</strong></div>`;
 }
 
-function fieldControl(field: Field, config: LocalRuntimeConfigV3): string {
+function fieldControl(field: Field, config: LocalRuntimeConfigV4): string {
   const value = getValue(config, field.path);
   const id = field.path.replaceAll(".", "-");
   return `<div class="field" data-field="${field.path}">
@@ -539,6 +637,7 @@ function bindEvents(): void {
   form?.addEventListener("input", handleInput);
   document.querySelector("#enabled")?.addEventListener("change", handleEnabled);
   document.querySelector("#capture-private-codex-turn-details")?.addEventListener("change", handlePrivateDetails);
+  document.querySelector("#lifecycle-enabled")?.addEventListener("change", handleLifecycleEnabled);
   document.querySelector("#discard")?.addEventListener("click", discardChanges);
   document.querySelector("#reset")?.addEventListener("click", openResetDialog);
   document.querySelector("#cancel-reset")?.addEventListener("click", closeResetDialog);
@@ -721,6 +820,19 @@ function handlePrivateDetails(event: Event): void {
   updateDirtyState();
 }
 
+function handleLifecycleEnabled(event: Event): void {
+  const input = event.target;
+  if (!(input instanceof HTMLInputElement) || !draft) return;
+  draft.lifecycle.enabled = input.checked;
+  setText(
+    "lifecycle-enabled-copy",
+    input.checked
+      ? "켜짐 · 다음 정리 작업부터 보관 기준을 지난 기존 데이터에도 적용됩니다"
+      : "꺼짐 · 기존 수동 보관 설정과 원문 보관 동작을 유지합니다",
+  );
+  updateDirtyState();
+}
+
 function updateAllVisuals(): void {
   if (!draft) return;
   document.querySelectorAll<HTMLElement>("[data-visual-value]").forEach((output) => {
@@ -736,6 +848,11 @@ function updateAllVisuals(): void {
     const minimum = Number(owner?.dataset.min ?? field.min);
     const maximum = Number(owner?.dataset.max ?? field.max);
     marker.style.left = `${position(getValue(draft!, path), minimum, maximum, owner?.dataset.log === "true")}%`;
+    const label = marker.querySelector("b");
+    if (label && path.startsWith("lifecycle.")) {
+      const stage = path === "lifecycle.hot_days" ? "Warm" : path === "lifecycle.warm_days" ? "Cold" : "Delete";
+      label.textContent = `${stage} ${getValue(draft!, path)}일`;
+    }
   });
   document.querySelectorAll<HTMLElement>("[data-dual-value]").forEach((output) => {
     const visual = output.closest<HTMLElement>(".policy-visual");
@@ -794,10 +911,10 @@ async function saveDraft(): Promise<void> {
     showToast("비어 있거나 허용 범위를 벗어난 값을 확인하세요.", "error");
     return;
   }
-  if (!validateConfig(draft)) {
-    const errors = validateConfig.errors ?? [];
-    for (const error of errors) {
-      const path = error.instancePath?.replace(/^\//, "").replaceAll("/", ".") as FieldPath;
+  const validation = validateLocalRuntimeConfig(draft);
+  if (!validation.valid) {
+    for (const error of validation.errors) {
+      const path = error.path as FieldPath;
       if (path in fields) showFieldError(path, error.message ?? "허용 범위를 확인하세요.");
     }
     focusFirstInvalid();
@@ -853,6 +970,7 @@ async function rebaseDraftOnLatest(): Promise<void> {
   const enabledChanged = localDraft.enabled !== localBase.enabled;
   const privateDetailsChanged = (localDraft.capture_private_codex_turn_details ?? false)
     !== (localBase.capture_private_codex_turn_details ?? false);
+  const lifecycleEnabledChanged = localDraft.lifecycle.enabled !== localBase.lifecycle.enabled;
   const latest = await api<Envelope>("/api/config");
   applyEnvelope(latest);
   if (!draft) return;
@@ -861,6 +979,7 @@ async function rebaseDraftOnLatest(): Promise<void> {
   if (privateDetailsChanged) {
     draft.capture_private_codex_turn_details = localDraft.capture_private_codex_turn_details ?? false;
   }
+  if (lifecycleEnabledChanged) draft.lifecycle.enabled = localDraft.lifecycle.enabled;
   conflicted = false;
   renderSettings("save-title");
 }
@@ -1090,28 +1209,29 @@ function mountIcons(): void {
   });
 }
 
-function getValue(config: LocalRuntimeConfigV3, path: FieldPath): number {
-  const [group, key] = path.split(".") as ["collection" | "retention", string];
+function getValue(config: LocalRuntimeConfigV4, path: FieldPath): number {
+  const [group, key] = path.split(".") as ["collection" | "retention" | "lifecycle", string];
   return Number((config[group] as unknown as Record<string, number>)[key]);
 }
 
-function setValue(config: LocalRuntimeConfigV3, path: FieldPath, value: number): void {
-  const [group, key] = path.split(".") as ["collection" | "retention", string];
+function setValue(config: LocalRuntimeConfigV4, path: FieldPath, value: number): void {
+  const [group, key] = path.split(".") as ["collection" | "retention" | "lifecycle", string];
   (config[group] as unknown as Record<string, number>)[key] = value;
 }
 
-function changedPaths(left: LocalRuntimeConfigV3, right: LocalRuntimeConfigV3): FieldPath[] {
+function changedPaths(left: LocalRuntimeConfigV4, right: LocalRuntimeConfigV4): FieldPath[] {
   return (Object.keys(fields) as FieldPath[]).filter(
     (path) => getValue(left, path) !== getValue(right, path),
   );
 }
 
-function booleanChangeCount(left: LocalRuntimeConfigV3, right: LocalRuntimeConfigV3): number {
+function booleanChangeCount(left: LocalRuntimeConfigV4, right: LocalRuntimeConfigV4): number {
   return Number(left.enabled !== right.enabled)
     + Number(
       (left.capture_private_codex_turn_details ?? false)
         !== (right.capture_private_codex_turn_details ?? false),
-    );
+    )
+    + Number(left.lifecycle.enabled !== right.lifecycle.enabled);
 }
 
 function position(value: number, min: number, max: number, logarithmic: boolean): number {
@@ -1126,6 +1246,12 @@ function formatDuration(value: number): string {
   if (value >= 60_000 && value % 60_000 === 0) return `${formatNumber(value / 60_000)}분`;
   if (value >= 1_000) return `${formatNumber(value / 1_000)}초`;
   return `${formatNumber(value)}ms`;
+}
+
+function formatDurationSeconds(value: number): string {
+  if (value >= 3_600 && value % 3_600 === 0) return `${formatNumber(value / 3_600)}시간`;
+  if (value >= 60 && value % 60 === 0) return `${formatNumber(value / 60)}분`;
+  return `${formatNumber(value)}초`;
 }
 
 function formatBytes(value: number): string {

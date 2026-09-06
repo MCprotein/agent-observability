@@ -13,7 +13,7 @@ test("tracked settings JavaScript matches the TypeScript bundle", async () => {
     target: ["es2022"],
     legalComments: "none",
     banner: {
-      js: "/* Generated from contracts/local-runtime-config-v3.schema.json. Do not edit. */",
+      js: "/* Generated from contracts/local-runtime-config-v4.schema.json. Do not edit. */",
     },
     write: false,
   });
@@ -22,4 +22,12 @@ test("tracked settings JavaScript matches the TypeScript bundle", async () => {
     result.outputFiles[0]?.text,
     await readFile("crates/local-ui/src/generated/settings-ui.js", "utf8"),
   );
+});
+
+test("degraded collector copy does not claim one unavailable failure reason", async () => {
+  const source = await readFile("ui/settings/main.ts", "utf8");
+  assert.match(source, /수집기 상태 저하/);
+  assert.match(source, /리포트 반영 또는 데이터 보관 정리가 지연될 수 있습니다/);
+  assert.doesNotMatch(source, /리포트 반영 지연/);
+  assert.doesNotMatch(source, /collector 실행 중 · 리포트 지연/);
 });

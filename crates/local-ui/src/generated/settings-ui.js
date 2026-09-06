@@ -1,4 +1,4 @@
-/* Generated from contracts/local-runtime-config-v3.schema.json. Do not edit. */
+/* Generated from contracts/local-runtime-config-v4.schema.json. Do not edit. */
 "use strict";
 (() => {
   // node_modules/lucide/dist/esm/defaultAttributes.mjs
@@ -307,8 +307,8 @@
     }
   };
 
-  // ui/settings/generated/validate-local-runtime-config-v3.js
-  var validate_local_runtime_config_v3_default = validate20;
+  // ui/settings/generated/validate-local-runtime-config-v4.js
+  var validate_local_runtime_config_v4_default = validate20;
   function validate20(data, { instancePath = "", parentData, parentDataProperty, rootData = data, dynamicAnchors = {} } = {}) {
     let vErrors = null;
     let errors = 0;
@@ -322,13 +322,13 @@
     if (errors === 0) {
       if (data && typeof data == "object" && !Array.isArray(data)) {
         let missing0;
-        if (data.schema_version === void 0 && (missing0 = "schema_version") || data.enabled === void 0 && (missing0 = "enabled") || data.capture_private_codex_turn_details === void 0 && (missing0 = "capture_private_codex_turn_details") || data.collection === void 0 && (missing0 = "collection") || data.retention === void 0 && (missing0 = "retention")) {
+        if (data.schema_version === void 0 && (missing0 = "schema_version") || data.enabled === void 0 && (missing0 = "enabled") || data.capture_private_codex_turn_details === void 0 && (missing0 = "capture_private_codex_turn_details") || data.collection === void 0 && (missing0 = "collection") || data.retention === void 0 && (missing0 = "retention") || data.lifecycle === void 0 && (missing0 = "lifecycle")) {
           validate20.errors = [{ instancePath, schemaPath: "#/required", keyword: "required", params: { missingProperty: missing0 }, message: "must have required property '" + missing0 + "'" }];
           return false;
         } else {
           const _errs1 = errors;
           for (const key0 in data) {
-            if (!(key0 === "schema_version" || key0 === "enabled" || key0 === "capture_private_codex_turn_details" || key0 === "collection" || key0 === "retention")) {
+            if (!(key0 === "schema_version" || key0 === "enabled" || key0 === "capture_private_codex_turn_details" || key0 === "collection" || key0 === "retention" || key0 === "lifecycle")) {
               validate20.errors = [{ instancePath, schemaPath: "#/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key0 }, message: "must NOT have additional properties" }];
               return false;
               break;
@@ -337,8 +337,8 @@
           if (_errs1 === errors) {
             if (data.schema_version !== void 0) {
               const _errs2 = errors;
-              if ("local_runtime.v3" !== data.schema_version) {
-                validate20.errors = [{ instancePath: instancePath + "/schema_version", schemaPath: "#/properties/schema_version/const", keyword: "const", params: { allowedValue: "local_runtime.v3" }, message: "must be equal to constant" }];
+              if ("local_runtime.v4" !== data.schema_version) {
+                validate20.errors = [{ instancePath: instancePath + "/schema_version", schemaPath: "#/properties/schema_version/const", keyword: "const", params: { allowedValue: "local_runtime.v4" }, message: "must be equal to constant" }];
                 return false;
               }
               var valid0 = _errs2 === errors;
@@ -687,6 +687,205 @@
                     } else {
                       var valid0 = true;
                     }
+                    if (valid0) {
+                      if (data.lifecycle !== void 0) {
+                        let data15 = data.lifecycle;
+                        const _errs35 = errors;
+                        const _errs36 = errors;
+                        if (errors === _errs36) {
+                          if (data15 && typeof data15 == "object" && !Array.isArray(data15)) {
+                            let missing3;
+                            if (data15.enabled === void 0 && (missing3 = "enabled") || data15.hot_days === void 0 && (missing3 = "hot_days") || data15.warm_days === void 0 && (missing3 = "warm_days") || data15.delete_after_days === void 0 && (missing3 = "delete_after_days") || data15.private_raw_days === void 0 && (missing3 = "private_raw_days") || data15.maintenance_interval_seconds === void 0 && (missing3 = "maintenance_interval_seconds") || data15.max_traces_per_pass === void 0 && (missing3 = "max_traces_per_pass")) {
+                              validate20.errors = [{ instancePath: instancePath + "/lifecycle", schemaPath: "#/$defs/lifecycle/required", keyword: "required", params: { missingProperty: missing3 }, message: "must have required property '" + missing3 + "'" }];
+                              return false;
+                            } else {
+                              const _errs38 = errors;
+                              for (const key3 in data15) {
+                                if (!(key3 === "enabled" || key3 === "hot_days" || key3 === "warm_days" || key3 === "delete_after_days" || key3 === "private_raw_days" || key3 === "maintenance_interval_seconds" || key3 === "max_traces_per_pass")) {
+                                  validate20.errors = [{ instancePath: instancePath + "/lifecycle", schemaPath: "#/$defs/lifecycle/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key3 }, message: "must NOT have additional properties" }];
+                                  return false;
+                                  break;
+                                }
+                              }
+                              if (_errs38 === errors) {
+                                if (data15.enabled !== void 0) {
+                                  const _errs39 = errors;
+                                  if (typeof data15.enabled !== "boolean") {
+                                    validate20.errors = [{ instancePath: instancePath + "/lifecycle/enabled", schemaPath: "#/$defs/lifecycle/properties/enabled/type", keyword: "type", params: { type: "boolean" }, message: "must be boolean" }];
+                                    return false;
+                                  }
+                                  var valid6 = _errs39 === errors;
+                                } else {
+                                  var valid6 = true;
+                                }
+                                if (valid6) {
+                                  if (data15.hot_days !== void 0) {
+                                    let data17 = data15.hot_days;
+                                    const _errs41 = errors;
+                                    if (!(typeof data17 == "number" && (!(data17 % 1) && !isNaN(data17)) && isFinite(data17))) {
+                                      validate20.errors = [{ instancePath: instancePath + "/lifecycle/hot_days", schemaPath: "#/$defs/lifecycle/properties/hot_days/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                      return false;
+                                    }
+                                    if (errors === _errs41) {
+                                      if (typeof data17 == "number" && isFinite(data17)) {
+                                        if (data17 > 3650 || isNaN(data17)) {
+                                          validate20.errors = [{ instancePath: instancePath + "/lifecycle/hot_days", schemaPath: "#/$defs/lifecycle/properties/hot_days/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3650 }, message: "must be <= 3650" }];
+                                          return false;
+                                        } else {
+                                          if (data17 < 1 || isNaN(data17)) {
+                                            validate20.errors = [{ instancePath: instancePath + "/lifecycle/hot_days", schemaPath: "#/$defs/lifecycle/properties/hot_days/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                            return false;
+                                          }
+                                        }
+                                      }
+                                    }
+                                    var valid6 = _errs41 === errors;
+                                  } else {
+                                    var valid6 = true;
+                                  }
+                                  if (valid6) {
+                                    if (data15.warm_days !== void 0) {
+                                      let data18 = data15.warm_days;
+                                      const _errs43 = errors;
+                                      if (!(typeof data18 == "number" && (!(data18 % 1) && !isNaN(data18)) && isFinite(data18))) {
+                                        validate20.errors = [{ instancePath: instancePath + "/lifecycle/warm_days", schemaPath: "#/$defs/lifecycle/properties/warm_days/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                        return false;
+                                      }
+                                      if (errors === _errs43) {
+                                        if (typeof data18 == "number" && isFinite(data18)) {
+                                          if (data18 > 3650 || isNaN(data18)) {
+                                            validate20.errors = [{ instancePath: instancePath + "/lifecycle/warm_days", schemaPath: "#/$defs/lifecycle/properties/warm_days/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3650 }, message: "must be <= 3650" }];
+                                            return false;
+                                          } else {
+                                            if (data18 < 1 || isNaN(data18)) {
+                                              validate20.errors = [{ instancePath: instancePath + "/lifecycle/warm_days", schemaPath: "#/$defs/lifecycle/properties/warm_days/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                              return false;
+                                            }
+                                          }
+                                        }
+                                      }
+                                      var valid6 = _errs43 === errors;
+                                    } else {
+                                      var valid6 = true;
+                                    }
+                                    if (valid6) {
+                                      if (data15.delete_after_days !== void 0) {
+                                        let data19 = data15.delete_after_days;
+                                        const _errs45 = errors;
+                                        if (!(typeof data19 == "number" && (!(data19 % 1) && !isNaN(data19)) && isFinite(data19))) {
+                                          validate20.errors = [{ instancePath: instancePath + "/lifecycle/delete_after_days", schemaPath: "#/$defs/lifecycle/properties/delete_after_days/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                          return false;
+                                        }
+                                        if (errors === _errs45) {
+                                          if (typeof data19 == "number" && isFinite(data19)) {
+                                            if (data19 > 3650 || isNaN(data19)) {
+                                              validate20.errors = [{ instancePath: instancePath + "/lifecycle/delete_after_days", schemaPath: "#/$defs/lifecycle/properties/delete_after_days/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3650 }, message: "must be <= 3650" }];
+                                              return false;
+                                            } else {
+                                              if (data19 < 1 || isNaN(data19)) {
+                                                validate20.errors = [{ instancePath: instancePath + "/lifecycle/delete_after_days", schemaPath: "#/$defs/lifecycle/properties/delete_after_days/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                                return false;
+                                              }
+                                            }
+                                          }
+                                        }
+                                        var valid6 = _errs45 === errors;
+                                      } else {
+                                        var valid6 = true;
+                                      }
+                                      if (valid6) {
+                                        if (data15.private_raw_days !== void 0) {
+                                          let data20 = data15.private_raw_days;
+                                          const _errs47 = errors;
+                                          if (!(typeof data20 == "number" && (!(data20 % 1) && !isNaN(data20)) && isFinite(data20))) {
+                                            validate20.errors = [{ instancePath: instancePath + "/lifecycle/private_raw_days", schemaPath: "#/$defs/lifecycle/properties/private_raw_days/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                            return false;
+                                          }
+                                          if (errors === _errs47) {
+                                            if (typeof data20 == "number" && isFinite(data20)) {
+                                              if (data20 > 3650 || isNaN(data20)) {
+                                                validate20.errors = [{ instancePath: instancePath + "/lifecycle/private_raw_days", schemaPath: "#/$defs/lifecycle/properties/private_raw_days/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3650 }, message: "must be <= 3650" }];
+                                                return false;
+                                              } else {
+                                                if (data20 < 1 || isNaN(data20)) {
+                                                  validate20.errors = [{ instancePath: instancePath + "/lifecycle/private_raw_days", schemaPath: "#/$defs/lifecycle/properties/private_raw_days/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                                  return false;
+                                                }
+                                              }
+                                            }
+                                          }
+                                          var valid6 = _errs47 === errors;
+                                        } else {
+                                          var valid6 = true;
+                                        }
+                                        if (valid6) {
+                                          if (data15.maintenance_interval_seconds !== void 0) {
+                                            let data21 = data15.maintenance_interval_seconds;
+                                            const _errs49 = errors;
+                                            if (!(typeof data21 == "number" && (!(data21 % 1) && !isNaN(data21)) && isFinite(data21))) {
+                                              validate20.errors = [{ instancePath: instancePath + "/lifecycle/maintenance_interval_seconds", schemaPath: "#/$defs/lifecycle/properties/maintenance_interval_seconds/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                              return false;
+                                            }
+                                            if (errors === _errs49) {
+                                              if (typeof data21 == "number" && isFinite(data21)) {
+                                                if (data21 > 86400 || isNaN(data21)) {
+                                                  validate20.errors = [{ instancePath: instancePath + "/lifecycle/maintenance_interval_seconds", schemaPath: "#/$defs/lifecycle/properties/maintenance_interval_seconds/maximum", keyword: "maximum", params: { comparison: "<=", limit: 86400 }, message: "must be <= 86400" }];
+                                                  return false;
+                                                } else {
+                                                  if (data21 < 60 || isNaN(data21)) {
+                                                    validate20.errors = [{ instancePath: instancePath + "/lifecycle/maintenance_interval_seconds", schemaPath: "#/$defs/lifecycle/properties/maintenance_interval_seconds/minimum", keyword: "minimum", params: { comparison: ">=", limit: 60 }, message: "must be >= 60" }];
+                                                    return false;
+                                                  }
+                                                }
+                                              }
+                                            }
+                                            var valid6 = _errs49 === errors;
+                                          } else {
+                                            var valid6 = true;
+                                          }
+                                          if (valid6) {
+                                            if (data15.max_traces_per_pass !== void 0) {
+                                              let data22 = data15.max_traces_per_pass;
+                                              const _errs51 = errors;
+                                              if (!(typeof data22 == "number" && (!(data22 % 1) && !isNaN(data22)) && isFinite(data22))) {
+                                                validate20.errors = [{ instancePath: instancePath + "/lifecycle/max_traces_per_pass", schemaPath: "#/$defs/lifecycle/properties/max_traces_per_pass/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                                return false;
+                                              }
+                                              if (errors === _errs51) {
+                                                if (typeof data22 == "number" && isFinite(data22)) {
+                                                  if (data22 > 128 || isNaN(data22)) {
+                                                    validate20.errors = [{ instancePath: instancePath + "/lifecycle/max_traces_per_pass", schemaPath: "#/$defs/lifecycle/properties/max_traces_per_pass/maximum", keyword: "maximum", params: { comparison: "<=", limit: 128 }, message: "must be <= 128" }];
+                                                    return false;
+                                                  } else {
+                                                    if (data22 < 1 || isNaN(data22)) {
+                                                      validate20.errors = [{ instancePath: instancePath + "/lifecycle/max_traces_per_pass", schemaPath: "#/$defs/lifecycle/properties/max_traces_per_pass/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                                      return false;
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                              var valid6 = _errs51 === errors;
+                                            } else {
+                                              var valid6 = true;
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          } else {
+                            validate20.errors = [{ instancePath: instancePath + "/lifecycle", schemaPath: "#/$defs/lifecycle/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                            return false;
+                          }
+                        }
+                        var valid0 = _errs35 === errors;
+                      } else {
+                        var valid0 = true;
+                      }
+                    }
                   }
                 }
               }
@@ -702,6 +901,34 @@
     return errors === 0;
   }
   validate20.evaluated = { "props": true, "dynamicProps": false, "dynamicItems": false };
+
+  // ui/settings/config-validation.ts
+  function validateLocalRuntimeConfig(value) {
+    if (!validate_local_runtime_config_v4_default(value)) {
+      return {
+        valid: false,
+        errors: (validate_local_runtime_config_v4_default.errors ?? []).map((error) => ({
+          path: error.instancePath?.replace(/^\//, "").replaceAll("/", ".") ?? "",
+          message: error.message ?? "\uD5C8\uC6A9 \uBC94\uC704\uB97C \uD655\uC778\uD558\uC138\uC694."
+        }))
+      };
+    }
+    const config = value;
+    const { hot_days: hot, warm_days: warm, delete_after_days: expiry } = config.lifecycle;
+    if (hot > warm) {
+      return {
+        valid: false,
+        errors: [{ path: "lifecycle.warm_days", message: "Hot \uAE30\uC900\uC77C \uC774\uC0C1\uC774\uC5B4\uC57C \uD569\uB2C8\uB2E4." }]
+      };
+    }
+    if (warm >= expiry) {
+      return {
+        valid: false,
+        errors: [{ path: "lifecycle.delete_after_days", message: "Warm \uAE30\uC900\uC77C\uBCF4\uB2E4 \uCEE4\uC57C \uD569\uB2C8\uB2E4." }]
+      };
+    }
+    return { valid: true, errors: [] };
+  }
 
   // ui/settings/main.ts
   var fields = {
@@ -777,8 +1004,8 @@
     },
     "retention.max_record_age_days": {
       path: "retention.max_record_age_days",
-      label: "\uBCF4\uAD00 \uAE30\uAC04",
-      description: "\uC774 \uAE30\uAC04\uBCF4\uB2E4 \uC624\uB798\uB41C trace\uB294 \uB9CC\uB8CC \uB300\uC0C1",
+      label: "\uC218\uB3D9 \uC815\uB9AC \uAE30\uC900\uC77C",
+      description: "\uC790\uB3D9 \uC0AD\uC81C \uAE30\uC900\uACFC \uBCC4\uAC1C\uB85C, \uC774 \uAE30\uAC04\uBCF4\uB2E4 \uC624\uB798\uB41C trace\uB97C \uC218\uB3D9 \uC815\uB9AC \uB300\uC0C1\uC73C\uB85C \uC120\uD0DD",
       min: 1,
       max: 3650,
       step: 1,
@@ -787,8 +1014,8 @@
     },
     "retention.max_archive_records": {
       path: "retention.max_archive_records",
-      label: "archive \uB808\uCF54\uB4DC",
-      description: "\uD558\uB098\uC758 private archive\uC5D0 \uB2F4\uC744 \uCD5C\uB300 \uB808\uCF54\uB4DC \uC218",
+      label: "\uC815\uB9AC \uB808\uCF54\uB4DC \uC0C1\uD55C",
+      description: "\uD55C \uBC88\uC758 \uC218\uB3D9 \uC815\uB9AC \uC791\uC5C5\uC5D0\uC11C archive\uB85C \uC62E\uAE38 \uC218 \uC788\uB294 \uC804\uCCB4 \uB808\uCF54\uB4DC \uC0C1\uD55C",
       min: 1,
       max: 1e5,
       step: 1,
@@ -797,13 +1024,73 @@
     },
     "retention.max_archive_bytes": {
       path: "retention.max_archive_bytes",
-      label: "archive \uD06C\uAE30",
-      description: "\uD558\uB098\uC758 private archive\uC5D0 \uB2F4\uC744 \uCD5C\uB300 \uD06C\uAE30",
+      label: "\uC815\uB9AC \uD06C\uAE30 \uC0C1\uD55C",
+      description: "\uD55C \uBC88\uC758 \uC218\uB3D9 \uC815\uB9AC \uC791\uC5C5\uC5D0\uC11C \uC0DD\uC131\uD558\uB294 archive\uC758 \uC804\uCCB4 \uD06C\uAE30 \uC0C1\uD55C",
       min: 65536,
       max: 268435456,
       step: 1,
       unit: "bytes",
       format: formatBytes
+    },
+    "lifecycle.hot_days": {
+      path: "lifecycle.hot_days",
+      label: "Hot(\uCD5C\uADFC) \uAE30\uC900\uC77C",
+      description: "\uC6D0\uBCF8 \uAD00\uCE21 \uC774\uB825\uC740 \uC81C\uAC70\uD558\uACE0 \uB9AC\uD3EC\uD2B8\uC6A9 \uAE30\uB85D\uC740 \uC720\uC9C0\uD558\uB294 Warm(\uC774\uB825 \uCD95\uC18C) \uB2E8\uACC4\uB85C \uC774\uB3D9",
+      min: 1,
+      max: 3650,
+      step: 1,
+      unit: "days",
+      format: (value) => `${formatNumber(value)}\uC77C`
+    },
+    "lifecycle.warm_days": {
+      path: "lifecycle.warm_days",
+      label: "Warm(\uC774\uB825 \uCD95\uC18C) \uAE30\uC900\uC77C",
+      description: "\uC77C\uBC18 \uB9AC\uD3EC\uD2B8\uC5D0\uC11C \uC81C\uC678\uD558\uACE0 \uC555\uCD95\uD558\uC9C0 \uC54A\uC740 trace\uBCC4 JSON \uBB36\uC74C\uC73C\uB85C \uBCF4\uAD00\uD558\uB294 Cold(\uC7A5\uAE30 \uBCF4\uAD00) \uB2E8\uACC4\uB85C \uC774\uB3D9",
+      min: 1,
+      max: 3650,
+      step: 1,
+      unit: "days",
+      format: (value) => `${formatNumber(value)}\uC77C`
+    },
+    "lifecycle.delete_after_days": {
+      path: "lifecycle.delete_after_days",
+      label: "\uC644\uC804 \uC0AD\uC81C \uAE30\uC900\uC77C",
+      description: "\uCD5C\uC2E0 \uAD00\uCE21 \uC774\uD6C4 \uAD00\uB9AC \uB300\uC0C1 trace\uAC00 \uC601\uAD6C \uC0AD\uC81C\uB418\uB294 \uC2DC\uC810",
+      min: 1,
+      max: 3650,
+      step: 1,
+      unit: "days",
+      format: (value) => `${formatNumber(value)}\uC77C`
+    },
+    "lifecycle.private_raw_days": {
+      path: "lifecycle.private_raw_days",
+      label: "\uC6D0\uBB38 \uC0C1\uC138 \uBCF4\uAD00",
+      description: "\uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uCC45\uC744 \uCF30\uC744 \uB54C private \uC694\uCCAD\xB7\uC751\uB2F5 \uC6D0\uBB38 \uBCF4\uAD00 \uAE30\uAC04",
+      min: 1,
+      max: 3650,
+      step: 1,
+      unit: "days",
+      format: (value) => `${formatNumber(value)}\uC77C`
+    },
+    "lifecycle.maintenance_interval_seconds": {
+      path: "lifecycle.maintenance_interval_seconds",
+      label: "\uC720\uC9C0\uAD00\uB9AC \uC8FC\uAE30",
+      description: "\uB85C\uCEEC \uC218\uC9D1\uAE30\uAC00 \uB2E4\uC74C \uC815\uB9AC \uC791\uC5C5\uC744 \uD655\uC778\uD558\uB294 \uAC04\uACA9",
+      min: 60,
+      max: 86400,
+      step: 1,
+      unit: "seconds",
+      format: formatDurationSeconds
+    },
+    "lifecycle.max_traces_per_pass": {
+      path: "lifecycle.max_traces_per_pass",
+      label: "\uC815\uB9AC \uC791\uC5C5\uB2F9 trace",
+      description: "\uD55C \uBC88\uC758 \uC815\uB9AC \uC791\uC5C5\uC5D0\uC11C \uCC98\uB9AC\uD560 \uCD5C\uB300 trace \uC218",
+      min: 1,
+      max: 128,
+      step: 1,
+      unit: "traces",
+      format: (value) => `${formatNumber(value)}\uAC1C`
     }
   };
   var rootElement = document.querySelector("#app");
@@ -932,7 +1219,8 @@
         <a href="#collection"><i data-lucide="activity"></i>\uC218\uC9D1</a>
         <a href="#privacy"><i data-lucide="shield-check"></i>\uAC1C\uC778\uC815\uBCF4</a>
         <a href="#storage"><i data-lucide="database"></i>\uC800\uC7A5\uC18C</a>
-        <a href="#retention"><i data-lucide="archive"></i>\uBCF4\uAD00</a>
+        <a href="#lifecycle"><i data-lucide="heart-pulse"></i>\uB370\uC774\uD130 \uBCF4\uAD00</a>
+        <a href="#retention"><i data-lucide="archive"></i>\uC218\uB3D9 \uC815\uB9AC</a>
         <div class="nav-note"><strong>Codex</strong><span>${configNavigationStatus()}</span><span>${collectorNavigationStatus()}</span></div>
       </nav>
       <main class="settings-main">
@@ -941,6 +1229,7 @@
           ${collectionSection(draft)}
           ${privacySection(draft)}
           ${storageSection(draft)}
+          ${lifecycleSection(draft)}
           ${retentionSection(draft)}
         </form>
       </main>
@@ -995,11 +1284,11 @@
     const ready = integration?.collector === "ready";
     const degraded = integration?.collector === "degraded";
     const conflicted2 = integration?.config === "conflict";
-    const state = integrationUnavailable ? "\uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00" : conflicted2 ? "\uC124\uC815 \uCDA9\uB3CC" : connected && degraded ? "\uB9AC\uD3EC\uD2B8 \uBC18\uC601 \uC9C0\uC5F0" : connected && ready ? "\uC218\uC9D1 \uC911" : connected ? "\uC218\uC9D1\uAE30 \uC751\uB2F5 \uC5C6\uC74C" : "\uC5F0\uACB0 \uC548 \uB428";
-    const detail = integrationUnavailable ? "\uB85C\uCEEC \uC124\uC815\uC740 \uC0AC\uC6A9\uD560 \uC218 \uC788\uC9C0\uB9CC Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC\uB97C \uD655\uC778\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4." : conflicted2 ? "Codex \uC124\uC815\uC774 \uC5F0\uACB0 \uD6C4 \uBCC0\uACBD\uB418\uC5B4 \uC790\uB3D9 \uBCF5\uC6D0\uC744 \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4." : connected && degraded ? "\uC774\uBCA4\uD2B8 \uC218\uC9D1\uC740 \uAC00\uB2A5\uD558\uC9C0\uB9CC \uBAA8\uB2C8\uD130\uB9C1 \uB9AC\uD3EC\uD2B8\uAC00 \uCD5C\uC2E0 \uC0C1\uD0DC\uAC00 \uC544\uB2D9\uB2C8\uB2E4." : connected && ready ? "Codex \uC774\uBCA4\uD2B8\uB97C private local runtime\uC5D0 \uBC18\uC601\uD569\uB2C8\uB2E4." : connected ? "Codex \uC5F0\uACB0\uC740 \uC720\uC9C0\uB418\uC9C0\uB9CC \uB85C\uCEEC \uC218\uC9D1\uAE30\uC5D0 \uC5F0\uACB0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD558\uBA74 \uB2E4\uC74C \uC791\uC5C5\uBD80\uD130 \uAE30\uB85D\uD569\uB2C8\uB2E4.";
+    const state = integrationUnavailable ? "\uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00" : conflicted2 ? "\uC124\uC815 \uCDA9\uB3CC" : connected && degraded ? "\uC218\uC9D1\uAE30 \uC0C1\uD0DC \uC800\uD558" : connected && ready ? "\uC218\uC9D1 \uC911" : connected ? "\uC218\uC9D1\uAE30 \uC751\uB2F5 \uC5C6\uC74C" : "\uC5F0\uACB0 \uC548 \uB428";
+    const detail = integrationUnavailable ? "\uB85C\uCEEC \uC124\uC815\uC740 \uC0AC\uC6A9\uD560 \uC218 \uC788\uC9C0\uB9CC Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC\uB97C \uD655\uC778\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4." : conflicted2 ? "Codex \uC124\uC815\uC774 \uC5F0\uACB0 \uD6C4 \uBCC0\uACBD\uB418\uC5B4 \uC790\uB3D9 \uBCF5\uC6D0\uC744 \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4." : connected && degraded ? "\uC774\uBCA4\uD2B8 \uC218\uC9D1\uC740 \uAC00\uB2A5\uD558\uC9C0\uB9CC \uB9AC\uD3EC\uD2B8 \uBC18\uC601 \uB610\uB294 \uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uB9AC\uAC00 \uC9C0\uC5F0\uB420 \uC218 \uC788\uC2B5\uB2C8\uB2E4." : connected && ready ? "Codex \uC774\uBCA4\uD2B8\uB97C private local runtime\uC5D0 \uBC18\uC601\uD569\uB2C8\uB2E4." : connected ? "Codex \uC5F0\uACB0\uC740 \uC720\uC9C0\uB418\uC9C0\uB9CC \uB85C\uCEEC \uC218\uC9D1\uAE30\uC5D0 \uC5F0\uACB0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD558\uBA74 \uB2E4\uC74C \uC791\uC5C5\uBD80\uD130 \uAE30\uB85D\uD569\uB2C8\uB2E4.";
     const action = integrationUnavailable ? `<button class="button secondary" id="refresh-integration" type="button"><i data-lucide="refresh-cw"></i>\uB2E4\uC2DC \uD655\uC778</button>` : connected ? `<button class="button secondary" id="toggle-integration" type="button"><i data-lucide="power"></i>\uC5F0\uACB0 \uD574\uC81C</button>` : `<button class="button primary" id="toggle-integration" type="button"><i data-lucide="cable"></i>Codex \uC5F0\uACB0</button>`;
     const panelState = integrationUnavailable ? "unavailable" : conflicted2 ? "conflict" : degraded ? "degraded" : ready ? "ready" : "idle";
-    const collectorLabel = integrationUnavailable ? "\uD655\uC778 \uBD88\uAC00" : degraded ? "\uB9AC\uD3EC\uD2B8 \uC9C0\uC5F0" : ready ? "\uC815\uC0C1" : "\uC911\uC9C0";
+    const collectorLabel = integrationUnavailable ? "\uD655\uC778 \uBD88\uAC00" : degraded ? "\uC0C1\uD0DC \uC800\uD558" : ready ? "\uC815\uC0C1" : "\uC911\uC9C0";
     return `<div class="integration-panel" data-state="${panelState}" data-config-state="${integration?.config ?? "disconnected"}" data-collector-state="${integration?.collector ?? "unavailable"}">
     <div class="integration-identity"><span class="integration-icon"><i data-lucide="activity"></i></span><div><span>Codex</span><strong>${state}</strong><small>${detail}</small></div></div>
     <div class="integration-meta"><span><b>\uC218\uC9D1\uAE30</b>${collectorLabel}</span><span><b>\uC800\uC7A5</b>\uB85C\uCEEC \uC804\uC6A9</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
@@ -1015,12 +1304,12 @@
   function collectorNavigationStatus() {
     if (integrationUnavailable) return "collector \uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00";
     if (integration?.collector === "ready") return "collector \uC2E4\uD589 \uC911";
-    if (integration?.collector === "degraded") return "collector \uC2E4\uD589 \uC911 \xB7 \uB9AC\uD3EC\uD2B8 \uC9C0\uC5F0";
+    if (integration?.collector === "degraded") return "collector \uC2E4\uD589 \uC911 \xB7 \uC0C1\uD0DC \uC800\uD558";
     return "collector \uC911\uC9C0\uB428";
   }
   function collectionSection(config) {
     return `<section class="settings-section" id="collection" aria-labelledby="collection-title">
-    ${sectionTitle("activity", "\uC218\uC9D1", "\uD30C\uC77C \uD655\uC778\uACFC durable \uAE30\uB85D \uBC18\uC601 \uAC04\uACA9")}
+    ${sectionTitle("collection", "activity", "\uC218\uC9D1", "\uD30C\uC77C \uD655\uC778\uACFC durable \uAE30\uB85D \uBC18\uC601 \uAC04\uACA9")}
     <div class="section-grid">
       <div class="field-grid">${fieldControl(fields["collection.file_reconcile_interval_ms"], config)}${fieldControl(fields["collection.flush_interval_ms"], config)}</div>
       ${dualTimeline(
@@ -1049,7 +1338,7 @@
   }
   function storageSection(config) {
     return `<section class="settings-section" id="storage" aria-labelledby="storage-title">
-    ${sectionTitle("database", "\uC800\uC7A5\uC18C", "\uB85C\uCEEC \uB370\uC774\uD130\uAC00 \uB118\uC9C0 \uBABB\uD558\uB294 \uB514\uC2A4\uD06C \uC608\uC0B0")}
+    ${sectionTitle("storage", "database", "\uC800\uC7A5\uC18C", "\uB85C\uCEEC \uB370\uC774\uD130\uAC00 \uB118\uC9C0 \uBABB\uD558\uB294 \uB514\uC2A4\uD06C \uC608\uC0B0")}
     <div class="section-grid">
       <div class="field-grid single">${fieldControl(fields["collection.local_storage_budget_bytes"], config)}</div>
       ${singleRuler("storage-visual", "\uC124\uC815 \uC800\uC7A5 \uD55C\uB3C4", fields["collection.local_storage_budget_bytes"], "256 MiB", "20 GiB", true, "\uD604\uC7AC \uC0AC\uC6A9\uB7C9\uC774 \uC544\uB2CC \uD5C8\uC6A9 \uD55C\uB3C4")}
@@ -1068,22 +1357,50 @@
     <div class="privacy-warning"><i data-lucide="shield-check"></i><div><strong>\uBA85\uC2DC\uC801\uC73C\uB85C \uCF20 \uC774\uD6C4\uC758 \uC0C8 turn\uBD80\uD130 \uC801\uC6A9\uB429\uB2C8\uB2E4.</strong><span>\uC6D0\uBB38\uC740 team \uC804\uC1A1\xB7\uC77C\uBC18 \uB9AC\uD3EC\uD2B8\xB7export\uC5D0 \uD3EC\uD568\uB418\uC9C0 \uC54A\uC73C\uBA70, \uC774 Mac\uC758 private localhost \uC0C1\uC138 \uD654\uBA74\uC5D0\uC11C\uB9CC \uC694\uCCAD\uD560 \uB54C \uC77D\uC2B5\uB2C8\uB2E4. \uBBFC\uAC10\uC815\uBCF4\uAC00 \uD3EC\uD568\uB420 \uC218 \uC788\uC2B5\uB2C8\uB2E4.</span></div></div>
   </section>`;
   }
+  function lifecycleSection(config) {
+    const enabled = config.lifecycle.enabled;
+    return `<section class="settings-section" id="lifecycle" aria-labelledby="lifecycle-title">
+    <div class="section-title"><span class="section-icon"><i data-lucide="heart-pulse"></i></span><div><h2 id="lifecycle-title">\uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uCC45</h2><p>\uCD5C\uC2E0 trace \uAD00\uCE21 \uC2DC\uC810\uBD80\uD130 \uB204\uC801\uB41C \uACBD\uACFC \uAE30\uAC04\uC73C\uB85C Hot(\uCD5C\uADFC) \u2192 Warm(\uC774\uB825 \uCD95\uC18C) \u2192 Cold(\uC7A5\uAE30 \uBCF4\uAD00) \u2192 Delete(\uC0AD\uC81C)\uB97C \uC801\uC6A9\uD569\uB2C8\uB2E4.</p></div></div>
+    <label class="collection-toggle lifecycle-toggle" data-boolean-field="lifecycle.enabled">
+      <span><strong>\uC790\uB3D9 \uC815\uB9AC</strong><small id="lifecycle-enabled-copy">${enabled ? "\uCF1C\uC9D0 \xB7 \uB2E4\uC74C \uC815\uB9AC \uC791\uC5C5\uBD80\uD130 \uBCF4\uAD00 \uAE30\uC900\uC744 \uC9C0\uB09C \uAE30\uC874 \uB370\uC774\uD130\uC5D0\uB3C4 \uC801\uC6A9\uB429\uB2C8\uB2E4" : "\uAEBC\uC9D0 \xB7 \uAE30\uC874 \uC218\uB3D9 \uBCF4\uAD00 \uC124\uC815\uACFC \uC6D0\uBB38 \uBCF4\uAD00 \uB3D9\uC791\uC744 \uC720\uC9C0\uD569\uB2C8\uB2E4"}</small></span>
+      <input type="checkbox" id="lifecycle-enabled" ${enabled ? "checked" : ""}>
+      <span class="toggle-track" aria-hidden="true"><span></span></span>
+    </label>
+    <div class="section-grid lifecycle-grid">
+      <div class="field-grid">${fieldControl(fields["lifecycle.hot_days"], config)}${fieldControl(fields["lifecycle.warm_days"], config)}${fieldControl(fields["lifecycle.delete_after_days"], config)}${fieldControl(fields["lifecycle.private_raw_days"], config)}${fieldControl(fields["lifecycle.maintenance_interval_seconds"], config)}${fieldControl(fields["lifecycle.max_traces_per_pass"], config)}</div>
+      ${lifecycleTimeline(config)}
+    </div>
+    <div class="retention-note lifecycle-warning" role="note"><i data-lucide="archive"></i><span><strong>\uC0AD\uC81C\uB294 \uB418\uB3CC\uB9B4 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4.</strong> \uC790\uB3D9 \uC815\uB9AC\uB97C \uCF1C\uAC70\uB098 \uAE30\uC900\uC77C\uC744 \uC904\uC774\uBA74 \uBCF4\uAD00 \uAE30\uC900\uC744 \uC9C0\uB09C \uAE30\uC874 \uB370\uC774\uD130\uAC00 \uB2E4\uC74C \uC815\uB9AC \uC791\uC5C5\uC5D0\uC11C \uC774\uB3D9\uD558\uAC70\uB098 \uC601\uAD6C \uC0AD\uC81C\uB420 \uC218 \uC788\uC2B5\uB2C8\uB2E4. \uC124\uC815 \uC800\uC7A5 \uC644\uB8CC\uB294 \uC815\uB9AC \uC2E4\uD589\uC774\uB098 \uB514\uC2A4\uD06C \uACF5\uAC04 \uD68C\uC218\uB97C \uC758\uBBF8\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.</span></div>
+  </section>`;
+  }
+  function lifecycleTimeline(config) {
+    return `<figure class="policy-visual timeline lifecycle-timeline" data-min="1" data-max="3650" data-log="true">
+    <figcaption><span>\uB204\uC801 \uACBD\uACFC \uAE30\uAC04</span><strong data-lifecycle-value>Hot(\uCD5C\uADFC) \u2192 Warm(\uC774\uB825 \uCD95\uC18C) \u2192 Cold(\uC7A5\uAE30 \uBCF4\uAD00) \u2192 Delete(\uC0AD\uC81C)</strong></figcaption>
+    <div class="timeline-track" aria-hidden="true">
+      <span class="timeline-marker first" data-marker data-path="lifecycle.hot_days"><b>Warm ${config.lifecycle.hot_days}\uC77C</b></span>
+      <span class="timeline-marker second" data-marker data-path="lifecycle.warm_days"><b>Cold ${config.lifecycle.warm_days}\uC77C</b></span>
+      <span class="timeline-marker third" data-marker data-path="lifecycle.delete_after_days"><b>Delete ${config.lifecycle.delete_after_days}\uC77C</b></span>
+    </div>
+    <div class="ruler-labels"><span>\uCD5C\uC2E0 \uAD00\uCE21</span><span>10\uB144</span></div>
+    <p>\uAC01 \uAC12\uC740 \uB2E8\uACC4\uBCC4 \uCD94\uAC00 \uAE30\uAC04\uC774 \uC544\uB2C8\uB77C \uCD5C\uC2E0 trace \uAD00\uCE21 \uC774\uD6C4\uC758 \uB204\uC801 \uACBD\uACFC \uAE30\uAC04\uC785\uB2C8\uB2E4.</p>
+  </figure>`;
+  }
   function retentionSection(config) {
     return `<section class="settings-section" id="retention" aria-labelledby="retention-title">
-    ${sectionTitle("archive", "\uBCF4\uAD00", "\uB9CC\uB8CC \uB300\uC0C1\uACFC private archive \uD06C\uAE30 \uC815\uCC45")}
+    ${sectionTitle("retention", "archive", "\uC218\uB3D9 \uC815\uB9AC", "\uC790\uB3D9 \uC0AD\uC81C\uC640 \uBCC4\uAC1C\uC778 \uC218\uB3D9 \uB300\uC0C1 \uAE30\uC900 \uBC0F \uC791\uC5C5\uBCC4 archive \uC0C1\uD55C")}
     <div class="section-grid">
       <div class="field-grid">${fieldControl(fields["retention.max_record_age_days"], config)}${fieldControl(fields["retention.max_archive_records"], config)}${fieldControl(fields["retention.max_archive_bytes"], config)}</div>
       <div class="visual-stack">
-        ${singleRuler("retention-visual", "\uBCF4\uAD00 \uAE30\uAC04", fields["retention.max_record_age_days"], "1\uC77C", "10\uB144", true, "cutoff\uBCF4\uB2E4 \uC624\uB798\uB41C trace\uB294 \uB9CC\uB8CC \uB300\uC0C1")}
-        ${singleRuler("archive-records-visual", "Archive \uB808\uCF54\uB4DC \uC0C1\uD55C", fields["retention.max_archive_records"], "1", "100k", true)}
-        ${singleRuler("archive-bytes-visual", "Archive \uD06C\uAE30 \uC0C1\uD55C", fields["retention.max_archive_bytes"], "64 KiB", "256 MiB", true)}
+        ${singleRuler("retention-visual", "\uC218\uB3D9 \uC815\uB9AC \uAE30\uC900\uC77C", fields["retention.max_record_age_days"], "1\uC77C", "10\uB144", true, "\uAE30\uC900\uC77C\uBCF4\uB2E4 \uC624\uB798\uB41C trace\uB294 \uC218\uB3D9 \uC815\uB9AC \uB300\uC0C1")}
+        ${singleRuler("archive-records-visual", "\uC791\uC5C5\uBCC4 Archive \uB808\uCF54\uB4DC \uC0C1\uD55C", fields["retention.max_archive_records"], "1", "100k", true)}
+        ${singleRuler("archive-bytes-visual", "\uC791\uC5C5\uBCC4 Archive \uD06C\uAE30 \uC0C1\uD55C", fields["retention.max_archive_bytes"], "64 KiB", "256 MiB", true)}
       </div>
     </div>
-    <div class="retention-note"><i data-lucide="archive"></i><span>\uBCF4\uAD00 \uAE30\uAC04\uC744 \uC904\uC5EC\uB3C4 \uC989\uC2DC \uC0AD\uC81C\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. cleanup\uC740 \uBCC4\uB3C4\uC758 retention plan/apply \uACBD\uACC4\uB97C \uB530\uB985\uB2C8\uB2E4.</span></div>
+    <div class="retention-note"><i data-lucide="archive"></i><span>\uC218\uB3D9 \uC815\uB9AC \uAE30\uC900 ${config.retention.max_record_age_days}\uC77C\uC740 \uC790\uB3D9 \uC644\uC804 \uC0AD\uC81C \uAE30\uC900 ${config.lifecycle.delete_after_days}\uC77C\uACFC \uBCC4\uAC1C\uC785\uB2C8\uB2E4. \uB808\uCF54\uB4DC\xB7\uD06C\uAE30 \uC0C1\uD55C\uC740 \uD55C \uBC88\uC758 \uC218\uB3D9 \uC815\uB9AC \uC791\uC5C5\uC5D0 \uD568\uAED8 \uC801\uC6A9\uB429\uB2C8\uB2E4. \uAE30\uC900\uC77C\uC744 \uC904\uC5EC\uB3C4 \uC989\uC2DC \uC0AD\uC81C\uD558\uC9C0 \uC54A\uC73C\uBA70 \uBCC4\uB3C4\uC758 \uACC4\uD68D \uC0DD\uC131\xB7\uC801\uC6A9 \uC808\uCC28\uB97C \uB530\uB985\uB2C8\uB2E4.</span></div>
   </section>`;
   }
-  function sectionTitle(icon, title, description) {
-    return `<div class="section-title"><span class="section-icon"><i data-lucide="${icon}"></i></span><div><h2 id="${title === "\uC218\uC9D1" ? "collection" : title === "\uC800\uC7A5\uC18C" ? "storage" : "retention"}-title">${title}</h2><p>${description}</p></div></div>`;
+  function sectionTitle(id, icon, title, description) {
+    return `<div class="section-title"><span class="section-icon"><i data-lucide="${icon}"></i></span><div><h2 id="${id}-title">${title}</h2><p>${description}</p></div></div>`;
   }
   function summaryItem(icon, label, value) {
     return `<div class="summary-item"><i data-lucide="${icon}"></i><span>${label}</span><strong>${value}</strong></div>`;
@@ -1128,6 +1445,7 @@
     form?.addEventListener("input", handleInput);
     document.querySelector("#enabled")?.addEventListener("change", handleEnabled);
     document.querySelector("#capture-private-codex-turn-details")?.addEventListener("change", handlePrivateDetails);
+    document.querySelector("#lifecycle-enabled")?.addEventListener("change", handleLifecycleEnabled);
     document.querySelector("#discard")?.addEventListener("click", discardChanges);
     document.querySelector("#reset")?.addEventListener("click", openResetDialog);
     document.querySelector("#cancel-reset")?.addEventListener("click", closeResetDialog);
@@ -1288,6 +1606,16 @@
     );
     updateDirtyState();
   }
+  function handleLifecycleEnabled(event) {
+    const input = event.target;
+    if (!(input instanceof HTMLInputElement) || !draft) return;
+    draft.lifecycle.enabled = input.checked;
+    setText(
+      "lifecycle-enabled-copy",
+      input.checked ? "\uCF1C\uC9D0 \xB7 \uB2E4\uC74C \uC815\uB9AC \uC791\uC5C5\uBD80\uD130 \uBCF4\uAD00 \uAE30\uC900\uC744 \uC9C0\uB09C \uAE30\uC874 \uB370\uC774\uD130\uC5D0\uB3C4 \uC801\uC6A9\uB429\uB2C8\uB2E4" : "\uAEBC\uC9D0 \xB7 \uAE30\uC874 \uC218\uB3D9 \uBCF4\uAD00 \uC124\uC815\uACFC \uC6D0\uBB38 \uBCF4\uAD00 \uB3D9\uC791\uC744 \uC720\uC9C0\uD569\uB2C8\uB2E4"
+    );
+    updateDirtyState();
+  }
   function updateAllVisuals() {
     if (!draft) return;
     document.querySelectorAll("[data-visual-value]").forEach((output) => {
@@ -1303,6 +1631,11 @@
       const minimum = Number(owner?.dataset.min ?? field.min);
       const maximum = Number(owner?.dataset.max ?? field.max);
       marker.style.left = `${position(getValue(draft, path), minimum, maximum, owner?.dataset.log === "true")}%`;
+      const label = marker.querySelector("b");
+      if (label && path.startsWith("lifecycle.")) {
+        const stage = path === "lifecycle.hot_days" ? "Warm" : path === "lifecycle.warm_days" ? "Cold" : "Delete";
+        label.textContent = `${stage} ${getValue(draft, path)}\uC77C`;
+      }
     });
     document.querySelectorAll("[data-dual-value]").forEach((output) => {
       const visual = output.closest(".policy-visual");
@@ -1356,10 +1689,10 @@
       showToast("\uBE44\uC5B4 \uC788\uAC70\uB098 \uD5C8\uC6A9 \uBC94\uC704\uB97C \uBC97\uC5B4\uB09C \uAC12\uC744 \uD655\uC778\uD558\uC138\uC694.", "error");
       return;
     }
-    if (!validate_local_runtime_config_v3_default(draft)) {
-      const errors = validate_local_runtime_config_v3_default.errors ?? [];
-      for (const error of errors) {
-        const path = error.instancePath?.replace(/^\//, "").replaceAll("/", ".");
+    const validation = validateLocalRuntimeConfig(draft);
+    if (!validation.valid) {
+      for (const error of validation.errors) {
+        const path = error.path;
         if (path in fields) showFieldError(path, error.message ?? "\uD5C8\uC6A9 \uBC94\uC704\uB97C \uD655\uC778\uD558\uC138\uC694.");
       }
       focusFirstInvalid();
@@ -1410,6 +1743,7 @@
     const changed = changedPaths(localDraft, localBase);
     const enabledChanged = localDraft.enabled !== localBase.enabled;
     const privateDetailsChanged = (localDraft.capture_private_codex_turn_details ?? false) !== (localBase.capture_private_codex_turn_details ?? false);
+    const lifecycleEnabledChanged = localDraft.lifecycle.enabled !== localBase.lifecycle.enabled;
     const latest = await api("/api/config");
     applyEnvelope(latest);
     if (!draft) return;
@@ -1418,6 +1752,7 @@
     if (privateDetailsChanged) {
       draft.capture_private_codex_turn_details = localDraft.capture_private_codex_turn_details ?? false;
     }
+    if (lifecycleEnabledChanged) draft.lifecycle.enabled = localDraft.lifecycle.enabled;
     conflicted = false;
     renderSettings("save-title");
   }
@@ -1634,7 +1969,7 @@
   function booleanChangeCount(left, right) {
     return Number(left.enabled !== right.enabled) + Number(
       (left.capture_private_codex_turn_details ?? false) !== (right.capture_private_codex_turn_details ?? false)
-    );
+    ) + Number(left.lifecycle.enabled !== right.lifecycle.enabled);
   }
   function position(value, min, max, logarithmic) {
     const bounded = Math.min(max, Math.max(min, value));
@@ -1645,6 +1980,11 @@
     if (value >= 6e4 && value % 6e4 === 0) return `${formatNumber(value / 6e4)}\uBD84`;
     if (value >= 1e3) return `${formatNumber(value / 1e3)}\uCD08`;
     return `${formatNumber(value)}ms`;
+  }
+  function formatDurationSeconds(value) {
+    if (value >= 3600 && value % 3600 === 0) return `${formatNumber(value / 3600)}\uC2DC\uAC04`;
+    if (value >= 60 && value % 60 === 0) return `${formatNumber(value / 60)}\uBD84`;
+    return `${formatNumber(value)}\uCD08`;
   }
   function formatBytes(value) {
     if (value >= 1073741824) return `${formatDecimal(value / 1073741824)} GiB`;

@@ -234,9 +234,13 @@ try {
   await lifecyclePage.locator(".integration-panel[data-state='degraded']").waitFor();
   assert.match(
     await lifecyclePage.locator(".integration-identity strong").innerText(),
-    /리포트 반영 지연/,
+    /수집기 상태 저하/,
   );
-  assert.match(await lifecyclePage.locator(".integration-meta").innerText(), /리포트 지연/);
+  assert.match(
+    await lifecyclePage.locator(".integration-identity").innerText(),
+    /리포트 반영 또는 데이터 보관 정리가 지연될 수 있습니다/,
+  );
+  assert.match(await lifecyclePage.locator(".integration-meta").innerText(), /상태 저하/);
   assert.doesNotMatch(await lifecyclePage.locator(".integration-meta").innerText(), /정상/);
   assert.equal(await lifecyclePage.locator("#toggle-integration").innerText(), "연결 해제");
   assert.equal(await lifecyclePage.evaluate(() => performance.timeOrigin), documentIdentity);
@@ -399,8 +403,8 @@ try {
     assert.equal(await page.evaluate(() => location.hash), "");
     assert.equal(await page.locator("main").count(), 1);
     assert.equal(await page.locator("nav[aria-label='설정 영역']").count(), 1);
-    assert.equal(await page.locator("#settings-form input[type=number]").count(), 10);
-    assert.equal(await page.locator("#settings-form input[type=checkbox]").count(), 2);
+    assert.equal(await page.locator("#settings-form input[type=number]").count(), 16);
+    assert.equal(await page.locator("#settings-form input[type=checkbox]").count(), 3);
     assert.equal(
       await page.evaluate(
         () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
@@ -440,6 +444,31 @@ try {
       const config = JSON.parse(await readFile(configPath, "utf8"));
       assert.equal(config.collection.max_batch_records, 125);
       assert.equal(config.capture_private_codex_turn_details, true);
+      assert.equal(config.lifecycle.enabled, false);
+      assert.match(await page.locator(".lifecycle-warning").innerText(), /삭제는 되돌릴 수 없습니다/);
+      await page.locator('[data-boolean-field="lifecycle.enabled"]').click();
+      await page.locator("#lifecycle-hot_days").fill("10");
+      await page.locator("#lifecycle-warm_days").fill("9");
+      await page.locator("#save").click();
+      assert.equal(await page.locator("#lifecycle-warm_days").getAttribute("aria-invalid"), "true");
+      assert.equal(JSON.parse(await readFile(configPath, "utf8")).lifecycle.enabled, false);
+      await page.locator("#lifecycle-warm_days").fill("30");
+      await page.locator("#lifecycle-private_raw_days").fill("3");
+      await page.locator("#save").click();
+      await page.waitForFunction(() => (document.querySelector("#save") as HTMLButtonElement).disabled
+        && document.querySelector("#save-title")?.textContent === "저장됨");
+      const lifecycleConfig = JSON.parse(await readFile(configPath, "utf8"));
+      assert.equal(lifecycleConfig.lifecycle.enabled, true);
+      assert.equal(lifecycleConfig.lifecycle.hot_days, 10);
+      assert.equal(lifecycleConfig.lifecycle.private_raw_days, 3);
+      await page.reload({ waitUntil: "networkidle" });
+      assert.equal(await page.locator("#lifecycle-enabled").isChecked(), true);
+      assert.equal(await page.locator("#lifecycle-hot_days").inputValue(), "10");
+      await page.locator('[data-boolean-field="lifecycle.enabled"]').click();
+      await page.locator("#save").click();
+      await page.waitForFunction(() => (document.querySelector("#save") as HTMLButtonElement).disabled
+        && document.querySelector("#save-title")?.textContent === "저장됨");
+      assert.equal(JSON.parse(await readFile(configPath, "utf8")).lifecycle.enabled, false);
       await page.locator("#collection-max_batch_records").fill("");
       await page.locator("#collection-flush_interval_ms").fill("6000");
       await page.locator("#save").click();

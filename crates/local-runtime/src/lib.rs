@@ -17,7 +17,7 @@ pub mod storage;
 pub use control::{ControlError, RuntimeControl};
 pub use ingress::{Ingress, IngressCounters, IngressMessage, IngressOutcome};
 pub use lock::{MutationGuard, Singleton, SingletonError};
-pub use policy::{CollectionPolicyV1, RetentionPolicyV1};
+pub use policy::{CollectionPolicyV1, RetentionPolicyV1, StorageLifecyclePolicyV1};
 pub use scheduler::{PressureSample, Schedule, Scheduler, State};
 pub use storage::{Admission, Partition, StorageAccountingError, StorageBudget, StorageError};
 
@@ -29,6 +29,6 @@ pub const CHANNEL_CAPACITY: usize = 64;
 pub const NORMALIZATION_WORKERS: usize = 1;
 pub use config::{
     ConfigError, ConfigMutationGuard, ConfigServiceError, InstalledLayout,
-    LOCAL_RUNTIME_CONFIG_VERSION, LocalConfigService, LocalRuntimeConfigV3, VersionedLocalConfig,
-    inspect, install, load, revision, save, save_if_revision,
+    LOCAL_RUNTIME_CONFIG_VERSION, LocalConfigService, LocalRuntimeConfigV3, LocalRuntimeConfigV4,
+    VersionedLocalConfig, inspect, install, load, revision, save, save_if_revision,
 };
