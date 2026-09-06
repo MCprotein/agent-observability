@@ -67,6 +67,8 @@ Import and report:
 
 Maintenance:
   agentobs retention-plan <root>
+  agentobs lifecycle-run [root]
+  agentobs cold-read <root> [after-archive-seq]
   agentobs retention-apply <root> <plan-id> <private-archive-jsonl>
   agentobs init|runtime-check|storage-check <root>
   agentobs config-check <config-json>
@@ -403,6 +405,9 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
         [command] if command == "contracts" => contracts(),
         [command, root] if command == "storage-check" => storage_check(Path::new(root)),
         [command, root] if command == "retention-plan" => retention(Path::new(root), None),
+        [command, args @ ..] if matches!(command.as_str(), "cold-read" | "lifecycle-run") => {
+            storage_lifecycle_command(command, args)
+        }
         [command, root, plan_id, archive] if command == "retention-apply" => retention(
             Path::new(root),
             Some((plan_id.as_str(), Path::new(archive))),
@@ -469,7 +474,6 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
             Ok(env!("CARGO_PKG_VERSION").into())
         }
         [] => Ok(USAGE.into()),
-        [command] if matches!(command.as_str(), "help" | "--help" | "-h") => Ok(USAGE.into()),
         [command] => Err(format!("unknown command {command}")),
         _ => Err(USAGE.into()),
     }
@@ -481,9 +485,30 @@ fn help_requested(arguments: &[String]) -> bool {
         .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
 }
 
+fn storage_lifecycle_command(command: &str, arguments: &[String]) -> Result<String, String> {
+    match (command, arguments) {
+        ("cold-read", [root]) => cold_read(Path::new(root), 0),
+        ("cold-read", [root, after]) => cold_read(
+            Path::new(root),
+            after
+                .parse::<u64>()
+                .map_err(|_| "invalid archive cursor".to_string())?,
+        ),
+        ("lifecycle-run", [] | [_]) => {
+            let root = arguments
+                .first()
+                .map_or_else(default_root, |root| Ok(PathBuf::from(root)))?;
+            agent_observability_local_collector::maintain_storage_lifecycle(&root)
+                .map_err(|error| error.to_string())
+        }
+        _ => Err(USAGE.into()),
+    }
+}
+
 fn run_onboarding(arguments: &[String]) -> Option<Result<String, String>> {
     let result = match arguments {
         _ if help_requested(arguments) => Ok(USAGE.into()),
+        [command] if command == "help" => Ok(USAGE.into()),
         [command] if command == "demo" => default_demo_root().and_then(|root| demo(&root, true)),
         [command, flag] if command == "demo" && flag == "--no-open" => {
             default_demo_root().and_then(|root| demo(&root, false))
@@ -791,6 +816,15 @@ fn set_config_value(
         "retention-days" => config.retention.max_record_age_days = parse!(u16),
         "archive-records" => config.retention.max_archive_records = parse!(u32),
         "archive-bytes" => config.retention.max_archive_bytes = parse!(u64),
+        "lifecycle-enabled" => config.lifecycle.enabled = parse!(bool),
+        "hot-days" => config.lifecycle.hot_days = parse!(u16),
+        "warm-days" => config.lifecycle.warm_days = parse!(u16),
+        "delete-after-days" => config.lifecycle.delete_after_days = parse!(u16),
+        "private-raw-days" => config.lifecycle.private_raw_days = parse!(u16),
+        "maintenance-interval-seconds" => {
+            config.lifecycle.maintenance_interval_seconds = parse!(u32);
+        }
+        "max-traces-per-pass" => config.lifecycle.max_traces_per_pass = parse!(u16),
         _ => return Err(format!("unknown config option {key}")),
     }
     config.validate().map_err(|error| error.to_string())
@@ -798,7 +832,7 @@ fn set_config_value(
 
 fn config_output(layout: &InstalledLayout, config: &LocalRuntimeConfigV3) -> String {
     format!(
-        "root={}\nconfig={}\nenabled={}\nprivate-codex-details={}\nfile-reconcile-ms={}\nflush-ms={}\nbatch-records={}\nbatch-bytes={}\nactive-heartbeat-ms={}\nidle-heartbeat-ms={}\nstorage-bytes={}\nretention-days={}\narchive-records={}\narchive-bytes={}",
+        "root={}\nconfig={}\nenabled={}\nprivate-codex-details={}\nfile-reconcile-ms={}\nflush-ms={}\nbatch-records={}\nbatch-bytes={}\nactive-heartbeat-ms={}\nidle-heartbeat-ms={}\nstorage-bytes={}\nretention-days={}\narchive-records={}\narchive-bytes={}\nlifecycle-enabled={}\nhot-days={}\nwarm-days={}\ndelete-after-days={}\nprivate-raw-days={}\nmaintenance-interval-seconds={}\nmax-traces-per-pass={}",
         layout.root.display(),
         layout.config.display(),
         config.enabled,
@@ -812,7 +846,14 @@ fn config_output(layout: &InstalledLayout, config: &LocalRuntimeConfigV3) -> Str
         config.collection.local_storage_budget_bytes,
         config.retention.max_record_age_days,
         config.retention.max_archive_records,
-        config.retention.max_archive_bytes
+        config.retention.max_archive_bytes,
+        config.lifecycle.enabled,
+        config.lifecycle.hot_days,
+        config.lifecycle.warm_days,
+        config.lifecycle.delete_after_days,
+        config.lifecycle.private_raw_days,
+        config.lifecycle.maintenance_interval_seconds,
+        config.lifecycle.max_traces_per_pass
     )
 }
 
@@ -823,8 +864,11 @@ fn storage_check(root: &Path) -> Result<String, String> {
     let config = load(&layout.config).map_err(|error| error.to_string())?;
     let store = open_store(&mutation, &layout, &config)?;
     let (observations, records, outcomes) = store.counts().map_err(|error| error.to_string())?;
+    let expired = store
+        .expired_trace_disposition_count()
+        .map_err(|error| error.to_string())?;
     Ok(format!(
-        "store_schema={LOCAL_STORE_SCHEMA_VERSION}\nobservations={observations}\nrecords={records}\ndelivery_outcomes={outcomes}\nteam_ingest=disabled"
+        "store_schema={LOCAL_STORE_SCHEMA_VERSION}\nobservations={observations}\nrecords={records}\ndelivery_outcomes={outcomes}\nexpired_trace_dispositions={expired}\nteam_ingest=disabled"
     ))
 }
 
@@ -839,6 +883,34 @@ fn open_store(
         .map_err(|error| error.to_string())?;
     LocalStore::open_with_migration_headroom(layout.state.join("store"), migration_headroom)
         .map_err(|error| error.to_string())
+}
+
+fn cold_read(root: &Path, after_archive_seq: u64) -> Result<String, String> {
+    let layout =
+        agent_observability_local_runtime::inspect(root).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let store =
+        LocalStore::open_current(layout.state.join("store")).map_err(|error| error.to_string())?;
+    let page = store
+        .query_cold_archives(agent_observability_local_store::ColdArchiveQuery {
+            after_archive_seq,
+            max_traces: config.lifecycle.max_traces_per_pass,
+            max_records: config.retention.max_archive_records,
+            max_bytes: config.retention.max_archive_bytes,
+        })
+        .map_err(|error| error.to_string())?;
+    let mut output = format!(
+        "cold_traces={}\nrecords={}\nnext_after_archive_seq={}\nhas_more={}\nblocked={:?}\n",
+        page.traces.len(),
+        page.records,
+        page.next_after_archive_seq,
+        page.has_more,
+        page.blocked,
+    );
+    for trace in page.traces {
+        output.push_str(&trace.records_jsonl().map_err(|error| error.to_string())?);
+    }
+    Ok(output)
 }
 
 fn retention(root: &Path, apply: Option<(&str, &Path)>) -> Result<String, String> {
@@ -858,6 +930,17 @@ fn retention(root: &Path, apply: Option<(&str, &Path)>) -> Result<String, String
         .saturating_mul(86_400_000)
         .saturating_sub(retention_ms);
     if let Some((expected_plan_id, archive_path)) = apply.as_ref() {
+        let render_guard = store
+            .try_acquire_report_render_guard()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "report publication is busy; retry retention".to_string())?;
+        store
+            .invalidate_report()
+            .map_err(|error| error.to_string())?;
+        agent_observability_static_report::write_refresh_pending(
+            &layout.logs.join(REPORT_FILE_NAME),
+        )
+        .map_err(|error| error.to_string())?;
         let result = store
             .apply_retention(
                 cutoff_unix_ms,
@@ -868,6 +951,7 @@ fn retention(root: &Path, apply: Option<(&str, &Path)>) -> Result<String, String
             )
             .map_err(|error| error.to_string())?;
         let output = retention_output(&result.plan, result.archive_path.as_deref(), true);
+        drop(render_guard);
         drop(store);
         drop(mutation);
         maintain_private_turn_details(root).map_err(|error| error.to_string())?;
@@ -1250,6 +1334,24 @@ fn ingest_paths(path: &Path) -> Result<IngestPaths, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lifecycle_cli_is_opt_in_and_cold_reads_are_bounded() {
+        let root =
+            std::env::temp_dir().join(format!("agentobs-lifecycle-cli-{}", std::process::id()));
+        let layout = agent_observability_local_runtime::install(&root).unwrap();
+        let root_arg = layout.root.to_string_lossy().into_owned();
+        assert_eq!(
+            super::run(["lifecycle-run".into(), root_arg.clone()].into_iter()).unwrap(),
+            "lifecycle=disabled"
+        );
+        super::run(["storage-check".into(), root_arg.clone()].into_iter()).unwrap();
+        let empty = super::run(["cold-read".into(), root_arg.clone()].into_iter()).unwrap();
+        assert!(empty.contains("cold_traces=0\n"));
+        assert!(empty.contains("has_more=false\n"));
+        assert!(super::run(["cold-read".into(), root_arg, "-1".into()].into_iter()).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::{
         IngestBlock, IngestResult, LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME, USAGE,
         format_codex_status, open_dashboard_with, open_settings_url_with, prepare_dashboard_with,
@@ -1324,7 +1426,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         let init = run(["init".into(), root.to_string_lossy().into_owned()].into_iter()).unwrap();
-        assert!(init.contains("config_schema=local_runtime.v3"));
+        assert!(init.contains("config_schema=local_runtime.v4"));
         let config = root.join("config.json");
         let check = run(["config-check".into(), config.to_string_lossy().into_owned()].into_iter())
             .unwrap();
@@ -1609,6 +1711,13 @@ mod tests {
             ("retention-days", "90"),
             ("archive-records", "5000"),
             ("archive-bytes", "8388608"),
+            ("lifecycle-enabled", "true"),
+            ("hot-days", "10"),
+            ("warm-days", "45"),
+            ("delete-after-days", "120"),
+            ("private-raw-days", "14"),
+            ("maintenance-interval-seconds", "600"),
+            ("max-traces-per-pass", "64"),
         ];
         for (key, value) in options {
             let output = run([
@@ -1683,6 +1792,7 @@ mod tests {
         .expect("storage check succeeds");
         assert!(output.contains(&format!("store_schema={LOCAL_STORE_SCHEMA_VERSION}")));
         assert!(output.contains("observations=0"));
+        assert!(output.contains("expired_trace_dispositions=0"));
         assert!(output.contains("team_ingest=disabled"));
         let _ = fs::remove_dir_all(directory);
     }

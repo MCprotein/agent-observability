@@ -94,6 +94,8 @@ const REPORT_RETRY_LIMIT: u32 = 4;
 const REPORT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
 const REPORT_DEBOUNCE_DELAY: Duration = Duration::from_millis(200);
 const REPORT_AUTHORITY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const LIFECYCLE_POLICY_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const LIFECYCLE_QUIET_PERIOD_MS: u64 = 30_000;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_LIFETIME: Duration = Duration::from_secs(30);
 const MAX_CONNECTIONS: usize = 64;
@@ -1366,6 +1368,7 @@ struct AppState {
     collector: Arc<Mutex<CollectorState>>,
     auth_token: Arc<str>,
     private_detail_failures: Arc<AtomicU64>,
+    lifecycle_failures: Arc<AtomicU64>,
     report_refresh_scheduled: Arc<AtomicBool>,
     report_refresh_requested: Arc<AtomicU64>,
     #[cfg(test)]
@@ -1383,6 +1386,8 @@ struct Health {
     report_refresh_failures: u32,
     report_failure: Option<ReportFailure>,
     private_detail_failures: u64,
+    lifecycle_failures: u64,
+    expired_trace_dispositions: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1452,6 +1457,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         collector,
         auth_token: Arc::from(options.auth_token),
         private_detail_failures,
+        lifecycle_failures: Arc::new(AtomicU64::new(0)),
         report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
         report_refresh_requested: Arc::new(AtomicU64::new(0)),
         #[cfg(test)]
@@ -1466,6 +1472,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         report_status.generation,
         REPORT_AUTHORITY_POLL_INTERVAL,
     ));
+    let lifecycle_watcher = tokio::spawn(watch_storage_lifecycle(state.clone()));
     let result = serve_transport(
         listener,
         tls_config,
@@ -1477,6 +1484,8 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     .await;
     report_watcher.abort();
     let _ = report_watcher.await;
+    lifecycle_watcher.abort();
+    let _ = lifecycle_watcher.await;
     drop(singleton);
     result
 }
@@ -1950,6 +1959,8 @@ fn private_turn_detail_receipt_response(
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let mut collector = state.collector.lock().await;
     let private_detail_failures = state.private_detail_failures.load(Ordering::Acquire);
+    let lifecycle_failures = state.lifecycle_failures.load(Ordering::Acquire);
+    let expired_trace_dispositions = collector.store.expired_trace_disposition_count().ok();
     let report_pending = if let Ok(status) = collector.store.report_status() {
         status.pending()
     } else {
@@ -1958,7 +1969,11 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     };
     collector.report_dirty = report_pending;
     axum::Json(Health {
-        status: if collector.report_degraded || report_pending {
+        status: if collector.report_degraded
+            || report_pending
+            || lifecycle_failures > 0
+            || expired_trace_dispositions.is_none_or(|count| count > 0)
+        {
             "degraded"
         } else {
             "ready"
@@ -1971,6 +1986,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         report_refresh_failures: collector.report_refresh_failures,
         report_failure: collector.report_failure,
         private_detail_failures,
+        lifecycle_failures,
+        expired_trace_dispositions,
     })
     .into_response()
 }
@@ -2265,6 +2282,135 @@ fn schedule_report_refresh(state: &AppState) {
             retry_initial: REPORT_RETRY_INITIAL_DELAY,
         },
     );
+}
+
+/// Executes one bounded, opt-in lifecycle pass without starting a collector.
+/// A busy writer is not waited on; the next scheduled pass can retry.
+pub fn maintain_storage_lifecycle(root: &Path) -> Result<String, CollectorError> {
+    let layout = inspect(root).map_err(runtime_error)?;
+    let _mutation = match MutationGuard::try_acquire(&layout.runtime) {
+        Ok(guard) => guard,
+        Err(SingletonError::AlreadyRunning) => return Ok("lifecycle=busy".into()),
+        Err(error) => return Err(runtime_error(error)),
+    };
+    let config = load(&layout.config).map_err(runtime_error)?;
+    if !config.lifecycle.enabled {
+        return Ok("lifecycle=disabled".into());
+    }
+    // Raw expiry needs no database copy and must still run when tier migration lacks disk space.
+    maintain_private_turn_details_locked(&layout, &config, SystemTime::now())?;
+    let store = LocalStore::open_current(layout.state.join("store")).map_err(runtime_error)?;
+    let policy = &config.lifecycle;
+    let request = agent_observability_local_store::LifecycleRequest {
+        now_unix_ms: current_unix_ms()?,
+        hot_days: policy.hot_days,
+        warm_days: policy.warm_days,
+        delete_after_days: policy.delete_after_days,
+        max_traces_per_pass: policy.max_traces_per_pass,
+        max_archive_records: config.retention.max_archive_records,
+        max_archive_bytes: config.retention.max_archive_bytes,
+    };
+    let preflight = store.lifecycle_preflight(request).map_err(runtime_error)?;
+    if !preflight.has_candidates && !preflight.has_backfill_pending {
+        return Ok("lifecycle=idle".into());
+    }
+    let headroom = RuntimeControl::new(&config)
+        .map_err(runtime_error)?
+        .migration_headroom(&layout.root)
+        .map_err(runtime_error)?;
+    if headroom < preflight.required_temporary_bytes {
+        return Err(CollectorError::Runtime(
+            "lifecycle temporary storage headroom unavailable".into(),
+        ));
+    }
+    let Some(_render_guard) = store
+        .try_acquire_report_render_guard()
+        .map_err(runtime_error)?
+    else {
+        return Ok("lifecycle=busy".into());
+    };
+    store.invalidate_report().map_err(runtime_error)?;
+    agent_observability_static_report::write_refresh_pending(&layout.logs.join(REPORT_FILE_NAME))
+        .map_err(runtime_error)?;
+    mark_report_dirty(&layout)?;
+    let result = store.maintain_lifecycle(request).map_err(runtime_error)?;
+    let status = if result.blocked > 0 {
+        "blocked"
+    } else {
+        "completed"
+    };
+    Ok(format!(
+        "lifecycle={status}\nreport_refresh=pending\n{result:?}"
+    ))
+}
+
+fn lifecycle_idle(last_ingest: Option<u64>, now: u64) -> bool {
+    last_ingest.is_none_or(|last| now.saturating_sub(last) >= LIFECYCLE_QUIET_PERIOD_MS)
+}
+
+fn record_lifecycle_pass(state: &AppState, output: &str) {
+    if output == "lifecycle=busy" {
+        return;
+    }
+    state.lifecycle_failures.store(
+        u64::from(output.starts_with("lifecycle=blocked\n")),
+        Ordering::Release,
+    );
+    if output.contains("report_refresh=pending") {
+        schedule_report_refresh(state);
+    }
+}
+
+async fn watch_storage_lifecycle(state: AppState) {
+    let mut ticker = tokio::time::interval(LIFECYCLE_POLICY_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_pass: Option<StdInstant> = None;
+    loop {
+        ticker.tick().await;
+        let Ok(collector) = state.collector.try_lock() else {
+            continue;
+        };
+        let Ok(now) = current_unix_ms() else {
+            continue;
+        };
+        if !lifecycle_idle(collector.last_ingest_unix_ms, now) {
+            continue;
+        }
+        let root = collector.layout.root.clone();
+        drop(collector);
+        // Config I/O and maintenance never occupy a Tokio network executor thread.
+        let elapsed = last_pass.map(|last| last.elapsed());
+        let outcome = tokio::task::spawn_blocking(move || {
+            let layout = inspect(&root).map_err(runtime_error)?;
+            let config = load(&layout.config).map_err(runtime_error)?;
+            if !config.lifecycle.enabled {
+                return Ok(Some("lifecycle=disabled".to_owned()));
+            }
+            let cadence =
+                Duration::from_secs(u64::from(config.lifecycle.maintenance_interval_seconds));
+            if elapsed.is_some_and(|elapsed| elapsed < cadence) {
+                return Ok(None);
+            }
+            maintain_storage_lifecycle(&root).map(Some)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(Some(output))) => {
+                if output != "lifecycle=busy" {
+                    last_pass = Some(StdInstant::now());
+                }
+                record_lifecycle_pass(&state, &output);
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(_)) | Err(_) => {
+                last_pass = Some(StdInstant::now());
+                state.lifecycle_failures.fetch_add(1, Ordering::AcqRel);
+                // A failed pass may already have hidden the previous HTML safely.
+                // Rebuild from committed storage rather than leaving that placeholder stale.
+                schedule_report_refresh(&state);
+            }
+        }
+    }
 }
 
 async fn watch_report_authority(state: AppState, mut observed_generation: u64, interval: Duration) {
@@ -2793,9 +2939,13 @@ fn prune_private_turn_files_with_limit(
         ));
     }
     let max_age = Duration::from_secs(
-        u64::from(config.retention.max_record_age_days)
-            .checked_mul(24 * 60 * 60)
-            .ok_or_else(|| CollectorError::Runtime("private detail retention overflow".into()))?,
+        u64::from(if config.lifecycle.enabled {
+            config.lifecycle.private_raw_days
+        } else {
+            config.retention.max_record_age_days
+        })
+        .checked_mul(24 * 60 * 60)
+        .ok_or_else(|| CollectorError::Runtime("private detail retention overflow".into()))?,
     );
     let mut retained = Vec::new();
     let mut expired = Vec::new();
@@ -3105,19 +3255,18 @@ pub fn check_health(root: &Path) -> HealthOutcome {
         Duration::from_millis(50),
         Duration::from_millis(100),
     ) {
-        Ok(response) if response.status == 200 => {
-            match serde_json::from_slice::<HealthProbe>(&response.body) {
-                Ok(HealthProbe {
-                    status,
-                    report_dirty: false,
-                }) if status == "ready" => HealthOutcome::Ready,
-                Ok(HealthProbe {
-                    status,
-                    report_dirty: true,
-                }) if status == "degraded" => HealthOutcome::Degraded,
-                _ => HealthOutcome::Unavailable,
-            }
-        }
+        Ok(response) if response.status == 200 => classify_health_probe(&response.body),
+        _ => HealthOutcome::Unavailable,
+    }
+}
+
+fn classify_health_probe(body: &[u8]) -> HealthOutcome {
+    match serde_json::from_slice::<HealthProbe>(body) {
+        Ok(HealthProbe {
+            status,
+            report_dirty: false,
+        }) if status == "ready" => HealthOutcome::Ready,
+        Ok(HealthProbe { status, .. }) if status == "degraded" => HealthOutcome::Degraded,
         _ => HealthOutcome::Unavailable,
     }
 }
@@ -3485,6 +3634,194 @@ fn runtime_error(error: impl std::fmt::Display) -> CollectorError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lifecycle_health_degradation_does_not_require_a_dirty_report() {
+        assert_eq!(
+            super::classify_health_probe(
+                br#"{"status":"degraded","report_dirty":false,"lifecycle_failures":1}"#
+            ),
+            super::HealthOutcome::Degraded
+        );
+        assert_eq!(
+            super::classify_health_probe(br#"{"status":"ready","report_dirty":true}"#),
+            super::HealthOutcome::Unavailable
+        );
+        assert_eq!(
+            super::classify_health_probe(br#"{"status":"unknown","report_dirty":false}"#),
+            super::HealthOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn lifecycle_quiet_period_protects_recent_and_future_ingest() {
+        assert!(super::lifecycle_idle(None, 0));
+        assert!(!super::lifecycle_idle(Some(1_000), 30_999));
+        assert!(super::lifecycle_idle(Some(1_000), 31_000));
+        assert!(!super::lifecycle_idle(Some(32_000), 31_000));
+    }
+
+    #[test]
+    fn lifecycle_disabled_does_not_require_or_create_store() {
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-lifecycle-disabled-{}-{}",
+            std::process::id(),
+            super::current_unix_ms().unwrap()
+        ));
+        let layout = agent_observability_local_runtime::install(&root).unwrap();
+        assert_eq!(
+            super::maintain_storage_lifecycle(&root).unwrap(),
+            "lifecycle=disabled"
+        );
+        assert!(!layout.state.join("store").exists());
+        let mutation_guard =
+            agent_observability_local_runtime::MutationGuard::acquire(&layout.runtime).unwrap();
+        assert_eq!(
+            super::maintain_storage_lifecycle(&root).unwrap(),
+            "lifecycle=busy"
+        );
+        drop(mutation_guard);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_idle_preserves_existing_report() {
+        let root = test_root("lifecycle-idle-report");
+        let state = collector_state(&root);
+        let layout = state.layout.clone();
+        drop(state);
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.lifecycle.enabled = true;
+        save(&guard, &config).unwrap();
+        drop(guard);
+        assert!(refresh_report_from_root(&root).unwrap());
+        let report_path = layout.logs.join(REPORT_FILE_NAME);
+        let before = fs::read(&report_path).unwrap();
+        assert_eq!(
+            super::maintain_storage_lifecycle(&root).unwrap(),
+            "lifecycle=idle"
+        );
+        assert_eq!(fs::read(&report_path).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_pass_health_tracks_last_pass_and_preserves_busy_state() {
+        let root = test_root("lifecycle-pass-health");
+        let state = app_state(&root);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                super::record_lifecycle_pass(&state, "lifecycle=blocked\nreport_refresh=pending");
+                assert_eq!(state.lifecycle_failures.load(Ordering::Acquire), 1);
+                assert!(state.report_refresh_scheduled.load(Ordering::Acquire));
+                super::record_lifecycle_pass(&state, "lifecycle=busy");
+                assert_eq!(state.lifecycle_failures.load(Ordering::Acquire), 1);
+                for output in [
+                    "lifecycle=completed",
+                    "lifecycle=idle",
+                    "lifecycle=disabled",
+                ] {
+                    state.lifecycle_failures.store(1, Ordering::Release);
+                    super::record_lifecycle_pass(&state, output);
+                    assert_eq!(state.lifecycle_failures.load(Ordering::Acquire), 0);
+                }
+            });
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_oversized_trace_reports_blocked_without_deleting_it() {
+        let root = test_root("lifecycle-blocked");
+        let mut state = collector_state(&root);
+        let layout = state.layout.clone();
+        let body = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
+          {"timeUnixNano":"1000000000000000000","attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},
+            {"key":"conversation.id","value":{"stringValue":"blocked-trace"}}]},
+          {"timeUnixNano":"1000000000000000000","attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+            {"key":"conversation.id","value":{"stringValue":"blocked-trace"}},
+            {"key":"auth.request_id","value":{"stringValue":"blocked-request"}}]}
+        ]}]}]}"#;
+        ingest_locked(&mut state, body).unwrap();
+        let count = state.store.record_count().unwrap();
+        assert!(count > 1);
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.lifecycle.enabled = true;
+        config.retention.max_archive_records = 1;
+        save(&guard, &config).unwrap();
+        drop(guard);
+        let output = super::maintain_storage_lifecycle(&root).unwrap();
+        assert!(output.starts_with("lifecycle=blocked\n"), "{output}");
+        assert_eq!(state.store.record_count().unwrap(), count);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_publication_lock_protects_report_and_expiry() {
+        let root = test_root("lifecycle-publication-lock");
+        let mut state = collector_state(&root);
+        let layout = state.layout.clone();
+        let body = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"1000000000000000000","attributes":[{"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},{"key":"conversation.id","value":{"stringValue":"old-lifecycle-trace"}}]}]}]}]}"#;
+        ingest_locked(&mut state, body).unwrap();
+        assert_eq!(state.store.record_count().unwrap(), 1);
+        refresh_report_from_root(&root).unwrap();
+        let config_guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.lifecycle.enabled = true;
+        save(&config_guard, &config).unwrap();
+        drop(config_guard);
+        let render_guard = state.store.acquire_report_render_guard().unwrap();
+        let path = layout.logs.join(REPORT_FILE_NAME);
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            super::maintain_storage_lifecycle(&root).unwrap(),
+            "lifecycle=busy"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(state.store.record_count().unwrap(), 1);
+        drop(render_guard);
+        let result = super::maintain_storage_lifecycle(&root).unwrap();
+        assert!(result.contains("lifecycle=completed"));
+        assert_eq!(state.store.record_count().unwrap(), 0);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("리포트 갱신 대기")
+        );
+        assert!(state.store.report_status().unwrap().pending());
+        refresh_report_from_root(&root).unwrap();
+        assert!(!state.store.report_status().unwrap().pending());
+        ingest_notify_locked(
+            &mut state,
+            &projected_notify("old-lifecycle-trace", "new-after-expiry"),
+        )
+        .unwrap();
+        assert_eq!(state.store.expired_trace_disposition_count().unwrap(), 1);
+        let health_state = app_state(&root);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let response = super::health(State(health_state)).await.into_response();
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(health["expired_trace_dispositions"], 1);
+                assert_eq!(health["status"], "degraded");
+            });
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     use super::{
         AUTH_HEADER_NAME, AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome,
         OtlpRejectionCategory, OtlpRequestCorrelationState, OtlpSubmissionOutcome,
@@ -3659,6 +3996,7 @@ mod tests {
             collector: Arc::new(Mutex::new(collector_state(root))),
             auth_token: Arc::from(auth_token),
             private_detail_failures,
+            lifecycle_failures: Arc::new(AtomicU64::new(0)),
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
             report_refresh_requested: Arc::new(AtomicU64::new(0)),
             report_refresh_attempts: Arc::new(AtomicU64::new(0)),
@@ -4974,27 +5312,17 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let (server_config, _) = test_tls_configs(&root);
-            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            configure_port(&root, listener.local_addr().unwrap().port());
-            let transport =
-                super::TransportListener::new(listener, server_config, Duration::from_secs(1), 2);
-            let app = router(app_state(&root));
-            let server = tokio::spawn(async move { axum::serve(transport, app).await });
-            tokio::task::yield_now().await;
-
-            let notify_root = root.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                submit_notify(
-                    &notify_root,
-                    &raw_notify("thread-private-only", "turn-private-only"),
-                )
-            })
-            .await
+            // Privacy is independent of host scheduling inside the foreground 250ms budget.
+            // Dedicated transport/deadline tests retain that production timing contract.
+            let envelope = capture_private_turn_detail_if_enabled(
+                &root,
+                &raw_notify("thread-private-only", "turn-private-only"),
+            )
+            .unwrap()
             .unwrap();
-            assert_eq!(outcome, NotifyOutcome::Accepted);
+            let response =
+                ingest_notify_with_private_detail(State(app_state(&root)), envelope.into()).await;
+            assert_eq!(response.status(), StatusCode::OK);
             let (_, detail) = project_notify_with_private_detail(&raw_notify(
                 "thread-private-only",
                 "turn-private-only",
@@ -5025,8 +5353,6 @@ mod tests {
                     .windows(b"RAW_OUTPUT_SECRET".len())
                     .any(|part| part == b"RAW_OUTPUT_SECRET")
             );
-            server.abort();
-            let _ = server.await;
         });
         refresh_report_from_root(&root).unwrap();
         fs::remove_dir_all(layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY)).unwrap();
@@ -5137,6 +5463,74 @@ mod tests {
             "startup/retention maintenance expires detail without another capture"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_raw_retention_is_independent_and_opt_in() {
+        let root = test_root("lifecycle-raw-retention");
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let mut config = load(&layout.config).unwrap();
+        config.lifecycle.private_raw_days = 1;
+        let (_, detail) = project_notify_with_private_detail(&raw_notify(
+            "thread-lifecycle-raw",
+            "turn-lifecycle-raw",
+        ))
+        .unwrap();
+        capture_private_turn_detail(&layout, &detail, &config).unwrap();
+        let path = private_turn_detail_path(
+            &layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY),
+            detail.turn_id(),
+        )
+        .unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let now = modified + Duration::from_hours(25);
+        maintain_private_turn_details_locked(&layout, &config, now).unwrap();
+        assert!(
+            path.is_file(),
+            "disabled lifecycle preserves legacy raw retention"
+        );
+        config.lifecycle.enabled = true;
+        maintain_private_turn_details_locked(&layout, &config, now).unwrap();
+        assert!(
+            !path.exists(),
+            "enabled lifecycle uses the independent raw age"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_raw_expiry_runs_even_when_store_is_unavailable() {
+        let root = test_root("lifecycle-raw-without-store");
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.lifecycle.enabled = true;
+        config.lifecycle.private_raw_days = 1;
+        save(&guard, &config).unwrap();
+        drop(guard);
+        let (_, detail) =
+            project_notify_with_private_detail(&raw_notify("raw-no-db", "turn-no-db")).unwrap();
+        capture_private_turn_detail(&layout, &detail, &config).unwrap();
+        let path = private_turn_detail_path(
+            &layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY),
+            detail.turn_id(),
+        )
+        .unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_hours(25);
+        fs::File::open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        assert!(super::maintain_storage_lifecycle(&root).is_err());
+        assert!(
+            !path.exists(),
+            "raw expiry does not depend on a usable canonical store"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -6901,6 +7295,7 @@ mod tests {
             collector: Arc::new(Mutex::new(restarted)),
             auth_token: Arc::from("a".repeat(64)),
             private_detail_failures,
+            lifecycle_failures: Arc::new(AtomicU64::new(0)),
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
             report_refresh_requested: Arc::new(AtomicU64::new(0)),
             report_refresh_attempts: Arc::new(AtomicU64::new(0)),
@@ -6924,6 +7319,47 @@ mod tests {
         assert!(root.join("logs").join(REPORT_FILE_NAME).is_file());
         assert!(!report_dirty_path(&install(&root).unwrap()).exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lifecycle_invalidation_recovers_before_any_destructive_commit() {
+        for replace_html in [false, true] {
+            let root = test_root(if replace_html {
+                "lifecycle-after-placeholder"
+            } else {
+                "lifecycle-before-placeholder"
+            });
+            let state = collector_state(&root);
+            let layout = state.layout.clone();
+            assert!(refresh_report_from_root(&root).unwrap());
+            let guard = state.store.acquire_report_render_guard().unwrap();
+            state.store.invalidate_report().unwrap();
+            if replace_html {
+                agent_observability_static_report::write_refresh_pending(
+                    &layout.logs.join(REPORT_FILE_NAME),
+                )
+                .unwrap();
+            }
+            drop(guard);
+            drop(state);
+            // Simulate process loss at either publication boundary: no sidecar wakeup exists.
+            assert!(!report_dirty_path(&layout).exists());
+            let reopened = collector_state(&root);
+            assert!(reopened.store.report_status().unwrap().pending());
+            assert!(reconcile_report_state(
+                &layout,
+                reopened.store.report_status().unwrap().pending()
+            ));
+            drop(reopened);
+            assert!(refresh_report_from_root(&root).unwrap());
+            let restored = fs::read_to_string(layout.logs.join(REPORT_FILE_NAME)).unwrap();
+            assert!(restored.contains("Agent Observability Report"));
+            assert!(!restored.contains("리포트 갱신 대기"));
+            let reopened = collector_state(&root);
+            assert!(!reopened.store.report_status().unwrap().pending());
+            drop(reopened);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

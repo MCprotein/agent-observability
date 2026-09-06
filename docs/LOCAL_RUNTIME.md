@@ -195,11 +195,12 @@ handoff file, normalize it with the agent adapter, commit it under the runtime s
 They do not require a LaunchAgent, local HTTP receiver, login or network access. Disconnecting Codex automatic
 collection does not disable or remove this path.
 
-The installed configuration is intentionally small:
+The v1.11.0 development branch writes the following configuration. Published v1.10.0 uses v3
+without the `lifecycle` section; the automatic lifecycle feature is not released yet.
 
 ~~~json
 {
-  "schema_version": "local_runtime.v3",
+  "schema_version": "local_runtime.v4",
   "enabled": true,
   "capture_private_codex_turn_details": false,
   "collection": {
@@ -215,13 +216,23 @@ The installed configuration is intentionally small:
     "max_record_age_days": 30,
     "max_archive_records": 10000,
     "max_archive_bytes": 16777216
+  },
+  "lifecycle": {
+    "enabled": false,
+    "hot_days": 7,
+    "warm_days": 30,
+    "delete_after_days": 90,
+    "private_raw_days": 7,
+    "maintenance_interval_seconds": 300,
+    "max_traces_per_pass": 32
   }
 }
 ~~~
 
-The runtime reads strict `local_runtime.v1` and `local_runtime.v2` documents through explicit
-migrations. Both migrate to v3 with private Codex turn-detail capture disabled; v2 remains a frozen
-compatibility schema and current writes always emit v3.
+The development runtime reads strict `local_runtime.v1`, `local_runtime.v2` and `local_runtime.v3`
+documents through explicit migrations. Existing values are preserved, automatic lifecycle stays off,
+and v1/v2 private Codex turn-detail capture stays disabled. Earlier schemas remain compatibility
+contracts; new writes in this branch emit v4.
 
 `config set [root] <option> <value>` acquires the runtime singleton, validates the complete updated
 configuration, writes a private temporary file, syncs it, and atomically replaces `config.json`.
@@ -372,7 +383,8 @@ a privacy-safe aggregate contribution journal and versioned checkpoints ahead of
 
 ## Durable state
 
-SQLite local_state.v4 is authoritative. Projection-affecting transactions set
+SQLite local_state.v4 is authoritative in published v1.10.0; the v1.11 development branch adds
+local_state.v5 tier storage and private lifecycle control tables. Projection-affecting transactions set
 projection_dirty=1; a successful atomic JSONL replacement clears it. A clean reopen does not
 rebuild the full projection. Explicit repairing store opens restore missing or dirty JSONL and bound
 stale projection-temp cleanup. Automatic collector startup and HTML refresh defer JSONL repair so a

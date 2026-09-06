@@ -446,6 +446,7 @@ try {
       assert.equal(config.capture_private_codex_turn_details, true);
       assert.equal(config.lifecycle.enabled, false);
       assert.match(await page.locator(".lifecycle-warning").innerText(), /삭제는 되돌릴 수 없습니다/);
+      assert.match(await page.locator(".lifecycle-warning").innerText(), /에이전트에서 새 세션을 시작해야 합니다/);
       await page.locator('[data-boolean-field="lifecycle.enabled"]').click();
       await page.locator("#lifecycle-hot_days").fill("10");
       await page.locator("#lifecycle-warm_days").fill("9");

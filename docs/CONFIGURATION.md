@@ -88,9 +88,35 @@ confused with the existing manual `retention-days` cutoff.
 | `archive-records` | `10000` | `1..100000` | 한 archive의 최대 record 수 |
 | `archive-bytes` | `16777216` | `65536..268435456` | 한 archive의 최대 bytes |
 
-시간 option은 milliseconds, 용량 option은 bytes 단위다. 설정 변경은 자동 cleanup을 실행하지
+위 표의 시간 option은 milliseconds, 용량 option은 bytes 단위다. 게시된 v1.10.0에서는 설정 변경이 자동 cleanup을 실행하지
 않는다. `retention-days` 변경 후 실제 만료 대상은 `retention-plan`으로 확인하고
 `retention-apply`로 명시적으로 적용한다.
+
+### v1.11.0 개발 브랜치: 자동 보관 설정
+
+아래 옵션은 아직 게시되지 않은 개발 브랜치에 구현 중이다. `settings`의 **자동 보관** 영역에서
+변경하며, 기존 **수동 정리**의 `retention-days`와 별개다. 기간은 모두 마지막 trace 관측부터
+계산하는 누적 일수다.
+
+| Option | Default | Allowed | Purpose |
+| --- | ---: | --- | --- |
+| `lifecycle-enabled` | `false` | `true`, `false` | 자동 단계 전환과 만료 삭제 활성화 |
+| `hot-days` | `7` | `1..3650` | Hot에서 Warm으로 이동하는 나이 |
+| `warm-days` | `30` | `1..3650` | Warm에서 Cold로 이동하는 나이 |
+| `delete-after-days` | `90` | `1..3650` | 관리 대상 trace를 삭제하는 나이 |
+| `private-raw-days` | `7` | `1..3650` | 원문 상세의 별도 보관 일수 |
+| `maintenance-interval-seconds` | `300` | `60..86400` | 정리 실행 간격(초) |
+| `max-traces-per-pass` | `32` | `1..128` | 한 번에 검사하는 최대 trace 수 |
+
+`hot-days <= warm-days < delete-after-days`여야 한다. `archive-records`, `archive-bytes`는
+단계 전환 작업에도 record/byte 상한을 제공한다. 자동 정리를 켜거나 기간을 줄이면 기존 데이터도
+다음 실행의 삭제 대상이 될 수 있으며 삭제는 되돌릴 수 없다. 기존 v1/v2/v3 설정은
+`local_runtime.v4`로 읽되 자동 정리를 끈 상태로 이전한다.
+
+collector가 실행 중일 때 설정을 다시 읽어 적용하며, 마지막 수집 뒤 30초의 조용한 구간에서만
+자동 작업을 시작한다. 지속적인 수집, 잠금 충돌, 용량 부족은 정리를 지연시킬 수 있으므로 만료
+시각의 즉시 삭제를 보장하지 않는다. collector 없는 사용은 `agentobs lifecycle-run <runtime>`으로
+한 번 실행한다. 전체 안전 조건은 [Storage Lifecycle](STORAGE_LIFECYCLE.md)을 따른다.
 
 `enabled`, `private-codex-details`, `batch-records`, `batch-bytes`, `storage-bytes`는 Codex automatic collector가
 요청마다 다시 읽고 적용하므로 UI나 CLI에서 바꾼 뒤 collector를 재시작할 필요가 없다. Codex

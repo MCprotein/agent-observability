@@ -78,6 +78,27 @@ pub fn render(report: &ReportDtoV2) -> Result<String, ReportArtifactError> {
 ///
 /// Returns [`ReportArtifactError`] for insecure paths, unsupported platforms, or I/O failures.
 pub fn write_private(path: &Path, report: &ReportDtoV2) -> Result<u64, ReportArtifactError> {
+    write_private_content(path, |writer| write_rendered(writer, report))
+}
+
+/// Replaces a managed report with a data-free placeholder before retention commits.
+/// The caller must hold the report publication guard through the destructive transaction.
+///
+/// # Errors
+///
+/// Returns [`ReportArtifactError`] without authorizing deletion if private publication fails.
+pub fn write_refresh_pending(path: &Path) -> Result<u64, ReportArtifactError> {
+    const PENDING: &str = "<!doctype html><html lang=\"ko\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Agent Observability — 갱신 대기</title><main><h1>리포트 갱신 대기</h1><p>데이터 보관 정책을 적용하는 동안 이전 리포트를 숨겼습니다.</p><p>수집기가 실행 중이면 잠시 후 새로고침하세요. 수동 실행 환경에서는 agentobs report 명령으로 다시 만드세요.</p></main></html>";
+    write_private_content(path, |writer| {
+        writer.write_all(PENDING.as_bytes())?;
+        u64::try_from(PENDING.len()).map_err(|_| ReportArtifactError::TooLarge)
+    })
+}
+
+fn write_private_content(
+    path: &Path,
+    render_content: impl FnOnce(&mut dyn Write) -> Result<u64, ReportArtifactError>,
+) -> Result<u64, ReportArtifactError> {
     let parent = path.parent().ok_or(ReportArtifactError::InvalidPath)?;
     private_directory(parent)?;
     reject_output_path(path)?;
@@ -85,7 +106,7 @@ pub fn write_private(path: &Path, report: &ReportDtoV2) -> Result<u64, ReportArt
     let mut file = private_create_new(&temporary)?;
     let result = (|| -> Result<u64, ReportArtifactError> {
         let mut writer = BufWriter::new(&mut file);
-        let bytes = write_rendered(&mut writer, report)?;
+        let bytes = render_content(&mut writer)?;
         writer.flush()?;
         drop(writer);
         validate_artifact_size(bytes)?;
@@ -393,10 +414,21 @@ mod tests {
             expected.len() as u64
         );
         assert_eq!(fs::read_to_string(&output).unwrap(), expected);
+        super::write_refresh_pending(&output).unwrap();
+        let pending = fs::read_to_string(&output).unwrap();
+        assert!(pending.contains("갱신 대기"));
+        assert!(!pending.contains("Private report"));
+        assert!(!pending.contains("<script"));
+        assert!(!pending.contains("http://"));
+        assert!(!pending.contains("https://"));
         assert_eq!(
             fs::metadata(&output).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let linked = root.join("linked.html");
+        std::os::unix::fs::symlink(&output, &linked).unwrap();
+        assert!(super::write_refresh_pending(&linked).is_err());
+        assert_eq!(fs::read_to_string(&output).unwrap(), pending);
 
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(

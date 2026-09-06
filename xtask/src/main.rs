@@ -23,10 +23,11 @@ use agent_observability_local_collector::{
     load_settings, submit_otlp_json_outcome,
 };
 use agent_observability_local_runtime::{
-    Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressMessage, IngressOutcome, LocalRuntimeConfigV3,
-    PressureSample, RuntimeControl, StorageBudget,
+    Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressMessage, IngressOutcome,
+    LOCAL_RUNTIME_CONFIG_VERSION, LocalRuntimeConfigV3, PressureSample, RuntimeControl,
+    StorageBudget,
 };
-use agent_observability_local_store::LocalStore;
+use agent_observability_local_store::{LOCAL_STORE_SCHEMA_VERSION, LocalStore};
 use serde::Deserialize;
 #[cfg(target_os = "macos")]
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -5915,7 +5916,7 @@ fn render_manifest(
         })
         .collect::<Vec<_>>();
     let mut out = format!(
-        "schema_version: local_performance.v1\nprotocol_revision: v1.2.0-supported-rate-saturation-continuous-network\nsource_revision: {}\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: {}\nos: {}\nfilesystem: {}\npower_mode: {}\ncold_warm_cache: warm-after-build-and-per-run-warmup\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: local_runtime.v3\n  durable_store: local_state.v4\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  supported_rate_events: {}\n  supported_inter_event_ms: {}\n  saturation_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  supported_rate_schedule: symmetric-driver-paced\n  supported_rate_durability_barrier: required-before-saturation\n  supported_rate_measurement_boundary: first-command-through-barrier-completion\n  saturation_schedule: enabled-unpaced\n  channel_capacity: 64\n  normalization_workers: 1\n  durable_batch_records: {DURABLE_BATCH_RECORDS}\n  durable_handoff_bytes_max: {DURABLE_HANDOFF_BYTES_MAX}\n  total_pipeline_payload_bytes_max: {TOTAL_PIPELINE_PAYLOAD_BYTES_MAX}\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: one-bounded-batch-local-store-drain-actor\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: run-relative/durable\n  durable_path_lifecycle: removed-after-measurement\nall_run_samples:\n",
+        "schema_version: local_performance.v1\nprotocol_revision: v1.2.0-supported-rate-saturation-continuous-network\nsource_revision: {}\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: {}\nos: {}\nfilesystem: {}\npower_mode: {}\ncold_warm_cache: warm-after-build-and-per-run-warmup\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: {runtime_config_version}\n  durable_store: {store_schema_version}\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  supported_rate_events: {}\n  supported_inter_event_ms: {}\n  saturation_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  supported_rate_schedule: symmetric-driver-paced\n  supported_rate_durability_barrier: required-before-saturation\n  supported_rate_measurement_boundary: first-command-through-barrier-completion\n  saturation_schedule: enabled-unpaced\n  channel_capacity: 64\n  normalization_workers: 1\n  durable_batch_records: {DURABLE_BATCH_RECORDS}\n  durable_handoff_bytes_max: {DURABLE_HANDOFF_BYTES_MAX}\n  total_pipeline_payload_bytes_max: {TOTAL_PIPELINE_PAYLOAD_BYTES_MAX}\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: one-bounded-batch-local-store-drain-actor\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: run-relative/durable\n  durable_path_lifecycle: removed-after-measurement\nall_run_samples:\n",
         host.source_revision,
         profile_name(config.profile),
         host.machine,
@@ -5933,6 +5934,8 @@ fn render_manifest(
         SUPPORTED_INTER_EVENT_PERIOD.as_millis(),
         config.saturation_events,
         config.sample.as_secs_f64(),
+        runtime_config_version = LOCAL_RUNTIME_CONFIG_VERSION,
+        store_schema_version = LOCAL_STORE_SCHEMA_VERSION,
     );
     for result in results {
         let _ = writeln!(
@@ -7656,6 +7659,8 @@ mod tests {
                 .contains("protocol_revision: v1.2.0-supported-rate-saturation-continuous-network")
         );
         assert!(manifest.contains("source_revision: 0123456789abcdef0123456789abcdef01234567"));
+        assert!(manifest.contains(&format!("  runtime_config: {LOCAL_RUNTIME_CONFIG_VERSION}")));
+        assert!(manifest.contains(&format!("  durable_store: {LOCAL_STORE_SCHEMA_VERSION}")));
         assert!(manifest.contains("supported_inter_event_ms: 3"));
         assert!(manifest.contains(
             "supported_rate_measurement_boundary: first-command-through-barrier-completion"

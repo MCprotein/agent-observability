@@ -554,7 +554,7 @@ function lifecycleSection(config: LocalRuntimeConfigV4): string {
       <div class="field-grid">${fieldControl(fields["lifecycle.hot_days"], config)}${fieldControl(fields["lifecycle.warm_days"], config)}${fieldControl(fields["lifecycle.delete_after_days"], config)}${fieldControl(fields["lifecycle.private_raw_days"], config)}${fieldControl(fields["lifecycle.maintenance_interval_seconds"], config)}${fieldControl(fields["lifecycle.max_traces_per_pass"], config)}</div>
       ${lifecycleTimeline(config)}
     </div>
-    <div class="retention-note lifecycle-warning" role="note"><i data-lucide="archive"></i><span><strong>삭제는 되돌릴 수 없습니다.</strong> 자동 정리를 켜거나 기준일을 줄이면 보관 기준을 지난 기존 데이터가 다음 정리 작업에서 이동하거나 영구 삭제될 수 있습니다. 설정 저장 완료는 정리 실행이나 디스크 공간 회수를 의미하지 않습니다.</span></div>
+    <div class="retention-note lifecycle-warning" role="note"><i data-lucide="archive"></i><span><strong>삭제는 되돌릴 수 없습니다.</strong> 자동 정리를 켜거나 기준일을 줄이면 보관 기준을 지난 기존 데이터가 다음 정리 작업에서 이동하거나 영구 삭제될 수 있습니다. 완전히 삭제된 세션의 새 활동을 수집하려면 에이전트에서 새 세션을 시작해야 합니다. 설정 저장 완료는 정리 실행이나 디스크 공간 회수를 의미하지 않습니다.</span></div>
   </section>`;
 }
 

@@ -20,6 +20,7 @@ const releasePackage = JSON.parse(
 const releaseWorkflow = readFileSync(".github/workflows/release.yml", "utf8");
 const ciWorkflow = readFileSync(".github/workflows/ci.yml", "utf8");
 const readme = readFileSync("README.md", "utf8");
+const roadmap = readFileSync("ROADMAP.md", "utf8");
 const cargoMetadata = JSON.parse(
   execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
     encoding: "utf8",
@@ -45,14 +46,76 @@ test("release metadata has one synchronized Apache-2.0 version", () => {
     [...new Set(localCargoPackages.map((match) => match[2]))],
     [workspaceVersion],
   );
-  const escapedWorkspaceVersion = workspaceVersion.replaceAll(".", "\\.");
-  assert.match(readme, new RegExp(`\\*\\*v${escapedWorkspaceVersion} 안정판\\.\\*\\*`));
-  assert.match(readme, new RegExp(`빠른 시작은 v${escapedWorkspaceVersion} 기준`));
-  const installerVersion = readme.match(/releases\/download\/v(\d+\.\d+\.\d+)\/install\.sh/)?.[1];
-  assert.equal(installerVersion, workspaceVersion);
-  const packageInstallVersion = readme.match(/npm install --global @mcprotein\/agent-observability@(\d+\.\d+\.\d+)/)?.[1];
-  assert.equal(packageInstallVersion, workspaceVersion);
 });
+
+test("published README versions agree with the ROADMAP released entry", () => {
+  const publishedVersion = validatePublishedReleaseDocs(readme, roadmap);
+  validateWorkspaceRoadmapStatus(workspaceVersion, publishedVersion, roadmap);
+});
+
+test("release docs allow an unpublished workspace version without moving stable install claims", () => {
+  const stable = "1.10.0";
+  const candidate = "1.11.0";
+  const sampleReadme = `> **v${stable} 안정판.**\n아래 빠른 시작은 v${stable} 기준이다.\n공개된 v${stable} installer를 사용한다.\nreleases/download/v${stable}/install.sh\nnpm install --global @mcprotein/agent-observability@${stable}`;
+  const sampleRoadmap = `| v${stable} | Released | stable | evidence |\n### v${candidate} — Candidate (In Progress)`;
+
+  assert.equal(validatePublishedReleaseDocs(sampleReadme, sampleRoadmap), stable);
+  assert.doesNotThrow(() => validateWorkspaceRoadmapStatus(candidate, stable, sampleRoadmap));
+  assert.throws(
+    () => validateWorkspaceRoadmapStatus(candidate, stable, sampleRoadmap.split("\n")[0] ?? ""),
+    /ROADMAP does not mark workspace v1\.11\.0 as In Progress/,
+  );
+  assert.throws(
+    () => validatePublishedReleaseDocs(
+      sampleReadme.replace(`빠른 시작은 v${stable}`, `빠른 시작은 v${candidate}`),
+      sampleRoadmap,
+    ),
+    /README published versions disagree/,
+  );
+});
+
+function validatePublishedReleaseDocs(readmeText: string, roadmapText: string): string {
+  const versions = {
+    stable: requiredVersion(readmeText, /\*\*v(\d+\.\d+\.\d+) 안정판\.\*\*/, "stable"),
+    quickstart: requiredVersion(readmeText, /빠른 시작은 v(\d+\.\d+\.\d+) 기준/, "quickstart"),
+    installerClaim: requiredVersion(readmeText, /공개된 v(\d+\.\d+\.\d+) installer/, "installer claim"),
+    installerDownload: requiredVersion(readmeText, /releases\/download\/v(\d+\.\d+\.\d+)\/install\.sh/, "installer download"),
+    packageInstall: requiredVersion(readmeText, /npm install --global @mcprotein\/agent-observability@(\d+\.\d+\.\d+)/, "package install"),
+  };
+  const publishedVersion = versions.stable;
+  if (Object.values(versions).some((version) => version !== publishedVersion)) {
+    throw new Error(`README published versions disagree: ${JSON.stringify(versions)}`);
+  }
+  const escaped = escapeRegex(publishedVersion);
+  if (!new RegExp(`^\\| v${escaped} \\| Released \\|`, "m").test(roadmapText)) {
+    throw new Error(`ROADMAP does not mark published v${publishedVersion} as Released`);
+  }
+  return publishedVersion;
+}
+
+function validateWorkspaceRoadmapStatus(
+  currentWorkspaceVersion: string,
+  publishedVersion: string,
+  roadmapText: string,
+): void {
+  if (currentWorkspaceVersion === publishedVersion) return;
+  const escaped = escapeRegex(currentWorkspaceVersion);
+  const inProgressTable = new RegExp(`^\\| v${escaped} \\| In Progress \\|`, "m");
+  const inProgressHeading = new RegExp(`^### v${escaped}\\b.*\\(In Progress\\)$`, "m");
+  if (!inProgressTable.test(roadmapText) && !inProgressHeading.test(roadmapText)) {
+    throw new Error(`ROADMAP does not mark workspace v${currentWorkspaceVersion} as In Progress`);
+  }
+}
+
+function requiredVersion(text: string, pattern: RegExp, label: string): string {
+  const version = text.match(pattern)?.[1];
+  if (!version) throw new Error(`README ${label} version is missing`);
+  return version;
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 test("GitHub package exposes only the universal native macOS CLI", () => {
   assert.deepEqual(releasePackage.os, ["darwin"]);

@@ -6,7 +6,7 @@
 
 ## Current and target stack
 
-현재 안정판은 `v1.10.0`이고, 이 문서는 해당 버전의 경계를 정의한다. macOS standalone은 Codex, Claude Code와 Cursor의 private
+현재 안정판은 `v1.10.0`이다. 이 문서는 공통 경계와 별도로 표시한 v1.11 개발 변경을 정의한다. macOS standalone은 Codex, Claude Code와 Cursor의 private
 handoff 수동 import를 daemon과 network 없이 계속 제공한다. 선택적 Codex automatic path는 private-CA
 HTTPS와 exact private random request header로 인증하는 `127.0.0.1` OTLP/HTTP JSON receiver,
 pre-transport projected notify supplement와 LaunchAgent를 추가한다. 이 transport는 mTLS가 아니다. Rust 경로는
@@ -281,8 +281,9 @@ anti-corruption layer다.
 
 ### Local Runtime
 
-- standalone 설정은 `local_runtime.v3` strict JSON이다. 기존 v1/v2는 명시적 migration으로
-  private Codex detail capture를 끈 v3로 로드한다. 팀 identity, 이메일, endpoint와 transport
+- 게시된 v1.10 standalone 설정은 `local_runtime.v3` strict JSON이다. v1.11 개발 브랜치는
+  `local_runtime.v4`에 opt-in storage lifecycle을 추가한다. v1/v2/v3 migration은 기존 값을 보존하고
+  자동 정리를 끈다. v1/v2의 private Codex detail capture도 기존처럼 기본 off다. 팀 identity, 이메일, endpoint와 transport
   설정은 포함하지 않는다.
 - Codex automatic integration은 별도 private `runtime/collector.json`,
   `runtime/integrations/codex/tls` credential tree와

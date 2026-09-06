@@ -228,7 +228,7 @@ fn init_and_runtime_check_create_only_private_local_paths() {
         "{}",
         String::from_utf8_lossy(&init.stderr)
     );
-    assert!(String::from_utf8_lossy(&init.stdout).contains("config_schema=local_runtime.v3"));
+    assert!(String::from_utf8_lossy(&init.stdout).contains("config_schema=local_runtime.v4"));
     assert_eq!(
         fs::metadata(&root).unwrap().permissions().mode() & 0o777,
         0o700
@@ -492,6 +492,26 @@ fn retention_plan_is_read_only_and_apply_writes_one_private_archive() {
     );
     assert!(!inside_archive.exists());
 
+    let publication_store = LocalStore::open(installed_store(&runtime)).unwrap();
+    let publication_guard = publication_store.acquire_report_render_guard().unwrap();
+    let html_before = fs::read(&dashboard).unwrap();
+    let busy = binary()
+        .args([
+            "retention-apply",
+            runtime.to_str().unwrap(),
+            plan_id,
+            archive.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!busy.status.success());
+    assert!(String::from_utf8_lossy(&busy.stderr).contains("report publication is busy"));
+    assert_eq!(fs::read(&dashboard).unwrap(), html_before);
+    assert_eq!(fs::read(&projection).unwrap(), before);
+    assert!(!archive.exists());
+    drop(publication_guard);
+    drop(publication_store);
+
     let apply = binary()
         .args([
             "retention-apply",
@@ -507,6 +527,9 @@ fn retention_plan_is_read_only_and_apply_writes_one_private_archive() {
         String::from_utf8_lossy(&apply.stderr)
     );
     assert!(String::from_utf8_lossy(&apply.stdout).contains("applied=1"));
+    let pending_report = fs::read_to_string(&dashboard).unwrap();
+    assert!(pending_report.contains("리포트 갱신 대기"));
+    assert!(!pending_report.contains("generatedSpans"));
     assert_eq!(
         fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
         0o600

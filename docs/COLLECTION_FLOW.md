@@ -6,7 +6,7 @@
 
 ## Scope Boundary
 
-| Boundary | v1.10.0 candidate status |
+| Boundary | Published v1.10.0 status |
 | --- | --- |
 | Private canonical handoff parser | Implemented for Codex, Claude Code, Cursor |
 | One-shot local ingest CLI | Implemented |

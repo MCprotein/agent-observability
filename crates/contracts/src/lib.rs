@@ -439,6 +439,7 @@ pub enum AdapterDispositionCode {
     ContentEventIgnored,
     PrimarySuperseded,
     DuplicateObservation,
+    ExpiredTrace,
 }
 
 impl AdapterDispositionCode {
@@ -452,6 +453,7 @@ impl AdapterDispositionCode {
             Self::ContentEventIgnored => "content_event_ignored",
             Self::PrimarySuperseded => "primary_superseded",
             Self::DuplicateObservation => "duplicate_observation",
+            Self::ExpiredTrace => "expired_trace",
         }
     }
 }
