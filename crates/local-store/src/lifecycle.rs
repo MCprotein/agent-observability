@@ -137,6 +137,8 @@ struct LifecycleCursor {
     hot: String,
     warm: String,
     cold: String,
+    #[serde(default)]
+    next_tier: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -815,7 +817,7 @@ fn lifecycle_candidates(
 ) -> Result<Vec<Candidate>, StoreError> {
     let mut candidates = Vec::with_capacity(usize::from(limit).saturating_mul(3));
     let mut remaining = usize::from(limit);
-    for tier in [Tier::Hot, Tier::Warm, Tier::Cold] {
+    for tier in tier_order(cursor.next_tier)? {
         if remaining == 0 {
             break;
         }
@@ -831,6 +833,7 @@ fn lifecycle_candidates(
                 Tier::Warm => cursor.warm.clone_from(&raw_key),
                 Tier::Cold => cursor.cold.clone_from(&raw_key),
             }
+            cursor.next_tier = next_tier(tier);
             let candidate = Candidate {
                 tier,
                 identity,
@@ -850,6 +853,23 @@ fn lifecycle_candidates(
         }
     }
     Ok(candidates)
+}
+
+fn tier_order(next_tier: u8) -> Result<[Tier; 3], StoreError> {
+    match next_tier {
+        0 => Ok([Tier::Hot, Tier::Warm, Tier::Cold]),
+        1 => Ok([Tier::Warm, Tier::Cold, Tier::Hot]),
+        2 => Ok([Tier::Cold, Tier::Hot, Tier::Warm]),
+        _ => Err(StoreError::SchemaMismatch),
+    }
+}
+
+fn next_tier(tier: Tier) -> u8 {
+    match tier {
+        Tier::Hot => 1,
+        Tier::Warm => 2,
+        Tier::Cold => 0,
+    }
 }
 
 fn query_tier_window(
@@ -1286,8 +1306,7 @@ mod tests {
     use crate::LIFECYCLE_SCAN_CURSOR_INITIAL;
     use rusqlite::Connection;
 
-    #[test]
-    fn candidate_windows_advance_through_large_recent_population() {
+    fn candidate_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE hot_trace_index (
@@ -1315,6 +1334,12 @@ mod tests {
              );",
         )
         .unwrap();
+        db
+    }
+
+    #[test]
+    fn candidate_windows_advance_through_large_recent_population() {
+        let db = candidate_db();
         for ordinal in 0..1_000 {
             let trace_id = format!("recent-{ordinal:04}");
             db.execute(
@@ -1353,6 +1378,47 @@ mod tests {
         assert!(
             found_old,
             "bounded raw-key windows did not advance to the old trace"
+        );
+    }
+
+    #[test]
+    fn candidate_tier_rotation_prevents_pinned_hot_starvation() {
+        let db = candidate_db();
+        for ordinal in 0..2 {
+            let trace_id = format!("hot-pinned-{ordinal}");
+            db.execute(
+                "INSERT INTO hot_trace_index VALUES (?1,?1,?2,1,1,1,1)",
+                params![trace_id, ordered_millis(0)],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "INSERT INTO warm_traces VALUES ('warm-ready',?1,?1)",
+            [ordered_millis(0)],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO cold_traces VALUES (1,'cold-ready',?1,?1,1,1,X'00')",
+            [ordered_millis(0)],
+        )
+        .unwrap();
+
+        let legacy_cursor: LifecycleCursor =
+            serde_json::from_str(r#"{"hot":"","warm":"","cold":""}"#).unwrap();
+        assert_eq!(legacy_cursor.next_tier, 0);
+        let hot_pass = lifecycle_candidates(&db, 0, 0, 0, legacy_cursor, 2).unwrap();
+        assert!(hot_pass.iter().all(|candidate| candidate.tier == Tier::Hot));
+        let persisted: LifecycleCursor =
+            serde_json::from_str(&hot_pass.last().unwrap().cursor_after).unwrap();
+        assert_eq!(persisted.next_tier, 1);
+
+        let next_pass = lifecycle_candidates(&db, 0, 0, 0, persisted, 2).unwrap();
+        assert_eq!(
+            next_pass
+                .iter()
+                .map(|candidate| candidate.tier)
+                .collect::<Vec<_>>(),
+            vec![Tier::Warm, Tier::Cold]
         );
     }
 }
