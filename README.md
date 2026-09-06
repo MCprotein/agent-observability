@@ -27,7 +27,7 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 > script는 `agentobs setup ~/.agent-observability --no-open`처럼 root를 명시한다. 자동 연결은 이후
 > 설정 UI 또는 고급 lifecycle 명령으로 언제든 추가할 수 있다.
 
-아래 빠른 시작은 공개된 v1.10.0 기준이다.
+아래 빠른 시작은 v1.10.0 기준이다.
 
 ## 빠른 시작
 

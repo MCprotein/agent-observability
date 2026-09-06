@@ -46,7 +46,7 @@ test("release metadata has one synchronized Apache-2.0 version", () => {
     [workspaceVersion],
   );
   const escapedWorkspaceVersion = workspaceVersion.replaceAll(".", "\\.");
-  assert.match(readme, new RegExp(`\\*\\*v${escapedWorkspaceVersion} 릴리스 후보\\.\\*\\*`));
+  assert.match(readme, new RegExp(`\\*\\*v${escapedWorkspaceVersion} 안정판\\.\\*\\*`));
   assert.match(readme, new RegExp(`빠른 시작은 v${escapedWorkspaceVersion} 기준`));
   const installerVersion = readme.match(/releases\/download\/v(\d+\.\d+\.\d+)\/install\.sh/)?.[1];
   assert.equal(installerVersion, workspaceVersion);
