@@ -22,12 +22,62 @@ pub const LOCAL_RUNTIME_CONFIG_V3_SCHEMA: &str =
     include_str!("../../../contracts/local-runtime-config-v3.schema.json");
 pub const LOCAL_RUNTIME_CONFIG_SCHEMA: &str =
     include_str!("../../../contracts/local-runtime-config-v4.schema.json");
+pub const LOCAL_COLLECTOR_HEALTH_SCHEMA: &str =
+    include_str!("../../../contracts/local-collector-health-v1.schema.json");
+pub const CODEX_INTEGRATION_STATUS_SCHEMA: &str =
+    include_str!("../../../contracts/codex-integration-status-v1.schema.json");
 pub const ADAPTER_CAPABILITY_V1: &str = include_str!("../capabilities/adapter-capability-v1.yaml");
 pub const DURABLE_RECORD_VERSION: &str = "agent_observability.v1";
 pub const REPORT_DTO_V1_VERSION: &str = "agent_observability.report.v1";
 pub const REPORT_DTO_VERSION: &str = "agent_observability.report.v2";
 pub const MAX_REPORT_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 pub const RETENTION_ARCHIVE_VERSION: &str = "agent_observability.retention_archive.v1";
+pub const LOCAL_COLLECTOR_HEALTH_VERSION: &str = "local_collector_health.v1";
+pub const CODEX_INTEGRATION_STATUS_VERSION: &str = "codex_integration_status.v1";
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexConnectionStatusV1 {
+    Connected,
+    Disconnected,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CollectorStatusV1 {
+    Ready,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexNotifyStatusV1 {
+    AgentobsOwned,
+    ExternalPreserved,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectorDegradationReasonV1 {
+    LifecycleFailure,
+    StoragePressure,
+    ExpiredTrace,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CodexIntegrationStatusV1 {
+    pub schema_version: String,
+    pub config: CodexConnectionStatusV1,
+    pub notify: Option<CodexNotifyStatusV1>,
+    pub collector: CollectorStatusV1,
+    pub endpoint: Option<String>,
+    pub service: Option<String>,
+    pub data_retained: bool,
+    pub collector_degradation_reasons: Vec<CollectorDegradationReasonV1>,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -2017,6 +2067,24 @@ impl ContractManifest {
             "local_runtime_config_parity",
             "contracts/local-runtime-config-v4.parity.json",
         )?;
+        self.expect("local_collector_health", LOCAL_COLLECTOR_HEALTH_VERSION)?;
+        self.expect(
+            "local_collector_health_schema",
+            "contracts/local-collector-health-v1.schema.json",
+        )?;
+        self.expect(
+            "local_collector_health_fixture",
+            "contracts/local-collector-health-v1.fixture.json",
+        )?;
+        self.expect("codex_integration_status", CODEX_INTEGRATION_STATUS_VERSION)?;
+        self.expect(
+            "codex_integration_status_schema",
+            "contracts/codex-integration-status-v1.schema.json",
+        )?;
+        self.expect(
+            "codex_integration_status_fixture",
+            "contracts/codex-integration-status-v1.fixture.json",
+        )?;
         self.expect("team_ingest", "disabled")?;
         Ok(())
     }
@@ -2109,8 +2177,11 @@ impl Error for ContractError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        ADAPTER_CAPABILITY_V1, AdapterCapabilityManifestV1, CONTRACT_MANIFEST, ContractManifest,
-        DURABLE_RECORD_SCHEMA, LOCAL_RUNTIME_CONFIG_SCHEMA, RATE_TABLE_SCHEMA, REPORT_DTO_SCHEMA,
+        ADAPTER_CAPABILITY_V1, AdapterCapabilityManifestV1, CODEX_INTEGRATION_STATUS_SCHEMA,
+        CODEX_INTEGRATION_STATUS_VERSION, CONTRACT_MANIFEST, CodexConnectionStatusV1,
+        CodexIntegrationStatusV1, CodexNotifyStatusV1, CollectorDegradationReasonV1,
+        CollectorStatusV1, ContractManifest, DURABLE_RECORD_SCHEMA, LOCAL_COLLECTOR_HEALTH_SCHEMA,
+        LOCAL_RUNTIME_CONFIG_SCHEMA, RATE_TABLE_SCHEMA, REPORT_DTO_SCHEMA,
         RETENTION_ARCHIVE_SCHEMA, redact_sensitive_text,
     };
 
@@ -2126,9 +2197,51 @@ mod tests {
             RATE_TABLE_SCHEMA,
             RETENTION_ARCHIVE_SCHEMA,
             LOCAL_RUNTIME_CONFIG_SCHEMA,
+            LOCAL_COLLECTOR_HEALTH_SCHEMA,
+            CODEX_INTEGRATION_STATUS_SCHEMA,
         ] {
             assert!(schema.contains("\"additionalProperties\": false"));
         }
+    }
+
+    #[test]
+    fn codex_integration_status_v1_serializes_closed_typed_reasons() {
+        let status = CodexIntegrationStatusV1 {
+            schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+            config: CodexConnectionStatusV1::Connected,
+            notify: Some(CodexNotifyStatusV1::AgentobsOwned),
+            collector: CollectorStatusV1::Degraded,
+            endpoint: Some("https://127.0.0.1:4318/v1/logs".into()),
+            service: Some("dev.agent-observability.collector".into()),
+            data_retained: true,
+            collector_degradation_reasons: vec![
+                CollectorDegradationReasonV1::LifecycleFailure,
+                CollectorDegradationReasonV1::StoragePressure,
+                CollectorDegradationReasonV1::ExpiredTrace,
+            ],
+        };
+        let value = serde_json::to_value(&status).expect("integration status serializes");
+        assert_eq!(value["schema_version"], CODEX_INTEGRATION_STATUS_VERSION);
+        assert_eq!(value["config"], "connected");
+        assert_eq!(value["notify"], "agentobs_owned");
+        assert_eq!(value["collector"], "degraded");
+        assert_eq!(
+            value["collector_degradation_reasons"],
+            serde_json::json!(["lifecycle_failure", "storage_pressure", "expired_trace"])
+        );
+        assert!(
+            serde_json::from_value::<CodexIntegrationStatusV1>(serde_json::json!({
+                "schema_version": CODEX_INTEGRATION_STATUS_VERSION,
+                "config": "connected",
+                "notify": null,
+                "collector": "degraded",
+                "endpoint": null,
+                "service": null,
+                "data_retained": true,
+                "collector_degradation_reasons": ["unknown"]
+            }))
+            .is_err()
+        );
     }
 
     #[test]

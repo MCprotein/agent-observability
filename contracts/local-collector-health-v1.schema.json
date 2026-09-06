@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "local_collector_health.v1",
+  "title": "LocalCollectorHealthV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "accepted_requests",
+    "rejected_requests",
+    "suppressed_requests",
+    "last_ingest_unix_ms",
+    "report_dirty",
+    "report_refresh_failures",
+    "report_failure",
+    "private_detail_failures",
+    "lifecycle_failures",
+    "expired_trace_dispositions",
+    "degradation_reasons"
+  ],
+  "properties": {
+    "schema_version": { "const": "local_collector_health.v1" },
+    "status": { "type": "string", "enum": ["ready", "degraded"] },
+    "accepted_requests": { "type": "integer", "minimum": 0 },
+    "rejected_requests": { "type": "integer", "minimum": 0 },
+    "suppressed_requests": { "type": "integer", "minimum": 0 },
+    "last_ingest_unix_ms": { "type": ["integer", "null"], "minimum": 0 },
+    "report_dirty": { "type": "boolean" },
+    "report_refresh_failures": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "report_failure": {
+      "type": ["string", "null"],
+      "enum": [
+        "task",
+        "install",
+        "open_store",
+        "clock",
+        "render_guard",
+        "snapshot",
+        "projection",
+        "publish",
+        "acknowledge",
+        "status",
+        null
+      ]
+    },
+    "private_detail_failures": { "type": "integer", "minimum": 0 },
+    "lifecycle_failures": { "type": "integer", "minimum": 0 },
+    "expired_trace_dispositions": { "type": ["integer", "null"], "minimum": 0 },
+    "degradation_reasons": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "string",
+        "enum": ["lifecycle_failure", "storage_pressure", "expired_trace"]
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "ready" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": { "degradation_reasons": { "type": "array", "maxItems": 0 } }
+      }
+    }
+  ]
+}

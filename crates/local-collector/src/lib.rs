@@ -10,6 +10,7 @@ use agent_observability_adapter_codex::{
 use agent_observability_application::ReportProjector;
 #[cfg(test)]
 use agent_observability_application::project_report;
+use agent_observability_contracts::{CollectorDegradationReasonV1, LOCAL_COLLECTOR_HEALTH_VERSION};
 use agent_observability_local_runtime::{
     Admission, InstalledLayout, LocalRuntimeConfigV3, MutationGuard, PressureSample,
     RuntimeControl, Singleton, SingletonError, StorageBudget, inspect, install, load,
@@ -306,6 +307,7 @@ impl PrivateTurnDetailReceiptV1 {
 
 #[derive(Debug)]
 pub enum CollectorError {
+    LifecycleStoragePressure,
     Io(std::io::Error),
     RequestIo {
         stage: &'static str,
@@ -1216,6 +1218,9 @@ fn credential_path(layout: &InstalledLayout, relative: &str) -> Result<PathBuf, 
 impl std::fmt::Display for CollectorError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::LifecycleStoragePressure => {
+                formatter.write_str("lifecycle temporary storage headroom unavailable")
+            }
             Self::Io(error) => write!(formatter, "local collector I/O error: {error}"),
             Self::RequestIo { stage, source } => {
                 write!(formatter, "local collector {stage} I/O error: {source}")
@@ -1229,7 +1234,7 @@ impl std::error::Error for CollectorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) | Self::RequestIo { source: error, .. } => Some(error),
-            Self::Runtime(_) => None,
+            Self::Runtime(_) | Self::LifecycleStoragePressure => None,
         }
     }
 }
@@ -1369,6 +1374,7 @@ struct AppState {
     auth_token: Arc<str>,
     private_detail_failures: Arc<AtomicU64>,
     lifecycle_failures: Arc<AtomicU64>,
+    lifecycle_storage_pressure: Arc<AtomicBool>,
     report_refresh_scheduled: Arc<AtomicBool>,
     report_refresh_requested: Arc<AtomicU64>,
     #[cfg(test)]
@@ -1377,6 +1383,8 @@ struct AppState {
 
 #[derive(Debug, Serialize)]
 struct Health {
+    schema_version: &'static str,
+    degradation_reasons: Vec<CollectorDegradationReasonV1>,
     status: &'static str,
     accepted_requests: u64,
     rejected_requests: u64,
@@ -1394,6 +1402,18 @@ struct Health {
 struct HealthProbe {
     status: String,
     report_dirty: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HealthReasonProjection {
+    schema_version: String,
+    degradation_reasons: Vec<CollectorDegradationReasonV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthDetails {
+    pub outcome: HealthOutcome,
+    pub degradation_reasons: Vec<CollectorDegradationReasonV1>,
 }
 
 /// Runs the authenticated OTLP/HTTP receiver until the process is terminated.
@@ -1458,6 +1478,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         auth_token: Arc::from(options.auth_token),
         private_detail_failures,
         lifecycle_failures: Arc::new(AtomicU64::new(0)),
+        lifecycle_storage_pressure: Arc::new(AtomicBool::new(false)),
         report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
         report_refresh_requested: Arc::new(AtomicU64::new(0)),
         #[cfg(test)]
@@ -1956,11 +1977,34 @@ fn private_turn_detail_receipt_response(
         .into_response()
 }
 
+fn lifecycle_degradation_reasons(
+    failures: u64,
+    storage_pressure: bool,
+    expired_dispositions: Option<u64>,
+) -> Vec<CollectorDegradationReasonV1> {
+    let mut reasons = Vec::with_capacity(2);
+    if storage_pressure {
+        reasons.push(CollectorDegradationReasonV1::StoragePressure);
+    } else if failures > 0 {
+        reasons.push(CollectorDegradationReasonV1::LifecycleFailure);
+    }
+    if expired_dispositions.is_some_and(|count| count > 0) {
+        reasons.push(CollectorDegradationReasonV1::ExpiredTrace);
+    }
+    reasons
+}
+
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let mut collector = state.collector.lock().await;
     let private_detail_failures = state.private_detail_failures.load(Ordering::Acquire);
     let lifecycle_failures = state.lifecycle_failures.load(Ordering::Acquire);
     let expired_trace_dispositions = collector.store.expired_trace_disposition_count().ok();
+    let degradation_reasons = lifecycle_degradation_reasons(
+        lifecycle_failures,
+        state.lifecycle_storage_pressure.load(Ordering::Acquire),
+        expired_trace_dispositions,
+    );
+    let lifecycle_degraded = !degradation_reasons.is_empty();
     let report_pending = if let Ok(status) = collector.store.report_status() {
         status.pending()
     } else {
@@ -1969,9 +2013,12 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     };
     collector.report_dirty = report_pending;
     axum::Json(Health {
+        schema_version: LOCAL_COLLECTOR_HEALTH_VERSION,
+        degradation_reasons,
         status: if collector.report_degraded
             || report_pending
             || lifecycle_failures > 0
+            || lifecycle_degraded
             || expired_trace_dispositions.is_none_or(|count| count > 0)
         {
             "degraded"
@@ -2047,7 +2094,9 @@ impl IngestError {
             Self::Invalid(CollectorError::Runtime(_)) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Busy | Self::Pressure => StatusCode::SERVICE_UNAVAILABLE,
             Self::Policy => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::Storage => StatusCode::INSUFFICIENT_STORAGE,
+            Self::Storage | Self::Invalid(CollectorError::LifecycleStoragePressure) => {
+                StatusCode::INSUFFICIENT_STORAGE
+            }
         }
     }
 
@@ -2319,9 +2368,7 @@ pub fn maintain_storage_lifecycle(root: &Path) -> Result<String, CollectorError>
         .migration_headroom(&layout.root)
         .map_err(runtime_error)?;
     if headroom < preflight.required_temporary_bytes {
-        return Err(CollectorError::Runtime(
-            "lifecycle temporary storage headroom unavailable".into(),
-        ));
+        return Err(CollectorError::LifecycleStoragePressure);
     }
     let Some(_render_guard) = store
         .try_acquire_report_render_guard()
@@ -2352,6 +2399,9 @@ fn record_lifecycle_pass(state: &AppState, output: &str) {
     if output == "lifecycle=busy" {
         return;
     }
+    state
+        .lifecycle_storage_pressure
+        .store(false, Ordering::Release);
     state.lifecycle_failures.store(
         u64::from(output.starts_with("lifecycle=blocked\n")),
         Ordering::Release,
@@ -2402,7 +2452,11 @@ async fn watch_storage_lifecycle(state: AppState) {
                 record_lifecycle_pass(&state, &output);
             }
             Ok(Ok(None)) => {}
-            Ok(Err(_)) | Err(_) => {
+            outcome => {
+                state.lifecycle_storage_pressure.store(
+                    matches!(outcome, Ok(Err(CollectorError::LifecycleStoragePressure))),
+                    Ordering::Release,
+                );
                 last_pass = Some(StdInstant::now());
                 state.lifecycle_failures.fetch_add(1, Ordering::AcqRel);
                 // A failed pass may already have hidden the previous HTML safely.
@@ -3123,6 +3177,7 @@ fn maintain_private_turn_directory_locked(
 
 fn private_turn_detail_error_code(error: &CollectorError) -> &'static str {
     match error {
+        CollectorError::LifecycleStoragePressure => "storage_budget",
         CollectorError::Runtime(message) if message.contains("conflict") => "conflict",
         CollectorError::Runtime(message) if message.contains("storage budget") => "storage_budget",
         CollectorError::Runtime(message) if message.contains("already running") => "busy",
@@ -3247,6 +3302,12 @@ fn private_turn_detail_path(directory: &Path, turn_id: &str) -> Result<PathBuf, 
 /// Performs a bounded authenticated health probe against the local collector.
 #[must_use]
 pub fn check_health(root: &Path) -> HealthOutcome {
+    check_health_details(root).outcome
+}
+
+/// Preserves allowlisted degradation reasons from a versioned collector health response.
+#[must_use]
+pub fn check_health_details(root: &Path) -> HealthDetails {
     match authenticated_request(
         root,
         "GET",
@@ -3255,8 +3316,28 @@ pub fn check_health(root: &Path) -> HealthOutcome {
         Duration::from_millis(50),
         Duration::from_millis(100),
     ) {
-        Ok(response) if response.status == 200 => classify_health_probe(&response.body),
-        _ => HealthOutcome::Unavailable,
+        Ok(response) if response.status == 200 => classify_health_details(&response.body),
+        _ => HealthDetails {
+            outcome: HealthOutcome::Unavailable,
+            degradation_reasons: Vec::new(),
+        },
+    }
+}
+
+fn classify_health_details(body: &[u8]) -> HealthDetails {
+    let outcome = classify_health_probe(body);
+    let degradation_reasons = if outcome == HealthOutcome::Degraded {
+        serde_json::from_slice::<HealthReasonProjection>(body)
+            .ok()
+            .filter(|projection| projection.schema_version == LOCAL_COLLECTOR_HEALTH_VERSION)
+            .filter(|projection| projection.degradation_reasons.len() <= 3)
+            .map_or_else(Vec::new, |projection| projection.degradation_reasons)
+    } else {
+        Vec::new()
+    };
+    HealthDetails {
+        outcome,
+        degradation_reasons,
     }
 }
 
@@ -3706,6 +3787,41 @@ mod tests {
     }
 
     #[test]
+    fn versioned_health_reasons_are_preserved_without_guessing_legacy_causes() {
+        use agent_observability_contracts::CollectorDegradationReasonV1 as Reason;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schema_version": super::LOCAL_COLLECTOR_HEALTH_VERSION,
+            "status": "degraded", "report_dirty": false,
+            "degradation_reasons": ["storage_pressure", "expired_trace"]
+        }))
+        .unwrap();
+        let details = super::classify_health_details(&body);
+        assert_eq!(details.outcome, super::HealthOutcome::Degraded);
+        assert_eq!(
+            details.degradation_reasons,
+            vec![Reason::StoragePressure, Reason::ExpiredTrace]
+        );
+        for body in [
+            br#"{"status":"degraded","report_dirty":false,"lifecycle_failures":1}"#.as_slice(),
+            br#"{"schema_version":"local_collector_health.v1","status":"degraded","report_dirty":false,"degradation_reasons":["future_reason"]}"#,
+            br#"{"schema_version":"future.v2","status":"degraded","report_dirty":false,"degradation_reasons":["storage_pressure"]}"#,
+        ] {
+            let details = super::classify_health_details(body);
+            assert_eq!(details.outcome, super::HealthOutcome::Degraded);
+            assert!(details.degradation_reasons.is_empty());
+        }
+        assert_eq!(
+            super::lifecycle_degradation_reasons(1, false, Some(0)),
+            vec![Reason::LifecycleFailure]
+        );
+        assert_eq!(
+            super::lifecycle_degradation_reasons(1, true, Some(1)),
+            vec![Reason::StoragePressure, Reason::ExpiredTrace]
+        );
+        assert!(super::lifecycle_degradation_reasons(0, false, Some(0)).is_empty());
+    }
+
+    #[test]
     fn lifecycle_pass_health_tracks_last_pass_and_preserves_busy_state() {
         let root = test_root("lifecycle-pass-health");
         let state = app_state(&root);
@@ -3719,6 +3835,11 @@ mod tests {
                 assert!(state.report_refresh_scheduled.load(Ordering::Acquire));
                 super::record_lifecycle_pass(&state, "lifecycle=busy");
                 assert_eq!(state.lifecycle_failures.load(Ordering::Acquire), 1);
+                state
+                    .lifecycle_storage_pressure
+                    .store(true, Ordering::Release);
+                super::record_lifecycle_pass(&state, "lifecycle=busy");
+                assert!(state.lifecycle_storage_pressure.load(Ordering::Acquire));
                 for output in [
                     "lifecycle=completed",
                     "lifecycle=idle",
@@ -3727,6 +3848,7 @@ mod tests {
                     state.lifecycle_failures.store(1, Ordering::Release);
                     super::record_lifecycle_pass(&state, output);
                     assert_eq!(state.lifecycle_failures.load(Ordering::Acquire), 0);
+                    assert!(!state.lifecycle_storage_pressure.load(Ordering::Acquire));
                 }
             });
         drop(state);
@@ -3754,6 +3876,17 @@ mod tests {
         let mut config = load(&layout.config).unwrap();
         config.lifecycle.enabled = true;
         config.retention.max_archive_records = 1;
+        config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+        config.retention.max_archive_bytes = 256 * 1024 * 1024;
+        save(&guard, &config).unwrap();
+        drop(guard);
+        assert!(matches!(
+            super::maintain_storage_lifecycle(&root),
+            Err(super::CollectorError::LifecycleStoragePressure)
+        ));
+        assert_eq!(state.store.record_count().unwrap(), count);
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        config.retention.max_archive_bytes = 65_536;
         save(&guard, &config).unwrap();
         drop(guard);
         let output = super::maintain_storage_lifecycle(&root).unwrap();
@@ -3817,6 +3950,26 @@ mod tests {
                 let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(health["expired_trace_dispositions"], 1);
                 assert_eq!(health["status"], "degraded");
+                assert_eq!(
+                    health["schema_version"],
+                    super::LOCAL_COLLECTOR_HEALTH_VERSION
+                );
+                assert_eq!(
+                    health["degradation_reasons"],
+                    serde_json::json!(["expired_trace"])
+                );
+                let schema: serde_json::Value = serde_json::from_str(
+                    agent_observability_contracts::LOCAL_COLLECTOR_HEALTH_SCHEMA,
+                )
+                .unwrap();
+                assert_eq!(
+                    health.as_object().unwrap().keys().collect::<Vec<_>>(),
+                    schema["properties"]
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .collect::<Vec<_>>(),
+                );
             });
         drop(state);
         fs::remove_dir_all(root).unwrap();
@@ -3997,6 +4150,7 @@ mod tests {
             auth_token: Arc::from(auth_token),
             private_detail_failures,
             lifecycle_failures: Arc::new(AtomicU64::new(0)),
+            lifecycle_storage_pressure: Arc::new(AtomicBool::new(false)),
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
             report_refresh_requested: Arc::new(AtomicU64::new(0)),
             report_refresh_attempts: Arc::new(AtomicU64::new(0)),
@@ -7296,6 +7450,7 @@ mod tests {
             auth_token: Arc::from("a".repeat(64)),
             private_detail_failures,
             lifecycle_failures: Arc::new(AtomicU64::new(0)),
+            lifecycle_storage_pressure: Arc::new(AtomicBool::new(false)),
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
             report_refresh_requested: Arc::new(AtomicU64::new(0)),
             report_refresh_attempts: Arc::new(AtomicU64::new(0)),

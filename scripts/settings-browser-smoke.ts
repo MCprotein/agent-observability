@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
 import { access, chmod, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { chromium, type Page, type Request } from "playwright-core";
+import type { CodexIntegrationStatusV1 } from "../ui/settings/generated/codex-integration-status-v1.js";
 
 const execute = promisify(execFile);
 
@@ -23,6 +23,12 @@ const child = spawn(binary, ["settings", runtimeRoot, "--no-open"], {
 });
 type SettingsProcess = typeof child;
 const browser = await chromium.launch({ executablePath, headless: true });
+const qaContext = await browser.newContext();
+let blockedPlatformOpenRequests = 0;
+await qaContext.route((url) => url.pathname === "/api/dashboard/open", async (route) => {
+  blockedPlatformOpenRequests += 1;
+  await route.abort("blockedbyclient");
+});
 let stderr = "";
 child.stderr.setEncoding("utf8");
 child.stderr.on("data", (chunk) => {
@@ -35,7 +41,8 @@ try {
   const results: Array<Record<string, string | number | boolean>> = [];
   const screenshotDirectory = process.env.SETTINGS_SCREENSHOT_DIR ?? directory;
 
-  const bootstrapFailurePage = await browser.newPage({ viewport: { width: 800, height: 600 } });
+  const bootstrapFailurePage = await qaContext.newPage();
+  await bootstrapFailurePage.setViewportSize({ width: 800, height: 600 });
   await mockCodexApi(bootstrapFailurePage);
   const bootstrapFailures: Request[] = [];
   const bootstrapPageErrors: string[] = [];
@@ -53,7 +60,8 @@ try {
   assert.deepEqual(bootstrapPageErrors, []);
   await bootstrapFailurePage.close();
 
-  const optionalIntegrationFailurePage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const optionalIntegrationFailurePage = await qaContext.newPage();
+  await optionalIntegrationFailurePage.setViewportSize({ width: 900, height: 700 });
   await mockCodexApi(optionalIntegrationFailurePage, { failStatus: true });
   await optionalIntegrationFailurePage.goto(url, { waitUntil: "networkidle" });
   await optionalIntegrationFailurePage.locator("#settings-form").waitFor();
@@ -67,7 +75,8 @@ try {
   assert.equal(await optionalIntegrationFailurePage.evaluate(() => sessionStorage.length), 1);
   await optionalIntegrationFailurePage.close();
 
-  const recoveringIntegrationPage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const recoveringIntegrationPage = await qaContext.newPage();
+  await recoveringIntegrationPage.setViewportSize({ width: 900, height: 700 });
   const recoveringIntegration = await mockCodexApi(recoveringIntegrationPage, {
     startConnected: true,
     firstStatusUnavailable: true,
@@ -81,7 +90,8 @@ try {
   );
   await recoveringIntegrationPage.close();
 
-  const persistentlyUnavailablePage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const persistentlyUnavailablePage = await qaContext.newPage();
+  await persistentlyUnavailablePage.setViewportSize({ width: 900, height: 700 });
   await persistentlyUnavailablePage.addInitScript(() => {
     const nativeAddEventListener = window.addEventListener.bind(window);
     window.addEventListener = ((type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions) => {
@@ -100,7 +110,8 @@ try {
   assert.equal(persistentlyUnavailable.methods.filter((method) => method === "GET").length, 2);
   await persistentlyUnavailablePage.close();
 
-  const outOfOrderPage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const outOfOrderPage = await qaContext.newPage();
+  await outOfOrderPage.setViewportSize({ width: 900, height: 700 });
   let integrationGetCount = 0;
   let releaseInitialStatus: (() => void) | undefined;
   const initialStatusRelease = new Promise<void>((resolve) => {
@@ -126,7 +137,8 @@ try {
   assert.equal(await outOfOrderPage.locator(".integration-panel").getAttribute("data-state"), "ready");
   await outOfOrderPage.close();
 
-  const expiredRacePage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const expiredRacePage = await qaContext.newPage();
+  await expiredRacePage.setViewportSize({ width: 900, height: 700 });
   await expiredRacePage.addInitScript(() => {
     const nativeSetInterval = window.setInterval.bind(window);
     (window as typeof window & { __agentobsIntervalCount?: number }).__agentobsIntervalCount = 0;
@@ -171,7 +183,8 @@ try {
   );
   await expiredRacePage.close();
 
-  const mutationFailurePage = await browser.newPage({ viewport: { width: 800, height: 600 } });
+  const mutationFailurePage = await qaContext.newPage();
+  await mutationFailurePage.setViewportSize({ width: 800, height: 600 });
   await mockCodexApi(mutationFailurePage);
   await mutationFailurePage.route(`${origin}/api/config`, (route) => {
     if (route.request().method() === "PUT") return route.abort("connectionfailed");
@@ -184,7 +197,8 @@ try {
   assert.equal(await mutationFailurePage.evaluate(() => sessionStorage.length), 0);
   await mutationFailurePage.close();
 
-  const lifecyclePage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+  const lifecyclePage = await qaContext.newPage();
+  await lifecyclePage.setViewportSize({ width: 1200, height: 800 });
   const lifecycle = await mockCodexApi(lifecyclePage, {
     startConflicted: true,
     failConnect: true,
@@ -225,7 +239,7 @@ try {
   assert.equal(lifecycle.launchAgentRunning, true);
   assert.equal(await lifecyclePage.locator("#toggle-integration").innerText(), "연결 해제");
 
-  lifecycle.status = degradedStatus();
+  lifecycle.status = degradedStatus(["lifecycle_failure"]);
   const documentIdentity = await lifecyclePage.evaluate(() => performance.timeOrigin);
   const navigationCount = await lifecyclePage.evaluate(
     () => performance.getEntriesByType("navigation").length,
@@ -234,11 +248,11 @@ try {
   await lifecyclePage.locator(".integration-panel[data-state='degraded']").waitFor();
   assert.match(
     await lifecyclePage.locator(".integration-identity strong").innerText(),
-    /수집기 상태 저하/,
+    /데이터 보관 정리 미완료/,
   );
   assert.match(
     await lifecyclePage.locator(".integration-identity").innerText(),
-    /리포트 반영 또는 데이터 보관 정리가 지연될 수 있습니다/,
+    /일부 데이터 또는 오류로 데이터 보관 정리 작업을 완료하지 못했습니다/,
   );
   assert.match(await lifecyclePage.locator(".integration-meta").innerText(), /상태 저하/);
   assert.doesNotMatch(await lifecyclePage.locator(".integration-meta").innerText(), /정상/);
@@ -248,8 +262,23 @@ try {
     await lifecyclePage.evaluate(() => performance.getEntriesByType("navigation").length),
     navigationCount,
   );
+  lifecycle.status = degradedStatus(["storage_pressure"]);
+  await lifecyclePage.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await lifecyclePage.locator(".integration-identity strong").filter({ hasText: "정리용 임시 저장 공간 부족" }).waitFor();
+  assert.match(
+    await lifecyclePage.locator(".integration-identity").innerText(),
+    /정리 작업에 필요한 임시 저장 공간이 부족해 데이터 보관 정리가 지연됩니다/,
+  );
+  lifecycle.status = degradedStatus(["expired_trace"]);
+  await lifecyclePage.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await lifecyclePage.locator(".integration-identity strong").filter({ hasText: "만료된 세션 데이터 제외" }).waitFor();
+  assert.match(
+    await lifecyclePage.locator(".integration-identity").innerText(),
+    /에이전트에서 새 세션을 시작해야 합니다/,
+  );
 
-  const heartbeatPage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const heartbeatPage = await qaContext.newPage();
+  await heartbeatPage.setViewportSize({ width: 900, height: 700 });
   await heartbeatPage.addInitScript(() => {
     const nativeSetInterval = window.setInterval.bind(window);
     window.setInterval = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
@@ -317,7 +346,8 @@ try {
   await lifecyclePage.close();
 
   for (const lifecycleMethod of ["POST", "DELETE"] as const) {
-    const delayedLifecyclePage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+    const delayedLifecyclePage = await qaContext.newPage();
+    await delayedLifecyclePage.setViewportSize({ width: 1200, height: 800 });
     const delayedLifecycle = await mockCodexApi(delayedLifecyclePage, {
       startConnected: lifecycleMethod === "DELETE",
       delayedMethod: lifecycleMethod,
@@ -341,25 +371,25 @@ try {
     await delayedLifecyclePage.close();
   }
 
-  const dashboardLauncherPage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+  const dashboardLauncherPage = await qaContext.newPage();
+  await dashboardLauncherPage.setViewportSize({ width: 1200, height: 800 });
+  let platformOpenApiRequests = 0;
+  dashboardLauncherPage.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/dashboard/open") platformOpenApiRequests += 1;
+  });
   await dashboardLauncherPage.goto(url, { waitUntil: "networkidle" });
-  const expectedDashboardOpenStatus = process.platform === "darwin" ? 204 : 409;
-  const firstOpenResponse = dashboardLauncherPage.waitForResponse(
-    (response) => response.url() === `${origin}/api/dashboard/open`
-      && response.request().method() === "POST",
-  );
-  await dashboardLauncherPage.locator("#open-dashboard").click();
-  assert.equal((await firstOpenResponse).status(), expectedDashboardOpenStatus);
-  const dashboardUrl = await waitForDashboardUrl(runtimeRoot);
+  const dashboardUrl = await launchDashboardWithoutOpener(dashboardLauncherPage);
   const dashboardPid = await readDashboardPid(runtimeRoot);
-  const secondOpenResponse = dashboardLauncherPage.waitForResponse(
-    (response) => response.url() === `${origin}/api/dashboard/open`
-      && response.request().method() === "POST",
+  const reusedDashboardUrl = await launchDashboardWithoutOpener(dashboardLauncherPage);
+  assert.equal(
+    reusedDashboardUrl === dashboardUrl,
+    true,
+    "repeated launch requests must reuse one private dashboard URL",
   );
-  await dashboardLauncherPage.locator("#open-dashboard").click();
-  assert.equal((await secondOpenResponse).status(), expectedDashboardOpenStatus);
   assert.equal(await readDashboardPid(runtimeRoot), dashboardPid, "repeated opens must reuse one server");
-  const independentDashboardPage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+  assert.equal(platformOpenApiRequests, 0, "headless QA must not request the platform-opening API");
+  const independentDashboardPage = await qaContext.newPage();
+  await independentDashboardPage.setViewportSize({ width: 1200, height: 800 });
   await independentDashboardPage.goto(dashboardUrl, { waitUntil: "load" });
   assert.equal(await independentDashboardPage.locator("h1").textContent(), "Agent Observability Report");
   await dashboardLauncherPage.close();
@@ -369,7 +399,8 @@ try {
     { name: "mobile", viewport: { width: 390, height: 844 } },
     { name: "compact", viewport: { width: 320, height: 800 } },
   ]) {
-    const page = await browser.newPage({ viewport: testCase.viewport });
+    const page = await qaContext.newPage();
+    await page.setViewportSize(testCase.viewport);
     await mockCodexApi(page);
     const consoleErrors: string[] = [];
     const expectedApiErrors: string[] = [];
@@ -660,30 +691,34 @@ try {
   assert.equal(await independentDashboardPage.locator("h1").textContent(), "Agent Observability Report");
   results.push({ name: "independent-dashboard", reloadAfterSettingsExit: true });
   await independentDashboardPage.close();
+  assert.equal(blockedPlatformOpenRequests, 0, "QA attempted an unmocked platform-opening API request");
   await stopDashboardProcess(runtimeRoot);
   console.log(JSON.stringify({ executablePath, results }));
 } finally {
   if (child.exitCode === null) child.kill("SIGTERM");
+  await qaContext.close();
   await browser.close();
   if (!process.env.SETTINGS_SCREENSHOT_DIR) {
     await rm(directory, { recursive: true, force: true });
   }
 }
 
-async function waitForDashboardUrl(root: string): Promise<string> {
-  const canonicalRoot = await realpath(root);
-  const digest = createHash("sha256").update(canonicalRoot).digest();
-  const port = 49_152 + (digest.readUInt16BE(0) % 12_000);
-  const capabilityPath = join(canonicalRoot, "runtime", "dashboard-ui", "capability");
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    const token = await readFile(capabilityPath, "utf8").then((value) => value.trim()).catch(() => "");
-    if (/^[0-9a-f]{64}$/.test(token)) {
-      return `http://127.0.0.1:${port}/report/${token}`;
+async function launchDashboardWithoutOpener(page: Page): Promise<string> {
+  return page.evaluate(async () => {
+    const token = sessionStorage.getItem("agent-observability.settings.session.v1");
+    if (!token) throw new Error("settings session token is unavailable");
+    const response = await fetch("/api/dashboard/launch", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "x-agent-observability-session": token },
+    });
+    if (!response.ok) throw new Error(`dashboard launch failed (${response.status})`);
+    const body = await response.json() as { url?: unknown };
+    if (typeof body.url !== "string" || !body.url.startsWith("http://127.0.0.1:")) {
+      throw new Error("dashboard launch returned an invalid URL");
     }
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  throw new Error("settings-launched dashboard capability was not created");
+    return body.url;
+  });
 }
 
 async function stopDashboardProcess(root: string): Promise<void> {
@@ -759,13 +794,7 @@ function rectanglesOverlap(first: DOMRect, second: DOMRect): boolean {
   );
 }
 
-type IntegrationStatus = {
-  config: "connected" | "disconnected" | "conflict";
-  collector: "ready" | "degraded" | "unavailable";
-  endpoint?: string;
-  service?: string;
-  data_retained: boolean;
-};
+type IntegrationStatus = CodexIntegrationStatusV1;
 
 type MockCodexOptions = {
   startConflicted?: boolean;
@@ -879,36 +908,54 @@ async function mockCodexApi(page: Page, options: MockCodexOptions = {}) {
 
 function connectedStatus(): IntegrationStatus {
   return {
+    schema_version: "codex_integration_status.v1",
     config: "connected",
+    notify: "agentobs_owned",
     collector: "ready",
     endpoint: "https://127.0.0.1:4318/v1/logs",
     service: "dev.agent-observability.collector",
     data_retained: true,
+    collector_degradation_reasons: [],
   };
 }
 
-function degradedStatus(): IntegrationStatus {
+function degradedStatus(
+  reasons: IntegrationStatus["collector_degradation_reasons"] = [],
+): IntegrationStatus {
   return {
+    schema_version: "codex_integration_status.v1",
     config: "connected",
+    notify: "agentobs_owned",
     collector: "degraded",
     endpoint: "https://127.0.0.1:4318/v1/logs",
     service: "dev.agent-observability.collector",
     data_retained: true,
+    collector_degradation_reasons: reasons,
   };
 }
 
 function disconnectedStatus(): IntegrationStatus {
   return {
+    schema_version: "codex_integration_status.v1",
     config: "disconnected",
+    notify: null,
     collector: "unavailable",
+    endpoint: null,
+    service: null,
     data_retained: true,
+    collector_degradation_reasons: [],
   };
 }
 
 function conflictStatus(): IntegrationStatus {
   return {
+    schema_version: "codex_integration_status.v1",
     config: "conflict",
+    notify: "external_preserved",
     collector: "unavailable",
+    endpoint: null,
+    service: null,
     data_retained: true,
+    collector_degradation_reasons: [],
   };
 }

@@ -1,0 +1,19 @@
+{
+  "schema_version": "local_collector_health.v1",
+  "status": "degraded",
+  "accepted_requests": 12,
+  "rejected_requests": 2,
+  "suppressed_requests": 1,
+  "last_ingest_unix_ms": 1788691270000,
+  "report_dirty": true,
+  "report_refresh_failures": 1,
+  "report_failure": "projection",
+  "private_detail_failures": 0,
+  "lifecycle_failures": 1,
+  "expired_trace_dispositions": 1,
+  "degradation_reasons": [
+    "lifecycle_failure",
+    "storage_pressure",
+    "expired_trace"
+  ]
+}

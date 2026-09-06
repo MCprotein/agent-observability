@@ -20,6 +20,11 @@ import {
   createIcons,
 } from "lucide";
 import { validateLocalRuntimeConfig } from "./config-validation.js";
+import { validateCodexIntegrationStatus } from "./integration-status-validation.js";
+import type {
+  CodexIntegrationStatusV1,
+  CollectorDegradationReasonV1,
+} from "./generated/codex-integration-status-v1.js";
 import type { LocalRuntimeConfigV4 } from "./generated/local-runtime-config-v4.js";
 
 type FieldPath =
@@ -45,14 +50,6 @@ type Envelope = {
   defaults: LocalRuntimeConfigV4;
   revision: string;
   collection_mode: "automatic_codex" | "manual_import";
-};
-
-type IntegrationStatus = {
-  config: "connected" | "disconnected" | "conflict";
-  collector: "ready" | "degraded" | "unavailable";
-  endpoint?: string;
-  service?: string;
-  data_retained: boolean;
 };
 
 type ApiError = { code?: string; message?: string };
@@ -245,7 +242,7 @@ let persisted: LocalRuntimeConfigV4 | null = null;
 let draft: LocalRuntimeConfigV4 | null = null;
 let defaults: LocalRuntimeConfigV4 | null = null;
 let revision = "";
-let integration: IntegrationStatus | null = null;
+let integration: CodexIntegrationStatusV1 | null = null;
 let integrationUnavailable = false;
 let integrationRequestGeneration = 0;
 let busy = false;
@@ -307,10 +304,10 @@ async function bootstrap(): Promise<void> {
 async function loadInitialIntegrationStatus(): Promise<boolean> {
   const generation = ++integrationRequestGeneration;
   try {
-    const initial = await api<IntegrationStatus>("/api/integrations/codex");
+    const initial = await integrationApi("/api/integrations/codex");
     const next = initial.config === "connected" && initial.collector === "unavailable"
       ? await new Promise<void>((resolve) => window.setTimeout(resolve, INITIAL_INTEGRATION_RETRY_MS))
-        .then(() => api<IntegrationStatus>("/api/integrations/codex"))
+        .then(() => integrationApi("/api/integrations/codex"))
       : initial;
     if (generation !== integrationRequestGeneration || !token) return false;
     integration = next;
@@ -438,12 +435,15 @@ function integrationPanel(): string {
   const ready = integration?.collector === "ready";
   const degraded = integration?.collector === "degraded";
   const conflicted = integration?.config === "conflict";
+  const degradedCopy = integrationDegradedCopy(
+    integration?.collector_degradation_reasons ?? [],
+  );
   const state = integrationUnavailable
     ? "상태 확인 불가"
     : conflicted
     ? "설정 충돌"
     : connected && degraded
-      ? "수집기 상태 저하"
+      ? degradedCopy.state
       : connected && ready
         ? "수집 중"
         : connected
@@ -454,7 +454,7 @@ function integrationPanel(): string {
     : conflicted
     ? "Codex 설정이 연결 후 변경되어 자동 복원을 중단했습니다."
     : connected && degraded
-      ? "이벤트 수집은 가능하지만 리포트 반영 또는 데이터 보관 정리가 지연될 수 있습니다."
+      ? degradedCopy.detail
       : connected && ready
         ? "Codex 이벤트를 private local runtime에 반영합니다."
         : connected
@@ -472,6 +472,37 @@ function integrationPanel(): string {
     <div class="integration-meta"><span><b>수집기</b>${collectorLabel}</span><span><b>저장</b>로컬 전용</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
     <div class="integration-actions">${action}<button class="button monitor-button" id="overview-dashboard" type="button"><i data-lucide="external-link"></i>리포트 열기</button></div>
   </div>`;
+}
+
+function integrationDegradedCopy(
+  reasons: CollectorDegradationReasonV1[],
+): { state: string; detail: string } {
+  if (reasons.length === 0) {
+    return {
+      state: "수집기 상태 저하",
+      detail: "리포트 반영 또는 데이터 보관 정리가 지연될 수 있습니다.",
+    };
+  }
+  const labels: Record<CollectorDegradationReasonV1, string> = {
+    lifecycle_failure: "데이터 보관 정리 미완료",
+    storage_pressure: "정리용 임시 저장 공간 부족",
+    expired_trace: "만료된 세션 데이터 제외",
+  };
+  const details: Record<CollectorDegradationReasonV1, string> = {
+    lifecycle_failure: "일부 데이터 또는 오류로 데이터 보관 정리 작업을 완료하지 못했습니다.",
+    storage_pressure: "정리 작업에 필요한 임시 저장 공간이 부족해 데이터 보관 정리가 지연됩니다.",
+    expired_trace: "완전히 만료된 세션의 후속 데이터가 제외되었습니다. 해당 작업을 계속 기록하려면 에이전트에서 새 세션을 시작해야 합니다.",
+  };
+  const reasonOrder: CollectorDegradationReasonV1[] = [
+    "lifecycle_failure",
+    "storage_pressure",
+    "expired_trace",
+  ];
+  const orderedReasons = reasonOrder.filter((reason) => reasons.includes(reason));
+  return {
+    state: orderedReasons.map((reason) => labels[reason]).join(" · "),
+    detail: orderedReasons.map((reason) => details[reason]).join(" "),
+  };
 }
 
 function configNavigationStatus(): string {
@@ -677,7 +708,7 @@ async function toggleIntegration(): Promise<void> {
   setBusy(true);
   try {
     const method = integration.config === "connected" ? "DELETE" : "POST";
-    const nextIntegration = await api<IntegrationStatus>("/api/integrations/codex", { method });
+    const nextIntegration = await integrationApi("/api/integrations/codex", { method });
     if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
     integration = nextIntegration;
     renderSettings("toggle-integration");
@@ -697,7 +728,7 @@ async function refreshIntegration(): Promise<void> {
   const generation = ++integrationRequestGeneration;
   setBusy(true);
   try {
-    const next = await api<IntegrationStatus>("/api/integrations/codex");
+    const next = await integrationApi("/api/integrations/codex");
     if (generation !== integrationRequestGeneration || !token) return;
     integration = next;
     integrationUnavailable = false;
@@ -720,7 +751,7 @@ async function refreshIntegrationStatus(): Promise<void> {
   const previous = integration;
   const wasUnavailable = integrationUnavailable;
   try {
-    const next = await api<IntegrationStatus>("/api/integrations/codex");
+    const next = await integrationApi("/api/integrations/codex");
     if (!token || generation !== integrationRequestGeneration) return;
     integration = next;
     integrationUnavailable = false;
@@ -741,15 +772,18 @@ async function refreshIntegrationStatus(): Promise<void> {
 }
 
 function sameIntegrationStatus(
-  left: IntegrationStatus | null,
-  right: IntegrationStatus,
+  left: CodexIntegrationStatusV1 | null,
+  right: CodexIntegrationStatusV1,
 ): boolean {
+  const rightReasons = right.collector_degradation_reasons as readonly CollectorDegradationReasonV1[];
   return left !== null
     && left.config === right.config
     && left.collector === right.collector
     && left.endpoint === right.endpoint
     && left.service === right.service
-    && left.data_retained === right.data_retained;
+    && left.data_retained === right.data_retained
+    && left.collector_degradation_reasons.length === right.collector_degradation_reasons.length
+    && left.collector_degradation_reasons.every((reason) => rightReasons.includes(reason));
 }
 
 async function openDashboard(): Promise<void> {
@@ -1132,6 +1166,17 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
+}
+
+async function integrationApi(
+  path: string,
+  init: RequestInit = {},
+): Promise<CodexIntegrationStatusV1> {
+  const value = await api<unknown>(path, init);
+  if (!validateCodexIntegrationStatus(value)) {
+    throw new Error("Codex 자동 수집 상태 응답이 올바르지 않습니다.");
+  }
+  return value;
 }
 
 function applyEnvelope(envelope: Envelope): void {

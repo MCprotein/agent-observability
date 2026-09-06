@@ -1,0 +1,14 @@
+{
+  "schema_version": "codex_integration_status.v1",
+  "config": "connected",
+  "notify": "agentobs_owned",
+  "collector": "degraded",
+  "endpoint": "https://127.0.0.1:4318/v1/logs",
+  "service": "dev.agent-observability.collector",
+  "data_retained": true,
+  "collector_degradation_reasons": [
+    "lifecycle_failure",
+    "storage_pressure",
+    "expired_trace"
+  ]
+}

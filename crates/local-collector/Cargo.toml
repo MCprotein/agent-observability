@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+agent-observability-contracts = { path = "../contracts" }
 agent-observability-adapter-codex = { path = "../adapter-codex" }
 agent-observability-application = { path = "../application" }
 agent-observability-local-runtime = { path = "../local-runtime" }

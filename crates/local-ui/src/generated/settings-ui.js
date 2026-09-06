@@ -930,6 +930,315 @@
     return { valid: true, errors: [] };
   }
 
+  // ui/settings/generated/validate-codex-integration-status-v1.js
+  var validate_codex_integration_status_v1_default = validate21;
+  var schema35 = { "title": "CodexIntegrationStatusV1", "type": "object", "additionalProperties": false, "required": ["schema_version", "config", "notify", "collector", "endpoint", "service", "data_retained", "collector_degradation_reasons"], "properties": { "schema_version": { "const": "codex_integration_status.v1" }, "config": { "$ref": "#/$defs/codex_connection_status" }, "notify": { "anyOf": [{ "$ref": "#/$defs/codex_notify_status" }, { "type": "null" }] }, "collector": { "$ref": "#/$defs/collector_status" }, "endpoint": { "type": ["string", "null"] }, "service": { "type": ["string", "null"] }, "data_retained": { "type": "boolean" }, "collector_degradation_reasons": { "type": "array", "maxItems": 3, "items": { "$ref": "#/$defs/collector_degradation_reason" } } }, "allOf": [{ "if": { "properties": { "collector": { "const": "degraded" } }, "required": ["collector"] }, "else": { "properties": { "collector_degradation_reasons": { "type": "array", "maxItems": 0 } } } }], "$defs": { "codex_connection_status": { "title": "CodexConnectionStatusV1", "type": "string", "enum": ["connected", "disconnected", "conflict"] }, "codex_notify_status": { "title": "CodexNotifyStatusV1", "type": "string", "enum": ["agentobs_owned", "external_preserved"] }, "collector_status": { "title": "CollectorStatusV1", "type": "string", "enum": ["ready", "degraded", "unavailable"] }, "collector_degradation_reason": { "title": "CollectorDegradationReasonV1", "type": "string", "enum": ["lifecycle_failure", "storage_pressure", "expired_trace"] } } };
+  var schema36 = { "title": "CodexConnectionStatusV1", "type": "string", "enum": ["connected", "disconnected", "conflict"] };
+  var schema37 = { "title": "CodexNotifyStatusV1", "type": "string", "enum": ["agentobs_owned", "external_preserved"] };
+  var schema38 = { "title": "CollectorStatusV1", "type": "string", "enum": ["ready", "degraded", "unavailable"] };
+  var schema39 = { "title": "CollectorDegradationReasonV1", "type": "string", "enum": ["lifecycle_failure", "storage_pressure", "expired_trace"] };
+  function validate21(data, { instancePath = "", parentData, parentDataProperty, rootData = data, dynamicAnchors = {} } = {}) {
+    let vErrors = null;
+    let errors = 0;
+    const evaluated0 = validate21.evaluated;
+    if (evaluated0.dynamicProps) {
+      evaluated0.props = void 0;
+    }
+    if (evaluated0.dynamicItems) {
+      evaluated0.items = void 0;
+    }
+    const _errs2 = errors;
+    let valid1 = true;
+    const _errs3 = errors;
+    if (data && typeof data == "object" && !Array.isArray(data)) {
+      let missing0;
+      if (data.collector === void 0 && (missing0 = "collector")) {
+        const err0 = {};
+        if (vErrors === null) {
+          vErrors = [err0];
+        } else {
+          vErrors.push(err0);
+        }
+        errors++;
+      } else {
+        if (data.collector !== void 0) {
+          if ("degraded" !== data.collector) {
+            const err1 = {};
+            if (vErrors === null) {
+              vErrors = [err1];
+            } else {
+              vErrors.push(err1);
+            }
+            errors++;
+          }
+        }
+      }
+    }
+    var _valid0 = _errs3 === errors;
+    errors = _errs2;
+    if (vErrors !== null) {
+      if (_errs2) {
+        vErrors.length = _errs2;
+      } else {
+        vErrors = null;
+      }
+    }
+    if (!_valid0) {
+      const _errs5 = errors;
+      if (data && typeof data == "object" && !Array.isArray(data)) {
+        if (data.collector_degradation_reasons !== void 0) {
+          let data1 = data.collector_degradation_reasons;
+          const _errs6 = errors;
+          if (errors === _errs6) {
+            if (Array.isArray(data1)) {
+              if (data1.length > 0) {
+                validate21.errors = [{ instancePath: instancePath + "/collector_degradation_reasons", schemaPath: "#/allOf/0/else/properties/collector_degradation_reasons/maxItems", keyword: "maxItems", params: { limit: 0 }, message: "must NOT have more than 0 items" }];
+                return false;
+              }
+            } else {
+              validate21.errors = [{ instancePath: instancePath + "/collector_degradation_reasons", schemaPath: "#/allOf/0/else/properties/collector_degradation_reasons/type", keyword: "type", params: { type: "array" }, message: "must be array" }];
+              return false;
+            }
+          }
+        }
+      }
+      var _valid0 = _errs5 === errors;
+      valid1 = _valid0;
+      if (valid1) {
+        var props0 = {};
+        props0.collector_degradation_reasons = true;
+        props0.collector = true;
+      }
+    }
+    if (!valid1) {
+      const err2 = { instancePath, schemaPath: "#/allOf/0/if", keyword: "if", params: { failingKeyword: "else" }, message: 'must match "else" schema' };
+      if (vErrors === null) {
+        vErrors = [err2];
+      } else {
+        vErrors.push(err2);
+      }
+      errors++;
+      validate21.errors = vErrors;
+      return false;
+    }
+    if (errors === 0) {
+      if (data && typeof data == "object" && !Array.isArray(data)) {
+        let missing1;
+        if (data.schema_version === void 0 && (missing1 = "schema_version") || data.config === void 0 && (missing1 = "config") || data.notify === void 0 && (missing1 = "notify") || data.collector === void 0 && (missing1 = "collector") || data.endpoint === void 0 && (missing1 = "endpoint") || data.service === void 0 && (missing1 = "service") || data.data_retained === void 0 && (missing1 = "data_retained") || data.collector_degradation_reasons === void 0 && (missing1 = "collector_degradation_reasons")) {
+          validate21.errors = [{ instancePath, schemaPath: "#/required", keyword: "required", params: { missingProperty: missing1 }, message: "must have required property '" + missing1 + "'" }];
+          return false;
+        } else {
+          const _errs8 = errors;
+          for (const key0 in data) {
+            if (!(key0 === "schema_version" || key0 === "config" || key0 === "notify" || key0 === "collector" || key0 === "endpoint" || key0 === "service" || key0 === "data_retained" || key0 === "collector_degradation_reasons")) {
+              validate21.errors = [{ instancePath, schemaPath: "#/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key0 }, message: "must NOT have additional properties" }];
+              return false;
+              break;
+            }
+          }
+          if (_errs8 === errors) {
+            if (data.schema_version !== void 0) {
+              const _errs9 = errors;
+              if ("codex_integration_status.v1" !== data.schema_version) {
+                validate21.errors = [{ instancePath: instancePath + "/schema_version", schemaPath: "#/properties/schema_version/const", keyword: "const", params: { allowedValue: "codex_integration_status.v1" }, message: "must be equal to constant" }];
+                return false;
+              }
+              var valid4 = _errs9 === errors;
+            } else {
+              var valid4 = true;
+            }
+            if (valid4) {
+              if (data.config !== void 0) {
+                let data3 = data.config;
+                const _errs10 = errors;
+                if (typeof data3 !== "string") {
+                  validate21.errors = [{ instancePath: instancePath + "/config", schemaPath: "#/$defs/codex_connection_status/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                  return false;
+                }
+                if (!(data3 === "connected" || data3 === "disconnected" || data3 === "conflict")) {
+                  validate21.errors = [{ instancePath: instancePath + "/config", schemaPath: "#/$defs/codex_connection_status/enum", keyword: "enum", params: { allowedValues: schema36.enum }, message: "must be equal to one of the allowed values" }];
+                  return false;
+                }
+                var valid4 = _errs10 === errors;
+              } else {
+                var valid4 = true;
+              }
+              if (valid4) {
+                if (data.notify !== void 0) {
+                  let data4 = data.notify;
+                  const _errs13 = errors;
+                  const _errs14 = errors;
+                  let valid6 = false;
+                  const _errs15 = errors;
+                  if (typeof data4 !== "string") {
+                    const err3 = { instancePath: instancePath + "/notify", schemaPath: "#/$defs/codex_notify_status/type", keyword: "type", params: { type: "string" }, message: "must be string" };
+                    if (vErrors === null) {
+                      vErrors = [err3];
+                    } else {
+                      vErrors.push(err3);
+                    }
+                    errors++;
+                  }
+                  if (!(data4 === "agentobs_owned" || data4 === "external_preserved")) {
+                    const err4 = { instancePath: instancePath + "/notify", schemaPath: "#/$defs/codex_notify_status/enum", keyword: "enum", params: { allowedValues: schema37.enum }, message: "must be equal to one of the allowed values" };
+                    if (vErrors === null) {
+                      vErrors = [err4];
+                    } else {
+                      vErrors.push(err4);
+                    }
+                    errors++;
+                  }
+                  var _valid1 = _errs15 === errors;
+                  valid6 = valid6 || _valid1;
+                  const _errs18 = errors;
+                  if (data4 !== null) {
+                    const err5 = { instancePath: instancePath + "/notify", schemaPath: "#/properties/notify/anyOf/1/type", keyword: "type", params: { type: "null" }, message: "must be null" };
+                    if (vErrors === null) {
+                      vErrors = [err5];
+                    } else {
+                      vErrors.push(err5);
+                    }
+                    errors++;
+                  }
+                  var _valid1 = _errs18 === errors;
+                  valid6 = valid6 || _valid1;
+                  if (!valid6) {
+                    const err6 = { instancePath: instancePath + "/notify", schemaPath: "#/properties/notify/anyOf", keyword: "anyOf", params: {}, message: "must match a schema in anyOf" };
+                    if (vErrors === null) {
+                      vErrors = [err6];
+                    } else {
+                      vErrors.push(err6);
+                    }
+                    errors++;
+                    validate21.errors = vErrors;
+                    return false;
+                  } else {
+                    errors = _errs14;
+                    if (vErrors !== null) {
+                      if (_errs14) {
+                        vErrors.length = _errs14;
+                      } else {
+                        vErrors = null;
+                      }
+                    }
+                  }
+                  var valid4 = _errs13 === errors;
+                } else {
+                  var valid4 = true;
+                }
+                if (valid4) {
+                  if (data.collector !== void 0) {
+                    let data5 = data.collector;
+                    const _errs20 = errors;
+                    if (typeof data5 !== "string") {
+                      validate21.errors = [{ instancePath: instancePath + "/collector", schemaPath: "#/$defs/collector_status/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                      return false;
+                    }
+                    if (!(data5 === "ready" || data5 === "degraded" || data5 === "unavailable")) {
+                      validate21.errors = [{ instancePath: instancePath + "/collector", schemaPath: "#/$defs/collector_status/enum", keyword: "enum", params: { allowedValues: schema38.enum }, message: "must be equal to one of the allowed values" }];
+                      return false;
+                    }
+                    var valid4 = _errs20 === errors;
+                  } else {
+                    var valid4 = true;
+                  }
+                  if (valid4) {
+                    if (data.endpoint !== void 0) {
+                      let data6 = data.endpoint;
+                      const _errs23 = errors;
+                      if (typeof data6 !== "string" && data6 !== null) {
+                        validate21.errors = [{ instancePath: instancePath + "/endpoint", schemaPath: "#/properties/endpoint/type", keyword: "type", params: { type: schema35.properties.endpoint.type }, message: "must be string,null" }];
+                        return false;
+                      }
+                      var valid4 = _errs23 === errors;
+                    } else {
+                      var valid4 = true;
+                    }
+                    if (valid4) {
+                      if (data.service !== void 0) {
+                        let data7 = data.service;
+                        const _errs25 = errors;
+                        if (typeof data7 !== "string" && data7 !== null) {
+                          validate21.errors = [{ instancePath: instancePath + "/service", schemaPath: "#/properties/service/type", keyword: "type", params: { type: schema35.properties.service.type }, message: "must be string,null" }];
+                          return false;
+                        }
+                        var valid4 = _errs25 === errors;
+                      } else {
+                        var valid4 = true;
+                      }
+                      if (valid4) {
+                        if (data.data_retained !== void 0) {
+                          const _errs27 = errors;
+                          if (typeof data.data_retained !== "boolean") {
+                            validate21.errors = [{ instancePath: instancePath + "/data_retained", schemaPath: "#/properties/data_retained/type", keyword: "type", params: { type: "boolean" }, message: "must be boolean" }];
+                            return false;
+                          }
+                          var valid4 = _errs27 === errors;
+                        } else {
+                          var valid4 = true;
+                        }
+                        if (valid4) {
+                          if (data.collector_degradation_reasons !== void 0) {
+                            let data9 = data.collector_degradation_reasons;
+                            const _errs29 = errors;
+                            if (errors === _errs29) {
+                              if (Array.isArray(data9)) {
+                                if (data9.length > 3) {
+                                  validate21.errors = [{ instancePath: instancePath + "/collector_degradation_reasons", schemaPath: "#/properties/collector_degradation_reasons/maxItems", keyword: "maxItems", params: { limit: 3 }, message: "must NOT have more than 3 items" }];
+                                  return false;
+                                } else {
+                                  var valid9 = true;
+                                  const len0 = data9.length;
+                                  for (let i0 = 0; i0 < len0; i0++) {
+                                    let data10 = data9[i0];
+                                    const _errs31 = errors;
+                                    if (typeof data10 !== "string") {
+                                      validate21.errors = [{ instancePath: instancePath + "/collector_degradation_reasons/" + i0, schemaPath: "#/$defs/collector_degradation_reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                                      return false;
+                                    }
+                                    if (!(data10 === "lifecycle_failure" || data10 === "storage_pressure" || data10 === "expired_trace")) {
+                                      validate21.errors = [{ instancePath: instancePath + "/collector_degradation_reasons/" + i0, schemaPath: "#/$defs/collector_degradation_reason/enum", keyword: "enum", params: { allowedValues: schema39.enum }, message: "must be equal to one of the allowed values" }];
+                                      return false;
+                                    }
+                                    var valid9 = _errs31 === errors;
+                                    if (!valid9) {
+                                      break;
+                                    }
+                                  }
+                                }
+                              } else {
+                                validate21.errors = [{ instancePath: instancePath + "/collector_degradation_reasons", schemaPath: "#/properties/collector_degradation_reasons/type", keyword: "type", params: { type: "array" }, message: "must be array" }];
+                                return false;
+                              }
+                            }
+                            var valid4 = _errs29 === errors;
+                          } else {
+                            var valid4 = true;
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else {
+        validate21.errors = [{ instancePath, schemaPath: "#/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+        return false;
+      }
+    }
+    validate21.errors = vErrors;
+    return errors === 0;
+  }
+  validate21.evaluated = { "props": true, "dynamicProps": false, "dynamicItems": false };
+
+  // ui/settings/integration-status-validation.ts
+  function validateCodexIntegrationStatus(value) {
+    return validate_codex_integration_status_v1_default(value);
+  }
+
   // ui/settings/main.ts
   var fields = {
     "collection.file_reconcile_interval_ms": {
@@ -1162,8 +1471,8 @@
   async function loadInitialIntegrationStatus() {
     const generation = ++integrationRequestGeneration;
     try {
-      const initial = await api("/api/integrations/codex");
-      const next = initial.config === "connected" && initial.collector === "unavailable" ? await new Promise((resolve) => window.setTimeout(resolve, INITIAL_INTEGRATION_RETRY_MS)).then(() => api("/api/integrations/codex")) : initial;
+      const initial = await integrationApi("/api/integrations/codex");
+      const next = initial.config === "connected" && initial.collector === "unavailable" ? await new Promise((resolve) => window.setTimeout(resolve, INITIAL_INTEGRATION_RETRY_MS)).then(() => integrationApi("/api/integrations/codex")) : initial;
       if (generation !== integrationRequestGeneration || !token) return false;
       integration = next;
       integrationUnavailable = false;
@@ -1284,8 +1593,11 @@
     const ready = integration?.collector === "ready";
     const degraded = integration?.collector === "degraded";
     const conflicted2 = integration?.config === "conflict";
-    const state = integrationUnavailable ? "\uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00" : conflicted2 ? "\uC124\uC815 \uCDA9\uB3CC" : connected && degraded ? "\uC218\uC9D1\uAE30 \uC0C1\uD0DC \uC800\uD558" : connected && ready ? "\uC218\uC9D1 \uC911" : connected ? "\uC218\uC9D1\uAE30 \uC751\uB2F5 \uC5C6\uC74C" : "\uC5F0\uACB0 \uC548 \uB428";
-    const detail = integrationUnavailable ? "\uB85C\uCEEC \uC124\uC815\uC740 \uC0AC\uC6A9\uD560 \uC218 \uC788\uC9C0\uB9CC Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC\uB97C \uD655\uC778\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4." : conflicted2 ? "Codex \uC124\uC815\uC774 \uC5F0\uACB0 \uD6C4 \uBCC0\uACBD\uB418\uC5B4 \uC790\uB3D9 \uBCF5\uC6D0\uC744 \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4." : connected && degraded ? "\uC774\uBCA4\uD2B8 \uC218\uC9D1\uC740 \uAC00\uB2A5\uD558\uC9C0\uB9CC \uB9AC\uD3EC\uD2B8 \uBC18\uC601 \uB610\uB294 \uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uB9AC\uAC00 \uC9C0\uC5F0\uB420 \uC218 \uC788\uC2B5\uB2C8\uB2E4." : connected && ready ? "Codex \uC774\uBCA4\uD2B8\uB97C private local runtime\uC5D0 \uBC18\uC601\uD569\uB2C8\uB2E4." : connected ? "Codex \uC5F0\uACB0\uC740 \uC720\uC9C0\uB418\uC9C0\uB9CC \uB85C\uCEEC \uC218\uC9D1\uAE30\uC5D0 \uC5F0\uACB0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD558\uBA74 \uB2E4\uC74C \uC791\uC5C5\uBD80\uD130 \uAE30\uB85D\uD569\uB2C8\uB2E4.";
+    const degradedCopy = integrationDegradedCopy(
+      integration?.collector_degradation_reasons ?? []
+    );
+    const state = integrationUnavailable ? "\uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00" : conflicted2 ? "\uC124\uC815 \uCDA9\uB3CC" : connected && degraded ? degradedCopy.state : connected && ready ? "\uC218\uC9D1 \uC911" : connected ? "\uC218\uC9D1\uAE30 \uC751\uB2F5 \uC5C6\uC74C" : "\uC5F0\uACB0 \uC548 \uB428";
+    const detail = integrationUnavailable ? "\uB85C\uCEEC \uC124\uC815\uC740 \uC0AC\uC6A9\uD560 \uC218 \uC788\uC9C0\uB9CC Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC\uB97C \uD655\uC778\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4." : conflicted2 ? "Codex \uC124\uC815\uC774 \uC5F0\uACB0 \uD6C4 \uBCC0\uACBD\uB418\uC5B4 \uC790\uB3D9 \uBCF5\uC6D0\uC744 \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4." : connected && degraded ? degradedCopy.detail : connected && ready ? "Codex \uC774\uBCA4\uD2B8\uB97C private local runtime\uC5D0 \uBC18\uC601\uD569\uB2C8\uB2E4." : connected ? "Codex \uC5F0\uACB0\uC740 \uC720\uC9C0\uB418\uC9C0\uB9CC \uB85C\uCEEC \uC218\uC9D1\uAE30\uC5D0 \uC5F0\uACB0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD558\uBA74 \uB2E4\uC74C \uC791\uC5C5\uBD80\uD130 \uAE30\uB85D\uD569\uB2C8\uB2E4.";
     const action = integrationUnavailable ? `<button class="button secondary" id="refresh-integration" type="button"><i data-lucide="refresh-cw"></i>\uB2E4\uC2DC \uD655\uC778</button>` : connected ? `<button class="button secondary" id="toggle-integration" type="button"><i data-lucide="power"></i>\uC5F0\uACB0 \uD574\uC81C</button>` : `<button class="button primary" id="toggle-integration" type="button"><i data-lucide="cable"></i>Codex \uC5F0\uACB0</button>`;
     const panelState = integrationUnavailable ? "unavailable" : conflicted2 ? "conflict" : degraded ? "degraded" : ready ? "ready" : "idle";
     const collectorLabel = integrationUnavailable ? "\uD655\uC778 \uBD88\uAC00" : degraded ? "\uC0C1\uD0DC \uC800\uD558" : ready ? "\uC815\uC0C1" : "\uC911\uC9C0";
@@ -1294,6 +1606,34 @@
     <div class="integration-meta"><span><b>\uC218\uC9D1\uAE30</b>${collectorLabel}</span><span><b>\uC800\uC7A5</b>\uB85C\uCEEC \uC804\uC6A9</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
     <div class="integration-actions">${action}<button class="button monitor-button" id="overview-dashboard" type="button"><i data-lucide="external-link"></i>\uB9AC\uD3EC\uD2B8 \uC5F4\uAE30</button></div>
   </div>`;
+  }
+  function integrationDegradedCopy(reasons) {
+    if (reasons.length === 0) {
+      return {
+        state: "\uC218\uC9D1\uAE30 \uC0C1\uD0DC \uC800\uD558",
+        detail: "\uB9AC\uD3EC\uD2B8 \uBC18\uC601 \uB610\uB294 \uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uB9AC\uAC00 \uC9C0\uC5F0\uB420 \uC218 \uC788\uC2B5\uB2C8\uB2E4."
+      };
+    }
+    const labels = {
+      lifecycle_failure: "\uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uB9AC \uBBF8\uC644\uB8CC",
+      storage_pressure: "\uC815\uB9AC\uC6A9 \uC784\uC2DC \uC800\uC7A5 \uACF5\uAC04 \uBD80\uC871",
+      expired_trace: "\uB9CC\uB8CC\uB41C \uC138\uC158 \uB370\uC774\uD130 \uC81C\uC678"
+    };
+    const details = {
+      lifecycle_failure: "\uC77C\uBD80 \uB370\uC774\uD130 \uB610\uB294 \uC624\uB958\uB85C \uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uB9AC \uC791\uC5C5\uC744 \uC644\uB8CC\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4.",
+      storage_pressure: "\uC815\uB9AC \uC791\uC5C5\uC5D0 \uD544\uC694\uD55C \uC784\uC2DC \uC800\uC7A5 \uACF5\uAC04\uC774 \uBD80\uC871\uD574 \uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uB9AC\uAC00 \uC9C0\uC5F0\uB429\uB2C8\uB2E4.",
+      expired_trace: "\uC644\uC804\uD788 \uB9CC\uB8CC\uB41C \uC138\uC158\uC758 \uD6C4\uC18D \uB370\uC774\uD130\uAC00 \uC81C\uC678\uB418\uC5C8\uC2B5\uB2C8\uB2E4. \uD574\uB2F9 \uC791\uC5C5\uC744 \uACC4\uC18D \uAE30\uB85D\uD558\uB824\uBA74 \uC5D0\uC774\uC804\uD2B8\uC5D0\uC11C \uC0C8 \uC138\uC158\uC744 \uC2DC\uC791\uD574\uC57C \uD569\uB2C8\uB2E4."
+    };
+    const reasonOrder = [
+      "lifecycle_failure",
+      "storage_pressure",
+      "expired_trace"
+    ];
+    const orderedReasons = reasonOrder.filter((reason) => reasons.includes(reason));
+    return {
+      state: orderedReasons.map((reason) => labels[reason]).join(" \xB7 "),
+      detail: orderedReasons.map((reason) => details[reason]).join(" ")
+    };
   }
   function configNavigationStatus() {
     if (integrationUnavailable) return "\uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00";
@@ -1482,7 +1822,7 @@
     setBusy(true);
     try {
       const method = integration.config === "connected" ? "DELETE" : "POST";
-      const nextIntegration = await api("/api/integrations/codex", { method });
+      const nextIntegration = await integrationApi("/api/integrations/codex", { method });
       if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
       integration = nextIntegration;
       renderSettings("toggle-integration");
@@ -1501,7 +1841,7 @@
     const generation = ++integrationRequestGeneration;
     setBusy(true);
     try {
-      const next = await api("/api/integrations/codex");
+      const next = await integrationApi("/api/integrations/codex");
       if (generation !== integrationRequestGeneration || !token) return;
       integration = next;
       integrationUnavailable = false;
@@ -1523,7 +1863,7 @@
     const previous = integration;
     const wasUnavailable = integrationUnavailable;
     try {
-      const next = await api("/api/integrations/codex");
+      const next = await integrationApi("/api/integrations/codex");
       if (!token || generation !== integrationRequestGeneration) return;
       integration = next;
       integrationUnavailable = false;
@@ -1543,7 +1883,8 @@
     }
   }
   function sameIntegrationStatus(left, right) {
-    return left !== null && left.config === right.config && left.collector === right.collector && left.endpoint === right.endpoint && left.service === right.service && left.data_retained === right.data_retained;
+    const rightReasons = right.collector_degradation_reasons;
+    return left !== null && left.config === right.config && left.collector === right.collector && left.endpoint === right.endpoint && left.service === right.service && left.data_retained === right.data_retained && left.collector_degradation_reasons.length === right.collector_degradation_reasons.length && left.collector_degradation_reasons.every((reason) => rightReasons.includes(reason));
   }
   async function openDashboard() {
     if (busy) return;
@@ -1885,6 +2226,13 @@
     }
     if (response.status === 204) return void 0;
     return await response.json();
+  }
+  async function integrationApi(path, init = {}) {
+    const value = await api(path, init);
+    if (!validateCodexIntegrationStatus(value)) {
+      throw new Error("Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC \uC751\uB2F5\uC774 \uC62C\uBC14\uB974\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.");
+    }
+    return value;
   }
   function applyEnvelope(envelope) {
     persisted = structuredClone(envelope.config);

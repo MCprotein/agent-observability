@@ -67,6 +67,10 @@ const MAX_CONNECTIONS: usize = 64;
 const SETTINGS_SHELL: &str = include_str!("generated/settings-shell.html");
 const SETTINGS_SCRIPT: &str = include_str!("generated/settings-ui.js");
 const SETTINGS_STYLE: &str = include_str!("generated/settings-ui.css");
+#[cfg(test)]
+static PLATFORM_OPEN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static PLATFORM_OPEN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug)]
 pub enum UiError {
@@ -336,6 +340,11 @@ struct ConfigEnvelope {
     collection_mode: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct DashboardLaunchResponse {
+    url: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateRequest {
@@ -475,6 +484,7 @@ fn router(state: AppState) -> Router {
                 .delete(disconnect_codex_integration),
         )
         .route("/api/dashboard/open", post(open_dashboard))
+        .route("/api/dashboard/launch", post(launch_dashboard))
         .route("/api/heartbeat", post(heartbeat))
         .route("/api/shutdown", post(shutdown))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -670,15 +680,7 @@ async fn open_dashboard(
 ) -> Result<StatusCode, ApiError> {
     authorize(&state, &headers, true)?;
     touch(&state)?;
-    let root = state.root;
-    let runtime = state.runtime;
-    let dashboard_child = state.dashboard_child;
-    let dashboard_url = tokio::task::spawn_blocking(move || {
-        launch_or_reuse_dashboard(&root, &runtime, &dashboard_child)
-    })
-    .await
-    .map_err(|_| dashboard_error(DashboardOpenError::TaskFailed))?
-    .map_err(dashboard_error)?;
+    let dashboard_url = ensure_dashboard_server(state).await?;
     let open_result = tokio::task::spawn_blocking(move || open_dashboard_target(&dashboard_url))
         .await
         .map_err(|_| DashboardOpenError::TaskFailed)
@@ -688,6 +690,28 @@ async fn open_dashboard(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn launch_dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DashboardLaunchResponse>, ApiError> {
+    authorize(&state, &headers, true)?;
+    touch(&state)?;
+    let url = ensure_dashboard_server(state).await?;
+    Ok(Json(DashboardLaunchResponse { url }))
+}
+
+async fn ensure_dashboard_server(state: AppState) -> Result<String, ApiError> {
+    let root = state.root;
+    let runtime = state.runtime;
+    let dashboard_child = state.dashboard_child;
+    tokio::task::spawn_blocking(move || {
+        launch_or_reuse_dashboard(&root, &runtime, &dashboard_child)
+    })
+    .await
+    .map_err(|_| dashboard_error(DashboardOpenError::TaskFailed))?
+    .map_err(dashboard_error)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DashboardOpenError {
     Artifact(DashboardArtifactError),
@@ -695,13 +719,21 @@ enum DashboardOpenError {
     TaskFailed,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 fn open_dashboard_target(target: &str) -> Result<(), DashboardOpenError> {
     open_local_target(target).map_err(DashboardOpenError::Platform)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(test)))]
 fn open_dashboard_target(_target: &str) -> Result<(), DashboardOpenError> {
+    Err(DashboardOpenError::Platform(
+        PlatformOpenError::UnsupportedPlatform,
+    ))
+}
+
+#[cfg(test)]
+fn open_dashboard_target(_target: &str) -> Result<(), DashboardOpenError> {
+    PLATFORM_OPEN_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Err(DashboardOpenError::Platform(
         PlatformOpenError::UnsupportedPlatform,
     ))
@@ -1298,10 +1330,10 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
 mod tests {
     use super::{
         AppState, DASHBOARD_IDENTITY_HEADER, DashboardArtifactError, DashboardOpenError,
-        DashboardState, LocalConfigService, MAX_REPORT_ARTIFACT_BYTES, PlatformOpenError,
-        REPORT_FILE_NAME, constant_time_equal, dashboard_error, dashboard_router,
-        platform_open_command, prepare, prepare_dashboard, read_private_report, router,
-        run_integration, run_platform_opener, session_token,
+        DashboardState, LocalConfigService, MAX_REPORT_ARTIFACT_BYTES, PLATFORM_OPEN_CALLS,
+        PLATFORM_OPEN_TEST_LOCK, PlatformOpenError, REPORT_FILE_NAME, constant_time_equal,
+        dashboard_error, dashboard_router, platform_open_command, prepare, prepare_dashboard,
+        read_private_report, router, run_integration, run_platform_opener, session_token,
     };
     use agent_observability_codex_integration::{CodexIntegrationStatus, IntegrationError};
     use agent_observability_contracts::hash_opaque_identifier;
@@ -1465,6 +1497,132 @@ mod tests {
         let command = platform_open_command(target);
         assert_eq!(command.get_program(), std::ffi::OsStr::new("/usr/bin/open"));
         assert_eq!(command.get_args().collect::<Vec<_>>(), [target]);
+    }
+
+    #[test]
+    fn test_build_dashboard_opener_is_fail_closed() {
+        let _opener_guard = PLATFORM_OPEN_TEST_LOCK.lock().unwrap();
+        let calls_before = PLATFORM_OPEN_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            super::open_dashboard_target("http://127.0.0.1:49152/report/private"),
+            Err(DashboardOpenError::Platform(
+                PlatformOpenError::UnsupportedPlatform
+            ))
+        );
+        assert!(
+            PLATFORM_OPEN_CALLS.load(std::sync::atomic::Ordering::SeqCst) > calls_before,
+            "test opener sentinel must record and block the call"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_launch_api_prepares_and_reuses_without_platform_opener() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _opener_guard = PLATFORM_OPEN_TEST_LOCK.lock().unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let root = std::env::temp_dir().join(format!(
+                    "agent-observability-dashboard-launch-test-{}",
+                    std::process::id()
+                ));
+                let _ = fs::remove_dir_all(&root);
+                let layout = install(&root).unwrap();
+                let report = layout.root.join("logs").join(REPORT_FILE_NAME);
+                fs::write(&report, b"<!doctype html><title>Private dashboard</title>").unwrap();
+                fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).unwrap();
+
+                let dashboard_server = prepare_dashboard(&layout).await.unwrap();
+                let expected_url = dashboard_server.url().to_owned();
+                let dashboard_shutdown = Arc::clone(&dashboard_server.shutdown);
+                let dashboard_task = tokio::spawn(dashboard_server.serve());
+                tokio::task::yield_now().await;
+
+                let state = AppState {
+                    config: LocalConfigService::new(&layout),
+                    root: layout.root.clone(),
+                    runtime: layout.runtime.clone(),
+                    host: "127.0.0.1:43191".into(),
+                    origin: "http://127.0.0.1:43191".into(),
+                    token: "test-session".into(),
+                    shutdown: Arc::new(Notify::new()),
+                    last_seen: Arc::new(Mutex::new(Instant::now())),
+                    dashboard_child: Arc::new(Mutex::new(None)),
+                };
+                let app = router(state);
+                let opener_calls_before =
+                    PLATFORM_OPEN_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+
+                let unauthorized = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/dashboard/launch")
+                            .header(header::HOST, "127.0.0.1:43191")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+                let wrong_origin = app
+                    .clone()
+                    .oneshot(api_request(
+                        "POST",
+                        "/api/dashboard/launch",
+                        "127.0.0.1:43191",
+                        Some("http://example.invalid"),
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(wrong_origin.status(), StatusCode::FORBIDDEN);
+
+                for _ in 0..2 {
+                    let response = app
+                        .clone()
+                        .oneshot(api_request(
+                            "POST",
+                            "/api/dashboard/launch",
+                            "127.0.0.1:43191",
+                            Some("http://127.0.0.1:43191"),
+                            None,
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::CACHE_CONTROL)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("no-store, max-age=0")
+                    );
+                    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                    let launch: Value = serde_json::from_slice(&body).unwrap();
+                    assert!(
+                        launch["url"]
+                            .as_str()
+                            .is_some_and(|url| url == expected_url),
+                        "launch API must return the prepared dashboard URL"
+                    );
+                }
+                assert_eq!(
+                    PLATFORM_OPEN_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                    opener_calls_before,
+                    "launch-only API must never invoke the platform opener"
+                );
+
+                dashboard_shutdown.notify_one();
+                dashboard_task.await.unwrap().unwrap();
+                let _ = fs::remove_dir_all(root);
+            });
     }
 
     #[test]

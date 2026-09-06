@@ -1403,6 +1403,8 @@ mod tests {
     #[test]
     fn codex_status_preserves_conflict_and_degraded_without_an_endpoint() {
         let output = format_codex_status(&CodexIntegrationStatus {
+            schema_version: agent_observability_contracts::CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: Vec::new(),
             config: ConnectionStatus::Conflict,
             notify: None,
             collector: CollectorStatus::Degraded,

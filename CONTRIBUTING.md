@@ -69,8 +69,14 @@ git diff --check
 ```
 
 GitHub의 `CI` workflow는 pull request에서 Rust 검사와 `npm test`를 다시 실행한다.
-CI 성공은 merge gate의 일부이며, 로컬에서만 실행할 수 있는 장시간 release performance
-검증을 대체하지 않는다.
+일반 PR CI 성공은 merge gate의 일부이며 장시간 release performance 검증을 대체하지 않는다.
+정확한 revision의 장시간 검사는 GitHub Actions `CI`를 수동 실행하여 별도로 수행한다.
+
+브라우저 QA는 임시 runtime과 headless Chromium을 사용한다. Headless 실행 자체는 서버의
+macOS 브라우저 열기 호출을 차단하지 않는다. 설정 smoke는 인증된
+`POST /api/dashboard/launch`로 서버 시작·재사용만 검증하고, 실제 브라우저를 여는
+`POST /api/dashboard/open`은 mock하거나 차단한다. 사용자 Chrome 탭을 열거나 포커스를
+옮기는 테스트를 자동 검증에 포함하지 않는다. `--no-open`은 초기 화면 자동 열기만 막는다.
 
 사용자 동작이나 성능 계약이 바뀌면 ROADMAP에 선언된 fixture, smoke, browser, performance
 검증도 추가한다. 생성된 evidence는 실제 실행 결과와 호환되는 protocol/manifest만

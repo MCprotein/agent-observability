@@ -5,15 +5,20 @@ use agent_observability_codex_config::{
     CodexConfigManager, ConfigError, ConnectionStatus as ConfigConnectionStatus, ExporterSecurity,
     NotifyOwnership,
 };
+use agent_observability_contracts::CODEX_INTEGRATION_STATUS_VERSION;
+pub use agent_observability_contracts::{
+    CodexConnectionStatusV1 as ConnectionStatus,
+    CodexIntegrationStatusV1 as CodexIntegrationStatus, CodexNotifyStatusV1 as NotifyStatus,
+    CollectorStatusV1 as CollectorStatus,
+};
 use agent_observability_local_collector::{
-    CollectorError, CollectorSettings, HealthOutcome, check_health, commit_settings_migration,
-    install_settings, load_settings, recover_occupied_persisted_port, rollback_settings_migration,
-    settings_migration_pending,
+    CollectorError, CollectorSettings, HealthOutcome, check_health, check_health_details,
+    commit_settings_migration, install_settings, load_settings, recover_occupied_persisted_port,
+    rollback_settings_migration, settings_migration_pending,
 };
 use agent_observability_local_runtime::{InstalledLayout, MutationGuard, install};
 #[cfg(target_os = "macos")]
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     env, fmt, fs,
@@ -40,29 +45,6 @@ const MAX_LAUNCH_AGENT_OWNERSHIP_BYTES: u64 = MAX_LAUNCH_AGENT_PLIST_BYTES * 12 
 const MACOS_O_NOFOLLOW: i32 = 0x0000_0100;
 #[cfg(target_os = "macos")]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum ConnectionStatus {
-    Connected,
-    Disconnected,
-    Conflict,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum CollectorStatus {
-    Ready,
-    Degraded,
-    Unavailable,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum NotifyStatus {
-    AgentobsOwned,
-    ExternalPreserved,
-}
 
 /// Reports whether a local Codex installation is available for automatic setup.
 ///
@@ -94,16 +76,6 @@ enum LaunchAgentOwnershipStatus {
     Absent,
     Owned,
     Conflict,
-}
-
-#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
-pub struct CodexIntegrationStatus {
-    pub config: ConnectionStatus,
-    pub notify: Option<NotifyStatus>,
-    pub collector: CollectorStatus,
-    pub endpoint: Option<String>,
-    pub service: Option<String>,
-    pub data_retained: bool,
 }
 
 #[derive(Debug)]
@@ -244,7 +216,7 @@ fn connect_with_reloaded_settings<C: ConfigLifecycle>(
     let manager = config_from_settings(&settings)
         .map_err(|error| rollback_migration_install(root, lifecycle, &service, error))?;
     let (config, notify) = match manager.connect() {
-        Ok((config, notify)) => (config.into(), notify.map(Into::into)),
+        Ok((config, notify)) => (connection_status(config), notify.map(notify_status)),
         Err(error) => {
             return Err(recover_failed_config_connect(
                 root, &manager, lifecycle, &service, error,
@@ -253,6 +225,8 @@ fn connect_with_reloaded_settings<C: ConfigLifecycle>(
     };
     lifecycle.commit_install(&service)?;
     Ok(CodexIntegrationStatus {
+        schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+        collector_degradation_reasons: Vec::new(),
         config,
         notify,
         collector,
@@ -275,11 +249,13 @@ fn connect_prepared(
         .wait_until_ready(root)
         .map_err(|error| rollback_install(lifecycle, &service, error))?;
     let (config_status, notify) = match config.connect() {
-        Ok((status, notify)) => (status.into(), notify.map(Into::into)),
+        Ok((status, notify)) => (connection_status(status), notify.map(notify_status)),
         Err(error) => return Err(rollback_install(lifecycle, &service, error)),
     };
     lifecycle.commit_install(&service)?;
     Ok(CodexIntegrationStatus {
+        schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+        collector_degradation_reasons: Vec::new(),
         config: config_status,
         notify,
         collector,
@@ -406,7 +382,9 @@ fn disconnect_owned_prepared(
         },
     };
     Ok(CodexIntegrationStatus {
-        config: status.into(),
+        schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+        collector_degradation_reasons: Vec::new(),
+        config: connection_status(status),
         notify: None,
         collector: CollectorStatus::Unavailable,
         endpoint: endpoint.map(str::to_owned),
@@ -441,12 +419,10 @@ impl ConfigLifecycle for CodexConfigManager {
     }
 }
 
-impl From<NotifyOwnership> for NotifyStatus {
-    fn from(ownership: NotifyOwnership) -> Self {
-        match ownership {
-            NotifyOwnership::AgentobsOwned => Self::AgentobsOwned,
-            NotifyOwnership::ExternalPreserved => Self::ExternalPreserved,
-        }
+fn notify_status(ownership: NotifyOwnership) -> NotifyStatus {
+    match ownership {
+        NotifyOwnership::AgentobsOwned => NotifyStatus::AgentobsOwned,
+        NotifyOwnership::ExternalPreserved => NotifyStatus::ExternalPreserved,
     }
 }
 
@@ -602,7 +578,7 @@ pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, 
         let manager = codex_config_manager(&layout, executable, &settings)?;
         let config = manager.status()?;
         let notify = if config == ConfigConnectionStatus::Connected {
-            manager.notify_ownership()?.map(Into::into)
+            manager.notify_ownership()?.map(notify_status)
         } else {
             None
         };
@@ -610,10 +586,13 @@ pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, 
         if settle_settings_migration_for_status(&layout.root, config)? {
             return status_without_settings(&layout);
         }
+        let health = check_health_details(&layout.root);
         Ok(CodexIntegrationStatus {
-            config: config.into(),
+            schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: health.degradation_reasons,
+            config: connection_status(config),
             notify,
-            collector: collector_status(check_health(&layout.root)),
+            collector: collector_status(health.outcome),
             endpoint: Some(settings.endpoint()),
             service: Some(service_label(&layout.root)),
             data_retained: true,
@@ -667,7 +646,7 @@ fn status_without_settings(
     let manager = codex_config_ownership_manager(layout)?;
     let config = manager.ownership_status()?;
     let notify = if config == Some(ConfigConnectionStatus::Connected) {
-        manager.notify_ownership()?.map(Into::into)
+        manager.notify_ownership()?.map(notify_status)
     } else {
         None
     };
@@ -694,9 +673,11 @@ fn missing_settings_status(
     {
         ConnectionStatus::Conflict
     } else {
-        config.unwrap_or(ConfigConnectionStatus::Conflict).into()
+        connection_status(config.unwrap_or(ConfigConnectionStatus::Conflict))
     };
     CodexIntegrationStatus {
+        schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+        collector_degradation_reasons: Vec::new(),
         config,
         notify,
         collector: CollectorStatus::Unavailable,
@@ -708,6 +689,8 @@ fn missing_settings_status(
 
 fn disconnected_status() -> CodexIntegrationStatus {
     CodexIntegrationStatus {
+        schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+        collector_degradation_reasons: Vec::new(),
         config: ConnectionStatus::Disconnected,
         notify: None,
         collector: CollectorStatus::Unavailable,
@@ -717,13 +700,11 @@ fn disconnected_status() -> CodexIntegrationStatus {
     }
 }
 
-impl From<ConfigConnectionStatus> for ConnectionStatus {
-    fn from(status: ConfigConnectionStatus) -> Self {
-        match status {
-            ConfigConnectionStatus::Connected => Self::Connected,
-            ConfigConnectionStatus::Disconnected => Self::Disconnected,
-            ConfigConnectionStatus::Conflict => Self::Conflict,
-        }
+fn connection_status(status: ConfigConnectionStatus) -> ConnectionStatus {
+    match status {
+        ConfigConnectionStatus::Connected => ConnectionStatus::Connected,
+        ConfigConnectionStatus::Disconnected => ConnectionStatus::Disconnected,
+        ConfigConnectionStatus::Conflict => ConnectionStatus::Conflict,
     }
 }
 
@@ -2355,6 +2336,8 @@ mod tests {
     #[test]
     fn status_is_serializable_with_stable_values() {
         let status = CodexIntegrationStatus {
+            schema_version: super::CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: Vec::new(),
             config: ConnectionStatus::Conflict,
             notify: None,
             collector: CollectorStatus::Unavailable,
@@ -2375,6 +2358,8 @@ mod tests {
 
         let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
         let status = CodexIntegrationStatus {
+            schema_version: super::CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: Vec::new(),
             config: ConnectionStatus::Connected,
             notify: Some(NotifyStatus::AgentobsOwned),
             collector: CollectorStatus::Ready,
@@ -2493,6 +2478,8 @@ mod tests {
         let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
         let status = CodexIntegrationStatus {
             config: ConnectionStatus::Disconnected,
+            schema_version: super::CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: Vec::new(),
             notify: None,
             collector: CollectorStatus::Unavailable,
             endpoint: None,
@@ -2542,6 +2529,10 @@ mod tests {
     #[test]
     fn degraded_status_serializes_without_becoming_ready() {
         let status = CodexIntegrationStatus {
+            schema_version: super::CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: vec![
+                agent_observability_contracts::CollectorDegradationReasonV1::StoragePressure,
+            ],
             config: ConnectionStatus::Connected,
             notify: Some(NotifyStatus::ExternalPreserved),
             collector: CollectorStatus::Degraded,
@@ -2553,6 +2544,10 @@ mod tests {
         let value = serde_json::to_value(status).unwrap();
 
         assert_eq!(value["collector"], "degraded");
+        assert_eq!(
+            value["collector_degradation_reasons"][0],
+            "storage_pressure"
+        );
     }
 
     #[test]

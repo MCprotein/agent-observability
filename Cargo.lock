@@ -82,6 +82,7 @@ name = "agent-observability-codex-integration"
 version = "1.11.0"
 dependencies = [
  "agent-observability-codex-config",
+ "agent-observability-contracts",
  "agent-observability-local-collector",
  "agent-observability-local-runtime",
  "serde",
@@ -109,6 +110,7 @@ version = "1.11.0"
 dependencies = [
  "agent-observability-adapter-codex",
  "agent-observability-application",
+ "agent-observability-contracts",
  "agent-observability-local-runtime",
  "agent-observability-local-store",
  "agent-observability-static-report",

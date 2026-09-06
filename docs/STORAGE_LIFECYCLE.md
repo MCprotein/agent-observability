@@ -68,6 +68,19 @@ counts traces that fit those limits but must wait because earlier work consumed 
 ordinary deferral does not degrade collector health. Maintenance health describes the last pass,
 not a full scan of every retained trace.
 
+The versioned collector health (`local_collector_health.v1`) and settings integration status
+(`codex_integration_status.v1`) carry allowlisted reasons to the existing settings status panel:
+
+| Reason | Meaning |
+| --- | --- |
+| `lifecycle_failure` | The last maintenance pass failed or encountered individually blocked traces |
+| `storage_pressure` | The last pass lacked the configured temporary storage headroom required for maintenance |
+| `expired_trace` | Retained diagnostics show later input excluded from a fully expired trace; start a new agent session |
+
+An older collector or an unrecognized reason retains the generic degraded message. The UI does not
+infer a cause from counters or the coarse status. Other report/collector degradation can still be
+generic; these reasons do not claim to classify every operating-system or I/O error.
+
 Before destructive maintenance, the managed HTML report is atomically replaced by a data-free
 refresh notice under the report publication lock. The collector rebuilds it from committed storage;
 after a manual one-shot or `retention-apply`, run `agentobs report /path/to/runtime`. A browser tab
@@ -102,6 +115,12 @@ inside the write transaction, perform full-database vacuum, or queue overlapping
 or pinned traces must not cause an unbounded loop. Atomic transitions and restart-safe retries are
 required. Disk admission must account for temporary rollback-journal growth, not only the final
 compacted size; the current SQLite store uses DELETE journaling, not WAL.
+
+Legacy indexing has an independent bounded 2 MiB pass allowance, so a smaller archive setting does
+not strand larger existing rows. A legacy row beyond that indexing bound pins its trace with a
+persistent blocked marker while later traces can progress. It is not silently declared indexed or
+deleted, and increasing the archive setting alone does not clear that marker. Such oversized rows
+are possible through the lower-level store API, not the current official adapter projections.
 
 ## Completion gates
 

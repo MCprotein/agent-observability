@@ -24,10 +24,13 @@ test("tracked settings JavaScript matches the TypeScript bundle", async () => {
   );
 });
 
-test("degraded collector copy does not claim one unavailable failure reason", async () => {
+test("degraded collector copy maps typed reasons and retains a generic fallback", async () => {
   const source = await readFile("ui/settings/main.ts", "utf8");
   assert.match(source, /수집기 상태 저하/);
   assert.match(source, /리포트 반영 또는 데이터 보관 정리가 지연될 수 있습니다/);
-  assert.doesNotMatch(source, /리포트 반영 지연/);
-  assert.doesNotMatch(source, /collector 실행 중 · 리포트 지연/);
+  assert.doesNotMatch(source, /이벤트 수집은 가능하지만/);
+  assert.match(source, /데이터 보관 정리 미완료/);
+  assert.match(source, /정리용 임시 저장 공간 부족/);
+  assert.match(source, /만료된 세션 데이터 제외/);
+  assert.match(source, /에이전트에서 새 세션을 시작해야 합니다/);
 });
