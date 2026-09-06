@@ -50,6 +50,8 @@ test("release metadata has one synchronized Apache-2.0 version", () => {
   assert.match(readme, new RegExp(`빠른 시작은 v${escapedWorkspaceVersion} 기준`));
   const installerVersion = readme.match(/releases\/download\/v(\d+\.\d+\.\d+)\/install\.sh/)?.[1];
   assert.equal(installerVersion, workspaceVersion);
+  const packageInstallVersion = readme.match(/npm install --global @mcprotein\/agent-observability@(\d+\.\d+\.\d+)/)?.[1];
+  assert.equal(packageInstallVersion, workspaceVersion);
 });
 
 test("GitHub package exposes only the universal native macOS CLI", () => {

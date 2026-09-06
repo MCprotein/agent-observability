@@ -367,7 +367,7 @@ npm login \
   --scope=@mcprotein \
   --auth-type=legacy \
   --registry=https://npm.pkg.github.com
-npm install --global @mcprotein/agent-observability@1.8.4 \
+npm install --global @mcprotein/agent-observability@1.10.0 \
   --registry=https://npm.pkg.github.com
 ```
 
