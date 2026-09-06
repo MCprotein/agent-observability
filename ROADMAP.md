@@ -111,6 +111,9 @@ The baseline `dd09e6d` long GitHub performance run passed. Live QA subsequently 
 refresh contention; the development fix uses an adaptive quiet window without weakening snapshot or
 deletion fences. Final-head checks, independent review and live recovery must pass before merging;
 the baseline measurement is not evidence for later code changes.
+Live-scale candidate QA also exceeds the 32 MiB single-HTML contract. This is a release blocker:
+report paging/capacity design and a fresh successful automatic smoke remain outstanding. See
+[the current review checkpoint](docs/reviews/v1.11.0.md).
 
 ## Branch Strategy
 
