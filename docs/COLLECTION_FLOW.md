@@ -6,7 +6,7 @@
 
 ## Scope Boundary
 
-| Boundary | v1.8.4 status |
+| Boundary | v1.10.0 candidate status |
 | --- | --- |
 | Private canonical handoff parser | Implemented for Codex, Claude Code, Cursor |
 | One-shot local ingest CLI | Implemented |
@@ -22,8 +22,9 @@
 
 수동 import는 별도 producer가 공식 surface를 versioned canonical handoff로 변환한 private file부터
 지원한다. Codex automatic path에서 raw notify는 foreground helper가 transport 전에 projection하고,
-receiver는 bounded raw OTLP만 decode해 allowlisted scalar로 즉시 축소한다. Raw payload와 unknown field는
-저장하거나 출력하지 않는다.
+receiver는 bounded raw OTLP만 decode해 allowlisted scalar로 즉시 축소한다. Private detail opt-in 시에는
+검증된 cwd/input/last-assistant만 전용 authenticated localhost endpoint와 collector-owned bounded writer로
+분리한다. Raw payload와 unknown field는 canonical 저장소나 report에 저장하거나 출력하지 않는다.
 
 ## System Context
 
@@ -97,7 +98,13 @@ sequenceDiagram
         Config-->>Codex: install optional agentobs notify command
         Codex->>Notify: raw notify callback
         Notify->>Notify: strict allowlist projection
-        Notify->>Receiver: projected supplement over authenticated HTTPS
+        alt private detail disabled
+            Notify->>Receiver: projected supplement over authenticated HTTPS
+        else private detail enabled
+            Notify->>Receiver: projection + validated detail over dedicated authenticated route
+            Receiver->>Store: bounded guarded write of private detail + terminal status
+            Store-->>Receiver: available only after both files are durable
+        end
     end
     Receiver->>Adapter: copy allowlisted scalars only
     Note over Receiver,Adapter: only bounded raw OTLP may exist transiently in receiver memory
@@ -201,8 +208,15 @@ Codex automatic parsing에서 raw notify payload는 foreground helper가 pre-tra
 존재하고, raw OTLP/tool attribute는 bounded request를 decode하는 동안 receiver memory에 일시적으로
 들어올 수 있다. `conversation.id`, `turn.id`, bounded model/tool/decision,
 request/call ID, duration, token counts와 success처럼 adapter가 소유한 scalar만 다음 단계로 복사된다.
-Raw body, prompt, response, tool arguments/output, command, cwd, path, account identity와 unknown field는
-persist, log, diagnostic, projection, report 또는 export되지 않는다.
+Raw body, prompt, response, tool arguments/output, command, raw cwd/path, account identity와 unknown field는
+canonical persist, log, diagnostic, projection, report 또는 export 경계를 통과하지 않는다. Notify의 cwd는
+pseudonymous project reference로만 축약될 수 있다. 사용자가 private detail을 켠 경우에는 notify가 제공한 cwd,
+input messages, last assistant message만 전용 authenticated localhost route의 bounded envelope로 전달하고,
+collector가 bounded mutation lock 아래 hashed turn ID로 연결한 별도 private artifact와 terminal 결과를
+동기화한 뒤에만 available을 반환한다. 상태는 1,024개×1KiB로 제한된 별도 diagnostic headroom에 둔다.
+메모리 detail queue와 재시작 뒤 고아 pending 상태는 없으며 전체 callback은 250ms deadline으로 fail open한다.
+Dashboard는 capability-protected localhost detail route로 선택한 turn만 읽으며 team path는 이 artifact를
+알지 못한다.
 
 ## Runtime and Backpressure
 
@@ -241,7 +255,7 @@ sequenceDiagram
     CLI->>Store: typed ordered snapshot
     Store-->>App: privacy-safe durable records
     App->>App: sanitize + map + price + aggregate
-    App-->>CLI: validated ReportDtoV1
+    App-->>CLI: validated ReportDtoV2
     Note over CLI,Assembler: built TypeScript asset embedded at compile time
     CLI->>Assembler: validated DTO
     Assembler->>HTML: atomic 0600 assembly

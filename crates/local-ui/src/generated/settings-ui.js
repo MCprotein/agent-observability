@@ -1,4 +1,4 @@
-/* Generated from contracts/local-runtime-config-v2.schema.json. Do not edit. */
+/* Generated from contracts/local-runtime-config-v3.schema.json. Do not edit. */
 "use strict";
 (() => {
   // node_modules/lucide/dist/esm/defaultAttributes.mjs
@@ -307,8 +307,8 @@
     }
   };
 
-  // ui/settings/generated/validate-local-runtime-config-v2.js
-  var validate_local_runtime_config_v2_default = validate20;
+  // ui/settings/generated/validate-local-runtime-config-v3.js
+  var validate_local_runtime_config_v3_default = validate20;
   function validate20(data, { instancePath = "", parentData, parentDataProperty, rootData = data, dynamicAnchors = {} } = {}) {
     let vErrors = null;
     let errors = 0;
@@ -322,13 +322,13 @@
     if (errors === 0) {
       if (data && typeof data == "object" && !Array.isArray(data)) {
         let missing0;
-        if (data.schema_version === void 0 && (missing0 = "schema_version") || data.enabled === void 0 && (missing0 = "enabled") || data.collection === void 0 && (missing0 = "collection") || data.retention === void 0 && (missing0 = "retention")) {
+        if (data.schema_version === void 0 && (missing0 = "schema_version") || data.enabled === void 0 && (missing0 = "enabled") || data.capture_private_codex_turn_details === void 0 && (missing0 = "capture_private_codex_turn_details") || data.collection === void 0 && (missing0 = "collection") || data.retention === void 0 && (missing0 = "retention")) {
           validate20.errors = [{ instancePath, schemaPath: "#/required", keyword: "required", params: { missingProperty: missing0 }, message: "must have required property '" + missing0 + "'" }];
           return false;
         } else {
           const _errs1 = errors;
           for (const key0 in data) {
-            if (!(key0 === "schema_version" || key0 === "enabled" || key0 === "collection" || key0 === "retention")) {
+            if (!(key0 === "schema_version" || key0 === "enabled" || key0 === "capture_private_codex_turn_details" || key0 === "collection" || key0 === "retention")) {
               validate20.errors = [{ instancePath, schemaPath: "#/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key0 }, message: "must NOT have additional properties" }];
               return false;
               break;
@@ -337,8 +337,8 @@
           if (_errs1 === errors) {
             if (data.schema_version !== void 0) {
               const _errs2 = errors;
-              if ("local_runtime.v2" !== data.schema_version) {
-                validate20.errors = [{ instancePath: instancePath + "/schema_version", schemaPath: "#/properties/schema_version/const", keyword: "const", params: { allowedValue: "local_runtime.v2" }, message: "must be equal to constant" }];
+              if ("local_runtime.v3" !== data.schema_version) {
+                validate20.errors = [{ instancePath: instancePath + "/schema_version", schemaPath: "#/properties/schema_version/const", keyword: "const", params: { allowedValue: "local_runtime.v3" }, message: "must be equal to constant" }];
                 return false;
               }
               var valid0 = _errs2 === errors;
@@ -357,66 +357,52 @@
                 var valid0 = true;
               }
               if (valid0) {
-                if (data.collection !== void 0) {
-                  let data2 = data.collection;
+                if (data.capture_private_codex_turn_details !== void 0) {
                   const _errs5 = errors;
-                  const _errs6 = errors;
-                  if (errors === _errs6) {
-                    if (data2 && typeof data2 == "object" && !Array.isArray(data2)) {
-                      let missing1;
-                      if (data2.file_reconcile_interval_ms === void 0 && (missing1 = "file_reconcile_interval_ms") || data2.flush_interval_ms === void 0 && (missing1 = "flush_interval_ms") || data2.max_batch_records === void 0 && (missing1 = "max_batch_records") || data2.max_batch_bytes === void 0 && (missing1 = "max_batch_bytes") || data2.active_heartbeat_interval_ms === void 0 && (missing1 = "active_heartbeat_interval_ms") || data2.idle_heartbeat_interval_ms === void 0 && (missing1 = "idle_heartbeat_interval_ms") || data2.local_storage_budget_bytes === void 0 && (missing1 = "local_storage_budget_bytes")) {
-                        validate20.errors = [{ instancePath: instancePath + "/collection", schemaPath: "#/$defs/collection/required", keyword: "required", params: { missingProperty: missing1 }, message: "must have required property '" + missing1 + "'" }];
-                        return false;
-                      } else {
-                        const _errs8 = errors;
-                        for (const key1 in data2) {
-                          if (!(key1 === "file_reconcile_interval_ms" || key1 === "flush_interval_ms" || key1 === "max_batch_records" || key1 === "max_batch_bytes" || key1 === "active_heartbeat_interval_ms" || key1 === "idle_heartbeat_interval_ms" || key1 === "local_storage_budget_bytes")) {
-                            validate20.errors = [{ instancePath: instancePath + "/collection", schemaPath: "#/$defs/collection/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key1 }, message: "must NOT have additional properties" }];
-                            return false;
-                            break;
-                          }
-                        }
-                        if (_errs8 === errors) {
-                          if (data2.file_reconcile_interval_ms !== void 0) {
-                            let data3 = data2.file_reconcile_interval_ms;
-                            const _errs9 = errors;
-                            if (!(typeof data3 == "number" && (!(data3 % 1) && !isNaN(data3)) && isFinite(data3))) {
-                              validate20.errors = [{ instancePath: instancePath + "/collection/file_reconcile_interval_ms", schemaPath: "#/$defs/collection/properties/file_reconcile_interval_ms/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                  if (typeof data.capture_private_codex_turn_details !== "boolean") {
+                    validate20.errors = [{ instancePath: instancePath + "/capture_private_codex_turn_details", schemaPath: "#/properties/capture_private_codex_turn_details/type", keyword: "type", params: { type: "boolean" }, message: "must be boolean" }];
+                    return false;
+                  }
+                  var valid0 = _errs5 === errors;
+                } else {
+                  var valid0 = true;
+                }
+                if (valid0) {
+                  if (data.collection !== void 0) {
+                    let data3 = data.collection;
+                    const _errs7 = errors;
+                    const _errs8 = errors;
+                    if (errors === _errs8) {
+                      if (data3 && typeof data3 == "object" && !Array.isArray(data3)) {
+                        let missing1;
+                        if (data3.file_reconcile_interval_ms === void 0 && (missing1 = "file_reconcile_interval_ms") || data3.flush_interval_ms === void 0 && (missing1 = "flush_interval_ms") || data3.max_batch_records === void 0 && (missing1 = "max_batch_records") || data3.max_batch_bytes === void 0 && (missing1 = "max_batch_bytes") || data3.active_heartbeat_interval_ms === void 0 && (missing1 = "active_heartbeat_interval_ms") || data3.idle_heartbeat_interval_ms === void 0 && (missing1 = "idle_heartbeat_interval_ms") || data3.local_storage_budget_bytes === void 0 && (missing1 = "local_storage_budget_bytes")) {
+                          validate20.errors = [{ instancePath: instancePath + "/collection", schemaPath: "#/$defs/collection/required", keyword: "required", params: { missingProperty: missing1 }, message: "must have required property '" + missing1 + "'" }];
+                          return false;
+                        } else {
+                          const _errs10 = errors;
+                          for (const key1 in data3) {
+                            if (!(key1 === "file_reconcile_interval_ms" || key1 === "flush_interval_ms" || key1 === "max_batch_records" || key1 === "max_batch_bytes" || key1 === "active_heartbeat_interval_ms" || key1 === "idle_heartbeat_interval_ms" || key1 === "local_storage_budget_bytes")) {
+                              validate20.errors = [{ instancePath: instancePath + "/collection", schemaPath: "#/$defs/collection/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key1 }, message: "must NOT have additional properties" }];
                               return false;
+                              break;
                             }
-                            if (errors === _errs9) {
-                              if (typeof data3 == "number" && isFinite(data3)) {
-                                if (data3 > 6e4 || isNaN(data3)) {
-                                  validate20.errors = [{ instancePath: instancePath + "/collection/file_reconcile_interval_ms", schemaPath: "#/$defs/collection/properties/file_reconcile_interval_ms/maximum", keyword: "maximum", params: { comparison: "<=", limit: 6e4 }, message: "must be <= 60000" }];
-                                  return false;
-                                } else {
-                                  if (data3 < 1e3 || isNaN(data3)) {
-                                    validate20.errors = [{ instancePath: instancePath + "/collection/file_reconcile_interval_ms", schemaPath: "#/$defs/collection/properties/file_reconcile_interval_ms/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1e3 }, message: "must be >= 1000" }];
-                                    return false;
-                                  }
-                                }
-                              }
-                            }
-                            var valid2 = _errs9 === errors;
-                          } else {
-                            var valid2 = true;
                           }
-                          if (valid2) {
-                            if (data2.flush_interval_ms !== void 0) {
-                              let data4 = data2.flush_interval_ms;
+                          if (_errs10 === errors) {
+                            if (data3.file_reconcile_interval_ms !== void 0) {
+                              let data4 = data3.file_reconcile_interval_ms;
                               const _errs11 = errors;
                               if (!(typeof data4 == "number" && (!(data4 % 1) && !isNaN(data4)) && isFinite(data4))) {
-                                validate20.errors = [{ instancePath: instancePath + "/collection/flush_interval_ms", schemaPath: "#/$defs/collection/properties/flush_interval_ms/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                validate20.errors = [{ instancePath: instancePath + "/collection/file_reconcile_interval_ms", schemaPath: "#/$defs/collection/properties/file_reconcile_interval_ms/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
                                 return false;
                               }
                               if (errors === _errs11) {
                                 if (typeof data4 == "number" && isFinite(data4)) {
                                   if (data4 > 6e4 || isNaN(data4)) {
-                                    validate20.errors = [{ instancePath: instancePath + "/collection/flush_interval_ms", schemaPath: "#/$defs/collection/properties/flush_interval_ms/maximum", keyword: "maximum", params: { comparison: "<=", limit: 6e4 }, message: "must be <= 60000" }];
+                                    validate20.errors = [{ instancePath: instancePath + "/collection/file_reconcile_interval_ms", schemaPath: "#/$defs/collection/properties/file_reconcile_interval_ms/maximum", keyword: "maximum", params: { comparison: "<=", limit: 6e4 }, message: "must be <= 60000" }];
                                     return false;
                                   } else {
                                     if (data4 < 1e3 || isNaN(data4)) {
-                                      validate20.errors = [{ instancePath: instancePath + "/collection/flush_interval_ms", schemaPath: "#/$defs/collection/properties/flush_interval_ms/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1e3 }, message: "must be >= 1000" }];
+                                      validate20.errors = [{ instancePath: instancePath + "/collection/file_reconcile_interval_ms", schemaPath: "#/$defs/collection/properties/file_reconcile_interval_ms/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1e3 }, message: "must be >= 1000" }];
                                       return false;
                                     }
                                   }
@@ -427,21 +413,21 @@
                               var valid2 = true;
                             }
                             if (valid2) {
-                              if (data2.max_batch_records !== void 0) {
-                                let data5 = data2.max_batch_records;
+                              if (data3.flush_interval_ms !== void 0) {
+                                let data5 = data3.flush_interval_ms;
                                 const _errs13 = errors;
                                 if (!(typeof data5 == "number" && (!(data5 % 1) && !isNaN(data5)) && isFinite(data5))) {
-                                  validate20.errors = [{ instancePath: instancePath + "/collection/max_batch_records", schemaPath: "#/$defs/collection/properties/max_batch_records/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                  validate20.errors = [{ instancePath: instancePath + "/collection/flush_interval_ms", schemaPath: "#/$defs/collection/properties/flush_interval_ms/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
                                   return false;
                                 }
                                 if (errors === _errs13) {
                                   if (typeof data5 == "number" && isFinite(data5)) {
-                                    if (data5 > 500 || isNaN(data5)) {
-                                      validate20.errors = [{ instancePath: instancePath + "/collection/max_batch_records", schemaPath: "#/$defs/collection/properties/max_batch_records/maximum", keyword: "maximum", params: { comparison: "<=", limit: 500 }, message: "must be <= 500" }];
+                                    if (data5 > 6e4 || isNaN(data5)) {
+                                      validate20.errors = [{ instancePath: instancePath + "/collection/flush_interval_ms", schemaPath: "#/$defs/collection/properties/flush_interval_ms/maximum", keyword: "maximum", params: { comparison: "<=", limit: 6e4 }, message: "must be <= 60000" }];
                                       return false;
                                     } else {
-                                      if (data5 < 1 || isNaN(data5)) {
-                                        validate20.errors = [{ instancePath: instancePath + "/collection/max_batch_records", schemaPath: "#/$defs/collection/properties/max_batch_records/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                      if (data5 < 1e3 || isNaN(data5)) {
+                                        validate20.errors = [{ instancePath: instancePath + "/collection/flush_interval_ms", schemaPath: "#/$defs/collection/properties/flush_interval_ms/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1e3 }, message: "must be >= 1000" }];
                                         return false;
                                       }
                                     }
@@ -452,21 +438,21 @@
                                 var valid2 = true;
                               }
                               if (valid2) {
-                                if (data2.max_batch_bytes !== void 0) {
-                                  let data6 = data2.max_batch_bytes;
+                                if (data3.max_batch_records !== void 0) {
+                                  let data6 = data3.max_batch_records;
                                   const _errs15 = errors;
                                   if (!(typeof data6 == "number" && (!(data6 % 1) && !isNaN(data6)) && isFinite(data6))) {
-                                    validate20.errors = [{ instancePath: instancePath + "/collection/max_batch_bytes", schemaPath: "#/$defs/collection/properties/max_batch_bytes/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                    validate20.errors = [{ instancePath: instancePath + "/collection/max_batch_records", schemaPath: "#/$defs/collection/properties/max_batch_records/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
                                     return false;
                                   }
                                   if (errors === _errs15) {
                                     if (typeof data6 == "number" && isFinite(data6)) {
-                                      if (data6 > 2097152 || isNaN(data6)) {
-                                        validate20.errors = [{ instancePath: instancePath + "/collection/max_batch_bytes", schemaPath: "#/$defs/collection/properties/max_batch_bytes/maximum", keyword: "maximum", params: { comparison: "<=", limit: 2097152 }, message: "must be <= 2097152" }];
+                                      if (data6 > 500 || isNaN(data6)) {
+                                        validate20.errors = [{ instancePath: instancePath + "/collection/max_batch_records", schemaPath: "#/$defs/collection/properties/max_batch_records/maximum", keyword: "maximum", params: { comparison: "<=", limit: 500 }, message: "must be <= 500" }];
                                         return false;
                                       } else {
-                                        if (data6 < 16384 || isNaN(data6)) {
-                                          validate20.errors = [{ instancePath: instancePath + "/collection/max_batch_bytes", schemaPath: "#/$defs/collection/properties/max_batch_bytes/minimum", keyword: "minimum", params: { comparison: ">=", limit: 16384 }, message: "must be >= 16384" }];
+                                        if (data6 < 1 || isNaN(data6)) {
+                                          validate20.errors = [{ instancePath: instancePath + "/collection/max_batch_records", schemaPath: "#/$defs/collection/properties/max_batch_records/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
                                           return false;
                                         }
                                       }
@@ -477,21 +463,21 @@
                                   var valid2 = true;
                                 }
                                 if (valid2) {
-                                  if (data2.active_heartbeat_interval_ms !== void 0) {
-                                    let data7 = data2.active_heartbeat_interval_ms;
+                                  if (data3.max_batch_bytes !== void 0) {
+                                    let data7 = data3.max_batch_bytes;
                                     const _errs17 = errors;
                                     if (!(typeof data7 == "number" && (!(data7 % 1) && !isNaN(data7)) && isFinite(data7))) {
-                                      validate20.errors = [{ instancePath: instancePath + "/collection/active_heartbeat_interval_ms", schemaPath: "#/$defs/collection/properties/active_heartbeat_interval_ms/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                      validate20.errors = [{ instancePath: instancePath + "/collection/max_batch_bytes", schemaPath: "#/$defs/collection/properties/max_batch_bytes/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
                                       return false;
                                     }
                                     if (errors === _errs17) {
                                       if (typeof data7 == "number" && isFinite(data7)) {
-                                        if (data7 > 3e5 || isNaN(data7)) {
-                                          validate20.errors = [{ instancePath: instancePath + "/collection/active_heartbeat_interval_ms", schemaPath: "#/$defs/collection/properties/active_heartbeat_interval_ms/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3e5 }, message: "must be <= 300000" }];
+                                        if (data7 > 2097152 || isNaN(data7)) {
+                                          validate20.errors = [{ instancePath: instancePath + "/collection/max_batch_bytes", schemaPath: "#/$defs/collection/properties/max_batch_bytes/maximum", keyword: "maximum", params: { comparison: "<=", limit: 2097152 }, message: "must be <= 2097152" }];
                                           return false;
                                         } else {
-                                          if (data7 < 3e4 || isNaN(data7)) {
-                                            validate20.errors = [{ instancePath: instancePath + "/collection/active_heartbeat_interval_ms", schemaPath: "#/$defs/collection/properties/active_heartbeat_interval_ms/minimum", keyword: "minimum", params: { comparison: ">=", limit: 3e4 }, message: "must be >= 30000" }];
+                                          if (data7 < 16384 || isNaN(data7)) {
+                                            validate20.errors = [{ instancePath: instancePath + "/collection/max_batch_bytes", schemaPath: "#/$defs/collection/properties/max_batch_bytes/minimum", keyword: "minimum", params: { comparison: ">=", limit: 16384 }, message: "must be >= 16384" }];
                                             return false;
                                           }
                                         }
@@ -502,21 +488,21 @@
                                     var valid2 = true;
                                   }
                                   if (valid2) {
-                                    if (data2.idle_heartbeat_interval_ms !== void 0) {
-                                      let data8 = data2.idle_heartbeat_interval_ms;
+                                    if (data3.active_heartbeat_interval_ms !== void 0) {
+                                      let data8 = data3.active_heartbeat_interval_ms;
                                       const _errs19 = errors;
                                       if (!(typeof data8 == "number" && (!(data8 % 1) && !isNaN(data8)) && isFinite(data8))) {
-                                        validate20.errors = [{ instancePath: instancePath + "/collection/idle_heartbeat_interval_ms", schemaPath: "#/$defs/collection/properties/idle_heartbeat_interval_ms/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                        validate20.errors = [{ instancePath: instancePath + "/collection/active_heartbeat_interval_ms", schemaPath: "#/$defs/collection/properties/active_heartbeat_interval_ms/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
                                         return false;
                                       }
                                       if (errors === _errs19) {
                                         if (typeof data8 == "number" && isFinite(data8)) {
-                                          if (data8 > 9e5 || isNaN(data8)) {
-                                            validate20.errors = [{ instancePath: instancePath + "/collection/idle_heartbeat_interval_ms", schemaPath: "#/$defs/collection/properties/idle_heartbeat_interval_ms/maximum", keyword: "maximum", params: { comparison: "<=", limit: 9e5 }, message: "must be <= 900000" }];
+                                          if (data8 > 3e5 || isNaN(data8)) {
+                                            validate20.errors = [{ instancePath: instancePath + "/collection/active_heartbeat_interval_ms", schemaPath: "#/$defs/collection/properties/active_heartbeat_interval_ms/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3e5 }, message: "must be <= 300000" }];
                                             return false;
                                           } else {
-                                            if (data8 < 12e4 || isNaN(data8)) {
-                                              validate20.errors = [{ instancePath: instancePath + "/collection/idle_heartbeat_interval_ms", schemaPath: "#/$defs/collection/properties/idle_heartbeat_interval_ms/minimum", keyword: "minimum", params: { comparison: ">=", limit: 12e4 }, message: "must be >= 120000" }];
+                                            if (data8 < 3e4 || isNaN(data8)) {
+                                              validate20.errors = [{ instancePath: instancePath + "/collection/active_heartbeat_interval_ms", schemaPath: "#/$defs/collection/properties/active_heartbeat_interval_ms/minimum", keyword: "minimum", params: { comparison: ">=", limit: 3e4 }, message: "must be >= 30000" }];
                                               return false;
                                             }
                                           }
@@ -527,21 +513,21 @@
                                       var valid2 = true;
                                     }
                                     if (valid2) {
-                                      if (data2.local_storage_budget_bytes !== void 0) {
-                                        let data9 = data2.local_storage_budget_bytes;
+                                      if (data3.idle_heartbeat_interval_ms !== void 0) {
+                                        let data9 = data3.idle_heartbeat_interval_ms;
                                         const _errs21 = errors;
                                         if (!(typeof data9 == "number" && (!(data9 % 1) && !isNaN(data9)) && isFinite(data9))) {
-                                          validate20.errors = [{ instancePath: instancePath + "/collection/local_storage_budget_bytes", schemaPath: "#/$defs/collection/properties/local_storage_budget_bytes/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                          validate20.errors = [{ instancePath: instancePath + "/collection/idle_heartbeat_interval_ms", schemaPath: "#/$defs/collection/properties/idle_heartbeat_interval_ms/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
                                           return false;
                                         }
                                         if (errors === _errs21) {
                                           if (typeof data9 == "number" && isFinite(data9)) {
-                                            if (data9 > 21474836480 || isNaN(data9)) {
-                                              validate20.errors = [{ instancePath: instancePath + "/collection/local_storage_budget_bytes", schemaPath: "#/$defs/collection/properties/local_storage_budget_bytes/maximum", keyword: "maximum", params: { comparison: "<=", limit: 21474836480 }, message: "must be <= 21474836480" }];
+                                            if (data9 > 9e5 || isNaN(data9)) {
+                                              validate20.errors = [{ instancePath: instancePath + "/collection/idle_heartbeat_interval_ms", schemaPath: "#/$defs/collection/properties/idle_heartbeat_interval_ms/maximum", keyword: "maximum", params: { comparison: "<=", limit: 9e5 }, message: "must be <= 900000" }];
                                               return false;
                                             } else {
-                                              if (data9 < 268435456 || isNaN(data9)) {
-                                                validate20.errors = [{ instancePath: instancePath + "/collection/local_storage_budget_bytes", schemaPath: "#/$defs/collection/properties/local_storage_budget_bytes/minimum", keyword: "minimum", params: { comparison: ">=", limit: 268435456 }, message: "must be >= 268435456" }];
+                                              if (data9 < 12e4 || isNaN(data9)) {
+                                                validate20.errors = [{ instancePath: instancePath + "/collection/idle_heartbeat_interval_ms", schemaPath: "#/$defs/collection/properties/idle_heartbeat_interval_ms/minimum", keyword: "minimum", params: { comparison: ">=", limit: 12e4 }, message: "must be >= 120000" }];
                                                 return false;
                                               }
                                             }
@@ -551,6 +537,32 @@
                                       } else {
                                         var valid2 = true;
                                       }
+                                      if (valid2) {
+                                        if (data3.local_storage_budget_bytes !== void 0) {
+                                          let data10 = data3.local_storage_budget_bytes;
+                                          const _errs23 = errors;
+                                          if (!(typeof data10 == "number" && (!(data10 % 1) && !isNaN(data10)) && isFinite(data10))) {
+                                            validate20.errors = [{ instancePath: instancePath + "/collection/local_storage_budget_bytes", schemaPath: "#/$defs/collection/properties/local_storage_budget_bytes/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                            return false;
+                                          }
+                                          if (errors === _errs23) {
+                                            if (typeof data10 == "number" && isFinite(data10)) {
+                                              if (data10 > 21474836480 || isNaN(data10)) {
+                                                validate20.errors = [{ instancePath: instancePath + "/collection/local_storage_budget_bytes", schemaPath: "#/$defs/collection/properties/local_storage_budget_bytes/maximum", keyword: "maximum", params: { comparison: "<=", limit: 21474836480 }, message: "must be <= 21474836480" }];
+                                                return false;
+                                              } else {
+                                                if (data10 < 268435456 || isNaN(data10)) {
+                                                  validate20.errors = [{ instancePath: instancePath + "/collection/local_storage_budget_bytes", schemaPath: "#/$defs/collection/properties/local_storage_budget_bytes/minimum", keyword: "minimum", params: { comparison: ">=", limit: 268435456 }, message: "must be >= 268435456" }];
+                                                  return false;
+                                                }
+                                              }
+                                            }
+                                          }
+                                          var valid2 = _errs23 === errors;
+                                        } else {
+                                          var valid2 = true;
+                                        }
+                                      }
                                     }
                                   }
                                 }
@@ -558,77 +570,51 @@
                             }
                           }
                         }
+                      } else {
+                        validate20.errors = [{ instancePath: instancePath + "/collection", schemaPath: "#/$defs/collection/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                        return false;
                       }
-                    } else {
-                      validate20.errors = [{ instancePath: instancePath + "/collection", schemaPath: "#/$defs/collection/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
-                      return false;
                     }
+                    var valid0 = _errs7 === errors;
+                  } else {
+                    var valid0 = true;
                   }
-                  var valid0 = _errs5 === errors;
-                } else {
-                  var valid0 = true;
-                }
-                if (valid0) {
-                  if (data.retention !== void 0) {
-                    let data10 = data.retention;
-                    const _errs23 = errors;
-                    const _errs24 = errors;
-                    if (errors === _errs24) {
-                      if (data10 && typeof data10 == "object" && !Array.isArray(data10)) {
-                        let missing2;
-                        if (data10.max_record_age_days === void 0 && (missing2 = "max_record_age_days") || data10.max_archive_records === void 0 && (missing2 = "max_archive_records") || data10.max_archive_bytes === void 0 && (missing2 = "max_archive_bytes")) {
-                          validate20.errors = [{ instancePath: instancePath + "/retention", schemaPath: "#/$defs/retention/required", keyword: "required", params: { missingProperty: missing2 }, message: "must have required property '" + missing2 + "'" }];
-                          return false;
-                        } else {
-                          const _errs26 = errors;
-                          for (const key2 in data10) {
-                            if (!(key2 === "max_record_age_days" || key2 === "max_archive_records" || key2 === "max_archive_bytes")) {
-                              validate20.errors = [{ instancePath: instancePath + "/retention", schemaPath: "#/$defs/retention/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key2 }, message: "must NOT have additional properties" }];
-                              return false;
-                              break;
-                            }
-                          }
-                          if (_errs26 === errors) {
-                            if (data10.max_record_age_days !== void 0) {
-                              let data11 = data10.max_record_age_days;
-                              const _errs27 = errors;
-                              if (!(typeof data11 == "number" && (!(data11 % 1) && !isNaN(data11)) && isFinite(data11))) {
-                                validate20.errors = [{ instancePath: instancePath + "/retention/max_record_age_days", schemaPath: "#/$defs/retention/properties/max_record_age_days/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                  if (valid0) {
+                    if (data.retention !== void 0) {
+                      let data11 = data.retention;
+                      const _errs25 = errors;
+                      const _errs26 = errors;
+                      if (errors === _errs26) {
+                        if (data11 && typeof data11 == "object" && !Array.isArray(data11)) {
+                          let missing2;
+                          if (data11.max_record_age_days === void 0 && (missing2 = "max_record_age_days") || data11.max_archive_records === void 0 && (missing2 = "max_archive_records") || data11.max_archive_bytes === void 0 && (missing2 = "max_archive_bytes")) {
+                            validate20.errors = [{ instancePath: instancePath + "/retention", schemaPath: "#/$defs/retention/required", keyword: "required", params: { missingProperty: missing2 }, message: "must have required property '" + missing2 + "'" }];
+                            return false;
+                          } else {
+                            const _errs28 = errors;
+                            for (const key2 in data11) {
+                              if (!(key2 === "max_record_age_days" || key2 === "max_archive_records" || key2 === "max_archive_bytes")) {
+                                validate20.errors = [{ instancePath: instancePath + "/retention", schemaPath: "#/$defs/retention/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key2 }, message: "must NOT have additional properties" }];
                                 return false;
+                                break;
                               }
-                              if (errors === _errs27) {
-                                if (typeof data11 == "number" && isFinite(data11)) {
-                                  if (data11 > 3650 || isNaN(data11)) {
-                                    validate20.errors = [{ instancePath: instancePath + "/retention/max_record_age_days", schemaPath: "#/$defs/retention/properties/max_record_age_days/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3650 }, message: "must be <= 3650" }];
-                                    return false;
-                                  } else {
-                                    if (data11 < 1 || isNaN(data11)) {
-                                      validate20.errors = [{ instancePath: instancePath + "/retention/max_record_age_days", schemaPath: "#/$defs/retention/properties/max_record_age_days/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
-                                      return false;
-                                    }
-                                  }
-                                }
-                              }
-                              var valid4 = _errs27 === errors;
-                            } else {
-                              var valid4 = true;
                             }
-                            if (valid4) {
-                              if (data10.max_archive_records !== void 0) {
-                                let data12 = data10.max_archive_records;
+                            if (_errs28 === errors) {
+                              if (data11.max_record_age_days !== void 0) {
+                                let data12 = data11.max_record_age_days;
                                 const _errs29 = errors;
                                 if (!(typeof data12 == "number" && (!(data12 % 1) && !isNaN(data12)) && isFinite(data12))) {
-                                  validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_records", schemaPath: "#/$defs/retention/properties/max_archive_records/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                  validate20.errors = [{ instancePath: instancePath + "/retention/max_record_age_days", schemaPath: "#/$defs/retention/properties/max_record_age_days/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
                                   return false;
                                 }
                                 if (errors === _errs29) {
                                   if (typeof data12 == "number" && isFinite(data12)) {
-                                    if (data12 > 1e5 || isNaN(data12)) {
-                                      validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_records", schemaPath: "#/$defs/retention/properties/max_archive_records/maximum", keyword: "maximum", params: { comparison: "<=", limit: 1e5 }, message: "must be <= 100000" }];
+                                    if (data12 > 3650 || isNaN(data12)) {
+                                      validate20.errors = [{ instancePath: instancePath + "/retention/max_record_age_days", schemaPath: "#/$defs/retention/properties/max_record_age_days/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3650 }, message: "must be <= 3650" }];
                                       return false;
                                     } else {
                                       if (data12 < 1 || isNaN(data12)) {
-                                        validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_records", schemaPath: "#/$defs/retention/properties/max_archive_records/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                        validate20.errors = [{ instancePath: instancePath + "/retention/max_record_age_days", schemaPath: "#/$defs/retention/properties/max_record_age_days/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
                                         return false;
                                       }
                                     }
@@ -639,21 +625,21 @@
                                 var valid4 = true;
                               }
                               if (valid4) {
-                                if (data10.max_archive_bytes !== void 0) {
-                                  let data13 = data10.max_archive_bytes;
+                                if (data11.max_archive_records !== void 0) {
+                                  let data13 = data11.max_archive_records;
                                   const _errs31 = errors;
                                   if (!(typeof data13 == "number" && (!(data13 % 1) && !isNaN(data13)) && isFinite(data13))) {
-                                    validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_bytes", schemaPath: "#/$defs/retention/properties/max_archive_bytes/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                    validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_records", schemaPath: "#/$defs/retention/properties/max_archive_records/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
                                     return false;
                                   }
                                   if (errors === _errs31) {
                                     if (typeof data13 == "number" && isFinite(data13)) {
-                                      if (data13 > 268435456 || isNaN(data13)) {
-                                        validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_bytes", schemaPath: "#/$defs/retention/properties/max_archive_bytes/maximum", keyword: "maximum", params: { comparison: "<=", limit: 268435456 }, message: "must be <= 268435456" }];
+                                      if (data13 > 1e5 || isNaN(data13)) {
+                                        validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_records", schemaPath: "#/$defs/retention/properties/max_archive_records/maximum", keyword: "maximum", params: { comparison: "<=", limit: 1e5 }, message: "must be <= 100000" }];
                                         return false;
                                       } else {
-                                        if (data13 < 65536 || isNaN(data13)) {
-                                          validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_bytes", schemaPath: "#/$defs/retention/properties/max_archive_bytes/minimum", keyword: "minimum", params: { comparison: ">=", limit: 65536 }, message: "must be >= 65536" }];
+                                        if (data13 < 1 || isNaN(data13)) {
+                                          validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_records", schemaPath: "#/$defs/retention/properties/max_archive_records/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
                                           return false;
                                         }
                                       }
@@ -663,18 +649,44 @@
                                 } else {
                                   var valid4 = true;
                                 }
+                                if (valid4) {
+                                  if (data11.max_archive_bytes !== void 0) {
+                                    let data14 = data11.max_archive_bytes;
+                                    const _errs33 = errors;
+                                    if (!(typeof data14 == "number" && (!(data14 % 1) && !isNaN(data14)) && isFinite(data14))) {
+                                      validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_bytes", schemaPath: "#/$defs/retention/properties/max_archive_bytes/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                      return false;
+                                    }
+                                    if (errors === _errs33) {
+                                      if (typeof data14 == "number" && isFinite(data14)) {
+                                        if (data14 > 268435456 || isNaN(data14)) {
+                                          validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_bytes", schemaPath: "#/$defs/retention/properties/max_archive_bytes/maximum", keyword: "maximum", params: { comparison: "<=", limit: 268435456 }, message: "must be <= 268435456" }];
+                                          return false;
+                                        } else {
+                                          if (data14 < 65536 || isNaN(data14)) {
+                                            validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_bytes", schemaPath: "#/$defs/retention/properties/max_archive_bytes/minimum", keyword: "minimum", params: { comparison: ">=", limit: 65536 }, message: "must be >= 65536" }];
+                                            return false;
+                                          }
+                                        }
+                                      }
+                                    }
+                                    var valid4 = _errs33 === errors;
+                                  } else {
+                                    var valid4 = true;
+                                  }
+                                }
                               }
                             }
                           }
+                        } else {
+                          validate20.errors = [{ instancePath: instancePath + "/retention", schemaPath: "#/$defs/retention/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                          return false;
                         }
-                      } else {
-                        validate20.errors = [{ instancePath: instancePath + "/retention", schemaPath: "#/$defs/retention/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
-                        return false;
                       }
+                      var valid0 = _errs25 === errors;
+                    } else {
+                      var valid0 = true;
                     }
-                    var valid0 = _errs23 === errors;
-                  } else {
-                    var valid0 = true;
                   }
                 }
               }
@@ -918,6 +930,7 @@
         <p class="nav-label">\uC124\uC815</p>
         <a href="#overview" class="active" aria-current="page"><i data-lucide="gauge"></i>\uAC1C\uC694</a>
         <a href="#collection"><i data-lucide="activity"></i>\uC218\uC9D1</a>
+        <a href="#privacy"><i data-lucide="shield-check"></i>\uAC1C\uC778\uC815\uBCF4</a>
         <a href="#storage"><i data-lucide="database"></i>\uC800\uC7A5\uC18C</a>
         <a href="#retention"><i data-lucide="archive"></i>\uBCF4\uAD00</a>
         <div class="nav-note"><strong>Codex</strong><span>${configNavigationStatus()}</span><span>${collectorNavigationStatus()}</span></div>
@@ -926,6 +939,7 @@
         <form id="settings-form" novalidate>
           ${overviewSection(draft)}
           ${collectionSection(draft)}
+          ${privacySection(draft)}
           ${storageSection(draft)}
           ${retentionSection(draft)}
         </form>
@@ -1042,6 +1056,18 @@
     </div>
   </section>`;
   }
+  function privacySection(config) {
+    const enabled = config.capture_private_codex_turn_details ?? false;
+    return `<section class="settings-section" id="privacy" aria-labelledby="privacy-title">
+    <div class="section-title"><span class="section-icon"><i data-lucide="shield-check"></i></span><div><h2 id="privacy-title">\uAC1C\uC778\uC815\uBCF4</h2><p>Codex \uC791\uC5C5 \uACBD\uB85C\uC640 \uB300\uD654 \uB0B4\uC6A9\uC744 \uBCC4\uB3C4 \uB85C\uCEEC \uC0C1\uC138 \uC800\uC7A5\uC18C\uC5D0 \uBCF4\uAD00\uD560\uC9C0 \uC120\uD0DD\uD569\uB2C8\uB2E4.</p></div></div>
+    <label class="collection-toggle privacy-toggle" data-boolean-field="capture_private_codex_turn_details">
+      <span><strong>\uC694\uCCAD\xB7\uC751\uB2F5 \uC0C1\uC138 \uC800\uC7A5</strong><small id="private-details-copy">${enabled ? "\uC0C8 Codex turn\uC758 \uACBD\uB85C\uC640 \uC694\uCCAD\xB7\uC751\uB2F5\uC744 \uB85C\uCEEC\uC5D0 \uC800\uC7A5\uD569\uB2C8\uB2E4" : "\uAEBC\uC9D0 \xB7 \uC77C\uBC18 \uC9C0\uD45C\uC640 \uD574\uC2DC \uC2DD\uBCC4\uC790\uB9CC \uC800\uC7A5\uD569\uB2C8\uB2E4"}</small></span>
+      <input type="checkbox" id="capture-private-codex-turn-details" ${enabled ? "checked" : ""}>
+      <span class="toggle-track" aria-hidden="true"><span></span></span>
+    </label>
+    <div class="privacy-warning"><i data-lucide="shield-check"></i><div><strong>\uBA85\uC2DC\uC801\uC73C\uB85C \uCF20 \uC774\uD6C4\uC758 \uC0C8 turn\uBD80\uD130 \uC801\uC6A9\uB429\uB2C8\uB2E4.</strong><span>\uC6D0\uBB38\uC740 team \uC804\uC1A1\xB7\uC77C\uBC18 \uB9AC\uD3EC\uD2B8\xB7export\uC5D0 \uD3EC\uD568\uB418\uC9C0 \uC54A\uC73C\uBA70, \uC774 Mac\uC758 private localhost \uC0C1\uC138 \uD654\uBA74\uC5D0\uC11C\uB9CC \uC694\uCCAD\uD560 \uB54C \uC77D\uC2B5\uB2C8\uB2E4. \uBBFC\uAC10\uC815\uBCF4\uAC00 \uD3EC\uD568\uB420 \uC218 \uC788\uC2B5\uB2C8\uB2E4.</span></div></div>
+  </section>`;
+  }
   function retentionSection(config) {
     return `<section class="settings-section" id="retention" aria-labelledby="retention-title">
     ${sectionTitle("archive", "\uBCF4\uAD00", "\uB9CC\uB8CC \uB300\uC0C1\uACFC private archive \uD06C\uAE30 \uC815\uCC45")}
@@ -1101,6 +1127,7 @@
     });
     form?.addEventListener("input", handleInput);
     document.querySelector("#enabled")?.addEventListener("change", handleEnabled);
+    document.querySelector("#capture-private-codex-turn-details")?.addEventListener("change", handlePrivateDetails);
     document.querySelector("#discard")?.addEventListener("click", discardChanges);
     document.querySelector("#reset")?.addEventListener("click", openResetDialog);
     document.querySelector("#cancel-reset")?.addEventListener("click", closeResetDialog);
@@ -1251,6 +1278,16 @@
     );
     updateDirtyState();
   }
+  function handlePrivateDetails(event) {
+    const input = event.target;
+    if (!(input instanceof HTMLInputElement) || !draft) return;
+    draft.capture_private_codex_turn_details = input.checked;
+    setText(
+      "private-details-copy",
+      input.checked ? "\uC0C8 Codex turn\uC758 \uACBD\uB85C\uC640 \uC694\uCCAD\xB7\uC751\uB2F5\uC744 \uB85C\uCEEC\uC5D0 \uC800\uC7A5\uD569\uB2C8\uB2E4" : "\uAEBC\uC9D0 \xB7 \uC77C\uBC18 \uC9C0\uD45C\uC640 \uD574\uC2DC \uC2DD\uBCC4\uC790\uB9CC \uC800\uC7A5\uD569\uB2C8\uB2E4"
+    );
+    updateDirtyState();
+  }
   function updateAllVisuals() {
     if (!draft) return;
     document.querySelectorAll("[data-visual-value]").forEach((output) => {
@@ -1298,9 +1335,10 @@
   function updateDirtyState() {
     if (!draft || !persisted) return;
     const changed = changedPaths(draft, persisted);
-    const dirty = draft.enabled !== persisted.enabled || changed.length > 0;
+    const booleanChanges = booleanChangeCount(draft, persisted);
+    const dirty = booleanChanges > 0 || changed.length > 0;
     document.querySelector("#save-band")?.classList.toggle("dirty", dirty);
-    setText("save-title", conflicted ? "\uC678\uBD80 \uBCC0\uACBD \uAC10\uC9C0" : dirty ? `${changed.length + Number(draft.enabled !== persisted.enabled)}\uAC1C \uBCC0\uACBD` : "\uC800\uC7A5\uB428");
+    setText("save-title", conflicted ? "\uC678\uBD80 \uBCC0\uACBD \uAC10\uC9C0" : dirty ? `${changed.length + booleanChanges}\uAC1C \uBCC0\uACBD` : "\uC800\uC7A5\uB428");
     setText("save-detail", conflicted ? "\uCD5C\uC2E0 \uC124\uC815\uC744 \uB2E4\uC2DC \uBD88\uB7EC\uC628 \uB4A4 \uD3B8\uC9D1\uD558\uC138\uC694." : dirty ? "\uC800\uC7A5 \uC804\uAE4C\uC9C0 \uC774 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uB9CC \uC720\uC9C0\uB429\uB2C8\uB2E4." : "\uD604\uC7AC \uC124\uC815\uACFC \uAC19\uC2B5\uB2C8\uB2E4.");
     setDisabled("save", !dirty || busy || conflicted);
     setDisabled("discard", !dirty || busy);
@@ -1318,8 +1356,8 @@
       showToast("\uBE44\uC5B4 \uC788\uAC70\uB098 \uD5C8\uC6A9 \uBC94\uC704\uB97C \uBC97\uC5B4\uB09C \uAC12\uC744 \uD655\uC778\uD558\uC138\uC694.", "error");
       return;
     }
-    if (!validate_local_runtime_config_v2_default(draft)) {
-      const errors = validate_local_runtime_config_v2_default.errors ?? [];
+    if (!validate_local_runtime_config_v3_default(draft)) {
+      const errors = validate_local_runtime_config_v3_default.errors ?? [];
       for (const error of errors) {
         const path = error.instancePath?.replace(/^\//, "").replaceAll("/", ".");
         if (path in fields) showFieldError(path, error.message ?? "\uD5C8\uC6A9 \uBC94\uC704\uB97C \uD655\uC778\uD558\uC138\uC694.");
@@ -1371,11 +1409,15 @@
     const localBase = structuredClone(persisted);
     const changed = changedPaths(localDraft, localBase);
     const enabledChanged = localDraft.enabled !== localBase.enabled;
+    const privateDetailsChanged = (localDraft.capture_private_codex_turn_details ?? false) !== (localBase.capture_private_codex_turn_details ?? false);
     const latest = await api("/api/config");
     applyEnvelope(latest);
     if (!draft) return;
     for (const path of changed) setValue(draft, path, getValue(localDraft, path));
     if (enabledChanged) draft.enabled = localDraft.enabled;
+    if (privateDetailsChanged) {
+      draft.capture_private_codex_turn_details = localDraft.capture_private_codex_turn_details ?? false;
+    }
     conflicted = false;
     renderSettings("save-title");
   }
@@ -1486,7 +1528,7 @@
   }
   function isDirty() {
     return Boolean(
-      draft && persisted && (draft.enabled !== persisted.enabled || changedPaths(draft, persisted).length > 0)
+      draft && persisted && (booleanChangeCount(draft, persisted) > 0 || changedPaths(draft, persisted).length > 0)
     );
   }
   async function api(path, init = {}) {
@@ -1587,6 +1629,11 @@
   function changedPaths(left, right) {
     return Object.keys(fields).filter(
       (path) => getValue(left, path) !== getValue(right, path)
+    );
+  }
+  function booleanChangeCount(left, right) {
+    return Number(left.enabled !== right.enabled) + Number(
+      (left.capture_private_codex_turn_details ?? false) !== (right.capture_private_codex_turn_details ?? false)
     );
   }
   function position(value, min, max, logarithmic) {

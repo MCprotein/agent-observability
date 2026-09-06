@@ -1,5 +1,12 @@
-import type { AgentObservabilityReportV1, Span, Trace } from "./generated/report-dto-v1.js";
-import validateReportDtoV1 from "./generated/validate-report-dto-v1.js";
+import type {
+  AgentObservabilityReportV2,
+  FieldAvailability,
+  Span,
+  Trace,
+} from "./generated/report-dto-v2.js";
+import type { PrivateCodexTurnDetailV1 } from "./generated/private-codex-turn-detail-v1.js";
+import validateReportDtoV2 from "./generated/validate-report-dto-v2.js";
+import validatePrivateCodexTurnDetailV1 from "./generated/validate-private-codex-turn-detail-v1.js";
 import {
   buildFilteredView,
   buildTimeline,
@@ -13,7 +20,7 @@ import {
   type FilterState,
   type Page,
 } from "./view-state.js";
-import { summarizeVisible } from "./view-summary.js";
+import { summarizeVisible, tokenTotal } from "./view-summary.js";
 
 const ALL_OPTION = "-1";
 const UNKNOWN = "unknown";
@@ -28,10 +35,10 @@ const reportData = document.getElementById("report-data");
 if (!reportData) throw new Error("Missing report data");
 
 const candidate = parseReportData(reportData.textContent);
-if (candidate === undefined || !validateReportDtoV1(candidate)) {
-  document.body.replaceChildren(errorState("Report data does not match agent_observability.report.v1."));
+if (candidate === undefined || !validateReportDtoV2(candidate)) {
+  document.body.replaceChildren(errorState("Report data does not match agent_observability.report.v2."));
 } else {
-  mount(candidate as unknown as AgentObservabilityReportV1);
+  mount(candidate as unknown as AgentObservabilityReportV2);
 }
 
 function parseReportData(value: string | null): unknown | undefined {
@@ -42,7 +49,7 @@ function parseReportData(value: string | null): unknown | undefined {
   }
 }
 
-function mount(data: AgentObservabilityReportV1): void {
+function mount(data: AgentObservabilityReportV2): void {
   const state: FilterState = {
     repo: undefined,
     session: undefined,
@@ -54,6 +61,9 @@ function mount(data: AgentObservabilityReportV1): void {
   let tracePageIndex = 0;
   let spanPageIndex = 0;
   let savedFilters: DimensionFilters[] = [];
+  let selectedSpanId: string | undefined;
+  let detailsOpenerSurface: "timeline" | "table" | undefined;
+  let detailRequest = 0;
   const selects = {
     repo: element<HTMLSelectElement>("repo-filter"),
     session: element<HTMLSelectElement>("session-filter"),
@@ -75,6 +85,19 @@ function mount(data: AgentObservabilityReportV1): void {
   const traceNext = element<HTMLButtonElement>("trace-next");
   const spanPrevious = element<HTMLButtonElement>("span-previous");
   const spanNext = element<HTMLButtonElement>("span-next");
+  const detailsBody = element<HTMLElement>("details-body");
+  const detailsHeading = element<HTMLElement>("details-heading");
+  const detailsClose = element<HTMLButtonElement>("details-close");
+
+  detailsClose.addEventListener("click", () => {
+    const opener = visibleSpanOpener(selectedSpanId, detailsOpenerSurface) ?? visibleSpanOpener();
+    selectedSpanId = undefined;
+    detailsOpenerSurface = undefined;
+    detailRequest += 1;
+    syncExpandedSpanOpeners();
+    renderDetails(undefined);
+    opener?.focus();
+  });
 
   const allFilterValues: Record<FilterKey, string[]> = {
     repo: data.filters.repos,
@@ -184,12 +207,14 @@ function mount(data: AgentObservabilityReportV1): void {
     tracePageIndex = tracePage.index;
     spanPageIndex = spanPage.index;
     const summary = summarizeVisible(visibleSpans);
+    const selectedSpan = visibleSpans.find((span) => span.spanId === selectedSpanId);
+    if (selectedSpanId !== undefined && selectedSpan === undefined) selectedSpanId = undefined;
 
     setText("kpi-sessions", summary.sessions);
     setText("kpi-turns", summary.turns);
     setText("kpi-llm", summary.llmRequests);
     setText("kpi-tools", summary.toolExecutions);
-    setText("kpi-tokens", formatNumber(summary.inputTokens + summary.outputTokens));
+    setText("kpi-tokens", formatTokenSummary(summary.totalTokens, summary.tokenStatus));
     setText("kpi-cost", formatCost(summary.estimatedCost, {
       status: summary.costStatus,
       currency: data.cost.currency,
@@ -205,6 +230,9 @@ function mount(data: AgentObservabilityReportV1): void {
     renderTraces(tracePage, view.spansByTrace);
     renderTimeline(visibleSpans, state.trace !== undefined);
     renderSpans(spanPage);
+    syncExpandedSpanOpeners();
+    renderQuality(visibleSpans);
+    renderDetails(selectedSpan);
     renderPager("trace", tracePage, tracePrevious, traceNext, TRACE_PAGE_SIZE);
     renderPager("span", spanPage, spanPrevious, spanNext, SPAN_PAGE_SIZE);
   }
@@ -230,7 +258,7 @@ function mount(data: AgentObservabilityReportV1): void {
         `<div class="trace-main"><span class="mono">${escapeHtml(shortId(trace.traceId))}</span>` +
         `<span class="badge ${traceSummary.errors ? "error" : "ok"}">${traceSummary.errors ? `${traceSummary.errors} error` : "ok"}</span></div>` +
         `<div class="trace-meta"><span>${escapeHtml(trace.repo)}</span><span>${traceSpans.length} spans</span>` +
-        `<span>${formatNumber(traceSummary.inputTokens + traceSummary.outputTokens)} tokens</span></div>`;
+        `<span>${escapeHtml(formatTokenSummary(traceSummary.totalTokens, traceSummary.tokenStatus))} tokens</span></div>`;
       return button;
     }));
   }
@@ -251,12 +279,17 @@ function mount(data: AgentObservabilityReportV1): void {
       const row = document.createElement("div");
       row.className = "timeline-row";
       row.innerHTML =
-        `<div class="timeline-label"><span>${escapeHtml(item.span.name)}</span>` +
+        `<div class="timeline-label"><button class="span-open" type="button" aria-controls="span-details" ` +
+        `aria-expanded="${selectedSpanId === item.span.spanId}" data-span-id="${escapeHtml(item.span.spanId)}" ` +
+        `data-opener-surface="timeline">${escapeHtml(item.span.name)}</button>` +
         `<span class="timeline-details"><span class="badge timeline-span-status ${statusClass(item.span.status)}">` +
         `${escapeHtml(item.span.status)}</span><span class="mono">` +
         `${escapeHtml(formatDuration(item.span.metrics.latencyMs ?? item.span.metrics.durationMs))}</span></span></div>` +
         `<div class="timeline-track"><span class="timeline-bar ${statusClass(item.span.status)}" ` +
         `style="left:${item.leftPercent.toFixed(3)}%;width:${item.widthPercent.toFixed(3)}%"></span></div>`;
+      row.querySelector<HTMLButtonElement>(".span-open")?.addEventListener("click", (event) => {
+        openSpanDetails(item.span, event.currentTarget as HTMLButtonElement);
+      });
       return row;
     }));
     element("timeline-status").textContent = spans.length > TIMELINE_LIMIT
@@ -271,18 +304,141 @@ function mount(data: AgentObservabilityReportV1): void {
     }
     tableElement.replaceChildren(...page.items.map((span) => {
       const row = document.createElement("tr");
+      const availability = availabilityOf(span);
       row.innerHTML =
         `<td><span class="badge">${escapeHtml(span.kind)}</span></td>` +
-        `<td>${escapeHtml(span.name)}${span.toolName ? `<div class="mono">${escapeHtml(span.toolName)}</div>` : ""}</td>` +
+        `<td><button class="span-open" type="button" aria-controls="span-details" aria-expanded="${selectedSpanId === span.spanId}" ` +
+        `data-span-id="${escapeHtml(span.spanId)}" data-opener-surface="table">${escapeHtml(span.name)}</button>` +
+        `${span.toolName ? `<div class="mono">${escapeHtml(span.toolName)}</div>` : ""}</td>` +
         `<td><span class="badge ${statusClass(span.status)}">${escapeHtml(span.status)}</span></td>` +
         `<td>${escapeHtml(span.repo)}</td>` +
         `<td class="mono">${escapeHtml(span.turnId ?? "")}</td>` +
-        `<td>${formatNumber((span.metrics.inputTokens ?? 0) + (span.metrics.outputTokens ?? 0))}</td>` +
+        `<td>${formatOptionalNumber(tokenTotal(span.metrics), availability.tokens)}</td>` +
         `<td>${escapeHtml(formatCost(span.estimatedCost, span.cost))}</td>` +
-        `<td>${formatDuration(span.metrics.latencyMs ?? span.metrics.durationMs)}</td>` +
+        `<td>${formatOptionalDuration(span.metrics.latencyMs ?? span.metrics.durationMs, availability.latency)}</td>` +
         `<td class="mono">${escapeHtml(shortId(span.parentSpanId ?? ""))}</td>`;
+      row.querySelector<HTMLButtonElement>(".span-open")?.addEventListener("click", (event) => {
+        openSpanDetails(span, event.currentTarget as HTMLButtonElement);
+      });
       return row;
     }));
+  }
+
+  function renderQuality(spans: Span[]): void {
+    const unavailable = spans.reduce((count, span) => count + Object.values(availabilityOf(span))
+      .filter((field) => field.state === "source_unavailable").length, 0);
+    const privateLookup = spans.reduce((count, span) => count + Object.values(availabilityOf(span))
+      .filter((field) => field.state === "private_lookup").length, 0);
+    setText("quality-summary", unavailable === 0 ? "Source fields are complete" : `${formatNumber(unavailable)} unavailable fields`);
+    setText(
+      "quality-detail",
+      privateLookup > 0
+        ? `${formatNumber(privateLookup)} private fields can be checked locally. Select a span for exact reasons.`
+        : "Select a span to see exact availability reasons.",
+    );
+  }
+
+  function openSpanDetails(span: Span, trigger: HTMLButtonElement): void {
+    selectedSpanId = span.spanId;
+    detailsOpenerSurface = trigger.dataset.openerSurface === "timeline" ? "timeline" : "table";
+    syncExpandedSpanOpeners();
+    renderDetails(span);
+    detailsHeading.focus();
+  }
+
+  function visibleSpanOpener(
+    spanId?: string,
+    surface?: "timeline" | "table",
+  ): HTMLButtonElement | undefined {
+    const candidates = [...document.querySelectorAll<HTMLButtonElement>(".span-open")]
+      .filter((candidate) => candidate.getClientRects().length > 0 && !candidate.disabled);
+    const matching = spanId === undefined
+      ? candidates
+      : candidates.filter((candidate) => candidate.dataset.spanId === spanId);
+    return matching.find((candidate) => candidate.dataset.openerSurface === surface) ?? matching[0];
+  }
+
+  function syncExpandedSpanOpeners(): void {
+    for (const opener of document.querySelectorAll<HTMLButtonElement>(".span-open[aria-expanded]")) {
+      opener.setAttribute("aria-expanded", String(selectedSpanId !== undefined && opener.dataset.spanId === selectedSpanId));
+    }
+  }
+
+  function renderDetails(span: Span | undefined): void {
+    if (!span) {
+      detailsBody.innerHTML = '<p class="detail-empty">Select a span name to inspect source, availability, and private local details.</p>';
+      return;
+    }
+    const source = scalarText(span.attributes.source) ?? "Unavailable";
+    const eventType = scalarText(span.attributes.event_type) ?? "Unavailable";
+    const availability = availabilityOf(span);
+    detailsBody.innerHTML =
+      `<section class="detail-section"><h3>Overview</h3><dl class="detail-grid">` +
+      detailRow("Name", span.name) + detailRow("Kind", span.kind) + detailRow("Status", span.status) +
+      detailRow("Repository", displayValue(span.repo, availability.repository)) +
+      detailRow("Model", displayValue(span.agent.model, availability.model)) +
+      detailRow("Tokens", displayValue(formatOptionalNumberValue(tokenTotal(span.metrics)), availability.tokens)) +
+      detailRow("Turn", displayValue(span.turnId, availability.turn)) +
+      detailRow("Latency", displayValue(formatDuration(span.metrics.latencyMs ?? span.metrics.durationMs), availability.latency)) +
+      `</dl></section>` +
+      `<section class="detail-section"><h3>Source &amp; privacy</h3><dl class="detail-grid">` +
+      detailRow("Agent", span.agent.name ?? "Unavailable") + detailRow("Surface", source) +
+      detailRow("Event", eventType) + availabilityRow("Location", availability.sourceLocation) +
+      availabilityRow("Request", availability.requestContent) + availabilityRow("Response", availability.responseContent) +
+      `</dl></section>` +
+      `<section class="detail-section" id="private-detail"><h3>Private local detail</h3>` +
+      `<p class="detail-empty">Checking the capability-protected local store…</p></section>`;
+    void loadPrivateDetail(span);
+  }
+
+  async function loadPrivateDetail(span: Span): Promise<void> {
+    const request = ++detailRequest;
+    const target = document.getElementById("private-detail");
+    if (!target) return;
+    if (!span.turnId) {
+      target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Unavailable: this source did not provide turn correlation.</p>';
+      return;
+    }
+    const availability = availabilityOf(span);
+    if (![availability.sourceLocation, availability.requestContent, availability.responseContent]
+      .every((field) => field.state === "private_lookup")) {
+      target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Not applicable: this span is not an eligible Codex notify turn.</p>';
+      return;
+    }
+    if (!/^https?:$/.test(globalThis.location.protocol)) {
+      target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Unavailable in a file:// report. Open the localhost dashboard.</p>';
+      return;
+    }
+    try {
+      const response = await fetch(`${globalThis.location.pathname}/details/${encodeURIComponent(span.turnId)}`, {
+        cache: "no-store",
+        credentials: "same-origin",
+      });
+      if (request !== detailRequest || selectedSpanId !== span.spanId) return;
+      if (response.status === 404) {
+        target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Not collected. Enable private Codex turn details in Settings for future turns.</p>';
+        return;
+      }
+      if (response.status === 503) {
+        const failure = await response.json() as { error?: unknown; code?: unknown };
+        const code = typeof failure.code === "string" ? failure.code : "lookup_failed";
+        target.innerHTML = `<h3>Private local detail</h3><p class="detail-empty">Capture failed (${escapeHtml(code)}). Check Settings and local storage health; the normal report remains usable.</p>`;
+        return;
+      }
+      if (!response.ok) throw new Error("private detail request failed");
+      const detail: unknown = await response.json();
+      if (!validatePrivateCodexTurnDetailV1(detail) || detail.turnId !== span.turnId) {
+        throw new Error("private detail contract mismatch");
+      }
+      const privateDetail: PrivateCodexTurnDetailV1 = detail;
+      target.innerHTML = `<h3>Private local detail</h3><p class="private-banner">Sensitive content stored only in this private local runtime. Review before sharing screenshots.</p>` +
+        `<dl class="detail-grid">${detailRow("Opened from", privateDetail.cwd)}</dl>` +
+        `<h3>Request</h3><pre class="private-content" tabindex="0">${escapeHtml(privateDetail.inputMessages.join("\n\n"))}</pre>` +
+        `<h3>Response</h3><pre class="private-content" tabindex="0">${escapeHtml(privateDetail.lastAssistantMessage ?? "Unavailable: Codex did not provide an assistant response in this notification.")}</pre>`;
+    } catch {
+      if (request !== detailRequest || selectedSpanId !== span.spanId) return;
+      target.innerHTML = '<h3>Private local detail</h3><p class="detail-empty">Temporarily unavailable. The normal report remains usable.</p>';
+    }
   }
 
   function renderPager(
@@ -322,6 +478,9 @@ function mount(data: AgentObservabilityReportV1): void {
 
   function resetSelection(): void {
     state.trace = undefined;
+    selectedSpanId = undefined;
+    detailsOpenerSurface = undefined;
+    detailRequest += 1;
     tracePageIndex = 0;
     spanPageIndex = 0;
     savedFilterSelect.value = ALL_OPTION;
@@ -331,6 +490,50 @@ function mount(data: AgentObservabilityReportV1): void {
   function hasActiveFilters(): boolean {
     return state.text.length > 0 || (Object.keys(selects) as FilterKey[]).some((key) => state[key] !== undefined);
   }
+}
+
+function availabilityLabel(field: FieldAvailability): string {
+  const state = field.state.replaceAll("_", " ");
+  const reason = field.reason.replaceAll("_", " ");
+  return `${state} — ${reason}`;
+}
+
+function availabilityOf(span: Span): NonNullable<Span["availability"]> {
+  return span.availability;
+}
+
+function availabilityRow(label: string, field: FieldAvailability): string {
+  return `<dt>${escapeHtml(label)}</dt><dd><span class="availability ${escapeHtml(field.state)}">${escapeHtml(availabilityLabel(field))}</span></dd>`;
+}
+
+function detailRow(label: string, value: string): string {
+  return `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`;
+}
+
+function displayValue(value: string | undefined, availability: FieldAvailability): string {
+  return value && value !== UNKNOWN ? value : availabilityLabel(availability);
+}
+
+function scalarText(value: string | number | boolean | undefined): string | undefined {
+  return value === undefined ? undefined : String(value);
+}
+
+function formatOptionalNumberValue(value: number | undefined): string | undefined {
+  return value === undefined ? undefined : formatNumber(value);
+}
+
+function formatOptionalNumber(value: number | undefined, availability: FieldAvailability): string {
+  return value === undefined ? availabilityLabel(availability) : formatNumber(value);
+}
+
+function formatTokenSummary(value: number | undefined, status: "complete" | "incomplete" | "unavailable"): string {
+  if (status === "incomplete") return "Incomplete";
+  if (status === "unavailable" || value === undefined) return "Unavailable";
+  return formatNumber(value);
+}
+
+function formatOptionalDuration(value: number | undefined, availability: FieldAvailability): string {
+  return value === undefined ? availabilityLabel(availability) : formatDuration(value);
 }
 
 function emptyDimensions(): DimensionFilters {

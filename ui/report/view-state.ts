@@ -1,4 +1,4 @@
-import type { Span, Trace } from "./generated/report-dto-v1.js";
+import type { Span, Trace } from "./generated/report-dto-v2.js";
 
 export type FilterKey = "repo" | "session" | "agent" | "model";
 export type DimensionFilters = Record<FilterKey, string | undefined>;

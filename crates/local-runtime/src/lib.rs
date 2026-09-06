@@ -29,6 +29,6 @@ pub const CHANNEL_CAPACITY: usize = 64;
 pub const NORMALIZATION_WORKERS: usize = 1;
 pub use config::{
     ConfigError, ConfigMutationGuard, ConfigServiceError, InstalledLayout,
-    LOCAL_RUNTIME_CONFIG_VERSION, LocalConfigService, LocalRuntimeConfigV2, VersionedLocalConfig,
-    install, load, revision, save, save_if_revision,
+    LOCAL_RUNTIME_CONFIG_VERSION, LocalConfigService, LocalRuntimeConfigV3, VersionedLocalConfig,
+    inspect, install, load, revision, save, save_if_revision,
 };

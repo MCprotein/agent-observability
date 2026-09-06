@@ -1,6 +1,7 @@
-import type { Span } from "./generated/report-dto-v1.js";
+import type { Metrics, Span } from "./generated/report-dto-v2.js";
 
 export type CostStatus = "estimated" | "incomplete" | "unknown";
+export type TokenStatus = "complete" | "incomplete" | "unavailable";
 
 export interface ViewSummary {
   sessions: number;
@@ -10,13 +11,13 @@ export interface ViewSummary {
   errors: number;
   inputTokens: number;
   outputTokens: number;
+  totalTokens: number | undefined;
+  tokenStatus: TokenStatus;
   estimatedCost: number;
   costStatus: CostStatus;
 }
 
-const TOKEN_METRICS = [
-  "inputTokens",
-  "outputTokens",
+const NON_TOTAL_TOKEN_METRICS = [
   "cachedInputTokens",
   "cacheCreationInputTokens",
   "reasoningOutputTokens",
@@ -34,9 +35,14 @@ export function summarizeVisible(spans: Span[]): ViewSummary {
     errors: 0,
     inputTokens: 0,
     outputTokens: 0,
+    totalTokens: undefined,
+    tokenStatus: "unavailable",
     estimatedCost: 0,
     costStatus: aggregateCostStatus(billable.map((span) => span.cost.status)),
   };
+  let completeTokenTotal = 0;
+  let completeTokenSpans = 0;
+  let incompleteTokenSpans = 0;
   for (const span of spans) {
     if (span.sessionId) sessions.add(span.sessionId);
     if (span.turnId) turns.add(span.turnId);
@@ -45,11 +51,28 @@ export function summarizeVisible(spans: Span[]): ViewSummary {
     if (span.status === "error") summary.errors += 1;
     summary.inputTokens += span.metrics.inputTokens ?? 0;
     summary.outputTokens += span.metrics.outputTokens ?? 0;
+    const spanTokenTotal = tokenTotal(span.metrics);
+    if (spanTokenTotal !== undefined && span.availability.tokens.state === "available") {
+      completeTokenTotal += spanTokenTotal;
+      completeTokenSpans += 1;
+    } else if (span.availability.tokens.state !== "not_applicable") {
+      incompleteTokenSpans += 1;
+    }
     summary.estimatedCost += span.estimatedCost ?? 0;
   }
   summary.sessions = sessions.size;
   summary.turns = turns.size;
+  summary.tokenStatus = incompleteTokenSpans > 0
+    ? "incomplete"
+    : completeTokenSpans > 0 ? "complete" : "unavailable";
+  summary.totalTokens = summary.tokenStatus === "complete" ? completeTokenTotal : undefined;
   return summary;
+}
+
+export function tokenTotal(metrics: Metrics): number | undefined {
+  const direct = sumComplete(metrics.inputTokens, metrics.outputTokens);
+  const cumulative = sumComplete(metrics.totalInputTokens, metrics.totalOutputTokens);
+  return direct ?? metrics.totalTokens ?? cumulative ?? metrics.totalAccumulatedTokens;
 }
 
 export function aggregateCostStatus(statuses: string[]): CostStatus {
@@ -62,5 +85,10 @@ export function aggregateCostStatus(statuses: string[]): CostStatus {
 }
 
 function hasTokenMetrics(span: Span): boolean {
-  return TOKEN_METRICS.some((key) => span.metrics[key] !== undefined);
+  return tokenTotal(span.metrics) !== undefined
+    || NON_TOTAL_TOKEN_METRICS.some((key) => span.metrics[key] !== undefined);
+}
+
+function sumComplete(left: number | undefined, right: number | undefined): number | undefined {
+  return left === undefined || right === undefined ? undefined : left + right;
 }

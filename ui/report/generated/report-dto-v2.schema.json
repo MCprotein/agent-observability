@@ -1,4 +1,5 @@
 {
+  "title": "AgentObservabilityReportV2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -13,7 +14,7 @@
   ],
   "properties": {
     "schemaVersion": {
-      "const": "agent_observability.report.v1"
+      "const": "agent_observability.report.v2"
     },
     "generatedAt": {
       "type": "string"
@@ -299,6 +300,7 @@
         "endTimeUnixMs",
         "repo",
         "agent",
+        "availability",
         "attributes",
         "metrics",
         "cost"
@@ -343,6 +345,9 @@
         "agent": {
           "$ref": "#/$defs/agent"
         },
+        "availability": {
+          "$ref": "#/$defs/availability"
+        },
         "sessionId": {
           "type": "string"
         },
@@ -364,7 +369,181 @@
         "cost": {
           "$ref": "#/$defs/cost"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "metrics": {
+                "type": "object",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "inputTokens": true
+                    },
+                    "required": [
+                      "inputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "outputTokens": true
+                    },
+                    "required": [
+                      "outputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "totalTokens": true
+                    },
+                    "required": [
+                      "totalTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "totalInputTokens": true
+                    },
+                    "required": [
+                      "totalInputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "totalOutputTokens": true
+                    },
+                    "required": [
+                      "totalOutputTokens"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "totalAccumulatedTokens": true
+                    },
+                    "required": [
+                      "totalAccumulatedTokens"
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          "then": {
+            "if": {
+              "properties": {
+                "metrics": {
+                  "type": "object",
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "totalTokens": true
+                      },
+                      "required": [
+                        "totalTokens"
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "totalAccumulatedTokens": true
+                      },
+                      "required": [
+                        "totalAccumulatedTokens"
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "inputTokens": true,
+                        "outputTokens": true
+                      },
+                      "required": [
+                        "inputTokens",
+                        "outputTokens"
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "totalInputTokens": true,
+                        "totalOutputTokens": true
+                      },
+                      "required": [
+                        "totalInputTokens",
+                        "totalOutputTokens"
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "availability": {
+                  "type": "object",
+                  "properties": {
+                    "tokens": {
+                      "type": "object",
+                      "properties": {
+                        "state": {
+                          "const": "available"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "availability": {
+                  "type": "object",
+                  "properties": {
+                    "tokens": {
+                      "type": "object",
+                      "properties": {
+                        "state": {
+                          "const": "source_unavailable"
+                        },
+                        "reason": {
+                          "const": "partial_token_metrics"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "availability": {
+                "type": "object",
+                "properties": {
+                  "tokens": {
+                    "type": "object",
+                    "properties": {
+                      "state": {
+                        "not": {
+                          "const": "available"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "agent": {
       "type": "object",
@@ -378,6 +557,160 @@
         },
         "version": {
           "type": "string"
+        }
+      }
+    },
+    "field_availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "reason"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "available",
+            "source_unavailable",
+            "withheld",
+            "not_applicable",
+            "private_lookup"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "reported_by_adapter",
+            "derived_from_trace_context",
+            "legacy_v1_report",
+            "source_not_provided",
+            "not_evaluated",
+            "partial_token_metrics",
+            "historical_codex_source_not_lookup_eligible",
+            "codex_notify_turn_correlation_unavailable",
+            "ambiguous_trace_repository",
+            "span_kind_not_model_backed",
+            "span_kind_has_no_latency",
+            "span_kind_has_no_token_usage",
+            "claude_private_lookup_not_supported",
+            "cursor_private_lookup_not_supported",
+            "codex_span_not_notify_derived",
+            "agent_private_lookup_not_supported",
+            "local_opt_in_lookup_required",
+            "withheld_by_privacy_policy"
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "state": {
+              "const": "available"
+            },
+            "reason": {
+              "enum": [
+                "reported_by_adapter",
+                "derived_from_trace_context",
+                "legacy_v1_report"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "state": {
+              "const": "source_unavailable"
+            },
+            "reason": {
+              "enum": [
+                "source_not_provided",
+                "not_evaluated",
+                "partial_token_metrics",
+                "historical_codex_source_not_lookup_eligible",
+                "codex_notify_turn_correlation_unavailable",
+                "ambiguous_trace_repository",
+                "legacy_v1_report"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "state": {
+              "const": "not_applicable"
+            },
+            "reason": {
+              "enum": [
+                "span_kind_not_model_backed",
+                "span_kind_has_no_latency",
+                "span_kind_has_no_token_usage",
+                "claude_private_lookup_not_supported",
+                "cursor_private_lookup_not_supported",
+                "codex_span_not_notify_derived",
+                "agent_private_lookup_not_supported"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "state": {
+              "const": "private_lookup"
+            },
+            "reason": {
+              "const": "local_opt_in_lookup_required"
+            }
+          }
+        },
+        {
+          "properties": {
+            "state": {
+              "const": "withheld"
+            },
+            "reason": {
+              "const": "withheld_by_privacy_policy"
+            }
+          }
+        }
+      ]
+    },
+    "availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "turn",
+        "model",
+        "tokens",
+        "latency",
+        "sourceLocation",
+        "requestContent",
+        "responseContent"
+      ],
+      "properties": {
+        "repository": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "turn": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "model": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "tokens": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "latency": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "sourceLocation": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "requestContent": {
+          "$ref": "#/$defs/field_availability"
+        },
+        "responseContent": {
+          "$ref": "#/$defs/field_availability"
         }
       }
     },

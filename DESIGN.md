@@ -36,7 +36,7 @@ Avoid:
 - gradients, ornamental blobs and illustration-led empty states
 - hiding missing data behind zero values
 - presenting client-side role visibility as authorization
-- showing local paths, raw prompts, outputs or source payloads
+- showing local paths, raw prompts, outputs or source payloads in the normal report plane or without explicit local opt-in
 
 ## Product goals
 
@@ -52,7 +52,7 @@ Goals:
 Non-goals:
 
 - landing page, sales site or in-product feature tour
-- raw prompt/output viewer
+- general-purpose raw prompt/output viewer or API traffic inspector
 - general-purpose log search or arbitrary query language
 - model request gateway administration
 - remote control of standalone local files; the same-user loopback settings console is explicitly local-only

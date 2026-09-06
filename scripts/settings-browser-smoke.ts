@@ -400,6 +400,7 @@ try {
     assert.equal(await page.locator("main").count(), 1);
     assert.equal(await page.locator("nav[aria-label='설정 영역']").count(), 1);
     assert.equal(await page.locator("#settings-form input[type=number]").count(), 10);
+    assert.equal(await page.locator("#settings-form input[type=checkbox]").count(), 2);
     assert.equal(
       await page.evaluate(
         () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
@@ -423,6 +424,10 @@ try {
 
     if (testCase.name === "desktop") {
       const input = page.locator("#collection-max_batch_records");
+      const privateDetails = page.locator("#capture-private-codex-turn-details");
+      assert.equal(await privateDetails.isChecked(), false);
+      await page.locator('[data-boolean-field="capture_private_codex_turn_details"]').click();
+      assert.equal(await privateDetails.isChecked(), true);
       await input.fill("125");
       assert.equal(await page.locator("#save").isEnabled(), true);
       assert.match((await page.locator("#batch-records-visual [data-visual-value]").textContent()) ?? "", /125/);
@@ -434,6 +439,7 @@ try {
       const configPath = join(runtimeRoot, "config.json");
       const config = JSON.parse(await readFile(configPath, "utf8"));
       assert.equal(config.collection.max_batch_records, 125);
+      assert.equal(config.capture_private_codex_turn_details, true);
       await page.locator("#collection-max_batch_records").fill("");
       await page.locator("#collection-flush_interval_ms").fill("6000");
       await page.locator("#save").click();

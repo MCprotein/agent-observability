@@ -1,7 +1,7 @@
 # Adapter Compatibility Contract
 
-Status: v1.8.4 Released; Codex 0.152.1 automatic local boundary remains experimental with exact-revision release evidence passed; exact-version private imports supported
-Last verified: 2026-09-04
+Status: v1.10.0 release candidate; Codex 0.152.1 automatic local boundary remains experimental with prior exact-revision release evidence; exact-version private imports supported
+Last verified: 2026-09-05
 
 이 문서는 Codex, Claude Code, Cursor adapter가 어떤 공식 surface를 어떤 우선순위로 사용하고,
 어떤 evidence가 있어야 특정 제품/version을 지원한다고 표시할 수 있는지 정의한다. 제품 업데이트로
@@ -18,7 +18,7 @@ adapter family, source generation, 공식 session/conversation/generation identi
 
 | Adapter | Primary source | Supplement / fallback | Current runtime support | Verified official reference |
 | --- | --- | --- | --- | --- |
-| Codex | native telemetry for model/API/token/tool signals | `agent-turn-complete` notify owns turn completion only; local session output is unused | macOS automatic private-CA HTTPS local OTLP/HTTP JSON with exact private random request header + projected bounded notify, plus manual handoff import; actual Codex e2e is part of the exact-revision release gate | [Advanced configuration](https://developers.openai.com/codex/config-advanced), [Configuration reference](https://developers.openai.com/codex/config-reference) |
+| Codex | native telemetry for model/API/token/tool signals | `agent-turn-complete` notify owns turn completion and a pseudonymous cwd-derived project reference; optional local-only detail can retain its cwd, input messages and last assistant message | macOS automatic private-CA HTTPS local OTLP/HTTP JSON with exact private random request header + projected bounded notify, plus manual handoff import; actual Codex e2e is part of the exact-revision release gate | [Advanced configuration](https://developers.openai.com/codex/config-advanced), [Configuration reference](https://developers.openai.com/codex/config-reference) |
 | Claude Code | native telemetry for usage, cost and tool metrics | hooks for lifecycle events; no transcript dependency in the Rust adapter | manual handoff import only; automatic producer/receiver TODO | [Hooks reference](https://code.claude.com/docs/en/hooks), [Monitoring usage](https://code.claude.com/docs/en/monitoring-usage) |
 | Cursor | generic `preToolUse`/`postToolUse`/`postToolUseFailure` hooks with `tool_use_id` | session/turn lifecycle hooks; specific shell/MCP/file hooks are diagnostic-only because they lack a shared operation ID | manual handoff import only; automatic producer/receiver TODO | [Hooks reference](https://cursor.com/docs/hooks) |
 
@@ -38,9 +38,11 @@ scalar values cross the adapter boundary:
 - known model, bounded tool category and bounded permission decision
 - duration, input/output/cached/reasoning/total token counts and success state
 
-Prompt, response, tool arguments/output, command, cwd, path, raw account identity and unknown attributes are
-discarded before canonical mapping. They are never persisted, logged, placed in diagnostics, projected to JSONL
-or HTML, reported, archived or exported.
+Prompt, response, tool arguments/output, command, raw cwd/path, raw account identity and unknown attributes are
+discarded before canonical mapping. A bounded pseudonymous reference derived from cwd may become the local project label. With the
+default-off `private-codex-details` option, only the official notify's cwd, input messages and last assistant
+message can be retained in a separate per-turn private detail artifact. That artifact is never projected to
+JSONL/HTML, reported, archived, exported or sent to team ingest. It is not an API wire request/response capture.
 
 ## Runtime rules
 
@@ -48,6 +50,12 @@ or HTML, reported, archived or exported.
   representation before any I/O, and performs only a bounded local private-CA HTTPS + exact-header handoff. Accepted, rejected and
   unavailable outcomes all exit successfully so observation cannot block Codex work. It does not call team
   endpoints, render reports, scan transcripts or wait for background flush completion.
+- If local private detail capture is enabled, the same bounded helper sends only the official notify fields to a
+  dedicated authenticated localhost route with a shared 250 ms transport deadline. The receiver first ingests
+  the content-free projection, then uses a bounded blocking task outside the event loop to synchronize the
+  private artifact and terminal status before acknowledging availability. There is no in-memory publication queue;
+  startup reconciliation removes orphan artifacts without an exact successful status. An existing external Codex `notify` is preserved, so this detail
+  source is unavailable unless agentobs owns and receives the callback.
 - The Codex OTLP receiver binds only IPv4 loopback. Clients validate its private-CA server certificate and
   loopback IP SAN; every request must carry the exact `x-agent-observability-token` header containing the
   runtime's private random 256-bit value. The exporter contains no client certificate/private-key fields, so the
@@ -79,7 +87,7 @@ Each entry in `crates/contracts/capabilities/adapter-capability-v1.yaml` contain
 privacy closure. The Codex, Claude Code and Cursor adapter suites verify declared input/projection fixture hashes,
 exact replay output, bounded input, restart/idempotency and privacy behavior. Claude Code additionally locks permission,
 compaction, failed lifecycle, interrupt-gap and out-of-order timestamp fixtures. The capability manifest publishes
-separate manual `private_canonical_handoff_v1` entries and a macOS standalone `codex_automatic_local.v3` entry
+separate manual `private_canonical_handoff_v1` entries and a macOS standalone `codex_automatic_local.v4` entry
 pinned to Codex `0.152.1`. Native receiver, foreground notify, privacy, restart, smoke and exact-revision five-run
 evidence pass on this macOS boundary. The manifest remains `experimental` because cross-version/OS/profile
 execution remains a future promotion gate.

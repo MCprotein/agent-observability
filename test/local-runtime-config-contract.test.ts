@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import validateConfig from "../ui/settings/generated/validate-local-runtime-config-v2.js";
+import validateConfig from "../ui/settings/generated/validate-local-runtime-config-v3.js";
 
 const fixture = JSON.parse(
-  await readFile("contracts/local-runtime-config-v2.fixture.json", "utf8"),
+  await readFile("contracts/local-runtime-config-v3.fixture.json", "utf8"),
 );
 const parityCases = JSON.parse(
-  await readFile("contracts/local-runtime-config-v2.parity.json", "utf8"),
+  await readFile("contracts/local-runtime-config-v3.parity.json", "utf8"),
 ) as ParityCase[];
 
 interface ParityCase {

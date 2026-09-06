@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "agent_observability.private_turn_detail.parity.v1",
+  "base": {
+    "schemaVersion": "agent_observability.private_turn_detail.v1",
+    "turnId": "id:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "cwd": "/private/project<&>",
+    "inputMessages": [
+      "raw user content: <script>alert(\"kept as data\")</script>",
+      "{\"nested\":true,\"unknownContent\":[1,2,3]}"
+    ],
+    "lastAssistantMessage": null
+  },
+  "cases": [
+    { "name": "raw legitimate content", "operation": "none", "path": [], "valid": true },
+    { "name": "raw legitimate assistant content", "operation": "set", "path": ["lastAssistantMessage"], "value": "raw assistant content: markdown **and** null escape text is data: \\u0000", "valid": true },
+    { "name": "uppercase hexadecimal id", "operation": "set", "path": ["turnId"], "value": "id:sha256:ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789", "valid": false },
+    { "name": "missing required nullable assistant message", "operation": "remove", "path": ["lastAssistantMessage"], "valid": false },
+    { "name": "null assistant message", "operation": "set", "path": ["lastAssistantMessage"], "value": null, "valid": true },
+    { "name": "unknown field", "operation": "set", "path": ["unknown"], "value": "private raw extension", "valid": false },
+    { "name": "unsupported schema version", "operation": "set", "path": ["schemaVersion"], "value": "agent_observability.private_turn_detail.v2", "valid": false },
+    { "name": "missing schema version", "operation": "remove", "path": ["schemaVersion"], "valid": false },
+    { "name": "missing turn id", "operation": "remove", "path": ["turnId"], "valid": false },
+    { "name": "wrong id prefix", "operation": "set", "path": ["turnId"], "value": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "valid": false },
+    { "name": "short id digest", "operation": "set", "path": ["turnId"], "value": "id:sha256:0123456789abcdef", "valid": false },
+    { "name": "non hexadecimal id digest", "operation": "set", "path": ["turnId"], "value": "id:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg", "valid": false },
+    { "name": "missing cwd", "operation": "remove", "path": ["cwd"], "valid": false },
+    { "name": "empty cwd", "operation": "set", "path": ["cwd"], "value": "", "valid": false },
+    { "name": "missing input messages", "operation": "remove", "path": ["inputMessages"], "valid": false },
+    { "name": "non string input message", "operation": "set", "path": ["inputMessages"], "value": ["valid", 1], "valid": false },
+    { "name": "serialized size at limit with null assistant message", "operation": "set_serialized_size", "path": ["cwd"], "size": 65536, "valid": true },
+    { "name": "serialized size above limit with null assistant message", "operation": "set_serialized_size", "path": ["cwd"], "size": 65537, "valid": false },
+    { "name": "multibyte content below byte limit", "operation": "set_repeated_string", "path": ["cwd"], "value": "한", "count": 21000, "valid": true },
+    { "name": "multibyte content above byte limit", "operation": "set_repeated_string", "path": ["cwd"], "value": "한", "count": 22000, "valid": false }
+  ]
+}

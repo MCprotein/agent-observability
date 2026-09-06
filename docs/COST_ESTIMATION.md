@@ -88,7 +88,7 @@ flowchart LR
     Status{"Complete inputs?"}
     Cost["Estimated cost + provenance"]
     Unknown["Unknown / incomplete"]
-    DTO["ReportDtoV1"]
+    DTO["ReportDtoV2"]
 
     Usage --> Policy
     Rates --> Policy
@@ -97,6 +97,6 @@ flowchart LR
     Status -->|No| Unknown --> DTO
 ```
 
-TypeScript UI는 `ReportDtoV1`의 결과를 표시할 뿐 browser에서 rate table을 읽거나 비용을 다시 계산하지
+TypeScript UI는 `ReportDtoV2`의 결과를 표시할 뿐 browser에서 rate table을 읽거나 비용을 다시 계산하지
 않는다. Model/rate compatibility의 architecture rule은
 [ARCHITECTURE.md](ARCHITECTURE.md#model-and-pricing-compatibility)를 따른다.

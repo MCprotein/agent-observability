@@ -228,7 +228,7 @@ fn init_and_runtime_check_create_only_private_local_paths() {
         "{}",
         String::from_utf8_lossy(&init.stderr)
     );
-    assert!(String::from_utf8_lossy(&init.stdout).contains("config_schema=local_runtime.v2"));
+    assert!(String::from_utf8_lossy(&init.stdout).contains("config_schema=local_runtime.v3"));
     assert_eq!(
         fs::metadata(&root).unwrap().permissions().mode() & 0o777,
         0o700

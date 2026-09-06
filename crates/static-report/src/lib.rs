@@ -1,6 +1,6 @@
 //! Self-contained, private HTML artifact assembly for validated report DTOs.
 
-use agent_observability_contracts::{ContractError, MAX_REPORT_ARTIFACT_BYTES, ReportDtoV1};
+use agent_observability_contracts::{ContractError, MAX_REPORT_ARTIFACT_BYTES, ReportDtoV2};
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -66,7 +66,7 @@ impl From<io::Error> for ReportArtifactError {
 /// # Errors
 ///
 /// Returns [`ReportArtifactError`] when the DTO or embedded shell is invalid.
-pub fn render(report: &ReportDtoV1) -> Result<String, ReportArtifactError> {
+pub fn render(report: &ReportDtoV2) -> Result<String, ReportArtifactError> {
     let mut html = Vec::new();
     write_rendered(&mut html, report)?;
     String::from_utf8(html).map_err(|_| ReportArtifactError::InvalidTemplate)
@@ -77,7 +77,7 @@ pub fn render(report: &ReportDtoV1) -> Result<String, ReportArtifactError> {
 /// # Errors
 ///
 /// Returns [`ReportArtifactError`] for insecure paths, unsupported platforms, or I/O failures.
-pub fn write_private(path: &Path, report: &ReportDtoV1) -> Result<u64, ReportArtifactError> {
+pub fn write_private(path: &Path, report: &ReportDtoV2) -> Result<u64, ReportArtifactError> {
     let parent = path.parent().ok_or(ReportArtifactError::InvalidPath)?;
     private_directory(parent)?;
     reject_output_path(path)?;
@@ -118,7 +118,7 @@ fn validate_artifact_size(bytes: u64) -> Result<(), ReportArtifactError> {
 
 fn write_rendered(
     mut output: impl Write,
-    report: &ReportDtoV1,
+    report: &ReportDtoV2,
 ) -> Result<u64, ReportArtifactError> {
     report.validate().map_err(ReportArtifactError::Contract)?;
     if SHELL.matches(TITLE_TOKEN).count() != 2
@@ -300,8 +300,8 @@ mod tests {
         ReportSummaryV1,
     };
 
-    fn report(title: &str) -> ReportDtoV1 {
-        ReportDtoV1 {
+    fn report(title: &str) -> ReportDtoV2 {
+        ReportDtoV2 {
             schema_version: REPORT_DTO_VERSION.into(),
             generated_at: "2026-08-29T00:00:00.000Z".into(),
             title: title.into(),

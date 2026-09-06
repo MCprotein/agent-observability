@@ -4,16 +4,16 @@ import { existsSync } from "node:fs";
 const generatedJavaScript = new Set([
   "crates/local-ui/src/generated/settings-ui.js",
   "src/report/generated/report-ui.js",
-  "ui/report/generated/validate-report-dto-v1.js",
+  "ui/report/generated/validate-report-dto-v2.js",
   "ui/report/generated/view-state.js",
   "ui/report/generated/view-summary.js",
-  "ui/settings/generated/validate-local-runtime-config-v2.js",
+  "ui/settings/generated/validate-local-runtime-config-v3.js",
 ]);
 const managedToolingPrefixes = [".anamnesis/", ".claude/", ".codex/", ".cursor/"];
 
 const trackedJavaScript = execFileSync(
   "git",
-  ["ls-files", "*.js", "*.mjs", "*.cjs"],
+  ["ls-files", "--cached", "--others", "--exclude-standard", "*.js", "*.mjs", "*.cjs"],
   { encoding: "utf8" },
 )
   .split("\n")

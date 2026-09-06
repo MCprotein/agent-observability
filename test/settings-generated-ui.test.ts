@@ -13,7 +13,7 @@ test("tracked settings JavaScript matches the TypeScript bundle", async () => {
     target: ["es2022"],
     legalComments: "none",
     banner: {
-      js: "/* Generated from contracts/local-runtime-config-v2.schema.json. Do not edit. */",
+      js: "/* Generated from contracts/local-runtime-config-v3.schema.json. Do not edit. */",
     },
     write: false,
   });

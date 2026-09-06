@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent_observability.report.v2",
+  "title": "AgentObservabilityReportV2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "generatedAt", "title", "summary", "cost", "filters", "traces", "spans"],
+  "properties": {
+    "schemaVersion": { "const": "agent_observability.report.v2" },
+    "generatedAt": { "type": "string" },
+    "title": { "type": "string" },
+    "summary": { "$ref": "#/$defs/summary" },
+    "cost": { "$ref": "#/$defs/cost" },
+    "filters": { "$ref": "#/$defs/filters" },
+    "traces": { "type": "array", "items": { "$ref": "#/$defs/trace" } },
+    "spans": { "type": "array", "items": { "$ref": "#/$defs/span" } }
+  },
+  "$defs": {
+    "summary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["generatedSpans", "sessions", "turns", "llmRequests", "toolExecutions", "errors", "inputTokens", "outputTokens", "cachedInputTokens", "cacheCreationInputTokens", "reasoningOutputTokens", "latencyMs", "durationMs", "estimatedCost"],
+      "properties": {
+        "generatedSpans": { "type": "number" }, "sessions": { "type": "number" }, "turns": { "type": "number" }, "llmRequests": { "type": "number" },
+        "toolExecutions": { "type": "number" }, "errors": { "type": "number" }, "inputTokens": { "type": "number" }, "outputTokens": { "type": "number" },
+        "cachedInputTokens": { "type": "number" }, "cacheCreationInputTokens": { "type": "number" }, "reasoningOutputTokens": { "type": "number" },
+        "latencyMs": { "type": "number" }, "durationMs": { "type": "number" }, "estimatedCost": { "type": "number" }
+      }
+    },
+    "cost": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "rate_table", "cost"],
+      "properties": {
+        "status": { "enum": ["estimated", "incomplete", "unknown"] }, "reason": { "type": "string" }, "estimated_cost": { "type": "number" },
+        "currency": { "type": "string" }, "model": { "type": "string" },
+        "rate_table": { "type": "object", "additionalProperties": false, "properties": { "version": { "type": "string" }, "unit": { "type": "string" } } },
+        "cost": { "$ref": "#/$defs/cost_detail" }
+      }
+    },
+    "cost_detail": {
+      "type": "object", "additionalProperties": false, "required": ["assumption"],
+      "properties": {
+        "assumption": { "type": "string" }, "incomplete_count": { "type": "number" }, "unknown_count": { "type": "number" },
+        "missing": { "$ref": "#/$defs/strings" }, "semantic_errors": { "$ref": "#/$defs/strings" },
+        "components": { "type": "object", "additionalProperties": { "$ref": "#/$defs/cost_component" } }
+      }
+    },
+    "cost_component": {
+      "type": "object", "additionalProperties": false, "required": ["tokens", "rate_per_1m", "estimated_cost"],
+      "properties": { "tokens": { "type": "number" }, "rate_per_1m": { "type": "number" }, "estimated_cost": { "type": "number" } }
+    },
+    "filters": {
+      "type": "object", "additionalProperties": false, "required": ["repos", "sessions", "turns"],
+      "properties": {
+        "repos": { "$ref": "#/$defs/strings" }, "sessions": { "$ref": "#/$defs/strings" }, "turns": { "$ref": "#/$defs/strings" },
+        "agents": { "$ref": "#/$defs/strings" }, "models": { "$ref": "#/$defs/strings" }
+      }
+    },
+    "trace": {
+      "type": "object", "additionalProperties": false,
+      "required": ["traceId", "repo", "spans", "errors", "inputTokens", "outputTokens", "estimatedCost", "startTimeUnixMs", "endTimeUnixMs", "sessions", "turns"],
+      "properties": {
+        "traceId": { "type": "string" }, "repo": { "type": "string" }, "spans": { "type": "number" }, "errors": { "type": "number" },
+        "inputTokens": { "type": "number" }, "outputTokens": { "type": "number" }, "estimatedCost": { "type": "number" },
+        "startTimeUnixMs": { "type": "number" }, "endTimeUnixMs": { "type": ["number", "null"] },
+        "sessions": { "$ref": "#/$defs/strings" }, "turns": { "$ref": "#/$defs/strings" }
+      }
+    },
+    "span": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "traceId", "spanId", "parentSpanId", "kind", "name", "status", "startTimeUnixMs", "endTimeUnixMs", "repo", "agent", "availability", "attributes", "metrics", "cost"],
+      "properties": {
+        "schemaVersion": { "type": "string" }, "traceId": { "type": "string" }, "spanId": { "type": "string" }, "parentSpanId": { "type": ["string", "null"] },
+        "kind": { "type": "string" }, "name": { "type": "string" }, "status": { "type": "string" }, "startTimeUnixMs": { "type": "number" }, "endTimeUnixMs": { "type": ["number", "null"] },
+        "repo": { "type": "string" }, "agent": { "$ref": "#/$defs/agent" }, "availability": { "$ref": "#/$defs/availability" }, "sessionId": { "type": "string" }, "turnId": { "type": "string" }, "toolName": { "type": "string" },
+        "attributes": { "$ref": "#/$defs/attributes" }, "metrics": { "$ref": "#/$defs/metrics" }, "estimatedCost": { "type": "number" }, "cost": { "$ref": "#/$defs/cost" }
+      },
+      "allOf": [{
+        "if": {
+          "properties": {
+            "metrics": {
+              "type": "object",
+              "anyOf": [
+                { "type": "object", "properties": { "inputTokens": true }, "required": ["inputTokens"] },
+                { "type": "object", "properties": { "outputTokens": true }, "required": ["outputTokens"] },
+                { "type": "object", "properties": { "totalTokens": true }, "required": ["totalTokens"] },
+                { "type": "object", "properties": { "totalInputTokens": true }, "required": ["totalInputTokens"] },
+                { "type": "object", "properties": { "totalOutputTokens": true }, "required": ["totalOutputTokens"] },
+                { "type": "object", "properties": { "totalAccumulatedTokens": true }, "required": ["totalAccumulatedTokens"] }
+              ]
+            }
+          }
+        },
+        "then": {
+          "if": {
+            "properties": {
+              "metrics": {
+                "type": "object",
+                "anyOf": [
+                  { "type": "object", "properties": { "totalTokens": true }, "required": ["totalTokens"] },
+                  { "type": "object", "properties": { "totalAccumulatedTokens": true }, "required": ["totalAccumulatedTokens"] },
+                  { "type": "object", "properties": { "inputTokens": true, "outputTokens": true }, "required": ["inputTokens", "outputTokens"] },
+                  { "type": "object", "properties": { "totalInputTokens": true, "totalOutputTokens": true }, "required": ["totalInputTokens", "totalOutputTokens"] }
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "availability": {
+                "type": "object",
+                "properties": { "tokens": { "type": "object", "properties": { "state": { "const": "available" } } } }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "availability": {
+                "type": "object",
+                "properties": {
+                  "tokens": {
+                    "type": "object",
+                    "properties": {
+                      "state": { "const": "source_unavailable" },
+                      "reason": { "const": "partial_token_metrics" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "else": {
+          "properties": {
+            "availability": {
+              "type": "object",
+              "properties": { "tokens": { "type": "object", "properties": { "state": { "not": { "const": "available" } } } } }
+            }
+          }
+        }
+      }]
+    },
+    "agent": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "name": { "type": "string" }, "model": { "type": "string" }, "version": { "type": "string" } }
+    },
+    "field_availability": {
+      "type": "object", "additionalProperties": false, "required": ["state", "reason"],
+      "properties": {
+        "state": { "enum": ["available", "source_unavailable", "withheld", "not_applicable", "private_lookup"] },
+        "reason": { "type": "string", "enum": ["reported_by_adapter", "derived_from_trace_context", "legacy_v1_report", "source_not_provided", "not_evaluated", "partial_token_metrics", "historical_codex_source_not_lookup_eligible", "codex_notify_turn_correlation_unavailable", "ambiguous_trace_repository", "span_kind_not_model_backed", "span_kind_has_no_latency", "span_kind_has_no_token_usage", "claude_private_lookup_not_supported", "cursor_private_lookup_not_supported", "codex_span_not_notify_derived", "agent_private_lookup_not_supported", "local_opt_in_lookup_required", "withheld_by_privacy_policy"] }
+      },
+      "oneOf": [
+        { "properties": { "state": { "const": "available" }, "reason": { "enum": ["reported_by_adapter", "derived_from_trace_context", "legacy_v1_report"] } } },
+        { "properties": { "state": { "const": "source_unavailable" }, "reason": { "enum": ["source_not_provided", "not_evaluated", "partial_token_metrics", "historical_codex_source_not_lookup_eligible", "codex_notify_turn_correlation_unavailable", "ambiguous_trace_repository", "legacy_v1_report"] } } },
+        { "properties": { "state": { "const": "not_applicable" }, "reason": { "enum": ["span_kind_not_model_backed", "span_kind_has_no_latency", "span_kind_has_no_token_usage", "claude_private_lookup_not_supported", "cursor_private_lookup_not_supported", "codex_span_not_notify_derived", "agent_private_lookup_not_supported"] } } },
+        { "properties": { "state": { "const": "private_lookup" }, "reason": { "const": "local_opt_in_lookup_required" } } },
+        { "properties": { "state": { "const": "withheld" }, "reason": { "const": "withheld_by_privacy_policy" } } }
+      ]
+    },
+    "availability": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "turn", "model", "tokens", "latency", "sourceLocation", "requestContent", "responseContent"],
+      "properties": {
+        "repository": { "$ref": "#/$defs/field_availability" },
+        "turn": { "$ref": "#/$defs/field_availability" },
+        "model": { "$ref": "#/$defs/field_availability" },
+        "tokens": { "$ref": "#/$defs/field_availability" },
+        "latency": { "$ref": "#/$defs/field_availability" },
+        "sourceLocation": { "$ref": "#/$defs/field_availability" },
+        "requestContent": { "$ref": "#/$defs/field_availability" },
+        "responseContent": { "$ref": "#/$defs/field_availability" }
+      }
+    },
+    "attributes": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "source": { "$ref": "#/$defs/scalar" }, "event_type": { "$ref": "#/$defs/scalar" }, "envelope_type": { "$ref": "#/$defs/scalar" },
+        "session_id": { "$ref": "#/$defs/scalar" }, "turn_id": { "$ref": "#/$defs/scalar" }, "request_id": { "$ref": "#/$defs/scalar" },
+        "call_id": { "$ref": "#/$defs/scalar" }, "tool_name": { "$ref": "#/$defs/scalar" }, "phase": { "$ref": "#/$defs/scalar" },
+        "exit_code": { "$ref": "#/$defs/scalar" }, "sandbox": { "$ref": "#/$defs/scalar" }, "approval": { "$ref": "#/$defs/scalar" }
+      }
+    },
+    "metrics": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "inputTokens": { "type": "number" }, "outputTokens": { "type": "number" }, "cachedInputTokens": { "type": "number" },
+        "cacheCreationInputTokens": { "type": "number" }, "reasoningOutputTokens": { "type": "number" }, "totalTokens": { "type": "number" },
+        "latencyMs": { "type": "number" }, "durationMs": { "type": "number" }, "totalInputTokens": { "type": "number" },
+        "totalOutputTokens": { "type": "number" }, "totalCachedInputTokens": { "type": "number" }, "totalReasoningOutputTokens": { "type": "number" },
+        "totalAccumulatedTokens": { "type": "number" }, "contextWindowTokens": { "type": "number" }
+      }
+    },
+    "scalar": { "type": ["string", "number", "boolean"] },
+    "strings": { "type": "array", "items": { "type": "string" } }
+  }
+}

@@ -7,10 +7,10 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { chromium } from "playwright-core";
 import type {
-  AgentObservabilityReportV1,
+  AgentObservabilityReportV2,
   Span,
   Trace,
-} from "../ui/report/generated/report-dto-v1.js";
+} from "../ui/report/generated/report-dto-v2.js";
 
 const execute = promisify(execFile);
 
@@ -78,7 +78,7 @@ try {
     await page.goto(pathToFileURL(reportPath).href);
 
     assert.equal(await page.locator("h1").textContent(), "Agent Observability Report");
-    assert.equal(await page.locator("h2").count(), 3);
+    assert.equal(await page.locator("h2").count(), 4);
     assert.equal(await page.locator('[aria-labelledby="timeline-heading"]').count(), 1);
     assert.equal(await page.locator('[aria-labelledby="traces-heading"]').count(), 1);
     assert.equal(await page.locator('[aria-labelledby="spans-heading"]').count(), 1);
@@ -110,8 +110,20 @@ try {
     await page.locator(".trace-row:visible").first().click();
     assert.equal(await page.locator(".trace-row:visible").first().getAttribute("aria-pressed"), "true");
     assert.equal(await page.locator(".timeline-row").count() > 0, true);
+    const spanOpener = page.locator("#span-table .span-open:visible").first();
+    await spanOpener.click();
+    assert.equal(await spanOpener.getAttribute("aria-expanded"), "true");
+    assert.match((await page.locator("#span-details").textContent()) ?? "", /Source & privacy/);
+    assert.match((await page.locator("#span-details").textContent()) ?? "", /Location/);
+    assert.match(
+      (await page.locator("#private-detail").textContent()) ?? "",
+      /Not applicable: this span is not an eligible Codex notify turn\./,
+    );
 
     if (testCase.name === "mobile") {
+      await page.locator("#details-close").click();
+      assert.equal(await spanOpener.getAttribute("aria-expanded"), "false");
+      assert.equal(await spanOpener.evaluate((element) => document.activeElement === element), true);
       const heights = await page.locator("select, input, button").evaluateAll((elements) =>
         elements.map((element) => element.getBoundingClientRect().height),
       );
@@ -144,12 +156,28 @@ try {
   });
   largePage.on("requestfailed", (request) => largeFailedRequests.push(request.url()));
   await largePage.goto(pathToFileURL(largeReportPath).href);
+  assert.equal(await largePage.locator("#kpi-tokens").textContent(), "Incomplete");
+  assert.match(
+    (await largePage.locator("#trace-list .trace-row").first().textContent()) ?? "",
+    /Incomplete tokens/,
+  );
+  for (const [name, total] of [
+    ["operation-0", "15"],
+    ["operation-1", "20"],
+    ["operation-2", "37"],
+    ["operation-3", "40"],
+  ] as const) {
+    const row = largePage.locator("#span-table tr", { hasText: name });
+    assert.equal(await row.locator("td").nth(5).textContent(), total);
+  }
   assert.equal(await largePage.locator("#span-count").textContent(), "4096");
   assert.equal(await largePage.locator("#span-table tr").count(), 200);
   assert.equal(await largePage.locator("#trace-list .trace-row").count(), 100);
   assert.equal(await largePage.locator("#session-filter option").count(), 502);
   await largePage.locator("#trace-list .trace-row").first().click();
   assert.equal(await largePage.locator(".timeline-row").count(), 120);
+  await largePage.locator("#span-table .span-open").first().click();
+  assert.match((await largePage.locator("#span-details").textContent()) ?? "", /Private local detail/);
   assert.deepEqual(largeConsoleErrors, []);
   assert.deepEqual(largeExternalRequests, []);
   assert.deepEqual(largeFailedRequests, []);
@@ -181,7 +209,7 @@ function rateTable() {
   };
 }
 
-function renderReportDto(shell: string, report: AgentObservabilityReportV1): string {
+function renderReportDto(shell: string, report: AgentObservabilityReportV2): string {
   return shell
     .replaceAll("__AGENT_OBSERVABILITY_REPORT_TITLE__", report.title)
     .replaceAll("__AGENT_OBSERVABILITY_REPORT_GENERATED_AT__", report.generatedAt)
@@ -191,7 +219,7 @@ function renderReportDto(shell: string, report: AgentObservabilityReportV1): str
     );
 }
 
-function largeReportFixture(): AgentObservabilityReportV1 {
+function largeReportFixture(): AgentObservabilityReportV2 {
   const spans: Span[] = Array.from({ length: 4_096 }, (_, index) => ({
     schemaVersion: "agent_observability.v1",
     traceId: index < 200 ? "trace-large-0" : `trace-large-${1 + (index % 255)}`,
@@ -204,10 +232,22 @@ function largeReportFixture(): AgentObservabilityReportV1 {
     endTimeUnixMs: 1_005 + index * 10,
     repo: "agent-observability",
     agent: { name: "codex", model: index % 2 === 0 ? "gpt-test" : "other-model" },
+    availability: {
+      repository: { state: "available", reason: "reported_by_adapter" },
+      turn: { state: "source_unavailable", reason: "source_not_provided" },
+      model: { state: "available", reason: "reported_by_adapter" },
+      tokens: index < 4
+        ? { state: "available", reason: "reported_by_adapter" }
+        : { state: "source_unavailable", reason: "source_not_provided" },
+      latency: { state: "available", reason: "reported_by_adapter" },
+      sourceLocation: { state: "private_lookup", reason: "local_opt_in_lookup_required" },
+      requestContent: { state: "private_lookup", reason: "local_opt_in_lookup_required" },
+      responseContent: { state: "private_lookup", reason: "local_opt_in_lookup_required" },
+    },
     sessionId: `session-${index % 501}`,
     toolName: "exec_command",
     attributes: { session_id: `session-${index % 501}`, tool_name: "exec_command" },
-    metrics: { durationMs: 5 },
+    metrics: aggregateTokenMetrics(index),
     cost: { status: "unknown", rate_table: {}, cost: { assumption: "fixture" } },
   }));
   const traceIds = [...new Set(spans.map((span) => span.traceId))];
@@ -231,7 +271,7 @@ function largeReportFixture(): AgentObservabilityReportV1 {
     };
   });
   return {
-    schemaVersion: "agent_observability.report.v1",
+    schemaVersion: "agent_observability.report.v2",
     generatedAt: "2026-07-10T00:00:00.000Z",
     title: "Agent Observability Report",
     summary: {
@@ -261,4 +301,14 @@ function largeReportFixture(): AgentObservabilityReportV1 {
     traces,
     spans,
   };
+}
+
+function aggregateTokenMetrics(index: number): Span["metrics"] {
+  const tokens = [
+    { inputTokens: 10, outputTokens: 5 },
+    { totalTokens: 20 },
+    { totalInputTokens: 30, totalOutputTokens: 7 },
+    { totalAccumulatedTokens: 40 },
+  ][index];
+  return { durationMs: 5, ...tokens };
 }

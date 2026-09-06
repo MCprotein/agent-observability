@@ -11,15 +11,19 @@ use std::fmt::{self, Display, Formatter};
 pub const CONTRACT_MANIFEST: &str = include_str!("../../../contracts/contract-manifest.v1");
 pub const DURABLE_RECORD_SCHEMA: &str =
     include_str!("../../../contracts/durable-record-v1.schema.json");
-pub const REPORT_DTO_SCHEMA: &str = include_str!("../../../contracts/report-dto-v1.schema.json");
+pub const REPORT_DTO_V1_SCHEMA: &str = include_str!("../../../contracts/report-dto-v1.schema.json");
+pub const REPORT_DTO_SCHEMA: &str = include_str!("../../../contracts/report-dto-v2.schema.json");
 pub const RATE_TABLE_SCHEMA: &str = include_str!("../../../contracts/rate-table-v1.schema.json");
 pub const RETENTION_ARCHIVE_SCHEMA: &str =
     include_str!("../../../contracts/retention-archive-entry-v1.schema.json");
-pub const LOCAL_RUNTIME_CONFIG_SCHEMA: &str =
+pub const LOCAL_RUNTIME_CONFIG_V2_SCHEMA: &str =
     include_str!("../../../contracts/local-runtime-config-v2.schema.json");
+pub const LOCAL_RUNTIME_CONFIG_SCHEMA: &str =
+    include_str!("../../../contracts/local-runtime-config-v3.schema.json");
 pub const ADAPTER_CAPABILITY_V1: &str = include_str!("../capabilities/adapter-capability-v1.yaml");
 pub const DURABLE_RECORD_VERSION: &str = "agent_observability.v1";
-pub const REPORT_DTO_VERSION: &str = "agent_observability.report.v1";
+pub const REPORT_DTO_V1_VERSION: &str = "agent_observability.report.v1";
+pub const REPORT_DTO_VERSION: &str = "agent_observability.report.v2";
 pub const MAX_REPORT_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 pub const RETENTION_ARCHIVE_VERSION: &str = "agent_observability.retention_archive.v1";
 
@@ -100,13 +104,17 @@ pub struct AutomaticLocalSourceSurfaceV1 {
     pub role: String,
     pub transport: String,
     pub endpoint: String,
+    pub owned_fields: Vec<String>,
     pub events: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct AutomaticLocalPrivacyV1 {
-    pub content_fields_durable: bool,
+    pub canonical_content_fields_durable: bool,
+    pub opt_in_private_detail_fields_durable: bool,
+    pub private_detail_scope: String,
     pub raw_identifiers_durable: bool,
     pub raw_request_bodies_durable: bool,
     pub unknown_fields: AutomaticUnknownFieldPolicyV1,
@@ -195,7 +203,7 @@ fn validate_capability_entry(entry: &AdapterCapabilityEntryV1) -> Result<(), Con
 fn validate_codex_automatic_local_capability(
     capability: &CodexAutomaticLocalCapabilityV1,
 ) -> Result<(), ContractError> {
-    if capability.capability_version != "codex_automatic_local.v3"
+    if capability.capability_version != "codex_automatic_local.v4"
         || capability.adapter_family != "codex"
         || capability.support_status != "experimental"
         || capability.platforms != ["macos"]
@@ -207,11 +215,13 @@ fn validate_codex_automatic_local_capability(
             !reference.starts_with(concat!("https", "://developers.openai.com/codex/"))
         })
         || capability.receiver_boundary
-            != "private_ca_https_exact_header_ipv4_loopback_otlp_http_json_v3"
+            != "private_ca_https_exact_header_ipv4_loopback_otlp_http_json_v4"
         || capability.source_generation != "codex-otel-v1"
         || capability.manual_ingest_boundary != "private_canonical_handoff_v1"
         || capability.team_ingest != "disabled"
-        || capability.privacy.content_fields_durable
+        || capability.privacy.canonical_content_fields_durable
+        || !capability.privacy.opt_in_private_detail_fields_durable
+        || capability.privacy.private_detail_scope != "standalone_local_only_default_off"
         || capability.privacy.raw_identifiers_durable
         || capability.privacy.raw_request_bodies_durable
         || capability.privacy.unknown_fields.otlp_attributes
@@ -222,7 +232,7 @@ fn validate_codex_automatic_local_capability(
         return Err(ContractError::InvalidCapabilityManifest);
     }
 
-    if capability.source_surfaces.len() != 2 {
+    if capability.source_surfaces.len() != 3 {
         return Err(ContractError::InvalidCapabilityManifest);
     }
     let primary = &capability.source_surfaces[0];
@@ -230,6 +240,7 @@ fn validate_codex_automatic_local_capability(
         || primary.role != "primary"
         || primary.transport != "ipv4_loopback_private_ca_https_exact_header_json"
         || primary.endpoint != "/v1/logs"
+        || primary.owned_fields.is_empty()
         || primary.events
             != [
                 "codex.conversation_starts",
@@ -247,7 +258,23 @@ fn validate_codex_automatic_local_capability(
         || supplement.role != "supplement"
         || supplement.transport != "ipv4_loopback_private_ca_https_exact_header_projected_json"
         || supplement.endpoint != "/v1/notify"
+        || supplement.owned_fields != ["turn.lifecycle", "project.pseudonymous_reference"]
         || supplement.events != ["agent-turn-complete"]
+    {
+        return Err(ContractError::InvalidCapabilityManifest);
+    }
+    let private_detail = &capability.source_surfaces[2];
+    if private_detail.id != "codex_notify_private_turn_detail_v1"
+        || private_detail.role != "optional_private_detail"
+        || private_detail.transport != "ipv4_loopback_private_ca_https_exact_header_closed_json"
+        || private_detail.endpoint != "/v1/notify/private-detail"
+        || private_detail.owned_fields
+            != [
+                "source.cwd",
+                "request.input_messages",
+                "response.last_assistant_message",
+            ]
+        || private_detail.events != ["agent-turn-complete"]
     {
         return Err(ContractError::InvalidCapabilityManifest);
     }
@@ -452,6 +479,9 @@ pub enum ObservationEvent {
         project: Option<String>,
     },
     Turn,
+    TurnWithProject {
+        project: String,
+    },
     ModelRequest {
         model: Option<String>,
     },
@@ -648,6 +678,7 @@ fn project_attributes(observation: &SourceObservation, state: &DomainSpanState) 
         }
         ObservationEvent::Session { .. }
         | ObservationEvent::Turn
+        | ObservationEvent::TurnWithProject { .. }
         | ObservationEvent::ModelRequest { .. } => {}
     }
     attributes
@@ -909,6 +940,9 @@ fn event_projection(
             ("session", "session", model.as_deref(), project.as_deref())
         }
         ObservationEvent::Turn => ("turn", "turn", None, None),
+        ObservationEvent::TurnWithProject { project } => {
+            ("turn", "turn", None, Some(project.as_str()))
+        }
         ObservationEvent::ModelRequest { model } => {
             ("model_request", "llm.request", model.as_deref(), None)
         }
@@ -921,7 +955,7 @@ fn event_projection(
 fn kind_for_event(event: &ObservationEvent) -> SpanKind {
     match event {
         ObservationEvent::Session { .. } => SpanKind::AgentSession,
-        ObservationEvent::Turn => SpanKind::Turn,
+        ObservationEvent::Turn | ObservationEvent::TurnWithProject { .. } => SpanKind::Turn,
         ObservationEvent::ModelRequest { .. } => SpanKind::LlmRequest,
         ObservationEvent::ToolOperation { .. } => SpanKind::ToolExecution,
         ObservationEvent::Permission { .. } => SpanKind::Permission,
@@ -1320,6 +1354,48 @@ pub struct ReportAgentV1 {
     pub version: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AvailabilityStateV2 {
+    Available,
+    #[default]
+    SourceUnavailable,
+    Withheld,
+    NotApplicable,
+    PrivateLookup,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct FieldAvailabilityV2 {
+    pub state: AvailabilityStateV2,
+    pub reason: String,
+}
+
+impl Default for FieldAvailabilityV2 {
+    fn default() -> Self {
+        Self {
+            state: AvailabilityStateV2::SourceUnavailable,
+            reason: "not_evaluated".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReportAvailabilityV2 {
+    pub repository: FieldAvailabilityV2,
+    pub turn: FieldAvailabilityV2,
+    pub model: FieldAvailabilityV2,
+    pub tokens: FieldAvailabilityV2,
+    pub latency: FieldAvailabilityV2,
+    pub source_location: FieldAvailabilityV2,
+    pub request_content: FieldAvailabilityV2,
+    pub response_content: FieldAvailabilityV2,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReportAttributesV1 {
@@ -1347,6 +1423,37 @@ pub struct ReportAttributesV1 {
     pub sandbox: Option<ScalarValueV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval: Option<ScalarValueV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReportSpanV2 {
+    pub schema_version: String,
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
+    #[serde(with = "span_kind_serde")]
+    pub kind: SpanKind,
+    pub name: String,
+    #[serde(with = "status_code_serde")]
+    pub status: StatusCode,
+    pub start_time_unix_ms: f64,
+    pub end_time_unix_ms: Option<f64>,
+    pub repo: String,
+    pub agent: ReportAgentV1,
+    pub availability: ReportAvailabilityV2,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    pub attributes: ReportAttributesV1,
+    pub metrics: ReportMetricsV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost: Option<f64>,
+    pub cost: CostEstimateV1,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1417,7 +1524,7 @@ impl ReportDtoV1 {
     ///
     /// Returns [`ContractError`] for a wrong version or invalid nested number/status.
     pub fn validate(&self) -> Result<(), ContractError> {
-        if self.schema_version != REPORT_DTO_VERSION {
+        if self.schema_version != REPORT_DTO_V1_VERSION {
             return Err(ContractError::InvalidReportVersion);
         }
         validate_finite(self.summary.estimated_cost)?;
@@ -1442,6 +1549,194 @@ impl ReportDtoV1 {
             validate_cost(&span.cost)?;
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReportDtoV2 {
+    pub schema_version: String,
+    pub generated_at: String,
+    pub title: String,
+    pub summary: ReportSummaryV1,
+    pub cost: CostEstimateV1,
+    pub filters: ReportFiltersV1,
+    pub traces: Vec<TraceSummaryV1>,
+    pub spans: Vec<ReportSpanV2>,
+}
+
+impl ReportDtoV2 {
+    /// Validates the current closed report wire contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractError`] for a wrong version or invalid nested value.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.schema_version != REPORT_DTO_VERSION {
+            return Err(ContractError::InvalidReportVersion);
+        }
+        validate_finite(self.summary.estimated_cost)?;
+        validate_cost(&self.cost)?;
+        for trace in &self.traces {
+            validate_finite(trace.estimated_cost)?;
+            validate_finite(trace.start_time_unix_ms)?;
+            if let Some(end) = trace.end_time_unix_ms {
+                validate_finite(end)?;
+            }
+        }
+        for span in &self.spans {
+            validate_finite(span.start_time_unix_ms)?;
+            if let Some(end) = span.end_time_unix_ms {
+                validate_finite(end)?;
+            }
+            validate_report_attributes(&span.attributes)?;
+            validate_report_metrics(&span.metrics)?;
+            let token_metrics_present = report_token_metrics_present(&span.metrics);
+            let token_total_present = report_token_total_present(&span.metrics);
+            let token_availability_valid = if token_total_present {
+                span.availability.tokens.state == AvailabilityStateV2::Available
+            } else if token_metrics_present {
+                span.availability.tokens.state == AvailabilityStateV2::SourceUnavailable
+                    && span.availability.tokens.reason == "partial_token_metrics"
+            } else {
+                span.availability.tokens.state != AvailabilityStateV2::Available
+            };
+            if !token_availability_valid {
+                return Err(ContractError::ContradictoryReportAvailability);
+            }
+            for field in [
+                &span.availability.repository,
+                &span.availability.turn,
+                &span.availability.model,
+                &span.availability.tokens,
+                &span.availability.latency,
+                &span.availability.source_location,
+                &span.availability.request_content,
+                &span.availability.response_content,
+            ] {
+                if !valid_availability_reason(field) {
+                    return Err(ContractError::ContradictoryReportAvailability);
+                }
+            }
+            if let Some(amount) = span.estimated_cost {
+                validate_finite(amount)?;
+            }
+            validate_cost(&span.cost)?;
+        }
+        Ok(())
+    }
+}
+
+fn valid_availability_reason(field: &FieldAvailabilityV2) -> bool {
+    use AvailabilityStateV2::{
+        Available, NotApplicable, PrivateLookup, SourceUnavailable, Withheld,
+    };
+    matches!(
+        (field.state, field.reason.as_str()),
+        (
+            Available,
+            "reported_by_adapter" | "derived_from_trace_context" | "legacy_v1_report"
+        ) | (
+            SourceUnavailable,
+            "source_not_provided"
+                | "not_evaluated"
+                | "partial_token_metrics"
+                | "historical_codex_source_not_lookup_eligible"
+                | "codex_notify_turn_correlation_unavailable"
+                | "ambiguous_trace_repository"
+                | "legacy_v1_report"
+        ) | (
+            NotApplicable,
+            "span_kind_not_model_backed"
+                | "span_kind_has_no_latency"
+                | "span_kind_has_no_token_usage"
+                | "claude_private_lookup_not_supported"
+                | "cursor_private_lookup_not_supported"
+                | "codex_span_not_notify_derived"
+                | "agent_private_lookup_not_supported"
+        ) | (PrivateLookup, "local_opt_in_lookup_required")
+            | (Withheld, "withheld_by_privacy_policy")
+    )
+}
+
+impl TryFrom<ReportDtoV1> for ReportDtoV2 {
+    type Error = ContractError;
+
+    fn try_from(legacy: ReportDtoV1) -> Result<Self, Self::Error> {
+        legacy.validate()?;
+        let report = Self {
+            schema_version: REPORT_DTO_VERSION.into(),
+            generated_at: legacy.generated_at,
+            title: legacy.title,
+            summary: legacy.summary,
+            cost: legacy.cost,
+            filters: legacy.filters,
+            traces: legacy.traces,
+            spans: legacy.spans.into_iter().map(ReportSpanV2::from).collect(),
+        };
+        report.validate()?;
+        Ok(report)
+    }
+}
+
+impl From<ReportSpanV1> for ReportSpanV2 {
+    fn from(legacy: ReportSpanV1) -> Self {
+        let availability = ReportAvailabilityV2::legacy_v1(&legacy.metrics);
+        Self {
+            schema_version: legacy.schema_version,
+            trace_id: legacy.trace_id,
+            span_id: legacy.span_id,
+            parent_span_id: legacy.parent_span_id,
+            kind: legacy.kind,
+            name: legacy.name,
+            status: legacy.status,
+            start_time_unix_ms: legacy.start_time_unix_ms,
+            end_time_unix_ms: legacy.end_time_unix_ms,
+            repo: legacy.repo,
+            agent: legacy.agent,
+            availability,
+            session_id: legacy.session_id,
+            turn_id: legacy.turn_id,
+            tool_name: legacy.tool_name,
+            attributes: legacy.attributes,
+            metrics: legacy.metrics,
+            estimated_cost: legacy.estimated_cost,
+            cost: legacy.cost,
+        }
+    }
+}
+
+impl ReportAvailabilityV2 {
+    fn legacy_v1(metrics: &ReportMetricsV1) -> Self {
+        let unavailable = FieldAvailabilityV2 {
+            state: AvailabilityStateV2::SourceUnavailable,
+            reason: "legacy_v1_report".into(),
+        };
+        let tokens = FieldAvailabilityV2 {
+            state: if report_token_total_present(metrics) {
+                AvailabilityStateV2::Available
+            } else {
+                AvailabilityStateV2::SourceUnavailable
+            },
+            reason:
+                if report_token_metrics_present(metrics) && !report_token_total_present(metrics) {
+                    "partial_token_metrics"
+                } else {
+                    "legacy_v1_report"
+                }
+                .into(),
+        };
+        Self {
+            repository: unavailable.clone(),
+            turn: unavailable.clone(),
+            model: unavailable.clone(),
+            tokens,
+            latency: unavailable.clone(),
+            source_location: unavailable.clone(),
+            request_content: unavailable.clone(),
+            response_content: unavailable,
+        }
     }
 }
 
@@ -1555,6 +1850,26 @@ fn validate_report_metrics(metrics: &ReportMetricsV1) -> Result<(), ContractErro
     Ok(())
 }
 
+fn report_token_metrics_present(metrics: &ReportMetricsV1) -> bool {
+    [
+        metrics.input_tokens,
+        metrics.output_tokens,
+        metrics.total_tokens,
+        metrics.total_input_tokens,
+        metrics.total_output_tokens,
+        metrics.total_accumulated_tokens,
+    ]
+    .into_iter()
+    .any(|value| value.is_some())
+}
+
+fn report_token_total_present(metrics: &ReportMetricsV1) -> bool {
+    metrics.total_tokens.is_some()
+        || metrics.total_accumulated_tokens.is_some()
+        || (metrics.input_tokens.is_some() && metrics.output_tokens.is_some())
+        || (metrics.total_input_tokens.is_some() && metrics.total_output_tokens.is_some())
+}
+
 fn validate_scalar(value: &ScalarValueV1) -> Result<(), ContractError> {
     if let ScalarValueV1::Number(number) = value {
         validate_finite(*number)?;
@@ -1650,9 +1965,32 @@ impl ContractManifest {
             "retention_archive",
             "agent_observability.retention_archive.v1",
         )?;
-        self.expect("local_runtime_config", "local_runtime.v2")?;
+        self.expect("local_runtime_config", "local_runtime.v3")?;
         self.expect("durable_schema", "contracts/durable-record-v1.schema.json")?;
-        self.expect("report_schema", "contracts/report-dto-v1.schema.json")?;
+        self.expect("report_schema", "contracts/report-dto-v2.schema.json")?;
+        self.expect(
+            "report_compatibility_schema",
+            "contracts/report-dto-v1.schema.json",
+        )?;
+        self.expect(
+            "report_compatibility_fixture",
+            "contracts/report-dto-v1.compatibility.fixture.json",
+        )?;
+        self.expect("report_fixture", "contracts/report-dto-v2.fixture.json")?;
+        self.expect("report_parity", "contracts/report-dto-v2.parity.json")?;
+        self.expect(
+            "private_codex_turn_detail",
+            "agent_observability.private_turn_detail.v1",
+        )?;
+        self.expect(
+            "private_codex_turn_detail_schema",
+            "contracts/private-codex-turn-detail-v1.schema.json",
+        )?;
+        self.expect(
+            "private_codex_turn_detail_parity",
+            "contracts/private-codex-turn-detail-v1.parity.json",
+        )?;
+        self.expect("private_codex_turn_detail_scope", "standalone_local_only")?;
         self.expect("rate_table_schema", "contracts/rate-table-v1.schema.json")?;
         self.expect(
             "retention_archive_schema",
@@ -1660,15 +1998,19 @@ impl ContractManifest {
         )?;
         self.expect(
             "local_runtime_config_schema",
+            "contracts/local-runtime-config-v3.schema.json",
+        )?;
+        self.expect(
+            "local_runtime_config_compatibility_schema",
             "contracts/local-runtime-config-v2.schema.json",
         )?;
         self.expect(
             "local_runtime_config_fixture",
-            "contracts/local-runtime-config-v2.fixture.json",
+            "contracts/local-runtime-config-v3.fixture.json",
         )?;
         self.expect(
             "local_runtime_config_parity",
-            "contracts/local-runtime-config-v2.parity.json",
+            "contracts/local-runtime-config-v3.parity.json",
         )?;
         self.expect("team_ingest", "disabled")?;
         Ok(())
@@ -1695,6 +2037,7 @@ pub enum ContractError {
     InvalidDurableHeader,
     MissingDurableIdentity,
     InvalidReportVersion,
+    ContradictoryReportAvailability,
     EmptyOptionalString,
     InvalidCostStatus,
     NonFiniteNumber,
@@ -1724,6 +2067,9 @@ impl Display for ContractError {
                 formatter.write_str("durable identity fields are required")
             }
             Self::InvalidReportVersion => formatter.write_str("invalid report DTO version"),
+            Self::ContradictoryReportAvailability => {
+                formatter.write_str("report availability contradicts report metrics")
+            }
             Self::EmptyOptionalString => {
                 formatter.write_str("optional contract strings must not be empty")
             }
@@ -1800,18 +2146,23 @@ mod tests {
             .automatic_local_capabilities
             .first()
             .expect("Codex automatic local capability exists");
-        assert_eq!(automatic.capability_version, "codex_automatic_local.v3");
+        assert_eq!(automatic.capability_version, "codex_automatic_local.v4");
         assert_eq!(automatic.support_status, "experimental");
         assert_eq!(automatic.product_version, "0.152.1");
         assert_eq!(automatic.verified_at, "2026-09-03");
         assert_eq!(
             automatic.receiver_boundary,
-            "private_ca_https_exact_header_ipv4_loopback_otlp_http_json_v3"
+            "private_ca_https_exact_header_ipv4_loopback_otlp_http_json_v4"
         );
         assert_eq!(automatic.source_generation, "codex-otel-v1");
         assert_eq!(automatic.manual_ingest_boundary, codex.ingest_boundary);
         assert_eq!(automatic.team_ingest, "disabled");
-        assert!(!automatic.privacy.content_fields_durable);
+        assert!(!automatic.privacy.canonical_content_fields_durable);
+        assert!(automatic.privacy.opt_in_private_detail_fields_durable);
+        assert_eq!(
+            automatic.privacy.private_detail_scope,
+            "standalone_local_only_default_off"
+        );
         assert!(!automatic.privacy.raw_identifiers_durable);
         assert!(!automatic.privacy.raw_request_bodies_durable);
         assert_eq!(
@@ -1864,7 +2215,7 @@ mod tests {
                 serde_json::json!(concat!("https", "://collector.example.com/v1/logs")),
             ),
             (
-                "/automatic_local_capabilities/0/privacy/content_fields_durable",
+                "/automatic_local_capabilities/0/privacy/canonical_content_fields_durable",
                 serde_json::json!(true),
             ),
             (
