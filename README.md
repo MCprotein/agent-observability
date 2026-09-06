@@ -4,7 +4,7 @@ Codex, Claude Code, Cursor의 token 사용량, latency, tool 실행, error, perm
 로컬 대시보드에서 확인하는 privacy-first macOS CLI다. 외부 서버나 계정 없이 동작하며 데이터와
 HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 
-> **v1.10.0 릴리스 후보.** 현재 수집 데이터의 `unknown`을 필드별 가용성으로 설명하고, 검증된 Codex
+> **v1.10.0 안정판.** 현재 수집 데이터의 `unknown`을 필드별 가용성으로 설명하고, 검증된 Codex
 > metadata로 pseudonymous project reference와 source location을 보강한다. 원문 request detail은 standalone에서만
 > 명시적으로 opt-in한 private detail 저장소와 별도 상세 화면을 사용하며 기본값은 계속 꺼짐이다.
 > assistant response 원문은 공식 source가 제공하지 않으면 `unavailable`로 표시하고 추측하거나
@@ -27,7 +27,7 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 > script는 `agentobs setup ~/.agent-observability --no-open`처럼 root를 명시한다. 자동 연결은 이후
 > 설정 UI 또는 고급 lifecycle 명령으로 언제든 추가할 수 있다.
 
-아래 빠른 시작은 v1.10.0 기준이다. 릴리스 후보 검증 중에는 installer URL이 tag 게시 뒤 활성화된다.
+아래 빠른 시작은 v1.10.0 기준이다.
 
 ## 빠른 시작
 
@@ -37,7 +37,7 @@ HTML 대시보드는 사용자 Mac 밖으로 전송되지 않는다.
 release checksum과 실행 파일 버전을 확인한 뒤 `~/.local/bin`에 원자적으로 설치하고, 현재 shell의
 profile에 PATH 블록을 한 번만 등록한다.
 
-릴리스 후 게시되는 v1.10.0 installer를 사용한다. 태그 게시 전에는 아래 URL이 아직 존재하지 않는다.
+공개된 v1.10.0 installer를 사용한다.
 
 ```bash
 (
@@ -250,7 +250,7 @@ WebSocket 경로는
 `codex.websocket_request`를 시작 이벤트로 삼고 token usage가 있는 `response.completed`와 private
 correlation ID로 연결한다. v1.8.2에서 이 상관관계가 추가됐고, v1.8.3은 이후 비소유 Codex 설정을
 안전하게 ownership snapshot에 재조정한다. v1.8.4는 이 경계를 넓히지 않고 SQLite operational-error
-fidelity와 deterministic concurrency coverage를 보강했다. 게시된 최신 안정판은 v1.9.1이며 automatic
+fidelity와 deterministic concurrency coverage를 보강했다. 게시된 최신 안정판은 v1.10.0이며 automatic
 capability의 공식 release pin은 계속 Codex 0.152.1이다.
 
 | Agent | Pinned / verified version | 현재 지원 | 알려진 제한 |
@@ -367,7 +367,7 @@ npm login \
   --scope=@mcprotein \
   --auth-type=legacy \
   --registry=https://npm.pkg.github.com
-npm install --global @mcprotein/agent-observability@1.8.4 \
+npm install --global @mcprotein/agent-observability@1.10.0 \
   --registry=https://npm.pkg.github.com
 ```
 

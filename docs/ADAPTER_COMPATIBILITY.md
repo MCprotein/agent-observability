@@ -1,6 +1,6 @@
 # Adapter Compatibility Contract
 
-Status: v1.10.0 release candidate; Codex 0.152.1 automatic local boundary remains experimental with prior exact-revision release evidence; exact-version private imports supported
+Status: v1.10.0 released; Codex 0.152.1 automatic local boundary remains experimental with exact-revision release evidence recorded in [Release Review](reviews/v1.10.0.md); exact-version private imports supported
 Last verified: 2026-09-05
 
 이 문서는 Codex, Claude Code, Cursor adapter가 어떤 공식 surface를 어떤 우선순위로 사용하고,
