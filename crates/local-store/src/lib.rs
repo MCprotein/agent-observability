@@ -3558,6 +3558,8 @@ fn lifecycle_backfill_initial(db: &Connection) -> Result<String, StoreError> {
         "done": false,
         "after_observation_rowid": 0,
         "highwater_observation_rowid": highwater_observation_rowid,
+        "scan_complete": false,
+        "blocked_traces": 0,
         "active": null,
     }))?)
 }
@@ -7015,7 +7017,7 @@ mod tests {
         let mut large = observation("1", "large", None);
         large.trace_id = TraceId::parse("large-trace").unwrap();
         large.event = ObservationEvent::ToolOperation {
-            tool_name: Some("x".repeat(2 * 1024 * 1024 + 1024)),
+            tool_name: Some("x".repeat(96 * 1024)),
             phase: None,
         };
         store.ingest(&large).unwrap();
@@ -7026,7 +7028,7 @@ mod tests {
             store
                 .db
                 .query_row(
-                    "SELECT MAX(octet_length(projected_json))>2097152 FROM observations",
+                    "SELECT MAX(octet_length(projected_json))>65536 FROM observations",
                     [],
                     |row| row.get::<_, bool>(0),
                 )
@@ -7069,6 +7071,77 @@ mod tests {
                 .unwrap(),
             2
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_backfill_reports_terminal_oversize_and_advances_to_later_trace() {
+        let dir = temp_dir("lifecycle-backfill-terminal-oversize");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let mut oversized = observation("1", "oversized", None);
+        oversized.trace_id = TraceId::parse("oversized-trace").unwrap();
+        oversized.event = ObservationEvent::ToolOperation {
+            tool_name: Some("x".repeat(2 * 1024 * 1024 + 1024)),
+            phase: None,
+        };
+        store.ingest(&oversized).unwrap();
+        let mut later = observation_after("2", Some("1"), "later", None);
+        later.trace_id = TraceId::parse("later-trace").unwrap();
+        store.ingest(&later).unwrap();
+        let database = store.database_path();
+        drop(store);
+        downgrade_to_v4_schema(&database);
+
+        let store = LocalStore::open_with_migration_headroom(&dir, u64::MAX).unwrap();
+        let request = LifecycleRequest {
+            max_archive_records: 1,
+            max_archive_bytes: 64 * 1024,
+            ..lifecycle_request(0)
+        };
+        let mut observed_blocked = false;
+        for _ in 0..8 {
+            let result = store.maintain_lifecycle(request).unwrap();
+            observed_blocked |= result.blocked > 0;
+            if store
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM hot_trace_index WHERE trace_id=?1 AND indexed_complete=1)",
+                    [hash_opaque_identifier("later-trace")],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+            {
+                break;
+            }
+        }
+        assert!(observed_blocked);
+        assert!(
+            store
+                .lifecycle_preflight(request)
+                .unwrap()
+                .has_backfill_pending
+        );
+        assert!(store.maintain_lifecycle(request).unwrap().blocked > 0);
+        assert_eq!(
+            store
+                .db
+                .query_row(
+                    "SELECT indexed_complete, record_count, estimated_bytes FROM hot_trace_index WHERE trace_id=?1",
+                    [hash_opaque_identifier("oversized-trace")],
+                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+                )
+                .unwrap(),
+            (false, 0, 0)
+        );
+        assert!(store
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM hot_trace_index WHERE trace_id=?1 AND indexed_complete=1)",
+                [hash_opaque_identifier("later-trace")],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 

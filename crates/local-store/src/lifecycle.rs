@@ -22,6 +22,7 @@ const ROW_OVERHEAD_BYTES: u64 = 512;
 const PREFLIGHT_FIXED_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_INCREMENTAL_VACUUM_PAGES: u64 = 128;
 const MAX_BACKFILL_ROWS_PER_PASS: u32 = 128;
+const MAX_BACKFILL_BYTES_PER_PASS: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LifecycleRequest {
@@ -327,7 +328,7 @@ impl LocalStore {
         &self,
         request: LifecycleRequest,
     ) -> Result<LifecycleResult, StoreError> {
-        backfill_hot_trace_index(&self.db, request)?;
+        let backfill_blocked = backfill_hot_trace_index(&self.db, request)?;
         let hot_cutoff = cutoff(request.now_unix_ms, request.hot_days);
         let warm_cutoff = cutoff(request.now_unix_ms, request.warm_days);
         let delete_cutoff = cutoff(request.now_unix_ms, request.delete_after_days);
@@ -350,7 +351,7 @@ impl LocalStore {
             moved_to_warm: 0,
             moved_to_cold: 0,
             deleted: 0,
-            blocked: 0,
+            blocked: backfill_blocked,
             deferred: 0,
             touched_records: 0,
             touched_bytes: 0,
@@ -393,7 +394,9 @@ impl LocalStore {
                 CapacityAdmission::Admitted(totals) => totals,
                 disposition => {
                     match disposition {
-                        CapacityAdmission::Blocked => result.blocked += 1,
+                        CapacityAdmission::Blocked => {
+                            result.blocked = result.blocked.saturating_add(1);
+                        }
                         CapacityAdmission::Deferred => result.deferred += 1,
                         CapacityAdmission::Admitted(_) => unreachable!(),
                     }
@@ -596,6 +599,10 @@ struct BackfillState {
     done: bool,
     after_observation_rowid: i64,
     highwater_observation_rowid: i64,
+    #[serde(default)]
+    scan_complete: bool,
+    #[serde(default)]
+    blocked_traces: u16,
     active: Option<BackfillTrace>,
 }
 
@@ -611,6 +618,8 @@ struct BackfillTrace {
     record_after_commit_seq: i64,
     record_count: u64,
     record_bytes: u64,
+    #[serde(default)]
+    blocked: bool,
 }
 
 impl BackfillTrace {
@@ -626,6 +635,7 @@ impl BackfillTrace {
             record_after_commit_seq: 0,
             record_count: 0,
             record_bytes: 0,
+            blocked: false,
         }
     }
 }
@@ -646,8 +656,14 @@ pub(super) fn invalidate_legacy_backfill_trace(
     if state.done {
         return Err(StoreError::SchemaMismatch);
     }
+    if state.scan_complete {
+        return Ok(());
+    }
     if state.active.as_ref().map(|active| active.trace_id.as_str()) == Some(trace_id) {
-        state.active = Some(BackfillTrace::new(trace_id.to_owned()));
+        let blocked = state.active.as_ref().is_some_and(|active| active.blocked);
+        let mut active = BackfillTrace::new(trace_id.to_owned());
+        active.blocked = blocked;
+        state.active = Some(active);
         tx.execute(
             "UPDATE metadata SET value=?1 WHERE key=?2",
             params![
@@ -655,6 +671,9 @@ pub(super) fn invalidate_legacy_backfill_trace(
                 LIFECYCLE_BACKFILL_CURSOR_KEY
             ],
         )?;
+        return Ok(());
+    }
+    if terminally_blocked_backfill_trace(tx, trace_id)? {
         return Ok(());
     }
     let future_legacy_observation = tx.query_row(
@@ -672,6 +691,17 @@ pub(super) fn invalidate_legacy_backfill_trace(
     Err(StoreError::SchemaMismatch)
 }
 
+fn terminally_blocked_backfill_trace(
+    db: &rusqlite::Connection,
+    trace_id: &str,
+) -> Result<bool, StoreError> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM hot_trace_index WHERE trace_id=?1 AND indexed_complete=0 AND record_count=0 AND estimated_bytes=0)",
+        [trace_id],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the bounded row cursor and its persisted accumulator form one transactional state machine"
@@ -679,14 +709,14 @@ pub(super) fn invalidate_legacy_backfill_trace(
 fn backfill_hot_trace_index(
     db: &rusqlite::Connection,
     request: LifecycleRequest,
-) -> Result<(), StoreError> {
+) -> Result<u16, StoreError> {
     let observed_cursor = required_schema_text(db.query_row(
         "SELECT value FROM metadata WHERE key=?1",
         [LIFECYCLE_BACKFILL_CURSOR_KEY],
         |row| row.get(0),
     ))?;
     if observed_cursor == LIFECYCLE_BACKFILL_COMPLETE {
-        return Ok(());
+        return Ok(0);
     }
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
     let encoded = required_schema_text(tx.query_row(
@@ -696,16 +726,21 @@ fn backfill_hot_trace_index(
     ))?;
     if encoded == LIFECYCLE_BACKFILL_COMPLETE {
         tx.commit()?;
-        return Ok(());
+        return Ok(0);
     }
     let mut state: BackfillState = serde_json::from_str(&encoded)?;
     if state.done {
         return Err(StoreError::SchemaMismatch);
     }
-    // The bundled SQLite's `octet_length(column)` reads the stored byte length
-    // from cell metadata, so payload size does not control backfill admission.
-    // The row cursor is the transaction work bound.
+    if state.scan_complete {
+        tx.commit()?;
+        return Ok(state.blocked_traces);
+    }
+    // The bundled SQLite's `octet_length(column)` reads byte length from cell
+    // metadata. The row cursor bounds scans; the byte cap admits normal traces
+    // and marks a larger whole trace terminally blocked without loading payloads.
     let mut remaining_rows = request.max_archive_records.min(MAX_BACKFILL_ROWS_PER_PASS);
+    let mut remaining_bytes = MAX_BACKFILL_BYTES_PER_PASS;
     let mut completed_traces = 0_u16;
     while remaining_rows > 0 && completed_traces < request.max_traces_per_pass {
         if state.active.is_none() {
@@ -720,19 +755,24 @@ fn backfill_hot_trace_index(
                 )
                 .optional()?;
             let Some((rowid, trace_id)) = next else {
-                state.done = true;
+                if state.blocked_traces == 0 {
+                    state.done = true;
+                } else {
+                    state.scan_complete = true;
+                }
                 break;
             };
             state.after_observation_rowid = rowid;
-            let indexed_complete = tx
+            let index_state = tx
                 .query_row(
-                    "SELECT indexed_complete FROM hot_trace_index WHERE trace_id=?1",
+                    "SELECT indexed_complete, record_count=0 AND estimated_bytes=0 FROM hot_trace_index WHERE trace_id=?1",
                     [&trace_id],
-                    |row| row.get::<_, bool>(0),
+                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
                 )
-                .optional()?
-                .unwrap_or(false);
-            if indexed_complete {
+                .optional()?;
+            if index_state
+                .is_some_and(|(complete, terminally_blocked)| complete || terminally_blocked)
+            {
                 completed_traces += 1;
                 continue;
             }
@@ -749,12 +789,26 @@ fn backfill_hot_trace_index(
                 .optional()?;
             if let Some((millis, event_id, bytes)) = row {
                 let bytes = u64::try_from(bytes).map_err(|_| StoreError::SchemaMismatch)?;
+                if !active.blocked
+                    && bytes <= MAX_BACKFILL_BYTES_PER_PASS
+                    && bytes > remaining_bytes
+                {
+                    break;
+                }
                 active.observation_after_millis.clone_from(&millis);
                 active.observation_after_event_id = event_id;
                 active.latest_observed_at_unix_ms = millis;
                 active.observation_count = active.observation_count.saturating_add(1);
-                active.observation_bytes = active.observation_bytes.saturating_add(bytes);
                 remaining_rows -= 1;
+                if bytes > MAX_BACKFILL_BYTES_PER_PASS {
+                    if !active.blocked {
+                        active.blocked = true;
+                        state.blocked_traces = state.blocked_traces.saturating_add(1);
+                    }
+                } else if !active.blocked {
+                    active.observation_bytes = active.observation_bytes.saturating_add(bytes);
+                    remaining_bytes -= bytes;
+                }
                 continue;
             }
             active.observations_done = true;
@@ -768,10 +822,30 @@ fn backfill_hot_trace_index(
             .optional()?;
         if let Some((commit_seq, bytes)) = row {
             let bytes = u64::try_from(bytes).map_err(|_| StoreError::SchemaMismatch)?;
+            if !active.blocked && bytes <= MAX_BACKFILL_BYTES_PER_PASS && bytes > remaining_bytes {
+                break;
+            }
             active.record_after_commit_seq = commit_seq;
             active.record_count = active.record_count.saturating_add(1);
-            active.record_bytes = active.record_bytes.saturating_add(bytes);
             remaining_rows -= 1;
+            if bytes > MAX_BACKFILL_BYTES_PER_PASS {
+                if !active.blocked {
+                    active.blocked = true;
+                    state.blocked_traces = state.blocked_traces.saturating_add(1);
+                }
+            } else if !active.blocked {
+                active.record_bytes = active.record_bytes.saturating_add(bytes);
+                remaining_bytes -= bytes;
+            }
+            continue;
+        }
+        if active.blocked {
+            tx.execute(
+                "INSERT INTO hot_trace_index(trace_id, scan_key, latest_observed_at_unix_ms, unresolved, record_count, estimated_bytes, indexed_complete) VALUES (?1,?1,?2,0,0,0,0) ON CONFLICT(trace_id) DO UPDATE SET latest_observed_at_unix_ms=excluded.latest_observed_at_unix_ms, unresolved=0, record_count=0, estimated_bytes=0, indexed_complete=0",
+                params![active.trace_id, active.latest_observed_at_unix_ms],
+            )?;
+            state.active = None;
+            completed_traces += 1;
             continue;
         }
         if active.record_count == 0 || active.latest_observed_at_unix_ms.is_empty() {
@@ -794,7 +868,7 @@ fn backfill_hot_trace_index(
         params![next, LIFECYCLE_BACKFILL_CURSOR_KEY],
     )?;
     tx.commit()?;
-    Ok(())
+    Ok(state.blocked_traces)
 }
 
 fn parse_millis(value: &str) -> Result<u64, StoreError> {
