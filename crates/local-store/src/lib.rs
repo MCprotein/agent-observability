@@ -7007,6 +7007,71 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn legacy_backfill_metadata_scan_progresses_past_large_valid_row() {
+        let dir = temp_dir("lifecycle-backfill-large-row");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        let mut large = observation("1", "large", None);
+        large.trace_id = TraceId::parse("large-trace").unwrap();
+        large.event = ObservationEvent::ToolOperation {
+            tool_name: Some("x".repeat(2 * 1024 * 1024 + 1024)),
+            phase: None,
+        };
+        store.ingest(&large).unwrap();
+        let mut later = observation_after("2", Some("1"), "later", None);
+        later.trace_id = TraceId::parse("later-trace").unwrap();
+        store.ingest(&later).unwrap();
+        assert!(
+            store
+                .db
+                .query_row(
+                    "SELECT MAX(octet_length(projected_json))>2097152 FROM observations",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        let database = store.database_path();
+        drop(store);
+        downgrade_to_v4_schema(&database);
+
+        let store = LocalStore::open_with_migration_headroom(&dir, u64::MAX).unwrap();
+        let request = LifecycleRequest {
+            max_archive_records: 1,
+            max_archive_bytes: 64 * 1024,
+            ..lifecycle_request(0)
+        };
+        for _ in 0..8 {
+            if !store
+                .lifecycle_preflight(request)
+                .unwrap()
+                .has_backfill_pending
+            {
+                break;
+            }
+            store.maintain_lifecycle(request).unwrap();
+        }
+        assert!(
+            !store
+                .lifecycle_preflight(request)
+                .unwrap()
+                .has_backfill_pending
+        );
+        assert_eq!(
+            store
+                .db
+                .query_row(
+                    "SELECT COUNT(*) FROM hot_trace_index WHERE indexed_complete=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn assert_indexed_lifecycle_query_plans(db: &Connection) {
         for (table, sql) in [
             (

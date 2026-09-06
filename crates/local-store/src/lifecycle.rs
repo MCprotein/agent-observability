@@ -702,8 +702,10 @@ fn backfill_hot_trace_index(
     if state.done {
         return Err(StoreError::SchemaMismatch);
     }
+    // The bundled SQLite's `octet_length(column)` reads the stored byte length
+    // from cell metadata, so payload size does not control backfill admission.
+    // The row cursor is the transaction work bound.
     let mut remaining_rows = request.max_archive_records.min(MAX_BACKFILL_ROWS_PER_PASS);
-    let mut remaining_bytes = request.max_archive_bytes;
     let mut completed_traces = 0_u16;
     while remaining_rows > 0 && completed_traces < request.max_traces_per_pass {
         if state.active.is_none() {
@@ -740,44 +742,36 @@ fn backfill_hot_trace_index(
         if !active.observations_done {
             let row = tx
                 .query_row(
-                    "SELECT observed_at_unix_ms, event_id, length(projected_json)+length(payload_hash)+?4 FROM observations WHERE trace_id=?1 AND (observed_at_unix_ms>?2 OR (observed_at_unix_ms=?2 AND event_id>?3)) ORDER BY observed_at_unix_ms, event_id LIMIT 1",
+                    "SELECT observed_at_unix_ms, event_id, octet_length(projected_json)+octet_length(payload_hash)+?4 FROM observations WHERE trace_id=?1 AND (observed_at_unix_ms>?2 OR (observed_at_unix_ms=?2 AND event_id>?3)) ORDER BY observed_at_unix_ms, event_id LIMIT 1",
                     params![active.trace_id, active.observation_after_millis, active.observation_after_event_id, i64::try_from(ROW_OVERHEAD_BYTES).map_err(|_| StoreError::SchemaMismatch)?],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
                 )
                 .optional()?;
             if let Some((millis, event_id, bytes)) = row {
                 let bytes = u64::try_from(bytes).map_err(|_| StoreError::SchemaMismatch)?;
-                if bytes > remaining_bytes {
-                    break;
-                }
                 active.observation_after_millis.clone_from(&millis);
                 active.observation_after_event_id = event_id;
                 active.latest_observed_at_unix_ms = millis;
                 active.observation_count = active.observation_count.saturating_add(1);
                 active.observation_bytes = active.observation_bytes.saturating_add(bytes);
                 remaining_rows -= 1;
-                remaining_bytes -= bytes;
                 continue;
             }
             active.observations_done = true;
         }
         let row = tx
             .query_row(
-                "SELECT commit_seq, length(state_json)+length(record_json)+?3 FROM records WHERE trace_id=?1 AND commit_seq>?2 ORDER BY commit_seq LIMIT 1",
+                "SELECT commit_seq, octet_length(state_json)+octet_length(record_json)+?3 FROM records WHERE trace_id=?1 AND commit_seq>?2 ORDER BY commit_seq LIMIT 1",
                 params![active.trace_id, active.record_after_commit_seq, i64::try_from(ROW_OVERHEAD_BYTES).map_err(|_| StoreError::SchemaMismatch)?],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()?;
         if let Some((commit_seq, bytes)) = row {
             let bytes = u64::try_from(bytes).map_err(|_| StoreError::SchemaMismatch)?;
-            if bytes > remaining_bytes {
-                break;
-            }
             active.record_after_commit_seq = commit_seq;
             active.record_count = active.record_count.saturating_add(1);
             active.record_bytes = active.record_bytes.saturating_add(bytes);
             remaining_rows -= 1;
-            remaining_bytes -= bytes;
             continue;
         }
         if active.record_count == 0 || active.latest_observed_at_unix_ms.is_empty() {
