@@ -389,8 +389,10 @@ a privacy-safe aggregate contribution journal and versioned checkpoints ahead of
 ## Durable state
 
 SQLite local_state.v4 is authoritative in published v1.10.0; the v1.11 development branch uses
-local_state.v6, retaining v5 tier storage and private lifecycle control tables and adding a
-report visibility epoch. Admitted v4/v5 stores migrate to v6 without discarding observations.
+local_state.v7, retaining v5 tier storage and private lifecycle control tables, the v6 report
+visibility epoch, and a fixed-width acknowledgement table. Admitted older stores migrate without
+discarding observations. The v6→v7 migration and its disk/rollback/downgrade contract are described
+in [Acknowledgement Storage](ACKNOWLEDGEMENT_STORAGE.md); this is not an installed migration claim.
 Projection-affecting transactions set
 projection_dirty=1; a successful atomic JSONL replacement clears it. A clean reopen does not
 rebuild the full projection. Explicit repairing store opens restore missing or dirty JSONL and bound

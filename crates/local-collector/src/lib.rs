@@ -18,7 +18,7 @@ use agent_observability_local_runtime::{
 use agent_observability_local_store::{
     LocalStore, MISSING_RATE_FINGERPRINT, ReportViewBuildError, ReportViewCatalogError,
     StoreBatchItem, current_report_view, current_report_view_needs_kernel_upgrade,
-    publish_report_view, recover_report_view_catalog,
+    publish_report_view, recover_report_view_catalog, recover_report_view_catalog_before_migration,
 };
 #[cfg(test)]
 use agent_observability_static_report::write_private;
@@ -85,9 +85,10 @@ const MAX_CREDENTIAL_PATH_BYTES: usize = 256;
 static SETTINGS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const REPORT_DIRTY_FILE_NAME: &str = "report-dirty";
 const MAX_AUTOMATIC_REPORT_VIEW_BYTES: u64 = agent_observability_local_store::MAX_REPORT_VIEW_BYTES;
-// Catalog atomic replacement is bounded to 16 KiB. Reserve 64 KiB outside the builder's
-// database/journal allowance for its temporary catalog and filesystem allocation rounding.
-const REPORT_VIEW_PUBLICATION_RESERVE_BYTES: u64 = 64 * 1024;
+// The bounded catalog replacement and authority ACK journal are separate from the
+// staging builder's own database/journal allowance. Include both in shared admission.
+const REPORT_VIEW_PUBLICATION_RESERVE_BYTES: u64 =
+    64 * 1024 + agent_observability_local_store::MAX_REPORT_ACKNOWLEDGEMENT_BYTES;
 const PRIVATE_TURN_DETAIL_DIRECTORY: &str = "private-codex-turn-details";
 const PRIVATE_TURN_DETAIL_STATUS_DIRECTORY: &str = "private-codex-turn-detail-statuses";
 const PRIVATE_TURN_DETAIL_STATUS_VERSION: &str = "private_codex_turn_detail_status.v1";
@@ -3840,8 +3841,8 @@ fn recover_report_reservation_for_startup(
     {
         // A reservation is created only for an already current store. Recovery must not
         // require migration headroom that is still conservatively reserved by the stale owner.
-        let store = LocalStore::open_current(layout.state.join("store")).map_err(runtime_error)?;
-        recover_report_view_catalog_for_startup(&store)?;
+        recover_report_view_catalog_before_migration(layout.state.join("store"))
+            .map_err(runtime_error)?;
         stale
             .release(&layout.root, mutation)
             .map_err(runtime_error)?;
@@ -3886,9 +3887,8 @@ fn cleanup_report_reservation(layout: &InstalledLayout) -> Result<(), ReportFail
         .claim_stale_report_reservation(&layout.root, &mutation)
         .map_err(report_control_failure)?
     {
-        let store = LocalStore::open_current(layout.state.join("store"))
-            .map_err(|_| ReportFailure::Publish)?;
-        recover_report_view_catalog(&store).map_err(report_catalog_failure)?;
+        recover_report_view_catalog_before_migration(layout.state.join("store"))
+            .map_err(report_catalog_failure)?;
         stale
             .release(&layout.root, &mutation)
             .map_err(|error| report_control_failure(ControlError::Reservation(error)))?;
@@ -8279,6 +8279,94 @@ mod tests {
             let reopened = collector_state(&root);
             assert!(!reopened.store.report_status().unwrap().pending());
             drop(reopened);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_v6_reservation_recovers_catalog_before_authority_migration() {
+        for invalid_staging in [false, true] {
+            let root = test_root(&format!("v6-reservation-catalog-{invalid_staging}"));
+            let mut collector = collector_state(&root);
+            ingest_notify_locked(&mut collector, &projected_notify("v6-thread", "v6-turn"))
+                .unwrap();
+            assert!(refresh_dashboard_snapshot(&root).unwrap());
+            let layout = collector.layout.clone();
+            assert!(current_report_view(&collector.store).unwrap().is_some());
+            let view_dir = layout.state.join("store/report-views.v1");
+            let published_files: Vec<_> = fs::read_dir(&view_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|value| value == "sqlite3"))
+                .collect();
+            assert_eq!(published_files.len(), 1);
+            let published_file = &published_files[0];
+            assert!(published_file.exists());
+            drop(collector);
+            let database = layout.state.join("store/local-store.sqlite3");
+            // The historical fixture has epoch7; this epoch0 catalog must be retired.
+            write_private_test_file(
+                &database,
+                include_bytes!("../../local-store/tests/fixtures/local_state_v6.sqlite3"),
+            );
+            let before = fs::read(&database).unwrap();
+            let config = load(&layout.config).unwrap();
+            let control = RuntimeControl::new(&config).unwrap();
+            let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+            drop(
+                control
+                    .reserve_report_build(&root, &mutation, 1024 * 1024)
+                    .unwrap(),
+            );
+            let staging = view_dir.join(".report-view.sqlite3.staging.v6-interrupted");
+            if invalid_staging {
+                fs::create_dir(&staging).unwrap();
+            } else {
+                write_private_test_file(&staging, b"content-free interrupted staging");
+            }
+            let unrelated = layout.logs.join("operator-note");
+            write_private_test_file(&unrelated, b"preserve");
+            if invalid_staging {
+                assert!(
+                    super::recover_report_reservation_for_startup(&layout, &config, &mutation)
+                        .is_err()
+                );
+                assert!(
+                    control
+                        .claim_stale_report_reservation(&root, &mutation)
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    fs::read(&database).unwrap() == before,
+                    "failed recovery changed authority"
+                );
+                fs::remove_dir(&staging).unwrap();
+                write_private_test_file(&staging, b"content-free interrupted staging");
+            }
+            super::recover_report_reservation_for_startup(&layout, &config, &mutation).unwrap();
+            assert!(!staging.exists());
+            assert!(!published_file.exists());
+            assert!(!view_dir.join("catalog.json").exists());
+            assert_eq!(fs::read(&unrelated).unwrap(), b"preserve");
+            assert!(
+                fs::read(&database).unwrap() == before,
+                "cleanup migrated or changed authority"
+            );
+            assert!(
+                control
+                    .claim_stale_report_reservation(&root, &mutation)
+                    .unwrap()
+                    .is_none()
+            );
+            let store = super::open_store(&mutation, &layout, &config).unwrap();
+            assert_eq!(store.report_status().unwrap().generation, 2);
+            assert_eq!(store.report_status().unwrap().acknowledged_generation, 1);
+            assert_eq!(store.report_visibility_epoch().unwrap(), 7);
+            assert_eq!(store.record_count().unwrap(), 2);
+            drop(store);
+            drop(mutation);
             fs::remove_dir_all(root).unwrap();
         }
     }

@@ -63,6 +63,12 @@ runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui�
 
 ## Deployment profiles
 
+The approved v1.11 local-state extension uses a fixed-width report acknowledgement separate from
+variable-size metadata. [Acknowledgement Storage](ACKNOWLEDGEMENT_STORAGE.md) owns its v6→v7
+migration, equality fence and disk-allocation contract. This changes only Rust local infrastructure;
+domain semantics, TypeScript report DTOs and team transport are unchanged. The development schema
+must not be confused with an installed or released upgrade.
+
 제품은 하나의 core를 두 개의 독립된 composition root로 조립한다.
 
 | Profile | Status | Required runtime | Storage | UI |

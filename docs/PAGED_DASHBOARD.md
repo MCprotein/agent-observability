@@ -95,7 +95,7 @@ separate authority transactions and may invalidate construction via the source-g
 
 ### Shared write admission and compatible index upgrade
 
-A refresh reserves its bounded build/journal allowance plus 64 KiB publication headroom in one
+A refresh reserves its bounded build/journal allowance plus 401,408 bytes of finalization headroom in one
 private durable runtime reservation. Ordinary write admission and migration headroom count the
 full active or interrupted reservation in addition to allocated files and filesystem limits.
 The reservation contains only a fixed kind, version, random owner nonce and numeric byte ceiling.
@@ -119,11 +119,12 @@ through their original bounded query kernel until normal publication replaces th
 index shape select the kernel; unknown or inconsistent layouts fail closed. Internal continuation
 keys cannot cross kernel versions. The HTTP query schema and opaque cursor contract remain v1.
 
-Release blocker: the 64 KiB publication allowance does not yet prove the authority acknowledgement
-transaction's rollback-journal bound for every accepted metadata layout. A bounded read-only check
-of the actual store found an internal metadata B-tree page, so a proposed single-leaf precondition
-would reject existing data. The recommended dedicated fixed-width acknowledgement table requires a
-separately approved `local_state.v6` to `local_state.v7` migration; it is not implemented or installed.
+The separately approved v6→v7 migration isolates acknowledgement in a fixed-width singleton table;
+it does not require the existing variable-size metadata table to fit one leaf. Finalization includes
+65,536 bytes for catalog publication and 335,872 bytes for the bounded acknowledgement journal,
+sparse-page materialization and directory allocation. [Acknowledgement Storage](ACKNOWLEDGEMENT_STORAGE.md)
+defines the enforced transaction/layout constraints and migration recovery. This is development
+implementation, not installed-runtime or release approval; final integrated evidence remains required.
 
 ## Resource budgets and completeness
 

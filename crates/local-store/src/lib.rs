@@ -2,11 +2,14 @@
 
 mod dashboard_query;
 mod lifecycle;
+mod migration_admission;
+mod report_ack;
 mod report_view;
 mod report_view_catalog;
 mod report_view_query;
 
 pub use dashboard_query::DashboardQueryService;
+pub use report_ack::MAX_REPORT_ACKNOWLEDGEMENT_BYTES;
 pub use report_view::{
     MAX_REPORT_VIEW_BYTES, MISSING_RATE_FINGERPRINT, ReportViewBuildError, ReportViewStaging,
     build_report_view_staging, build_report_view_staging_observing,
@@ -52,7 +55,8 @@ const DB_NAME: &str = "local-store.sqlite3";
 const PROJECTION_NAME: &str = "observations.jsonl";
 const STORE_OPEN_LOCK_NAME: &str = ".store-open.lock";
 const REPORT_RENDER_LOCK_NAME: &str = ".report-render.lock";
-pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v6";
+pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v7";
+const VISIBILITY_LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v6";
 const PREVIOUS_LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v5";
 const LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v4";
 const REPORT_GENERATION_KEY: &str = "report_generation";
@@ -80,6 +84,7 @@ const MAX_ARCHIVE_TEMP_COLLISIONS: usize = 64;
 const MAX_PRIVATE_DIRECTORY_ENTRIES: usize = 4_096;
 const MAX_STALE_PROJECTION_TEMPS: usize = 1024;
 const SCHEMA_OBJECTS: &[(&str, &str, &str)] = &[
+    ("table", "report_acknowledgement", report_ack::TABLE_SQL),
     (
         "table",
         "metadata",
@@ -511,6 +516,21 @@ pub struct LocalStore {
     db: Connection,
 }
 
+/// Recovers interrupted report sidecars before an admitted authority migration.
+///
+/// Accepts only validated v6/v7 authority. Never creates a store, migrates its schema,
+/// repairs JSONL or changes observations; normal `SQLite` hot-journal recovery may run.
+/// The caller must retain its runtime mutation guard and stale reservation until success.
+///
+/// # Errors
+/// Returns [`ReportViewCatalogError`] for incompatible authority, contention or unsafe files.
+pub fn recover_report_view_catalog_before_migration(
+    dir: impl AsRef<Path>,
+) -> Result<(), ReportViewCatalogError> {
+    let store = LocalStore::open_report_recovery_source(dir.as_ref(), true)?;
+    recover_report_view_catalog(&store)
+}
+
 impl LocalStore {
     /// Opens or creates private transactional state and repairs its JSONL projection when needed.
     ///
@@ -557,11 +577,16 @@ impl LocalStore {
     ///
     /// Returns [`StoreError`] when the store is missing, insecure, or not on the current schema.
     pub fn open_current(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let dir = dir.as_ref();
+        Self::open_report_recovery_source(dir.as_ref(), false)
+    }
+
+    fn open_report_recovery_source(dir: &Path, allow_v6: bool) -> Result<Self, StoreError> {
         validate_existing_private_dir(dir)?;
         let dir = fs::canonicalize(dir)?;
         let db_path = dir.join(DB_NAME);
         private_file(&db_path)?;
+        let _journal_guard =
+            migration_admission::open_private_journal(&db_path.with_extension("sqlite3-journal"))?;
         let db = Connection::open_with_flags(
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -573,11 +598,22 @@ impl LocalStore {
         db.pragma_update(None, "foreign_keys", true)?;
         db.pragma_update(None, "synchronous", "FULL")?;
         let schema = required_schema_version(&db)?;
-        if schema != LOCAL_STORE_SCHEMA_VERSION {
+        if schema != LOCAL_STORE_SCHEMA_VERSION
+            && !(allow_v6 && schema == VISIBILITY_LOCAL_STORE_SCHEMA_VERSION)
+        {
             return Err(StoreError::SchemaMismatch);
         }
         metadata_generation(&db, REPORT_GENERATION_KEY)?;
-        metadata_generation(&db, REPORT_ACKNOWLEDGED_GENERATION_KEY)?;
+        if schema == VISIBILITY_LOCAL_STORE_SCHEMA_VERSION {
+            validate_schema_version(&db, false)?;
+            if metadata_generation(&db, REPORT_ACKNOWLEDGED_GENERATION_KEY)?
+                > metadata_generation(&db, REPORT_GENERATION_KEY)?
+            {
+                return Err(StoreError::SchemaMismatch);
+            }
+        } else {
+            report_ack::read(&db)?;
+        }
         metadata_generation(&db, REPORT_VISIBILITY_EPOCH_KEY)?;
         Ok(Self { dir, db })
     }
@@ -598,6 +634,8 @@ impl LocalStore {
         let dir = fs::canonicalize(dir)?;
         let db_path = dir.join(DB_NAME);
         private_file(&db_path)?;
+        let _journal_guard =
+            migration_admission::open_private_journal(&db_path.with_extension("sqlite3-journal"))?;
         let db = Connection::open_with_flags(
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -632,6 +670,8 @@ impl LocalStore {
             }
             Err(error) => return Err(error),
         }
+        let _journal_guard =
+            migration_admission::open_private_journal(&db_path.with_extension("sqlite3-journal"))?;
         let db = Connection::open_with_flags(
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -641,10 +681,14 @@ impl LocalStore {
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         db.busy_timeout(Duration::from_secs(5))?;
+        preflight_store_migration(&db, admitted_temporary_bytes)?;
         db.pragma_update(None, "journal_mode", "DELETE")?;
         db.pragma_update(None, "foreign_keys", true)?;
         db.pragma_update(None, "synchronous", "FULL")?;
-        db.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        let auto_vacuum: i64 = db.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+        if auto_vacuum != 2 {
+            db.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        }
         initialize_empty_schema(&db)?;
         let schema = required_schema_version(&db)?;
         if matches!(
@@ -654,6 +698,7 @@ impl LocalStore {
                 | "local_state.v3"
                 | LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION
                 | PREVIOUS_LOCAL_STORE_SCHEMA_VERSION
+                | VISIBILITY_LOCAL_STORE_SCHEMA_VERSION
         ) {
             let required_workspace = migration_required_workspace(&db)?;
             if admitted_temporary_bytes.is_none_or(|bytes| bytes < required_workspace) {
@@ -661,20 +706,40 @@ impl LocalStore {
             }
             if matches!(
                 schema.as_str(),
-                "local_state.v1" | "local_state.v2" | "local_state.v3"
+                LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION
+                    | PREVIOUS_LOCAL_STORE_SCHEMA_VERSION
+                    | VISIBILITY_LOCAL_STORE_SCHEMA_VERSION
             ) {
-                migrate_to_v4(&db)?;
+                migration_admission::migrate(
+                    &db,
+                    &db_path,
+                    admitted_temporary_bytes.ok_or(StoreError::MigrationAdmissionRequired)?,
+                )?;
+            } else {
+                if matches!(
+                    schema.as_str(),
+                    "local_state.v1" | "local_state.v2" | "local_state.v3"
+                ) {
+                    migrate_to_v4(&db)?;
+                }
+                if required_schema_version(&db)? == LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION {
+                    migrate_v4_to_v5(&db)?;
+                }
+                if required_schema_version(&db)? == PREVIOUS_LOCAL_STORE_SCHEMA_VERSION {
+                    migrate_v5_to_v6(&db)?;
+                }
+                if schema != VISIBILITY_LOCAL_STORE_SCHEMA_VERSION {
+                    ensure_report_metadata(&db)?;
+                }
+                report_ack::migrate(&db)?;
             }
-            if required_schema_version(&db)? == LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION {
-                migrate_v4_to_v5(&db)?;
-            }
-            migrate_v5_to_v6(&db)?;
         } else if schema != LOCAL_STORE_SCHEMA_VERSION {
             return Err(StoreError::SchemaMismatch);
         }
         validate_schema(&db)?;
-        ensure_report_metadata(&db)?;
+        metadata_generation(&db, REPORT_VISIBILITY_EPOCH_KEY)?;
         let store = Self { dir, db };
+        store.report_status()?;
         if repair_projection {
             store.repair_projection_if_needed()?;
         }
@@ -1552,7 +1617,7 @@ impl LocalStore {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)?;
         let status = ReportStatus {
             generation: metadata_generation(&tx, REPORT_GENERATION_KEY)?,
-            acknowledged_generation: metadata_generation(&tx, REPORT_ACKNOWLEDGED_GENERATION_KEY)?,
+            acknowledged_generation: report_ack::read(&tx)?,
         };
         tx.commit()?;
         if status.acknowledged_generation > status.generation {
@@ -1615,18 +1680,7 @@ impl LocalStore {
     ///
     /// Returns [`StoreError`] when durable generation metadata cannot be updated transactionally.
     pub fn acknowledge_report_generation(&self, generation: u64) -> Result<bool, StoreError> {
-        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-        let current = metadata_generation(&tx, REPORT_GENERATION_KEY)?;
-        if current != generation {
-            tx.commit()?;
-            return Ok(false);
-        }
-        tx.execute(
-            "UPDATE metadata SET value=?1 WHERE key=?2",
-            params![generation.to_string(), REPORT_ACKNOWLEDGED_GENERATION_KEY],
-        )?;
-        tx.commit()?;
-        Ok(true)
+        report_ack::acknowledge(&self.db, generation)
     }
 
     /// Plans a bounded archive-and-prune pass without changing authority or projections.
@@ -3565,10 +3619,7 @@ fn initialize_empty_schema(db: &Connection) -> Result<(), StoreError> {
             "INSERT INTO metadata(key, value) VALUES (?1, '0')",
             [REPORT_GENERATION_KEY],
         )?;
-        tx.execute(
-            "INSERT INTO metadata(key, value) VALUES (?1, '0')",
-            [REPORT_ACKNOWLEDGED_GENERATION_KEY],
-        )?;
+        report_ack::insert(&tx, 0)?;
         tx.execute(
             "INSERT INTO metadata(key, value) VALUES (?1, '0')",
             [REPORT_VISIBILITY_EPOCH_KEY],
@@ -3591,13 +3642,66 @@ fn migration_required_workspace(db: &Connection) -> Result<u64, StoreError> {
     let page_size = db.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))?;
     let page_count = u64::try_from(page_count).map_err(|_| StoreError::SchemaMismatch)?;
     let page_size = u64::try_from(page_size).map_err(|_| StoreError::SchemaMismatch)?;
+    if matches!(
+        required_schema_version(db)?.as_str(),
+        LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION
+            | PREVIOUS_LOCAL_STORE_SCHEMA_VERSION
+            | VISIBILITY_LOCAL_STORE_SCHEMA_VERSION
+    ) {
+        return migration_admission::initial_allowance(page_count, page_size);
+    }
     Ok(page_count
-        .saturating_mul(page_size)
+        .saturating_mul(page_size.saturating_mul(2).saturating_add(8))
         .saturating_add(2 * 1024 * 1024))
+}
+
+fn preflight_store_migration(db: &Connection, admitted: Option<u64>) -> Result<(), StoreError> {
+    let empty: bool = db.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%')",
+        [],
+        |row| row.get(0),
+    )?;
+    if empty {
+        return Ok(());
+    }
+    let schema = required_schema_version(db)?;
+    if schema == LOCAL_STORE_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if matches!(
+        schema.as_str(),
+        LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION
+            | PREVIOUS_LOCAL_STORE_SCHEMA_VERSION
+            | VISIBILITY_LOCAL_STORE_SCHEMA_VERSION
+    ) {
+        migration_admission::validate_modes(db)?;
+    }
+    if !matches!(
+        schema.as_str(),
+        "local_state.v1"
+            | "local_state.v2"
+            | "local_state.v3"
+            | LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION
+            | PREVIOUS_LOCAL_STORE_SCHEMA_VERSION
+            | VISIBILITY_LOCAL_STORE_SCHEMA_VERSION
+    ) {
+        return Err(StoreError::SchemaMismatch);
+    }
+    let required = migration_required_workspace(db)?;
+    if admitted.is_none_or(|bytes| bytes < required) {
+        return Err(StoreError::MigrationAdmissionRequired);
+    }
+    Ok(())
 }
 
 fn ensure_report_metadata(db: &Connection) -> Result<(), StoreError> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    ensure_report_metadata_body(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn ensure_report_metadata_body(tx: &Transaction<'_>) -> Result<(), StoreError> {
     let generation = tx
         .query_row(
             "SELECT value FROM metadata WHERE key=?1",
@@ -3636,8 +3740,7 @@ fn ensure_report_metadata(db: &Connection) -> Result<(), StoreError> {
         }
         _ => return Err(StoreError::SchemaMismatch),
     }
-    metadata_generation(&tx, REPORT_VISIBILITY_EPOCH_KEY)?;
-    tx.commit()?;
+    metadata_generation(tx, REPORT_VISIBILITY_EPOCH_KEY)?;
     Ok(())
 }
 
@@ -3744,7 +3847,13 @@ fn migrate_to_v4_inner(db: &Connection) -> Result<(), StoreError> {
 
 fn migrate_v4_to_v5(db: &Connection) -> Result<(), StoreError> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
-    if required_schema_version(&tx)? != LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION {
+    migrate_v4_to_v5_body(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_v4_to_v5_body(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    if required_schema_version(tx)? != LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION {
         return Err(StoreError::SchemaMismatch);
     }
     for name in [
@@ -3777,20 +3886,25 @@ fn migrate_v4_to_v5(db: &Connection) -> Result<(), StoreError> {
         "INSERT INTO metadata(key, value) VALUES (?1, ?2)",
         params![
             LIFECYCLE_BACKFILL_CURSOR_KEY,
-            lifecycle_backfill_initial(&tx)?
+            lifecycle_backfill_initial(tx)?
         ],
     )?;
     tx.execute(
         "UPDATE metadata SET value=?1 WHERE key='schema_version'",
         [PREVIOUS_LOCAL_STORE_SCHEMA_VERSION],
     )?;
-    tx.commit()?;
     Ok(())
 }
 
 fn migrate_v5_to_v6(db: &Connection) -> Result<(), StoreError> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
-    if required_schema_version(&tx)? != PREVIOUS_LOCAL_STORE_SCHEMA_VERSION {
+    migrate_v5_to_v6_body(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_v5_to_v6_body(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    if required_schema_version(tx)? != PREVIOUS_LOCAL_STORE_SCHEMA_VERSION {
         return Err(StoreError::SchemaMismatch);
     }
     let existing = tx
@@ -3812,9 +3926,8 @@ fn migrate_v5_to_v6(db: &Connection) -> Result<(), StoreError> {
     }
     tx.execute(
         "UPDATE metadata SET value=?1 WHERE key='schema_version'",
-        [LOCAL_STORE_SCHEMA_VERSION],
+        [VISIBILITY_LOCAL_STORE_SCHEMA_VERSION],
     )?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -3864,6 +3977,10 @@ fn create_v4_retention_objects(tx: &Transaction<'_>) -> Result<(), StoreError> {
 }
 
 fn validate_schema(db: &Connection) -> Result<(), StoreError> {
+    validate_schema_version(db, true)
+}
+
+fn validate_schema_version(db: &Connection, fixed_ack: bool) -> Result<(), StoreError> {
     let auto_vacuum: i64 = db.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
     if auto_vacuum != 2 {
         return Err(StoreError::SchemaMismatch);
@@ -3877,10 +3994,13 @@ fn validate_schema(db: &Connection) -> Result<(), StoreError> {
         [],
         |row| row.get(0),
     )?;
-    if usize::try_from(object_count).ok() != Some(SCHEMA_OBJECTS.len()) {
+    if usize::try_from(object_count).ok() != Some(SCHEMA_OBJECTS.len() - usize::from(!fixed_ack)) {
         return Err(StoreError::SchemaMismatch);
     }
     for (kind, name, expected_sql) in SCHEMA_OBJECTS {
+        if !fixed_ack && *name == "report_acknowledgement" {
+            continue;
+        }
         let actual_sql = required_schema_text(db.query_row(
             "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
             params![kind, name],
@@ -4173,6 +4293,7 @@ mod tests {
 
     fn downgrade_to_historical_schema(database: &Path, version: &str) {
         let connection = Connection::open(database).unwrap();
+        downgrade_ack_schema(&connection);
         connection
             .pragma_update(None, "foreign_keys", false)
             .unwrap();
@@ -4235,6 +4356,7 @@ mod tests {
 
     fn downgrade_to_v4_schema(database: &Path) {
         let connection = Connection::open(database).unwrap();
+        downgrade_ack_schema(&connection);
         connection
             .pragma_update(None, "foreign_keys", false)
             .unwrap();
@@ -4261,6 +4383,7 @@ mod tests {
 
     fn downgrade_to_v5_schema(database: &Path, visibility_epoch: Option<&str>) {
         let connection = Connection::open(database).unwrap();
+        downgrade_ack_schema(&connection);
         connection
             .execute(
                 "UPDATE metadata SET value=?1 WHERE key='schema_version'",
@@ -4281,6 +4404,17 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    fn downgrade_ack_schema(db: &Connection) {
+        let acknowledged = report_ack::read(db).unwrap();
+        db.execute(
+            "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+            params![REPORT_ACKNOWLEDGED_GENERATION_KEY, acknowledged.to_string()],
+        )
+        .unwrap();
+        db.execute_batch("DROP TABLE report_acknowledgement")
+            .unwrap();
     }
 
     #[test]
@@ -6300,6 +6434,7 @@ mod tests {
         let store = LocalStore::open(&dir).unwrap();
         let database = store.database_path();
         drop(store);
+        downgrade_to_v4_schema(&database);
         let connection = Connection::open(database).unwrap();
         connection
             .execute(
@@ -6309,7 +6444,7 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let reopened = LocalStore::open(&dir).unwrap();
+        let reopened = LocalStore::open_with_migration_headroom(&dir, u64::MAX).unwrap();
         assert_eq!(
             reopened.report_status().unwrap(),
             ReportStatus {
@@ -7450,6 +7585,78 @@ mod tests {
                 .has_backfill_pending
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v6_ack_migration_preserves_authority_and_requires_admission() {
+        let dir = temp_dir("v6-ack-admission");
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        store.acknowledge_report_generation(1).unwrap();
+        store
+            .ingest(&observation_after("2", Some("1"), "turn", Some("session")))
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE metadata SET value='7' WHERE key=?1",
+                [REPORT_VISIBILITY_EPOCH_KEY],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO metadata(key,value) VALUES('large_metadata_fixture',?1)",
+                ["x".repeat(MAX_CODEX_CORRELATION_STATE_BYTES)],
+            )
+            .unwrap();
+        let before_status = store.report_status().unwrap();
+        let before_records = store.current_records().unwrap();
+        let database = store.database_path();
+        downgrade_ack_schema(&store.db);
+        store
+            .db
+            .execute(
+                "UPDATE metadata SET value=?1 WHERE key='schema_version'",
+                [VISIBILITY_LOCAL_STORE_SCHEMA_VERSION],
+            )
+            .unwrap();
+        let required = migration_required_workspace(&store.db).unwrap();
+        drop(store);
+        let before = fs::read(&database).unwrap();
+        recover_report_view_catalog_before_migration(&dir).unwrap();
+        assert_eq!(
+            Sha256::digest(fs::read(&database).unwrap()),
+            Sha256::digest(&before)
+        );
+        assert!(matches!(
+            LocalStore::open_with_migration_headroom(&dir, required - 1),
+            Err(StoreError::MigrationAdmissionRequired)
+        ));
+        assert_eq!(
+            Sha256::digest(fs::read(&database).unwrap()),
+            Sha256::digest(before)
+        );
+        let store = LocalStore::open_with_migration_headroom(&dir, required).unwrap();
+        assert_eq!(store.report_status().unwrap(), before_status);
+        assert_eq!(store.current_records().unwrap(), before_records);
+        assert_eq!(store.report_visibility_epoch().unwrap(), 7);
+        assert_eq!(count(&store.db, "source_inputs").unwrap(), 2);
+        assert_eq!(count(&store.db, "delivery_outcomes").unwrap(), 2);
+        assert_eq!(
+            required_schema_version(&store.db).unwrap(),
+            LOCAL_STORE_SCHEMA_VERSION
+        );
+        assert!(
+            store
+                .acknowledge_report_generation(before_status.generation)
+                .unwrap()
+        );
+        drop(store);
+        let reopened = LocalStore::open_current(&dir).unwrap();
+        assert!(!reopened.report_status().unwrap().pending());
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

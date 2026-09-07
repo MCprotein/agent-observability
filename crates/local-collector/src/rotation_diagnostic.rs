@@ -439,7 +439,13 @@ mod rotation_diagnostic {
             .unwrap();
         drop(
             LocalStore::open_with_migration_headroom_deferred_projection(&store_dir, headroom)
-                .unwrap_or_else(|_| panic!("temporary copy migration failed")),
+                .unwrap_or_else(|error| {
+                    let code = match &error {
+                        agent_observability_local_store::StoreError::Sqlite(error) => error.sqlite_error_code(),
+                        _ => None,
+                    };
+                    panic!("temporary copy migration failed: {error}; sqlite_code={code:?}; admitted_bytes={headroom}")
+                }),
         );
     }
 
@@ -473,6 +479,22 @@ mod rotation_diagnostic {
         let runtime = PrivateRuntime::new();
         backup_into(&source, &runtime);
         three_generations(&runtime.0);
+        runtime.cleanup();
+    }
+
+    /// Isolates backup/migration RSS from report construction; use a process-level RSS probe.
+    #[test]
+    #[ignore = "explicit private-backup migration measurement; leader-run only"]
+    fn private_backup_migration_only() {
+        let source = std::env::var_os("AO_ROTATION_BACKUP_SOURCE")
+            .expect("explicit backup source required");
+        let source = fs::canonicalize(source).expect("backup source exists");
+        assert!(source.is_file());
+        let runtime = PrivateRuntime::new();
+        backup_into(&source, &runtime);
+        let store = LocalStore::open_current(runtime.0.join("state/store")).unwrap();
+        eprintln!("migration_records={} status=ok", store.record_count().unwrap());
+        drop(store);
         runtime.cleanup();
     }
 

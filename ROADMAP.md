@@ -122,8 +122,10 @@ existing-tab Chrome QA and fresh exact-head CI/automatic performance evidence re
 
 The private-copy three-generation capacity check has passed. The remaining acknowledgement journal
 proof cannot use a single-leaf guard on the actual metadata layout. A dedicated fixed-width state
-table and bounded v6→v7 migration are a proposed additional scope, awaiting approval, not a completed
-schema change. No merge or stable-version promotion is authorized by a measurement pass alone.
+table and bounded v6→v7 migration were explicitly approved and are implemented in the development
+branch with regression verification in progress. [Acknowledgement Storage](docs/ACKNOWLEDGEMENT_STORAGE.md)
+defines the migration and finalization allocation contract. Actual-runtime migration, final-head
+release evidence and merge remain pending; a measurement pass alone does not promote the stable version.
 
 ## Branch Strategy
 

@@ -2036,7 +2036,7 @@ impl ContractManifest {
             "agent_observability.retention_archive.v1",
         )?;
         self.expect("local_runtime_config", "local_runtime.v4")?;
-        self.expect("local_state", "local_state.v6")?;
+        self.expect("local_state", "local_state.v7")?;
         self.expect("durable_schema", "contracts/durable-record-v1.schema.json")?;
         self.expect("report_schema", "contracts/report-dto-v2.schema.json")?;
         self.expect(
