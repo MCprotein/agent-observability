@@ -118,6 +118,30 @@ collector가 실행 중일 때 설정을 다시 읽어 적용하며, 마지막 �
 시각의 즉시 삭제를 보장하지 않는다. collector 없는 사용은 `agentobs lifecycle-run <runtime>`으로
 한 번 실행한다. 전체 안전 조건은 [Storage Lifecycle](STORAGE_LIFECYCLE.md)을 따른다.
 
+## 저장 공간 예산
+
+`storage-bytes`의 기본값은 **1 GiB = 1,073,741,824 bytes**이며 설정 범위는
+**256 MiB~20 GiB**다. RAM이나 컴퓨터 전체 디스크의 한도가 아니라 이 도구가 관리하는
+runtime 디렉터리의 디스크 예산이다. DB 외에도 인덱스, 리포트, journal, 임시 파일과
+원자적 교체 중의 이전·새 파일을 포함하고, 파일의 논리적 길이가 아닌 할당된 블록으로 계산한다.
+
+이 수치는 초기 아키텍처 커밋 `9284f3d`에서 **실측 전 planning budget**으로 지정됐고,
+v0.13.0 구현 `6e6b9f1`에 기본값으로 들어갔다. 해당 설계·도입 변경에는 사용자의 평균
+사용량이나 보관 일수에서 1 GiB를 산출한 근거가 없다. 성능검사도 이 값을 고정 기준으로
+사용하지만, 검사 통과가 모든 사용 패턴에서 충분한 용량이라는 뜻은 아니다.
+
+전체 예산 중 `max(32 MiB, 예산/8)`과 파티션 반올림 잔여분은 안전 여유로 남긴다.
+1 GiB 설정에서는 새 쓰기의 사전 심사에 사용하는 유효 한도가 **894 MiB**다.
+현재 할당량에 트랜잭션 임시 공간과 진행 중인 report 예약을 더해 심사하므로,
+현재 파일 합계가 1 GiB 미만이어도 수집이 거부될 수 있다. 기존의 보수적인 수집 정책은
+store 전체 크기와 최대 batch 크기를 추가로 예약한다. 이 예약을 줄이는 v1.11 개발 작업은
+별도 메모리·롤백 검증 대상이며, 아직 실제 설치본의 수집 복구를 의미하지 않는다.
+
+설정 화면 또는 `agentobs config set storage-bytes 2147483648`로 예산을 변경할 수 있다.
+예산을 줄여도 유효기간이 남은 데이터를 임의 삭제하지 않는다. 보관 기간과 자동 삭제는
+별도 [Storage Lifecycle](STORAGE_LIFECYCLE.md) 설정이며, 용량을 늘리는 것만으로
+저장 엔진의 과도한 임시 공간 예약 문제가 해결됐다고 판단하지 않는다.
+
 `enabled`, `private-codex-details`, `batch-records`, `batch-bytes`, `storage-bytes`는 Codex automatic collector가
 요청마다 다시 읽고 적용하므로 UI나 CLI에서 바꾼 뒤 collector를 재시작할 필요가 없다. Codex
 receiver는 설정값과 별개로 요청당 1 MiB, 4096 log record의 절대 parser 상한을 유지하며 실제

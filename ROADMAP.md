@@ -136,6 +136,9 @@ its passing isolated smoke does not identify the historical workflow failure ret
 Installed collection also remains blocked by conservative write admission. Runtime diagnostics must
 use that same admission policy; reducing transaction headroom requires separate rollback/capacity
 proof, not deletion or a larger budget. Details and evidence boundaries are in the current review.
+The user approved [staged-ingest design and implementation scope](docs/STAGED_INGEST.md).
+Reduced admission remains disabled until write-set/memory bounds, atomic rollback and
+post-publication ingestion capacity pass review and tests; approval does not mean installed recovery.
 The earlier long workflow `34135080615` was cancelled before its normative job when those defects
 required a new candidate. Settle final changes before dispatching exact-revision long evidence.
 

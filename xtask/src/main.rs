@@ -7264,10 +7264,23 @@ mod tests {
             ReportViewCatalogError::SnapshotExpired,
             ReportViewCatalogError::Io(io::Error::other("/tmp/private SELECT raw")),
         ] {
+            let classified = automatic_catalog_read_error(error, PublishedSnapshotStage::Catalog);
             assert_eq!(
-                automatic_catalog_read_error(error, PublishedSnapshotStage::Catalog),
+                classified,
                 AutomaticConvergenceError::Fatal(PublishedSnapshotStage::Catalog)
             );
+            let mut polls = 0;
+            let mut sleeps = 0;
+            let result = wait_for_automatic_convergence(
+                || {
+                    polls += 1;
+                    Err(classified)
+                },
+                || Duration::ZERO,
+                |_| sleeps += 1,
+            );
+            assert_eq!(result.unwrap_err(), PublishedSnapshotStage::Catalog.code());
+            assert_eq!((polls, sleeps), (1, 0));
         }
     }
 
@@ -7476,18 +7489,60 @@ mod tests {
         // The injected test above separately proves immediate termination on fatal.
         assert!(polls > 0);
         assert_eq!(polls, sleeps + 1);
+    }
+
+    #[test]
+    fn automatic_snapshot_real_catalog_corruption_reaches_fatal() {
+        use agent_observability_local_store::{
+            MISSING_RATE_FINGERPRINT, build_report_view_staging, publish_report_view,
+        };
+        let root = env::temp_dir().join(format!(
+            "xtask-catalog-corruption-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _cleanup = DirectoryCleanup::new(root.clone(), "catalog corruption test fixture");
+        let mut store = LocalStore::open(&root).unwrap();
+        store
+            .ingest(&observation("codex|0", &BTreeMap::new()).unwrap())
+            .unwrap();
+        let staging =
+            build_report_view_staging(&store, MISSING_RATE_FINGERPRINT, 16 * 1024 * 1024, None)
+                .unwrap();
+        let publication = publish_report_view(&store, staging).unwrap();
+        store
+            .acknowledge_report_generation(publication.current().generation())
+            .unwrap();
+        drop(publication);
 
         fs::write(
-            views.join("catalog.json"),
+            root.join("report-views.v1/catalog.json"),
             b"/tmp/AUTOMATIC_RAW_PROMPT_SENTINEL SELECT * FROM secrets",
         )
         .unwrap();
+        let started = Instant::now();
+        let mut polls = 0;
+        let mut sleeps = 0;
         assert_eq!(
-            automatic_published_snapshot_convergence(&store),
-            Err(AutomaticConvergenceError::Fatal(
-                PublishedSnapshotStage::Catalog
-            ))
+            wait_for_automatic_convergence(
+                || {
+                    polls += 1;
+                    automatic_published_snapshot_convergence(&store)
+                },
+                || started.elapsed(),
+                |duration| {
+                    sleeps += 1;
+                    sleep(duration);
+                },
+            )
+            .unwrap_err(),
+            PublishedSnapshotStage::Catalog.code()
         );
+        assert!(polls > 0);
+        assert_eq!(polls, sleeps + 1);
     }
 
     #[test]
