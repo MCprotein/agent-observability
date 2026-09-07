@@ -100,8 +100,11 @@ private durable runtime reservation. Ordinary write admission and migration head
 full active or interrupted reservation in addition to allocated files and filesystem limits.
 The reservation contains only a fixed kind, version, random owner nonce and numeric byte ceiling.
 Its lifetime lock remains a stable empty inode; metadata is published separately with private
-atomic replacement and directory synchronization. After the final failed retry, a cleanup-only
-pass attempts guarded recovery so a stopped refresh does not strand an otherwise recoverable promise.
+atomic replacement and directory synchronization. After the final failed build retry, cleanup-only
+recovery retains scheduler ownership for up to four nonblocking attempts with exponential delays.
+Persistent contention or fatal cleanup/task failure is reported through the bounded degraded stage;
+the promise remains accounted until a later refresh wake or startup completes guarded recovery.
+Cleanup retries do not rebuild the report or spin indefinitely.
 
 Admission and final publication use short, nonblocking runtime mutation guards. Construction
 releases that guard so collection can proceed within the remaining budget. Final publication

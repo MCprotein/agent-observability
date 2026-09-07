@@ -1411,6 +1411,7 @@ struct ReportSnapshotTest {
     delay_ms: AtomicU64,
     started: AtomicBool,
     fail_after_reservation: AtomicBool,
+    cleanup_attempts: AtomicU64,
 }
 
 #[derive(Debug, Serialize)]
@@ -2630,10 +2631,13 @@ fn schedule_report_refresh_with_timing(state: &AppState, timing: ReportRefreshTi
                 collector.report_degraded = true;
                 let layout = collector.layout.clone();
                 drop(collector);
-                // A failed build must not strand its promise after the final retry. Keep the
-                // scheduler flag while doing one cleanup-only pass; never wait for either lock.
-                let _ =
-                    tokio::task::spawn_blocking(move || cleanup_report_reservation(&layout)).await;
+                // Retain scheduler ownership across bounded cleanup-only retries. A busy
+                // mutation lock must not silently discard recovery after the last build.
+                if let Err(failure) =
+                    cleanup_report_reservation_with_retry(&state, &layout, timing).await
+                {
+                    state.collector.lock().await.report_failure = Some(failure);
+                }
                 state
                     .report_refresh_scheduled
                     .store(false, Ordering::Release);
@@ -3845,10 +3849,51 @@ fn recover_report_reservation_for_startup(
     Ok(())
 }
 
-fn cleanup_report_reservation(layout: &InstalledLayout) -> Result<(), CollectorError> {
-    let mutation = try_collector_mutation(&layout.runtime)?;
-    let config = load(&layout.config).map_err(runtime_error)?;
-    recover_report_reservation_for_startup(layout, &config, &mutation)
+async fn cleanup_report_reservation_with_retry(
+    state: &AppState,
+    layout: &InstalledLayout,
+    timing: ReportRefreshTiming,
+) -> Result<(), ReportFailure> {
+    let mut delay = timing.retry_initial;
+    for attempt in 0..REPORT_RETRY_LIMIT {
+        #[cfg(test)]
+        state
+            .report_snapshot_test
+            .cleanup_attempts
+            .fetch_add(1, Ordering::Release);
+        #[cfg(not(test))]
+        let _ = state;
+        let layout = layout.clone();
+        let result = tokio::task::spawn_blocking(move || cleanup_report_reservation(&layout))
+            .await
+            .map_err(|_| ReportFailure::Task)?;
+        match result {
+            Err(ReportFailure::RenderGuard) if attempt + 1 < REPORT_RETRY_LIMIT => {
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+            result => return result,
+        }
+    }
+    unreachable!("cleanup retry limit is nonzero")
+}
+
+fn cleanup_report_reservation(layout: &InstalledLayout) -> Result<(), ReportFailure> {
+    let mutation = try_report_mutation(layout)?;
+    let config = load(&layout.config).map_err(|_| ReportFailure::Publish)?;
+    let control = RuntimeControl::new(&config).map_err(|_| ReportFailure::Publish)?;
+    if let Some(stale) = control
+        .claim_stale_report_reservation(&layout.root, &mutation)
+        .map_err(report_control_failure)?
+    {
+        let store = LocalStore::open_current(layout.state.join("store"))
+            .map_err(|_| ReportFailure::Publish)?;
+        recover_report_view_catalog(&store).map_err(report_catalog_failure)?;
+        stale
+            .release(&layout.root, &mutation)
+            .map_err(|error| report_control_failure(ControlError::Reservation(error)))?;
+    }
+    Ok(())
 }
 
 fn automatic_report_view_missing(store: &LocalStore) -> Result<bool, CollectorError> {
@@ -8236,6 +8281,136 @@ mod tests {
             drop(reopened);
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn terminal_cleanup_retries_contention_without_rebuilding() {
+        for lock_kind in ["mutation", "catalog", "reservation"] {
+            let root = test_root(&format!("report-terminal-cleanup-{lock_kind}"));
+            let state = app_state(&root);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let layout = state.collector.lock().await.layout.clone();
+                let config = load(&layout.config).unwrap();
+                let control = RuntimeControl::new(&config).unwrap();
+                let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+                let reservation = control
+                    .reserve_report_build(&root, &mutation, 65536)
+                    .unwrap();
+                let reservation = if lock_kind == "reservation" {
+                    Some(reservation)
+                } else {
+                    drop(reservation);
+                    None
+                };
+                let blocker = LocalStore::open_current(layout.state.join("store")).unwrap();
+                let catalog = if lock_kind == "catalog" {
+                    Some(blocker.acquire_report_render_guard().unwrap())
+                } else {
+                    None
+                };
+                let mutation = if lock_kind == "mutation" {
+                    Some(mutation)
+                } else {
+                    drop(mutation);
+                    None
+                };
+                let cleanup_state = state.clone();
+                let cleanup_layout = layout.clone();
+                let cleanup = tokio::spawn(async move {
+                    super::cleanup_report_reservation_with_retry(
+                        &cleanup_state,
+                        &cleanup_layout,
+                        super::ReportRefreshTiming {
+                            debounce: Duration::ZERO,
+                            retry_initial: Duration::from_millis(50),
+                        },
+                    )
+                    .await
+                });
+                // Wait until at least one busy attempt has completed; the held lock cannot
+                // be acquired by the second attempt either until explicitly released here.
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while state
+                        .report_snapshot_test
+                        .cleanup_attempts
+                        .load(Ordering::Acquire)
+                        < 2
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(!cleanup.is_finished());
+                drop(mutation);
+                drop(catalog);
+                drop(reservation);
+                assert_eq!(cleanup.await.unwrap(), Ok(()));
+                assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 0);
+                let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+                assert!(
+                    control
+                        .claim_stale_report_reservation(&root, &mutation)
+                        .unwrap()
+                        .is_none()
+                );
+            });
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn terminal_cleanup_exhaustion_is_bounded_and_preserves_recovery() {
+        let root = test_root("report-terminal-cleanup-exhaustion");
+        let state = app_state(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let layout = state.collector.lock().await.layout.clone();
+            let config = load(&layout.config).unwrap();
+            let control = RuntimeControl::new(&config).unwrap();
+            let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+            drop(
+                control
+                    .reserve_report_build(&root, &mutation, 65536)
+                    .unwrap(),
+            );
+            let result = super::cleanup_report_reservation_with_retry(
+                &state,
+                &layout,
+                super::ReportRefreshTiming {
+                    debounce: Duration::ZERO,
+                    retry_initial: Duration::from_millis(1),
+                },
+            )
+            .await;
+            assert_eq!(result, Err(ReportFailure::RenderGuard));
+            assert_eq!(
+                state
+                    .report_snapshot_test
+                    .cleanup_attempts
+                    .load(Ordering::Acquire),
+                u64::from(super::REPORT_RETRY_LIMIT)
+            );
+            assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 0);
+            assert!(
+                control
+                    .claim_stale_report_reservation(&root, &mutation)
+                    .unwrap()
+                    .is_some()
+            );
+            drop(mutation);
+            assert_eq!(super::cleanup_report_reservation(&layout), Ok(()));
+        });
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
