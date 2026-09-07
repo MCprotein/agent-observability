@@ -12,6 +12,9 @@ use std::{
     path::Path,
 };
 
+/// Worst-case allocated metadata block, additional to the requested write ceiling.
+pub const REPORT_RESERVATION_METADATA_ALLOWANCE: u64 = 4096;
+
 const FILE_NAME: &str = "report-reservation.lock";
 const MAX_METADATA_BYTES: u64 = 512;
 const MAX_BYTE_CEILING: u64 = 20 * 1024 * 1024 * 1024;
