@@ -16,6 +16,8 @@ pub struct Singleton {
 #[derive(Debug)]
 pub struct MutationGuard {
     file: File,
+    directory: File,
+    runtime_dir: PathBuf,
 }
 #[derive(Debug)]
 pub enum SingletonError {
@@ -25,6 +27,7 @@ pub enum SingletonError {
     InsecurePermissions,
     Symlink,
     UnsupportedPlatform,
+    WrongMutationRoot,
 }
 impl From<std::io::Error> for SingletonError {
     fn from(e: std::io::Error) -> Self {
@@ -39,6 +42,9 @@ impl std::fmt::Display for SingletonError {
             Self::CorruptMetadata => formatter.write_str("runtime metadata is corrupt"),
             Self::InsecurePermissions => formatter.write_str("runtime path is not private"),
             Self::Symlink => formatter.write_str("runtime path must not be a symlink"),
+            Self::WrongMutationRoot => {
+                formatter.write_str("mutation guard does not own this runtime root")
+            }
             Self::UnsupportedPlatform => {
                 formatter.write_str("private singleton files are unsupported on this platform")
             }
@@ -133,6 +139,24 @@ impl Drop for Singleton {
 }
 
 impl MutationGuard {
+    pub(crate) fn require_root(&self, root: &Path) -> Result<(), SingletonError> {
+        let runtime = root.join("runtime");
+        if fs::canonicalize(&runtime)? != self.runtime_dir {
+            return Err(SingletonError::WrongMutationRoot);
+        }
+        private_runtime_dir(&runtime)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = self.directory.metadata()?;
+            let named = fs::metadata(&runtime)?;
+            if held.dev() != named.dev() || held.ino() != named.ino() {
+                return Err(SingletonError::WrongMutationRoot);
+            }
+        }
+        same_file(&self.file, &runtime.join("mutation.lock"))
+    }
+
     pub fn acquire(runtime_dir: &Path) -> Result<Self, SingletonError> {
         Self::acquire_with(runtime_dir, false)
     }
@@ -165,7 +189,14 @@ impl MutationGuard {
         } else {
             file.lock_exclusive().map_err(SingletonError::Io)?;
         }
-        Ok(Self { file })
+        let directory = File::open(runtime_dir)?;
+        let runtime_dir = fs::canonicalize(runtime_dir)?;
+        same_file(&file, &runtime_dir.join("mutation.lock"))?;
+        Ok(Self {
+            file,
+            directory,
+            runtime_dir,
+        })
     }
 }
 
@@ -201,7 +232,7 @@ fn decode_nonce(value: &str) -> Result<[u8; 32], SingletonError> {
 }
 
 #[cfg(unix)]
-fn private_runtime_dir(path: &Path) -> Result<(), SingletonError> {
+pub(crate) fn private_runtime_dir(path: &Path) -> Result<(), SingletonError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     if !path.exists() {
         let mut builder = fs::DirBuilder::new();
@@ -224,11 +255,11 @@ fn private_runtime_dir(path: &Path) -> Result<(), SingletonError> {
 }
 
 #[cfg(not(unix))]
-fn private_runtime_dir(_path: &Path) -> Result<(), SingletonError> {
+pub(crate) fn private_runtime_dir(_path: &Path) -> Result<(), SingletonError> {
     Err(SingletonError::UnsupportedPlatform)
 }
 
-fn reject_symlink(path: &Path) -> Result<(), SingletonError> {
+pub(crate) fn reject_symlink(path: &Path) -> Result<(), SingletonError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(SingletonError::Symlink),
         Ok(_) => Ok(()),
@@ -238,7 +269,7 @@ fn reject_symlink(path: &Path) -> Result<(), SingletonError> {
 }
 
 #[cfg(unix)]
-fn private_open_file(file: &File) -> Result<(), SingletonError> {
+pub(crate) fn private_open_file(file: &File) -> Result<(), SingletonError> {
     use std::os::unix::fs::PermissionsExt;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -253,18 +284,47 @@ fn private_open_file(file: &File) -> Result<(), SingletonError> {
 }
 
 #[cfg(not(unix))]
-fn private_open_file(_file: &File) -> Result<(), SingletonError> {
+pub(crate) fn private_open_file(_file: &File) -> Result<(), SingletonError> {
     Err(SingletonError::UnsupportedPlatform)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-const fn no_follow_flag() -> i32 {
+pub(crate) const fn no_follow_flag() -> i32 {
     0x20_000
 }
 
 #[cfg(target_os = "macos")]
-const fn no_follow_flag() -> i32 {
+pub(crate) const fn no_follow_flag() -> i32 {
     0x100
+}
+
+/// Recheck the named lock against the held descriptor; never unlink lock files.
+#[cfg(unix)]
+pub(crate) fn same_file(file: &File, path: &Path) -> Result<(), SingletonError> {
+    use std::os::unix::fs::MetadataExt;
+    reject_symlink(path)?;
+    private_open_file(file)?;
+    let held = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if held.dev() != named.dev() || held.ino() != named.ino() || held.nlink() != 1 {
+        return Err(SingletonError::WrongMutationRoot);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn same_file(_file: &File, _path: &Path) -> Result<(), SingletonError> {
+    Err(SingletonError::UnsupportedPlatform)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) const fn nonblocking_flag() -> i32 {
+    0x800
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) const fn nonblocking_flag() -> i32 {
+    0x4
 }
 
 #[cfg(test)]

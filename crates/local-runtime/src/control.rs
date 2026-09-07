@@ -1,6 +1,7 @@
 use crate::{
-    Admission, CollectionPolicyV1, LocalRuntimeConfigV3, PressureSample, Schedule, Scheduler,
-    StorageAccountingError, StorageBudget, StorageError,
+    Admission, CollectionPolicyV1, LocalRuntimeConfigV3, MutationGuard, PressureSample,
+    ReservationError, Schedule, Scheduler, StorageAccountingError, StorageBudget, StorageError,
+    WriteReservation,
 };
 use std::path::Path;
 
@@ -24,34 +25,98 @@ impl RuntimeControl {
     }
 
     pub fn admit(&self, root: &Path, worst_case_write: u64) -> Result<Admission, ControlError> {
-        let allocated =
-            StorageBudget::allocated_tree_bytes(root).map_err(ControlError::Accounting)?;
-        Ok(self.storage.admit(allocated, worst_case_write))
+        if worst_case_write > self.writable_headroom(root)? {
+            Ok(Admission::Denied)
+        } else {
+            Ok(Admission::Allowed {
+                reserved: worst_case_write,
+            })
+        }
     }
 
-    /// Available bytes for a new managed write, without borrowing reserved global headroom.
-    /// Existing authority, current/retired snapshots and temporary files are all counted.
+    /// Includes actual files plus the full active or stale report reservation.
     pub fn writable_headroom(&self, root: &Path) -> Result<u64, ControlError> {
-        let allocated =
-            StorageBudget::allocated_tree_bytes(root).map_err(ControlError::Accounting)?;
-        let filesystem_remaining = fs2::available_space(root)
-            .map_err(StorageAccountingError::Io)
-            .map_err(ControlError::Accounting)?;
-        Ok(self
-            .storage
-            .writable_limit()
-            .saturating_sub(allocated)
-            .min(filesystem_remaining))
+        let reserved =
+            crate::reservation::reserved_bytes(root).map_err(ControlError::Reservation)?;
+        Self::headroom(root, self.storage.writable_limit(), reserved)
     }
 
     pub fn migration_headroom(&self, root: &Path) -> Result<u64, ControlError> {
+        let reserved =
+            crate::reservation::reserved_bytes(root).map_err(ControlError::Reservation)?;
+        Self::headroom(root, self.storage.total, reserved)
+    }
+
+    fn headroom(root: &Path, limit: u64, reserved: u64) -> Result<u64, ControlError> {
         let allocated =
             StorageBudget::allocated_tree_bytes(root).map_err(ControlError::Accounting)?;
-        let budget_remaining = self.storage.total.saturating_sub(allocated);
+        let committed = allocated
+            .checked_add(reserved)
+            .ok_or(ControlError::Accounting(StorageAccountingError::Overflow))?;
         let filesystem_remaining = fs2::available_space(root)
             .map_err(StorageAccountingError::Io)
             .map_err(ControlError::Accounting)?;
-        Ok(budget_remaining.min(filesystem_remaining))
+        Ok(limit
+            .saturating_sub(committed)
+            .min(filesystem_remaining.saturating_sub(reserved)))
+    }
+
+    /// Acquires only the lifetime lock; the caller can immediately drop the
+    /// mutation guard while building. The ceiling includes build/journal and
+    /// publication writes; reservation metadata is separately accounted.
+    pub fn reserve_report_build(
+        &self,
+        root: &Path,
+        guard: &MutationGuard,
+        byte_ceiling: u64,
+    ) -> Result<WriteReservation, ControlError> {
+        guard
+            .require_root(root)
+            .map_err(ReservationError::from)
+            .map_err(ControlError::Reservation)?;
+        let available = self.writable_headroom(root)?;
+        if byte_ceiling == 0
+            || byte_ceiling
+                .checked_add(4096)
+                .is_none_or(|required| required > available)
+        {
+            return Err(ControlError::Reservation(ReservationError::Capacity));
+        }
+        let reservation = WriteReservation::acquire(root, guard, byte_ceiling)
+            .map_err(ControlError::Reservation)?;
+        // Count the newly allocated metadata too, before exposing an owner.
+        if byte_ceiling > Self::headroom(root, self.storage.writable_limit(), 0)? {
+            reservation
+                .release(root, guard)
+                .map_err(ControlError::Reservation)?;
+            return Err(ControlError::Reservation(ReservationError::Capacity));
+        }
+        Ok(reservation)
+    }
+
+    /// Excludes only this validated owner's promise, never its actual staging
+    /// allocation. Intended for the short final publication/cleanup boundary.
+    pub fn reservation_finalization_headroom(
+        &self,
+        root: &Path,
+        guard: &MutationGuard,
+        reservation: &WriteReservation,
+    ) -> Result<u64, ControlError> {
+        reservation
+            .validate_owner(root, guard)
+            .map_err(ControlError::Reservation)?;
+        Ok(Self::headroom(root, self.storage.writable_limit(), 0)?.min(reservation.byte_ceiling()))
+    }
+
+    /// Claim stale metadata before cleaning interrupted staging. The returned
+    /// owner keeps the lifetime lock; clean under the mutation guard, then
+    /// release it explicitly. Failed cleanup leaves the promise intact.
+    pub fn claim_stale_report_reservation(
+        &self,
+        root: &Path,
+        guard: &MutationGuard,
+    ) -> Result<Option<WriteReservation>, ControlError> {
+        crate::reservation::recover(root, guard).map_err(ControlError::Reservation)
     }
 
     pub fn evaluate(&mut self, now_ms: u64, sample: PressureSample) -> Schedule {
@@ -78,6 +143,7 @@ pub enum ControlError {
     Config(crate::ConfigError),
     Storage(StorageError),
     Accounting(StorageAccountingError),
+    Reservation(ReservationError),
 }
 
 impl std::fmt::Display for ControlError {
@@ -86,6 +152,7 @@ impl std::fmt::Display for ControlError {
             Self::Config(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Accounting(error) => error.fmt(formatter),
+            Self::Reservation(error) => error.fmt(formatter),
         }
     }
 }
@@ -96,6 +163,7 @@ impl std::error::Error for ControlError {
             Self::Config(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::Accounting(error) => Some(error),
+            Self::Reservation(error) => Some(error),
         }
     }
 }

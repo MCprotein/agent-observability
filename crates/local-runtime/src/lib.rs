@@ -11,6 +11,7 @@ pub mod control;
 pub mod ingress;
 pub mod lock;
 pub mod policy;
+pub mod reservation;
 pub mod scheduler;
 pub mod storage;
 
@@ -18,6 +19,7 @@ pub use control::{ControlError, RuntimeControl};
 pub use ingress::{Ingress, IngressCounters, IngressMessage, IngressOutcome};
 pub use lock::{MutationGuard, Singleton, SingletonError};
 pub use policy::{CollectionPolicyV1, RetentionPolicyV1, StorageLifecyclePolicyV1};
+pub use reservation::{ReservationError, WriteReservation};
 pub use scheduler::{PressureSample, Schedule, Scheduler, State};
 pub use storage::{Admission, Partition, StorageAccountingError, StorageBudget, StorageError};
 
