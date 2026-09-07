@@ -82,7 +82,10 @@ const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
 const MAX_CREDENTIAL_PATH_BYTES: usize = 256;
 static SETTINGS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const REPORT_DIRTY_FILE_NAME: &str = "report-dirty";
-const MAX_AUTOMATIC_REPORT_VIEW_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_AUTOMATIC_REPORT_VIEW_BYTES: u64 = agent_observability_local_store::MAX_REPORT_VIEW_BYTES;
+// Catalog atomic replacement is bounded to 16 KiB. Reserve 64 KiB outside the builder's
+// database/journal allowance for its temporary catalog and filesystem allocation rounding.
+const REPORT_VIEW_PUBLICATION_RESERVE_BYTES: u64 = 64 * 1024;
 const PRIVATE_TURN_DETAIL_DIRECTORY: &str = "private-codex-turn-details";
 const PRIVATE_TURN_DETAIL_STATUS_DIRECTORY: &str = "private-codex-turn-detail-statuses";
 const PRIVATE_TURN_DETAIL_STATUS_VERSION: &str = "private_codex_turn_detail_status.v1";
@@ -3726,6 +3729,15 @@ fn refresh_report_observing(
 ) -> Result<bool, ReportFailure> {
     let admitted_bytes = automatic_report_view_admitted_bytes(layout, config)?;
     let staging = build_automatic_report_view_staging(store, admitted_bytes, on_record)?;
+    // Recount with the completed staging file present. A concurrent managed write may have
+    // consumed the initial allowance; fail before changing current/retired catalog authority.
+    let remaining = RuntimeControl::new(config)
+        .map_err(|_| ReportFailure::Publish)?
+        .writable_headroom(&layout.root)
+        .map_err(|_| ReportFailure::Publish)?;
+    if remaining < REPORT_VIEW_PUBLICATION_RESERVE_BYTES {
+        return Err(ReportFailure::Capacity);
+    }
     let publication = publish_report_view(store, staging).map_err(report_catalog_failure)?;
     if publication.cleanup_pending() {
         return Err(ReportFailure::Publish);
@@ -3757,9 +3769,13 @@ fn automatic_report_view_admitted_bytes(
     // sidecars. The builder keeps its SQLite journal reserve inside this per-generation amount.
     RuntimeControl::new(config)
         .map_err(|_| ReportFailure::Publish)?
-        .migration_headroom(&layout.root)
+        .writable_headroom(&layout.root)
         .map_err(|_| ReportFailure::Publish)
-        .map(|headroom| headroom.min(MAX_AUTOMATIC_REPORT_VIEW_BYTES))
+        .map(|headroom| {
+            headroom
+                .saturating_sub(REPORT_VIEW_PUBLICATION_RESERVE_BYTES)
+                .min(MAX_AUTOMATIC_REPORT_VIEW_BYTES)
+        })
 }
 
 #[cfg(not(test))]
@@ -4262,6 +4278,8 @@ mod tests {
         }
     }
 
+    include!("rotation_diagnostic.rs");
+
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "agent-observability-collector-{name}-{}",
@@ -4477,6 +4495,28 @@ mod tests {
 
         drop(guard);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_admission_preserves_writable_headroom_and_publication_reserve() {
+        let root = test_root("snapshot-writable-admission");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        let mut config = load(&state.layout.config).unwrap();
+        assert_eq!(
+            config.collection.local_storage_budget_bytes,
+            1024 * 1024 * 1024
+        );
+        assert_eq!(super::MAX_AUTOMATIC_REPORT_VIEW_BYTES, 256 * 1024 * 1024);
+        config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+        let budget =
+            StorageBudget::calculate(config.collection.local_storage_budget_bytes, false).unwrap();
+        let allocated = StorageBudget::allocated_tree_bytes(&root).unwrap();
+        let admitted = super::automatic_report_view_admitted_bytes(&state.layout, &config).unwrap();
+        assert!(admitted < super::MAX_AUTOMATIC_REPORT_VIEW_BYTES);
+        assert!(allocated + admitted + 64 * 1024 <= budget.writable_limit());
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

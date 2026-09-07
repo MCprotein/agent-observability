@@ -19,7 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const REPORT_VIEW_SCHEMA_VERSION: &str = "agent_observability.report_view_staging.v1";
 const STAGING_FILE_PREFIX: &str = ".report-view.sqlite3.staging.";
-const MAX_STAGING_BYTES: u64 = 128 * 1024 * 1024;
+/// Finite per-generation database plus rollback-journal disk ceiling.
+pub const MAX_REPORT_VIEW_BYTES: u64 = 256 * 1024 * 1024;
 const SQLITE_PAGE_BYTES: u64 = 4096;
 const SQLITE_CACHE_KIB: i64 = 8 * 1024;
 const SQLITE_WRITE_HEADROOM_BYTES: u64 = 8 * 1024 * 1024;
@@ -242,7 +243,7 @@ impl Drop for ReportViewStaging {
 
 /// Builds a complete, unpublished report-view projection under the publication guard.
 ///
-/// The caller explicitly reserves no more than 128 MiB for the database plus rollback-journal
+/// The caller explicitly reserves no more than 256 MiB for the database plus rollback-journal
 /// headroom. The fixed managed directory is derived from the local store, binding the staging file
 /// to that authority. The database page ceiling excludes a fixed
 /// 8 MiB write reserve, write transactions are bounded, indexes are created while empty, and
@@ -421,7 +422,8 @@ fn validate_build_inputs(
     rate_fingerprint: &str,
     admitted_bytes: u64,
 ) -> Result<(), ReportViewBuildError> {
-    let admitted_range = SQLITE_WRITE_HEADROOM_BYTES + (4 * SQLITE_PAGE_BYTES)..=MAX_STAGING_BYTES;
+    let admitted_range =
+        SQLITE_WRITE_HEADROOM_BYTES + (4 * SQLITE_PAGE_BYTES)..=MAX_REPORT_VIEW_BYTES;
     if !admitted_range.contains(&admitted_bytes) {
         return Err(ReportViewBuildError::InvalidByteBudget);
     }
@@ -753,10 +755,40 @@ mod tests {
         Timing, TokenUsage, TraceId,
     };
 
-    const TEST_ADMISSION: u64 = MAX_STAGING_BYTES;
+    const TEST_ADMISSION: u64 = MAX_REPORT_VIEW_BYTES;
     const TEST_RATE_FINGERPRINT: &str =
         "0000000000000000000000000000000000000000000000000000000000000000";
     const TEST_RAW_SENTINEL: &str = "RAW_PRIVATE_CONTENT_SENTINEL";
+
+    #[test]
+    fn staging_cap_and_sqlite_bounds_preserve_non_disk_limits() {
+        assert_eq!(MAX_REPORT_VIEW_BYTES, 256 * 1024 * 1024);
+        assert!(validate_build_inputs(TEST_RATE_FINGERPRINT, MAX_REPORT_VIEW_BYTES).is_ok());
+        assert!(validate_build_inputs(TEST_RATE_FINGERPRINT, MAX_REPORT_VIEW_BYTES + 1).is_err());
+        assert!(validate_build_inputs(TEST_RATE_FINGERPRINT, SQLITE_WRITE_HEADROOM_BYTES).is_err());
+        let root = temp_dir("sqlite-bounds");
+        let _ = fs::remove_dir_all(&root);
+        let store = LocalStore::open(&root).unwrap();
+        let admitted = MAX_REPORT_VIEW_BYTES - 1;
+        let staging = create_staging(&store, TEST_RATE_FINGERPRINT, admitted).unwrap();
+        let value = |name| {
+            staging
+                .connection()
+                .pragma_query_value(None, name, |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        assert_eq!(
+            value("max_page_count"),
+            i64::try_from((admitted - SQLITE_WRITE_HEADROOM_BYTES) / SQLITE_PAGE_BYTES).unwrap()
+        );
+        assert_eq!(value("cache_size"), -8192);
+        assert_eq!(value("journal_size_limit"), 8 * 1024 * 1024);
+        assert_eq!(WRITE_BATCH_RECORDS, 128);
+        assert_eq!(WRITE_BATCH_BYTES, 2 * 1024 * 1024);
+        drop(staging);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

@@ -8,8 +8,8 @@ mod report_view_query;
 
 pub use dashboard_query::DashboardQueryService;
 pub use report_view::{
-    MISSING_RATE_FINGERPRINT, ReportViewBuildError, ReportViewStaging, build_report_view_staging,
-    build_report_view_staging_observing,
+    MAX_REPORT_VIEW_BYTES, MISSING_RATE_FINGERPRINT, ReportViewBuildError, ReportViewStaging,
+    build_report_view_staging, build_report_view_staging_observing,
 };
 pub use report_view_catalog::{
     ReportViewCatalogError, ReportViewPublication, ReportViewRetirement, ReportViewSnapshot,
