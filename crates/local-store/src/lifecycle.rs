@@ -1,9 +1,11 @@
+use super::report_view_catalog::retire_report_views_for_visibility_change;
 use super::{
     LIFECYCLE_BACKFILL_COMPLETE, LIFECYCLE_BACKFILL_CURSOR_KEY, LIFECYCLE_SCAN_CURSOR_KEY,
     LocalStore, MAX_ARCHIVE_BYTES, MAX_ARCHIVE_RECORDS, MAX_EXPIRED_SPAN_GUARDS, MIN_ARCHIVE_BYTES,
-    MIN_ARCHIVE_RECORDS, PROJECTION_NAME, StoreError, advance_report_generation,
-    canonical_state_hash, hash_opaque_identifier, mark_projection_dirty, ordered_millis,
-    private_file, prune_expired_span_guards, required_schema_text, state_from_json,
+    MIN_ARCHIVE_RECORDS, PROJECTION_NAME, REPORT_VISIBILITY_EPOCH_KEY, ReportRenderGuard,
+    ReportViewRetirement, StoreError, advance_report_generation, advance_report_visibility_epoch,
+    canonical_state_hash, hash_opaque_identifier, mark_projection_dirty, metadata_generation,
+    ordered_millis, private_file, prune_expired_span_guards, required_schema_text, state_from_json,
 };
 use agent_observability_contracts::{DurableRecordV1, sanitize_durable_record};
 use agent_observability_domain::DomainSpanState;
@@ -293,12 +295,30 @@ impl LocalStore {
         &self,
         request: LifecycleRequest,
     ) -> Result<LifecycleResult, StoreError> {
+        let publication_guard = self.acquire_report_render_guard()?;
+        self.maintain_lifecycle_guarded(request, publication_guard)
+    }
+
+    /// Runs bounded lifecycle maintenance using a caller-owned report publication guard.
+    ///
+    /// The guard is consumed so the first visibility-removing transition can transfer it into a
+    /// retirement token that remains alive through every destructive commit in this pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] under the same conditions as [`Self::maintain_lifecycle`], including
+    /// when managed report views cannot be retired before destructive work.
+    pub fn maintain_lifecycle_guarded(
+        &self,
+        request: LifecycleRequest,
+        publication_guard: ReportRenderGuard,
+    ) -> Result<LifecycleResult, StoreError> {
         validate_request(request)?;
         self.db.busy_timeout(MAINTENANCE_BUSY_TIMEOUT)?;
         let result = (|| {
             self.db.pragma_update(None, "secure_delete", true)?;
             let before = storage_stats(&self.db, &self.database_path())?;
-            self.maintain_lifecycle_inner(request)
+            self.maintain_lifecycle_inner(request, publication_guard)
                 .and_then(|mut result| {
                     result.vacuum_pages_requested =
                         incremental_vacuum_bounded(&self.db, result.touched_bytes)?;
@@ -324,10 +344,17 @@ impl LocalStore {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "bounded lifecycle transition accounting stays with its authoritative transactions"
+    )]
     fn maintain_lifecycle_inner(
         &self,
         request: LifecycleRequest,
+        publication_guard: ReportRenderGuard,
     ) -> Result<LifecycleResult, StoreError> {
+        let mut publication_guard = Some(publication_guard);
+        let mut retirement: Option<ReportViewRetirement> = None;
         let backfill_blocked = backfill_hot_trace_index(&self.db, request)?;
         let hot_cutoff = cutoff(request.now_unix_ms, request.hot_days);
         let warm_cutoff = cutoff(request.now_unix_ms, request.warm_days);
@@ -406,7 +433,22 @@ impl LocalStore {
                 }
             };
 
-            match transition.expect("checked above") {
+            let transition = transition.expect("checked above");
+            let removes_visibility = transition != Transition::Warm;
+            if removes_visibility && retirement.is_none() {
+                let next_visibility_epoch = metadata_generation(&tx, REPORT_VISIBILITY_EPOCH_KEY)?
+                    .checked_add(1)
+                    .ok_or(StoreError::SchemaMismatch)?;
+                retirement = Some(
+                    retire_report_views_for_visibility_change(
+                        self,
+                        publication_guard.take().ok_or(StoreError::SchemaMismatch)?,
+                        next_visibility_epoch,
+                    )
+                    .map_err(|_| StoreError::ReportViewRetirement)?,
+                );
+            }
+            match transition {
                 Transition::Warm => {
                     move_hot_to_warm(&tx, &current, request.now_unix_ms)?;
                     result.moved_to_warm = result.moved_to_warm.saturating_add(1);
@@ -426,6 +468,9 @@ impl LocalStore {
             result.touched_bytes = totals.bytes;
             mark_projection_dirty(&tx)?;
             advance_report_generation(&tx)?;
+            if removes_visibility {
+                advance_report_visibility_epoch(&tx)?;
+            }
             update_scan_cursor(&tx, &candidate.cursor_after)?;
             tx.commit()?;
         }

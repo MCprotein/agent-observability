@@ -1,5 +1,7 @@
 //! Pure application use cases for local pricing and cost aggregation.
 
+pub mod dashboard_summary;
+
 use agent_observability_contracts::{
     AttributesV1, AvailabilityStateV2, CostComponentV1, CostDetailV1, CostEstimateV1,
     DurableRecordV1, FieldAvailabilityV2, MetricsV1, REPORT_DTO_VERSION, RateTableRefV1,
@@ -555,26 +557,38 @@ fn propagate_trace_repositories(spans: &mut [ReportSpanV2]) {
             .insert(span.repo.clone());
     }
     for span in spans {
-        if span.repo != "unknown" {
-            continue;
-        }
-        match known.get(&span.trace_id) {
-            Some(repos) if repos.len() == 1 => {
-                span.repo
-                    .clone_from(repos.first().expect("single repository"));
-                span.availability.repository = field_availability(
-                    AvailabilityStateV2::Available,
-                    "derived_from_trace_context",
-                );
-            }
-            Some(_) => {
-                span.availability.repository = field_availability(
-                    AvailabilityStateV2::SourceUnavailable,
-                    "ambiguous_trace_repository",
-                );
-            }
-            None => {}
-        }
+        let repositories = known.get(&span.trace_id);
+        resolve_report_repository(span, repositories.into_iter().flatten().map(String::as_str));
+    }
+}
+
+/// Resolves an unknown repository using already privacy-projected trace context.
+///
+/// An indexed consumer may supply at most two distinct known repositories: that is sufficient
+/// to distinguish missing, unique, and ambiguous context without materializing a whole trace.
+/// Known span repositories remain authoritative. Source/durable strings must be projected first.
+pub fn resolve_report_repository<'a>(
+    span: &mut ReportSpanV2,
+    known_repositories: impl IntoIterator<Item = &'a str>,
+) {
+    if span.repo != "unknown" {
+        return;
+    }
+    let mut repositories = known_repositories
+        .into_iter()
+        .filter(|repository| *repository != "unknown");
+    let Some(first) = repositories.next() else {
+        return;
+    };
+    if repositories.any(|repository| repository != first) {
+        span.availability.repository = field_availability(
+            AvailabilityStateV2::SourceUnavailable,
+            "ambiguous_trace_repository",
+        );
+    } else {
+        first.clone_into(&mut span.repo);
+        span.availability.repository =
+            field_availability(AvailabilityStateV2::Available, "derived_from_trace_context");
     }
 }
 

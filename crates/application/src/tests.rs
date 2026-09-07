@@ -90,6 +90,133 @@ fn full(model: &str) -> DurableRecordV1 {
     )
 }
 
+#[test]
+fn paged_summary_preserves_token_precedence_and_rejects_overflow_atomically() {
+    use crate::dashboard_summary::{DashboardSummaryAccumulator, dashboard_token_total};
+    use agent_observability_contracts::dashboard::{DashboardCostStatusV1, DashboardTokenStatusV1};
+    let rates = table();
+    let projected = project_report_span(0, &full("gpt-test"), Some(&rates)).unwrap();
+    let mut accumulator = DashboardSummaryAccumulator::default();
+    accumulator.push(&projected).unwrap();
+    let expected = accumulator.clone().finish(1, 1).unwrap();
+    assert_eq!(expected.total_tokens, Some(1_500_000));
+    assert_eq!(expected.token_status, DashboardTokenStatusV1::Complete);
+    let mut invalid = projected.clone();
+    invalid.metrics.input_tokens = Some(f64::INFINITY);
+    assert!(accumulator.push(&invalid).is_err());
+    assert_eq!(accumulator.finish(1, 1).unwrap(), expected);
+    let empty = DashboardSummaryAccumulator::default().finish(0, 0).unwrap();
+    assert_eq!(empty.token_status, DashboardTokenStatusV1::Unavailable);
+    assert_eq!(empty.cost_status, DashboardCostStatusV1::Unknown);
+    assert_eq!(empty.estimated_cost, None);
+    let mut metrics = projected.metrics.clone();
+    metrics.total_tokens = Some(3.0);
+    assert_eq!(dashboard_token_total(&metrics), Some(1_500_000.0));
+    metrics.output_tokens = None;
+    assert_eq!(dashboard_token_total(&metrics), Some(3.0));
+}
+
+#[test]
+fn paged_summary_without_token_usage_validates_as_complete_wire_response() {
+    use crate::dashboard_summary::DashboardSummaryAccumulator;
+    use agent_observability_contracts::dashboard::DashboardQueryResponseV1;
+    let mut record = span("tool", MetricsV1::default());
+    record.span_kind = SpanKind::ToolExecution;
+    let projected = project_report_span(0, &record, None).unwrap();
+    for include_tool in [false, true] {
+        let mut accumulator = DashboardSummaryAccumulator::default();
+        if include_tool {
+            accumulator.push(&projected).unwrap();
+        }
+        let kpis = accumulator.finish(0, 0).unwrap();
+        assert_eq!(kpis.input_tokens, None);
+        assert_eq!(kpis.output_tokens, None);
+        assert_eq!(kpis.total_tokens, None);
+        let wire = serde_json::json!({
+            "schemaVersion": "agent_observability.dashboard_query.v1",
+            "kind": "summary",
+            "snapshot": {
+                "id": "a".repeat(64), "generation": "0", "visibilityEpoch": "0",
+                "generatedAt": "2026-09-07T00:00:00.000Z", "state": "current"
+            },
+            "scope": { "filters": {}, "selectedTraceId": null, "coldExcluded": true },
+            "work": { "state": "complete", "kpis": kpis },
+            "pagination": { "nextCursor": null }
+        });
+        let response: DashboardQueryResponseV1 = serde_json::from_value(wire).unwrap();
+        response.validate().unwrap();
+    }
+}
+
+#[test]
+fn paged_summary_never_fabricates_missing_token_components() {
+    use crate::dashboard_summary::DashboardSummaryAccumulator;
+    use agent_observability_contracts::dashboard::DashboardTokenStatusV1;
+    let total_only = project_report_span(
+        0,
+        &span(
+            "total-only",
+            MetricsV1 {
+                total_tokens: Some(3.0),
+                ..MetricsV1::default()
+            },
+        ),
+        None,
+    )
+    .unwrap();
+    let mut accumulator = DashboardSummaryAccumulator::default();
+    accumulator.push(&total_only).unwrap();
+    let total = accumulator.clone().finish(1, 1).unwrap();
+    assert_eq!(total.token_status, DashboardTokenStatusV1::Complete);
+    assert_eq!(total.total_tokens, Some(3));
+    assert_eq!(total.input_tokens, None);
+    assert_eq!(total.output_tokens, None);
+    let direct = project_report_span(
+        1,
+        &span(
+            "direct",
+            MetricsV1 {
+                input_tokens: Some(0.0),
+                output_tokens: Some(2.0),
+                ..MetricsV1::default()
+            },
+        ),
+        None,
+    )
+    .unwrap();
+    let mut direct_only = DashboardSummaryAccumulator::default();
+    direct_only.push(&direct).unwrap();
+    let direct_total = direct_only.finish(1, 1).unwrap();
+    assert_eq!(direct_total.input_tokens, Some(0));
+    assert_eq!(direct_total.output_tokens, Some(2));
+    accumulator.push(&direct).unwrap();
+    let mixed = accumulator.finish(2, 2).unwrap();
+    assert_eq!(mixed.total_tokens, Some(5));
+    assert_eq!(mixed.input_tokens, None);
+    assert_eq!(mixed.output_tokens, None);
+}
+
+#[test]
+fn paged_summary_marks_partial_tokens_and_mixed_currency_without_false_totals() {
+    use crate::dashboard_summary::DashboardSummaryAccumulator;
+    use agent_observability_contracts::dashboard::{DashboardCostStatusV1, DashboardTokenStatusV1};
+    let mut projected = project_report_span(0, &full("gpt-test"), None).unwrap();
+    projected.estimated_cost = Some(1.0);
+    projected.cost.status = "estimated".into();
+    projected.cost.currency = Some("USD".into());
+    let mut accumulator = DashboardSummaryAccumulator::default();
+    accumulator.push(&projected).unwrap();
+    projected.cost.currency = Some("EUR".into());
+    projected.availability.tokens.state = AvailabilityStateV2::SourceUnavailable;
+    accumulator.push(&projected).unwrap();
+    let result = accumulator.finish(1, 2).unwrap();
+    assert_eq!(result.token_status, DashboardTokenStatusV1::Incomplete);
+    assert_eq!(result.total_tokens, None);
+    assert_eq!(result.cost_status, DashboardCostStatusV1::Incomplete);
+    assert_eq!(result.estimated_cost, None);
+    assert_eq!(result.currency, None);
+}
+
 fn sorted_hashes(values: &[&str]) -> Vec<String> {
     let mut values = values
         .iter()
@@ -497,6 +624,48 @@ fn individual_report_span_projection_matches_single_record_report_and_pricing() 
             .unwrap()
             .contains("RAW_SINGLE_SPAN_SENTINEL")
     );
+}
+
+#[test]
+fn indexed_repository_resolution_matches_trace_context_rules() {
+    let mut record = full("gpt-test");
+    record.project = ProjectV1::default();
+    let original = project_report_span(0, &record, None).unwrap();
+    assert_eq!(original.repo, "unknown");
+    for (candidates, expected_repo, expected_reason) in [
+        (
+            vec![],
+            "unknown",
+            original.availability.repository.reason.as_str(),
+        ),
+        (
+            vec!["unknown"],
+            "unknown",
+            original.availability.repository.reason.as_str(),
+        ),
+        (vec!["repo-a"], "repo-a", "derived_from_trace_context"),
+        (
+            vec!["repo-a", "repo-a"],
+            "repo-a",
+            "derived_from_trace_context",
+        ),
+        (
+            vec!["repo-a", "repo-b"],
+            "unknown",
+            "ambiguous_trace_repository",
+        ),
+    ] {
+        let mut span = original.clone();
+        resolve_report_repository(&mut span, candidates);
+        assert_eq!(span.repo, expected_repo);
+        assert_eq!(span.availability.repository.reason, expected_reason);
+        span.validate().unwrap();
+    }
+    let mut known = original;
+    known.repo = "authoritative-repo".into();
+    let before = known.clone();
+    resolve_report_repository(&mut known, ["other-repo"]);
+    assert_eq!(known, before);
 }
 
 #[test]

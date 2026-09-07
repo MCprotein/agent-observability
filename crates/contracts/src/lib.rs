@@ -1,3 +1,5 @@
+pub mod dashboard;
+
 use agent_observability_domain::{
     CorrelationIds, DomainSpanState, LifecycleState, ObservationId, SourceCursor, SourceGeneration,
     SpanId, SpanKind, StatusCode, Timing, TokenUsage, TraceId,
@@ -2034,7 +2036,7 @@ impl ContractManifest {
             "agent_observability.retention_archive.v1",
         )?;
         self.expect("local_runtime_config", "local_runtime.v4")?;
-        self.expect("local_state", "local_state.v5")?;
+        self.expect("local_state", "local_state.v6")?;
         self.expect("durable_schema", "contracts/durable-record-v1.schema.json")?;
         self.expect("report_schema", "contracts/report-dto-v2.schema.json")?;
         self.expect(
@@ -2047,6 +2049,19 @@ impl ContractManifest {
         )?;
         self.expect("report_fixture", "contracts/report-dto-v2.fixture.json")?;
         self.expect("report_parity", "contracts/report-dto-v2.parity.json")?;
+        self.expect("dashboard_query", dashboard::DASHBOARD_QUERY_VERSION)?;
+        self.expect(
+            "dashboard_query_schema",
+            "contracts/dashboard-query-v1.schema.json",
+        )?;
+        self.expect(
+            "dashboard_query_fixture",
+            "contracts/dashboard-query-v1.fixture.json",
+        )?;
+        self.expect(
+            "dashboard_query_parity",
+            "contracts/dashboard-query-v1.parity.json",
+        )?;
         self.expect(
             "private_codex_turn_detail",
             "agent_observability.private_turn_detail.v1",
@@ -2213,6 +2228,7 @@ mod tests {
             LOCAL_RUNTIME_CONFIG_SCHEMA,
             LOCAL_COLLECTOR_HEALTH_SCHEMA,
             CODEX_INTEGRATION_STATUS_SCHEMA,
+            super::dashboard::DASHBOARD_QUERY_SCHEMA,
         ] {
             assert!(schema.contains("\"additionalProperties\": false"));
         }

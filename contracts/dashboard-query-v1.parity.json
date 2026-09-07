@@ -1,0 +1,184 @@
+{
+  "schemaVersion": "agent_observability.dashboard_query.parity.v1",
+  "bases": {
+    "bootstrapRequest": {
+      "schemaVersion": "agent_observability.dashboard_query.v1",
+      "kind": "bootstrap"
+    },
+    "spansRequest": {
+      "schemaVersion": "agent_observability.dashboard_query.v1",
+      "kind": "spans",
+      "snapshotId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "traceId": "id:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "cursor": null
+    },
+    "tracesRequest": {
+      "schemaVersion": "agent_observability.dashboard_query.v1",
+      "kind": "traces",
+      "snapshotId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "summaryRequest": {
+      "schemaVersion": "agent_observability.dashboard_query.v1",
+      "kind": "summary",
+      "snapshotId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "spanRequest": {
+      "schemaVersion": "agent_observability.dashboard_query.v1",
+      "kind": "span",
+      "snapshotId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "traceId": "id:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "spanId": "id:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "facetsRequest": {
+      "schemaVersion": "agent_observability.dashboard_query.v1",
+      "kind": "facets",
+      "snapshotId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "spansResponse": {
+      "schemaVersion": "agent_observability.dashboard_query.v1",
+      "kind": "spans",
+      "snapshot": {
+        "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "generation": "42",
+        "visibilityEpoch": "7",
+        "generatedAt": "2026-09-07T00:00:00.000Z",
+        "state": "current"
+      },
+      "scope": {
+        "filters": {},
+        "selectedTraceId": null,
+        "coldExcluded": true
+      },
+      "work": {
+        "state": "complete",
+        "kpis": {
+          "sessions": 1,
+          "turns": 1,
+          "llm": 0,
+          "tools": 1,
+          "errors": 0,
+          "inputTokens": null,
+          "outputTokens": null,
+          "totalTokens": 120,
+          "tokenStatus": "complete",
+          "estimatedCost": null,
+          "costStatus": "unknown",
+          "currency": null
+        }
+      },
+      "rows": [
+        {
+          "traceId": "id:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "spanId": "id:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "parentSpanId": null,
+          "kind": "tool",
+          "name": "shell",
+          "status": "ok",
+          "startTimeUnixMs": 1,
+          "endTimeUnixMs": null,
+          "repo": "workspace",
+          "availabilityReasons": [
+            {
+              "field": "tokens",
+              "state": "not_applicable",
+              "reason": "span_kind_has_no_token_usage"
+            }
+          ]
+        }
+      ],
+      "pagination": {
+        "nextCursor": null
+      }
+    },
+    "tracesResponse": {
+      "schemaVersion": "agent_observability.dashboard_query.v1",
+      "kind": "traces",
+      "snapshot": {
+        "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "generation": "42",
+        "visibilityEpoch": "7",
+        "generatedAt": "2026-09-07T00:00:00.000Z",
+        "state": "current"
+      },
+      "scope": {
+        "filters": {},
+        "selectedTraceId": null,
+        "coldExcluded": true
+      },
+      "work": {
+        "state": "pending"
+      },
+      "rows": [
+        {
+          "traceId": "id:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "repo": "workspace",
+          "spanCount": 1,
+          "errorCount": 0,
+          "startTimeUnixMs": 1,
+          "endTimeUnixMs": null,
+          "availabilityReasons": []
+        }
+      ],
+      "pagination": {
+        "nextCursor": null
+      }
+    },
+    "statusResponse": {
+      "schemaVersion": "agent_observability.dashboard_query.v1",
+      "kind": "status",
+      "requestKind": "traces",
+      "reason": "building"
+    }
+  },
+  "cases": [
+    { "name": "optional filters may be absent", "category": "positive", "base": "bootstrapRequest", "operation": "none", "path": [], "valid": true },
+    { "name": "nullable request cursor may be null", "category": "positive", "base": "spansRequest", "operation": "none", "path": [], "valid": true },
+    { "name": "required nullable response fields may be null", "category": "positive", "base": "spansResponse", "operation": "none", "path": [], "valid": true },
+    { "name": "optional row strings may be absent", "category": "positive", "base": "spansResponse", "operation": "none", "path": [], "valid": true },
+    { "name": "optional status snapshot may be absent", "category": "positive", "base": "statusResponse", "operation": "none", "path": [], "valid": true },
+    { "name": "complete token total permits unknown input component", "category": "positive", "base": "spansResponse", "operation": "set", "path": ["work", "kpis", "outputTokens"], "value": 20, "valid": true },
+    { "name": "complete token total permits unknown output component", "category": "positive", "base": "spansResponse", "operation": "set", "path": ["work", "kpis", "inputTokens"], "value": 100, "valid": true },
+    { "name": "incomplete token total preserves known input component", "category": "positive", "base": "spansResponse", "operation": "set", "path": ["work", "kpis"], "value": { "sessions": 1, "turns": 1, "llm": 1, "tools": 0, "errors": 0, "inputTokens": 100, "outputTokens": null, "totalTokens": null, "tokenStatus": "incomplete", "estimatedCost": null, "costStatus": "unknown", "currency": null }, "valid": true },
+    { "name": "unavailable tokens remain all null", "category": "positive", "base": "spansResponse", "operation": "set", "path": ["work", "kpis"], "value": { "sessions": 1, "turns": 1, "llm": 0, "tools": 1, "errors": 0, "inputTokens": null, "outputTokens": null, "totalTokens": null, "tokenStatus": "unavailable", "estimatedCost": null, "costStatus": "unknown", "currency": null }, "valid": true },
+    { "name": "canonical unavailable reason is accepted", "category": "positive", "base": "spansResponse", "operation": "none", "path": [], "valid": true },
+
+    { "name": "optional filters reject null", "category": "negative", "base": "bootstrapRequest", "operation": "set", "path": ["filters"], "value": null, "valid": false },
+    { "name": "traces filters reject null", "category": "negative", "base": "tracesRequest", "operation": "set", "path": ["filters"], "value": null, "valid": false },
+    { "name": "spans filters reject null", "category": "negative", "base": "spansRequest", "operation": "set", "path": ["filters"], "value": null, "valid": false },
+    { "name": "summary filters reject null", "category": "negative", "base": "summaryRequest", "operation": "set", "path": ["filters"], "value": null, "valid": false },
+    { "name": "span filters reject null", "category": "negative", "base": "spanRequest", "operation": "set", "path": ["filters"], "value": null, "valid": false },
+    { "name": "facets filters reject null", "category": "negative", "base": "facetsRequest", "operation": "set", "path": ["filters"], "value": null, "valid": false },
+    { "name": "optional filter text rejects null", "category": "negative", "base": "bootstrapRequest", "operation": "set", "path": ["filters"], "value": { "text": null }, "valid": false },
+    { "name": "scope selected trace id is required", "category": "negative", "base": "spansResponse", "operation": "remove", "path": ["scope", "selectedTraceId"], "valid": false },
+    { "name": "KPI input tokens are required", "category": "negative", "base": "spansResponse", "operation": "remove", "path": ["work", "kpis", "inputTokens"], "valid": false },
+    { "name": "KPI output tokens are required", "category": "negative", "base": "spansResponse", "operation": "remove", "path": ["work", "kpis", "outputTokens"], "valid": false },
+    { "name": "KPI total tokens are required", "category": "negative", "base": "spansResponse", "operation": "remove", "path": ["work", "kpis", "totalTokens"], "valid": false },
+    { "name": "KPI estimated cost is required", "category": "negative", "base": "spansResponse", "operation": "remove", "path": ["work", "kpis", "estimatedCost"], "valid": false },
+    { "name": "KPI currency is required", "category": "negative", "base": "spansResponse", "operation": "remove", "path": ["work", "kpis", "currency"], "valid": false },
+    { "name": "pagination next cursor is required", "category": "negative", "base": "spansResponse", "operation": "remove", "path": ["pagination", "nextCursor"], "valid": false },
+    { "name": "optional pagination total rejects null", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["pagination", "total"], "value": null, "valid": false },
+    { "name": "span parent id is required", "category": "negative", "base": "spansResponse", "operation": "remove", "path": ["rows", 0, "parentSpanId"], "valid": false },
+    { "name": "span end time is required", "category": "negative", "base": "spansResponse", "operation": "remove", "path": ["rows", 0, "endTimeUnixMs"], "valid": false },
+    { "name": "trace end time is required", "category": "negative", "base": "tracesResponse", "operation": "remove", "path": ["rows", 0, "endTimeUnixMs"], "valid": false },
+    { "name": "optional row agent rejects null", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["rows", 0, "agent"], "value": null, "valid": false },
+    { "name": "optional row model rejects null", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["rows", 0, "model"], "value": null, "valid": false },
+    { "name": "optional row session id rejects null", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["rows", 0, "sessionId"], "value": null, "valid": false },
+    { "name": "optional row turn id rejects null", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["rows", 0, "turnId"], "value": null, "valid": false },
+    { "name": "optional row tool name rejects null", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["rows", 0, "toolName"], "value": null, "valid": false },
+    { "name": "optional status snapshot rejects null", "category": "negative", "base": "statusResponse", "operation": "set", "path": ["snapshot"], "value": null, "valid": false },
+    { "name": "complete token status requires total", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["work", "kpis", "totalTokens"], "value": null, "valid": false },
+    { "name": "incomplete token status rejects a total", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["work", "kpis", "tokenStatus"], "value": "incomplete", "valid": false },
+    { "name": "unavailable tokens reject known components", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["work", "kpis"], "value": { "sessions": 1, "turns": 1, "llm": 0, "tools": 1, "errors": 0, "inputTokens": 0, "outputTokens": null, "totalTokens": null, "tokenStatus": "unavailable", "estimatedCost": null, "costStatus": "unknown", "currency": null }, "valid": false },
+    { "name": "availability reason requires canonical state", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["rows", 0, "availabilityReasons"], "value": [{ "field": "tokens", "reason": "span_kind_has_no_token_usage" }], "valid": false },
+    { "name": "available fields are omitted from availability reasons", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["rows", 0, "availabilityReasons"], "value": [{ "field": "tokens", "state": "available", "reason": "reported_by_adapter" }], "valid": false },
+    { "name": "availability reasons reject arbitrary reasons", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["rows", 0, "availabilityReasons"], "value": [{ "field": "tokens", "state": "source_unavailable", "reason": "adapter_was_confused" }], "valid": false },
+    { "name": "availability reasons reject invalid state reason pairs", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["rows", 0, "availabilityReasons"], "value": [{ "field": "tokens", "state": "withheld", "reason": "source_not_provided" }], "valid": false },
+    { "name": "availability reasons reject duplicate fields", "category": "negative", "base": "spansResponse", "operation": "set", "path": ["rows", 0, "availabilityReasons"], "value": [{ "field": "tokens", "state": "source_unavailable", "reason": "source_not_provided" }, { "field": "tokens", "state": "not_applicable", "reason": "span_kind_has_no_token_usage" }], "valid": false },
+
+    { "name": "request rejects SQL authority", "category": "privacy", "base": "bootstrapRequest", "operation": "set", "path": ["sql"], "value": "select raw_content from durable_records", "valid": false },
+    { "name": "request rejects local paths", "category": "privacy", "base": "bootstrapRequest", "operation": "set", "path": ["path"], "value": "/private/store.db", "valid": false },
+    { "name": "compact row rejects raw content", "category": "privacy", "base": "spansResponse", "operation": "set", "path": ["rows", 0, "rawContent"], "value": "RAW_PRIVATE_SENTINEL", "valid": false },
+    { "name": "compact row rejects request content", "category": "privacy", "base": "spansResponse", "operation": "set", "path": ["rows", 0, "requestContent"], "value": "RAW_REQUEST_SENTINEL", "valid": false },
+    { "name": "compact row rejects response content", "category": "privacy", "base": "spansResponse", "operation": "set", "path": ["rows", 0, "responseContent"], "value": "RAW_RESPONSE_SENTINEL", "valid": false }
+  ]
+}

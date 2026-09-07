@@ -1,0 +1,646 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-observability.local/contracts/dashboard-query-v1.schema.json",
+  "title": "DashboardQueryWireV1",
+  "description": "Closed request and response wire contract for the bounded standalone paged dashboard. Cursors are opaque server leases and never grant query authority.",
+  "$comment": "Requests are additionally limited to 8192 serialized UTF-8 bytes and responses to 1048576 serialized UTF-8 bytes. These wire limits are enforced separately from row limits.",
+  "x-agent-observability-max-request-serialized-utf8-bytes": 8192,
+  "x-agent-observability-max-response-serialized-utf8-bytes": 1048576,
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/response" }
+  ],
+  "$defs": {
+    "request": {
+      "title": "DashboardQueryRequestV1",
+      "oneOf": [
+        { "$ref": "#/$defs/bootstrap_request" },
+        { "$ref": "#/$defs/traces_request" },
+        { "$ref": "#/$defs/spans_request" },
+        { "$ref": "#/$defs/summary_request" },
+        { "$ref": "#/$defs/span_request" },
+        { "$ref": "#/$defs/facets_request" }
+      ]
+    },
+    "request_base": {
+      "type": "object",
+      "required": ["schemaVersion"],
+      "properties": {
+        "schemaVersion": { "const": "agent_observability.dashboard_query.v1" },
+        "filters": { "$ref": "#/$defs/filters" }
+      }
+    },
+    "bootstrap_request": {
+      "title": "DashboardBootstrapRequestV1",
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/request_base" },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": { "kind": { "const": "bootstrap" } }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "traces_request": {
+      "title": "DashboardTracesRequestV1",
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/request_base" },
+        {
+          "type": "object",
+          "required": ["kind", "snapshotId"],
+          "properties": {
+            "kind": { "const": "traces" },
+            "snapshotId": { "$ref": "#/$defs/snapshot_id" },
+            "cursor": { "$ref": "#/$defs/nullable_cursor" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "spans_request": {
+      "title": "DashboardSpansRequestV1",
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/request_base" },
+        {
+          "type": "object",
+          "required": ["kind", "snapshotId", "traceId"],
+          "properties": {
+            "kind": { "const": "spans" },
+            "snapshotId": { "$ref": "#/$defs/snapshot_id" },
+            "traceId": { "$ref": "#/$defs/projected_id" },
+            "cursor": { "$ref": "#/$defs/nullable_cursor" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "summary_request": {
+      "title": "DashboardSummaryRequestV1",
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/request_base" },
+        {
+          "type": "object",
+          "required": ["kind", "snapshotId"],
+          "properties": {
+            "kind": { "const": "summary" },
+            "snapshotId": { "$ref": "#/$defs/snapshot_id" },
+            "cursor": { "$ref": "#/$defs/nullable_cursor" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "span_request": {
+      "title": "DashboardSpanRequestV1",
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/request_base" },
+        {
+          "type": "object",
+          "required": ["kind", "snapshotId", "traceId", "spanId"],
+          "properties": {
+            "kind": { "const": "span" },
+            "snapshotId": { "$ref": "#/$defs/snapshot_id" },
+            "traceId": { "$ref": "#/$defs/projected_id" },
+            "spanId": { "$ref": "#/$defs/projected_id" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "facets_request": {
+      "title": "DashboardFacetsRequestV1",
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/request_base" },
+        {
+          "type": "object",
+          "required": ["kind", "snapshotId"],
+          "properties": {
+            "kind": { "const": "facets" },
+            "snapshotId": { "$ref": "#/$defs/snapshot_id" },
+            "cursor": { "$ref": "#/$defs/nullable_cursor" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "filters": {
+      "title": "DashboardFiltersV1",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repo": { "$ref": "#/$defs/filter_values" },
+        "session": { "$ref": "#/$defs/filter_values" },
+        "agent": { "$ref": "#/$defs/filter_values" },
+        "model": { "$ref": "#/$defs/filter_values" },
+        "text": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    },
+    "filter_values": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+    },
+    "nullable_cursor": {
+      "oneOf": [
+        { "$ref": "#/$defs/cursor" },
+        { "type": "null" }
+      ]
+    },
+    "cursor": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "description": "Opaque server-issued lease token bound to the normalized query, snapshot generation, visibility epoch, query kind and scan key. Clients must not parse or construct it."
+    },
+    "projected_id": {
+      "type": "string",
+      "pattern": "^id:sha256:[0-9a-f]{64}$"
+    },
+    "snapshot_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "decimal_u64": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 20,
+      "pattern": "^(0|[1-9][0-9]{0,19})$",
+      "description": "Unsigned 64-bit counter serialized as a decimal string to avoid JavaScript precision loss. Semantic validators additionally reject values above u64::MAX."
+    },
+    "snapshot": {
+      "title": "DashboardSnapshotV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "generation", "visibilityEpoch", "generatedAt", "state"],
+      "properties": {
+        "id": { "$ref": "#/$defs/snapshot_id" },
+        "generation": { "$ref": "#/$defs/decimal_u64" },
+        "visibilityEpoch": { "$ref": "#/$defs/decimal_u64" },
+        "generatedAt": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "state": { "$ref": "#/$defs/snapshot_state" }
+      }
+    },
+    "snapshot_state": {
+      "title": "DashboardSnapshotStateV1",
+      "type": "string",
+      "enum": ["current", "stale"]
+    },
+    "scope": {
+      "title": "DashboardQueryScopeV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filters", "selectedTraceId", "coldExcluded"],
+      "properties": {
+        "filters": { "$ref": "#/$defs/filters" },
+        "selectedTraceId": {
+          "oneOf": [
+            { "$ref": "#/$defs/projected_id" },
+            { "type": "null" }
+          ]
+        },
+        "coldExcluded": { "const": true }
+      }
+    },
+    "work": {
+      "title": "DashboardWorkV1",
+      "description": "KPI values have no independent generation field and therefore inherit the enclosing snapshot generation by construction.",
+      "oneOf": [
+        {
+          "title": "DashboardPendingWorkV1",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state"],
+          "properties": { "state": { "const": "pending" } }
+        },
+        {
+          "title": "DashboardCompleteWorkV1",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "kpis"],
+          "properties": {
+            "state": { "const": "complete" },
+            "kpis": { "$ref": "#/$defs/kpis" }
+          }
+        }
+      ]
+    },
+    "kpis": {
+      "title": "DashboardKpisV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessions", "turns", "llm", "tools", "errors", "inputTokens", "outputTokens", "totalTokens", "tokenStatus", "estimatedCost", "costStatus", "currency"],
+      "properties": {
+        "sessions": { "$ref": "#/$defs/safe_count" },
+        "turns": { "$ref": "#/$defs/safe_count" },
+        "llm": { "$ref": "#/$defs/safe_count" },
+        "tools": { "$ref": "#/$defs/safe_count" },
+        "errors": { "$ref": "#/$defs/safe_count" },
+        "inputTokens": { "$ref": "#/$defs/nullable_safe_count" },
+        "outputTokens": { "$ref": "#/$defs/nullable_safe_count" },
+        "totalTokens": { "$ref": "#/$defs/nullable_safe_count" },
+        "tokenStatus": { "$ref": "#/$defs/token_status" },
+        "estimatedCost": {
+          "oneOf": [
+            { "type": "number", "minimum": 0, "maximum": 1000000000000 },
+            { "type": "null" }
+          ]
+        },
+        "costStatus": { "$ref": "#/$defs/cost_status" },
+        "currency": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 16 },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "tokenStatus": { "const": "complete" },
+                "totalTokens": { "$ref": "#/$defs/safe_count" }
+              }
+            },
+            {
+              "properties": {
+                "tokenStatus": { "const": "incomplete" },
+                "totalTokens": { "type": "null" }
+              }
+            },
+            {
+              "properties": {
+                "tokenStatus": { "const": "unavailable" },
+                "inputTokens": { "type": "null" },
+                "outputTokens": { "type": "null" },
+                "totalTokens": { "type": "null" }
+              }
+            }
+          ]
+        },
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "costStatus": { "const": "estimated" },
+                "estimatedCost": { "type": "number", "minimum": 0, "maximum": 1000000000000 },
+                "currency": { "type": "string", "minLength": 1, "maxLength": 16 }
+              }
+            },
+            {
+              "properties": { "costStatus": { "const": "incomplete" } }
+            },
+            {
+              "properties": {
+                "costStatus": { "const": "unknown" },
+                "estimatedCost": { "type": "null" },
+                "currency": { "type": "null" }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "safe_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "nullable_safe_count": {
+      "oneOf": [
+        { "$ref": "#/$defs/safe_count" },
+        { "type": "null" }
+      ]
+    },
+    "token_status": {
+      "title": "DashboardTokenStatusV1",
+      "type": "string",
+      "enum": ["complete", "incomplete", "unavailable"]
+    },
+    "cost_status": {
+      "title": "DashboardCostStatusV1",
+      "type": "string",
+      "enum": ["estimated", "incomplete", "unknown"]
+    },
+    "pagination": {
+      "title": "DashboardPaginationV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nextCursor"],
+      "properties": {
+        "nextCursor": { "$ref": "#/$defs/nullable_cursor" },
+        "total": { "$ref": "#/$defs/safe_count" }
+      }
+    },
+    "availability_reason": {
+      "title": "DashboardAvailabilityReasonV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "state", "reason"],
+      "properties": {
+        "field": { "$ref": "#/$defs/availability_field" },
+        "state": { "$ref": "report-dto-v2.schema.json#/$defs/field_availability/properties/state" },
+        "reason": { "$ref": "report-dto-v2.schema.json#/$defs/field_availability/properties/reason" }
+      },
+      "oneOf": [
+        { "type": "object", "required": ["state", "reason"], "properties": { "state": { "const": "source_unavailable" }, "reason": { "enum": ["source_not_provided", "not_evaluated", "partial_token_metrics", "historical_codex_source_not_lookup_eligible", "codex_notify_turn_correlation_unavailable", "ambiguous_trace_repository", "legacy_v1_report"] } } },
+        { "type": "object", "required": ["state", "reason"], "properties": { "state": { "const": "not_applicable" }, "reason": { "enum": ["span_kind_not_model_backed", "span_kind_has_no_latency", "span_kind_has_no_token_usage", "claude_private_lookup_not_supported", "cursor_private_lookup_not_supported", "codex_span_not_notify_derived", "agent_private_lookup_not_supported"] } } },
+        { "type": "object", "required": ["state", "reason"], "properties": { "state": { "const": "private_lookup" }, "reason": { "const": "local_opt_in_lookup_required" } } },
+        { "type": "object", "required": ["state", "reason"], "properties": { "state": { "const": "withheld" }, "reason": { "const": "withheld_by_privacy_policy" } } }
+      ]
+    },
+    "availability_reasons": {
+      "type": "array",
+      "maxItems": 9,
+      "items": { "$ref": "#/$defs/availability_reason" },
+      "allOf": [
+        { "contains": { "type": "object", "properties": { "field": { "const": "repository" } }, "required": ["field"] }, "minContains": 0, "maxContains": 1 },
+        { "contains": { "type": "object", "properties": { "field": { "const": "session" } }, "required": ["field"] }, "minContains": 0, "maxContains": 1 },
+        { "contains": { "type": "object", "properties": { "field": { "const": "turn" } }, "required": ["field"] }, "minContains": 0, "maxContains": 1 },
+        { "contains": { "type": "object", "properties": { "field": { "const": "model" } }, "required": ["field"] }, "minContains": 0, "maxContains": 1 },
+        { "contains": { "type": "object", "properties": { "field": { "const": "tokens" } }, "required": ["field"] }, "minContains": 0, "maxContains": 1 },
+        { "contains": { "type": "object", "properties": { "field": { "const": "latency" } }, "required": ["field"] }, "minContains": 0, "maxContains": 1 },
+        { "contains": { "type": "object", "properties": { "field": { "const": "source_location" } }, "required": ["field"] }, "minContains": 0, "maxContains": 1 },
+        { "contains": { "type": "object", "properties": { "field": { "const": "request_content" } }, "required": ["field"] }, "minContains": 0, "maxContains": 1 },
+        { "contains": { "type": "object", "properties": { "field": { "const": "response_content" } }, "required": ["field"] }, "minContains": 0, "maxContains": 1 }
+      ]
+    },
+    "availability_field": {
+      "title": "DashboardAvailabilityFieldV1",
+      "type": "string",
+      "enum": ["repository", "session", "turn", "model", "tokens", "latency", "source_location", "request_content", "response_content"]
+    },
+    "trace_row": {
+      "title": "DashboardTraceRowV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["traceId", "repo", "spanCount", "errorCount", "startTimeUnixMs", "endTimeUnixMs", "availabilityReasons"],
+      "properties": {
+        "traceId": { "$ref": "#/$defs/projected_id" },
+        "repo": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "spanCount": { "$ref": "#/$defs/safe_count" },
+        "errorCount": { "$ref": "#/$defs/safe_count" },
+        "startTimeUnixMs": { "type": "number", "minimum": 0 },
+        "endTimeUnixMs": {
+          "oneOf": [
+            { "type": "number", "minimum": 0 },
+            { "type": "null" }
+          ]
+        },
+        "availabilityReasons": {
+          "$ref": "#/$defs/availability_reasons"
+        }
+      }
+    },
+    "span_row": {
+      "title": "DashboardSpanRowV1",
+      "description": "Compact projected list row. It intentionally omits attributes, metrics, source content, response content and private raw detail.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["traceId", "spanId", "parentSpanId", "kind", "name", "status", "startTimeUnixMs", "endTimeUnixMs", "repo", "availabilityReasons"],
+      "properties": {
+        "traceId": { "$ref": "#/$defs/projected_id" },
+        "spanId": { "$ref": "#/$defs/projected_id" },
+        "parentSpanId": {
+          "oneOf": [
+            { "$ref": "#/$defs/projected_id" },
+            { "type": "null" }
+          ]
+        },
+        "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "status": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "startTimeUnixMs": { "type": "number", "minimum": 0 },
+        "endTimeUnixMs": {
+          "oneOf": [
+            { "type": "number", "minimum": 0 },
+            { "type": "null" }
+          ]
+        },
+        "repo": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "agent": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "model": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "sessionId": { "$ref": "#/$defs/projected_id" },
+        "turnId": { "$ref": "#/$defs/projected_id" },
+        "toolName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "availabilityReasons": {
+          "$ref": "#/$defs/availability_reasons"
+        }
+      }
+    },
+    "facet_row": {
+      "title": "DashboardFacetRowV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dimension", "value"],
+      "properties": {
+        "dimension": { "$ref": "#/$defs/facet_dimension" },
+        "value": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "facet_dimension": {
+      "title": "DashboardFacetDimensionV1",
+      "type": "string",
+      "enum": ["repo", "session", "agent", "model"]
+    },
+    "limits": {
+      "title": "DashboardQueryLimitsV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["traceRows", "spanRows", "timelineRows", "facetValues", "requestBytes", "responseBytes"],
+      "properties": {
+        "traceRows": { "const": 100 },
+        "spanRows": { "const": 200 },
+        "timelineRows": { "const": 120 },
+        "facetValues": { "const": 500 },
+        "requestBytes": { "const": 8192 },
+        "responseBytes": { "const": 1048576 }
+      }
+    },
+    "response_base": {
+      "type": "object",
+      "required": ["schemaVersion", "snapshot", "scope", "work"],
+      "properties": {
+        "schemaVersion": { "const": "agent_observability.dashboard_query.v1" },
+        "snapshot": { "$ref": "#/$defs/snapshot" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "work": { "$ref": "#/$defs/work" }
+      }
+    },
+    "bootstrap_response": {
+      "title": "DashboardBootstrapResponseV1",
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/response_base" },
+        {
+          "type": "object",
+          "required": ["kind", "limits"],
+          "properties": {
+            "kind": { "const": "bootstrap" },
+            "limits": { "$ref": "#/$defs/limits" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "traces_response": {
+      "title": "DashboardTracesResponseV1",
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/response_base" },
+        {
+          "type": "object",
+          "required": ["kind", "rows", "pagination"],
+          "properties": {
+            "kind": { "const": "traces" },
+            "rows": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/trace_row" } },
+            "pagination": { "$ref": "#/$defs/pagination" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "spans_response": {
+      "title": "DashboardSpansResponseV1",
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/response_base" },
+        {
+          "type": "object",
+          "required": ["kind", "rows", "pagination"],
+          "properties": {
+            "kind": { "const": "spans" },
+            "rows": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/span_row" } },
+            "pagination": { "$ref": "#/$defs/pagination" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "summary_response": {
+      "title": "DashboardSummaryResponseV1",
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/response_base" },
+        {
+          "type": "object",
+          "required": ["kind", "pagination"],
+          "properties": {
+            "kind": { "const": "summary" },
+            "pagination": { "$ref": "#/$defs/pagination" }
+          }
+        }
+      ],
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "work": { "type": "object", "properties": { "state": { "const": "pending" } } },
+            "pagination": { "type": "object", "properties": { "nextCursor": { "$ref": "#/$defs/cursor" } } }
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "work": { "type": "object", "properties": { "state": { "const": "complete" } } },
+            "pagination": { "type": "object", "properties": { "nextCursor": { "type": "null" } } }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "span_response": {
+      "title": "DashboardSpanResponseV1",
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/response_base" },
+        {
+          "type": "object",
+          "required": ["kind", "detail"],
+          "properties": {
+            "kind": { "const": "span" },
+            "detail": {
+              "allOf": [
+                { "$ref": "report-dto-v2.schema.json#/$defs/span" },
+                {
+                  "type": "object",
+                  "properties": {
+                    "traceId": { "$ref": "#/$defs/projected_id" },
+                    "spanId": { "$ref": "#/$defs/projected_id" },
+                    "parentSpanId": {
+                      "oneOf": [
+                        { "$ref": "#/$defs/projected_id" },
+                        { "type": "null" }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "facets_response": {
+      "title": "DashboardFacetsResponseV1",
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/response_base" },
+        {
+          "type": "object",
+          "required": ["kind", "rows", "pagination"],
+          "properties": {
+            "kind": { "const": "facets" },
+            "rows": { "type": "array", "maxItems": 500, "items": { "$ref": "#/$defs/facet_row" } },
+            "pagination": { "$ref": "#/$defs/pagination" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "status_response": {
+      "title": "DashboardStatusResponseV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "requestKind", "reason"],
+      "properties": {
+        "schemaVersion": { "const": "agent_observability.dashboard_query.v1" },
+        "kind": { "const": "status" },
+        "requestKind": { "$ref": "#/$defs/request_kind" },
+        "reason": { "$ref": "#/$defs/status_reason" },
+        "snapshot": { "$ref": "#/$defs/snapshot" }
+      }
+    },
+    "request_kind": {
+      "title": "DashboardRequestKindV1",
+      "type": "string",
+      "enum": ["bootstrap", "traces", "spans", "summary", "span", "facets"]
+    },
+    "status_reason": {
+      "title": "DashboardStatusReasonV1",
+      "type": "string",
+      "enum": ["building", "refresh_pending", "snapshot_expired", "busy", "capacity", "invalid_query"]
+    },
+    "response": {
+      "title": "DashboardQueryResponseV1",
+      "oneOf": [
+        { "$ref": "#/$defs/bootstrap_response" },
+        { "$ref": "#/$defs/traces_response" },
+        { "$ref": "#/$defs/spans_response" },
+        { "$ref": "#/$defs/summary_response" },
+        { "$ref": "#/$defs/span_response" },
+        { "$ref": "#/$defs/facets_response" },
+        { "$ref": "#/$defs/status_response" }
+      ]
+    }
+  }
+}

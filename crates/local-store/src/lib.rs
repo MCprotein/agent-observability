@@ -1,6 +1,21 @@
 //! Private, replayable `SQLite` authority for standalone observations.
 
+mod dashboard_query;
 mod lifecycle;
+mod report_view;
+mod report_view_catalog;
+mod report_view_query;
+
+pub use dashboard_query::DashboardQueryService;
+pub use report_view::{
+    MISSING_RATE_FINGERPRINT, ReportViewBuildError, ReportViewStaging, build_report_view_staging,
+    build_report_view_staging_observing,
+};
+pub use report_view_catalog::{
+    ReportViewCatalogError, ReportViewPublication, ReportViewRetirement, ReportViewSnapshot,
+    current_report_view, publish_report_view, recover_report_view_catalog,
+    with_report_view_snapshot,
+};
 
 pub use lifecycle::{
     ColdArchiveBlocked, ColdArchivePage, ColdArchiveQuery, ColdArchiveTrace, LifecyclePreflight,
@@ -21,6 +36,7 @@ use agent_observability_domain::{
 use fs2::FileExt;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    types::ValueRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,15 +52,18 @@ const DB_NAME: &str = "local-store.sqlite3";
 const PROJECTION_NAME: &str = "observations.jsonl";
 const STORE_OPEN_LOCK_NAME: &str = ".store-open.lock";
 const REPORT_RENDER_LOCK_NAME: &str = ".report-render.lock";
-pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v5";
-const PREVIOUS_LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v4";
+pub const LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v6";
+const PREVIOUS_LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v5";
+const LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION: &str = "local_state.v4";
 const REPORT_GENERATION_KEY: &str = "report_generation";
 const REPORT_ACKNOWLEDGED_GENERATION_KEY: &str = "report_acknowledged_generation";
+const REPORT_VISIBILITY_EPOCH_KEY: &str = "report_visibility_epoch";
 const LIFECYCLE_SCAN_CURSOR_KEY: &str = "lifecycle_scan_cursor";
 const LIFECYCLE_SCAN_CURSOR_INITIAL: &str = r#"{"hot":"","warm":"","cold":"","next_tier":0}"#;
 const LIFECYCLE_BACKFILL_CURSOR_KEY: &str = "lifecycle_backfill_cursor";
 const LIFECYCLE_BACKFILL_COMPLETE: &str = r#"{"done":true}"#;
 const REPORT_VISIT_BATCH_SIZE: i64 = 128;
+const REPORT_VISIT_MAX_BATCH_BYTES: u64 = 2 * 1024 * 1024;
 const TRACE_ESTIMATED_ROW_OVERHEAD: u64 = 512;
 const CODEX_CORRELATION_KEY_PREFIX: &str = "codex_request_correlation.v1:";
 const MAX_CODEX_CORRELATION_STATE_BYTES: usize = 512 * 1024;
@@ -371,37 +390,56 @@ pub enum StoreError {
     InvalidRetentionBounds,
     PendingRetentionRecovery,
     MigrationAdmissionRequired,
+    ReportViewRetirement,
     ReportSnapshotChanged,
+    ReportSnapshotRecordTooLarge {
+        record_bytes: u64,
+        max_batch_bytes: u64,
+    },
 }
 
 impl Display for StoreError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Io(_) => "local store I/O failure",
-            Self::Sqlite(_) => "local store database failure",
-            Self::Json(_) => "local store JSON failure",
-            Self::InvalidObservation => "invalid observation",
-            Self::CursorConflict => "source cursor conflict",
-            Self::PayloadConflict => "observation payload conflict",
-            Self::TopologyConflict => "observation topology conflict",
-            Self::SchemaMismatch => "local store schema or integrity mismatch",
-            Self::Crash(_) => "injected local store crash",
-            Self::InsecurePermissions => "local store permissions are too broad",
-            Self::Symlink => "local store paths must not be symbolic links",
-            Self::InvalidPath => "local store path has the wrong filesystem type",
-            Self::StaleRetentionPlan => "retention plan is stale",
+        match self {
+            Self::Io(_) => f.write_str("local store I/O failure"),
+            Self::Sqlite(_) => f.write_str("local store database failure"),
+            Self::Json(_) => f.write_str("local store JSON failure"),
+            Self::InvalidObservation => f.write_str("invalid observation"),
+            Self::CursorConflict => f.write_str("source cursor conflict"),
+            Self::PayloadConflict => f.write_str("observation payload conflict"),
+            Self::TopologyConflict => f.write_str("observation topology conflict"),
+            Self::SchemaMismatch => f.write_str("local store schema or integrity mismatch"),
+            Self::Crash(_) => f.write_str("injected local store crash"),
+            Self::InsecurePermissions => f.write_str("local store permissions are too broad"),
+            Self::Symlink => f.write_str("local store paths must not be symbolic links"),
+            Self::InvalidPath => f.write_str("local store path has the wrong filesystem type"),
+            Self::StaleRetentionPlan => f.write_str("retention plan is stale"),
             Self::RetentionBoundsTooSmall => {
-                "retention bounds cannot fit every eligible complete trace in one pass"
+                f.write_str("retention bounds cannot fit every eligible complete trace in one pass")
             }
-            Self::InvalidRetentionBounds => "retention bounds are outside the supported range",
+            Self::InvalidRetentionBounds => {
+                f.write_str("retention bounds are outside the supported range")
+            }
             Self::PendingRetentionRecovery => {
-                "a previous retention pass must be recovered before starting another"
+                f.write_str("a previous retention pass must be recovered before starting another")
             }
-            Self::MigrationAdmissionRequired => {
-                "legacy local store migration requires admitted temporary disk headroom"
+            Self::MigrationAdmissionRequired => f.write_str(
+                "legacy local store migration requires admitted temporary disk headroom",
+            ),
+            Self::ReportViewRetirement => {
+                f.write_str("report views could not be safely retired before destructive work")
             }
-            Self::ReportSnapshotChanged => "report snapshot changed while it was being visited",
-        })
+            Self::ReportSnapshotChanged => {
+                f.write_str("report snapshot changed while it was being visited")
+            }
+            Self::ReportSnapshotRecordTooLarge {
+                record_bytes,
+                max_batch_bytes,
+            } => write!(
+                f,
+                "report snapshot record requires {record_bytes} bytes, exceeding the {max_batch_bytes}-byte batch capacity"
+            ),
+        }
     }
 }
 impl std::error::Error for StoreError {
@@ -511,8 +549,7 @@ impl LocalStore {
     /// Returns [`StoreError`] when the store is missing, insecure, or not on the current schema.
     pub fn open_current(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
         let dir = dir.as_ref();
-        fs::symlink_metadata(dir)?;
-        private_dir(dir)?;
+        validate_existing_private_dir(dir)?;
         let dir = fs::canonicalize(dir)?;
         let db_path = dir.join(DB_NAME);
         private_file(&db_path)?;
@@ -532,6 +569,41 @@ impl LocalStore {
         }
         metadata_generation(&db, REPORT_GENERATION_KEY)?;
         metadata_generation(&db, REPORT_ACKNOWLEDGED_GENERATION_KEY)?;
+        metadata_generation(&db, REPORT_VISIBILITY_EPOCH_KEY)?;
+        Ok(Self { dir, db })
+    }
+
+    /// Opens an existing current-schema store as a fail-fast report query reader.
+    ///
+    /// This path never creates, migrates, repairs, or rewrites store artifacts. It validates only
+    /// the schema version and report generation/visibility metadata needed by bounded report
+    /// queries. The connection is read-only and query-only, with no lock wait and an 8 MiB cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the store is missing, insecure, locked, not on the current
+    /// schema, or has invalid report generation/visibility metadata.
+    pub fn open_report_reader(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let dir = dir.as_ref();
+        validate_existing_private_dir(dir)?;
+        let dir = fs::canonicalize(dir)?;
+        let db_path = dir.join(DB_NAME);
+        private_file(&db_path)?;
+        let db = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        db.busy_timeout(Duration::ZERO)?;
+        db.pragma_update(None, "query_only", true)?;
+        db.pragma_update(None, "cache_size", -(8 * 1024_i64))?;
+        let schema = required_schema_version(&db)?;
+        if schema != LOCAL_STORE_SCHEMA_VERSION {
+            return Err(StoreError::SchemaMismatch);
+        }
+        metadata_generation(&db, REPORT_GENERATION_KEY)?;
+        metadata_generation(&db, REPORT_VISIBILITY_EPOCH_KEY)?;
         Ok(Self { dir, db })
     }
 
@@ -568,20 +640,26 @@ impl LocalStore {
         let schema = required_schema_version(&db)?;
         if matches!(
             schema.as_str(),
-            "local_state.v1" | "local_state.v2" | "local_state.v3"
+            "local_state.v1"
+                | "local_state.v2"
+                | "local_state.v3"
+                | LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION
+                | PREVIOUS_LOCAL_STORE_SCHEMA_VERSION
         ) {
             let required_workspace = migration_required_workspace(&db)?;
             if admitted_temporary_bytes.is_none_or(|bytes| bytes < required_workspace) {
                 return Err(StoreError::MigrationAdmissionRequired);
             }
-            migrate_to_v4(&db)?;
-            migrate_v4_to_v5(&db)?;
-        } else if schema == PREVIOUS_LOCAL_STORE_SCHEMA_VERSION {
-            let required_workspace = migration_required_workspace(&db)?;
-            if admitted_temporary_bytes.is_none_or(|bytes| bytes < required_workspace) {
-                return Err(StoreError::MigrationAdmissionRequired);
+            if matches!(
+                schema.as_str(),
+                "local_state.v1" | "local_state.v2" | "local_state.v3"
+            ) {
+                migrate_to_v4(&db)?;
             }
-            migrate_v4_to_v5(&db)?;
+            if required_schema_version(&db)? == LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION {
+                migrate_v4_to_v5(&db)?;
+            }
+            migrate_v5_to_v6(&db)?;
         } else if schema != LOCAL_STORE_SCHEMA_VERSION {
             return Err(StoreError::SchemaMismatch);
         }
@@ -1330,13 +1408,41 @@ impl LocalStore {
     /// Rows are copied in bounded transactions and visited after each read transaction closes, so
     /// projection work cannot hold a `SQLite` read lock. A generation fence rejects a multi-batch
     /// visit if a writer commits between batches. The returned count belongs to the visited
-    /// generation and is not queried separately.
+    /// generation and is not queried separately. This compatibility path retains its historical
+    /// row-only batch bound; query consumers should use [`Self::visit_report_snapshot_bounded`] for
+    /// an additional serialized-byte bound.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the snapshot or a stored record cannot be read.
     pub fn visit_report_snapshot(
         &self,
+        visit: impl FnMut(usize, DurableRecordV1),
+    ) -> Result<ReportVisit, StoreError> {
+        self.visit_report_snapshot_with_limit(None, visit)
+    }
+
+    /// Visits an ordered report snapshot in query-safe bounded copied batches.
+    ///
+    /// Each closed read transaction copies at most 128 records and at most 2 MiB of serialized
+    /// `record_json`. Record byte length is admitted before allocating an owned string. Callbacks
+    /// run only after that read transaction closes. This method preserves the same generation
+    /// fence, exact record count, and ordering contract as [`Self::visit_report_snapshot`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::ReportSnapshotRecordTooLarge`] when one record cannot fit the fixed
+    /// byte bound. Other [`StoreError`] values report snapshot changes or invalid stored records.
+    pub fn visit_report_snapshot_bounded(
+        &self,
+        visit: impl FnMut(usize, DurableRecordV1),
+    ) -> Result<ReportVisit, StoreError> {
+        self.visit_report_snapshot_with_limit(Some(REPORT_VISIT_MAX_BATCH_BYTES), visit)
+    }
+
+    fn visit_report_snapshot_with_limit(
+        &self,
+        max_batch_bytes: Option<u64>,
         mut visit: impl FnMut(usize, DurableRecordV1),
     ) -> Result<ReportVisit, StoreError> {
         let mut expected_generation = None;
@@ -1367,11 +1473,34 @@ impl LocalStore {
                 let mut statement = tx.prepare(
                     "SELECT record_order, record_json FROM (SELECT commit_seq AS record_order, record_json FROM records UNION ALL SELECT original_commit_seq AS record_order, record_json FROM warm_records) WHERE record_order > ?1 ORDER BY record_order LIMIT ?2",
                 )?;
-                let rows = statement
-                    .query_map(params![last_commit_seq, REPORT_VISIT_BATCH_SIZE], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                    })?;
-                rows.collect::<Result<Vec<_>, _>>()?
+                let mut rows =
+                    statement.query(params![last_commit_seq, REPORT_VISIT_BATCH_SIZE])?;
+                let mut batch = Vec::new();
+                let mut batch_bytes = 0_u64;
+                while let Some(row) = rows.next()? {
+                    if let Some(max_batch_bytes) = max_batch_bytes {
+                        let record_bytes = match row.get_ref(1)? {
+                            ValueRef::Text(bytes) => u64::try_from(bytes.len())
+                                .map_err(|_| StoreError::SchemaMismatch)?,
+                            _ => return Err(StoreError::SchemaMismatch),
+                        };
+                        if record_bytes > max_batch_bytes {
+                            return Err(StoreError::ReportSnapshotRecordTooLarge {
+                                record_bytes,
+                                max_batch_bytes,
+                            });
+                        }
+                        let next_batch_bytes = batch_bytes
+                            .checked_add(record_bytes)
+                            .ok_or(StoreError::SchemaMismatch)?;
+                        if !batch.is_empty() && next_batch_bytes > max_batch_bytes {
+                            break;
+                        }
+                        batch_bytes = next_batch_bytes;
+                    }
+                    batch.push((row.get::<_, i64>(0)?, row.get::<_, String>(1)?));
+                }
+                batch
             };
             tx.commit()?;
 
@@ -1421,6 +1550,17 @@ impl LocalStore {
             return Err(StoreError::SchemaMismatch);
         }
         Ok(status)
+    }
+
+    /// Returns the durable epoch that revokes report views after visibility-removing mutations.
+    ///
+    /// Ordinary ingest and report-generation invalidation do not advance this value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when epoch metadata is missing, invalid, or cannot be read.
+    pub fn report_visibility_epoch(&self) -> Result<u64, StoreError> {
+        metadata_generation(&self.db, REPORT_VISIBILITY_EPOCH_KEY)
     }
 
     /// Durably marks every rendered report artifact stale without changing stored observations.
@@ -1524,6 +1664,35 @@ impl LocalStore {
         )
     }
 
+    /// Applies manual retention while consuming a caller-owned report publication guard.
+    ///
+    /// This avoids reacquiring the same process lock and keeps report-view retirement fenced
+    /// through the authoritative deletion commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] under the same conditions as [`Self::apply_retention`], including
+    /// when managed report views cannot be retired before deletion.
+    pub fn apply_retention_guarded(
+        &self,
+        cutoff_unix_ms: u64,
+        max_archive_records: u32,
+        max_archive_bytes: u64,
+        expected_plan_id: &str,
+        archive_path: &Path,
+        publication_guard: ReportRenderGuard,
+    ) -> Result<RetentionResult, StoreError> {
+        self.apply_retention_guarded_at(
+            cutoff_unix_ms,
+            max_archive_records,
+            max_archive_bytes,
+            expected_plan_id,
+            archive_path,
+            publication_guard,
+            None,
+        )
+    }
+
     fn apply_retention_at(
         &self,
         cutoff_unix_ms: u64,
@@ -1531,6 +1700,32 @@ impl LocalStore {
         max_archive_bytes: u64,
         expected_plan_id: &str,
         archive_path: &Path,
+        crash: Option<CrashPoint>,
+    ) -> Result<RetentionResult, StoreError> {
+        let publication_guard = self.acquire_report_render_guard()?;
+        self.apply_retention_guarded_at(
+            cutoff_unix_ms,
+            max_archive_records,
+            max_archive_bytes,
+            expected_plan_id,
+            archive_path,
+            publication_guard,
+            crash,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the guarded internal mirrors the stable bounded retention API plus crash injection"
+    )]
+    fn apply_retention_guarded_at(
+        &self,
+        cutoff_unix_ms: u64,
+        max_archive_records: u32,
+        max_archive_bytes: u64,
+        expected_plan_id: &str,
+        archive_path: &Path,
+        publication_guard: ReportRenderGuard,
         crash: Option<CrashPoint>,
     ) -> Result<RetentionResult, StoreError> {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
@@ -1582,6 +1777,15 @@ impl LocalStore {
             )?;
         }
         prune_expired_span_guards(&tx)?;
+        let next_visibility_epoch = metadata_generation(&tx, REPORT_VISIBILITY_EPOCH_KEY)?
+            .checked_add(1)
+            .ok_or(StoreError::SchemaMismatch)?;
+        let _retirement = report_view_catalog::retire_report_views_for_visibility_change(
+            self,
+            publication_guard,
+            next_visibility_epoch,
+        )
+        .map_err(|_| StoreError::ReportViewRetirement)?;
         tx.execute_batch(
             "DELETE FROM delivery_outcomes WHERE event_id IN (SELECT event_id FROM observations WHERE trace_id IN (SELECT trace_id FROM retention_selected_traces));
              DELETE FROM source_inputs WHERE event_id IN (SELECT event_id FROM observations WHERE trace_id IN (SELECT trace_id FROM retention_selected_traces));
@@ -1593,6 +1797,7 @@ impl LocalStore {
         )?;
         mark_projection_dirty(&tx)?;
         advance_report_generation(&tx)?;
+        advance_report_visibility_epoch(&tx)?;
         if crash == Some(CrashPoint::BeforeRetentionCommit) {
             return Err(StoreError::Crash(CrashPoint::BeforeRetentionCommit));
         }
@@ -3070,63 +3275,79 @@ fn parse_kind(value: &str) -> Result<SpanKind, StoreError> {
     }
 }
 fn private_dir(path: &Path) -> Result<(), StoreError> {
-    let existed = ensure_directory_chain(path)?;
+    ensure_directory_chain(path)?;
+    validate_existing_private_dir(path)
+}
+
+pub(crate) fn validate_existing_private_dir(path: &Path) -> Result<(), StoreError> {
+    let metadata = validate_directory_components(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if existed && fs::metadata(path)?.permissions().mode() & 0o777 != 0o700 {
+        if metadata.permissions().mode() & 0o777 != 0o700 {
             return Err(StoreError::InsecurePermissions);
         }
     }
+    #[cfg(not(unix))]
+    let _ = metadata;
     Ok(())
 }
 
-fn ensure_directory_chain(path: &Path) -> Result<bool, StoreError> {
+fn validate_directory_components(path: &Path) -> Result<fs::Metadata, StoreError> {
     if path
         .components()
         .any(|component| component == std::path::Component::ParentDir)
     {
         return Err(StoreError::InvalidPath);
     }
-    let existed = match fs::symlink_metadata(path) {
-        Ok(_) => true,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error.into()),
-    };
+    let mut current = PathBuf::new();
+    let mut target_metadata = None;
+    for component in path.components() {
+        current.push(component);
+        target_metadata = Some(validate_directory_component(&current)?);
+    }
+    target_metadata.map_or_else(|| fs::symlink_metadata(path).map_err(StoreError::from), Ok)
+}
+
+fn validate_directory_component(path: &Path) -> Result<fs::Metadata, StoreError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        if trusted_platform_symlink(path) {
+            return fs::metadata(path).map_err(StoreError::from);
+        }
+        return Err(StoreError::Symlink);
+    }
+    if !metadata.is_dir() {
+        return Err(StoreError::InvalidPath);
+    }
+    Ok(metadata)
+}
+
+fn ensure_directory_chain(path: &Path) -> Result<(), StoreError> {
+    if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(StoreError::InvalidPath);
+    }
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    if trusted_platform_symlink(&current) {
-                        continue;
-                    }
-                    return Err(StoreError::Symlink);
-                }
-                if !metadata.is_dir() {
-                    return Err(StoreError::InvalidPath);
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        match validate_directory_component(&current) {
+            Ok(_) => {}
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                 match create_private_dir(&current) {
                     Ok(()) => {}
                     Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        let metadata = fs::symlink_metadata(&current)?;
-                        if metadata.file_type().is_symlink() {
-                            return Err(StoreError::Symlink);
-                        }
-                        if !metadata.is_dir() {
-                            return Err(StoreError::InvalidPath);
-                        }
+                        validate_directory_component(&current)?;
                     }
                     Err(error) => return Err(error),
                 }
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         }
     }
-    Ok(existed)
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -3275,12 +3496,20 @@ fn metadata_generation(db: &Connection, key: &str) -> Result<u64, StoreError> {
 }
 
 fn advance_report_generation(tx: &Transaction<'_>) -> Result<(), StoreError> {
-    let generation = metadata_generation(tx, REPORT_GENERATION_KEY)?
+    advance_metadata_generation(tx, REPORT_GENERATION_KEY)
+}
+
+fn advance_report_visibility_epoch(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    advance_metadata_generation(tx, REPORT_VISIBILITY_EPOCH_KEY)
+}
+
+fn advance_metadata_generation(tx: &Transaction<'_>, key: &str) -> Result<(), StoreError> {
+    let generation = metadata_generation(tx, key)?
         .checked_add(1)
         .ok_or(StoreError::SchemaMismatch)?;
     tx.execute(
         "UPDATE metadata SET value=?1 WHERE key=?2",
-        params![generation.to_string(), REPORT_GENERATION_KEY],
+        params![generation.to_string(), key],
     )?;
     Ok(())
 }
@@ -3330,6 +3559,10 @@ fn initialize_empty_schema(db: &Connection) -> Result<(), StoreError> {
         tx.execute(
             "INSERT INTO metadata(key, value) VALUES (?1, '0')",
             [REPORT_ACKNOWLEDGED_GENERATION_KEY],
+        )?;
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, '0')",
+            [REPORT_VISIBILITY_EPOCH_KEY],
         )?;
         tx.execute(
             "INSERT INTO metadata(key, value) VALUES (?1, ?2)",
@@ -3394,6 +3627,7 @@ fn ensure_report_metadata(db: &Connection) -> Result<(), StoreError> {
         }
         _ => return Err(StoreError::SchemaMismatch),
     }
+    metadata_generation(&tx, REPORT_VISIBILITY_EPOCH_KEY)?;
     tx.commit()?;
     Ok(())
 }
@@ -3429,7 +3663,7 @@ fn prune_legacy_adapter_dispositions(db: &Connection) -> Result<(), StoreError> 
 fn migrate_to_v4_inner(db: &Connection) -> Result<(), StoreError> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
     let version = required_schema_version(&tx)?;
-    if version == PREVIOUS_LOCAL_STORE_SCHEMA_VERSION {
+    if version == LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION {
         tx.commit()?;
         return Ok(());
     }
@@ -3493,7 +3727,7 @@ fn migrate_to_v4_inner(db: &Connection) -> Result<(), StoreError> {
     create_v4_retention_objects(&tx)?;
     tx.execute(
         "UPDATE metadata SET value=?1 WHERE key='schema_version'",
-        [PREVIOUS_LOCAL_STORE_SCHEMA_VERSION],
+        [LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION],
     )?;
     tx.commit()?;
     Ok(())
@@ -3501,7 +3735,7 @@ fn migrate_to_v4_inner(db: &Connection) -> Result<(), StoreError> {
 
 fn migrate_v4_to_v5(db: &Connection) -> Result<(), StoreError> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
-    if required_schema_version(&tx)? != PREVIOUS_LOCAL_STORE_SCHEMA_VERSION {
+    if required_schema_version(&tx)? != LIFECYCLE_LOCAL_STORE_SCHEMA_VERSION {
         return Err(StoreError::SchemaMismatch);
     }
     for name in [
@@ -3537,6 +3771,36 @@ fn migrate_v4_to_v5(db: &Connection) -> Result<(), StoreError> {
             lifecycle_backfill_initial(&tx)?
         ],
     )?;
+    tx.execute(
+        "UPDATE metadata SET value=?1 WHERE key='schema_version'",
+        [PREVIOUS_LOCAL_STORE_SCHEMA_VERSION],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_v5_to_v6(db: &Connection) -> Result<(), StoreError> {
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    if required_schema_version(&tx)? != PREVIOUS_LOCAL_STORE_SCHEMA_VERSION {
+        return Err(StoreError::SchemaMismatch);
+    }
+    let existing = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [REPORT_VISIBILITY_EPOCH_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        existing
+            .parse::<u64>()
+            .map_err(|_| StoreError::SchemaMismatch)?;
+    } else {
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, '0')",
+            [REPORT_VISIBILITY_EPOCH_KEY],
+        )?;
+    }
     tx.execute(
         "UPDATE metadata SET value=?1 WHERE key='schema_version'",
         [LOCAL_STORE_SCHEMA_VERSION],
@@ -3893,6 +4157,7 @@ mod tests {
                  DROP TABLE hot_trace_index;
                  DELETE FROM metadata WHERE key='lifecycle_scan_cursor';
                  DELETE FROM metadata WHERE key='lifecycle_backfill_cursor';
+                 DELETE FROM metadata WHERE key='report_visibility_epoch';
                  DROP INDEX observations_trace_idx;
                  DROP INDEX records_trace_idx;
                  DROP INDEX topology_trace_idx;
@@ -3954,12 +4219,37 @@ mod tests {
                  DROP TABLE hot_trace_index;
                  DELETE FROM metadata WHERE key='lifecycle_scan_cursor';
                  DELETE FROM metadata WHERE key='lifecycle_backfill_cursor';
+                 DELETE FROM metadata WHERE key='report_visibility_epoch';
                  UPDATE metadata SET value='local_state.v4' WHERE key='schema_version';",
             )
             .unwrap();
         connection
             .pragma_update(None, "foreign_keys", true)
             .unwrap();
+    }
+
+    fn downgrade_to_v5_schema(database: &Path, visibility_epoch: Option<&str>) {
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value=?1 WHERE key='schema_version'",
+                [PREVIOUS_LOCAL_STORE_SCHEMA_VERSION],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM metadata WHERE key=?1",
+                [REPORT_VISIBILITY_EPOCH_KEY],
+            )
+            .unwrap();
+        if let Some(visibility_epoch) = visibility_epoch {
+            connection
+                .execute(
+                    "INSERT INTO metadata(key, value) VALUES (?1, ?2)",
+                    params![REPORT_VISIBILITY_EPOCH_KEY, visibility_epoch],
+                )
+                .unwrap();
+        }
     }
 
     #[test]
@@ -4071,6 +4361,241 @@ mod tests {
             "local_state.v3"
         );
         let _ = fs::remove_dir_all(&legacy);
+    }
+
+    #[test]
+    fn report_reader_is_existing_only_and_cannot_ingest() {
+        let missing = temp_dir("report-reader-missing");
+        let _ = fs::remove_dir_all(&missing);
+        assert!(matches!(
+            LocalStore::open_report_reader(&missing),
+            Err(StoreError::Io(ref error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(!missing.exists());
+
+        let dir = temp_dir("report-reader-read-only");
+        let _ = fs::remove_dir_all(&dir);
+        let store = LocalStore::open(&dir).unwrap();
+        drop(store);
+
+        let mut reader = LocalStore::open_report_reader(&dir).unwrap();
+        assert_eq!(
+            reader
+                .db
+                .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reader
+                .db
+                .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            reader
+                .db
+                .query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            -(8 * 1024)
+        );
+        assert!(matches!(
+            reader.ingest(&observation("1", "session", None)),
+            Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(ref failure, _)))
+                if failure.code == rusqlite::ErrorCode::ReadOnly
+        ));
+        assert_eq!(reader.observation_count().unwrap(), 0);
+        drop(reader);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_private_directory_validation_never_creates_a_missing_path() {
+        let root = temp_dir("existing-private-directory-missing");
+        let _ = fs::remove_dir_all(&root);
+        private_dir(&root).unwrap();
+        let missing = root.join("missing").join("store");
+
+        assert!(matches!(
+            validate_existing_private_dir(&missing),
+            Err(StoreError::Io(ref error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(!root.join("missing").exists());
+
+        let removed = root.join("removed");
+        private_dir(&removed).unwrap();
+        assert!(removed.is_dir());
+        fs::remove_dir(&removed).unwrap();
+        assert!(matches!(
+            validate_existing_private_dir(&removed),
+            Err(StoreError::Io(ref error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(!removed.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_only_open_paths_leave_store_artifacts_unchanged() {
+        let dir = temp_dir("existing-only-open-no-write");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        let database = store.database_path();
+        let projection = store.projection_path();
+        drop(store);
+
+        let database_before = fs::read(&database).unwrap();
+        let database_modified_before = fs::metadata(&database).unwrap().modified().unwrap();
+        let projection_before = fs::read(&projection).unwrap();
+        let entries_before = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+
+        drop(LocalStore::open_current(&dir).unwrap());
+        drop(LocalStore::open_report_reader(&dir).unwrap());
+
+        assert_eq!(fs::read(&database).unwrap(), database_before);
+        assert_eq!(
+            fs::metadata(&database).unwrap().modified().unwrap(),
+            database_modified_before
+        );
+        assert_eq!(fs::read(&projection).unwrap(), projection_before);
+        assert_eq!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<BTreeSet<_>>(),
+            entries_before
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_private_directory_validation_rejects_unsafe_components_without_mutation() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = temp_dir("existing-private-directory-unsafe");
+        let _ = fs::remove_dir_all(&root);
+        private_dir(&root).unwrap();
+
+        let private = root.join("private");
+        private_dir(&private).unwrap();
+        assert!(matches!(
+            validate_existing_private_dir(&private.join("..").join("private")),
+            Err(StoreError::InvalidPath)
+        ));
+
+        let file_component = root.join("file");
+        fs::write(&file_component, b"sentinel").unwrap();
+        fs::set_permissions(&file_component, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            validate_existing_private_dir(&file_component.join("store")),
+            Err(StoreError::InvalidPath)
+        ));
+        assert_eq!(fs::read(&file_component).unwrap(), b"sentinel");
+
+        let insecure = root.join("insecure");
+        fs::create_dir(&insecure).unwrap();
+        fs::set_permissions(&insecure, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            validate_existing_private_dir(&insecure),
+            Err(StoreError::InsecurePermissions)
+        ));
+        assert_eq!(
+            fs::metadata(&insecure).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        let target = root.join("target");
+        private_dir(&target).unwrap();
+        let linked = root.join("linked");
+        symlink(&target, &linked).unwrap();
+        assert!(matches!(
+            validate_existing_private_dir(&linked),
+            Err(StoreError::Symlink)
+        ));
+        assert!(
+            fs::symlink_metadata(&linked)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_only_open_paths_reject_parent_symlink_and_insecure_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = temp_dir("existing-only-open-unsafe");
+        let _ = fs::remove_dir_all(&dir);
+        drop(LocalStore::open(&dir).unwrap());
+
+        let parent_path = dir.join("missing").join("..");
+        assert!(matches!(
+            LocalStore::open_current(&parent_path),
+            Err(StoreError::InvalidPath)
+        ));
+        assert!(matches!(
+            LocalStore::open_report_reader(&parent_path),
+            Err(StoreError::InvalidPath)
+        ));
+
+        let linked = temp_dir("existing-only-open-unsafe-link");
+        let _ = fs::remove_file(&linked);
+        symlink(&dir, &linked).unwrap();
+        assert!(matches!(
+            LocalStore::open_current(&linked),
+            Err(StoreError::Symlink)
+        ));
+        assert!(matches!(
+            LocalStore::open_report_reader(&linked),
+            Err(StoreError::Symlink)
+        ));
+        fs::remove_file(&linked).unwrap();
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            LocalStore::open_current(&dir),
+            Err(StoreError::InsecurePermissions)
+        ));
+        assert!(matches!(
+            LocalStore::open_report_reader(&dir),
+            Err(StoreError::InsecurePermissions)
+        ));
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn report_reader_returns_immediately_when_authority_is_exclusively_locked() {
+        let dir = temp_dir("report-reader-locked");
+        let _ = fs::remove_dir_all(&dir);
+        let store = LocalStore::open(&dir).unwrap();
+        let database = store.database_path();
+        drop(store);
+
+        let locker = Connection::open(&database).unwrap();
+        locker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let started = std::time::Instant::now();
+        let error = LocalStore::open_report_reader(&dir).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(matches!(
+            error,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(ref failure, _))
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        assert!(elapsed < Duration::from_millis(250), "elapsed: {elapsed:?}");
+        locker.execute_batch("ROLLBACK").unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5166,7 +5691,7 @@ mod tests {
                     |row| row.get::<_, String>(0)
                 )
                 .unwrap(),
-            "local_state.v5"
+            LOCAL_STORE_SCHEMA_VERSION
         );
         assert_eq!(
             connection
@@ -5281,6 +5806,7 @@ mod tests {
         let turn = observation_after("2", Some("1"), "turn", Some("session"));
         store.ingest(&session).unwrap();
         store.ingest(&turn).unwrap();
+        assert_eq!(store.report_visibility_epoch().unwrap(), 0);
         let before = fs::read(store.projection_path()).unwrap();
         let plan = store.retention_plan(100, 100, 1_048_576).unwrap();
         assert_eq!(plan.traces, 1);
@@ -5298,6 +5824,7 @@ mod tests {
         let result = store
             .apply_retention(100, 100, 1_048_576, &plan.plan_id, &archive)
             .unwrap();
+        assert_eq!(store.report_visibility_epoch().unwrap(), 1);
         assert_eq!(result.archive_path.as_deref(), Some(archive.as_path()));
         assert_eq!(
             fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
@@ -5616,6 +6143,122 @@ mod tests {
         assert_eq!(final_visit.records, 257);
         assert_eq!(visited, 257);
         assert_eq!(final_visit.generation, 257);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bounded_report_visitor_splits_on_bytes_and_preserves_order() {
+        let dir = temp_dir("bounded-report-visitor-byte-batches");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        store
+            .ingest(&observation_after(
+                "2",
+                Some("1"),
+                "turn-2",
+                Some("session"),
+            ))
+            .unwrap();
+        store
+            .ingest(&observation_after(
+                "3",
+                Some("2"),
+                "turn-3",
+                Some("session"),
+            ))
+            .unwrap();
+        let padding = " ".repeat(800 * 1024);
+        store
+            .db
+            .execute(
+                "UPDATE records SET record_json=record_json || ?1",
+                [&padding],
+            )
+            .unwrap();
+        let (largest, total) = store
+            .db
+            .query_row(
+                "SELECT MAX(octet_length(record_json)), SUM(octet_length(record_json)) FROM records",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        let largest = u64::try_from(largest).unwrap();
+        let total = u64::try_from(total).unwrap();
+        assert!(largest < REPORT_VISIT_MAX_BATCH_BYTES);
+        assert!(total > REPORT_VISIT_MAX_BATCH_BYTES);
+        let expected = store.current_records().unwrap();
+
+        let mut visited = Vec::new();
+        let result = store
+            .visit_report_snapshot_bounded(|index, record| {
+                assert_eq!(index, visited.len());
+                visited.push(record);
+            })
+            .unwrap();
+
+        assert_eq!(result.records, expected.len());
+        assert_eq!(visited, expected);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bounded_report_visitor_rejects_an_oversized_record_without_skipping() {
+        let dir = temp_dir("bounded-report-visitor-oversized-record");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        let padding = " ".repeat(usize::try_from(REPORT_VISIT_MAX_BATCH_BYTES).unwrap());
+        store
+            .db
+            .execute(
+                "UPDATE records SET record_json=record_json || ?1",
+                [&padding],
+            )
+            .unwrap();
+
+        let mut bounded_visits = 0;
+        let error = store
+            .visit_report_snapshot_bounded(|_, _| bounded_visits += 1)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::ReportSnapshotRecordTooLarge {
+                record_bytes,
+                max_batch_bytes: REPORT_VISIT_MAX_BATCH_BYTES,
+            } if record_bytes > REPORT_VISIT_MAX_BATCH_BYTES
+        ));
+        assert_eq!(bounded_visits, 0);
+
+        let mut legacy_visits = 0;
+        let legacy = store
+            .visit_report_snapshot(|_, _| legacy_visits += 1)
+            .unwrap();
+        assert_eq!(legacy.records, 1);
+        assert_eq!(legacy_visits, 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bounded_report_visitor_callbacks_run_outside_transaction_and_fence_generation() {
+        let dir = temp_dir("bounded-report-visitor-generation-fence");
+        let _ = fs::remove_dir_all(&dir);
+        let mut writer = LocalStore::open(&dir).unwrap();
+        writer.ingest(&observation("1", "session", None)).unwrap();
+        let reader = LocalStore::open_current(&dir).unwrap();
+
+        let error = reader
+            .visit_report_snapshot_bounded(|index, _| {
+                assert_eq!(index, 0);
+                writer
+                    .ingest(&observation_after("2", Some("1"), "turn", Some("session")))
+                    .expect("callback must not hold a SQLite read transaction");
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, StoreError::ReportSnapshotChanged));
+        assert_eq!(reader.report_status().unwrap().generation, 2);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -6195,6 +6838,8 @@ mod tests {
 
             let reopened = LocalStore::open(&dir).unwrap();
             let expected = u64::from(crash == CrashPoint::BeforeRetentionCommit);
+            let expected_epoch = u64::from(crash == CrashPoint::AfterRetentionCommit);
+            assert_eq!(reopened.report_visibility_epoch().unwrap(), expected_epoch);
             assert_eq!(reopened.observation_count().unwrap(), expected);
             assert_eq!(reopened.record_count().unwrap(), expected);
             assert_eq!(
@@ -6743,6 +7388,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let mut store = LocalStore::open(&dir).unwrap();
         store.ingest(&observation("1", "session", None)).unwrap();
+        let report_status = store.report_status().unwrap();
         let database = store.database_path();
         drop(store);
         downgrade_to_v4_schema(&database);
@@ -6754,8 +7400,10 @@ mod tests {
         let reopened = LocalStore::open_with_migration_headroom(&dir, u64::MAX).unwrap();
         assert_eq!(
             required_schema_version(&reopened.db).unwrap(),
-            "local_state.v5"
+            LOCAL_STORE_SCHEMA_VERSION
         );
+        assert_eq!(reopened.report_visibility_epoch().unwrap(), 0);
+        assert_eq!(reopened.report_status().unwrap(), report_status);
         assert_eq!(count(&reopened.db, "hot_trace_index").unwrap(), 0);
         assert_eq!(reopened.record_count().unwrap(), 1);
         let pending = reopened.lifecycle_preflight(lifecycle_request(0)).unwrap();
@@ -6771,6 +7419,90 @@ mod tests {
                 .has_backfill_pending
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v5_visibility_epoch_migration_requires_admission_and_preserves_metadata() {
+        for (label, legacy_epoch, expected_epoch) in
+            [("missing", None, 0_u64), ("existing", Some("7"), 7_u64)]
+        {
+            let dir = temp_dir(&format!("v5-visibility-epoch-{label}"));
+            let _ = fs::remove_dir_all(&dir);
+            let mut store = LocalStore::open(&dir).unwrap();
+            store.ingest(&observation("1", "session", None)).unwrap();
+            let report_status = store.report_status().unwrap();
+            let database = store.database_path();
+            drop(store);
+            downgrade_to_v5_schema(&database, legacy_epoch);
+
+            assert!(matches!(
+                LocalStore::open(&dir),
+                Err(StoreError::MigrationAdmissionRequired)
+            ));
+            let reopened = LocalStore::open_with_migration_headroom(&dir, u64::MAX).unwrap();
+            assert_eq!(
+                required_schema_version(&reopened.db).unwrap(),
+                LOCAL_STORE_SCHEMA_VERSION
+            );
+            assert_eq!(reopened.report_status().unwrap(), report_status);
+            assert_eq!(reopened.report_visibility_epoch().unwrap(), expected_epoch);
+            drop(reopened);
+
+            let reopened = LocalStore::open_current(&dir).unwrap();
+            assert_eq!(reopened.report_visibility_epoch().unwrap(), expected_epoch);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn visibility_epoch_corruption_fails_closed_without_resetting_v5() {
+        let current = temp_dir("visibility-epoch-corrupt-current");
+        let _ = fs::remove_dir_all(&current);
+        let store = LocalStore::open(&current).unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE metadata SET value='invalid' WHERE key=?1",
+                [REPORT_VISIBILITY_EPOCH_KEY],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.report_visibility_epoch(),
+            Err(StoreError::SchemaMismatch)
+        ));
+        drop(store);
+        assert!(matches!(
+            LocalStore::open_current(&current),
+            Err(StoreError::SchemaMismatch)
+        ));
+        let _ = fs::remove_dir_all(&current);
+
+        let legacy = temp_dir("visibility-epoch-corrupt-v5");
+        let _ = fs::remove_dir_all(&legacy);
+        let store = LocalStore::open(&legacy).unwrap();
+        let database = store.database_path();
+        drop(store);
+        downgrade_to_v5_schema(&database, Some("invalid"));
+        assert!(matches!(
+            LocalStore::open_with_migration_headroom(&legacy, u64::MAX),
+            Err(StoreError::SchemaMismatch)
+        ));
+        let connection = Connection::open(&database).unwrap();
+        assert_eq!(
+            required_schema_version(&connection).unwrap(),
+            PREVIOUS_LOCAL_STORE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key=?1",
+                    [REPORT_VISIBILITY_EPOCH_KEY],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "invalid"
+        );
+        let _ = fs::remove_dir_all(&legacy);
     }
 
     #[test]
@@ -7310,7 +8042,9 @@ mod tests {
         let dir = temp_dir("report-invalidation-pending");
         let _ = fs::remove_dir_all(&dir);
         let mut store = LocalStore::open(&dir).unwrap();
+        assert_eq!(store.report_visibility_epoch().unwrap(), 0);
         store.ingest(&observation("1", "session", None)).unwrap();
+        assert_eq!(store.report_visibility_epoch().unwrap(), 0);
         let before = store.report_status().unwrap();
         assert!(
             store
@@ -7319,6 +8053,7 @@ mod tests {
         );
         let records = store.current_records().unwrap();
         store.invalidate_report().unwrap();
+        assert_eq!(store.report_visibility_epoch().unwrap(), 0);
         let invalidated = store.report_status().unwrap();
         assert_eq!(invalidated.generation, before.generation + 1);
         assert!(invalidated.pending());
@@ -7326,8 +8061,124 @@ mod tests {
         drop(store);
 
         let reopened = LocalStore::open_current(&dir).unwrap();
+        assert_eq!(reopened.report_visibility_epoch().unwrap(), 0);
         assert_eq!(reopened.report_status().unwrap(), invalidated);
         assert_eq!(reopened.current_records().unwrap(), records);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_lifecycle_and_retention_passes_do_not_advance_visibility_epoch() {
+        let dir = temp_dir("visibility-epoch-empty-passes");
+        let _ = fs::remove_dir_all(&dir);
+        let store = LocalStore::open(&dir).unwrap();
+        assert_eq!(store.report_visibility_epoch().unwrap(), 0);
+
+        let lifecycle = store.maintain_lifecycle(lifecycle_request(0)).unwrap();
+        assert_eq!(lifecycle.moved_to_warm, 0);
+        assert_eq!(lifecycle.moved_to_cold, 0);
+        assert_eq!(lifecycle.deleted, 0);
+        assert_eq!(store.report_visibility_epoch().unwrap(), 0);
+
+        let plan = store.retention_plan(100, 100, 1_048_576).unwrap();
+        assert_eq!(plan.traces, 0);
+        let archive = dir.join("archive/empty.jsonl");
+        let result = store
+            .apply_retention(100, 100, 1_048_576, &plan.plan_id, &archive)
+            .unwrap();
+        assert!(result.archive_path.is_none());
+        assert!(!archive.exists());
+        assert_eq!(store.report_visibility_epoch().unwrap(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn publish_test_report_view(store: &LocalStore) -> ReportViewPublication {
+        let staging =
+            build_report_view_staging(store, MISSING_RATE_FINGERPRINT, 32 * 1024 * 1024, None)
+                .unwrap();
+        publish_report_view(store, staging).unwrap()
+    }
+
+    #[test]
+    fn guarded_lifecycle_retires_physical_views_before_cold_commit() {
+        let dir = temp_dir("lifecycle-report-view-retirement");
+        let _ = fs::remove_dir_all(&dir);
+        let now = 10 * 86_400_000;
+        let old = now - 2 * 86_400_000;
+        let mut store = LocalStore::open(&dir).unwrap();
+        let mut item = observation("1", "session", None);
+        item.timing = Timing::new(old, Some(old)).unwrap();
+        store.ingest(&item).unwrap();
+        let publication = publish_test_report_view(&store);
+        let view_id = publication.current().view_id().to_owned();
+        let managed = report_view_catalog::managed_report_view_directory(&store).unwrap();
+        assert!(fs::read_dir(&managed).unwrap().count() >= 2);
+
+        let guard = store.try_acquire_report_render_guard().unwrap().unwrap();
+        let result = store
+            .maintain_lifecycle_guarded(lifecycle_request(now), guard)
+            .unwrap();
+        assert_eq!(result.moved_to_cold, 1);
+        assert_eq!(store.report_visibility_epoch().unwrap(), 1);
+        assert_eq!(fs::read_dir(&managed).unwrap().count(), 0);
+        assert!(matches!(
+            with_report_view_snapshot(&store, &view_id, |_, _| Ok(())),
+            Err(ReportViewCatalogError::RefreshPending)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guarded_manual_retention_retires_physical_views_before_delete_commit() {
+        let dir = temp_dir("manual-retention-report-view-retirement");
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = LocalStore::open(&dir).unwrap();
+        store.ingest(&observation("1", "session", None)).unwrap();
+        publish_test_report_view(&store);
+        let managed = report_view_catalog::managed_report_view_directory(&store).unwrap();
+        let plan = store.retention_plan(100, 100, 1_048_576).unwrap();
+        let archive = dir.join("archive/retired.jsonl");
+        let guard = store.try_acquire_report_render_guard().unwrap().unwrap();
+
+        store
+            .apply_retention_guarded(100, 100, 1_048_576, &plan.plan_id, &archive, guard)
+            .unwrap();
+        assert_eq!(store.record_count().unwrap(), 0);
+        assert_eq!(store.report_visibility_epoch().unwrap(), 1);
+        assert_eq!(fs::read_dir(managed).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_view_cleanup_failure_rolls_back_lifecycle_authority() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("lifecycle-report-view-retirement-failure");
+        let _ = fs::remove_dir_all(&dir);
+        let now = 10 * 86_400_000;
+        let old = now - 2 * 86_400_000;
+        let mut store = LocalStore::open(&dir).unwrap();
+        let mut item = observation("1", "session", None);
+        item.timing = Timing::new(old, Some(old)).unwrap();
+        store.ingest(&item).unwrap();
+        publish_test_report_view(&store);
+        let managed = report_view_catalog::managed_report_view_directory(&store).unwrap();
+        let unsafe_entry = managed.join("unsafe-entry");
+        symlink(store.database_path(), &unsafe_entry).unwrap();
+        let guard = store.try_acquire_report_render_guard().unwrap().unwrap();
+
+        assert!(matches!(
+            store.maintain_lifecycle_guarded(lifecycle_request(now), guard),
+            Err(StoreError::ReportViewRetirement)
+        ));
+        assert_eq!(store.record_count().unwrap(), 1);
+        assert_eq!(store.observation_count().unwrap(), 1);
+        assert_eq!(store.report_visibility_epoch().unwrap(), 0);
+        assert!(store.projection_path().is_file());
+
+        fs::remove_file(unsafe_entry).unwrap();
+        report_view_catalog::recover_report_view_catalog(&store).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -7342,12 +8193,14 @@ mod tests {
         store.ingest(&item).unwrap();
         let before = store.current_records().unwrap();
         let projection = store.projection_path();
+        assert_eq!(store.report_visibility_epoch().unwrap(), 0);
 
         let warm = store.maintain_lifecycle(lifecycle_request(now)).unwrap();
         assert_eq!(warm.moved_to_warm, 1);
         assert_eq!(warm.moved_to_cold, 0);
         assert_eq!(store.observation_count().unwrap(), 0);
         assert_eq!(store.current_records().unwrap(), before);
+        assert_eq!(store.report_visibility_epoch().unwrap(), 0);
         assert!(projection.is_file());
         assert_eq!(
             store
@@ -7361,6 +8214,7 @@ mod tests {
             .maintain_lifecycle(lifecycle_request(now + 86_400_000))
             .unwrap();
         assert_eq!(cold.moved_to_cold, 1);
+        assert_eq!(store.report_visibility_epoch().unwrap(), 1);
         assert_eq!(store.record_count().unwrap(), 0);
         assert!(!projection.exists());
         let page = store
@@ -7379,6 +8233,7 @@ mod tests {
             .maintain_lifecycle(lifecycle_request(now + 2 * 86_400_000))
             .unwrap();
         assert_eq!(deleted.deleted, 1);
+        assert_eq!(store.report_visibility_epoch().unwrap(), 2);
         assert!(
             store
                 .query_cold_archives(ColdArchiveQuery {
@@ -7619,6 +8474,7 @@ mod tests {
             assert_eq!(count(&store.db, "observations").unwrap(), 1);
             assert_eq!(count(&store.db, "warm_records").unwrap(), 0);
             assert_eq!(count(&store.db, "cold_traces").unwrap(), 0);
+            assert_eq!(store.report_visibility_epoch().unwrap(), 0);
             assert!(!projection.exists());
             store
                 .db
@@ -7628,6 +8484,7 @@ mod tests {
 
             let reopened = LocalStore::open(&dir).unwrap();
             assert_eq!(reopened.record_count().unwrap(), 1);
+            assert_eq!(reopened.report_visibility_epoch().unwrap(), 0);
             assert!(projection.is_file());
             let _ = fs::remove_dir_all(&dir);
         }
