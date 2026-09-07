@@ -4,7 +4,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { generateSyntheticFixtureSet } from "../scripts/paged-dashboard-browser-smoke.ts";
+import { generateSyntheticFixtureSet, isExpectedSmokeCancellation } from "../scripts/paged-dashboard-browser-smoke.ts";
+
+test("smoke accepts only explicitly marked request aborts, not ordinary network failures", () => {
+  assert.equal(isExpectedSmokeCancellation("net::ERR_ABORTED", true), true);
+  assert.equal(isExpectedSmokeCancellation("net::ERR_ABORTED", false), false);
+  assert.equal(isExpectedSmokeCancellation("net::ERR_CONNECTION_RESET", true), false);
+  assert.equal(isExpectedSmokeCancellation(undefined, true), false);
+});
+
+test("CI paged smoke explicitly budgets setup and browser traversal without changing product limits", async () => {
+  const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as {
+    scripts: Record<string, string>;
+  };
+  assert.match(manifest.scripts["test:paged-dashboard-browser"]!, /--profile=small --timeout-ms=180000$/);
+});
 
 test("paged browser smoke fixture stays bounded, synthetic, and cursor-valid by construction", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-observability-paged-contract-"));
@@ -71,8 +85,9 @@ test("paged browser smoke requires a candidate binary and forbids real-browser o
   assert.match(source, /await rm\(directory, \{ recursive: true, force: true \}\)/);
   assert.match(source, /requestedPaths\.includes\("\/api\/dashboard\/open"\)/);
   assert.match(source, /received kind=.*reason=.*page=/);
-  assert.match(source, /selectTraceAcrossPages\(page, `\$\{expectedPagedTraceSpans\} spans`\)/);
-  assert.match(source, /pageNumber <= 32/);
+  assert.match(source, /selectTraceAcrossPages\(page, `\$\{expectedPagedTraceSpans\} spans`, directEvidence\.tracePages\)/);
+  assert.match(source, /verifiedPageCount <= 512/);
+  assert.match(source, /pageNumber <= verifiedPageCount/);
   assert.doesNotMatch(source, /queryFailures\.push\(\{ request:/);
   assert.doesNotMatch(source, /cargo["'], \["build/);
   assert.doesNotMatch(source, /channel:\s*["']chrome["']/);

@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Readable } from "node:stream";
-import { chromium, type BrowserContext, type Page } from "playwright-core";
+import { chromium, type BrowserContext, type Page, type Request } from "playwright-core";
 
 const HANDOFF_SCHEMA_VERSION = "codex_handoff.v1";
 const DASHBOARD_SCHEMA_VERSION = "agent_observability.dashboard_query.v1";
@@ -578,7 +578,12 @@ async function exerciseBrowser(
   const consoleErrors: string[] = [];
   const pageErrors: string[] = [];
   const externalRequests: string[] = [];
-  const failedRequests: string[] = [];
+  const failedRequests: Array<{ kind: string; failure: string }> = [];
+  const pendingQueries = new Set<Request>();
+  const expectedCancelledQueries = new WeakSet<Request>();
+  const markFilterCancellation = () => {
+    for (const request of pendingQueries) expectedCancelledQueries.add(request);
+  };
   const requestedPaths: string[] = [];
   const queryFailures: Array<{ kind: string; reason: string }> = [];
   let popupCount = 0;
@@ -599,11 +604,17 @@ async function exerciseBrowser(
   page.on("request", (request) => {
     const url = new URL(request.url());
     requestedPaths.push(url.pathname);
+    if (url.origin === origin && url.pathname.endsWith("/query")) pendingQueries.add(request);
     if (url.origin !== origin) externalRequests.push(request.url());
   });
+  page.on("requestfinished", (request) => { pendingQueries.delete(request); });
   page.on("requestfailed", (request) => {
-    if (decodeDashboardRequest(request.url()).filters?.text !== "delayed-no-match") {
-      failedRequests.push(request.url());
+    pendingQueries.delete(request);
+    if (!isExpectedSmokeCancellation(request.failure()?.errorText, expectedCancelledQueries.has(request))) {
+      failedRequests.push({
+        kind: safeStatusValue(decodeDashboardRequest(request.url()).kind),
+        failure: request.failure()?.errorText === "net::ERR_ABORTED" ? "unexpected_abort" : "network_failure",
+      });
     }
   });
   page.on("response", async (response) => {
@@ -643,9 +654,12 @@ async function exerciseBrowser(
   await page.waitForFunction(() => document.getElementById("kpi-tokens")?.textContent === "Unavailable");
   assert.match((await page.locator("#quality-summary").textContent()) ?? "", /Hot\/warm data; cold excluded/);
 
+  markFilterCancellation();
   await page.locator("#text-filter").fill("delayed-no-match");
   await delayedRequestSeen;
+  markFilterCancellation();
   await page.locator("#text-filter").fill("");
+  markFilterCancellation();
   await page.locator("#agent-filter").selectOption("codex");
   await delayedRouteFinished;
   await assertKpi(page, "kpi-sessions", manifest.traceCount);
@@ -653,17 +667,34 @@ async function exerciseBrowser(
   assert.equal(await page.locator(".trace-row").count() > 0, true);
 
   const expectedPagedTraceSpans = 2 + DEFAULT_EXTRA_TOOL_SPANS;
-  const uiTracePages = await selectTraceAcrossPages(page, `${expectedPagedTraceSpans} spans`);
+  const uiTracePages = await selectTraceAcrossPages(page, `${expectedPagedTraceSpans} spans`, directEvidence.tracePages);
   await page.waitForFunction(() => {
     const button = document.getElementById("span-next") as HTMLButtonElement | null;
     return button !== null && !button.disabled;
   });
+  const readSpanIds = () => page.locator("#span-table .span-open").evaluateAll(
+    (buttons) => buttons.map((button) => (button as HTMLElement).dataset.spanId),
+  );
+  const firstSpanIds = await readSpanIds();
+  assert.equal(firstSpanIds.length, 200);
   await page.locator("#span-table .span-open").first().click();
   await page.locator("#span-details.open").waitFor();
   assert.match((await page.locator("#details-body").textContent()) ?? "", /Safe projected detail/);
   await page.locator("#span-next").click();
   await page.waitForFunction(() => document.getElementById("span-page-status")?.textContent?.startsWith("Page 2"));
-  assert.equal(await page.locator("#span-table .span-open").count(), expectedPagedTraceSpans - 200);
+  const secondSpanIds = await readSpanIds();
+  assert.equal(secondSpanIds.length, 200);
+  await page.locator("#span-next").click();
+  await page.waitForFunction(() => document.getElementById("span-page-status")?.textContent?.startsWith("Page 3"));
+  const thirdSpanIds = await readSpanIds();
+  assert.equal(thirdSpanIds.length, expectedPagedTraceSpans - 400);
+  assert.equal(await page.locator("#span-next").isDisabled(), true);
+  const visibleSpanIds = [...firstSpanIds, ...secondSpanIds, ...thirdSpanIds];
+  assert.equal(visibleSpanIds.every((id) => typeof id === "string" && id.length > 0), true);
+  assert.equal(new Set(visibleSpanIds).size, expectedPagedTraceSpans);
+  await page.locator("#span-previous").click();
+  await page.waitForFunction(() => document.getElementById("span-page-status")?.textContent?.startsWith("Page 2"));
+  assert.deepEqual(await readSpanIds(), secondSpanIds);
 
   const deletionPage = await queryHttp(dashboardUrl, {
     kind: "traces",
@@ -710,8 +741,13 @@ async function exerciseBrowser(
   };
 }
 
-async function selectTraceAcrossPages(page: Page, expectedText: string): Promise<number> {
-  for (let pageNumber = 1; pageNumber <= 32; pageNumber += 1) {
+export function isExpectedSmokeCancellation(errorText: string | undefined, explicitlyCancelledRequest: boolean): boolean {
+  return explicitlyCancelledRequest && errorText === "net::ERR_ABORTED";
+}
+
+async function selectTraceAcrossPages(page: Page, expectedText: string, verifiedPageCount: number): Promise<number> {
+  assert.ok(Number.isSafeInteger(verifiedPageCount) && verifiedPageCount > 0 && verifiedPageCount <= 512);
+  for (let pageNumber = 1; pageNumber <= verifiedPageCount; pageNumber += 1) {
     const matchingTrace = page.locator(".trace-row", { hasText: expectedText });
     if (await matchingTrace.count() > 0) {
       await matchingTrace.first().click();
@@ -726,7 +762,7 @@ async function selectTraceAcrossPages(page: Page, expectedText: string): Promise
       priorStatus,
     );
   }
-  throw new Error("paged synthetic trace was not found within 32 bounded UI pages");
+  throw new Error("paged synthetic trace was not found within the verified bounded UI pages");
 }
 
 async function assertKpi(page: Page, id: string, expected: number): Promise<void> {

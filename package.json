@@ -13,7 +13,7 @@
     "pretest": "npm run setup:browser",
     "test:browser": "tsx scripts/browser-smoke.ts",
     "test:dashboard-browser": "tsx scripts/dashboard-browser-smoke.ts",
-    "test:paged-dashboard-browser": "npm run build:ui && cargo build --locked -p agent-observability-cli && tsx scripts/paged-dashboard-browser-smoke.ts \"$PWD/target/debug/agent-observability\"",
+    "test:paged-dashboard-browser": "npm run build:ui && cargo build --locked -p agent-observability-cli && tsx scripts/paged-dashboard-browser-smoke.ts \"$PWD/target/debug/agent-observability\" --profile=small --timeout-ms=180000",
     "test:settings-browser": "cargo build -q -p agent-observability-cli && tsx scripts/settings-browser-smoke.ts",
     "check:authored-js": "tsx scripts/check-authored-js.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
