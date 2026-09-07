@@ -4,7 +4,41 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { consumeExpectedSmokeCancellation, generateSyntheticFixtureSet, isExpectedSmokeCancellation } from "../scripts/paged-dashboard-browser-smoke.ts";
+import { consumeExpectedSmokeCancellation, generateSyntheticFixtureSet, isCompletedResponseCancellation, isExpectedSmokeCancellation } from "../scripts/paged-dashboard-browser-smoke.ts";
+
+test("completed-response cancellation requires exact version, body and network proof", () => {
+  const valid: Parameters<typeof isCompletedResponseCancellation>[0] = {
+    browserVersion: "151.0.7922.34",
+    error: "net::ERR_ABORTED", token: "1", tokenMultiplicity: 1,
+    sourceAborted: false, dispatchedAborted: false, fetchRejected: false,
+    body: { token: "1", status: 200, declared: "458", encoding: null, bytes: 458, terminal: "complete", schemaValidated: true, responseKindMatches: true },
+    network: [{ startStage: "bootstrap", events: ["request", "aborted"], canceled: true }],
+  };
+  assert.equal(isCompletedResponseCancellation(valid), true);
+  for (const patch of [
+    { browserVersion: "152.0.0.0" }, { error: "net::ERR_CONNECTION_RESET" },
+    { error: undefined }, { token: undefined }, { token: "" }, { token: "2" },
+    { tokenMultiplicity: 0 }, { tokenMultiplicity: 2 },
+    { sourceAborted: true }, { dispatchedAborted: true }, { fetchRejected: true },
+    { body: undefined }, { network: undefined }, { network: [] },
+    { network: [...valid.network!, ...valid.network!] },
+  ]) assert.equal(isCompletedResponseCancellation({ ...valid, ...patch }), false);
+  for (const patch of [
+    { token: "2" }, { status: 500 }, { schemaValidated: false }, { responseKindMatches: false },
+    { declared: null }, { declared: "0458" }, { declared: "458.0" },
+    { declared: "458x" }, { declared: "459" }, { encoding: "gzip" },
+    { bytes: 457 }, { bytes: Number.NaN }, { bytes: 0, declared: "0" },
+    { bytes: 1048577, declared: "1048577" },
+    { terminal: "reading" }, { terminal: "cancel" }, { terminal: "error" },
+  ]) assert.equal(isCompletedResponseCancellation({ ...valid, body: { ...valid.body!, ...patch } }), false);
+  for (const entry of [
+    { events: ["request", "finished"], canceled: true },
+    { events: ["request", "aborted", "finished"], canceled: true },
+    { events: ["request", "request_restarted", "aborted"], canceled: true },
+    { events: ["request", "aborted"], canceled: false },
+    { events: ["request", "aborted"] },
+  ]) assert.equal(isCompletedResponseCancellation({ ...valid, network: [{ startStage: "bootstrap", ...entry }] }), false);
+});
 
 test("smoke cancellation consumes only the exact causal token once", () => {
   const expected = new Set(["1", "2"]);

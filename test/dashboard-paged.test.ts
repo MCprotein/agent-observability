@@ -448,6 +448,31 @@ test("uses same-origin GET transport and enforces both wire byte bounds", async 
   );
 });
 
+test("successful headers never conceal a later body-stream failure", async () => {
+  const failure = new TypeError("synthetic body transport failure");
+  let pulls = 0;
+  let validations = 0;
+  const transport = createDashboardTransport({
+    endpoint: "/report/capability/query",
+    origin: "http://127.0.0.1:8080",
+    validate: (value): value is DashboardQueryResponseV1 => {
+      validations += 1;
+      return validateResponse(value);
+    },
+    fetch: async () => new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulls++ === 0) controller.enqueue(new TextEncoder().encode('{"schemaVersion":'));
+        else controller.error(failure);
+      },
+    }), { status: 200 }),
+  });
+  await assert.rejects(
+    transport({ schemaVersion: "agent_observability.dashboard_query.v1", kind: "bootstrap" }, new AbortController().signal),
+    (error: unknown) => error === failure,
+  );
+  assert.equal(validations, 0);
+});
+
 test("loads eligible private detail only after explicit request", async () => {
   let privateCalls = 0;
   const turnId = projected("d");

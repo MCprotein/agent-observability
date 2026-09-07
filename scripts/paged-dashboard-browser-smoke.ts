@@ -13,9 +13,38 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Readable } from "node:stream";
 import { chromium, type BrowserContext, type Page } from "playwright-core";
+import { build } from "esbuild";
+import { DASHBOARD_RESPONSE_BYTES } from "../ui/report/paged-client.ts";
+
+interface BodyEvidence {
+  token: string;
+  status: number;
+  declared: string | null;
+  encoding: string | null;
+  bytes: number;
+  terminal: string;
+  schemaValidated: boolean;
+  responseKindMatches: boolean;
+}
+
+interface NetworkEvidence {
+  startStage: string;
+  events: string[];
+  canceled?: boolean;
+  encodedBytes?: number;
+}
+
+interface SmokeCancellationState {
+  expected: string[];
+  aborted: string[];
+  dispatchedAborted: string[];
+  mutations: number;
+  rejected: Array<{ token: string; name: string }>;
+  bodies: BodyEvidence[];
+}
 
 const HANDOFF_SCHEMA_VERSION = "codex_handoff.v1";
 const DASHBOARD_SCHEMA_VERSION = "agent_observability.dashboard_query.v1";
@@ -581,7 +610,6 @@ async function exerciseBrowser(
   const failedRequests: Array<{ kind: string; error: string | undefined; token: string | undefined; stage: string; responseStarted: boolean }> = [];
   const responseTokens = new Set<string>();
   let browserStage = "bootstrap";
-  type NetworkEvidence = { startStage: string; events: string[]; canceled?: boolean; encodedBytes?: number };
   const networkRequests = new Map<string, NetworkEvidence>();
   const networkEvidence = new Map<string, NetworkEvidence[]>();
   const network = await context.newCDPSession(page);
@@ -616,8 +644,19 @@ async function exerciseBrowser(
   });
   // Observe causality in the page, where filter handlers synchronously abort their signal.
   // A smoke-only header binds that signal to the exact browser network request.
-  await page.addInitScript(() => {
-    const state = { expected: [] as string[], aborted: [] as string[], mutations: 0, rejected: [] as Array<{ token: string; name: string }>, bodies: [] as Array<{ token: string; status: number; declared: string | null; bytes: number; terminal: string }> };
+  const validatorBundle = await build({
+    entryPoints: [fileURLToPath(new URL("../ui/report/generated/validate-dashboard-query-v1.ts", import.meta.url))],
+    bundle: true,
+    write: false,
+    format: "iife",
+    globalName: "__agentobsSmokeContract",
+    footer: { js: "globalThis.__agentobsSmokeContract = __agentobsSmokeContract;" },
+    platform: "browser",
+    target: "es2022",
+  });
+  await page.addInitScript({ content: validatorBundle.outputFiles[0]!.text });
+  await page.addInitScript((responseLimit: number) => {
+    const state: SmokeCancellationState = { expected: [], aborted: [], dispatchedAborted: [], mutations: 0, rejected: [], bodies: [] };
     Object.assign(window, { __agentobsSmokeCancellation: state });
     let active = false;
     let sequence = 0;
@@ -644,8 +683,10 @@ async function exerciseBrowser(
         state.aborted.push(token);
         if (active) state.expected.push(token);
       }, { once: true });
-      return originalFetch(new window.Request(request, { headers })).then((response) => {
-        const evidence = { token, status: response.status, declared: response.headers.get("content-length"), bytes: 0, terminal: "unread" };
+      const dispatched = new window.Request(request, { headers });
+      dispatched.signal.addEventListener("abort", () => { state.dispatchedAborted.push(token); }, { once: true });
+      return originalFetch(dispatched).then((response) => {
+        const evidence: BodyEvidence = { token, status: response.status, declared: response.headers.get("content-length"), encoding: response.headers.get("content-encoding"), bytes: 0, terminal: "unread", schemaValidated: false, responseKindMatches: false };
         state.bodies.push(evidence);
         if (response.body) {
           const body = response.body;
@@ -654,19 +695,45 @@ async function exerciseBrowser(
             const reader = getReader();
             const read = reader.read.bind(reader);
             const cancel = reader.cancel.bind(reader);
+            const chunks: Uint8Array[] = [];
             reader.read = async () => {
               try {
                 const result = await read();
                 evidence.bytes += result.value?.byteLength ?? 0;
                 evidence.terminal = result.done ? "complete" : "reading";
+                if (result.value && evidence.bytes <= responseLimit) chunks.push(result.value);
+                if (evidence.bytes > responseLimit) chunks.length = 0;
+                if (result.done) {
+                  try {
+                    if (evidence.bytes <= responseLimit) {
+                      const joined = new Uint8Array(evidence.bytes);
+                      let offset = 0;
+                      for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.byteLength; }
+                      const value: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(joined));
+                      evidence.schemaValidated = (window as unknown as {
+                        __agentobsSmokeContract: { default(value: unknown): boolean };
+                      }).__agentobsSmokeContract.default(value);
+                      if (evidence.schemaValidated) {
+                        const requested = JSON.parse(url.searchParams.get("request") ?? "null") as { kind?: string } | null;
+                        const validated = value as { kind: string; requestKind?: string };
+                        evidence.responseKindMatches = typeof requested?.kind === "string"
+                          && (validated.kind === requested.kind
+                            || (validated.kind === "status" && validated.requestKind === requested.kind));
+                      }
+                    }
+                  } catch { evidence.schemaValidated = false; }
+                  finally { chunks.length = 0; }
+                }
                 return result;
               } catch (error) {
                 evidence.terminal = "error";
+                chunks.length = 0;
                 throw error;
               }
             };
             reader.cancel = async (reason) => {
               evidence.terminal = "cancel";
+              chunks.length = 0;
               return cancel(reason);
             };
             return reader;
@@ -680,7 +747,7 @@ async function exerciseBrowser(
         throw error;
       });
     };
-  });
+  }, DASHBOARD_RESPONSE_BYTES);
   const requestedPaths: string[] = [];
   const queryFailures: Array<{ kind: string; reason: string }> = [];
   let popupCount = 0;
@@ -740,6 +807,9 @@ async function exerciseBrowser(
   });
 
   await page.goto(dashboardUrl, { waitUntil: "load" });
+  assert.equal(await page.evaluate(() => typeof (window as unknown as {
+    __agentobsSmokeContract?: { default?: unknown };
+  }).__agentobsSmokeContract?.default), "function", "smoke response validator must be installed");
   assert.equal(await page.locator("h1").textContent(), "Agent Observability");
   await assertKpi(page, "kpi-sessions", manifest.traceCount).catch((error: unknown) => {
     throw new Error(`initial dashboard KPI failed; queryFailures=${JSON.stringify(queryFailures)}`, {
@@ -825,13 +895,34 @@ async function exerciseBrowser(
   assert.deepEqual(pageErrors, []);
   assert.deepEqual(externalRequests, []);
   const cancellation = await page.evaluate(() => (window as unknown as {
-    __agentobsSmokeCancellation: { expected: string[]; aborted: string[]; mutations: number; rejected: Array<{ token: string; name: string }>; bodies: Array<{ token: string; status: number; declared: string | null; bytes: number; terminal: string }> };
+    __agentobsSmokeCancellation: SmokeCancellationState;
   }).__agentobsSmokeCancellation);
   assert.equal(cancellation.mutations, 3);
+  const completedBodies = cancellation.bodies.filter((body) => body.terminal === "complete");
+  assert.ok(completedBodies.length > 0);
+  const invalidBodies = completedBodies.filter((body) => !body.schemaValidated || !body.responseKindMatches);
+  assert.equal(invalidBodies.length, 0,
+    `completed query validation failed; first=${JSON.stringify(invalidBodies.slice(0, 3))}`);
   assert.ok(cancellation.expected.length > 0, "explicit filter change must abort an observed signal");
   const expectedTokens = new Set(cancellation.expected);
+  const completedResponseCancellations: string[] = [];
   const unexpectedFailures = failedRequests.filter((failure) => {
-    return !consumeExpectedSmokeCancellation(failure.error, failure.token, expectedTokens);
+    if (consumeExpectedSmokeCancellation(failure.error, failure.token, expectedTokens)) return false;
+    if (isCompletedResponseCancellation({
+      browserVersion: context.browser()?.version() ?? "",
+      error: failure.error,
+      token: failure.token,
+      tokenMultiplicity: failedRequests.filter((candidate) => candidate.token === failure.token).length,
+      sourceAborted: cancellation.aborted.includes(failure.token ?? ""),
+      dispatchedAborted: cancellation.dispatchedAborted.includes(failure.token ?? ""),
+      fetchRejected: cancellation.rejected.some((entry) => entry.token === failure.token),
+      body: cancellation.bodies.find((entry) => entry.token === failure.token),
+      network: networkEvidence.get(failure.token ?? ""),
+    })) {
+      completedResponseCancellations.push(failure.token!);
+      return false;
+    }
+    return true;
   }).map((failure) => ({
     kind: failure.kind,
     failure: failure.error === "net::ERR_ABORTED" ? "unexpected_abort" : "network_failure",
@@ -859,11 +950,42 @@ async function exerciseBrowser(
     deletionCursor: revoked.reason,
     externalRequests: 0,
     escapedOpenRequests: 0,
+    completedResponseCancellations: completedResponseCancellations.length,
   };
 }
 
 export function isExpectedSmokeCancellation(errorText: string | undefined, explicitlyCancelledRequest: boolean): boolean {
   return explicitlyCancelledRequest && errorText === "net::ERR_ABORTED";
+}
+
+// Chromium 151 can close the JS stream before its reentrant consumer cancellation
+// becomes CDP loadingFailed. Keep this separate from intentional filter aborts.
+export function isCompletedResponseCancellation(evidence: {
+  browserVersion: string;
+  error: string | undefined;
+  token: string | undefined;
+  tokenMultiplicity: number;
+  sourceAborted: boolean;
+  dispatchedAborted: boolean;
+  fetchRejected: boolean;
+  body: BodyEvidence | undefined;
+  network: NetworkEvidence[] | undefined;
+}): boolean {
+  const { body, network } = evidence;
+  return evidence.browserVersion === "151.0.7922.34"
+    && evidence.error === "net::ERR_ABORTED"
+    && typeof evidence.token === "string" && evidence.token.length > 0
+    && evidence.tokenMultiplicity === 1
+    && !evidence.sourceAborted && !evidence.dispatchedAborted && !evidence.fetchRejected
+    && body !== undefined && body.token === evidence.token
+    && body.status === 200 && body.terminal === "complete" && body.schemaValidated && body.responseKindMatches
+    && (body.encoding === null || body.encoding === "identity")
+    && body.declared !== null && /^[1-9][0-9]*$/.test(body.declared)
+    && Number.isSafeInteger(body.bytes) && body.bytes > 0 && body.bytes <= DASHBOARD_RESPONSE_BYTES
+    && Number(body.declared) === body.bytes
+    && network?.length === 1 && network[0]?.canceled === true
+    && network[0].events.length === 2
+    && network[0].events[0] === "request" && network[0].events[1] === "aborted";
 }
 
 export function consumeExpectedSmokeCancellation(errorText: string | undefined, token: string | undefined, expected: Set<string>): boolean {
