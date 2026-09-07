@@ -1,6 +1,6 @@
 # Paged local dashboard
 
-Status: accepted v1.11.0 scope; implementation and release verification pending.
+Status: v1.11.0 development implementation; integration and release verification pending.
 
 ## Why
 
@@ -93,6 +93,26 @@ the publication guard while owning a staging connection, so destructive maintena
 cleanup while another process still owns an old-epoch staging file. Ingest still uses short,
 separate authority transactions and may invalidate construction via the source-generation fence.
 
+### Shared write admission and compatible index upgrade
+
+A refresh reserves its bounded build/journal allowance plus 64 KiB publication headroom in one
+private durable runtime reservation. Ordinary write admission and migration headroom count the
+full active or interrupted reservation in addition to allocated files and filesystem limits.
+The reservation contains only a fixed kind, version, random owner nonce and numeric byte ceiling.
+
+Admission and final publication use short, nonblocking runtime mutation guards. Construction
+releases that guard so collection can proceed within the remaining budget. Final publication
+reloads the current configuration and recounts actual usage; only the validated reservation owner
+can exclude its own promised bytes from that final check. Contention leaves the old view intact
+and retries. An interrupted reservation stays accounted until guarded staging cleanup succeeds;
+process identifiers are not recovery authority.
+
+New sidecars use the private `report_view_staging.v2` layout: the repository, session, turn, agent
+and model indexes store their dimension plus source order. Validated v1 sidecars remain readable
+through their original bounded query kernel until normal publication replaces them. Metadata and
+index shape select the kernel; unknown or inconsistent layouts fail closed. Internal continuation
+keys cannot cross kernel versions. The HTTP query schema and opaque cursor contract remain v1.
+
 ## Resource budgets and completeness
 
 Initial implementation budgets below require measurement before release, not silent increases:
@@ -107,7 +127,7 @@ Initial implementation budgets below require measurement before release, not sil
 | Active query/cursor leases | At most 16, 120-second idle expiry, 10-minute hard expiry |
 | Snapshot files | Current + one retired + one staging file; no accumulating generations |
 | SQLite page cache | At most 8 MiB per connection; no full DTO cache |
-| Sidecar disk | At most 128 MiB per generation; all three files and write headroom count toward configured local storage budget |
+| Sidecar disk | At most 256 MiB per generation including 8 MiB write/journal reserve; current, retired, staging, publication headroom and durable write reservations count toward the configured local storage budget |
 
 Limits on returned rows are additional to work/byte limits. Sparse filters may produce short or
 empty pages with continuation; the UI distinguishes this from the end of results. Text matching

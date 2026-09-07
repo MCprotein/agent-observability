@@ -1224,8 +1224,8 @@ fn runtime_check(root: &Path) -> Result<String, String> {
         StorageBudget::allocated_tree_bytes(&layout.root).map_err(|error| error.to_string())?;
     let mut control = RuntimeControl::new(&config).map_err(|error| error.to_string())?;
     let admission = match control
-        .storage_budget()
-        .admit(allocated, u64::from(config.collection.max_batch_bytes))
+        .admit(&layout.root, u64::from(config.collection.max_batch_bytes))
+        .map_err(|error| error.to_string())?
     {
         Admission::Allowed { .. } => "allowed",
         Admission::Denied => "denied",
@@ -1837,6 +1837,53 @@ mod tests {
         assert!(output.contains("storage_admission=allowed"));
         assert!(output.contains("team_ingest=disabled"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_check_counts_active_and_stale_report_reservations() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-reservation-{}",
+            std::process::id()
+        ));
+        super::runtime_check(&root).unwrap();
+        let layout = agent_observability_local_runtime::install(&root).unwrap();
+        let config = agent_observability_local_runtime::load(&layout.config).unwrap();
+        let control = agent_observability_local_runtime::RuntimeControl::new(&config).unwrap();
+        let mutation =
+            agent_observability_local_runtime::MutationGuard::acquire(&layout.runtime).unwrap();
+        let ceiling = control.writable_headroom(&root).unwrap()
+            - u64::from(config.collection.max_batch_bytes) / 2;
+        let reservation = control
+            .reserve_report_build(&root, &mutation, ceiling)
+            .unwrap();
+        drop(mutation);
+        assert!(
+            super::runtime_check(&root)
+                .unwrap()
+                .contains("storage_admission=denied")
+        );
+        drop(reservation);
+        assert!(
+            super::runtime_check(&root)
+                .unwrap()
+                .contains("storage_admission=denied")
+        );
+        let mutation =
+            agent_observability_local_runtime::MutationGuard::acquire(&layout.runtime).unwrap();
+        // This fixture created no staging file; guarded cleanup is already complete.
+        control
+            .claim_stale_report_reservation(&root, &mutation)
+            .unwrap()
+            .unwrap()
+            .release(&root, &mutation)
+            .unwrap();
+        drop(mutation);
+        assert!(
+            super::runtime_check(&root)
+                .unwrap()
+                .contains("storage_admission=allowed")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

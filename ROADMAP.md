@@ -114,7 +114,10 @@ the baseline measurement is not evidence for later code changes.
 Live-scale candidate QA also exceeds the 32 MiB single-HTML contract. This is a release blocker:
 The user approved [paged dashboard scope](docs/PAGED_DASHBOARD.md): bounded Rust queries and
 TypeScript page/detail loading, while preserving observations and the standalone HTML export.
-Query/index implementation, resource-budget verification and a fresh successful automatic smoke remain outstanding. See
+Paged query/index code and browser regressions are implemented in the development branch. The
+approved capacity follow-up adds shared runtime write reservations and a smaller v2 index while
+retaining v1 reads. Actual-copy three-generation capacity validation, integrated independent review,
+existing-tab Chrome QA and fresh exact-head CI/automatic performance evidence remain release gates. See
 [the current review checkpoint](docs/reviews/v1.11.0.md).
 
 ## Branch Strategy

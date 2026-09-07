@@ -311,6 +311,9 @@ mod rotation_diagnostic {
         let before = canonical_identity(&state.store);
         let mut config = load(&state.layout.config).unwrap();
         config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+        let config_guard = ConfigMutationGuard::acquire(&state.layout).unwrap();
+        save(&config_guard, &config).unwrap();
+        drop(config_guard);
         let budget =
             StorageBudget::calculate(config.collection.local_storage_budget_bytes, false).unwrap();
         fill_to_remaining(&runtime.0, budget, 4 * 1024 * 1024);
@@ -319,7 +322,7 @@ mod rotation_diagnostic {
             .invalidate_report()
             .unwrap_or_else(|_| panic!("temporary invalidation failed"));
         assert!(matches!(
-            crate::refresh_report_observing(&state.layout, &state.store, &config, |_| {}),
+            crate::refresh_report_observing(&state.layout, &state.store, |_| {}),
             Err(ReportFailure::Capacity)
         ));
         assert_eq!(current_report_view(&state.store).unwrap(), Some(current));
@@ -341,6 +344,9 @@ mod rotation_diagnostic {
         let before = canonical_identity(&state.store);
         let mut config = load(&state.layout.config).unwrap();
         config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+        let config_guard = ConfigMutationGuard::acquire(&state.layout).unwrap();
+        save(&config_guard, &config).unwrap();
+        drop(config_guard);
         let budget =
             StorageBudget::calculate(config.collection.local_storage_budget_bytes, false).unwrap();
         state
@@ -348,7 +354,7 @@ mod rotation_diagnostic {
             .invalidate_report()
             .unwrap_or_else(|_| panic!("temporary invalidation failed"));
         let mut injected = false;
-        let result = crate::refresh_report_observing(&state.layout, &state.store, &config, |_| {
+        let result = crate::refresh_report_observing(&state.layout, &state.store, |_| {
             if !injected {
                 injected = true;
                 fill_to_remaining(&runtime.0, budget, 16 * 1024);

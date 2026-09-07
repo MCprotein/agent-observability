@@ -11,12 +11,14 @@ use agent_observability_adapter_codex::{
 use agent_observability_application::project_report;
 use agent_observability_contracts::{CollectorDegradationReasonV1, LOCAL_COLLECTOR_HEALTH_VERSION};
 use agent_observability_local_runtime::{
-    Admission, InstalledLayout, LocalRuntimeConfigV3, MutationGuard, PressureSample,
-    RuntimeControl, Singleton, SingletonError, StorageBudget, inspect, install, load,
+    Admission, ControlError, InstalledLayout, LocalRuntimeConfigV3, MutationGuard, PressureSample,
+    REPORT_RESERVATION_METADATA_ALLOWANCE, ReservationError, RuntimeControl, Singleton,
+    SingletonError, StorageBudget, inspect, install, load,
 };
 use agent_observability_local_store::{
     LocalStore, MISSING_RATE_FINGERPRINT, ReportViewBuildError, ReportViewCatalogError,
-    StoreBatchItem, current_report_view, publish_report_view, recover_report_view_catalog,
+    StoreBatchItem, current_report_view, current_report_view_needs_kernel_upgrade,
+    publish_report_view, recover_report_view_catalog,
 };
 #[cfg(test)]
 use agent_observability_static_report::write_private;
@@ -1464,6 +1466,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let singleton = Singleton::acquire(&layout.runtime.join("collector")).map_err(runtime_error)?;
     let mutation = try_collector_mutation(&layout.runtime)?;
     let config = load(&layout.config).map_err(runtime_error)?;
+    recover_report_reservation_for_startup(&layout, &config, &mutation)?;
     maintain_private_turn_details_locked(&layout, &config, SystemTime::now())?;
     let store = open_store(&mutation, &layout, &config)?;
     recover_report_view_catalog_for_startup(&store)?;
@@ -2799,10 +2802,9 @@ fn refresh_report_from_root_observing(
     on_record: impl FnMut(usize),
 ) -> Result<bool, ReportFailure> {
     let layout = install(root).map_err(|_| ReportFailure::Install)?;
-    let config = load(&layout.config).map_err(|_| ReportFailure::Install)?;
     let store = LocalStore::open_current(layout.state.join("store"))
         .map_err(|_| ReportFailure::OpenStore)?;
-    refresh_report_observing(&layout, &store, &config, on_record)
+    refresh_report_observing(&layout, &store, on_record)
 }
 
 /// Projects and sends a raw notify argument with bounded foreground deadlines.
@@ -3724,17 +3726,41 @@ fn parse_complete_http_response(
 fn refresh_report_observing(
     layout: &InstalledLayout,
     store: &LocalStore,
-    config: &LocalRuntimeConfigV3,
     on_record: impl FnMut(usize),
 ) -> Result<bool, ReportFailure> {
-    let admitted_bytes = automatic_report_view_admitted_bytes(layout, config)?;
+    let mutation = try_report_mutation(layout)?;
+    let config = load(&layout.config).map_err(|_| ReportFailure::Publish)?;
+    let control = RuntimeControl::new(&config).map_err(report_control_failure)?;
+    if let Some(stale) = control
+        .claim_stale_report_reservation(&layout.root, &mutation)
+        .map_err(report_control_failure)?
+    {
+        // Keep both locks until cleanup succeeds. Failed cleanup preserves the stale promise.
+        recover_report_view_catalog(store).map_err(report_catalog_failure)?;
+        stale
+            .release(&layout.root, &mutation)
+            .map_err(|_| ReportFailure::Publish)?;
+    }
+    let admitted_bytes = automatic_report_view_admitted_bytes(layout, &config)?;
+    let reservation = control
+        .reserve_report_build(
+            &layout.root,
+            &mutation,
+            admitted_bytes + REPORT_VIEW_PUBLICATION_RESERVE_BYTES,
+        )
+        .map_err(report_control_failure)?;
+    drop(mutation);
     let staging = build_automatic_report_view_staging(store, admitted_bytes, on_record)?;
-    // Recount with the completed staging file present. A concurrent managed write may have
-    // consumed the initial allowance; fail before changing current/retired catalog authority.
-    let remaining = RuntimeControl::new(config)
-        .map_err(|_| ReportFailure::Publish)?
-        .writable_headroom(&layout.root)
-        .map_err(|_| ReportFailure::Publish)?;
+    // Never wait while holding the publication guard. Other writers can own mutation and
+    // attempt publication in the opposite order; contention is retryable, not a deadlock.
+    let mutation = try_report_mutation(layout)?;
+    // Settings may change during projection. Publication must obey the latest budget, not
+    // the admission-time copy, even though the original reservation remains conservative.
+    let config = load(&layout.config).map_err(|_| ReportFailure::Publish)?;
+    let control = RuntimeControl::new(&config).map_err(report_control_failure)?;
+    let remaining = control
+        .reservation_finalization_headroom(&layout.root, &mutation, &reservation)
+        .map_err(report_control_failure)?;
     if remaining < REPORT_VIEW_PUBLICATION_RESERVE_BYTES {
         return Err(ReportFailure::Capacity);
     }
@@ -3742,14 +3768,80 @@ fn refresh_report_observing(
     if publication.cleanup_pending() {
         return Err(ReportFailure::Publish);
     }
-    store
-        .acknowledge_report_generation(publication.current().generation())
-        .map_err(|_| ReportFailure::Acknowledge)
+    acknowledge_report_reservation(
+        layout,
+        store,
+        publication.current().generation(),
+        &mutation,
+        reservation,
+    )
+}
+
+fn acknowledge_report_reservation(
+    layout: &InstalledLayout,
+    store: &LocalStore,
+    generation: u64,
+    mutation: &MutationGuard,
+    reservation: agent_observability_local_runtime::WriteReservation,
+) -> Result<bool, ReportFailure> {
+    let acknowledged = store
+        .acknowledge_report_generation(generation)
+        .map_err(|_| ReportFailure::Acknowledge)?;
+    if !acknowledged {
+        // Do not discharge an incomplete finalization. Guarded recovery will reconcile the
+        // published catalog before a later attempt clears this now-stale reservation.
+        return Err(ReportFailure::SnapshotChanged);
+    }
+    reservation
+        .release(&layout.root, mutation)
+        .map_err(|_| ReportFailure::Publish)?;
+    Ok(acknowledged)
+}
+
+fn try_report_mutation(layout: &InstalledLayout) -> Result<MutationGuard, ReportFailure> {
+    MutationGuard::try_acquire(&layout.runtime).map_err(|error| match error {
+        SingletonError::AlreadyRunning => ReportFailure::RenderGuard,
+        _ => ReportFailure::Publish,
+    })
+}
+
+#[allow(clippy::needless_pass_by_value)] // Direct Result::map_err adapter consumes the source error.
+fn report_control_failure(error: ControlError) -> ReportFailure {
+    match error {
+        ControlError::Reservation(ReservationError::Busy) => ReportFailure::RenderGuard,
+        ControlError::Reservation(ReservationError::Capacity) => ReportFailure::Capacity,
+        _ => ReportFailure::Publish,
+    }
+}
+
+fn recover_report_reservation_for_startup(
+    layout: &InstalledLayout,
+    config: &LocalRuntimeConfigV3,
+    mutation: &MutationGuard,
+) -> Result<(), CollectorError> {
+    let control = RuntimeControl::new(config).map_err(runtime_error)?;
+    if let Some(stale) = control
+        .claim_stale_report_reservation(&layout.root, mutation)
+        .map_err(runtime_error)?
+    {
+        // A reservation is created only for an already current store. Recovery must not
+        // require migration headroom that is still conservatively reserved by the stale owner.
+        let store = LocalStore::open_current(layout.state.join("store")).map_err(runtime_error)?;
+        recover_report_view_catalog_for_startup(&store)?;
+        stale
+            .release(&layout.root, mutation)
+            .map_err(runtime_error)?;
+    }
+    Ok(())
 }
 
 fn automatic_report_view_missing(store: &LocalStore) -> Result<bool, CollectorError> {
     match current_report_view(store) {
-        Ok(view) => Ok(view.is_none()),
+        Ok(view) => match current_report_view_needs_kernel_upgrade(store) {
+            Ok(needs_upgrade) => Ok(view.is_none() || needs_upgrade),
+            Err(ReportViewCatalogError::Busy) => Ok(true),
+            Err(error) => Err(runtime_error(error)),
+        },
         // A staging build or destructive pass already owns publication. Start normally and let
         // the existing adaptive refresh scheduler converge after that bounded operation ends.
         Err(ReportViewCatalogError::Busy) => Ok(true),
@@ -3774,6 +3866,7 @@ fn automatic_report_view_admitted_bytes(
         .map(|headroom| {
             headroom
                 .saturating_sub(REPORT_VIEW_PUBLICATION_RESERVE_BYTES)
+                .saturating_sub(REPORT_RESERVATION_METADATA_ALLOWANCE)
                 .min(MAX_AUTOMATIC_REPORT_VIEW_BYTES)
         })
 }
@@ -4238,7 +4331,8 @@ mod tests {
         MAX_HANDOFF_BYTES, parse_otlp_http_json, project_notify_with_private_detail,
     };
     use agent_observability_local_runtime::{
-        ConfigMutationGuard, MutationGuard, StorageBudget, install, load, save,
+        Admission, ConfigMutationGuard, MutationGuard, RuntimeControl, StorageBudget, install,
+        load, save,
     };
     use axum::{
         extract::State,
@@ -4483,7 +4577,7 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_report_refresh_is_independent_of_config_mutation() {
+    fn report_refresh_retries_after_config_mutation_without_waiting() {
         let root = test_root("open-rebuild-mutation");
         let _ = fs::remove_dir_all(&root);
         let state = collector_state(&root);
@@ -4491,9 +4585,9 @@ mod tests {
         drop(state);
         let guard = ConfigMutationGuard::acquire(&layout).unwrap();
 
-        assert!(refresh_report_from_root(&root).unwrap());
-
+        assert!(!refresh_dashboard_snapshot(&root).unwrap());
         drop(guard);
+        assert!(refresh_report_from_root(&root).unwrap());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7857,7 +7951,7 @@ mod tests {
     }
 
     #[test]
-    fn report_refresh_does_not_require_the_runtime_mutation_guard() {
+    fn report_refresh_does_not_wait_for_busy_runtime_mutation_guard() {
         let root = test_root("report-render-mutation-lock-boundary");
         let _ = fs::remove_dir_all(&root);
         let mut collector = collector_state(&root);
@@ -7875,13 +7969,127 @@ mod tests {
         assert!(!refresh.join().unwrap().unwrap());
         assert!(!projection.exists());
         drop(render_guard);
-        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        assert!(!refresh_dashboard_snapshot(&root).unwrap());
         drop(mutation);
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
         assert!(!projection.exists());
         assert_eq!(collector.store.record_count().unwrap(), 1);
         assert!(!collector.store.report_status().unwrap().pending());
         assert_published_report_view(&root, 1);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_refresh_does_not_hold_runtime_mutation_guard_during_projection() {
+        let root = test_root("report-reservation-short-mutation-lock");
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        let mut observed = false;
+        assert!(
+            super::refresh_report_from_root_observing(&root, |_| {
+                let guard = MutationGuard::try_acquire(&collector.layout.runtime)
+                    .expect("projection must not hold the ingest mutation lock");
+                let config = load(&collector.layout.config).unwrap();
+                let control = RuntimeControl::new(&config).unwrap();
+                let allocated = StorageBudget::allocated_tree_bytes(&root).unwrap();
+                let unreserved = control.storage_budget().writable_limit() - allocated;
+                assert_eq!(control.admit(&root, unreserved).unwrap(), Admission::Denied);
+                assert!(matches!(
+                    control.admit(&root, 1).unwrap(),
+                    Admission::Allowed { .. }
+                ));
+                observed = true;
+                drop(guard);
+            })
+            .unwrap()
+        );
+        assert!(observed);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_finalization_contention_preserves_reservation_until_guarded_recovery() {
+        let root = test_root("report-reservation-finalization-contention");
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        let mut blocker = None;
+        let result = super::refresh_report_from_root_observing(&root, |_| {
+            blocker = Some(MutationGuard::try_acquire(&collector.layout.runtime).unwrap());
+        });
+        assert_eq!(result.unwrap_err(), super::ReportFailure::RenderGuard);
+        let reservation_path = collector.layout.runtime.join("report-reservation.lock");
+        assert!(fs::metadata(&reservation_path).unwrap().len() > 0);
+        assert!(collector.store.report_status().unwrap().pending());
+        assert!(current_report_view(&collector.store).unwrap().is_none());
+        drop(blocker);
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        assert_eq!(fs::metadata(&reservation_path).unwrap().len(), 0);
+        assert_published_report_view(&root, 1);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_acknowledgement_mismatch_keeps_reservation_for_recovery() {
+        let root = test_root("report-reservation-ack-mismatch");
+        let collector = collector_state(&root);
+        let config = load(&collector.layout.config).unwrap();
+        let control = RuntimeControl::new(&config).unwrap();
+        let mutation = MutationGuard::acquire(&collector.layout.runtime).unwrap();
+        let reservation = control
+            .reserve_report_build(&root, &mutation, 1024 * 1024)
+            .unwrap();
+        let wrong_generation = collector.store.report_status().unwrap().generation + 1;
+        assert_eq!(
+            super::acknowledge_report_reservation(
+                &collector.layout,
+                &collector.store,
+                wrong_generation,
+                &mutation,
+                reservation,
+            )
+            .unwrap_err(),
+            super::ReportFailure::SnapshotChanged
+        );
+        assert!(
+            fs::metadata(collector.layout.runtime.join("report-reservation.lock"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        drop(mutation);
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        assert_eq!(
+            fs::metadata(collector.layout.runtime.join("report-reservation.lock"))
+                .unwrap()
+                .len(),
+            0
+        );
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_publication_rechecks_budget_changed_during_projection() {
+        let root = test_root("report-reservation-budget-change");
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        let current = current_report_view(&collector.store).unwrap();
+        collector.store.invalidate_report().unwrap();
+        let result = super::refresh_report_from_root_observing(&root, |_| {
+            let guard = ConfigMutationGuard::acquire(&collector.layout).unwrap();
+            let mut config = load(&collector.layout.config).unwrap();
+            config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+            save(&guard, &config).unwrap();
+            inflate_allocated_accounting(&root);
+        });
+        assert_eq!(result.unwrap_err(), super::ReportFailure::Capacity);
+        assert_eq!(current_report_view(&collector.store).unwrap(), current);
+        assert!(collector.store.report_status().unwrap().pending());
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
