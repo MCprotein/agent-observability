@@ -73,26 +73,42 @@ mod rotation_diagnostic {
         journal: u64,
     }
 
-    fn sample(root: &Path) -> Sample {
+    fn sample(root: &Path) -> Result<Sample, ()> {
         let mut result = Sample {
-            allocated: StorageBudget::allocated_tree_bytes(root).unwrap_or(0),
+            allocated: StorageBudget::allocated_tree_bytes(root).map_err(|_| ())?,
             ..Sample::default()
         };
-        if let Ok(entries) = fs::read_dir(root.join("state/store/report-views.v1")) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                let bytes = entry.metadata().map_or(0, |metadata| metadata.len());
-                if name.ends_with("-journal") {
-                    result.journal += bytes;
-                } else if name.ends_with(".sqlite3")
-                    || name.starts_with(".report-view.sqlite3.staging.")
-                {
-                    result.database += bytes;
-                }
+        let entries = match fs::read_dir(root.join("state/store/report-views.v1")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+            Err(_) => return Err(()),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|_| ())?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let bytes = match entry.metadata() {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(()),
+            };
+            if name.ends_with("-journal") {
+                result.journal += bytes;
+            } else if name.ends_with(".sqlite3")
+                || name.starts_with(".report-view.sqlite3.staging.")
+            {
+                result.database += bytes;
             }
         }
-        result
+        Ok(result)
+    }
+
+    struct StopSampler<'a>(&'a AtomicBool);
+
+    impl Drop for StopSampler<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
     }
 
     fn measured_refresh(root: &Path) -> Sample {
@@ -101,22 +117,65 @@ mod rotation_diagnostic {
             let monitor = scope.spawn(|| {
                 let mut peak = Sample::default();
                 loop {
-                    let observed = sample(root);
+                    let observed = sample(root)?;
                     peak.allocated = peak.allocated.max(observed.allocated);
                     peak.database = peak.database.max(observed.database);
                     peak.journal = peak.journal.max(observed.journal);
                     if done.load(Ordering::Acquire) {
-                        return peak;
+                        return Ok::<_, ()>(peak);
                     }
-                    std::thread::sleep(Duration::from_millis(1));
+                    std::thread::sleep(Duration::from_millis(10));
                 }
             });
+            let stop = StopSampler(&done);
             let result = refresh_dashboard_snapshot(root);
-            done.store(true, Ordering::Release);
-            let peak = monitor.join().expect("sampler completed");
+            drop(stop);
+            let peak = monitor
+                .join()
+                .expect("sampler completed")
+                .expect("allocated accounting succeeded");
             assert!(result.unwrap_or_else(|_| panic!("bounded snapshot publication failed")));
             peak
         })
+    }
+
+    fn complete_summary(
+        store: &LocalStore,
+        snapshot: &str,
+    ) -> agent_observability_contracts::dashboard::DashboardKpisV1 {
+        use agent_observability_contracts::dashboard::{
+            DASHBOARD_QUERY_VERSION, DashboardQueryRequestV1, DashboardQueryResponseV1,
+            DashboardSummaryKindV1, DashboardSummaryRequestV1, DashboardWorkV1,
+        };
+        let mut service = agent_observability_local_store::DashboardQueryService::new([7; 32]);
+        let deadline = Instant::now() + Duration::from_mins(5);
+        let mut cursor = None;
+        loop {
+            assert!(Instant::now() < deadline, "summary diagnostic deadline");
+            let response = service.query(
+                store,
+                DashboardQueryRequestV1::Summary(DashboardSummaryRequestV1 {
+                    schema_version: DASHBOARD_QUERY_VERSION.into(),
+                    kind: DashboardSummaryKindV1::Summary,
+                    filters: None,
+                    snapshot_id: snapshot.into(),
+                    cursor,
+                }),
+            );
+            let DashboardQueryResponseV1::Summary(response) = response else {
+                panic!("summary failed with bounded status");
+            };
+            if let DashboardWorkV1::Complete(work) = response.work {
+                assert!(response.pagination.next_cursor.is_none());
+                return work.kpis;
+            }
+            cursor = Some(
+                response
+                    .pagination
+                    .next_cursor
+                    .expect("pending summary has continuation"),
+            );
+        }
     }
 
     fn three_generations(root: &Path) {
@@ -126,6 +185,7 @@ mod rotation_diagnostic {
         let budget = StorageBudget::calculate(1024 * 1024 * 1024, false).unwrap();
         let mut previous_generation = None;
         let mut first_files = Vec::new();
+        let mut first_summary = None;
         for rotation in 0..3 {
             if rotation > 0 {
                 store
@@ -148,6 +208,15 @@ mod rotation_diagnostic {
                 previous_generation.is_none_or(|generation| snapshot.generation() > generation)
             );
             previous_generation = Some(snapshot.generation());
+            let summary = complete_summary(&store, snapshot.view_id());
+            if let Some(expected) = &first_summary {
+                assert!(
+                    expected == &summary,
+                    "complete summary remains identical across rotations"
+                );
+            } else {
+                first_summary = Some(summary);
+            }
             assert_eq!(u64::try_from(snapshot.records()).unwrap(), before.0);
             assert_eq!(
                 store
@@ -298,43 +367,46 @@ mod rotation_diagnostic {
         );
     }
 
-    /// Opt-in only: source is read through SQLite's read-only backup API, never opened by LocalStore.
-    /// Run with AO_ROTATION_BACKUP_SOURCE=/path/to/coherent.sqlite3 and --ignored --nocapture.
-    #[test]
-    #[ignore = "explicit private-backup diagnostic; leader-run only"]
-    fn private_backup_three_generation_rotation() {
-        let source =
-            std::env::var_os("AO_ROTATION_BACKUP_SOURCE").expect("explicit backup source required");
-        let source = fs::canonicalize(source).expect("backup source exists");
-        assert!(source.is_file());
-        let runtime = PrivateRuntime::new();
+    struct BackupProcess(std::process::Child);
+
+    impl Drop for BackupProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn backup_into(source: &Path, runtime: &PrivateRuntime) {
         let layout = install(&runtime.0).unwrap();
         let store_dir = layout.state.join("store");
         drop(LocalStore::open(&store_dir).unwrap());
         let target = store_dir.join("local-store.sqlite3");
-        // stdin command contains only the freshly owned destination; source is a separate argv.
+        // Backup command contains only the freshly owned destination; source is a separate argv.
         let destination = target
             .to_str()
             .expect("temporary destination is UTF-8")
             .replace('\'', "''");
-        let mut child = Command::new("sqlite3")
-            .arg("-readonly")
-            .arg(&source)
-            .arg(format!(".backup '{destination}'"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("SQLite backup tool available");
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut child = BackupProcess(
+            Command::new("sqlite3")
+                .arg("-readonly")
+                .args(["-cmd", ".timeout 5000"])
+                .arg(source)
+                .arg(format!(".backup '{destination}'"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("SQLite backup tool available"),
+        );
+        let deadline = Instant::now() + Duration::from_mins(2);
         loop {
-            if let Some(status) = child.try_wait().expect("backup status available") {
+            if let Some(status) = child.0.try_wait().expect("backup status available") {
                 assert!(status.success(), "read-only coherent backup succeeded");
                 break;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.0.kill();
+                let _ = child.0.wait();
                 panic!("backup deadline exceeded");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -348,6 +420,47 @@ mod rotation_diagnostic {
                 0o700
             );
         }
+        // Legacy migration is admitted against the copied runtime only; never open the source.
+        let config = load(&layout.config).unwrap();
+        let headroom = crate::RuntimeControl::new(&config)
+            .unwrap()
+            .migration_headroom(&runtime.0)
+            .unwrap();
+        drop(
+            LocalStore::open_with_migration_headroom_deferred_projection(&store_dir, headroom)
+                .unwrap_or_else(|_| panic!("temporary copy migration failed")),
+        );
+    }
+
+    #[test]
+    fn synthetic_read_only_backup_rotates_without_changing_source() {
+        let source_runtime = PrivateRuntime::new();
+        let mut state = collector_state(&source_runtime.0);
+        ingest_notify_locked(
+            &mut state,
+            &projected_notify("backup-thread", "backup-turn"),
+        )
+        .unwrap();
+        drop(state);
+        let source = source_runtime.0.join("state/store/local-store.sqlite3");
+        let before = fs::read(&source).unwrap();
+        let runtime = PrivateRuntime::new();
+        backup_into(&source, &runtime);
+        three_generations(&runtime.0);
+        assert_eq!(fs::read(source).unwrap(), before);
+    }
+
+    /// Opt-in only: source uses the read-only `SQLite` backup API, never `LocalStore`.
+    /// Run with `AO_ROTATION_BACKUP_SOURCE=/path/to/coherent.sqlite3` and `--ignored --nocapture`.
+    #[test]
+    #[ignore = "explicit private-backup diagnostic; leader-run only"]
+    fn private_backup_three_generation_rotation() {
+        let source =
+            std::env::var_os("AO_ROTATION_BACKUP_SOURCE").expect("explicit backup source required");
+        let source = fs::canonicalize(source).expect("backup source exists");
+        assert!(source.is_file());
+        let runtime = PrivateRuntime::new();
+        backup_into(&source, &runtime);
         three_generations(&runtime.0);
     }
 }

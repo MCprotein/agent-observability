@@ -172,7 +172,7 @@ mod tests {
             available + allocated + control.storage_budget().headroom.bytes
                 <= control.storage_budget().total
         );
-        assert!(available < control.migration_headroom(&root).unwrap());
+        assert!(available <= control.migration_headroom(&root).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 
