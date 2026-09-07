@@ -1297,13 +1297,6 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
                 .ok()
                 .as_deref(),
         );
-    if validation.is_ok() && preserve_smoke_evidence {
-        let passed =
-            render_automatic_manifest(config, &host, &source_revision, &results, &errors, "pass");
-        validate_automatic_manifest_shape(&passed)?;
-        fs::write(&manifest_path, passed)
-            .map_err(|error| format!("finalize preserved smoke manifest: {error}"))?;
-    }
     let runtime_result = runtime_cleanup.cleanup();
     let smoke_result = smoke_cleanup.as_mut().map_or(Ok(()), |cleanup| {
         if validation.is_err() {
@@ -1316,20 +1309,25 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
             cleanup.cleanup()
         }
     });
-    if let Err(cleanup_error) = combine_cleanup(runtime_result, smoke_result) {
+    let cleanup_result = combine_cleanup(runtime_result, smoke_result);
+    if let Err(cleanup_error) = &cleanup_result {
         errors.push(format!("cleanup: {cleanup_error}"));
-        if config.profile == Profile::Release {
-            let failed = render_automatic_manifest(
-                config,
-                &host,
-                &source_revision,
-                &results,
-                &errors,
-                "failed",
-            );
-            fs::write(&manifest_path, failed)
-                .map_err(|error| format!("finalize automatic cleanup failure: {error}"))?;
-        }
+    }
+    if config.profile == Profile::Release || preserve_smoke_evidence || validation.is_err() {
+        let completed = render_automatic_outcome(
+            config,
+            &host,
+            &source_revision,
+            &results,
+            &errors,
+            validation.is_ok(),
+            cleanup_result.is_ok(),
+        );
+        validate_automatic_manifest_shape(&completed)?;
+        fs::write(&manifest_path, completed)
+            .map_err(|error| format!("finalize automatic manifest: {error}"))?;
+    }
+    if let Err(cleanup_error) = cleanup_result {
         println!(
             "{}",
             automatic_manifest_metadata(&manifest_path, config.profile, "failed")?
@@ -1348,13 +1346,6 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
             manifest_path.display()
         ));
     }
-    if config.profile == Profile::Release {
-        let passed =
-            render_automatic_manifest(config, &host, &source_revision, &results, &errors, "pass");
-        validate_automatic_manifest_shape(&passed)?;
-        fs::write(&manifest_path, passed)
-            .map_err(|error| format!("finalize automatic manifest: {error}"))?;
-    }
     println!(
         "{}",
         automatic_manifest_metadata(&manifest_path, config.profile, "pass")?
@@ -1364,6 +1355,23 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
 
 fn preserve_automatic_smoke_evidence(value: Option<&str>) -> bool {
     value == Some("1")
+}
+
+fn render_automatic_outcome(
+    config: AutomaticConfig,
+    host: &HostEvidence,
+    source_revision: &str,
+    results: &[AutomaticRunResult],
+    errors: &[String],
+    validation_succeeded: bool,
+    cleanup_succeeded: bool,
+) -> String {
+    let status = if validation_succeeded && cleanup_succeeded {
+        "pass"
+    } else {
+        "failed"
+    };
+    render_automatic_manifest(config, host, source_revision, results, errors, status)
 }
 
 fn collect_automatic_run_results(
@@ -5423,9 +5431,9 @@ fn render_automatic_manifest(
         .iter()
         .map(|result| result.rss_observed_max_gap_ms)
         .max();
-    let release_readiness = match status {
-        "pass" => "verified",
-        "pending-validation" => "pending",
+    let release_readiness = match (config.profile, status) {
+        (Profile::Release, "pass") => "verified",
+        (Profile::Release, "pending-validation") => "pending",
         _ => "not_verified",
     };
     let real_codex_e2e_status = if errors
@@ -5588,10 +5596,10 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<AutomaticEvidence
     {
         return Err("automatic performance manifest shape is invalid".into());
     }
-    let expected_readiness = match evidence.status.as_str() {
-        "pass" => "verified",
-        "pending-validation" => "pending",
-        "failed" => "not_verified",
+    let expected_readiness = match (evidence.profile.as_str(), evidence.status.as_str()) {
+        ("release", "pass") => "verified",
+        ("release", "pending-validation") => "pending",
+        (_, "pass" | "pending-validation" | "failed") => "not_verified",
         _ => return Err("automatic performance manifest status is invalid".into()),
     };
     if evidence.release_readiness != expected_readiness {
@@ -7013,6 +7021,46 @@ mod tests {
                 .unwrap_err()
                 .contains("non-finite or negative")
         );
+    }
+
+    #[test]
+    fn preserved_smoke_evidence_never_claims_release_readiness() {
+        let mut config = automatic_config();
+        config.profile = Profile::Smoke;
+        config.runs = 1;
+        let results = vec![automatic_result(1, vec![1; 100])];
+        for status in ["pass", "pending-validation", "failed"] {
+            let manifest = render_automatic_manifest(
+                config,
+                &host(),
+                "0123456789abcdef0123456789abcdef01234567",
+                &results,
+                &[],
+                status,
+            );
+            assert!(manifest.contains("release_readiness: not_verified"));
+            validate_automatic_manifest_shape(&manifest).unwrap();
+            assert!(
+                validate_automatic_manifest_shape(&manifest.replace(
+                    "release_readiness: not_verified",
+                    "release_readiness: verified"
+                ))
+                .is_err()
+            );
+        }
+        let failed = render_automatic_outcome(
+            config,
+            &host(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &results,
+            &["cleanup: injected failure".into()],
+            true,
+            false,
+        );
+        assert!(failed.contains("status: failed\n"));
+        assert!(failed.contains("release_readiness: not_verified"));
+        assert!(failed.contains("code=cleanup_failed"));
+        validate_automatic_manifest_shape(&failed).unwrap();
     }
 
     #[test]
