@@ -581,10 +581,43 @@ async function exerciseBrowser(
   const failedRequests: Array<{ kind: string; error: string | undefined; token: string | undefined; stage: string; responseStarted: boolean }> = [];
   const responseTokens = new Set<string>();
   let browserStage = "bootstrap";
+  type NetworkEvidence = { startStage: string; events: string[]; canceled?: boolean; encodedBytes?: number };
+  const networkRequests = new Map<string, NetworkEvidence>();
+  const networkEvidence = new Map<string, NetworkEvidence[]>();
+  const network = await context.newCDPSession(page);
+  await network.send("Network.enable");
+  network.on("Network.requestWillBeSent", (event) => {
+    const token = event.request.headers["x-agentobs-smoke-token"] as string | undefined;
+    if (token === undefined) return;
+    const existing = networkRequests.get(event.requestId);
+    if (existing) {
+      existing.events.push("request_restarted");
+      return;
+    }
+    const evidence = { startStage: browserStage, events: ["request"] };
+    networkRequests.set(event.requestId, evidence);
+    const entries = networkEvidence.get(token) ?? [];
+    entries.push(evidence);
+    networkEvidence.set(token, entries);
+  });
+  network.on("Network.loadingFinished", (event) => {
+    const evidence = networkRequests.get(event.requestId);
+    if (evidence) {
+      evidence.events.push("finished");
+      evidence.encodedBytes = event.encodedDataLength;
+    }
+  });
+  network.on("Network.loadingFailed", (event) => {
+    const evidence = networkRequests.get(event.requestId);
+    if (evidence) {
+      evidence.events.push(event.errorText === "net::ERR_ABORTED" ? "aborted" : "failed");
+      if (event.canceled !== undefined) evidence.canceled = event.canceled;
+    }
+  });
   // Observe causality in the page, where filter handlers synchronously abort their signal.
   // A smoke-only header binds that signal to the exact browser network request.
   await page.addInitScript(() => {
-    const state = { expected: [] as string[], aborted: [] as string[], mutations: 0, rejected: [] as Array<{ token: string; name: string }> };
+    const state = { expected: [] as string[], aborted: [] as string[], mutations: 0, rejected: [] as Array<{ token: string; name: string }>, bodies: [] as Array<{ token: string; status: number; declared: string | null; bytes: number; terminal: string }> };
     Object.assign(window, { __agentobsSmokeCancellation: state });
     let active = false;
     let sequence = 0;
@@ -611,7 +644,36 @@ async function exerciseBrowser(
         state.aborted.push(token);
         if (active) state.expected.push(token);
       }, { once: true });
-      return originalFetch(new window.Request(request, { headers })).catch((error: unknown) => {
+      return originalFetch(new window.Request(request, { headers })).then((response) => {
+        const evidence = { token, status: response.status, declared: response.headers.get("content-length"), bytes: 0, terminal: "unread" };
+        state.bodies.push(evidence);
+        if (response.body) {
+          const body = response.body;
+          const getReader = body.getReader.bind(body);
+          Object.defineProperty(body, "getReader", { value() {
+            const reader = getReader();
+            const read = reader.read.bind(reader);
+            const cancel = reader.cancel.bind(reader);
+            reader.read = async () => {
+              try {
+                const result = await read();
+                evidence.bytes += result.value?.byteLength ?? 0;
+                evidence.terminal = result.done ? "complete" : "reading";
+                return result;
+              } catch (error) {
+                evidence.terminal = "error";
+                throw error;
+              }
+            };
+            reader.cancel = async (reason) => {
+              evidence.terminal = "cancel";
+              return cancel(reason);
+            };
+            return reader;
+          } });
+        }
+        return response;
+      }).catch((error: unknown) => {
         const name = error instanceof DOMException && error.name === "AbortError" ? "AbortError"
           : error instanceof TypeError ? "TypeError" : "other";
         state.rejected.push({ token, name });
@@ -763,7 +825,7 @@ async function exerciseBrowser(
   assert.deepEqual(pageErrors, []);
   assert.deepEqual(externalRequests, []);
   const cancellation = await page.evaluate(() => (window as unknown as {
-    __agentobsSmokeCancellation: { expected: string[]; aborted: string[]; mutations: number; rejected: Array<{ token: string; name: string }> };
+    __agentobsSmokeCancellation: { expected: string[]; aborted: string[]; mutations: number; rejected: Array<{ token: string; name: string }>; bodies: Array<{ token: string; status: number; declared: string | null; bytes: number; terminal: string }> };
   }).__agentobsSmokeCancellation);
   assert.equal(cancellation.mutations, 3);
   assert.ok(cancellation.expected.length > 0, "explicit filter change must abort an observed signal");
@@ -781,6 +843,8 @@ async function exerciseBrowser(
     responseStarted: failure.responseStarted,
     tokenMultiplicity: failedRequests.filter((candidate) => candidate.token === failure.token).length,
     fetchRejection: cancellation.rejected.find((entry) => entry.token === failure.token)?.name ?? "none",
+    body: cancellation.bodies.find((entry) => entry.token === failure.token),
+    network: networkEvidence.get(failure.token ?? ""),
   }));
   assert.deepEqual(unexpectedFailures, []);
   return {
