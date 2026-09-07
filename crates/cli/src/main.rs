@@ -684,7 +684,26 @@ fn prepare_setup_runtime(root: &Path, _open: bool) -> Result<PathBuf, String> {
 }
 
 fn prepare_dashboard_store(layout: &InstalledLayout) -> Result<(), String> {
-    let _mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if try_prepare_dashboard_store(layout)? {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("dashboard snapshot preparation is busy; retry setup shortly".into());
+        }
+        // Publication acquires mutation after render. Never wait for render while
+        // retaining mutation: retry the entire attempt after releasing both resources.
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn try_prepare_dashboard_store(layout: &InstalledLayout) -> Result<bool, String> {
+    let _mutation = match MutationGuard::try_acquire(&layout.runtime) {
+        Ok(guard) => guard,
+        Err(agent_observability_local_runtime::SingletonError::AlreadyRunning) => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
     let config = load(&layout.config).map_err(|error| error.to_string())?;
     let headroom = RuntimeControl::new(&config)
         .map_err(|error| error.to_string())?
@@ -695,9 +714,11 @@ fn prepare_dashboard_store(layout: &InstalledLayout) -> Result<(), String> {
         headroom,
     )
     .map_err(|error| error.to_string())?;
-    agent_observability_local_store::recover_report_view_catalog(&store)
-        .map_err(|_| "dashboard snapshot recovery failed".to_owned())?;
-    Ok(())
+    match agent_observability_local_store::recover_report_view_catalog(&store) {
+        Ok(()) => Ok(true),
+        Err(agent_observability_local_store::ReportViewCatalogError::Busy) => Ok(false),
+        Err(_) => Err("dashboard snapshot recovery failed".into()),
+    }
 }
 
 fn connect_codex(root: &Path) -> Result<String, String> {
@@ -1223,10 +1244,10 @@ fn runtime_check(root: &Path) -> Result<String, String> {
     let allocated =
         StorageBudget::allocated_tree_bytes(&layout.root).map_err(|error| error.to_string())?;
     let mut control = RuntimeControl::new(&config).map_err(|error| error.to_string())?;
-    let admission = match control
-        .admit(&layout.root, u64::from(config.collection.max_batch_bytes))
-        .map_err(|error| error.to_string())?
-    {
+    let diagnostic = control
+        .collector_admission_diagnostic(&layout.root, u64::from(config.collection.max_batch_bytes))
+        .map_err(|error| error.to_string())?;
+    let admission = match diagnostic.admission {
         Admission::Allowed { .. } => "allowed",
         Admission::Denied => "denied",
     };
@@ -1239,7 +1260,11 @@ fn runtime_check(root: &Path) -> Result<String, String> {
         },
     );
     Ok(format!(
-        "config_schema={LOCAL_RUNTIME_CONFIG_VERSION}\nstore_schema={LOCAL_STORE_SCHEMA_VERSION}\nallocated_bytes={allocated}\nstorage_admission={admission}\nruntime_state={:?}\nsingleton=held\nteam_ingest=disabled",
+        "config_schema={LOCAL_RUNTIME_CONFIG_VERSION}\nstore_schema={LOCAL_STORE_SCHEMA_VERSION}\nallocated_bytes={allocated}\nstorage_admission={admission}\ningest_reservation_bytes={}\nreport_reserved_bytes={}\nwritable_headroom_bytes={}\nstorage_deficit_bytes={}\nruntime_state={:?}\nsingleton=held\nteam_ingest=disabled",
+        diagnostic.collector_reservation_bytes,
+        diagnostic.current_report_reserved_bytes,
+        diagnostic.writable_headroom_bytes,
+        diagnostic.deficit_bytes,
         schedule.state
     ))
 }
@@ -1278,14 +1303,12 @@ fn ingest_items<'a>(
         return Ok(IngestResult::blocked(source, IngestBlock::Pressure));
     }
     if control
-        .admit(
+        .collector_admission_diagnostic(
             &paths.accounting_root,
-            ingest_reservation_bytes(
-                &paths.store_directory,
-                u64::from(config.collection.max_batch_bytes),
-            )?,
+            u64::from(config.collection.max_batch_bytes),
         )
         .map_err(|error| error.to_string())?
+        .admission
         == Admission::Denied
     {
         return Ok(IngestResult::blocked(source, IngestBlock::Storage));
@@ -1343,17 +1366,6 @@ fn ingest_items<'a>(
         suppressed,
         blocked: None,
     })
-}
-
-fn ingest_reservation_bytes(store_directory: &Path, batch_bytes: u64) -> Result<u64, String> {
-    if !store_directory.exists() {
-        return Ok(batch_bytes);
-    }
-    let existing =
-        StorageBudget::allocated_tree_bytes(store_directory).map_err(|error| error.to_string())?;
-    batch_bytes
-        .checked_add(existing)
-        .ok_or_else(|| "ingest storage reservation overflow".to_string())
 }
 
 struct IngestPaths {
@@ -1525,6 +1537,92 @@ mod tests {
             0o600
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn setup_retries_publication_contention_without_holding_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-setup-publication-contention-{}",
+            std::process::id()
+        ));
+        let layout = install(&root).unwrap();
+        let store = super::LocalStore::open(layout.state.join("store")).unwrap();
+        let render = store.acquire_report_render_guard().unwrap();
+        let runtime = layout.runtime.clone();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            // A publisher needs mutation before releasing its render guard. Setup must
+            // release mutation between attempts instead of waiting with the inverse order.
+            let mutation = MutationGuard::acquire(&runtime).unwrap();
+            drop(render);
+            drop(mutation);
+        });
+        let result = super::prepare_dashboard_store(&layout);
+        release.join().unwrap();
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn setup_persistent_publication_contention_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-setup-persistent-contention-{}",
+            std::process::id()
+        ));
+        let layout = install(&root).unwrap();
+        let store = super::LocalStore::open(layout.state.join("store")).unwrap();
+        let render = store.acquire_report_render_guard().unwrap();
+        let error = super::prepare_dashboard_store(&layout).unwrap_err();
+        assert_eq!(
+            error,
+            "dashboard snapshot preparation is busy; retry setup shortly"
+        );
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        drop(mutation);
+        drop(render);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setup_mutation_contention_is_retryable_without_store_creation() {
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-setup-mutation-contention-{}",
+            std::process::id()
+        ));
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+        assert!(!super::try_prepare_dashboard_store(&layout).unwrap());
+        assert!(!layout.state.join("store").exists());
+        drop(mutation);
+        assert!(super::try_prepare_dashboard_store(&layout).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_does_not_retry_or_repair_invalid_catalog() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-setup-invalid-catalog-{}",
+            std::process::id()
+        ));
+        let layout = install(&root).unwrap();
+        let store = super::LocalStore::open(layout.state.join("store")).unwrap();
+        let directory = layout.state.join("store/report-views.v1");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let catalog = directory.join("catalog.json");
+        fs::write(&catalog, b"invalid catalog").unwrap();
+        fs::set_permissions(&catalog, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            super::try_prepare_dashboard_store(&layout).unwrap_err(),
+            "dashboard snapshot recovery failed"
+        );
+        assert_eq!(fs::read(catalog).unwrap(), b"invalid catalog");
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1883,6 +1981,60 @@ mod tests {
                 .unwrap()
                 .contains("storage_admission=allowed")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_check_reports_the_collectors_full_write_admission() {
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-runtime-ingest-admission-{}",
+            std::process::id()
+        ));
+        super::runtime_check(&root).unwrap();
+        let layout = install(&root).unwrap();
+        let config = super::load(&layout.config).unwrap();
+        let control = super::RuntimeControl::new(&config).unwrap();
+        let batch = u64::from(config.collection.max_batch_bytes);
+        let store_bytes =
+            super::StorageBudget::allocated_tree_bytes(&layout.state.join("store")).unwrap();
+        let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+        let ceiling = control.writable_headroom(&root).unwrap() - batch - store_bytes / 2;
+        let reservation = control
+            .reserve_report_build(&root, &mutation, ceiling)
+            .unwrap();
+        drop(mutation);
+        // The former status check reported allowed here, despite the actual writer's refusal.
+        assert!(matches!(
+            control.admit(&root, batch).unwrap(),
+            super::Admission::Allowed { .. }
+        ));
+        let output = super::runtime_check(&root).unwrap();
+        let diagnostic = control
+            .collector_admission_diagnostic(&root, batch)
+            .unwrap();
+        assert_eq!(diagnostic.admission, super::Admission::Denied);
+        assert!(diagnostic.deficit_bytes > 0);
+        assert!(output.contains("storage_admission=denied\n"));
+        let number = |key: &str| -> u64 {
+            output
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once('=')?;
+                    (name == key).then(|| value.parse().unwrap())
+                })
+                .unwrap()
+        };
+        // Each assessment is coherent under mutation; lock metadata may change
+        // allocation after runtime-check returns, so compare its own numeric snapshot.
+        assert_eq!(
+            number("storage_deficit_bytes"),
+            number("ingest_reservation_bytes").saturating_sub(number("writable_headroom_bytes"))
+        );
+        assert!(number("storage_deficit_bytes") > 0);
+        assert!(!output.contains(&root.to_string_lossy().into_owned()));
+        let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+        reservation.release(&root, &mutation).unwrap();
+        drop(mutation);
         fs::remove_dir_all(root).unwrap();
     }
 

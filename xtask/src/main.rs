@@ -2125,11 +2125,11 @@ fn verify_automatic_ownership_rebase(
         AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
         &cleanup.environment(),
     )
-    .map_err(|_| "automatic lifecycle ownership rebase setup failed")?;
+    .map_err(|error| automatic_ownership_rebase_command_error(&error))?;
     require_output_line(&setup, "config", "connected")
-        .map_err(|_| "automatic lifecycle ownership rebase setup failed")?;
+        .map_err(|_| "automatic lifecycle ownership rebase config assertion failed")?;
     require_collector_ready_or_degraded(&setup)
-        .map_err(|_| "automatic lifecycle ownership rebase setup failed")?;
+        .map_err(|_| "automatic lifecycle ownership rebase collector assertion failed")?;
     verify_exact_file(
         &cleanup.config,
         &edited,
@@ -2860,6 +2860,20 @@ fn require_automatic_setup_output(result: Result<String, String>) -> Result<Stri
     require_collector_ready_or_degraded(&output)
         .map_err(|_| "automatic lifecycle setup collector assertion failed")?;
     Ok(output)
+}
+
+fn automatic_ownership_rebase_command_error(error: &str) -> String {
+    let safe_stage = error.rsplit_once(": ").map(|(_, stage)| stage);
+    match safe_stage {
+        Some("dashboard snapshot preparation is busy; retry setup shortly") => {
+            "automatic lifecycle ownership rebase command preparation busy"
+        }
+        Some("dashboard snapshot recovery failed") => {
+            "automatic lifecycle ownership rebase command snapshot recovery failed"
+        }
+        _ => "automatic lifecycle ownership rebase command failed",
+    }
+    .into()
 }
 
 fn output_value(output: &str, key: &str) -> Option<String> {
@@ -5720,6 +5734,16 @@ fn automatic_evidence_error_code(error: &str) -> &'static str {
             "code=lifecycle_codex_e2e_failed"
         } else if error.contains("initial report") {
             "code=lifecycle_report_failed"
+        } else if error.contains("ownership rebase command preparation busy") {
+            "code=lifecycle_ownership_rebase_command_preparation_busy"
+        } else if error.contains("ownership rebase command snapshot recovery") {
+            "code=lifecycle_ownership_rebase_command_snapshot_recovery_failed"
+        } else if error.contains("ownership rebase command") {
+            "code=lifecycle_ownership_rebase_command_failed"
+        } else if error.contains("ownership rebase config assertion") {
+            "code=lifecycle_ownership_rebase_config_failed"
+        } else if error.contains("ownership rebase collector assertion") {
+            "code=lifecycle_ownership_rebase_collector_failed"
         } else if error.contains("setup command") {
             "code=lifecycle_setup_command_failed"
         } else if error.contains("setup status assertion") {
@@ -6082,6 +6106,11 @@ fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
         "  - 'code=lifecycle_codex_config_failed'",
         "  - 'code=lifecycle_codex_e2e_failed'",
         "  - 'code=lifecycle_report_failed'",
+        "  - 'code=lifecycle_ownership_rebase_command_preparation_busy'",
+        "  - 'code=lifecycle_ownership_rebase_command_snapshot_recovery_failed'",
+        "  - 'code=lifecycle_ownership_rebase_command_failed'",
+        "  - 'code=lifecycle_ownership_rebase_config_failed'",
+        "  - 'code=lifecycle_ownership_rebase_collector_failed'",
         "  - 'code=lifecycle_setup_failed'",
         "  - 'code=lifecycle_setup_command_failed'",
         "  - 'code=lifecycle_setup_status_failed'",
@@ -7887,9 +7916,40 @@ mod tests {
                 "lifecycle preflight: automatic lifecycle setup collector assertion failed",
                 "code=lifecycle_setup_collector_failed",
             ),
+            (
+                "lifecycle preflight: automatic lifecycle ownership rebase command failed",
+                "code=lifecycle_ownership_rebase_command_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle ownership rebase command preparation busy",
+                "code=lifecycle_ownership_rebase_command_preparation_busy",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle ownership rebase command snapshot recovery failed",
+                "code=lifecycle_ownership_rebase_command_snapshot_recovery_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle ownership rebase config assertion failed",
+                "code=lifecycle_ownership_rebase_config_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle ownership rebase collector assertion failed",
+                "code=lifecycle_ownership_rebase_collector_failed",
+            ),
         ] {
             assert_eq!(automatic_evidence_error_code(error), code);
             assert!(!code.contains("private"));
+            let manifest = render_automatic_manifest(
+                automatic_config(),
+                &host(),
+                &"a".repeat(40),
+                &[],
+                &[error.into()],
+                "failed",
+            );
+            assert!(manifest.contains(&format!("  - '{code}'")));
+            validate_automatic_manifest_shape(&manifest).unwrap();
+            validate_automatic_manifest_privacy(&manifest).unwrap();
         }
     }
 
@@ -7929,6 +7989,28 @@ mod tests {
             .unwrap(),
             "status=ready\nconfig=connected\ncollector=degraded\n"
         );
+    }
+
+    #[test]
+    fn automatic_ownership_rebase_command_diagnostics_allow_only_exact_safe_stages() {
+        for (raw, expected) in [
+            (
+                "built product command failed: exit status: 1: dashboard snapshot preparation is busy; retry setup shortly",
+                "automatic lifecycle ownership rebase command preparation busy",
+            ),
+            (
+                "built product command failed: exit status: 1: dashboard snapshot recovery failed",
+                "automatic lifecycle ownership rebase command snapshot recovery failed",
+            ),
+        ] {
+            assert_eq!(automatic_ownership_rebase_command_error(raw), expected);
+        }
+
+        let private = "built product command failed: exit status: 1: dashboard snapshot recovery failed\n/private/tmp/AUTOMATIC_RAW_PROMPT_SENTINEL";
+        let error = automatic_ownership_rebase_command_error(private);
+        assert_eq!(error, "automatic lifecycle ownership rebase command failed");
+        assert!(!error.contains("/private/tmp"));
+        assert!(!error.contains("AUTOMATIC_RAW_PROMPT_SENTINEL"));
     }
 
     #[test]

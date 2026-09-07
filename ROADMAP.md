@@ -130,6 +130,12 @@ release evidence and merge remain pending; a measurement pass alone does not pro
 Candidate `4d4261c` passed Linux/macOS/UI CI `34135886327`. Chrome extension QA on an isolated
 demo exposed two display defects, now fixed and independently reviewed: snapshot header state and
 token/cost details. Synthetic Chrome recheck passed; this is not installed-runtime acceptance.
+The subsequent exact-head workflow `34137212497` failed during setup preflight, before sustained
+measurement. A reproducible setup/publication-lock contention defect is corrected in development;
+its passing isolated smoke does not identify the historical workflow failure retroactively.
+Installed collection also remains blocked by conservative write admission. Runtime diagnostics must
+use that same admission policy; reducing transaction headroom requires separate rollback/capacity
+proof, not deletion or a larger budget. Details and evidence boundaries are in the current review.
 The earlier long workflow `34135080615` was cancelled before its normative job when those defects
 required a new candidate. Settle final changes before dispatching exact-revision long evidence.
 

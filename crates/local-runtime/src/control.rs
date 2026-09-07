@@ -12,6 +12,17 @@ pub struct RuntimeControl {
     scheduler: Scheduler,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectorDiagnostic {
+    pub existing_store_allocated_bytes: u64,
+    pub max_batch_bytes: u64,
+    pub current_report_reserved_bytes: u64,
+    pub collector_reservation_bytes: u64,
+    pub writable_headroom_bytes: u64,
+    pub deficit_bytes: u64,
+    pub admission: Admission,
+}
+
 impl RuntimeControl {
     pub fn new(config: &LocalRuntimeConfigV3) -> Result<Self, ControlError> {
         config.validate().map_err(ControlError::Config)?;
@@ -34,6 +45,58 @@ impl RuntimeControl {
         }
     }
 
+    /// Reports the collector's existing conservative full-store reservation
+    /// without changing the admission policy or creating runtime state.
+    ///
+    /// Callers using this assessment to enforce admission must hold the
+    /// matching root's [`MutationGuard`] for the full assessment-to-write
+    /// boundary. Observation-only callers may accept a non-coherent snapshot.
+    pub fn collector_admission_diagnostic(
+        &self,
+        root: &Path,
+        max_batch_bytes: u64,
+    ) -> Result<CollectorDiagnostic, ControlError> {
+        let store = root.join("state/store");
+        let existing_store_allocated_bytes = match std::fs::symlink_metadata(&store) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => {
+                return Err(ControlError::Accounting(StorageAccountingError::Io(error)));
+            }
+            Ok(_) => StorageBudget::allocated_tree_bytes_strict(&store)
+                .map_err(ControlError::Accounting)?,
+        };
+        let collector_reservation_bytes = existing_store_allocated_bytes
+            .checked_add(max_batch_bytes)
+            .ok_or(ControlError::CollectorAdmissionOverflow)?;
+        let current_report_reserved_bytes =
+            crate::reservation::reserved_bytes(root).map_err(ControlError::Reservation)?;
+        let allocated =
+            StorageBudget::allocated_tree_bytes_strict(root).map_err(ControlError::Accounting)?;
+        let writable_headroom_bytes = Self::headroom_from_allocated(
+            root,
+            self.storage.writable_limit(),
+            current_report_reserved_bytes,
+            allocated,
+        )?;
+        let admission = if collector_reservation_bytes > writable_headroom_bytes {
+            Admission::Denied
+        } else {
+            Admission::Allowed {
+                reserved: collector_reservation_bytes,
+            }
+        };
+        let deficit_bytes = collector_reservation_bytes.saturating_sub(writable_headroom_bytes);
+        Ok(CollectorDiagnostic {
+            existing_store_allocated_bytes,
+            max_batch_bytes,
+            current_report_reserved_bytes,
+            collector_reservation_bytes,
+            writable_headroom_bytes,
+            deficit_bytes,
+            admission,
+        })
+    }
+
     /// Includes actual files plus the full active or stale report reservation.
     pub fn writable_headroom(&self, root: &Path) -> Result<u64, ControlError> {
         let reserved =
@@ -50,6 +113,15 @@ impl RuntimeControl {
     fn headroom(root: &Path, limit: u64, reserved: u64) -> Result<u64, ControlError> {
         let allocated =
             StorageBudget::allocated_tree_bytes(root).map_err(ControlError::Accounting)?;
+        Self::headroom_from_allocated(root, limit, reserved, allocated)
+    }
+
+    fn headroom_from_allocated(
+        root: &Path,
+        limit: u64,
+        reserved: u64,
+        allocated: u64,
+    ) -> Result<u64, ControlError> {
         let committed = allocated
             .checked_add(reserved)
             .ok_or(ControlError::Accounting(StorageAccountingError::Overflow))?;
@@ -144,6 +216,7 @@ pub enum ControlError {
     Storage(StorageError),
     Accounting(StorageAccountingError),
     Reservation(ReservationError),
+    CollectorAdmissionOverflow,
 }
 
 impl std::fmt::Display for ControlError {
@@ -153,6 +226,9 @@ impl std::fmt::Display for ControlError {
             Self::Storage(error) => error.fmt(formatter),
             Self::Accounting(error) => error.fmt(formatter),
             Self::Reservation(error) => error.fmt(formatter),
+            Self::CollectorAdmissionOverflow => {
+                formatter.write_str("collector admission reservation overflow")
+            }
         }
     }
 }
@@ -164,6 +240,7 @@ impl std::error::Error for ControlError {
             Self::Storage(error) => Some(error),
             Self::Accounting(error) => Some(error),
             Self::Reservation(error) => Some(error),
+            Self::CollectorAdmissionOverflow => None,
         }
     }
 }
@@ -214,6 +291,145 @@ mod tests {
             Admission::Denied
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collector_admission_keeps_the_full_existing_store_reservation() {
+        let root = std::env::temp_dir().join(format!(
+            "runtime-collector-full-store-admission-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("state/store")).unwrap();
+        fs::write(root.join("state/store/data"), [0x5a; 4096]).unwrap();
+        let control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
+        let existing_store =
+            StorageBudget::allocated_tree_bytes(&root.join("state/store")).unwrap();
+        let available = control.writable_headroom(&root).unwrap();
+        let max_batch_bytes = available - existing_store + 1;
+
+        assert!(matches!(
+            control.admit(&root, max_batch_bytes).unwrap(),
+            Admission::Allowed { .. }
+        ));
+        let diagnostic = control
+            .collector_admission_diagnostic(&root, max_batch_bytes)
+            .unwrap();
+        assert_eq!(diagnostic.existing_store_allocated_bytes, existing_store);
+        assert_eq!(
+            diagnostic.collector_reservation_bytes,
+            existing_store + max_batch_bytes
+        );
+        assert_eq!(diagnostic.deficit_bytes, 1);
+        assert_eq!(diagnostic.admission, Admission::Denied);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn collector_admission_accounts_for_current_report_reservation() {
+        let root = std::env::temp_dir().join(format!(
+            "runtime-collector-reserved-admission-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
+        let before = control.collector_admission_diagnostic(&root, 1).unwrap();
+        let max_batch_bytes = before.writable_headroom_bytes;
+        assert_eq!(
+            control
+                .collector_admission_diagnostic(&root, max_batch_bytes)
+                .unwrap()
+                .admission,
+            Admission::Allowed {
+                reserved: max_batch_bytes
+            }
+        );
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let reservation = control.reserve_report_build(&root, &guard, 8192).unwrap();
+
+        let diagnostic = control
+            .collector_admission_diagnostic(&root, max_batch_bytes)
+            .unwrap();
+        assert_eq!(diagnostic.existing_store_allocated_bytes, 0);
+        assert_eq!(diagnostic.current_report_reserved_bytes, 8192);
+        assert_eq!(diagnostic.collector_reservation_bytes, max_batch_bytes);
+        assert!(diagnostic.deficit_bytes >= 8192);
+        assert_eq!(diagnostic.admission, Admission::Denied);
+
+        reservation.release(&root, &guard).unwrap();
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collector_admission_rejects_unknown_reservation_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "runtime-collector-unknown-reservation-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        drop(guard);
+        let metadata = root.join("runtime/report-reservation.meta");
+        fs::write(&metadata, br#"{"version":2,"kind":"unknown"}"#).unwrap();
+        fs::set_permissions(&metadata, fs::Permissions::from_mode(0o600)).unwrap();
+        let control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
+
+        assert!(matches!(
+            control.collector_admission_diagnostic(&root, 4096),
+            Err(ControlError::Reservation(ReservationError::Corrupt))
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn collector_admission_treats_a_missing_store_as_zero() {
+        let root = std::env::temp_dir().join(format!(
+            "runtime-collector-missing-store-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
+
+        let diagnostic = control.collector_admission_diagnostic(&root, 4096).unwrap();
+        assert_eq!(diagnostic.existing_store_allocated_bytes, 0);
+        assert_eq!(diagnostic.max_batch_bytes, 4096);
+        assert_eq!(diagnostic.collector_reservation_bytes, 4096);
+        assert_eq!(diagnostic.deficit_bytes, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collector_admission_preserves_overflow_and_unsafe_accounting_failures() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "runtime-collector-admission-errors-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("state/store")).unwrap();
+        fs::write(root.join("state/store/data"), [0x5a; 4096]).unwrap();
+        let control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
+        assert!(matches!(
+            control.collector_admission_diagnostic(&root, u64::MAX),
+            Err(ControlError::CollectorAdmissionOverflow)
+        ));
+
+        fs::remove_dir_all(root.join("state/store")).unwrap();
+        symlink(root.join("unowned"), root.join("state/store")).unwrap();
+        assert!(matches!(
+            control.collector_admission_diagnostic(&root, 4096),
+            Err(ControlError::Accounting(StorageAccountingError::Symlink))
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

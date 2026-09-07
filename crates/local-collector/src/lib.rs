@@ -2264,20 +2264,16 @@ fn admit_request(
     if schedule.flush_paused {
         return Err(IngestError::Pressure);
     }
-    let store_directory = state.layout.state.join("store");
-    let existing_store = if store_directory.exists() {
-        StorageBudget::allocated_tree_bytes(&store_directory).map_err(runtime_error)?
-    } else {
-        0
-    };
-    let reservation = existing_store
-        .checked_add(u64::from(config.collection.max_batch_bytes))
-        .ok_or(IngestError::Storage)?;
-    if control
-        .admit(&state.layout.root, reservation)
-        .map_err(runtime_error)?
-        == Admission::Denied
-    {
+    let diagnostic = control
+        .collector_admission_diagnostic(
+            &state.layout.root,
+            u64::from(config.collection.max_batch_bytes),
+        )
+        .map_err(|error| match error {
+            ControlError::CollectorAdmissionOverflow => IngestError::Storage,
+            error => IngestError::Invalid(runtime_error(error)),
+        })?;
+    if diagnostic.admission == Admission::Denied {
         return Err(IngestError::Storage);
     }
     Ok(Some(config))
@@ -4843,6 +4839,55 @@ mod tests {
         assert!(matches!(retry, Err(IngestError::Storage)));
         assert_eq!(state.store.record_count().unwrap(), 0);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collector_admission_denies_full_store_reservation_when_batch_alone_fits() {
+        let root = test_root("collector-full-store-admission");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        fs::write(
+            state.layout.state.join("store/admission-fixture"),
+            vec![0_u8; 2 * 1024 * 1024],
+        )
+        .unwrap();
+        inflate_allocated_accounting(&root);
+        let guard = ConfigMutationGuard::acquire(&state.layout).unwrap();
+        let mut config = load(&state.layout.config).unwrap();
+        config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+        save(&guard, &config).unwrap();
+        drop(guard);
+        let control = RuntimeControl::new(&config).unwrap();
+        let max_batch_bytes = u64::from(config.collection.max_batch_bytes);
+        for index in (0..300).rev() {
+            if matches!(
+                control.admit(&root, max_batch_bytes).unwrap(),
+                Admission::Allowed { .. }
+            ) {
+                break;
+            }
+            let link = root.join(format!("allocated-budget-link-{index}"));
+            if link.exists() {
+                fs::remove_file(link).unwrap();
+            }
+        }
+
+        assert!(matches!(
+            control.admit(&root, max_batch_bytes).unwrap(),
+            Admission::Allowed { .. }
+        ));
+        let diagnostic = control
+            .collector_admission_diagnostic(&root, max_batch_bytes)
+            .unwrap();
+        assert!(diagnostic.existing_store_allocated_bytes > max_batch_bytes);
+        assert_eq!(diagnostic.admission, Admission::Denied);
+        assert!(diagnostic.deficit_bytes > 0);
+        assert!(matches!(
+            admit_request(&state, usize::try_from(max_batch_bytes).unwrap()),
+            Err(IngestError::Storage)
+        ));
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn projected_notify(thread: &str, turn: &str) -> Vec<u8> {
