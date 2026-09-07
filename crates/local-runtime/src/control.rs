@@ -29,6 +29,21 @@ impl RuntimeControl {
         Ok(self.storage.admit(allocated, worst_case_write))
     }
 
+    /// Available bytes for a new managed write, without borrowing reserved global headroom.
+    /// Existing authority, current/retired snapshots and temporary files are all counted.
+    pub fn writable_headroom(&self, root: &Path) -> Result<u64, ControlError> {
+        let allocated =
+            StorageBudget::allocated_tree_bytes(root).map_err(ControlError::Accounting)?;
+        let filesystem_remaining = fs2::available_space(root)
+            .map_err(StorageAccountingError::Io)
+            .map_err(ControlError::Accounting)?;
+        Ok(self
+            .storage
+            .writable_limit()
+            .saturating_sub(allocated)
+            .min(filesystem_remaining))
+    }
+
     pub fn migration_headroom(&self, root: &Path) -> Result<u64, ControlError> {
         let allocated =
             StorageBudget::allocated_tree_bytes(root).map_err(ControlError::Accounting)?;
@@ -131,6 +146,34 @@ mod tests {
             Admission::Denied
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn writable_headroom_counts_current_retired_staging_catalog_and_journal() {
+        let root =
+            std::env::temp_dir().join(format!("runtime-snapshot-headroom-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        for name in [
+            "authority",
+            "current",
+            "retired",
+            "staging",
+            "staging-journal",
+            ".catalog.tmp",
+        ] {
+            fs::write(root.join(name), [0x5a; 4096]).unwrap();
+        }
+        let control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
+        let allocated = StorageBudget::allocated_tree_bytes(&root).unwrap();
+        let available = control.writable_headroom(&root).unwrap();
+        assert!(available + allocated <= control.storage_budget().writable_limit());
+        assert!(
+            available + allocated + control.storage_budget().headroom.bytes
+                <= control.storage_budget().total
+        );
+        assert!(available < control.migration_headroom(&root).unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
