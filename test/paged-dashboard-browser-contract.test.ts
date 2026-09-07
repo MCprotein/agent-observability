@@ -4,7 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { generateSyntheticFixtureSet, isExpectedSmokeCancellation } from "../scripts/paged-dashboard-browser-smoke.ts";
+import { consumeExpectedSmokeCancellation, generateSyntheticFixtureSet, isExpectedSmokeCancellation } from "../scripts/paged-dashboard-browser-smoke.ts";
+
+test("smoke cancellation consumes only the exact causal token once", () => {
+  const expected = new Set(["1", "2"]);
+  assert.equal(consumeExpectedSmokeCancellation("net::ERR_ABORTED", "3", expected), false);
+  assert.equal(consumeExpectedSmokeCancellation("net::ERR_ABORTED", undefined, expected), false);
+  assert.equal(consumeExpectedSmokeCancellation("net::ERR_CONNECTION_RESET", "1", expected), false);
+  assert.equal(expected.has("1"), true);
+  assert.equal(consumeExpectedSmokeCancellation("net::ERR_ABORTED", "1", expected), true);
+  assert.equal(consumeExpectedSmokeCancellation("net::ERR_ABORTED", "1", expected), false);
+  assert.deepEqual([...expected], ["2"]);
+});
 
 test("smoke accepts only explicitly marked request aborts, not ordinary network failures", () => {
   assert.equal(isExpectedSmokeCancellation("net::ERR_ABORTED", true), true);

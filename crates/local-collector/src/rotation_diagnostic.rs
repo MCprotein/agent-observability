@@ -26,6 +26,11 @@ mod rotation_diagnostic {
             builder.create(&root).expect("fresh private runtime");
             Self(root)
         }
+
+        fn cleanup(self) {
+            fs::remove_dir_all(&self.0).expect("owned private diagnostic cleanup succeeded");
+            assert!(!self.0.exists(), "owned diagnostic directory removed");
+        }
     }
 
     impl Drop for PrivateRuntime {
@@ -462,5 +467,80 @@ mod rotation_diagnostic {
         let runtime = PrivateRuntime::new();
         backup_into(&source, &runtime);
         three_generations(&runtime.0);
+        runtime.cleanup();
+    }
+
+    /// Measurement only: rewrites indexes of an isolated copied sidecar, never a usable view.
+    #[test]
+    #[ignore = "explicit private-backup index measurement; not query parity evidence"]
+    fn private_backup_narrow_index_measurement() {
+        let source =
+            std::env::var_os("AO_ROTATION_BACKUP_SOURCE").expect("explicit backup source required");
+        let source = fs::canonicalize(source).expect("backup source exists");
+        assert!(source.is_file());
+        let runtime = PrivateRuntime::new();
+        backup_into(&source, &runtime);
+        measured_refresh(&runtime.0);
+        let files = catalog_files(&runtime.0);
+        assert_eq!(files.len(), 1);
+        let measurement = runtime.0.join("index-measurement.sqlite3");
+        fs::copy(&files[0], &measurement).expect("copy owned sidecar for isolated measurement");
+        let unvacuumed = fs::metadata(&measurement).unwrap().len();
+        run_measurement_sql(&measurement, "PRAGMA cache_size=-8192; VACUUM;");
+        let before = fs::metadata(&measurement).unwrap().len();
+        let sql = "PRAGMA cache_size=-8192; PRAGMA temp_store=FILE; \
+            DROP INDEX spans_repo_order_idx; DROP INDEX spans_session_order_idx; \
+            DROP INDEX spans_turn_order_idx; DROP INDEX spans_agent_order_idx; \
+            DROP INDEX spans_model_order_idx; \
+            CREATE INDEX spans_repo_order_idx ON spans(repo,source_order); \
+            CREATE INDEX spans_session_order_idx ON spans(session_id,source_order); \
+            CREATE INDEX spans_turn_order_idx ON spans(turn_id,source_order); \
+            CREATE INDEX spans_agent_order_idx ON spans(agent,source_order); \
+            CREATE INDEX spans_model_order_idx ON spans(model,source_order); VACUUM;";
+        run_measurement_sql(&measurement, sql);
+        let after = fs::metadata(&measurement).unwrap().len();
+        println!(
+            "index_measurement_unvacuumed_bytes={unvacuumed} index_measurement_baseline_bytes={before} index_measurement_narrow_bytes={after} query_parity=unverified"
+        );
+        assert!(after < before, "narrow indexes must demonstrate savings");
+        runtime.cleanup();
+    }
+
+    fn run_measurement_sql(measurement: &Path, sql: &str) {
+        let private_directory = measurement.parent().expect("private measurement parent");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(private_directory)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        let mut child = BackupProcess(
+            Command::new("sqlite3")
+                .env("SQLITE_TMPDIR", private_directory)
+                .env("TMPDIR", private_directory)
+                .current_dir(private_directory)
+                .arg(measurement)
+                .arg(sql)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("SQLite measurement tool available"),
+        );
+        let deadline = Instant::now() + Duration::from_mins(2);
+        loop {
+            if let Some(status) = child.0.try_wait().expect("measurement status available") {
+                assert!(status.success(), "isolated index measurement succeeded");
+                break;
+            }
+            assert!(Instant::now() < deadline, "index measurement deadline");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

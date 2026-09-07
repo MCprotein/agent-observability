@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Readable } from "node:stream";
-import { chromium, type BrowserContext, type Page, type Request } from "playwright-core";
+import { chromium, type BrowserContext, type Page } from "playwright-core";
 
 const HANDOFF_SCHEMA_VERSION = "codex_handoff.v1";
 const DASHBOARD_SCHEMA_VERSION = "agent_observability.dashboard_query.v1";
@@ -578,12 +578,40 @@ async function exerciseBrowser(
   const consoleErrors: string[] = [];
   const pageErrors: string[] = [];
   const externalRequests: string[] = [];
-  const failedRequests: Array<{ kind: string; failure: string }> = [];
-  const pendingQueries = new Set<Request>();
-  const expectedCancelledQueries = new WeakSet<Request>();
-  const markFilterCancellation = () => {
-    for (const request of pendingQueries) expectedCancelledQueries.add(request);
-  };
+  const failedRequests: Array<{ kind: string; error: string | undefined; token: string | undefined }> = [];
+  // Observe causality in the page, where filter handlers synchronously abort their signal.
+  // A smoke-only header binds that signal to the exact browser network request.
+  await page.addInitScript(() => {
+    const state = { expected: [] as string[], aborted: [] as string[], mutations: 0 };
+    Object.assign(window, { __agentobsSmokeCancellation: state });
+    let active = false;
+    let sequence = 0;
+    for (const eventName of ["input", "change"]) {
+      document.addEventListener(eventName, (event) => {
+        const id = (event.target as HTMLElement | null)?.id;
+        if (!((eventName === "input" && id === "text-filter")
+          || (eventName === "change" && id === "agent-filter"))) return;
+        state.mutations += 1;
+        active = true;
+      }, true);
+      window.addEventListener(eventName, () => { active = false; });
+    }
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      const request = new window.Request(input, init);
+      const url = new URL(request.url);
+      if (url.origin !== location.origin || !url.pathname.endsWith("/query")) return originalFetch(input, init);
+      const token = String(++sequence);
+      const headers = new Headers(request.headers);
+      headers.set("x-agentobs-smoke-token", token);
+      const signal = init?.signal ?? (input instanceof window.Request ? input.signal : request.signal);
+      signal.addEventListener("abort", () => {
+        state.aborted.push(token);
+        if (active) state.expected.push(token);
+      }, { once: true });
+      return originalFetch(new window.Request(request, { headers }));
+    };
+  });
   const requestedPaths: string[] = [];
   const queryFailures: Array<{ kind: string; reason: string }> = [];
   let popupCount = 0;
@@ -604,18 +632,14 @@ async function exerciseBrowser(
   page.on("request", (request) => {
     const url = new URL(request.url());
     requestedPaths.push(url.pathname);
-    if (url.origin === origin && url.pathname.endsWith("/query")) pendingQueries.add(request);
     if (url.origin !== origin) externalRequests.push(request.url());
   });
-  page.on("requestfinished", (request) => { pendingQueries.delete(request); });
   page.on("requestfailed", (request) => {
-    pendingQueries.delete(request);
-    if (!isExpectedSmokeCancellation(request.failure()?.errorText, expectedCancelledQueries.has(request))) {
-      failedRequests.push({
-        kind: safeStatusValue(decodeDashboardRequest(request.url()).kind),
-        failure: request.failure()?.errorText === "net::ERR_ABORTED" ? "unexpected_abort" : "network_failure",
-      });
-    }
+    failedRequests.push({
+      kind: safeStatusValue(decodeDashboardRequest(request.url()).kind),
+      error: request.failure()?.errorText,
+      token: request.headers()["x-agentobs-smoke-token"],
+    });
   });
   page.on("response", async (response) => {
     if (!new URL(response.url()).pathname.endsWith("/query")) return;
@@ -654,12 +678,9 @@ async function exerciseBrowser(
   await page.waitForFunction(() => document.getElementById("kpi-tokens")?.textContent === "Unavailable");
   assert.match((await page.locator("#quality-summary").textContent()) ?? "", /Hot\/warm data; cold excluded/);
 
-  markFilterCancellation();
   await page.locator("#text-filter").fill("delayed-no-match");
   await delayedRequestSeen;
-  markFilterCancellation();
   await page.locator("#text-filter").fill("");
-  markFilterCancellation();
   await page.locator("#agent-filter").selectOption("codex");
   await delayedRouteFinished;
   await assertKpi(page, "kpi-sessions", manifest.traceCount);
@@ -725,7 +746,23 @@ async function exerciseBrowser(
   assert.deepEqual(consoleErrors, []);
   assert.deepEqual(pageErrors, []);
   assert.deepEqual(externalRequests, []);
-  assert.deepEqual(failedRequests, []);
+  const cancellation = await page.evaluate(() => (window as unknown as {
+    __agentobsSmokeCancellation: { expected: string[]; aborted: string[]; mutations: number };
+  }).__agentobsSmokeCancellation);
+  assert.equal(cancellation.mutations, 3);
+  assert.ok(cancellation.expected.length > 0, "explicit filter change must abort an observed signal");
+  const expectedTokens = new Set(cancellation.expected);
+  const unexpectedFailures = failedRequests.filter((failure) => {
+    return !consumeExpectedSmokeCancellation(failure.error, failure.token, expectedTokens);
+  }).map((failure) => ({
+    kind: failure.kind,
+    failure: failure.error === "net::ERR_ABORTED" ? "unexpected_abort" : "network_failure",
+    hasToken: failure.token !== undefined,
+    causalAbortCount: cancellation.expected.length,
+    signalAborted: failure.token !== undefined && cancellation.aborted.includes(failure.token),
+    wasCausal: failure.token !== undefined && cancellation.expected.includes(failure.token),
+  }));
+  assert.deepEqual(unexpectedFailures, []);
   return {
     origin,
     tracePages: directEvidence.tracePages,
@@ -743,6 +780,11 @@ async function exerciseBrowser(
 
 export function isExpectedSmokeCancellation(errorText: string | undefined, explicitlyCancelledRequest: boolean): boolean {
   return explicitlyCancelledRequest && errorText === "net::ERR_ABORTED";
+}
+
+export function consumeExpectedSmokeCancellation(errorText: string | undefined, token: string | undefined, expected: Set<string>): boolean {
+  if (!isExpectedSmokeCancellation(errorText, token !== undefined && expected.has(token))) return false;
+  return token !== undefined && expected.delete(token);
 }
 
 async function selectTraceAcrossPages(page: Page, expectedText: string, verifiedPageCount: number): Promise<number> {
