@@ -144,7 +144,7 @@ impl MutationGuard {
         if fs::canonicalize(&runtime)? != self.runtime_dir {
             return Err(SingletonError::WrongMutationRoot);
         }
-        private_runtime_dir(&runtime)?;
+        validate_private_runtime_dir(&runtime)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -233,12 +233,19 @@ fn decode_nonce(value: &str) -> Result<[u8; 32], SingletonError> {
 
 #[cfg(unix)]
 pub(crate) fn private_runtime_dir(path: &Path) -> Result<(), SingletonError> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
     if !path.exists() {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true).mode(0o700);
         builder.create(path)?;
     }
+    validate_private_runtime_dir(path)
+}
+
+/// Validate an existing directory without creating it, including after removal.
+#[cfg(unix)]
+pub(crate) fn validate_private_runtime_dir(path: &Path) -> Result<(), SingletonError> {
+    use std::os::unix::fs::PermissionsExt;
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Err(SingletonError::Symlink);
@@ -256,6 +263,11 @@ pub(crate) fn private_runtime_dir(path: &Path) -> Result<(), SingletonError> {
 
 #[cfg(not(unix))]
 pub(crate) fn private_runtime_dir(_path: &Path) -> Result<(), SingletonError> {
+    Err(SingletonError::UnsupportedPlatform)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn validate_private_runtime_dir(_path: &Path) -> Result<(), SingletonError> {
     Err(SingletonError::UnsupportedPlatform)
 }
 
@@ -339,6 +351,17 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
+    }
+
+    #[test]
+    fn validation_after_observed_directory_removal_does_not_recreate_it() {
+        let root =
+            std::env::temp_dir().join(format!("runtime-validation-race-{}", std::process::id()));
+        private_dir(&root);
+        assert!(fs::symlink_metadata(&root).unwrap().is_dir());
+        fs::remove_dir(&root).unwrap();
+        assert!(validate_private_runtime_dir(&root).is_err());
+        assert!(!root.exists());
     }
 
     #[test]
