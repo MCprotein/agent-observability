@@ -77,7 +77,7 @@ impl RuntimeControl {
         let available = self.writable_headroom(root)?;
         if byte_ceiling == 0
             || byte_ceiling
-                .checked_add(4096)
+                .checked_add(crate::REPORT_RESERVATION_METADATA_ALLOWANCE)
                 .is_none_or(|required| required > available)
         {
             return Err(ControlError::Reservation(ReservationError::Capacity));
