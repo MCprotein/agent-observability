@@ -8,6 +8,7 @@ import { validateDashboardQueryRequestV1 } from "../ui/report/generated/validate
 import { PagedDashboardClient } from "../ui/report/paged-client.ts";
 import {
   dashboardFiltersFromSavedDimensions,
+  detailUsageRows,
   facetLimitDisclosure,
   savedDimensionsFromDashboardFilters,
 } from "../ui/report/paged.ts";
@@ -16,6 +17,32 @@ import {
   parseSavedFilters,
   serializeSavedFilters,
 } from "../ui/report/view-state.ts";
+
+test("paged span detail exposes reported usage and server cost without inventing missing totals", () => {
+  const span = {
+    metrics: { inputTokens: 100, outputTokens: 25, cachedInputTokens: 0 },
+    availability: { tokens: { state: "available", reason: "reported_by_adapter" } },
+    cost: { status: "estimated", estimated_cost: 0.0125, currency: "USD", rate_table: { version: "test-v1" }, cost: { assumption: "API list prices, not a bill" } },
+  } as Parameters<typeof detailUsageRows>[0];
+  const rows = Object.fromEntries(detailUsageRows(span));
+  assert.equal(rows["Input tokens"], "100");
+  assert.equal(rows["Output tokens"], "25");
+  assert.equal(rows["Cached input tokens"], "0");
+  assert.equal(rows["Reported total tokens"], "Not reported");
+  assert.equal(rows["Estimated API cost"], "Estimated · USD 0.0125");
+  assert.equal(rows["Rate table"], "test-v1");
+  assert.equal(rows["Cost assumption"], "API list prices, not a bill");
+  const { currency: _currency, ...noCurrency } = span.cost;
+  assert.equal(Object.fromEntries(detailUsageRows({ ...span, cost: noCurrency }))["Estimated API cost"], "Estimated · Currency not provided 0.0125");
+  assert.equal(Object.fromEntries(detailUsageRows({ ...span, cost: { ...span.cost, status: "incomplete" } }))["Estimated API cost"], "Incomplete · USD 0.0125");
+  const missing = Object.fromEntries(detailUsageRows({ ...span, metrics: {},
+    availability: { ...span.availability, tokens: { state: "source_unavailable", reason: "partial_token_metrics" } },
+    cost: { ...span.cost, status: "unknown", reason: "missing_rate_table", estimated_cost: 0 },
+  }));
+  assert.equal(missing["Input tokens"], "Source unavailable — Partial token metrics");
+  assert.equal(missing["Estimated API cost"], "Unknown");
+  assert.equal(missing["Cost reason"], "Missing rate table");
+});
 
 test("paged saved views reuse the bounded legacy storage contract without persisting text", () => {
   const session = `id:sha256:${"a".repeat(64)}`;

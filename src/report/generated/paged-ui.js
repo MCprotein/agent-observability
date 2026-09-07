@@ -11490,6 +11490,8 @@
     };
     const suffix = state.scope?.coldExcluded ? " \xB7 Cold archive excluded" : "";
     const reason = state.reason && state.reason !== "cold_excluded" ? ` \xB7 ${state.reason.replaceAll("_", " ")}` : "";
+    const timestamp = document.querySelector(".timestamp");
+    if (timestamp) timestamp.textContent = state.snapshot ? `${labels[state.availability]} \xB7 ${formatTime(state.snapshot.generatedAt)}` : labels[state.availability];
     setText("filter-status", `${labels[state.availability]}${suffix}${reason}`);
     setText("quality-summary", state.scope?.coldExcluded ? "Hot/warm data; cold excluded" : labels[state.availability]);
     const facetDisclosure = facetLimitDisclosure(state.facetsLimited);
@@ -11665,7 +11667,8 @@
       ["Session", span.sessionId ?? "Unavailable"],
       ["Turn", span.turnId ?? availabilityText(span.availability.turn)],
       ["Span", span.spanId],
-      ["Parent", span.parentSpanId ?? "Root"]
+      ["Parent", span.parentSpanId ?? "Root"],
+      ...detailUsageRows(span)
     ];
     for (const [label, value] of rows) {
       appendText(list, "dt", label);
@@ -11677,6 +11680,28 @@
       pendingDetailsFocusSpanId = void 0;
       required("details-heading").focus();
     }
+  }
+  function detailUsageRows(span) {
+    const fields = [
+      ["Input tokens", "inputTokens"],
+      ["Output tokens", "outputTokens"],
+      ["Cached input tokens", "cachedInputTokens"],
+      ["Cache creation input tokens", "cacheCreationInputTokens"],
+      ["Reasoning output tokens", "reasoningOutputTokens"],
+      ["Reported total tokens", "totalTokens"]
+    ];
+    const missing = span.availability.tokens.state === "available" ? "Not reported" : availabilityText(span.availability.tokens);
+    const rows = fields.map(([label, key]) => [
+      label,
+      span.metrics[key] === void 0 ? missing : span.metrics[key].toLocaleString()
+    ]);
+    const cost = span.cost;
+    const amount = cost.status !== "unknown" && cost.estimated_cost !== void 0 ? ` \xB7 ${cost.currency ?? "Currency not provided"} ${Number(cost.estimated_cost.toPrecision(12))}` : "";
+    rows.push(["Estimated API cost", `${title(cost.status)}${amount}`]);
+    if (cost.reason) rows.push(["Cost reason", title(cost.reason)]);
+    rows.push(["Cost assumption", cost.cost.assumption]);
+    rows.push(["Rate table", cost.rate_table.version ?? "Not provided"]);
+    return rows;
   }
   function privateDetailSection(state) {
     const section = document.createElement("section");

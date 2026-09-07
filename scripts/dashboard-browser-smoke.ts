@@ -189,6 +189,7 @@ try {
       assert.equal(await page.locator("h1").textContent(), "Agent Observability");
       await page.waitForFunction(() => document.querySelectorAll(".trace-row").length > 0);
       assert.match((await page.locator("#filter-status").textContent()) ?? "", /Current snapshot/);
+      assert.match((await page.locator(".timestamp").textContent()) ?? "", /Current snapshot/);
       await page.locator("#agent-filter option", { hasText: "codex" }).waitFor({ state: "attached" });
       await page.waitForFunction(() => document.getElementById("kpi-sessions")?.textContent?.startsWith("Exact"));
       await waitForDashboardIdle();
@@ -199,6 +200,8 @@ try {
       assert.equal(await page.locator(".timeline-row").count() > 0, true);
       await page.locator("#span-table .span-open", { hasText: "LLM request" }).first().click();
       await page.locator("#private-detail", { hasText: "not eligible for private local detail" }).waitFor();
+      assert.match((await page.locator("#details-body").textContent()) ?? "", /Input tokens/);
+      assert.match((await page.locator("#details-body").textContent()) ?? "", /Estimated API cost/);
       assert.equal(
         await page.locator("#details-heading").evaluate((element) => document.activeElement === element),
         true,

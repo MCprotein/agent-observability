@@ -221,6 +221,10 @@ function renderAvailability(state: PagedDashboardState): void {
   };
   const suffix = state.scope?.coldExcluded ? " · Cold archive excluded" : "";
   const reason = state.reason && state.reason !== "cold_excluded" ? ` · ${state.reason.replaceAll("_", " ")}` : "";
+  const timestamp = document.querySelector<HTMLElement>(".timestamp");
+  if (timestamp) timestamp.textContent = state.snapshot
+    ? `${labels[state.availability]} · ${formatTime(state.snapshot.generatedAt)}`
+    : labels[state.availability];
   setText("filter-status", `${labels[state.availability]}${suffix}${reason}`);
   setText("quality-summary", state.scope?.coldExcluded ? "Hot/warm data; cold excluded" : labels[state.availability]);
   const facetDisclosure = facetLimitDisclosure(state.facetsLimited);
@@ -414,6 +418,7 @@ function renderDetails(state: PagedDashboardState): void {
     ["Model", span.agent.model ?? availabilityText(span.availability.model)],
     ["Session", span.sessionId ?? "Unavailable"], ["Turn", span.turnId ?? availabilityText(span.availability.turn)],
     ["Span", span.spanId], ["Parent", span.parentSpanId ?? "Root"],
+    ...detailUsageRows(span),
   ];
   for (const [label, value] of rows) {
     appendText(list, "dt", label);
@@ -425,6 +430,27 @@ function renderDetails(state: PagedDashboardState): void {
     pendingDetailsFocusSpanId = undefined;
     required<HTMLElement>("details-heading").focus();
   }
+}
+
+export function detailUsageRows(span: Pick<NonNullable<PagedDashboardState["selectedSpan"]>, "metrics" | "availability" | "cost">): Array<[string, string]> {
+  const fields = [
+    ["Input tokens", "inputTokens"], ["Output tokens", "outputTokens"],
+    ["Cached input tokens", "cachedInputTokens"], ["Cache creation input tokens", "cacheCreationInputTokens"],
+    ["Reasoning output tokens", "reasoningOutputTokens"], ["Reported total tokens", "totalTokens"],
+  ] as const;
+  const missing = span.availability.tokens.state === "available"
+    ? "Not reported" : availabilityText(span.availability.tokens);
+  const rows: Array<[string, string]> = fields.map(([label, key]) => [
+    label, span.metrics[key] === undefined ? missing : span.metrics[key]!.toLocaleString(),
+  ]);
+  const cost = span.cost;
+  const amount = cost.status !== "unknown" && cost.estimated_cost !== undefined
+    ? ` · ${cost.currency ?? "Currency not provided"} ${Number(cost.estimated_cost.toPrecision(12))}` : "";
+  rows.push(["Estimated API cost", `${title(cost.status)}${amount}`]);
+  if (cost.reason) rows.push(["Cost reason", title(cost.reason)]);
+  rows.push(["Cost assumption", cost.cost.assumption]);
+  rows.push(["Rate table", cost.rate_table.version ?? "Not provided"]);
+  return rows;
 }
 
 function privateDetailSection(state: PagedDashboardState): HTMLElement {
