@@ -158,6 +158,42 @@ fn invalid_real_process_command_fails_on_stderr() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown command"));
 }
 
+#[cfg(unix)]
+#[test]
+fn dashboard_durable_startup_failure_exits_nonzero_with_actionable_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-dashboard-startup-failure-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let setup = binary()
+        .args(["setup", root.to_str().unwrap(), "--no-open"])
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    let store = installed_store(&root).join("local-store.sqlite3");
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o644)).unwrap();
+    let dashboard = binary()
+        .args(["dashboard-serve", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(!dashboard.status.success());
+    assert!(dashboard.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&dashboard.stderr)
+            .contains("local store permissions are too broad")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn codex_notify_real_process_rejects_before_io_with_zero_exit() {
     let root = std::env::temp_dir().join(format!(
@@ -291,9 +327,11 @@ fn setup_and_config_set_work_end_to_end_in_the_real_process() {
     assert!(setup_output.contains("status=ready"));
     assert!(setup_output.contains("collection=manual_import"));
     assert!(setup_output.contains("opened=false"));
-    let dashboard = root.join("logs/agent-observability-report.html");
+    assert!(setup_output.contains("dashboard_command=agentobs dashboard"));
+    assert!(!root.join("logs/agent-observability-report.html").exists());
+    let store = root.join("state/store/local-store.sqlite3");
     assert_eq!(
-        fs::metadata(&dashboard).unwrap().permissions().mode() & 0o777,
+        fs::metadata(&store).unwrap().permissions().mode() & 0o777,
         0o600
     );
 
@@ -328,7 +366,8 @@ fn setup_and_config_set_work_end_to_end_in_the_real_process() {
         0o600
     );
 
-    fs::remove_file(&dashboard).unwrap();
+    let dashboard = root.join("logs/agent-observability-report.html");
+    assert!(!dashboard.exists());
     let dashboard_command = binary()
         .args(["report", root.to_str().unwrap()])
         .output()

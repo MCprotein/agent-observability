@@ -27,7 +27,9 @@ use agent_observability_local_runtime::{
     LOCAL_RUNTIME_CONFIG_VERSION, LocalRuntimeConfigV3, PressureSample, RuntimeControl,
     StorageBudget,
 };
-use agent_observability_local_store::{LOCAL_STORE_SCHEMA_VERSION, LocalStore};
+use agent_observability_local_store::{
+    LOCAL_STORE_SCHEMA_VERSION, LocalStore, current_report_view, with_report_view_snapshot,
+};
 use serde::Deserialize;
 #[cfg(target_os = "macos")]
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -36,7 +38,7 @@ const USAGE: &str = "usage:\n  cargo run -p xtask -- perf <local|automatic> --pr
 const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-performance-v1.yaml");
 const AUTOMATIC_PROTOCOL: &str =
     include_str!("../../crates/contracts/performance/automatic-local-performance-v1.yaml");
-const AUTOMATIC_PROTOCOL_REVISION: &str = "v1.8.3-codex-0.152.1-private-ca-header-ownership-rebase-real-e2e-synthetic-diagnostics-rss-p95-v4";
+const AUTOMATIC_PROTOCOL_REVISION: &str = "v1.8.3-codex-0.152.1-private-ca-header-ownership-rebase-real-e2e-synthetic-diagnostics-rss-p95-v5-paged-snapshot-parity";
 const AUTOMATIC_PRESERVE_SMOKE_EVIDENCE_ENV: &str =
     "AGENT_OBSERVABILITY_PRESERVE_AUTOMATIC_SMOKE_EVIDENCE";
 const AUTOMATIC_CODEX_VERSION: &str = "codex-cli 0.152.1";
@@ -502,6 +504,19 @@ struct AutomaticRunResult {
 struct ReportConvergence {
     generation: u64,
     records: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AutomaticPublishedSnapshotEvidence {
+    source_generation: u64,
+    acknowledged_generation: u64,
+    source_visibility_epoch: u64,
+    authoritative_records: u64,
+    snapshot_generation: u64,
+    snapshot_visibility_epoch: u64,
+    snapshot_records: u64,
+    indexed_records: u64,
+    current_consistent: bool,
 }
 impl Config {
     fn for_profile(profile: Profile) -> Self {
@@ -1245,6 +1260,15 @@ fn command(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn automatic_smoke_preservation_requested(profile: Profile) -> bool {
+    profile == Profile::Smoke
+        && preserve_automatic_smoke_evidence(
+            env::var(AUTOMATIC_PRESERVE_SMOKE_EVIDENCE_ENV)
+                .ok()
+                .as_deref(),
+        )
+}
+
 fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Result<(), String> {
     validate_automatic_protocol_contract()?;
     validate_automatic_profile_host(config.profile, env::consts::OS)?;
@@ -1291,18 +1315,10 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
     validate_automatic_manifest_shape(&manifest)?;
     fs::write(&manifest_path, &manifest)
         .map_err(|error| format!("write automatic manifest: {error}"))?;
-    let preserve_smoke_evidence = config.profile == Profile::Smoke
-        && preserve_automatic_smoke_evidence(
-            env::var(AUTOMATIC_PRESERVE_SMOKE_EVIDENCE_ENV)
-                .ok()
-                .as_deref(),
-        );
+    let preserve_smoke_evidence = automatic_smoke_preservation_requested(config.profile);
     let runtime_result = runtime_cleanup.cleanup();
     let smoke_result = smoke_cleanup.as_mut().map_or(Ok(()), |cleanup| {
-        if validation.is_err() {
-            cleanup.preserve();
-            Ok(())
-        } else if preserve_smoke_evidence {
+        if validation.is_err() || preserve_smoke_evidence {
             cleanup.preserve();
             Ok(())
         } else {
@@ -1457,7 +1473,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
             notify_boundary: "separately verified built agent-observability codex-notify supplement through private-CA HTTPS with the exact private random request header".into(),
             collector_boundary: "built agent-observability collector-serve subprocess".into(),
             payload: "bounded synthetic Codex-shaped WebSocket-request/completed OTLP log pairs with opaque identifiers; one bounded notify supplement per measured run whose raw sentinels must be absent from the durable tree".into(),
-            readiness: "successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, exactly two durable synthetic records per accepted OTLP request plus one notify record, acknowledged report generation, and HTML generatedSpans parity with authoritative SQLite must converge before collector shutdown".into(),
+            readiness: "successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, exactly two durable synthetic records per accepted OTLP request plus one notify record, and one current validated published paged snapshot whose generation, visibility epoch, metadata record count, and indexed row count match authoritative SQLite must converge before collector shutdown".into(),
             collector_shutdown: "bounded child termination and wait".into(),
         },
         metrics: AutomaticProtocolMetrics {
@@ -1498,7 +1514,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
             build_timeout_seconds: AUTOMATIC_BUILD_TIMEOUT.as_secs(),
             startup_timeout_seconds: AUTOMATIC_START_TIMEOUT.as_secs(),
             cleanup_timeout_seconds: AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT.as_secs(),
-            fail_closed: "missing or invalid benchmark metrics, real Codex execution or native OTLP failure, rejected synthetic OTLP requests, Codex version or strict config-load incompatibility, missing notify or report convergence evidence, durable raw sentinels, non-loopback endpoints, timeout, or threshold breach produce non-zero exit".into(),
+            fail_closed: "missing or invalid benchmark metrics, real Codex execution or native OTLP failure, rejected synthetic OTLP requests, Codex version or strict config-load incompatibility, missing notify or published paged report convergence evidence, durable raw sentinels, non-loopback endpoints, timeout, or threshold breach produce non-zero exit".into(),
         },
         evidence: AutomaticProtocolEvidence {
             output: "docs/evidence/local/performance/automatic-<run>/manifest.yaml".into(),
@@ -3491,27 +3507,92 @@ fn wait_for_automatic_report_convergence(
         }
         if check_health(root) == HealthOutcome::Ready
             && let Ok(store) = LocalStore::open_current(root.join("state/store"))
-            && let Ok(status_before) = store.report_status()
-            && !status_before.pending()
-            && let Ok(record_count) = store.record_count()
-            && record_count > 0
-            && let Ok(report) =
-                fs::read_to_string(root.join("logs/agent-observability-report.html"))
-            && report.contains(&format!(r#""generatedSpans":{record_count}"#))
-            && let Ok(status_after) = store.report_status()
-            && status_after == status_before
-            && !status_after.pending()
+            && let Ok(Some(convergence)) = automatic_published_snapshot_convergence(&store)
         {
-            return Ok(ReportConvergence {
-                generation: status_after.generation,
-                records: record_count,
-            });
+            return Ok(convergence);
         }
         if started.elapsed() >= AUTOMATIC_START_TIMEOUT {
-            return Err("automatic durable report convergence timed out".into());
+            return Err("automatic published paged snapshot convergence timed out".into());
         }
         sleep(Duration::from_millis(20));
     }
+}
+
+fn automatic_published_snapshot_convergence(
+    store: &LocalStore,
+) -> Result<Option<ReportConvergence>, String> {
+    let status_before = store
+        .report_status()
+        .map_err(|error| format!("read report status before published snapshot: {error}"))?;
+    let visibility_before = store
+        .report_visibility_epoch()
+        .map_err(|error| format!("read visibility epoch before published snapshot: {error}"))?;
+    let records_before = store.record_count().map_err(|error| {
+        format!("read authoritative record count before published snapshot: {error}")
+    })?;
+    let Some(current_before) = current_report_view(store)
+        .map_err(|error| format!("read current published snapshot: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let (guarded_snapshot, indexed_records) =
+        with_report_view_snapshot(store, current_before.view_id(), |connection, snapshot| {
+            let indexed_records =
+                connection
+                    .query_row("SELECT COUNT(*) FROM spans", [], |row| row.get::<_, i64>(0))?;
+            Ok((snapshot.clone(), indexed_records))
+        })
+        .map_err(|error| format!("validate current published snapshot: {error}"))?;
+    let status_after = store
+        .report_status()
+        .map_err(|error| format!("read report status after published snapshot: {error}"))?;
+    let visibility_after = store
+        .report_visibility_epoch()
+        .map_err(|error| format!("read visibility epoch after published snapshot: {error}"))?;
+    let records_after = store.record_count().map_err(|error| {
+        format!("read authoritative record count after published snapshot: {error}")
+    })?;
+    let current_after = current_report_view(store)
+        .map_err(|error| format!("recheck current published snapshot: {error}"))?;
+    let snapshot_records = u64::try_from(guarded_snapshot.records())
+        .map_err(|_| "published snapshot record count exceeds u64".to_owned())?;
+    let indexed_records = u64::try_from(indexed_records)
+        .map_err(|_| "published snapshot indexed row count is negative".to_owned())?;
+    let evidence = AutomaticPublishedSnapshotEvidence {
+        source_generation: status_after.generation,
+        acknowledged_generation: status_after.acknowledged_generation,
+        source_visibility_epoch: visibility_after,
+        authoritative_records: records_after,
+        snapshot_generation: guarded_snapshot.generation(),
+        snapshot_visibility_epoch: guarded_snapshot.visibility_epoch(),
+        snapshot_records,
+        indexed_records,
+        current_consistent: status_before == status_after
+            && visibility_before == visibility_after
+            && records_before == records_after
+            && current_before == guarded_snapshot
+            && current_after.as_ref() == Some(&guarded_snapshot),
+    };
+    Ok(validate_automatic_published_snapshot(evidence))
+}
+
+fn validate_automatic_published_snapshot(
+    evidence: AutomaticPublishedSnapshotEvidence,
+) -> Option<ReportConvergence> {
+    if evidence.authoritative_records == 0
+        || evidence.source_generation != evidence.acknowledged_generation
+        || evidence.snapshot_generation != evidence.source_generation
+        || evidence.snapshot_visibility_epoch != evidence.source_visibility_epoch
+        || evidence.snapshot_records != evidence.authoritative_records
+        || evidence.indexed_records != evidence.authoritative_records
+        || !evidence.current_consistent
+    {
+        return None;
+    }
+    Some(ReportConvergence {
+        generation: evidence.source_generation,
+        records: evidence.authoritative_records,
+    })
 }
 
 fn automatic_notify_payload(run: usize, event: usize) -> String {
@@ -5313,7 +5394,7 @@ fn validate_automatic_results(
             return Err("automatic notify supplement evidence is missing".into());
         }
         if !result.report_converged {
-            return Err("automatic durable report convergence evidence is missing".into());
+            return Err("automatic published paged report convergence evidence is missing".into());
         }
         let expected_records = u64::try_from(config.events)
             .map_err(|_| "automatic expected record count overflow")?
@@ -6782,7 +6863,8 @@ mod tests {
         assert!(AUTOMATIC_PROTOCOL.contains("exact 10 input and 2 output token records"));
         assert!(AUTOMATIC_PROTOCOL.contains("sustained synthetic Codex-shaped OTLP/HTTP JSON"));
         assert!(AUTOMATIC_PROTOCOL.contains("after the real Codex gate passes"));
-        assert!(AUTOMATIC_PROTOCOL.contains("HTML generatedSpans parity"));
+        assert!(AUTOMATIC_PROTOCOL.contains("current validated published paged snapshot"));
+        assert!(!AUTOMATIC_PROTOCOL.contains("HTML generatedSpans parity"));
         assert!(AUTOMATIC_PROTOCOL.contains("not mTLS"));
         assert!(!AUTOMATIC_PROTOCOL.contains("launchd kickstart recovery"));
         assert!(
@@ -7009,6 +7091,57 @@ mod tests {
             validate_single_automatic(result)
                 .unwrap_err()
                 .contains("report convergence")
+        );
+    }
+
+    #[test]
+    fn automatic_published_snapshot_convergence_requires_current_exact_parity() {
+        let valid = AutomaticPublishedSnapshotEvidence {
+            source_generation: 7,
+            acknowledged_generation: 7,
+            source_visibility_epoch: 3,
+            authoritative_records: 51,
+            snapshot_generation: 7,
+            snapshot_visibility_epoch: 3,
+            snapshot_records: 51,
+            indexed_records: 51,
+            current_consistent: true,
+        };
+
+        for invalid in [
+            AutomaticPublishedSnapshotEvidence {
+                acknowledged_generation: 6,
+                ..valid
+            },
+            AutomaticPublishedSnapshotEvidence {
+                snapshot_generation: 6,
+                ..valid
+            },
+            AutomaticPublishedSnapshotEvidence {
+                snapshot_visibility_epoch: 2,
+                ..valid
+            },
+            AutomaticPublishedSnapshotEvidence {
+                snapshot_records: 50,
+                ..valid
+            },
+            AutomaticPublishedSnapshotEvidence {
+                indexed_records: 50,
+                ..valid
+            },
+            AutomaticPublishedSnapshotEvidence {
+                current_consistent: false,
+                ..valid
+            },
+        ] {
+            assert_eq!(validate_automatic_published_snapshot(invalid), None);
+        }
+        assert_eq!(
+            validate_automatic_published_snapshot(valid),
+            Some(ReportConvergence {
+                generation: 7,
+                records: 51,
+            })
         );
     }
 

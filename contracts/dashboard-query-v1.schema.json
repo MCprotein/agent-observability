@@ -54,7 +54,7 @@
           "properties": {
             "kind": { "const": "traces" },
             "snapshotId": { "$ref": "#/$defs/snapshot_id" },
-            "cursor": { "$ref": "#/$defs/nullable_cursor" }
+            "cursor": { "$ref": "#/$defs/cursor" }
           }
         }
       ],
@@ -72,7 +72,7 @@
             "kind": { "const": "spans" },
             "snapshotId": { "$ref": "#/$defs/snapshot_id" },
             "traceId": { "$ref": "#/$defs/projected_id" },
-            "cursor": { "$ref": "#/$defs/nullable_cursor" }
+            "cursor": { "$ref": "#/$defs/cursor" }
           }
         }
       ],
@@ -89,7 +89,7 @@
           "properties": {
             "kind": { "const": "summary" },
             "snapshotId": { "$ref": "#/$defs/snapshot_id" },
-            "cursor": { "$ref": "#/$defs/nullable_cursor" }
+            "cursor": { "$ref": "#/$defs/cursor" }
           }
         }
       ],
@@ -124,7 +124,7 @@
           "properties": {
             "kind": { "const": "facets" },
             "snapshotId": { "$ref": "#/$defs/snapshot_id" },
-            "cursor": { "$ref": "#/$defs/nullable_cursor" }
+            "cursor": { "$ref": "#/$defs/cursor" }
           }
         }
       ],

@@ -159,6 +159,8 @@ dependencies = [
  "agent-observability-contracts",
  "agent-observability-local-collector",
  "agent-observability-local-runtime",
+ "agent-observability-local-store",
+ "agent-observability-static-report",
  "axum",
  "getrandom 0.3.4",
  "hyper",

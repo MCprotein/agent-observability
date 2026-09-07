@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const SHELL: &str = include_str!("../../../src/report/generated/report-shell.html");
+const PAGED_SHELL: &str = include_str!("../../../src/report/generated/paged-shell.html");
 const TITLE_TOKEN: &str = "__AGENT_OBSERVABILITY_REPORT_TITLE__";
 const GENERATED_AT_TOKEN: &str = "__AGENT_OBSERVABILITY_REPORT_GENERATED_AT__";
 const DATA_TOKEN: &str = "__AGENT_OBSERVABILITY_REPORT_DATA__";
@@ -70,6 +71,30 @@ pub fn render(report: &ReportDtoV2) -> Result<String, ReportArtifactError> {
     let mut html = Vec::new();
     write_rendered(&mut html, report)?;
     String::from_utf8(html).map_err(|_| ReportArtifactError::InvalidTemplate)
+}
+
+/// Renders the data-free loopback dashboard shell, independently of HTML export capacity.
+///
+/// This entry point is not a self-contained export and must only be served on the private
+/// dashboard origin. No source content, filesystem path or capability is embedded.
+///
+/// # Errors
+/// Returns an error if the generated shell placeholders or fixed shell size are invalid.
+pub fn render_paged_dashboard() -> Result<String, ReportArtifactError> {
+    if PAGED_SHELL.matches(TITLE_TOKEN).count() != 2
+        || PAGED_SHELL.matches(GENERATED_AT_TOKEN).count() != 1
+        || PAGED_SHELL.matches(DATA_TOKEN).count() != 1
+    {
+        return Err(ReportArtifactError::InvalidTemplate);
+    }
+    let html = PAGED_SHELL
+        .replace(TITLE_TOKEN, "Agent Observability")
+        .replace(GENERATED_AT_TOKEN, "Loading snapshot…")
+        .replace(DATA_TOKEN, r#"{"mode":"paged_dashboard_v1"}"#);
+    if html.len() > 1024 * 1024 {
+        return Err(ReportArtifactError::TooLarge);
+    }
+    Ok(html)
 }
 
 /// Atomically writes one private report file inside an existing private directory.
@@ -320,6 +345,16 @@ mod tests {
         CostDetailV1, CostEstimateV1, REPORT_DTO_VERSION, RateTableRefV1, ReportFiltersV1,
         ReportSummaryV1,
     };
+
+    #[test]
+    fn paged_shell_is_data_free_and_does_not_require_an_export() {
+        let html = super::render_paged_dashboard().unwrap();
+        assert!(html.contains(r#"{"mode":"paged_dashboard_v1"}"#));
+        assert!(!html.contains(super::DATA_TOKEN));
+        assert!(!html.contains(super::TITLE_TOKEN));
+        assert!(!html.contains(super::GENERATED_AT_TOKEN));
+        assert!(html.len() <= 1024 * 1024);
+    }
 
     fn report(title: &str) -> ReportDtoV2 {
         ReportDtoV2 {

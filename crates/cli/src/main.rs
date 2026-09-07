@@ -273,20 +273,39 @@ fn setup_ui(root: &Path, automatic: bool) -> Result<(), String> {
 }
 
 fn dashboard_ui(root: &Path, open: bool) -> Result<(), String> {
-    let _ = prepare_dashboard(root, false)?;
     serve_existing_dashboard(root, open, None)
+}
+
+fn classify_initial_dashboard_refresh(
+    result: Result<bool, agent_observability_local_collector::CollectorError>,
+) -> Result<Option<agent_observability_contracts::dashboard::DashboardStatusReasonV1>, String> {
+    match result {
+        Ok(_) => Ok(None),
+        Err(agent_observability_local_collector::CollectorError::DashboardStorageCapacity) => Ok(
+            Some(agent_observability_contracts::dashboard::DashboardStatusReasonV1::Capacity),
+        ),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn serve_existing_dashboard(root: &Path, open: bool, context: Option<&str>) -> Result<(), String> {
     let layout = install(root).map_err(|error| error.to_string())?;
+    // Initialization/migration is a CLI mutation step, never performed by query endpoints.
+    prepare_dashboard_store(&layout)?;
+    let initial_snapshot_failure = classify_initial_dashboard_refresh(
+        agent_observability_local_collector::refresh_dashboard_snapshot(&layout.root),
+    )?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| format!("dashboard runtime failed: {error}"))?;
     runtime.block_on(async {
-        let ui = agent_observability_local_ui::prepare_dashboard(&layout)
-            .await
-            .map_err(|error| error.to_string())?;
+        let ui = agent_observability_local_ui::prepare_dashboard_with_status(
+            &layout,
+            initial_snapshot_failure,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         announce_dashboard(&ui, open, context)?;
         ui.serve().await.map_err(|error| error.to_string())
     })
@@ -327,7 +346,6 @@ fn announce_dashboard(
 }
 
 fn settings_ui(root: &Path, open: bool) -> Result<(), String> {
-    let _ = prepare_dashboard(root, false)?;
     let layout = install(root).map_err(|error| error.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -626,7 +644,7 @@ fn setup(root: &Path, open: bool, automatic: bool) -> Result<String, String> {
         open,
         automatic,
         detected,
-        prepare_dashboard,
+        prepare_setup_runtime,
         connect_codex,
     )
 }
@@ -640,7 +658,7 @@ fn setup_with(
     connect: impl FnOnce(&Path) -> Result<String, String>,
 ) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let dashboard = prepare(&layout.root, open)?;
+    let _prepared = prepare(&layout.root, open)?;
     let connection = (automatic && codex_is_detected)
         .then(|| connect(&layout.root))
         .transpose()?;
@@ -651,12 +669,35 @@ fn setup_with(
     };
     let detection = (automatic && !codex_is_detected).then_some("\ncodex=not_detected");
     Ok(format!(
-        "status=ready\nroot={}\ndashboard={}\ncollection={collection}\nopened={open}{}{}",
+        "status=ready\nroot={}\ndashboard_command=agentobs dashboard\ncollection={collection}\nopened={open}{}{}",
         layout.root.display(),
-        dashboard.display(),
         detection.unwrap_or_default(),
         connection.map_or_else(String::new, |output| format!("\n{output}"))
     ))
+}
+
+fn prepare_setup_runtime(root: &Path, _open: bool) -> Result<PathBuf, String> {
+    // Interactive setup_ui owns the subsequent server/open step; --no-open needs no export.
+    let layout = install(root).map_err(|error| error.to_string())?;
+    prepare_dashboard_store(&layout)?;
+    Ok(layout.root)
+}
+
+fn prepare_dashboard_store(layout: &InstalledLayout) -> Result<(), String> {
+    let _mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let headroom = RuntimeControl::new(&config)
+        .map_err(|error| error.to_string())?
+        .migration_headroom(&layout.root)
+        .map_err(|error| error.to_string())?;
+    let store = LocalStore::open_with_migration_headroom_deferred_projection(
+        layout.state.join("store"),
+        headroom,
+    )
+    .map_err(|error| error.to_string())?;
+    agent_observability_local_store::recover_report_view_catalog(&store)
+        .map_err(|_| "dashboard snapshot recovery failed".to_owned())?;
+    Ok(())
 }
 
 fn connect_codex(root: &Path) -> Result<String, String> {
@@ -942,16 +983,16 @@ fn retention(root: &Path, apply: Option<(&str, &Path)>) -> Result<String, String
         )
         .map_err(|error| error.to_string())?;
         let result = store
-            .apply_retention(
+            .apply_retention_guarded(
                 cutoff_unix_ms,
                 config.retention.max_archive_records,
                 config.retention.max_archive_bytes,
                 expected_plan_id,
                 archive_path,
+                render_guard,
             )
             .map_err(|error| error.to_string())?;
         let output = retention_output(&result.plan, result.archive_path.as_deref(), true);
-        drop(render_guard);
         drop(store);
         drop(mutation);
         maintain_private_turn_details(root).map_err(|error| error.to_string())?;
@@ -1354,8 +1395,9 @@ mod tests {
 
     use super::{
         IngestBlock, IngestResult, LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME, USAGE,
-        format_codex_status, open_dashboard_with, open_settings_url_with, prepare_dashboard_with,
-        require_demo_ingest, run, run_ui_command, setup_with, timestamp_from_duration,
+        classify_initial_dashboard_refresh, format_codex_status, open_dashboard_with,
+        open_settings_url_with, prepare_dashboard_with, require_demo_ingest, run, run_ui_command,
+        setup_with, timestamp_from_duration,
     };
     use agent_observability_codex_integration::{
         CodexIntegrationStatus, CollectorStatus, ConnectionStatus,
@@ -1401,6 +1443,22 @@ mod tests {
     }
 
     #[test]
+    fn retryable_dashboard_refresh_keeps_native_building_semantics() {
+        assert_eq!(classify_initial_dashboard_refresh(Ok(false)), Ok(None));
+    }
+
+    #[test]
+    fn durable_dashboard_refresh_failure_is_not_downgraded_to_pending() {
+        let message = "dashboard snapshot refresh failed at publish";
+        let error = classify_initial_dashboard_refresh(Err(
+            agent_observability_local_collector::CollectorError::Runtime(message.into()),
+        ))
+        .unwrap_err();
+
+        assert_eq!(error, message);
+    }
+
+    #[test]
     fn codex_status_preserves_conflict_and_degraded_without_an_endpoint() {
         let output = format_codex_status(&CodexIntegrationStatus {
             schema_version: agent_observability_contracts::CODEX_INTEGRATION_STATUS_VERSION.into(),
@@ -1439,7 +1497,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn setup_creates_a_ready_private_dashboard_in_one_command() {
+    fn setup_prepares_private_store_without_requiring_html_export() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
@@ -1458,10 +1516,12 @@ mod tests {
         assert!(output.contains("status=ready"));
         assert!(output.contains("collection=manual_import"));
         assert!(output.contains("opened=false"));
-        let dashboard = root.join("logs").join(REPORT_FILE_NAME);
-        assert!(dashboard.is_file());
+        assert!(output.contains("dashboard_command=agentobs dashboard"));
+        assert!(!root.join("logs").join(REPORT_FILE_NAME).exists());
+        let store = root.join("state/store/local-store.sqlite3");
+        assert!(store.is_file());
         assert_eq!(
-            fs::metadata(dashboard).unwrap().permissions().mode() & 0o777,
+            fs::metadata(store).unwrap().permissions().mode() & 0o777,
             0o600
         );
         let _ = fs::remove_dir_all(root);

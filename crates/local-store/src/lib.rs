@@ -442,6 +442,15 @@ impl Display for StoreError {
         }
     }
 }
+impl StoreError {
+    /// Whether a read may be retried because `SQLite` reported an active competing operation.
+    #[must_use]
+    pub fn is_contention(&self) -> bool {
+        matches!(self, Self::Sqlite(error) if matches!(error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)))
+    }
+}
+
 impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -4056,6 +4065,28 @@ mod tests {
         CompactionId, CorrelationIds, ObservationId, SourceCursor, SourceGeneration, SpanId,
         Timing, TokenUsage, TraceId,
     };
+
+    #[test]
+    fn read_contention_classification_does_not_retry_durable_failures() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ));
+            assert!(error.is_contention());
+        }
+        for error in [
+            StoreError::SchemaMismatch,
+            StoreError::InsecurePermissions,
+            StoreError::Symlink,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                None,
+            )),
+        ] {
+            assert!(!error.is_contention());
+        }
+    }
 
     fn observation(cursor: &str, span: &str, parent: Option<&str>) -> SourceObservation {
         observation_after(cursor, None, span, parent)

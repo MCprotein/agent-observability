@@ -391,7 +391,7 @@ try {
   const independentDashboardPage = await qaContext.newPage();
   await independentDashboardPage.setViewportSize({ width: 1200, height: 800 });
   await independentDashboardPage.goto(dashboardUrl, { waitUntil: "load" });
-  assert.equal(await independentDashboardPage.locator("h1").textContent(), "Agent Observability Report");
+  assert.equal(await independentDashboardPage.locator("h1").textContent(), "Agent Observability");
   await dashboardLauncherPage.close();
 
   for (const testCase of [
@@ -688,7 +688,7 @@ try {
   const exitCode = await waitForExit(child);
   assert.equal(exitCode, 0, stderr);
   await independentDashboardPage.reload({ waitUntil: "load" });
-  assert.equal(await independentDashboardPage.locator("h1").textContent(), "Agent Observability Report");
+  assert.equal(await independentDashboardPage.locator("h1").textContent(), "Agent Observability");
   results.push({ name: "independent-dashboard", reloadAfterSettingsExit: true });
   await independentDashboardPage.close();
   assert.equal(blockedPlatformOpenRequests, 0, "QA attempted an unmocked platform-opening API request");

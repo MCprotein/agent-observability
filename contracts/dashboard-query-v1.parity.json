@@ -9,8 +9,7 @@
       "schemaVersion": "agent_observability.dashboard_query.v1",
       "kind": "spans",
       "snapshotId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "traceId": "id:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "cursor": null
+      "traceId": "id:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
     "tracesRequest": {
       "schemaVersion": "agent_observability.dashboard_query.v1",
@@ -132,7 +131,7 @@
   },
   "cases": [
     { "name": "optional filters may be absent", "category": "positive", "base": "bootstrapRequest", "operation": "none", "path": [], "valid": true },
-    { "name": "nullable request cursor may be null", "category": "positive", "base": "spansRequest", "operation": "none", "path": [], "valid": true },
+    { "name": "optional request cursor may be absent", "category": "positive", "base": "spansRequest", "operation": "none", "path": [], "valid": true },
     { "name": "required nullable response fields may be null", "category": "positive", "base": "spansResponse", "operation": "none", "path": [], "valid": true },
     { "name": "optional row strings may be absent", "category": "positive", "base": "spansResponse", "operation": "none", "path": [], "valid": true },
     { "name": "optional status snapshot may be absent", "category": "positive", "base": "statusResponse", "operation": "none", "path": [], "valid": true },
@@ -149,6 +148,10 @@
     { "name": "span filters reject null", "category": "negative", "base": "spanRequest", "operation": "set", "path": ["filters"], "value": null, "valid": false },
     { "name": "facets filters reject null", "category": "negative", "base": "facetsRequest", "operation": "set", "path": ["filters"], "value": null, "valid": false },
     { "name": "optional filter text rejects null", "category": "negative", "base": "bootstrapRequest", "operation": "set", "path": ["filters"], "value": { "text": null }, "valid": false },
+    { "name": "traces request cursor rejects null", "category": "negative", "base": "tracesRequest", "operation": "set", "path": ["cursor"], "value": null, "valid": false },
+    { "name": "spans request cursor rejects null", "category": "negative", "base": "spansRequest", "operation": "set", "path": ["cursor"], "value": null, "valid": false },
+    { "name": "summary request cursor rejects null", "category": "negative", "base": "summaryRequest", "operation": "set", "path": ["cursor"], "value": null, "valid": false },
+    { "name": "facets request cursor rejects null", "category": "negative", "base": "facetsRequest", "operation": "set", "path": ["cursor"], "value": null, "valid": false },
     { "name": "scope selected trace id is required", "category": "negative", "base": "spansResponse", "operation": "remove", "path": ["scope", "selectedTraceId"], "valid": false },
     { "name": "KPI input tokens are required", "category": "negative", "base": "spansResponse", "operation": "remove", "path": ["work", "kpis", "inputTokens"], "valid": false },
     { "name": "KPI output tokens are required", "category": "negative", "base": "spansResponse", "operation": "remove", "path": ["work", "kpis", "outputTokens"], "valid": false },

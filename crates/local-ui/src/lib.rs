@@ -1,11 +1,18 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
+mod dashboard_request;
+
 use agent_observability_codex_integration::{
     CodexIntegrationStatus, IntegrationError, connect as connect_codex,
     disconnect as disconnect_codex, status as codex_status,
 };
 use agent_observability_contracts::MAX_REPORT_ARTIFACT_BYTES;
+use agent_observability_contracts::dashboard::{
+    DASHBOARD_QUERY_VERSION, DASHBOARD_RESPONSE_MAX_SERIALIZED_UTF8_BYTES, DashboardQueryRequestV1,
+    DashboardQueryResponseV1, DashboardRequestKindV1, DashboardStatusKindV1,
+    DashboardStatusReasonV1, DashboardStatusResponseV1,
+};
 use agent_observability_local_collector::{
     PrivateTurnDetailLookup, REPORT_FILE_NAME, lookup_private_turn_detail,
 };
@@ -13,10 +20,13 @@ use agent_observability_local_runtime::{
     ConfigServiceError, InstalledLayout, LocalConfigService, LocalRuntimeConfigV3, Singleton,
     VersionedLocalConfig,
 };
+use agent_observability_local_store::{DashboardQueryService, LocalStore};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, FromRequest, Path as AxumPath, State, rejection::JsonRejection},
+    extract::{
+        DefaultBodyLimit, FromRequest, Path as AxumPath, RawQuery, State, rejection::JsonRejection,
+    },
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -328,6 +338,10 @@ struct DashboardState {
     origin: String,
     token: String,
     report: PathBuf,
+    paged: bool,
+    query_service: Arc<Mutex<DashboardQueryService>>,
+    query_slots: Arc<Semaphore>,
+    initial_snapshot_failure: Option<DashboardStatusReasonV1>,
     root: PathBuf,
     last_seen: Arc<Mutex<Instant>>,
 }
@@ -430,21 +444,26 @@ pub async fn prepare(layout: &InstalledLayout) -> Result<PreparedUi, UiError> {
 }
 
 pub async fn prepare_dashboard(layout: &InstalledLayout) -> Result<PreparedDashboard, UiError> {
+    prepare_dashboard_with_status(layout, None).await
+}
+
+pub async fn prepare_dashboard_with_status(
+    layout: &InstalledLayout,
+    initial_snapshot_failure: Option<DashboardStatusReasonV1>,
+) -> Result<PreparedDashboard, UiError> {
     let dashboard_singleton = Singleton::acquire(&layout.runtime.join("dashboard-ui"))
         .map_err(|error| UiError::Runtime(error.to_string()))?;
-    prepare_dashboard_path(layout, dashboard_singleton).await
+    prepare_dashboard_path(layout, dashboard_singleton, initial_snapshot_failure).await
 }
 
 async fn prepare_dashboard_path(
     layout: &InstalledLayout,
     dashboard_singleton: Singleton,
+    initial_snapshot_failure: Option<DashboardStatusReasonV1>,
 ) -> Result<PreparedDashboard, UiError> {
-    let path = layout.root.join("logs").join(REPORT_FILE_NAME);
-    let report = path.clone();
-    tokio::task::spawn_blocking(move || validate_private_report(&path))
-        .await
-        .map_err(|_| UiError::Runtime("local dashboard artifact task failed".into()))?
-        .map_err(UiError::DashboardArtifact)?;
+    // The interactive shell must be available even when the manual HTML export is absent
+    // or exceeds its independent size bound. Snapshot availability is a query response.
+    let report = layout.root.join("logs").join(REPORT_FILE_NAME);
     let token = load_or_create_dashboard_token(&layout.runtime.join("dashboard-ui"))?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, dashboard_port(&layout.root))).await?;
     let address = listener.local_addr()?;
@@ -457,6 +476,10 @@ async fn prepare_dashboard_path(
         origin: origin.clone(),
         token: token.clone(),
         report,
+        paged: true,
+        query_service: Arc::new(Mutex::new(dashboard_query_service()?)),
+        query_slots: Arc::new(Semaphore::new(1)),
+        initial_snapshot_failure,
         root: layout.root.clone(),
         last_seen: Arc::clone(&last_seen),
     };
@@ -468,6 +491,12 @@ async fn prepare_dashboard_path(
         last_seen,
         _dashboard_singleton: dashboard_singleton,
     })
+}
+
+fn dashboard_query_service() -> Result<DashboardQueryService, UiError> {
+    let mut secret = [0_u8; 32];
+    getrandom::fill(&mut secret).map_err(|error| UiError::Random(error.to_string()))?;
+    Ok(DashboardQueryService::new(secret))
 }
 
 fn router(state: AppState) -> Router {
@@ -498,6 +527,7 @@ fn router(state: AppState) -> Router {
 fn dashboard_router(state: DashboardState) -> Router {
     Router::new()
         .route("/report/{token}", get(dashboard_document))
+        .route("/report/{token}/query", get(dashboard_query))
         .route(
             "/report/{token}/details/{turn_id}",
             get(dashboard_turn_detail),
@@ -533,11 +563,17 @@ async fn dashboard_document(
         return Err(StatusCode::NOT_FOUND);
     }
     touch_last_seen(&state.last_seen).map_err(|()| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let report = state.report;
-    let html = tokio::task::spawn_blocking(move || read_private_report(&report))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let html = if state.paged {
+        agent_observability_static_report::render_paged_dashboard()
+            .map(String::into_bytes)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        let report = state.report;
+        tokio::task::spawn_blocking(move || read_private_report(&report))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| StatusCode::NOT_FOUND)?
+    };
     let mut response = Body::from(html).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -546,6 +582,102 @@ async fn dashboard_document(
     response
         .headers_mut()
         .insert(DASHBOARD_IDENTITY_HEADER, HeaderValue::from_static("1"));
+    Ok(response)
+}
+
+async fn dashboard_query(
+    State(state): State<DashboardState>,
+    AxumPath(token): AxumPath<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, StatusCode> {
+    if !constant_time_equal(token.as_bytes(), state.token.as_bytes()) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let request =
+        dashboard_request::decode_query(raw.as_deref()).map_err(|()| StatusCode::BAD_REQUEST)?;
+    let kind = match &request {
+        DashboardQueryRequestV1::Bootstrap(_) => DashboardRequestKindV1::Bootstrap,
+        DashboardQueryRequestV1::Traces(_) => DashboardRequestKindV1::Traces,
+        DashboardQueryRequestV1::Spans(_) => DashboardRequestKindV1::Spans,
+        DashboardQueryRequestV1::Summary(_) => DashboardRequestKindV1::Summary,
+        DashboardQueryRequestV1::Span(_) => DashboardRequestKindV1::Span,
+        DashboardQueryRequestV1::Facets(_) => DashboardRequestKindV1::Facets,
+    };
+    let Ok(permit) = state.query_slots.clone().try_acquire_owned() else {
+        return query_response(&query_status(kind, DashboardStatusReasonV1::Busy));
+    };
+    touch_last_seen(&state.last_seen).map_err(|()| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let response = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let Ok(mut service) = state.query_service.try_lock() else {
+            return Ok(query_status(kind, DashboardStatusReasonV1::Busy));
+        };
+        // No migration, repairing projection, or retained authority connection on HTTP reads.
+        let store = match LocalStore::open_report_reader(state.root.join("state/store")) {
+            Ok(store) => store,
+            Err(error) => {
+                return reader_failure_reason(&error).map(|reason| query_status(kind, reason));
+            }
+        };
+        let response = service.query(&store, request);
+        Ok(match (&response, state.initial_snapshot_failure) {
+            (DashboardQueryResponseV1::Status(status), Some(reason))
+                if matches!(
+                    status.reason,
+                    DashboardStatusReasonV1::Building | DashboardStatusReasonV1::RefreshPending
+                ) =>
+            {
+                query_status(kind, reason)
+            }
+            _ => response,
+        })
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    query_response(&response)
+}
+
+fn reader_failure_reason(
+    error: &agent_observability_local_store::StoreError,
+) -> Result<DashboardStatusReasonV1, StatusCode> {
+    if error.is_contention() {
+        return Ok(DashboardStatusReasonV1::Busy);
+    }
+    if matches!(error, agent_observability_local_store::StoreError::Io(error)
+        if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(DashboardStatusReasonV1::RefreshPending);
+    }
+    // Never turn corrupt, insecure or otherwise unreadable storage into a retry loop.
+    Err(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn query_status(
+    kind: DashboardRequestKindV1,
+    reason: DashboardStatusReasonV1,
+) -> DashboardQueryResponseV1 {
+    DashboardQueryResponseV1::Status(DashboardStatusResponseV1 {
+        schema_version: DASHBOARD_QUERY_VERSION.into(),
+        kind: DashboardStatusKindV1::Status,
+        request_kind: kind,
+        reason,
+        snapshot: None,
+    })
+}
+
+fn query_response(response: &DashboardQueryResponseV1) -> Result<Response, StatusCode> {
+    response
+        .validate()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let body = serde_json::to_vec(response).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if body.len() > DASHBOARD_RESPONSE_MAX_SERIALIZED_UTF8_BYTES {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let mut response = Body::from(body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     Ok(response)
 }
 
@@ -982,8 +1114,6 @@ fn launch_or_reuse_dashboard(
     runtime: &Path,
     child_slot: &Mutex<Option<Child>>,
 ) -> Result<String, DashboardOpenError> {
-    validate_private_report(&root.join("logs").join(REPORT_FILE_NAME))
-        .map_err(DashboardOpenError::Artifact)?;
     if let Some(url) = dashboard_url(runtime, root).map_err(DashboardOpenError::Artifact)?
         && dashboard_probe(&url)
     {
@@ -1145,11 +1275,6 @@ fn read_private_report(path: &Path) -> Result<Vec<u8>, DashboardArtifactError> {
 }
 
 #[cfg(unix)]
-fn validate_private_report(path: &Path) -> Result<(), DashboardArtifactError> {
-    open_private_report(path).map(|_| ())
-}
-
-#[cfg(unix)]
 fn open_private_report(path: &Path) -> Result<(fs::File, u64), DashboardArtifactError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -1180,11 +1305,6 @@ fn open_private_report(path: &Path) -> Result<(fs::File, u64), DashboardArtifact
 
 #[cfg(not(unix))]
 fn read_private_report(_path: &Path) -> Result<Vec<u8>, DashboardArtifactError> {
-    Err(DashboardArtifactError::Unsupported)
-}
-
-#[cfg(not(unix))]
-fn validate_private_report(_path: &Path) -> Result<(), DashboardArtifactError> {
     Err(DashboardArtifactError::Unsupported)
 }
 
@@ -1518,8 +1638,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dashboard_launch_api_prepares_and_reuses_without_platform_opener() {
-        use std::os::unix::fs::PermissionsExt;
-
         let _opener_guard = PLATFORM_OPEN_TEST_LOCK.lock().unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1533,11 +1651,15 @@ mod tests {
                 let _ = fs::remove_dir_all(&root);
                 let layout = install(&root).unwrap();
                 let report = layout.root.join("logs").join(REPORT_FILE_NAME);
-                fs::write(&report, b"<!doctype html><title>Private dashboard</title>").unwrap();
-                fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).unwrap();
+                assert!(
+                    !report.exists(),
+                    "interactive launch cannot depend on a full HTML export"
+                );
 
                 let dashboard_server = prepare_dashboard(&layout).await.unwrap();
                 let expected_url = dashboard_server.url().to_owned();
+                assert_dashboard_pending_without_store(&dashboard_server).await;
+                assert!(!report.exists());
                 let dashboard_shutdown = Arc::clone(&dashboard_server.shutdown);
                 let dashboard_task = tokio::spawn(dashboard_server.serve());
                 tokio::task::yield_now().await;
@@ -1606,10 +1728,9 @@ mod tests {
                     );
                     let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
                     let launch: Value = serde_json::from_slice(&body).unwrap();
-                    assert!(
-                        launch["url"]
-                            .as_str()
-                            .is_some_and(|url| url == expected_url),
+                    assert_eq!(
+                        launch["url"].as_str(),
+                        Some(expected_url.as_str()),
                         "launch API must return the prepared dashboard URL"
                     );
                 }
@@ -1623,6 +1744,117 @@ mod tests {
                 dashboard_task.await.unwrap().unwrap();
                 let _ = fs::remove_dir_all(root);
             });
+    }
+
+    #[test]
+    fn dashboard_reader_classifies_absence_without_masking_durable_failures() {
+        use agent_observability_local_store::StoreError;
+        assert_eq!(
+            super::reader_failure_reason(&StoreError::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound
+            ))),
+            Ok(super::DashboardStatusReasonV1::RefreshPending)
+        );
+        for error in [
+            StoreError::SchemaMismatch,
+            StoreError::InsecurePermissions,
+            StoreError::Symlink,
+            StoreError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            StoreError::Io(std::io::Error::from(std::io::ErrorKind::InvalidData)),
+        ] {
+            assert_eq!(
+                super::reader_failure_reason(&error),
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_queries_enforce_scope_and_single_worker_without_creating_store() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let root = std::env::temp_dir().join(format!("agentobs-query-boundary-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            let layout = install(&root).unwrap();
+            let slots = Arc::new(tokio::sync::Semaphore::new(1));
+            let mut permit = Some(Arc::clone(&slots).try_acquire_owned().unwrap());
+            let state = DashboardState {
+                host: "127.0.0.1:43192".into(), origin: "http://127.0.0.1:43192".into(),
+                token: "query-session".into(), report: root.join("absent.html"), paged: true,
+                query_service: Arc::new(Mutex::new(super::DashboardQueryService::new([1; 32]))),
+                query_slots: slots, initial_snapshot_failure: None, root: layout.root.clone(),
+                last_seen: Arc::new(Mutex::new(Instant::now())),
+            };
+            let app = dashboard_router(state);
+            let query = "request=%7B%22schemaVersion%22%3A%22agent_observability.dashboard_query.v1%22%2C%22kind%22%3A%22bootstrap%22%7D";
+            for (method, token, host, origin, encoded, expected) in [
+                ("GET", "wrong", "127.0.0.1:43192", "http://127.0.0.1:43192", query, StatusCode::NOT_FOUND),
+                ("POST", "query-session", "127.0.0.1:43192", "http://127.0.0.1:43192", query, StatusCode::FORBIDDEN),
+                ("GET", "query-session", "localhost:43192", "http://127.0.0.1:43192", query, StatusCode::FORBIDDEN),
+                ("GET", "query-session", "127.0.0.1:43192", "http://example.invalid", query, StatusCode::FORBIDDEN),
+                ("GET", "query-session", "127.0.0.1:43192", "http://127.0.0.1:43192", "request=%", StatusCode::BAD_REQUEST),
+            ] {
+                let response = app.clone().oneshot(Request::builder().method(method)
+                    .uri(format!("/report/{token}/query?{encoded}"))
+                    .header(header::HOST, host).header(header::ORIGIN, origin)
+                    .body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(), expected);
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store, max-age=0");
+            }
+            for expected_reason in ["busy", "refresh_pending"] {
+                let response = app.clone().oneshot(Request::builder()
+                    .uri(format!("/report/query-session/query?{query}"))
+                    .header(header::HOST, "127.0.0.1:43192").body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), 1024).await.unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["reason"], expected_reason);
+                if expected_reason == "busy" { drop(permit.take()); }
+            }
+            assert!(!layout.state.join("store/local-store.sqlite3").exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                drop(super::LocalStore::open(layout.state.join("store")).unwrap());
+                fs::set_permissions(layout.state.join("store/local-store.sqlite3"), fs::Permissions::from_mode(0o644)).unwrap();
+                let response = app.clone().oneshot(Request::builder()
+                    .uri(format!("/report/query-session/query?{query}"))
+                    .header(header::HOST, "127.0.0.1:43192").body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(to_bytes(response.into_body(), 1024).await.unwrap().is_empty());
+            }
+            drop(permit);
+            fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    async fn assert_dashboard_pending_without_store(server: &super::PreparedDashboard) {
+        let local_path = server.url().strip_prefix("http://127.0.0.1:").unwrap();
+        let (port, path) = local_path.split_once('/').unwrap();
+        let host = format!("127.0.0.1:{port}");
+        let query_path = format!(
+            "/{path}/query?request=%7B%22schemaVersion%22%3A%22agent_observability.dashboard_query.v1%22%2C%22kind%22%3A%22bootstrap%22%7D"
+        );
+        let response = server
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(query_path)
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, max-age=0"
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let query: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(query["kind"], "status");
+        assert_eq!(query["reason"], "refresh_pending");
     }
 
     #[test]
@@ -2002,6 +2234,10 @@ mod tests {
                     origin: "http://127.0.0.1:43192".into(),
                     token: "dashboard-session".into(),
                     report: report.clone(),
+                    paged: false,
+                    query_service: Arc::new(Mutex::new(super::DashboardQueryService::new([1; 32]))),
+                    query_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+                    initial_snapshot_failure: None,
                     root: layout.root.clone(),
                     last_seen: Arc::new(Mutex::new(Instant::now())),
                 };

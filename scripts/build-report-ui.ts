@@ -123,7 +123,23 @@ const scriptPattern = /(<script id="report-data"[^>]*>[^<]*<\/script>\s*<script>
 if (!scriptPattern.test(currentShell)) {
   throw new Error(`Unable to locate the generated report UI block in ${shellPath}`);
 }
-await writeFile(shellPath, currentShell.replace(scriptPattern, `$1${reportUi}$2`), "utf8");
+const staticShell = currentShell.replace(scriptPattern, (_match, prefix: string, suffix: string) => `${prefix}${reportUi}${suffix}`);
+await writeFile(shellPath, staticShell, "utf8");
+
+const pagedBundle = "src/report/generated/paged-ui.js";
+await build({
+  entryPoints: ["ui/report/paged-main.ts"],
+  outfile: pagedBundle,
+  bundle: true,
+  format: "iife",
+  platform: "browser",
+  target: ["es2022"],
+  legalComments: "none",
+  banner: { js: "/* Generated from TypeScript and dashboard-query-v1.schema.json. Do not edit. */" },
+});
+const pagedUi = await readFile(pagedBundle, "utf8");
+await writeFile("src/report/generated/paged-shell.html", staticShell.replace(scriptPattern,
+  (_match, prefix: string, suffix: string) => `${prefix}${pagedUi}${suffix}`), "utf8");
 
 await build({
   entryPoints: ["ui/report/view-summary.ts"],

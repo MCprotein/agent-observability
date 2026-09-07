@@ -86,6 +86,29 @@ test("canonical dashboard fixture passes the generated response validator", () =
   assert.equal(validateDashboardQueryResponseV1(fixture), true);
 });
 
+test("request cursors are optional but reject explicit null", () => {
+  const requests = [
+    { schemaVersion, kind: "traces", snapshotId },
+    {
+      schemaVersion,
+      kind: "spans",
+      snapshotId,
+      traceId: `id:sha256:${"b".repeat(64)}`,
+    },
+    { schemaVersion, kind: "summary", snapshotId },
+    { schemaVersion, kind: "facets", snapshotId },
+  ];
+
+  for (const request of requests) {
+    assert.equal(validateDashboardQueryRequestV1(request), true, request.kind);
+    assert.equal(
+      validateDashboardQueryRequestV1({ ...request, cursor: null }),
+      false,
+      request.kind,
+    );
+  }
+});
+
 test("availability reasons use the closed canonical flattened state contract", () => {
   const response = structuredClone(fixture);
   const row = (response.rows as Array<Record<string, unknown>>)[0];

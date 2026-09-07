@@ -7,7 +7,6 @@ use agent_observability_adapter_codex::{
     parse_otlp_http_json_with_state, parse_projected_notify_json, project_notify_json,
     project_notify_with_private_detail,
 };
-use agent_observability_application::ReportProjector;
 #[cfg(test)]
 use agent_observability_application::project_report;
 use agent_observability_contracts::{CollectorDegradationReasonV1, LOCAL_COLLECTOR_HEALTH_VERSION};
@@ -15,7 +14,11 @@ use agent_observability_local_runtime::{
     Admission, InstalledLayout, LocalRuntimeConfigV3, MutationGuard, PressureSample,
     RuntimeControl, Singleton, SingletonError, StorageBudget, inspect, install, load,
 };
-use agent_observability_local_store::{LocalStore, StoreBatchItem};
+use agent_observability_local_store::{
+    LocalStore, MISSING_RATE_FINGERPRINT, ReportViewBuildError, ReportViewCatalogError,
+    StoreBatchItem, current_report_view, publish_report_view, recover_report_view_catalog,
+};
+#[cfg(test)]
 use agent_observability_static_report::write_private;
 use axum::{
     Router,
@@ -79,6 +82,7 @@ const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
 const MAX_CREDENTIAL_PATH_BYTES: usize = 256;
 static SETTINGS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const REPORT_DIRTY_FILE_NAME: &str = "report-dirty";
+const MAX_AUTOMATIC_REPORT_VIEW_BYTES: u64 = 128 * 1024 * 1024;
 const PRIVATE_TURN_DETAIL_DIRECTORY: &str = "private-codex-turn-details";
 const PRIVATE_TURN_DETAIL_STATUS_DIRECTORY: &str = "private-codex-turn-detail-statuses";
 const PRIVATE_TURN_DETAIL_STATUS_VERSION: &str = "private_codex_turn_detail_status.v1";
@@ -309,6 +313,7 @@ impl PrivateTurnDetailReceiptV1 {
 #[derive(Debug)]
 pub enum CollectorError {
     LifecycleStoragePressure,
+    DashboardStorageCapacity,
     Io(std::io::Error),
     RequestIo {
         stage: &'static str,
@@ -1222,6 +1227,9 @@ impl std::fmt::Display for CollectorError {
             Self::LifecycleStoragePressure => {
                 formatter.write_str("lifecycle temporary storage headroom unavailable")
             }
+            Self::DashboardStorageCapacity => {
+                formatter.write_str("dashboard snapshot storage headroom unavailable")
+            }
             Self::Io(error) => write!(formatter, "local collector I/O error: {error}"),
             Self::RequestIo { stage, source } => {
                 write!(formatter, "local collector {stage} I/O error: {source}")
@@ -1235,7 +1243,9 @@ impl std::error::Error for CollectorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) | Self::RequestIo { source: error, .. } => Some(error),
-            Self::Runtime(_) | Self::LifecycleStoragePressure => None,
+            Self::Runtime(_) | Self::LifecycleStoragePressure | Self::DashboardStorageCapacity => {
+                None
+            }
         }
     }
 }
@@ -1360,7 +1370,6 @@ enum ReportFailure {
     Task,
     Install,
     OpenStore,
-    Clock,
     RenderGuard,
     Snapshot,
     // Preserve the v1 public stage code; distinguish transient contention internally without
@@ -1369,6 +1378,8 @@ enum ReportFailure {
     SnapshotChanged,
     Projection,
     Publish,
+    #[serde(rename = "publish")]
+    Capacity,
     Acknowledge,
     Status,
 }
@@ -1452,8 +1463,9 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let config = load(&layout.config).map_err(runtime_error)?;
     maintain_private_turn_details_locked(&layout, &config, SystemTime::now())?;
     let store = open_store(&mutation, &layout, &config)?;
+    recover_report_view_catalog_for_startup(&store)?;
     let report_status = store.report_status().map_err(runtime_error)?;
-    let report_missing = !layout.logs.join(REPORT_FILE_NAME).is_file();
+    let report_missing = automatic_report_view_missing(&store)?;
     let report_wakeup = reconcile_report_state(&layout, report_status.pending() || report_missing);
     let report_dirty = report_status.pending() || report_missing;
     let source_generation = SOURCE_GENERATION.to_owned();
@@ -2112,9 +2124,10 @@ impl IngestError {
             Self::Invalid(CollectorError::Runtime(_)) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Busy | Self::Pressure => StatusCode::SERVICE_UNAVAILABLE,
             Self::Policy => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::Storage | Self::Invalid(CollectorError::LifecycleStoragePressure) => {
-                StatusCode::INSUFFICIENT_STORAGE
-            }
+            Self::Storage
+            | Self::Invalid(
+                CollectorError::LifecycleStoragePressure | CollectorError::DashboardStorageCapacity,
+            ) => StatusCode::INSUFFICIENT_STORAGE,
         }
     }
 
@@ -2388,7 +2401,7 @@ pub fn maintain_storage_lifecycle(root: &Path) -> Result<String, CollectorError>
     if headroom < preflight.required_temporary_bytes {
         return Err(CollectorError::LifecycleStoragePressure);
     }
-    let Some(_render_guard) = store
+    let Some(render_guard) = store
         .try_acquire_report_render_guard()
         .map_err(runtime_error)?
     else {
@@ -2398,7 +2411,9 @@ pub fn maintain_storage_lifecycle(root: &Path) -> Result<String, CollectorError>
     agent_observability_static_report::write_refresh_pending(&layout.logs.join(REPORT_FILE_NAME))
         .map_err(runtime_error)?;
     mark_report_dirty(&layout)?;
-    let result = store.maintain_lifecycle(request).map_err(runtime_error)?;
+    let result = store
+        .maintain_lifecycle_guarded(request, render_guard)
+        .map_err(runtime_error)?;
     let status = if result.blocked > 0 {
         "blocked"
     } else {
@@ -2633,31 +2648,34 @@ async fn run_report_refresh_attempt(
         .fetch_add(1, Ordering::Release);
     #[cfg(test)]
     let snapshot_test = Arc::clone(&state.report_snapshot_test);
-    let started = StdInstant::now();
     let result = tokio::task::spawn_blocking(move || {
+        let started = StdInstant::now();
         #[cfg(not(test))]
         {
-            refresh_report_from_root(&root)
+            (refresh_report_from_root(&root), started.elapsed())
         }
         #[cfg(test)]
         {
-            refresh_report_from_root_observing(&root, |index| {
-                if index == 0 {
-                    snapshot_test.started.store(true, Ordering::Release);
-                    std::thread::sleep(Duration::from_millis(
-                        snapshot_test.delay_ms.load(Ordering::Acquire),
-                    ));
-                }
-            })
+            (
+                refresh_report_from_root_observing(&root, |index| {
+                    if index == 0 {
+                        snapshot_test.started.store(true, Ordering::Release);
+                        std::thread::sleep(Duration::from_millis(
+                            snapshot_test.delay_ms.load(Ordering::Acquire),
+                        ));
+                    }
+                }),
+                started.elapsed(),
+            )
         }
     })
     .await;
-    let (published, failure) = match result {
-        Ok(Ok(published)) => (Some(published), None),
-        Ok(Err(failure)) => (None, Some(failure)),
-        Err(_) => (None, Some(ReportFailure::Task)),
+    let (published, failure, attempt_duration) = match result {
+        Ok((Ok(published), attempt_duration)) => (Some(published), None, attempt_duration),
+        Ok((Err(failure), attempt_duration)) => (None, Some(failure), attempt_duration),
+        Err(_) => (None, Some(ReportFailure::Task), Duration::ZERO),
     };
-    (published, failure, started.elapsed())
+    (published, failure, attempt_duration)
 }
 
 fn contention_quiet_period(previous: Duration, attempt: Duration) -> Duration {
@@ -2742,15 +2760,46 @@ fn refresh_report_from_root(root: &Path) -> Result<bool, ReportFailure> {
     refresh_report_from_root_observing(root, |_| {})
 }
 
+/// Builds and publishes the bounded immutable dashboard snapshot for a prepared local store.
+///
+/// The caller remains responsible for initializing or migrating the store under the CLI/runtime
+/// mutation guard. Concurrent publication and source-generation drift are retryable and return
+/// `Ok(false)`; storage-capacity rejection and other durable failures remain explicit errors.
+pub fn refresh_dashboard_snapshot(root: &Path) -> Result<bool, CollectorError> {
+    match refresh_report_from_root(root) {
+        Ok(published) => Ok(published),
+        Err(ReportFailure::RenderGuard | ReportFailure::SnapshotChanged) => Ok(false),
+        Err(ReportFailure::Capacity) => Err(CollectorError::DashboardStorageCapacity),
+        Err(error) => Err(CollectorError::Runtime(format!(
+            "dashboard snapshot refresh failed at {}",
+            report_failure_stage(error)
+        ))),
+    }
+}
+
+const fn report_failure_stage(error: ReportFailure) -> &'static str {
+    match error {
+        ReportFailure::Task => "task",
+        ReportFailure::Install => "install",
+        ReportFailure::OpenStore => "open_store",
+        ReportFailure::RenderGuard => "render_guard",
+        ReportFailure::Snapshot | ReportFailure::SnapshotChanged => "snapshot",
+        ReportFailure::Projection => "projection",
+        ReportFailure::Publish | ReportFailure::Capacity => "publish",
+        ReportFailure::Acknowledge => "acknowledge",
+        ReportFailure::Status => "status",
+    }
+}
+
 fn refresh_report_from_root_observing(
     root: &Path,
     on_record: impl FnMut(usize),
 ) -> Result<bool, ReportFailure> {
     let layout = install(root).map_err(|_| ReportFailure::Install)?;
+    let config = load(&layout.config).map_err(|_| ReportFailure::Install)?;
     let store = LocalStore::open_current(layout.state.join("store"))
         .map_err(|_| ReportFailure::OpenStore)?;
-    let now_unix_ms = current_unix_ms().map_err(|_| ReportFailure::Clock)?;
-    refresh_report_observing(&layout, &store, now_unix_ms, on_record)
+    refresh_report_observing(&layout, &store, &config, on_record)
 }
 
 /// Projects and sends a raw notify argument with bounded foreground deadlines.
@@ -3246,7 +3295,9 @@ fn maintain_private_turn_directory_locked(
 
 fn private_turn_detail_error_code(error: &CollectorError) -> &'static str {
     match error {
-        CollectorError::LifecycleStoragePressure => "storage_budget",
+        CollectorError::LifecycleStoragePressure | CollectorError::DashboardStorageCapacity => {
+            "storage_budget"
+        }
         CollectorError::Runtime(message) if message.contains("conflict") => "conflict",
         CollectorError::Runtime(message) if message.contains("storage budget") => "storage_budget",
         CollectorError::Runtime(message) if message.contains("already running") => "busy",
@@ -3670,43 +3721,118 @@ fn parse_complete_http_response(
 fn refresh_report_observing(
     layout: &InstalledLayout,
     store: &LocalStore,
-    now_unix_ms: u64,
-    mut on_record: impl FnMut(usize),
+    config: &LocalRuntimeConfigV3,
+    on_record: impl FnMut(usize),
 ) -> Result<bool, ReportFailure> {
-    let _render_guard = store
-        .acquire_report_render_guard()
-        .map_err(|_| ReportFailure::RenderGuard)?;
-    let capacity = usize::try_from(store.record_count().map_err(|_| ReportFailure::Snapshot)?)
-        .map_err(|_| ReportFailure::Snapshot)?;
-    let mut projector = ReportProjector::new(capacity, None);
-    let mut projection_failure = false;
-    let visit = store
-        .visit_report_snapshot(|index, record| {
-            on_record(index);
-            if !projection_failure && projector.push_owned(index, record).is_err() {
-                projection_failure = true;
-            }
-        })
-        .map_err(|error| match error {
-            agent_observability_local_store::StoreError::ReportSnapshotChanged => {
-                ReportFailure::SnapshotChanged
-            }
-            _ => ReportFailure::Snapshot,
-        })?;
-    if projection_failure {
-        return Err(ReportFailure::Projection);
+    let admitted_bytes = automatic_report_view_admitted_bytes(layout, config)?;
+    let staging = build_automatic_report_view_staging(store, admitted_bytes, on_record)?;
+    let publication = publish_report_view(store, staging).map_err(report_catalog_failure)?;
+    if publication.cleanup_pending() {
+        return Err(ReportFailure::Publish);
     }
-    let report = projector
-        .finish(
-            timestamp_from_unix_ms(now_unix_ms).map_err(|_| ReportFailure::Projection)?,
-            "Agent Observability Report",
-        )
-        .map_err(|_| ReportFailure::Projection)?;
-    write_private(&layout.logs.join(REPORT_FILE_NAME), &report)
-        .map_err(|_| ReportFailure::Publish)?;
     store
-        .acknowledge_report_generation(visit.generation)
+        .acknowledge_report_generation(publication.current().generation())
         .map_err(|_| ReportFailure::Acknowledge)
+}
+
+fn automatic_report_view_missing(store: &LocalStore) -> Result<bool, CollectorError> {
+    match current_report_view(store) {
+        Ok(view) => Ok(view.is_none()),
+        // A staging build or destructive pass already owns publication. Start normally and let
+        // the existing adaptive refresh scheduler converge after that bounded operation ends.
+        Err(ReportViewCatalogError::Busy) => Ok(true),
+        Err(error) => Err(runtime_error(error)),
+    }
+}
+
+fn recover_report_view_catalog_for_startup(store: &LocalStore) -> Result<(), CollectorError> {
+    recover_report_view_catalog(store).map_err(runtime_error)
+}
+
+fn automatic_report_view_admitted_bytes(
+    layout: &InstalledLayout,
+    config: &LocalRuntimeConfigV3,
+) -> Result<u64, ReportFailure> {
+    // Runtime accounting covers the entire managed tree, including current/retired/staging
+    // sidecars. The builder keeps its SQLite journal reserve inside this per-generation amount.
+    RuntimeControl::new(config)
+        .map_err(|_| ReportFailure::Publish)?
+        .migration_headroom(&layout.root)
+        .map_err(|_| ReportFailure::Publish)
+        .map(|headroom| headroom.min(MAX_AUTOMATIC_REPORT_VIEW_BYTES))
+}
+
+#[cfg(not(test))]
+fn build_automatic_report_view_staging(
+    store: &LocalStore,
+    admitted_bytes: u64,
+    _on_record: impl FnMut(usize),
+) -> Result<agent_observability_local_store::ReportViewStaging, ReportFailure> {
+    agent_observability_local_store::build_report_view_staging(
+        store,
+        MISSING_RATE_FINGERPRINT,
+        admitted_bytes,
+        None,
+    )
+    .map_err(|error| report_view_build_failure(&error))
+}
+
+#[cfg(test)]
+fn build_automatic_report_view_staging(
+    store: &LocalStore,
+    admitted_bytes: u64,
+    on_record: impl FnMut(usize),
+) -> Result<agent_observability_local_store::ReportViewStaging, ReportFailure> {
+    agent_observability_local_store::build_report_view_staging_observing(
+        store,
+        MISSING_RATE_FINGERPRINT,
+        admitted_bytes,
+        None,
+        on_record,
+    )
+    .map_err(|error| report_view_build_failure(&error))
+}
+
+fn report_view_build_failure(error: &ReportViewBuildError) -> ReportFailure {
+    match error {
+        ReportViewBuildError::Busy => ReportFailure::RenderGuard,
+        ReportViewBuildError::SnapshotChanged
+        | ReportViewBuildError::Store(
+            agent_observability_local_store::StoreError::ReportSnapshotChanged,
+        ) => ReportFailure::SnapshotChanged,
+        ReportViewBuildError::Store(
+            agent_observability_local_store::StoreError::ReportSnapshotRecordTooLarge { .. },
+        ) => ReportFailure::Capacity,
+        ReportViewBuildError::Store(_) => ReportFailure::Snapshot,
+        ReportViewBuildError::Projection(_) | ReportViewBuildError::Json(_) => {
+            ReportFailure::Projection
+        }
+        ReportViewBuildError::Sqlite(_)
+        | ReportViewBuildError::Io(_)
+        | ReportViewBuildError::InvalidRateFingerprint
+        | ReportViewBuildError::InvalidStagingState => ReportFailure::Publish,
+        ReportViewBuildError::InvalidByteBudget | ReportViewBuildError::CapacityExceeded => {
+            ReportFailure::Capacity
+        }
+    }
+}
+
+fn report_catalog_failure(error: ReportViewCatalogError) -> ReportFailure {
+    match error {
+        ReportViewCatalogError::Busy => ReportFailure::RenderGuard,
+        ReportViewCatalogError::SnapshotChanged => ReportFailure::SnapshotChanged,
+        ReportViewCatalogError::Store(_) => ReportFailure::Snapshot,
+        ReportViewCatalogError::Build(error) => report_view_build_failure(&error),
+        ReportViewCatalogError::Sqlite(_)
+        | ReportViewCatalogError::Json(_)
+        | ReportViewCatalogError::Io(_)
+        | ReportViewCatalogError::SourceMismatch
+        | ReportViewCatalogError::SnapshotExpired
+        | ReportViewCatalogError::RefreshPending
+        | ReportViewCatalogError::InvalidCatalog
+        | ReportViewCatalogError::CatalogCapacityExceeded
+        | ReportViewCatalogError::InvalidVisibilityAdvance => ReportFailure::Publish,
+    }
 }
 
 fn open_store(
@@ -3755,6 +3881,7 @@ fn current_unix_ms() -> Result<u64, CollectorError> {
         .map_err(|_| CollectorError::Runtime("system clock is out of range".into()))
 }
 
+#[cfg(test)]
 fn timestamp_from_unix_ms(unix_ms: u64) -> Result<String, CollectorError> {
     let seconds = i64::try_from(unix_ms / 1_000)
         .map_err(|_| CollectorError::Runtime("system clock is out of range".into()))?;
@@ -3770,6 +3897,7 @@ fn timestamp_from_unix_ms(unix_ms: u64) -> Result<String, CollectorError> {
     ))
 }
 
+#[cfg(test)]
 fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     let days = days_since_epoch + 719_468;
     let era = days / 146_097;
@@ -3851,8 +3979,15 @@ mod tests {
         config.lifecycle.enabled = true;
         save(&guard, &config).unwrap();
         drop(guard);
-        assert!(refresh_report_from_root(&root).unwrap());
         let report_path = layout.logs.join(REPORT_FILE_NAME);
+        let report = project_report(
+            &[],
+            "2026-09-07T00:00:00.000Z",
+            "Agent Observability Report",
+            None,
+        )
+        .unwrap();
+        write_private(&report_path, &report).unwrap();
         let before = fs::read(&report_path).unwrap();
         assert_eq!(
             super::maintain_storage_lifecycle(&root).unwrap(),
@@ -3981,6 +4116,15 @@ mod tests {
         ingest_locked(&mut state, body).unwrap();
         assert_eq!(state.store.record_count().unwrap(), 1);
         refresh_report_from_root(&root).unwrap();
+        let snapshot = state.store.report_snapshot().unwrap();
+        let report = project_report(
+            &snapshot.records,
+            "2026-09-07T00:00:00.000Z",
+            "Agent Observability Report",
+            None,
+        )
+        .unwrap();
+        write_private(&layout.logs.join(REPORT_FILE_NAME), &report).unwrap();
         let config_guard = ConfigMutationGuard::acquire(&layout).unwrap();
         let mut config = load(&layout.config).unwrap();
         config.lifecycle.enabled = true;
@@ -4007,6 +4151,7 @@ mod tests {
         assert!(state.store.report_status().unwrap().pending());
         refresh_report_from_root(&root).unwrap();
         assert!(!state.store.report_status().unwrap().pending());
+        assert_published_report_view(&root, 0);
         ingest_notify_locked(
             &mut state,
             &projected_notify("old-lifecycle-trace", "new-after-expiry"),
@@ -4052,13 +4197,13 @@ mod tests {
     }
 
     use super::{
-        AUTH_HEADER_NAME, AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome,
-        OtlpRejectionCategory, OtlpRequestCorrelationState, OtlpSubmissionOutcome,
-        PrivateTurnDetailLookup, REPORT_FILE_NAME, ReportFailure, admit_request,
-        authenticated_request, build_client_config, build_server_config,
-        capture_private_turn_detail, capture_private_turn_detail_if_enabled,
-        capture_private_turn_detail_locked, classify_otlp_rejection, enforce_batch_policy,
-        ensure_private_directory_tree, ingest_locked, ingest_notify_locked,
+        AUTH_HEADER_NAME, AppState, CollectorState, IngestError, IngestOutcome, LocalStore,
+        MISSING_RATE_FINGERPRINT, NotifyOutcome, OtlpRejectionCategory,
+        OtlpRequestCorrelationState, OtlpSubmissionOutcome, PrivateTurnDetailLookup,
+        REPORT_FILE_NAME, ReportFailure, admit_request, authenticated_request, build_client_config,
+        build_server_config, capture_private_turn_detail, capture_private_turn_detail_if_enabled,
+        capture_private_turn_detail_locked, classify_otlp_rejection, current_report_view,
+        enforce_batch_policy, ensure_private_directory_tree, ingest_locked, ingest_notify_locked,
         ingest_notify_with_private_detail, install_settings, is_json, load_settings,
         lookup_private_turn_detail, maintain_private_turn_details_locked, open_store,
         parse_complete_http_response, persist_private_turn_detail,
@@ -4067,6 +4212,7 @@ mod tests {
         private_turn_detail_status_directory, private_turn_detail_status_path, project_report,
         prune_private_turn_details_with_limit, read_private_snapshot, read_private_turn_detail,
         read_private_turn_detail_status, reconcile_report_state, recover_occupied_persisted_port,
+        recover_report_view_catalog_for_startup, refresh_dashboard_snapshot,
         refresh_report_from_root, report_dirty_path, router, schedule_report_refresh,
         settings_path, submit_notify, submit_otlp_json_outcome, timestamp_from_unix_ms,
         token_matches, watch_report_authority, write_private, write_private_json,
@@ -4103,12 +4249,12 @@ mod tests {
             (ReportFailure::Task, "\"task\""),
             (ReportFailure::Install, "\"install\""),
             (ReportFailure::OpenStore, "\"open_store\""),
-            (ReportFailure::Clock, "\"clock\""),
             (ReportFailure::RenderGuard, "\"render_guard\""),
             (ReportFailure::Snapshot, "\"snapshot\""),
             (ReportFailure::SnapshotChanged, "\"snapshot\""),
             (ReportFailure::Projection, "\"projection\""),
             (ReportFailure::Publish, "\"publish\""),
+            (ReportFailure::Capacity, "\"publish\""),
             (ReportFailure::Acknowledge, "\"acknowledge\""),
             (ReportFailure::Status, "\"status\""),
         ] {
@@ -4121,6 +4267,17 @@ mod tests {
             "agent-observability-collector-{name}-{}",
             std::process::id()
         ))
+    }
+
+    fn assert_published_report_view(root: &Path, expected_records: usize) {
+        let store = LocalStore::open_current(root.join("state/store")).unwrap();
+        let snapshot = current_report_view(&store).unwrap().unwrap();
+        assert_eq!(snapshot.records(), expected_records);
+        assert_eq!(snapshot.rate_fingerprint(), MISSING_RATE_FINGERPRINT);
+        assert_eq!(
+            snapshot.generation(),
+            store.report_status().unwrap().acknowledged_generation
+        );
     }
 
     #[test]
@@ -4319,6 +4476,134 @@ mod tests {
         assert!(refresh_report_from_root(&root).unwrap());
 
         drop(guard);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn automatic_report_refresh_publishes_a_readable_empty_index() {
+        let root = test_root("empty-index-publication");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        let config = load(&state.layout.config).unwrap();
+        let admitted = super::automatic_report_view_admitted_bytes(&state.layout, &config).unwrap();
+        assert!(admitted > 0);
+        assert!(admitted <= super::MAX_AUTOMATIC_REPORT_VIEW_BYTES);
+        drop(state);
+
+        assert!(super::refresh_dashboard_snapshot(&root).unwrap());
+        assert_published_report_view(&root, 0);
+        assert!(!root.join("logs").join(REPORT_FILE_NAME).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collector_startup_recovers_interrupted_report_view_files_before_catalog_read() {
+        let root = test_root("startup-report-view-recovery");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        let published = current_report_view(&state.store).unwrap().unwrap();
+        let orphan = root
+            .join("state/store/report-views.v1")
+            .join(".report-view.sqlite3.staging.interrupted");
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut interrupted = options.open(&orphan).unwrap();
+        interrupted.write_all(b"interrupted").unwrap();
+        interrupted.sync_all().unwrap();
+        drop(interrupted);
+
+        recover_report_view_catalog_for_startup(&state.store).unwrap();
+
+        assert!(!orphan.exists());
+        assert_eq!(current_report_view(&state.store).unwrap(), Some(published));
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn standalone_dashboard_refresh_reports_busy_as_retryable() {
+        let root = test_root("standalone-dashboard-busy");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        let guard = state.store.acquire_report_render_guard().unwrap();
+
+        assert!(!super::refresh_dashboard_snapshot(&root).unwrap());
+        assert!(current_report_view(&state.store).is_err());
+
+        drop(guard);
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn standalone_dashboard_capacity_mapping_remains_typed() {
+        assert_eq!(
+            super::report_view_build_failure(
+                &agent_observability_local_store::ReportViewBuildError::InvalidByteBudget
+            ),
+            ReportFailure::Capacity
+        );
+        assert_eq!(
+            super::CollectorError::DashboardStorageCapacity.to_string(),
+            "dashboard snapshot storage headroom unavailable"
+        );
+    }
+
+    #[test]
+    fn standalone_dashboard_refresh_maps_oversized_authority_record_to_capacity() {
+        let root = test_root("standalone-dashboard-oversized-authority-record");
+        let _ = fs::remove_dir_all(&root);
+        let mut state = collector_state(&root);
+        let body = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{
+          "timeUnixNano":"1787875200000000000",
+          "attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},
+            {"key":"conversation.id","value":{"stringValue":"conversation-capacity"}},
+            {"key":"model","value":{"stringValue":"gpt-5.6-sol"}}
+          ]
+        }]}]}]}"#;
+        let (batch, _) = parse_otlp_http_json(body, "codex-test", None, 1, 0).unwrap();
+        let mut observation = match batch.items.into_iter().next().unwrap() {
+            agent_observability_adapter_codex::AdapterItem::Observation(observation) => observation,
+            agent_observability_adapter_codex::AdapterItem::Disposition(_) => {
+                panic!("conversation start must produce an authority observation")
+            }
+        };
+        observation.event = agent_observability_contracts::ObservationEvent::Session {
+            model: Some(format!("gpt-5.6-sol-{}", "x".repeat(2 * 1024 * 1024))),
+            project: Some("agent-observability".to_owned()),
+        };
+        state.store.ingest(&observation).unwrap();
+        let record = state.store.current_records().unwrap().pop().unwrap();
+        assert!(serde_json::to_vec(&record).unwrap().len() > 2 * 1024 * 1024);
+        drop(state);
+
+        assert!(matches!(
+            refresh_dashboard_snapshot(&root),
+            Err(super::CollectorError::DashboardStorageCapacity)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn standalone_dashboard_refresh_keeps_ordinary_failures_as_errors() {
+        let root = test_root("standalone-dashboard-ordinary-error");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        assert!(!layout.state.join("store").exists());
+
+        assert!(matches!(
+            refresh_dashboard_snapshot(&root),
+            Err(super::CollectorError::Runtime(message))
+                if message == "dashboard snapshot refresh failed at open_store"
+        ));
+        assert!(!layout.state.join("store").exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -5587,6 +5872,7 @@ mod tests {
                     .any(|part| part == b"RAW_OUTPUT_SECRET")
             );
         });
+        drop(runtime);
         refresh_report_from_root(&root).unwrap();
         fs::remove_dir_all(layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY)).unwrap();
         fs::remove_dir_all(private_turn_detail_status_directory(&layout)).unwrap();
@@ -6904,14 +7190,8 @@ mod tests {
 
         assert_eq!(state.last_cursor.as_deref(), Some("3"));
         assert_eq!(state.store.counts().unwrap().0, 2);
-        let report = layout.logs.join(REPORT_FILE_NAME);
-        assert!(report.is_file());
-        let html = fs::read_to_string(report).unwrap();
-        assert!(html.contains("Agent Observability Report"));
-        assert!(!html.contains("conversation-1"));
-        assert!(!html.contains("SECRET_PROMPT"));
-        assert!(!html.contains("SECRET_OUTPUT"));
-        assert!(!html.contains("SECRET_PATH"));
+        assert_published_report_view(&root, 2);
+        assert!(!layout.logs.join(REPORT_FILE_NAME).exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7211,8 +7491,7 @@ mod tests {
             .unwrap();
             assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 1);
         });
-        let html = fs::read_to_string(root.join("logs").join(REPORT_FILE_NAME)).unwrap();
-        assert!(html.contains(r#""generatedSpans":10"#));
+        assert_published_report_view(&root, 10);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7295,8 +7574,7 @@ mod tests {
                 attempts
             );
         });
-        let html = fs::read_to_string(root.join("logs").join(REPORT_FILE_NAME)).unwrap();
-        assert!(html.contains(r#""generatedSpans":9"#));
+        assert_published_report_view(&root, 9);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7366,8 +7644,7 @@ mod tests {
             assert_eq!(collector.store.record_count().unwrap(), 2);
         });
 
-        let html = fs::read_to_string(root.join("logs").join(REPORT_FILE_NAME)).unwrap();
-        assert!(html.contains(r#""generatedSpans":2"#));
+        assert_published_report_view(&root, 2);
         assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 2);
         let _ = fs::remove_dir_all(root);
     }
@@ -7377,8 +7654,8 @@ mod tests {
         let root = test_root("report-retry");
         let _ = fs::remove_dir_all(&root);
         let state = app_state(&root);
-        let report = root.join("logs").join(REPORT_FILE_NAME);
-        fs::create_dir(&report).unwrap();
+        let report_views = root.join("state/store/report-views.v1");
+        fs::write(&report_views, b"occupied").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -7400,20 +7677,18 @@ mod tests {
                     .unwrap();
             }
             schedule_report_refresh(&state);
-            fs::remove_dir(&report).unwrap();
+            fs::remove_file(&report_views).unwrap();
 
             for _ in 0..100 {
-                if report.is_file() && !state.report_refresh_scheduled.load(Ordering::Acquire) {
+                if !state.report_refresh_scheduled.load(Ordering::Acquire) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            assert!(report.is_file());
             assert!(!state.report_refresh_scheduled.load(Ordering::Acquire));
         });
 
-        let html = fs::read_to_string(&report).unwrap();
-        assert!(html.contains(r#""generatedSpans":2"#));
+        assert_published_report_view(&root, 2);
         assert!(!report_dirty_path(&state.collector.blocking_lock().layout).exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -7451,9 +7726,14 @@ mod tests {
 
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
+                    let published = {
+                        let collector = state.collector.lock().await;
+                        current_report_view(&collector.store)
+                            .is_ok_and(|view| view.is_some_and(|view| view.records() == 1))
+                    };
                     if state.report_refresh_attempts.load(Ordering::Acquire) > 0
                         && !state.report_refresh_scheduled.load(Ordering::Acquire)
-                        && root.join("logs").join(REPORT_FILE_NAME).is_file()
+                        && published
                     {
                         break;
                     }
@@ -7475,8 +7755,7 @@ mod tests {
                     .pending()
             );
         });
-        let html = fs::read_to_string(root.join("logs").join(REPORT_FILE_NAME)).unwrap();
-        assert!(html.contains(r#""generatedSpans":1"#));
+        assert_published_report_view(&root, 1);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7528,10 +7807,11 @@ mod tests {
 
         assert!(refresh_report_from_root(&root).unwrap());
         assert!(!collector.store.report_status().unwrap().pending());
+        assert_published_report_view(&root, 2);
         assert!(
             fs::read_to_string(&report_path)
                 .unwrap()
-                .contains(r#""generatedSpans":2"#)
+                .contains(r#""generatedSpans":1"#)
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -7550,21 +7830,17 @@ mod tests {
         let projection = collector.layout.state.join("store/observations.jsonl");
         assert!(!projection.exists());
         let refresh_root = root.clone();
-        let refresh = thread::spawn(move || refresh_report_from_root(&refresh_root));
+        let refresh = thread::spawn(move || refresh_dashboard_snapshot(&refresh_root));
 
-        thread::sleep(Duration::from_millis(50));
+        assert!(!refresh.join().unwrap().unwrap());
         assert!(!projection.exists());
         drop(render_guard);
-        assert!(refresh.join().unwrap().unwrap());
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
         drop(mutation);
         assert!(!projection.exists());
         assert_eq!(collector.store.record_count().unwrap(), 1);
         assert!(!collector.store.report_status().unwrap().pending());
-        assert!(
-            fs::read_to_string(collector.layout.logs.join(REPORT_FILE_NAME))
-                .unwrap()
-                .contains(r#""generatedSpans":1"#)
-        );
+        assert_published_report_view(&root, 1);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7584,11 +7860,7 @@ mod tests {
 
             assert!(refresh_report_from_root(&root).unwrap());
             assert!(!collector.store.report_status().unwrap().pending());
-            let html = fs::read_to_string(collector.layout.logs.join(REPORT_FILE_NAME)).unwrap();
-            assert!(
-                html.contains(&format!(r#""generatedSpans":{count}"#)),
-                "report did not preserve the {count}-record boundary"
-            );
+            assert_published_report_view(&root, count);
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -7636,7 +7908,8 @@ mod tests {
             assert!(!collector.report_dirty);
             assert!(!collector.report_degraded);
         });
-        assert!(root.join("logs").join(REPORT_FILE_NAME).is_file());
+        assert_published_report_view(&root, 1);
+        assert!(!root.join("logs").join(REPORT_FILE_NAME).exists());
         assert!(!report_dirty_path(&install(&root).unwrap()).exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -7672,9 +7945,14 @@ mod tests {
             ));
             drop(reopened);
             assert!(refresh_report_from_root(&root).unwrap());
-            let restored = fs::read_to_string(layout.logs.join(REPORT_FILE_NAME)).unwrap();
-            assert!(restored.contains("Agent Observability Report"));
-            assert!(!restored.contains("리포트 갱신 대기"));
+            assert_published_report_view(&root, 0);
+            if replace_html {
+                assert!(
+                    fs::read_to_string(layout.logs.join(REPORT_FILE_NAME))
+                        .unwrap()
+                        .contains("리포트 갱신 대기")
+                );
+            }
             let reopened = collector_state(&root);
             assert!(!reopened.store.report_status().unwrap().pending());
             drop(reopened);
@@ -7687,8 +7965,8 @@ mod tests {
         let root = test_root("report-persistent-failure");
         let _ = fs::remove_dir_all(&root);
         let state = app_state(&root);
-        let report = root.join("logs").join(REPORT_FILE_NAME);
-        fs::create_dir(&report).unwrap();
+        let report_views = root.join("state/store/report-views.v1");
+        fs::write(&report_views, b"occupied").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -7735,7 +8013,7 @@ mod tests {
                 generation,
                 Duration::from_millis(10),
             ));
-            fs::remove_dir(&report).unwrap();
+            fs::remove_file(&report_views).unwrap();
             assert!(refresh_report_from_root(&root).unwrap());
             tokio::time::timeout(Duration::from_secs(1), async {
                 loop {
@@ -7761,6 +8039,7 @@ mod tests {
             assert_eq!(health["report_dirty"], false);
             assert_eq!(health["report_refresh_failures"], 0);
         });
+        assert_published_report_view(&root, 1);
         assert!(!report_dirty_path(&install(&root).unwrap()).exists());
         let _ = fs::remove_dir_all(root);
     }

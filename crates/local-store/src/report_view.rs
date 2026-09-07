@@ -72,10 +72,6 @@ CREATE INDEX spans_agent_order_idx
     ON spans(agent, start_time_unix_ms, trace_id, span_id);
 CREATE INDEX spans_model_order_idx
     ON spans(model, start_time_unix_ms, trace_id, span_id);
-CREATE INDEX spans_kind_order_idx
-    ON spans(kind, start_time_unix_ms, trace_id, span_id);
-CREATE INDEX spans_status_order_idx
-    ON spans(status, start_time_unix_ms, trace_id, span_id);
 ";
 
 /// Failure while constructing a private report-view staging database.
@@ -836,6 +832,14 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(columns, ["trace_id", "start_time_unix_ms", "span_id"]);
+        let unused_indexes: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('spans_kind_order_idx','spans_status_order_idx')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            unused_indexes, 0,
+            "unqueried indexes must not consume the bounded snapshot budget"
+        );
     }
 
     fn projected_turn(connection: &Connection) -> (String, ReportSpanV2) {

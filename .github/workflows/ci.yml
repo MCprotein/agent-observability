@@ -86,6 +86,8 @@ jobs:
         run: npm ci
       - name: Run report UI checks
         run: npm test
+      - name: Verify paged dashboard against the candidate Rust server
+        run: npm run test:paged-dashboard-browser
 
   automatic-release-evidence:
     name: Exact-revision automatic release evidence

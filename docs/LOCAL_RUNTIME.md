@@ -388,8 +388,10 @@ a privacy-safe aggregate contribution journal and versioned checkpoints ahead of
 
 ## Durable state
 
-SQLite local_state.v4 is authoritative in published v1.10.0; the v1.11 development branch adds
-local_state.v5 tier storage and private lifecycle control tables. Projection-affecting transactions set
+SQLite local_state.v4 is authoritative in published v1.10.0; the v1.11 development branch uses
+local_state.v6, retaining v5 tier storage and private lifecycle control tables and adding a
+report visibility epoch. Admitted v4/v5 stores migrate to v6 without discarding observations.
+Projection-affecting transactions set
 projection_dirty=1; a successful atomic JSONL replacement clears it. A clean reopen does not
 rebuild the full projection. Explicit repairing store opens restore missing or dirty JSONL and bound
 stale projection-temp cleanup. Automatic collector startup and HTML refresh defer JSONL repair so a

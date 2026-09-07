@@ -183,7 +183,11 @@ pub struct DashboardTracesRequestV1 {
     )]
     pub filters: Option<DashboardFiltersV1>,
     pub snapshot_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_nonnull",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cursor: Option<String>,
 }
 
@@ -200,7 +204,11 @@ pub struct DashboardSpansRequestV1 {
     pub filters: Option<DashboardFiltersV1>,
     pub snapshot_id: String,
     pub trace_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_nonnull",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cursor: Option<String>,
 }
 
@@ -216,7 +224,11 @@ pub struct DashboardSummaryRequestV1 {
     )]
     pub filters: Option<DashboardFiltersV1>,
     pub snapshot_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_nonnull",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cursor: Option<String>,
 }
 
@@ -248,7 +260,11 @@ pub struct DashboardFacetsRequestV1 {
     )]
     pub filters: Option<DashboardFiltersV1>,
     pub snapshot_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_nonnull",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cursor: Option<String>,
 }
 

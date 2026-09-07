@@ -71,10 +71,9 @@ export type FilterValues =
 export type DashboardTracesRequestV1 = RequestBase & {
   kind: "traces";
   snapshotId: SnapshotId;
-  cursor?: NullableCursor;
+  cursor?: Cursor;
 };
 export type SnapshotId = string;
-export type NullableCursor = Cursor | null;
 /**
  * Opaque server-issued lease token bound to the normalized query, snapshot generation, visibility epoch, query kind and scan key. Clients must not parse or construct it.
  */
@@ -83,13 +82,13 @@ export type DashboardSpansRequestV1 = RequestBase & {
   kind: "spans";
   snapshotId: SnapshotId;
   traceId: ProjectedId;
-  cursor?: NullableCursor;
+  cursor?: Cursor;
 };
 export type ProjectedId = string;
 export type DashboardSummaryRequestV1 = RequestBase & {
   kind: "summary";
   snapshotId: SnapshotId;
-  cursor?: NullableCursor;
+  cursor?: Cursor;
 };
 export type DashboardSpanRequestV1 = RequestBase & {
   kind: "span";
@@ -100,7 +99,7 @@ export type DashboardSpanRequestV1 = RequestBase & {
 export type DashboardFacetsRequestV1 = RequestBase & {
   kind: "facets";
   snapshotId: SnapshotId;
-  cursor?: NullableCursor;
+  cursor?: Cursor;
 };
 export type DashboardQueryResponseV1 =
   | DashboardBootstrapResponseV1
@@ -286,6 +285,7 @@ export type DashboardAvailabilityFieldV1 =
   | "source_location"
   | "request_content"
   | "response_content";
+export type NullableCursor = Cursor | null;
 export type DashboardSpansResponseV1 = ResponseBase & {
   kind: "spans";
   /**
