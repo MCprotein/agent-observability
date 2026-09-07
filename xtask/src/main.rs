@@ -7334,6 +7334,33 @@ mod tests {
     }
 
     #[test]
+    fn automatic_snapshot_fatal_after_transients_never_sleeps_again() {
+        let mut outcomes = [
+            Err(AutomaticConvergenceError::Retry),
+            Err(AutomaticConvergenceError::Retry),
+            Err(AutomaticConvergenceError::Fatal(
+                PublishedSnapshotStage::Validation,
+            )),
+        ]
+        .into_iter();
+        let mut polls = 0;
+        let mut sleeps = 0;
+        assert_eq!(
+            wait_for_automatic_convergence(
+                || {
+                    polls += 1;
+                    outcomes.next().expect("must stop on fatal")
+                },
+                || Duration::ZERO,
+                |_| sleeps += 1,
+            )
+            .unwrap_err(),
+            "published_snapshot_validation_failed"
+        );
+        assert_eq!((polls, sleeps), (3, 2));
+    }
+
+    #[test]
     fn automatic_snapshot_real_store_parity_contention_and_corruption() {
         use agent_observability_local_store::{
             MISSING_RATE_FINGERPRINT, build_report_view_staging, publish_report_view,
@@ -7398,6 +7425,7 @@ mod tests {
             })
             .unwrap();
         fs::write(&snapshot, b"AUTOMATIC_RAW_PROMPT_SENTINEL not a database").unwrap();
+        let started = Instant::now();
         let mut polls = 0;
         let mut sleeps = 0;
         assert_eq!(
@@ -7406,13 +7434,19 @@ mod tests {
                     polls += 1;
                     automatic_published_snapshot_convergence(&store)
                 },
-                || Duration::ZERO,
-                |_| sleeps += 1,
+                || started.elapsed(),
+                |duration| {
+                    sleeps += 1;
+                    sleep(duration);
+                },
             )
             .unwrap_err(),
             "published_snapshot_validation_failed"
         );
-        assert_eq!((polls, sleeps), (1, 0));
+        // Real filesystem locks may transiently retry before validation is reached.
+        // The injected test above separately proves immediate termination on fatal.
+        assert!(polls > 0);
+        assert_eq!(polls, sleeps + 1);
 
         fs::write(
             views.join("catalog.json"),
