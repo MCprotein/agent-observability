@@ -71,6 +71,11 @@ Existing v7 migration and report-rotation measurements do not prove this ingesti
 Reduced reservation must remain disabled until both memory enforcement and post-publication
 capacity are demonstrated. Even selective eligibility without a known bulk path remains disabled
 until distinct dirty pages, temporary-memory use and peak RSS have enforceable bounds.
-The next implementation slice is test-only transaction observation and rollback evidence, not
-automatic-collector admission. Progress and CI status live in the
+The first proof slice adds a private before-commit observer to the existing ordered transaction;
+production callers supply a no-op. Test-only observers measure journal bytes and page geometry,
+inject failure, and check rollback/retry for a mixed batch and one-input/four-row archived
+rehydration. Original invalid-payload and crash/reopen tests remain in place. This measures a
+precommit point, not the peak or an enforceable dirty-page/RSS bound; collector admission is unchanged.
+Further proof must cover topology fan-out, ledger pruning and steady-state paged snapshots.
+Progress and CI status live in the
 [v1.11 review checkpoint](reviews/v1.11.0.md).

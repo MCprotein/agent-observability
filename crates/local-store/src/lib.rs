@@ -894,6 +894,19 @@ impl LocalStore {
         correlation_state: Option<(&str, &str)>,
         crash: Option<CrashPoint>,
     ) -> Result<Vec<IngestStatus>, StoreError> {
+        self.ingest_ordered_batch_at_inner_observing(items, correlation_state, crash, |_| Ok(()))
+    }
+
+    fn ingest_ordered_batch_at_inner_observing<F>(
+        &mut self,
+        items: &[StoreBatchItem<'_>],
+        correlation_state: Option<(&str, &str)>,
+        crash: Option<CrashPoint>,
+        before_commit: F,
+    ) -> Result<Vec<IngestStatus>, StoreError>
+    where
+        F: FnOnce(&Transaction<'_>) -> Result<(), StoreError>,
+    {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let mut statuses = Vec::with_capacity(items.len());
         for item in items {
@@ -921,6 +934,7 @@ impl LocalStore {
                 params![key, value],
             )?;
         }
+        before_commit(&tx)?;
         if crash == Some(CrashPoint::BeforeCommit) {
             return Err(StoreError::Crash(CrashPoint::BeforeCommit));
         }
@@ -4291,6 +4305,99 @@ mod tests {
         ))
     }
 
+    #[derive(Clone, Copy, Debug)]
+    struct JournalMeasurement {
+        logical_bytes: u64,
+        allocated_bytes: u64,
+        page_size: u64,
+        page_count: u64,
+        freelist_pages: u64,
+    }
+
+    fn measure_ingest_journal(
+        tx: &Transaction<'_>,
+        journal_path: &Path,
+    ) -> Result<JournalMeasurement, StoreError> {
+        let journal = fs::metadata(journal_path)?;
+        let page_size = tx.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))?;
+        let page_count = tx.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))?;
+        let freelist_pages =
+            tx.query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))?;
+        Ok(JournalMeasurement {
+            logical_bytes: journal.len(),
+            allocated_bytes: allocated_bytes(&journal),
+            page_size: u64::try_from(page_size).map_err(|_| StoreError::SchemaMismatch)?,
+            page_count: u64::try_from(page_count).map_err(|_| StoreError::SchemaMismatch)?,
+            freelist_pages: u64::try_from(freelist_pages)
+                .map_err(|_| StoreError::SchemaMismatch)?,
+        })
+    }
+
+    fn assert_measured_journal(measurement: JournalMeasurement) {
+        eprintln!(
+            "ingest_journal logical_bytes={} allocated_bytes={} page_size={} page_count={} freelist_pages={}",
+            measurement.logical_bytes,
+            measurement.allocated_bytes,
+            measurement.page_size,
+            measurement.page_count,
+            measurement.freelist_pages
+        );
+        assert!(measurement.logical_bytes > 0);
+        assert!(measurement.allocated_bytes > 0);
+        assert!(measurement.page_size.is_power_of_two());
+        assert!(measurement.page_count > 0);
+        assert!(measurement.freelist_pages <= measurement.page_count);
+    }
+
+    fn assert_empty_ingest_authority(store: &LocalStore, generation: u64, projection_dirty: bool) {
+        assert_eq!(store.observation_count().unwrap(), 0);
+        assert_eq!(store.source_input_count().unwrap(), 0);
+        assert_eq!(store.disposition_count().unwrap(), 0);
+        assert_eq!(store.record_count().unwrap(), 0);
+        assert_eq!(count(&store.db, "topology").unwrap(), 0);
+        assert_eq!(count(&store.db, "delivery_outcomes").unwrap(), 0);
+        assert_eq!(store.cursor("codex", "generation").unwrap(), None);
+        assert_eq!(
+            store.codex_request_correlation_state("generation").unwrap(),
+            None
+        );
+        assert_eq!(
+            metadata_generation(&store.db, REPORT_GENERATION_KEY).unwrap(),
+            generation
+        );
+        assert_eq!(store.projection_dirty().unwrap(), projection_dirty);
+    }
+
+    fn measure_ordered_batch_transaction(
+        tx: &Transaction<'_>,
+        correlation_key: &str,
+        correlation: &str,
+        journal_path: &Path,
+    ) -> Result<JournalMeasurement, StoreError> {
+        assert_eq!(count(tx, "observations")?, 2);
+        assert_eq!(count(tx, "adapter_dispositions")?, 1);
+        assert_eq!(count(tx, "records")?, 2);
+        assert_eq!(count(tx, "delivery_outcomes")?, 2);
+        assert_eq!(metadata_generation(tx, REPORT_GENERATION_KEY)?, 2);
+        assert_eq!(
+            tx.query_row(
+                "SELECT cursor FROM source_cursors WHERE source='codex'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "3"
+        );
+        assert_eq!(
+            tx.query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [correlation_key],
+                |row| row.get::<_, String>(0),
+            )?,
+            correlation
+        );
+        measure_ingest_journal(tx, journal_path)
+    }
+
     fn downgrade_to_historical_schema(database: &Path, version: &str) {
         let connection = Connection::open(database).unwrap();
         downgrade_ack_schema(&connection);
@@ -5023,6 +5130,111 @@ mod tests {
         assert_eq!(store.observation_count().unwrap(), 0);
         assert_eq!(store.disposition_count().unwrap(), 0);
         assert_eq!(store.cursor("codex", "generation").unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn observed_ordered_batch_failure_rolls_back_all_authority_and_retries_idempotently() {
+        let dir = temp_dir("observed-ordered-mixed-rollback");
+        let _ = fs::remove_dir_all(&dir);
+        let first = observation("1", "session", None);
+        let disposition = SourceCheckpoint {
+            source: AgentSource::Codex,
+            source_generation: SourceGeneration::parse("generation").unwrap(),
+            previous_source_cursor: Some(SourceCursor::parse("1").unwrap()),
+            source_cursor: SourceCursor::parse("2").unwrap(),
+        };
+        let last = observation_after("3", Some("2"), "turn", Some("session"));
+        let items = [
+            StoreBatchItem::Observation(&first),
+            StoreBatchItem::Disposition {
+                checkpoint: &disposition,
+                disposition: AdapterDispositionKind::Diagnostic,
+                code: AdapterDispositionCode::ContentEventIgnored,
+                canonical_payload_hash: None,
+            },
+            StoreBatchItem::Observation(&last),
+        ];
+        let mut store = LocalStore::open(&dir).unwrap();
+        let journal_path = store.database_path().with_extension("sqlite3-journal");
+        let correlation = correlation_snapshot("observed-rollback");
+        let correlation_key = codex_correlation_key("generation").unwrap();
+        let generation_before = metadata_generation(&store.db, REPORT_GENERATION_KEY).unwrap();
+        let projection_dirty_before = store.projection_dirty().unwrap();
+        let mut failed_measurement = None;
+
+        assert!(matches!(
+            store.ingest_ordered_batch_at_inner_observing(
+                &items,
+                Some((&correlation_key, &correlation)),
+                None,
+                |tx| {
+                    failed_measurement = Some(measure_ordered_batch_transaction(
+                        tx,
+                        &correlation_key,
+                        &correlation,
+                        &journal_path,
+                    )?);
+                    Err(StoreError::Io(io::Error::other("observer failure")))
+                },
+            ),
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::Other
+        ));
+        assert_empty_ingest_authority(&store, generation_before, projection_dirty_before);
+        assert_measured_journal(failed_measurement.unwrap());
+
+        assert_eq!(
+            store
+                .ingest_ordered_batch_at_inner_observing(
+                    &items,
+                    Some((&correlation_key, &correlation)),
+                    None,
+                    |tx| {
+                        let measurement = measure_ingest_journal(tx, &journal_path)?;
+                        assert_measured_journal(measurement);
+                        Ok(())
+                    },
+                )
+                .unwrap(),
+            [
+                IngestStatus::Committed,
+                IngestStatus::Committed,
+                IngestStatus::Committed
+            ]
+        );
+        let generation_after_retry = metadata_generation(&store.db, REPORT_GENERATION_KEY).unwrap();
+        assert_eq!(generation_after_retry, generation_before + 2);
+        assert_eq!(
+            store
+                .ingest_codex_batch_with_correlation_state_deferred_projection(
+                    &items,
+                    "generation",
+                    &correlation,
+                )
+                .unwrap(),
+            [
+                IngestStatus::Duplicate,
+                IngestStatus::Duplicate,
+                IngestStatus::Duplicate
+            ]
+        );
+        assert_eq!(store.observation_count().unwrap(), 2);
+        assert_eq!(store.disposition_count().unwrap(), 1);
+        assert_eq!(
+            store.cursor("codex", "generation").unwrap().as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            store
+                .codex_request_correlation_state("generation")
+                .unwrap()
+                .as_deref(),
+            Some(correlation.as_str())
+        );
+        assert_eq!(
+            metadata_generation(&store.db, REPORT_GENERATION_KEY).unwrap(),
+            generation_after_retry
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -8584,6 +8796,86 @@ mod tests {
         assert_eq!(count(&reopened.db, "cold_traces").unwrap(), 0);
         assert_eq!(count(&reopened.db, "lifecycle_trace_control").unwrap(), 0);
         assert_eq!(count(&reopened.db, "records").unwrap(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn observed_archived_trace_rehydration_restores_many_rows_and_rolls_back() {
+        let dir = temp_dir("lifecycle-rehydrate-observer-rollback");
+        let _ = fs::remove_dir_all(&dir);
+        let now = 10 * 86_400_000;
+        let old = now - 2 * 86_400_000;
+        let mut store = LocalStore::open(&dir).unwrap();
+        let mut archived = vec![observation("1", "session", None)];
+        for cursor in 2..=4 {
+            archived.push(observation_after(
+                &cursor.to_string(),
+                Some(&(cursor - 1).to_string()),
+                &format!("turn-{cursor}"),
+                Some("session"),
+            ));
+        }
+        for item in &mut archived {
+            item.timing = Timing::new(old, Some(old)).unwrap();
+        }
+        store.ingest_batch_deferred_projection(&archived).unwrap();
+        store.maintain_lifecycle(lifecycle_request(now)).unwrap();
+        assert_eq!(count(&store.db, "lifecycle_span_control").unwrap(), 4);
+        let mut changed = observation_after("5", Some("4"), "session", None);
+        changed.timing = Timing::new(old, Some(old + 1)).unwrap();
+        let items = [StoreBatchItem::Observation(&changed)];
+        let journal_path = store.database_path().with_extension("sqlite3-journal");
+        let generation_before = metadata_generation(&store.db, REPORT_GENERATION_KEY).unwrap();
+        let mut failed_measurement = None;
+
+        assert!(matches!(
+            store.ingest_ordered_batch_at_inner_observing(&items, None, None, |tx| {
+                assert_eq!(items.len(), 1);
+                assert_eq!(count(tx, "records")?, 4);
+                assert_eq!(count(tx, "topology")?, 4);
+                assert_eq!(count(tx, "cold_traces")?, 0);
+                assert_eq!(count(tx, "lifecycle_span_control")?, 0);
+                failed_measurement = Some(measure_ingest_journal(tx, &journal_path)?);
+                Err(StoreError::Io(io::Error::other(
+                    "injected rehydration observer failure",
+                )))
+            }),
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::Other
+        ));
+        assert_measured_journal(failed_measurement.unwrap());
+        assert_eq!(count(&store.db, "cold_traces").unwrap(), 1);
+        assert_eq!(count(&store.db, "lifecycle_trace_control").unwrap(), 1);
+        assert_eq!(count(&store.db, "lifecycle_span_control").unwrap(), 4);
+        assert_eq!(count(&store.db, "records").unwrap(), 0);
+        assert_eq!(count(&store.db, "topology").unwrap(), 0);
+        assert_eq!(
+            store.cursor("codex", "generation").unwrap().as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            metadata_generation(&store.db, REPORT_GENERATION_KEY).unwrap(),
+            generation_before
+        );
+
+        assert_eq!(
+            store
+                .ingest_ordered_batch_at_inner_observing(&items, None, None, |tx| {
+                    assert_eq!(count(tx, "records")?, 4);
+                    Ok(())
+                })
+                .unwrap(),
+            [IngestStatus::Committed]
+        );
+        let generation_after_retry = metadata_generation(&store.db, REPORT_GENERATION_KEY).unwrap();
+        assert_eq!(store.ingest(&changed).unwrap(), IngestStatus::Duplicate);
+        assert_eq!(count(&store.db, "cold_traces").unwrap(), 0);
+        assert_eq!(count(&store.db, "lifecycle_trace_control").unwrap(), 0);
+        assert_eq!(count(&store.db, "lifecycle_span_control").unwrap(), 0);
+        assert_eq!(count(&store.db, "records").unwrap(), 4);
+        assert_eq!(
+            metadata_generation(&store.db, REPORT_GENERATION_KEY).unwrap(),
+            generation_after_retry
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

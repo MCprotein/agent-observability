@@ -7935,9 +7935,21 @@ mod tests {
 
     #[test]
     fn report_authority_watcher_converges_an_external_store_commit() {
-        let root = test_root("report-external-store-commit");
+        assert_external_commit_converges(0);
+    }
+
+    #[test]
+    fn report_authority_watcher_respects_a_learned_quiet_window() {
+        assert_external_commit_converges(2_500);
+    }
+
+    fn assert_external_commit_converges(quiet_ms: u64) {
+        let root = test_root(&format!("report-external-store-commit-{quiet_ms}"));
         let _ = fs::remove_dir_all(&root);
         let state = app_state(&root);
+        state
+            .report_contention_quiet_ms
+            .store(quiet_ms, Ordering::Release);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -7964,26 +7976,45 @@ mod tests {
             )
             .unwrap();
 
-            tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    let published = {
-                        let collector = state.collector.lock().await;
-                        current_report_view(&collector.store)
-                            .is_ok_and(|view| view.is_some_and(|view| view.records() == 1))
-                    };
-                    if state.report_refresh_attempts.load(Ordering::Acquire) > 0
-                        && !state.report_refresh_scheduled.load(Ordering::Acquire)
-                        && published
-                    {
-                        break;
+            // This is a convergence test, not a two-second publication SLO. A learned
+            // quiet window can legally outlast that old harness deadline. Keep a
+            // finite guard beyond the production quiet ceiling; performance has its
+            // own measured protocol rather than this shared-runner wall clock.
+            let convergence = tokio::time::timeout(
+                super::REPORT_CONTENTION_QUIET_LIMIT + Duration::from_secs(5),
+                async {
+                    loop {
+                        let published = {
+                            let collector = state.collector.lock().await;
+                            current_report_view(&collector.store)
+                                .is_ok_and(|view| view.is_some_and(|view| view.records() == 1))
+                        };
+                        if state.report_refresh_attempts.load(Ordering::Acquire) > 0
+                            && !state.report_refresh_scheduled.load(Ordering::Acquire)
+                            && published
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
+                },
+            )
+            .await;
             watcher.abort();
             let _ = watcher.await;
+            assert!(
+                convergence.is_ok(),
+                "external commit convergence timed out: attempts={} scheduled={} quiet_ms={} state={:?}",
+                state.report_refresh_attempts.load(Ordering::Acquire),
+                state.report_refresh_scheduled.load(Ordering::Acquire),
+                state.report_contention_quiet_ms.load(Ordering::Acquire),
+                state.collector.try_lock().ok().map(|collector| (
+                    collector.report_dirty,
+                    collector.report_degraded,
+                    collector.report_refresh_failures,
+                    collector.report_failure,
+                )),
+            );
             assert!(
                 !state
                     .collector
