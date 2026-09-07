@@ -118,6 +118,39 @@ test("large session facets cannot starve later agent and model dimensions", asyn
   assert.equal(client.state.facetsLimited, true);
 });
 
+test("unowned AbortError fails current query and clears queued work", async () => {
+  const requests: string[] = [];
+  const client = new PagedDashboardClient({ transport: async (request, signal) => {
+    requests.push(request.kind);
+    if (request.kind === "bootstrap") return response({ kind: "bootstrap", limits });
+    assert.equal(signal.aborted, false);
+    throw new DOMException("network abort", "AbortError");
+  } });
+  client.start();
+  await client.settled();
+  assert.equal(client.state.availability, "error");
+  assert.deepEqual(requests, ["bootstrap", "traces"]);
+});
+
+test("owned filter abort rejection cannot replace the new revision with an error", async () => {
+  let first = true;
+  const client = new PagedDashboardClient({ autoLoad: false, transport: async (_request, signal) => {
+    if (first) {
+      first = false;
+      return new Promise<DashboardQueryResponseV1>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new DOMException("cancelled", "AbortError")), { once: true });
+      });
+    }
+    return response({ kind: "bootstrap", limits });
+  } });
+  client.start();
+  await Promise.resolve();
+  client.setFilters({ repo: ["new-repo"] });
+  await client.settled();
+  assert.equal(client.state.availability, "current");
+  assert.deepEqual(client.state.filters, { repo: ["new-repo"] });
+});
+
 test("aborts filter work and ignores a late response from the prior revision", async () => {
   let resolveFirst!: (value: DashboardQueryResponseV1) => void;
   const first = new Promise<DashboardQueryResponseV1>((resolve) => { resolveFirst = resolve; });

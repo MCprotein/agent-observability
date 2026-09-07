@@ -120,6 +120,11 @@ retaining v1 reads. Actual-copy three-generation capacity validation, integrated
 existing-tab Chrome QA and fresh exact-head CI/automatic performance evidence remain release gates. See
 [the current review checkpoint](docs/reviews/v1.11.0.md).
 
+The private-copy three-generation capacity check has passed. The remaining acknowledgement journal
+proof cannot use a single-leaf guard on the actual metadata layout. A dedicated fixed-width state
+table and bounded v6→v7 migration are a proposed additional scope, awaiting approval, not a completed
+schema change. No merge or stable-version promotion is authorized by a measurement pass alone.
+
 ## Branch Strategy
 
 - `main` is the stable line. It should only receive verified version work.

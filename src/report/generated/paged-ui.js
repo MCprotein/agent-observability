@@ -10904,17 +10904,18 @@
           const [task] = this.queue.splice(taskIndex, 1);
           if (!task) break;
           if (task.revision !== this.revision) continue;
-          this.controller = new AbortController();
+          const controller = new AbortController();
+          this.controller = controller;
           try {
-            const response = await this.transport(task.request, this.controller.signal);
+            const response = await this.transport(task.request, controller.signal);
             if (task.revision !== this.revision) continue;
             this.applyResponse(task, response);
           } catch (error) {
-            if (task.revision !== this.revision || isAbortError(error)) continue;
+            if (task.revision !== this.revision || isAbortError(error) && controller.signal.aborted) continue;
             this.update({ availability: error instanceof DashboardTransportError && error.code === "capacity" ? "capacity" : "error", reason: errorMessage(error) });
             this.queue = [];
           } finally {
-            this.controller = void 0;
+            if (this.controller === controller) this.controller = void 0;
           }
         }
       } finally {

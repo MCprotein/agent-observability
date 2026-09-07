@@ -1410,6 +1410,7 @@ struct AppState {
 struct ReportSnapshotTest {
     delay_ms: AtomicU64,
     started: AtomicBool,
+    fail_after_reservation: AtomicBool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2627,12 +2628,17 @@ fn schedule_report_refresh_with_timing(state: &AppState, timing: ReportRefreshTi
             failure_attempts += 1;
             if failure_attempts == REPORT_RETRY_LIMIT {
                 collector.report_degraded = true;
+                let layout = collector.layout.clone();
+                drop(collector);
+                // A failed build must not strand its promise after the final retry. Keep the
+                // scheduler flag while doing one cleanup-only pass; never wait for either lock.
+                let _ =
+                    tokio::task::spawn_blocking(move || cleanup_report_reservation(&layout)).await;
                 state
                     .report_refresh_scheduled
                     .store(false, Ordering::Release);
                 let retry_latest =
                     state.report_refresh_requested.load(Ordering::Acquire) != attempt_epoch;
-                drop(collector);
                 if retry_latest {
                     schedule_report_refresh_with_timing(&state, timing);
                 }
@@ -2666,6 +2672,10 @@ async fn run_report_refresh_attempt(
                 refresh_report_from_root_observing(&root, |index| {
                     if index == 0 {
                         snapshot_test.started.store(true, Ordering::Release);
+                        assert!(
+                            !snapshot_test.fail_after_reservation.load(Ordering::Acquire),
+                            "injected post-reservation projection failure"
+                        );
                         std::thread::sleep(Duration::from_millis(
                             snapshot_test.delay_ms.load(Ordering::Acquire),
                         ));
@@ -3833,6 +3843,12 @@ fn recover_report_reservation_for_startup(
             .map_err(runtime_error)?;
     }
     Ok(())
+}
+
+fn cleanup_report_reservation(layout: &InstalledLayout) -> Result<(), CollectorError> {
+    let mutation = try_collector_mutation(&layout.runtime)?;
+    let config = load(&layout.config).map_err(runtime_error)?;
+    recover_report_reservation_for_startup(layout, &config, &mutation)
 }
 
 fn automatic_report_view_missing(store: &LocalStore) -> Result<bool, CollectorError> {
@@ -8018,13 +8034,25 @@ mod tests {
             blocker = Some(MutationGuard::try_acquire(&collector.layout.runtime).unwrap());
         });
         assert_eq!(result.unwrap_err(), super::ReportFailure::RenderGuard);
-        let reservation_path = collector.layout.runtime.join("report-reservation.lock");
-        assert!(fs::metadata(&reservation_path).unwrap().len() > 0);
+        let control = RuntimeControl::new(&load(&collector.layout.config).unwrap()).unwrap();
+        assert!(
+            control
+                .claim_stale_report_reservation(&root, blocker.as_ref().unwrap())
+                .unwrap()
+                .is_some()
+        );
         assert!(collector.store.report_status().unwrap().pending());
         assert!(current_report_view(&collector.store).unwrap().is_none());
         drop(blocker);
         assert!(refresh_dashboard_snapshot(&root).unwrap());
-        assert_eq!(fs::metadata(&reservation_path).unwrap().len(), 0);
+        let mutation = MutationGuard::acquire(&collector.layout.runtime).unwrap();
+        assert!(
+            control
+                .claim_stale_report_reservation(&root, &mutation)
+                .unwrap()
+                .is_none()
+        );
+        drop(mutation);
         assert_published_report_view(&root, 1);
         drop(collector);
         fs::remove_dir_all(root).unwrap();
@@ -8053,19 +8081,21 @@ mod tests {
             super::ReportFailure::SnapshotChanged
         );
         assert!(
-            fs::metadata(collector.layout.runtime.join("report-reservation.lock"))
+            control
+                .claim_stale_report_reservation(&root, &mutation)
                 .unwrap()
-                .len()
-                > 0
+                .is_some()
         );
         drop(mutation);
         assert!(refresh_dashboard_snapshot(&root).unwrap());
-        assert_eq!(
-            fs::metadata(collector.layout.runtime.join("report-reservation.lock"))
+        let mutation = MutationGuard::acquire(&collector.layout.runtime).unwrap();
+        assert!(
+            control
+                .claim_stale_report_reservation(&root, &mutation)
                 .unwrap()
-                .len(),
-            0
+                .is_none()
         );
+        drop(mutation);
         drop(collector);
         fs::remove_dir_all(root).unwrap();
     }
@@ -8206,6 +8236,60 @@ mod tests {
             drop(reopened);
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn terminal_refresh_failure_cleans_stale_reservation_without_rebuilding() {
+        let root = test_root("report-terminal-reservation-cleanup");
+        let state = app_state(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let current = {
+                let mut collector = state.collector.lock().await;
+                ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1"))
+                    .unwrap();
+                assert!(refresh_dashboard_snapshot(&root).unwrap());
+                let current = current_report_view(&collector.store).unwrap();
+                collector.store.invalidate_report().unwrap();
+                current
+            };
+            state
+                .report_snapshot_test
+                .fail_after_reservation
+                .store(true, Ordering::Release);
+            schedule_report_refresh(&state);
+            for _ in 0..200 {
+                if !state.report_refresh_scheduled.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!state.report_refresh_scheduled.load(Ordering::Acquire));
+            let collector = state.collector.lock().await;
+            assert_eq!(collector.report_refresh_failures, super::REPORT_RETRY_LIMIT);
+            assert_eq!(current_report_view(&collector.store).unwrap(), current);
+            assert!(collector.store.report_status().unwrap().pending());
+            let config = load(&collector.layout.config).unwrap();
+            let control = RuntimeControl::new(&config).unwrap();
+            let mutation = MutationGuard::acquire(&collector.layout.runtime).unwrap();
+            assert!(
+                control
+                    .claim_stale_report_reservation(&root, &mutation)
+                    .unwrap()
+                    .is_none()
+            );
+            let allocated = StorageBudget::allocated_tree_bytes(&root).unwrap();
+            let request = control.storage_budget().writable_limit() - allocated - 8192;
+            assert!(matches!(
+                control.admit(&root, request).unwrap(),
+                Admission::Allowed { .. }
+            ));
+        });
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

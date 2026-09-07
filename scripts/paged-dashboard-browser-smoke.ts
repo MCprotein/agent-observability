@@ -578,11 +578,13 @@ async function exerciseBrowser(
   const consoleErrors: string[] = [];
   const pageErrors: string[] = [];
   const externalRequests: string[] = [];
-  const failedRequests: Array<{ kind: string; error: string | undefined; token: string | undefined }> = [];
+  const failedRequests: Array<{ kind: string; error: string | undefined; token: string | undefined; stage: string; responseStarted: boolean }> = [];
+  const responseTokens = new Set<string>();
+  let browserStage = "bootstrap";
   // Observe causality in the page, where filter handlers synchronously abort their signal.
   // A smoke-only header binds that signal to the exact browser network request.
   await page.addInitScript(() => {
-    const state = { expected: [] as string[], aborted: [] as string[], mutations: 0 };
+    const state = { expected: [] as string[], aborted: [] as string[], mutations: 0, rejected: [] as Array<{ token: string; name: string }> };
     Object.assign(window, { __agentobsSmokeCancellation: state });
     let active = false;
     let sequence = 0;
@@ -609,7 +611,12 @@ async function exerciseBrowser(
         state.aborted.push(token);
         if (active) state.expected.push(token);
       }, { once: true });
-      return originalFetch(new window.Request(request, { headers }));
+      return originalFetch(new window.Request(request, { headers })).catch((error: unknown) => {
+        const name = error instanceof DOMException && error.name === "AbortError" ? "AbortError"
+          : error instanceof TypeError ? "TypeError" : "other";
+        state.rejected.push({ token, name });
+        throw error;
+      });
     };
   });
   const requestedPaths: string[] = [];
@@ -635,14 +642,19 @@ async function exerciseBrowser(
     if (url.origin !== origin) externalRequests.push(request.url());
   });
   page.on("requestfailed", (request) => {
+    const token = request.headers()["x-agentobs-smoke-token"];
     failedRequests.push({
       kind: safeStatusValue(decodeDashboardRequest(request.url()).kind),
       error: request.failure()?.errorText,
-      token: request.headers()["x-agentobs-smoke-token"],
+      token,
+      stage: browserStage,
+      responseStarted: token !== undefined && responseTokens.has(token),
     });
   });
   page.on("response", async (response) => {
     if (!new URL(response.url()).pathname.endsWith("/query")) return;
+    const token = response.request().headers()["x-agentobs-smoke-token"];
+    if (token !== undefined) responseTokens.add(token);
     const body = await response.json().catch(() => undefined) as DashboardResponse | undefined;
     if (body?.kind === "status" && body.reason !== "busy" && body.reason !== "building") {
       const request = decodeDashboardRequest(response.url());
@@ -678,6 +690,7 @@ async function exerciseBrowser(
   await page.waitForFunction(() => document.getElementById("kpi-tokens")?.textContent === "Unavailable");
   assert.match((await page.locator("#quality-summary").textContent()) ?? "", /Hot\/warm data; cold excluded/);
 
+  browserStage = "filter_changes";
   await page.locator("#text-filter").fill("delayed-no-match");
   await delayedRequestSeen;
   await page.locator("#text-filter").fill("");
@@ -688,6 +701,7 @@ async function exerciseBrowser(
   assert.equal(await page.locator(".trace-row").count() > 0, true);
 
   const expectedPagedTraceSpans = 2 + DEFAULT_EXTRA_TOOL_SPANS;
+  browserStage = "trace_traversal";
   const uiTracePages = await selectTraceAcrossPages(page, `${expectedPagedTraceSpans} spans`, directEvidence.tracePages);
   await page.waitForFunction(() => {
     const button = document.getElementById("span-next") as HTMLButtonElement | null;
@@ -696,6 +710,7 @@ async function exerciseBrowser(
   const readSpanIds = () => page.locator("#span-table .span-open").evaluateAll(
     (buttons) => buttons.map((button) => (button as HTMLElement).dataset.spanId),
   );
+  browserStage = "span_traversal";
   const firstSpanIds = await readSpanIds();
   assert.equal(firstSpanIds.length, 200);
   await page.locator("#span-table .span-open").first().click();
@@ -717,6 +732,7 @@ async function exerciseBrowser(
   await page.waitForFunction(() => document.getElementById("span-page-status")?.textContent?.startsWith("Page 2"));
   assert.deepEqual(await readSpanIds(), secondSpanIds);
 
+  browserStage = "retention";
   const deletionPage = await queryHttp(dashboardUrl, {
     kind: "traces",
     snapshotId: directEvidence.snapshotId,
@@ -747,7 +763,7 @@ async function exerciseBrowser(
   assert.deepEqual(pageErrors, []);
   assert.deepEqual(externalRequests, []);
   const cancellation = await page.evaluate(() => (window as unknown as {
-    __agentobsSmokeCancellation: { expected: string[]; aborted: string[]; mutations: number };
+    __agentobsSmokeCancellation: { expected: string[]; aborted: string[]; mutations: number; rejected: Array<{ token: string; name: string }> };
   }).__agentobsSmokeCancellation);
   assert.equal(cancellation.mutations, 3);
   assert.ok(cancellation.expected.length > 0, "explicit filter change must abort an observed signal");
@@ -761,6 +777,10 @@ async function exerciseBrowser(
     causalAbortCount: cancellation.expected.length,
     signalAborted: failure.token !== undefined && cancellation.aborted.includes(failure.token),
     wasCausal: failure.token !== undefined && cancellation.expected.includes(failure.token),
+    stage: failure.stage,
+    responseStarted: failure.responseStarted,
+    tokenMultiplicity: failedRequests.filter((candidate) => candidate.token === failure.token).length,
+    fetchRejection: cancellation.rejected.find((entry) => entry.token === failure.token)?.name ?? "none",
   }));
   assert.deepEqual(unexpectedFailures, []);
   return {

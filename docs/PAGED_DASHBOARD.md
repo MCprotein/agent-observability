@@ -4,7 +4,7 @@ Status: v1.11.0 development implementation; integration and release verification
 
 ## Why
 
-The current UI bounds DOM rows but embeds every sanitized span in one HTML artifact. A private
+The original single-file UI bounds DOM rows but embeds every sanitized span in one HTML artifact. A private
 32,317-record diagnostic snapshot passed typed SQLite reading but exceeded the 32 MiB HTML bound.
 Adaptive quiet scheduling repairs report-refresh contention; it cannot solve artifact capacity.
 
@@ -99,6 +99,9 @@ A refresh reserves its bounded build/journal allowance plus 64 KiB publication h
 private durable runtime reservation. Ordinary write admission and migration headroom count the
 full active or interrupted reservation in addition to allocated files and filesystem limits.
 The reservation contains only a fixed kind, version, random owner nonce and numeric byte ceiling.
+Its lifetime lock remains a stable empty inode; metadata is published separately with private
+atomic replacement and directory synchronization. After the final failed retry, a cleanup-only
+pass attempts guarded recovery so a stopped refresh does not strand an otherwise recoverable promise.
 
 Admission and final publication use short, nonblocking runtime mutation guards. Construction
 releases that guard so collection can proceed within the remaining budget. Final publication
@@ -112,6 +115,12 @@ and model indexes store their dimension plus source order. Validated v1 sidecars
 through their original bounded query kernel until normal publication replaces them. Metadata and
 index shape select the kernel; unknown or inconsistent layouts fail closed. Internal continuation
 keys cannot cross kernel versions. The HTTP query schema and opaque cursor contract remain v1.
+
+Release blocker: the 64 KiB publication allowance does not yet prove the authority acknowledgement
+transaction's rollback-journal bound for every accepted metadata layout. A bounded read-only check
+of the actual store found an internal metadata B-tree page, so a proposed single-leaf precondition
+would reject existing data. The recommended dedicated fixed-width acknowledgement table requires a
+separately approved `local_state.v6` to `local_state.v7` migration; it is not implemented or installed.
 
 ## Resource budgets and completeness
 
