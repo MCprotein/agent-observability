@@ -209,9 +209,8 @@ impl<'a> ReportProjector<'a> {
         index: usize,
         record: &DurableRecordV1,
     ) -> Result<(), ReportProjectionError> {
-        let record = sanitize_durable_record(record)
-            .map_err(|source| ReportProjectionError::InvalidRecord { index, source })?;
-        self.spans.push(report_span(&record, self.table));
+        self.spans
+            .push(project_report_span(index, record, self.table)?);
         Ok(())
     }
 
@@ -225,13 +224,15 @@ impl<'a> ReportProjector<'a> {
         index: usize,
         record: DurableRecordV1,
     ) -> Result<(), ReportProjectionError> {
-        let record = sanitize_owned_durable_record(record)
-            .map_err(|source| ReportProjectionError::InvalidRecord { index, source })?;
-        self.spans.push(report_span(&record, self.table));
+        self.spans
+            .push(project_owned_report_span(index, record, self.table)?);
         Ok(())
     }
 
     /// Finalizes aggregate, filter, trace, and ordering projections.
+    ///
+    /// This is where a repository verified on one span is propagated to otherwise unknown spans
+    /// in the same trace. Single-record projection cannot infer that trace context.
     ///
     /// # Errors
     ///
@@ -265,6 +266,50 @@ impl<'a> ReportProjector<'a> {
             .map_err(ReportProjectionError::InvalidReport)?;
         Ok(report)
     }
+}
+
+/// Validates, sanitizes, and projects one borrowed durable record into a report span.
+///
+/// Repository availability is derived only from this record. Use [`ReportProjector::finish`] when
+/// sibling spans should supply verified trace-level repository context.
+///
+/// # Errors
+///
+/// Returns [`ReportProjectionError::InvalidRecord`] with `index` when the durable record violates
+/// the closed contract.
+pub fn project_report_span(
+    index: usize,
+    record: &DurableRecordV1,
+    table: Option<&RateTable>,
+) -> Result<ReportSpanV2, ReportProjectionError> {
+    let record = sanitize_durable_record(record)
+        .map_err(|source| ReportProjectionError::InvalidRecord { index, source })?;
+    let span = report_span(&record, table);
+    span.validate()
+        .map_err(ReportProjectionError::InvalidReport)?;
+    Ok(span)
+}
+
+/// Validates, sanitizes, and projects one owned durable record into a report span.
+///
+/// This variant reuses the durable record allocation during sanitization. Repository availability
+/// is derived only from this record; trace-level propagation remains a projector finalization step.
+///
+/// # Errors
+///
+/// Returns [`ReportProjectionError::InvalidRecord`] with `index` when the durable record violates
+/// the closed contract.
+pub fn project_owned_report_span(
+    index: usize,
+    record: DurableRecordV1,
+    table: Option<&RateTable>,
+) -> Result<ReportSpanV2, ReportProjectionError> {
+    let record = sanitize_owned_durable_record(record)
+        .map_err(|source| ReportProjectionError::InvalidRecord { index, source })?;
+    let span = report_span(&record, table);
+    span.validate()
+        .map_err(ReportProjectionError::InvalidReport)?;
+    Ok(span)
 }
 
 /// Projects validated durable spans into the privacy-safe report DTO.

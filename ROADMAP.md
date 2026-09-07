@@ -97,7 +97,7 @@ gate를 통과해 추가한다.
 | v1.9.1 | Released | Settings status and LaunchAgent recovery hotfix | Refresh Codex integration status without page reload, ignore stale overlapping responses, keep session expiry authoritative, retry one transient startup-unavailable state, and tolerate bounded asynchronous `launchctl bootout` convergence | Exact-source evidence run `33879838197`, independent review in `docs/reviews/v1.9.1.md`, merge `494ddbb8d8d78c6da74d9f30b167ade302616fb3`, and release run `33878650227` passed; public Release, Package, checksums, attestations, fresh v1.9.1 install, Settings QA, and live Codex dashboard growth verified |
 | v1.10.0 | Released | Explainable source context and private detail visibility | Replace ambiguous `unknown` rendering with field-level availability reasons, populate verified project/repository and bounded source-location metadata, and add standalone-only explicit opt-in private request detail storage and inspection; assistant response content remains unavailable unless an official source supplies it | Exact-source evidence run `33979306300`, independent review in `docs/reviews/v1.10.0.md`, merge `4996ece47c179fe47d0ce8dadb65a9621e3abf62`, and release run `34021039994` passed; public Release, Package publication step, all distributable checksums, universal archive attestation, public installer upgrade, and live Chrome dashboard growth verified |
 
-### v1.11.0 — Local storage lifecycle (In Progress)
+### v1.11.0 — Local storage lifecycle and paged dashboard (In Progress)
 
 Configurable Hot/Warm/Cold ages, managed-data expiry, independent raw-detail retention and
 bounded automatic maintenance. Existing installations keep automatic deletion disabled until
@@ -112,7 +112,9 @@ refresh contention; the development fix uses an adaptive quiet window without we
 deletion fences. Final-head checks, independent review and live recovery must pass before merging;
 the baseline measurement is not evidence for later code changes.
 Live-scale candidate QA also exceeds the 32 MiB single-HTML contract. This is a release blocker:
-report paging/capacity design and a fresh successful automatic smoke remain outstanding. See
+The user approved [paged dashboard scope](docs/PAGED_DASHBOARD.md): bounded Rust queries and
+TypeScript page/detail loading, while preserving observations and the standalone HTML export.
+Query/index implementation, resource-budget verification and a fresh successful automatic smoke remain outstanding. See
 [the current review checkpoint](docs/reviews/v1.11.0.md).
 
 ## Branch Strategy

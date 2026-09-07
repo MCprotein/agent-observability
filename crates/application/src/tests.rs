@@ -468,6 +468,68 @@ fn owned_report_projection_matches_borrowed_projection() {
 }
 
 #[test]
+fn individual_report_span_projection_matches_single_record_report_and_pricing() {
+    let mut record = full("gpt-test");
+    record.trace_id = "trace-single".into();
+    record.span_id = "span-single".into();
+    record.project.name = Some("known-repo".into());
+    record.content.prompt = Some(agent_observability_contracts::JsonValue::String(
+        "RAW_SINGLE_SPAN_SENTINEL".into(),
+    ));
+    let rates = table();
+
+    let report = project_report(
+        std::slice::from_ref(&record),
+        "generated",
+        "title",
+        Some(&rates),
+    )
+    .unwrap();
+    let borrowed = project_report_span(7, &record, Some(&rates)).unwrap();
+    let owned = project_owned_report_span(7, record, Some(&rates)).unwrap();
+
+    assert_eq!(borrowed, report.spans[0]);
+    assert_eq!(owned, report.spans[0]);
+    assert_eq!(borrowed.repo, "known-repo");
+    assert_eq!(borrowed.estimated_cost, Some(5.87));
+    assert!(
+        !serde_json::to_string(&borrowed)
+            .unwrap()
+            .contains("RAW_SINGLE_SPAN_SENTINEL")
+    );
+}
+
+#[test]
+fn individual_report_span_projection_rejects_malformed_records() {
+    let mut record = full("gpt-test");
+    record.metrics.input_tokens = Some(-1.0);
+
+    assert!(matches!(
+        project_report_span(23, &record, Some(&table())),
+        Err(ReportProjectionError::InvalidRecord { index: 23, .. })
+    ));
+    assert!(matches!(
+        project_owned_report_span(29, record, Some(&table())),
+        Err(ReportProjectionError::InvalidRecord { index: 29, .. })
+    ));
+}
+
+#[test]
+fn individual_report_span_projection_rejects_invalid_projected_cost() {
+    let mut rates = table();
+    rates.models.get_mut("gpt-test").unwrap().input_tokens = Some(f64::MAX);
+
+    assert!(matches!(
+        project_report_span(31, &full("gpt-test"), Some(&rates)),
+        Err(ReportProjectionError::InvalidReport(_))
+    ));
+    assert!(matches!(
+        project_owned_report_span(37, full("gpt-test"), Some(&rates)),
+        Err(ReportProjectionError::InvalidReport(_))
+    ));
+}
+
+#[test]
 fn report_projection_rejects_fractional_summary_metrics() {
     let mut record = span("gpt-test", MetricsV1::default());
     record.metrics.latency_ms = Some(1.5);

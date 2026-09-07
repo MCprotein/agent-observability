@@ -3,8 +3,8 @@
 ## Source of truth
 
 Status: Active
-Date: 2026-09-01
-Product surfaces: standalone static report, standalone loopback settings console, team hosted operations console, team administration
+Date: 2026-09-07
+Product surfaces: standalone HTML export, standalone loopback dashboard and settings console, planned team hosted operations console and administration
 
 Evidence reviewed:
 
@@ -98,7 +98,7 @@ Standalone settings use an ephemeral loopback route opened by `agentobs settings
   removes it after a confirmed explicit close or an invalid-session/network failure during bootstrap,
   heartbeat, or config mutation. A failed shutdown request retains it only so the user can retry closing.
 
-Standalone monitoring remains one self-contained report artifact. `agentobs dashboard` delivers that artifact
+The published v1.10 dashboard delivers one self-contained report artifact. `agentobs dashboard` delivers that artifact
 through a separate private read-only path capability on a runtime-root-derived stable `127.0.0.1` origin. Its report-only router exposes no
 settings or integration API and remains reloadable while the foreground command is alive. It expires after
 ten idle minutes or a one-hour hard deadline; the self-contained artifact continues to work through the file
@@ -109,6 +109,36 @@ The stable report origin preserves sanitized browser-local saved views across da
 private capability path remains separate from browser storage. A settings-triggered dashboard is owned by a
 separate child process and repeated opens reuse the live process. Report generation and loopback delivery share
 one 32 MiB artifact limit.
+
+### Paged standalone dashboard — v1.11.0 accepted scope, implementation pending
+
+The user approved separating interactive dashboard delivery from the single-file export after a
+32,317-record local snapshot exceeded the 32 MiB artifact limit. This is not permission to delete
+observations, silently truncate results, raise the artifact bound, or add a mandatory remote service.
+
+- `agentobs dashboard` will serve a small TypeScript shell and private, bounded Rust query responses.
+  It must open even when the full HTML export would exceed its bound. Existing path-capability,
+  exact loopback Host/Origin, no-store, independent lifetime and settings separation remain required.
+- The overview shows aggregate scope and generation time before trace/span pages. KPI totals describe
+  all matching hot/warm observations, never just the rows loaded by the browser. Cold data remains
+  an explicitly separate archive lookup; explain that exclusion beside the scope.
+- Trace and span navigation fetches bounded pages. Selecting a trace resets span pagination;
+  selecting a span loads only its detail. Private raw detail continues through the existing opt-in
+  local-only boundary, never through list responses or persisted browser state.
+- Every response identifies its report generation and scope. Do not combine pages or totals from
+  different generations. A stale cursor shows “데이터가 갱신되었습니다. 새로고침하세요.” and a
+  refresh action; it must not silently append new-generation rows to the old view.
+- Preserve the current neutral layout, controls, safe saved views, keyboard focus and responsive
+  breakpoints. Keep loading/error/status messages in a stable region with accessible announcements.
+  Superseded filter requests cannot replace newer results. No polling while the page is hidden.
+- Show displayed rows versus total matches and explicit limits for facets and timelines. Capacity,
+  refresh-pending and unavailable-query states must not appear as an empty, healthy report.
+- `agentobs report` remains the explicit self-contained, network-free HTML export with the 32 MiB
+  bound. Export capacity failure must leave authoritative data intact and direct users to the
+  paged dashboard. Opening the interactive dashboard must not depend on export success.
+
+Backend query/index design, resource budgets and deletion fences are specified in
+[Paged Dashboard](docs/PAGED_DASHBOARD.md). This section is an accepted target, not release evidence.
 
 The settings process binds an operating-system-selected port on `127.0.0.1`, rejects non-loopback host and
 origin values, sends no CORS permission, makes no external request and expires after inactivity. Closing it
@@ -329,7 +359,8 @@ implementation tutorials and keyboard-shortcut copy inside the main product surf
 - Web UI is TypeScript in `strict` mode. Framework selection is deferred until implementation evidence.
 - Rust owns domain, application, API, query, aggregate, privacy, cost and DTO projection.
 - Schema is generated or runtime-validated from a versioned source; Rust and TypeScript do not hand-copy it.
-- Standalone output remains one self-contained HTML file with no runtime network request.
+- Standalone HTML export remains one self-contained file with no runtime network request. The accepted
+  v1.11 interactive dashboard uses only same-origin private loopback queries; neither mode needs team services.
 - Standalone scope is fixed local state. A team/workspace selector is forbidden until hosted query returns a
   server-resolved authorized scope; agent and model remain report filter dimensions.
 - Team uses authenticated pagination and server-resolved scope; `TeamIngestEnvelopeV1` is never a UI DTO.

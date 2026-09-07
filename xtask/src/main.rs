@@ -37,6 +37,8 @@ const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-pe
 const AUTOMATIC_PROTOCOL: &str =
     include_str!("../../crates/contracts/performance/automatic-local-performance-v1.yaml");
 const AUTOMATIC_PROTOCOL_REVISION: &str = "v1.8.3-codex-0.152.1-private-ca-header-ownership-rebase-real-e2e-synthetic-diagnostics-rss-p95-v4";
+const AUTOMATIC_PRESERVE_SMOKE_EVIDENCE_ENV: &str =
+    "AGENT_OBSERVABILITY_PRESERVE_AUTOMATIC_SMOKE_EVIDENCE";
 const AUTOMATIC_CODEX_VERSION: &str = "codex-cli 0.152.1";
 const AUTOMATIC_OWNERSHIP_REBASE_PROBE: &[u8] =
     b"\n[hooks.state.\"agentobs-release-evidence\"]\ntrusted_hash = \"content-free\"\n";
@@ -1289,9 +1291,25 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
     validate_automatic_manifest_shape(&manifest)?;
     fs::write(&manifest_path, &manifest)
         .map_err(|error| format!("write automatic manifest: {error}"))?;
+    let preserve_smoke_evidence = config.profile == Profile::Smoke
+        && preserve_automatic_smoke_evidence(
+            env::var(AUTOMATIC_PRESERVE_SMOKE_EVIDENCE_ENV)
+                .ok()
+                .as_deref(),
+        );
+    if validation.is_ok() && preserve_smoke_evidence {
+        let passed =
+            render_automatic_manifest(config, &host, &source_revision, &results, &errors, "pass");
+        validate_automatic_manifest_shape(&passed)?;
+        fs::write(&manifest_path, passed)
+            .map_err(|error| format!("finalize preserved smoke manifest: {error}"))?;
+    }
     let runtime_result = runtime_cleanup.cleanup();
     let smoke_result = smoke_cleanup.as_mut().map_or(Ok(()), |cleanup| {
         if validation.is_err() {
+            cleanup.preserve();
+            Ok(())
+        } else if preserve_smoke_evidence {
             cleanup.preserve();
             Ok(())
         } else {
@@ -1342,6 +1360,10 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
         automatic_manifest_metadata(&manifest_path, config.profile, "pass")?
     );
     Ok(())
+}
+
+fn preserve_automatic_smoke_evidence(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
 fn collect_automatic_run_results(
@@ -1899,19 +1921,12 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
         complete: false,
     };
     let smoke = (|| {
-        let setup = run_bounded_product_command_with_env(
+        let setup = require_automatic_setup_output(run_bounded_product_command_with_env(
             binary,
             &["setup", "--no-open"],
             AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
             &cleanup.environment(),
-        )
-        .map_err(|_| "automatic lifecycle setup stage failed")?;
-        require_output_line(&setup, "status", "ready")
-            .map_err(|_| "automatic lifecycle setup stage failed")?;
-        require_output_line(&setup, "config", "connected")
-            .map_err(|_| "automatic lifecycle setup stage failed")?;
-        require_collector_ready_or_degraded(&setup)
-            .map_err(|_| "automatic lifecycle setup stage failed")?;
+        ))?;
         verify_installed_codex_compatibility(&cleanup)?;
         verify_automatic_ownership_rebase(binary, &root, &mut cleanup)?;
         let service =
@@ -2807,6 +2822,17 @@ fn require_collector_ready_or_degraded(output: &str) -> Result<(), String> {
     } else {
         Err("automatic lifecycle collector was neither ready nor degraded".into())
     }
+}
+
+fn require_automatic_setup_output(result: Result<String, String>) -> Result<String, String> {
+    let output = result.map_err(|_| "automatic lifecycle setup command failed")?;
+    require_output_line(&output, "status", "ready")
+        .map_err(|_| "automatic lifecycle setup status assertion failed")?;
+    require_output_line(&output, "config", "connected")
+        .map_err(|_| "automatic lifecycle setup config assertion failed")?;
+    require_collector_ready_or_degraded(&output)
+        .map_err(|_| "automatic lifecycle setup collector assertion failed")?;
+    Ok(output)
 }
 
 fn output_value(output: &str, key: &str) -> Option<String> {
@@ -5507,6 +5533,14 @@ fn automatic_evidence_error_code(error: &str) -> &'static str {
             "code=lifecycle_codex_e2e_failed"
         } else if error.contains("initial report") {
             "code=lifecycle_report_failed"
+        } else if error.contains("setup command") {
+            "code=lifecycle_setup_command_failed"
+        } else if error.contains("setup status assertion") {
+            "code=lifecycle_setup_status_failed"
+        } else if error.contains("setup config assertion") {
+            "code=lifecycle_setup_config_failed"
+        } else if error.contains("setup collector assertion") {
+            "code=lifecycle_setup_collector_failed"
         } else if error.contains("setup") {
             "code=lifecycle_setup_failed"
         } else if error.contains("recovery") || error.contains("SIGKILL") {
@@ -5851,6 +5885,10 @@ fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
         "  - 'code=lifecycle_codex_e2e_failed'",
         "  - 'code=lifecycle_report_failed'",
         "  - 'code=lifecycle_setup_failed'",
+        "  - 'code=lifecycle_setup_command_failed'",
+        "  - 'code=lifecycle_setup_status_failed'",
+        "  - 'code=lifecycle_setup_config_failed'",
+        "  - 'code=lifecycle_setup_collector_failed'",
         "  - 'code=lifecycle_recovery_failed'",
         "  - 'code=lifecycle_reconnect_failed'",
         "  - 'code=lifecycle_cleanup_failed'",
@@ -7243,10 +7281,64 @@ mod tests {
                 "lifecycle preflight: automatic lifecycle setup stage failed",
                 "code=lifecycle_setup_failed",
             ),
+            (
+                "lifecycle preflight: automatic lifecycle setup command failed",
+                "code=lifecycle_setup_command_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle setup status assertion failed",
+                "code=lifecycle_setup_status_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle setup config assertion failed",
+                "code=lifecycle_setup_config_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle setup collector assertion failed",
+                "code=lifecycle_setup_collector_failed",
+            ),
         ] {
             assert_eq!(automatic_evidence_error_code(error), code);
             assert!(!code.contains("private"));
         }
+    }
+
+    #[test]
+    fn automatic_setup_diagnostics_are_specific_and_content_free() {
+        let private = "/Users/private token AUTOMATIC_RAW_PROMPT_SENTINEL";
+        let cases = [
+            (
+                Err(private.into()),
+                "automatic lifecycle setup command failed",
+            ),
+            (
+                Ok("config=connected\ncollector=ready\n".into()),
+                "automatic lifecycle setup status assertion failed",
+            ),
+            (
+                Ok("status=ready\nconfig=conflict\ncollector=ready\n".into()),
+                "automatic lifecycle setup config assertion failed",
+            ),
+            (
+                Ok("status=ready\nconfig=connected\ncollector=unavailable\n".into()),
+                "automatic lifecycle setup collector assertion failed",
+            ),
+        ];
+
+        for (result, expected) in cases {
+            let error = require_automatic_setup_output(result).unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!error.contains("private"));
+            assert!(!error.contains("token"));
+            assert!(!error.contains("AUTOMATIC_RAW_PROMPT_SENTINEL"));
+        }
+        assert_eq!(
+            require_automatic_setup_output(Ok(
+                "status=ready\nconfig=connected\ncollector=degraded\n".into()
+            ))
+            .unwrap(),
+            "status=ready\nconfig=connected\ncollector=degraded\n"
+        );
     }
 
     #[test]
@@ -7297,6 +7389,14 @@ mod tests {
 
         assert!(root.is_dir());
         fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn automatic_smoke_evidence_preservation_requires_explicit_one() {
+        assert!(preserve_automatic_smoke_evidence(Some("1")));
+        assert!(!preserve_automatic_smoke_evidence(None));
+        assert!(!preserve_automatic_smoke_evidence(Some("0")));
+        assert!(!preserve_automatic_smoke_evidence(Some("true")));
     }
 
     #[test]
@@ -7356,6 +7456,10 @@ mod tests {
             "automatic lifecycle Codex config stage failed",
             "automatic lifecycle real Codex stage failed",
             "automatic lifecycle setup stage failed",
+            "automatic lifecycle setup command failed",
+            "automatic lifecycle setup status assertion failed",
+            "automatic lifecycle setup config assertion failed",
+            "automatic lifecycle setup collector assertion failed",
         ] {
             let manifest = render_automatic_manifest(
                 automatic_config(),

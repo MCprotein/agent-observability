@@ -1640,45 +1640,59 @@ impl ReportDtoV2 {
             }
         }
         for span in &self.spans {
-            validate_finite(span.start_time_unix_ms)?;
-            if let Some(end) = span.end_time_unix_ms {
-                validate_finite(end)?;
-            }
-            validate_report_attributes(&span.attributes)?;
-            validate_report_metrics(&span.metrics)?;
-            let token_metrics_present = report_token_metrics_present(&span.metrics);
-            let token_total_present = report_token_total_present(&span.metrics);
-            let token_availability_valid = if token_total_present {
-                span.availability.tokens.state == AvailabilityStateV2::Available
-            } else if token_metrics_present {
-                span.availability.tokens.state == AvailabilityStateV2::SourceUnavailable
-                    && span.availability.tokens.reason == "partial_token_metrics"
-            } else {
-                span.availability.tokens.state != AvailabilityStateV2::Available
-            };
-            if !token_availability_valid {
-                return Err(ContractError::ContradictoryReportAvailability);
-            }
-            for field in [
-                &span.availability.repository,
-                &span.availability.turn,
-                &span.availability.model,
-                &span.availability.tokens,
-                &span.availability.latency,
-                &span.availability.source_location,
-                &span.availability.request_content,
-                &span.availability.response_content,
-            ] {
-                if !valid_availability_reason(field) {
-                    return Err(ContractError::ContradictoryReportAvailability);
-                }
-            }
-            if let Some(amount) = span.estimated_cost {
-                validate_finite(amount)?;
-            }
-            validate_cost(&span.cost)?;
+            span.validate()?;
         }
         Ok(())
+    }
+}
+
+impl ReportSpanV2 {
+    /// Validates one projected span without requiring a complete report allocation.
+    ///
+    /// This is the same nested contract used by [`ReportDtoV2::validate`], not a substitute
+    /// for privacy projection of source or durable records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractError`] for invalid numeric values or contradictory availability.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_finite(self.start_time_unix_ms)?;
+        if let Some(end) = self.end_time_unix_ms {
+            validate_finite(end)?;
+        }
+        validate_report_attributes(&self.attributes)?;
+        validate_report_metrics(&self.metrics)?;
+        let token_metrics_present = report_token_metrics_present(&self.metrics);
+        let token_total_present = report_token_total_present(&self.metrics);
+        let token_availability_valid = if token_total_present {
+            self.availability.tokens.state == AvailabilityStateV2::Available
+        } else if token_metrics_present {
+            self.availability.tokens.state == AvailabilityStateV2::SourceUnavailable
+                && self.availability.tokens.reason == "partial_token_metrics"
+        } else {
+            self.availability.tokens.state != AvailabilityStateV2::Available
+        };
+        if !token_availability_valid {
+            return Err(ContractError::ContradictoryReportAvailability);
+        }
+        for field in [
+            &self.availability.repository,
+            &self.availability.turn,
+            &self.availability.model,
+            &self.availability.tokens,
+            &self.availability.latency,
+            &self.availability.source_location,
+            &self.availability.request_content,
+            &self.availability.response_content,
+        ] {
+            if !valid_availability_reason(field) {
+                return Err(ContractError::ContradictoryReportAvailability);
+            }
+        }
+        if let Some(amount) = self.estimated_cost {
+            validate_finite(amount)?;
+        }
+        validate_cost(&self.cost)
     }
 }
 

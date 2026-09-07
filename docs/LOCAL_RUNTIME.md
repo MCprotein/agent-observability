@@ -437,6 +437,10 @@ smoke remains available while the diagnostic commit is being prepared.
 
 ## Static report
 
+The accepted v1.11 [paged dashboard extension](PAGED_DASHBOARD.md) separates interactive queries
+from this export path; it is not implemented or released yet. The behavior below describes the
+existing self-contained export. Its 32 MiB capacity error must not require deleting observations.
+
 `report` prepares the store under the singleton lock, releases it, then holds the report publication lock
 while reading a typed ordered snapshot from SQLite authority. It applies the
 Rust privacy/cost projector, and writes `logs/agent-observability-report.html` atomically with mode

@@ -43,6 +43,12 @@ versioned config DTO만 사용한다. report는 self-contained static HTML이며
 분리되며 설정·integration API를 등록하지 않는다. 설정에서 연 dashboard도 별도 자식 프로세스가 소유하고,
 반복 open은 살아 있는 동일 process를 재사용한다. 생성기와 transport는 같은 32 MiB artifact 상한을
 공유하며, foreground process는 10분 idle 또는 1시간 hard deadline에 종료된다.
+
+v1.11 개발 범위에는 [Paged Dashboard](PAGED_DASHBOARD.md)가 추가됐다. 위 단일 artifact
+transport 설명은 현재 구현이며, 목표는 interactive dashboard의 bounded query transport와
+32 MiB self-contained HTML export를 분리하는 것이다. 전체 데이터 삭제/축약이나 cap 상향은
+해결책으로 사용하지 않는다. query/index의 generation, privacy, 삭제 fence와 resource budget을
+검증하기 전에는 이 확장을 구현 완료 또는 배포 완료로 표시하지 않는다.
 설정 UI는 CLI가 명시적으로 시작한 동안에만 `127.0.0.1:0`에 bind하는 ephemeral
 inbound adapter를 사용한다. settings token, exact Host/Origin, body bound, no-store와 optimistic revision을
 검증한다. HTTP/1 header read는 5초, 동시 연결은 64개, 종료 drain은 1초로 제한해 불완전한

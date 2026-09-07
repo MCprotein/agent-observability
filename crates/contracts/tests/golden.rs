@@ -559,6 +559,38 @@ fn report_v2_fixture_matches_availability_parity_corpus() {
 }
 
 #[test]
+fn standalone_span_validation_matches_full_report_validation() {
+    let report: ReportDtoV2 = serde_json::from_str(include_str!(
+        "../../../contracts/report-dto-v2.fixture.json"
+    ))
+    .unwrap();
+    let original = report.spans[0].clone();
+    let mut cases = vec![original.clone()];
+    let mut invalid = original.clone();
+    invalid.start_time_unix_ms = f64::NAN;
+    cases.push(invalid);
+    let mut invalid = original.clone();
+    invalid.metrics.input_tokens = Some(f64::INFINITY);
+    cases.push(invalid);
+    let mut invalid = original.clone();
+    invalid.availability.tokens.state =
+        agent_observability_contracts::AvailabilityStateV2::SourceUnavailable;
+    cases.push(invalid);
+    let mut invalid = original.clone();
+    invalid.availability.repository.reason = "unrecognized_reason".into();
+    cases.push(invalid);
+    let mut invalid = original;
+    invalid.estimated_cost = Some(f64::INFINITY);
+    cases.push(invalid);
+    for (index, span) in cases.into_iter().enumerate() {
+        let mut one_span_report = report.clone();
+        one_span_report.spans = vec![span.clone()];
+        assert_eq!(span.validate(), one_span_report.validate());
+        assert_eq!(span.validate().is_ok(), index == 0);
+    }
+}
+
+#[test]
 fn report_v2_rejects_token_availability_that_contradicts_metrics() {
     let fixture = include_str!("../../../contracts/report-dto-v2.fixture.json");
     let report: ReportDtoV2 = serde_json::from_str(fixture).expect("v2 fixture parses");
