@@ -116,16 +116,22 @@ The user approved [paged dashboard scope](docs/PAGED_DASHBOARD.md): bounded Rust
 TypeScript page/detail loading, while preserving observations and the standalone HTML export.
 Paged query/index code and browser regressions are implemented in the development branch. The
 approved capacity follow-up adds shared runtime write reservations and a smaller v2 index while
-retaining v1 reads. Actual-copy three-generation capacity validation, integrated independent review,
-existing-tab Chrome QA and fresh exact-head CI/automatic performance evidence remain release gates. See
+retaining v1 reads. Private-copy three-generation capacity validation has passed. Integrated release
+review, actual installed collection/recovery acceptance and final-head automatic performance remain gates. See
 [the current review checkpoint](docs/reviews/v1.11.0.md).
 
 The private-copy three-generation capacity check has passed. The remaining acknowledgement journal
 proof cannot use a single-leaf guard on the actual metadata layout. A dedicated fixed-width state
 table and bounded v6→v7 migration were explicitly approved and are implemented in the development
-branch with regression verification in progress. [Acknowledgement Storage](docs/ACKNOWLEDGEMENT_STORAGE.md)
+branch with scoped regression verification complete. [Acknowledgement Storage](docs/ACKNOWLEDGEMENT_STORAGE.md)
 defines the migration and finalization allocation contract. Actual-runtime migration, final-head
 release evidence and merge remain pending; a measurement pass alone does not promote the stable version.
+
+Candidate `4d4261c` passed Linux/macOS/UI CI `34135886327`. Chrome extension QA on an isolated
+demo exposed two display defects, now fixed and independently reviewed: snapshot header state and
+token/cost details. Synthetic Chrome recheck passed; this is not installed-runtime acceptance.
+The earlier long workflow `34135080615` was cancelled before its normative job when those defects
+required a new candidate. Settle final changes before dispatching exact-revision long evidence.
 
 ## Branch Strategy
 
