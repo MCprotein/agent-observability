@@ -1,9 +1,11 @@
 //! Stateful bounded query service for immutable local dashboard snapshots.
 
-use super::report_view_catalog::{ReportViewCatalogError, ReportViewReadScope, ReportViewSnapshot};
+use super::report_view_catalog::{
+    ReportViewCatalogError, ReportViewKernel, ReportViewReadScope, ReportViewSnapshot,
+};
 use super::report_view_query::{
-    IdentityDimension, IdentityScanCursor, SpanScanCursor, matches_filters, scan_identities,
-    scan_spans,
+    DimensionPosition, IdentityDimension, IdentityScanCursor, SpanScanCursor, matches_filters,
+    scan_identities, scan_spans,
 };
 use super::{LocalStore, ReportViewBuildError};
 use agent_observability_application::dashboard_summary::{
@@ -252,9 +254,9 @@ impl DashboardQueryService {
             Ok(value) => value,
             Err(failure) => return failure.response(DashboardRequestKindV1::Summary),
         };
-        let result = store.with_snapshot(snapshot_id, |connection, metadata| {
-            let step =
-                advance_summary(connection, progress, &filters).map_err(summary_catalog_error)?;
+        let result = store.with_snapshot_kernel(snapshot_id, |connection, metadata, kernel| {
+            let step = advance_summary(connection, progress, kernel, &filters)
+                .map_err(summary_catalog_error)?;
             Ok((metadata.clone(), step))
         });
         let (metadata, step) = match result {
@@ -416,8 +418,8 @@ impl DashboardQueryService {
             Ok(value) => value,
             Err(failure) => return failure.response(kind),
         };
-        let result = store.with_snapshot(snapshot_id, |connection, metadata| {
-            let batch = scan_facet_rows(connection, cursor, &filters)
+        let result = store.with_snapshot_kernel(snapshot_id, |connection, metadata, kernel| {
+            let batch = scan_facet_rows(connection, cursor, kernel, &filters)
                 .map_err(ReportViewCatalogError::Build)?;
             Ok((metadata.clone(), batch))
         });
@@ -784,7 +786,7 @@ impl FacetPhase {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct FacetScanCursor {
     phase: FacetPhase,
-    after: Option<(String, f64, String, String)>,
+    after: DimensionPosition,
     last_emitted: Option<String>,
 }
 
@@ -910,18 +912,15 @@ struct FacetScanBatch {
 
 fn scan_facet_rows(
     connection: &rusqlite::Connection,
-    cursor: FacetScanCursor,
+    mut cursor: FacetScanCursor,
+    kernel: ReportViewKernel,
     filters: &DashboardFiltersV1,
 ) -> Result<FacetScanBatch, ReportViewBuildError> {
-    let (sql, dimension) = facet_query(cursor.phase);
-    let (value, time, trace, span) = cursor
-        .after
-        .as_ref()
-        .map_or(("", f64::MIN, "", ""), |(value, time, trace, span)| {
-            (value.as_str(), *time, trace.as_str(), span.as_str())
-        });
+    cursor.after.bind(kernel)?;
+    let (sql, dimension) = facet_query(cursor.phase, kernel);
+    let parameters = cursor.after.parameters();
     let mut statement = connection.prepare(sql)?;
-    let mut source = statement.query(params![value, time, trace, span])?;
+    let mut source = statement.query(rusqlite::params_from_iter(parameters))?;
     let mut batch = FacetScanBatch {
         rows: Vec::new(),
         cursor,
@@ -942,7 +941,8 @@ fn scan_facet_rows(
             if let Some(next) = batch.cursor.phase.next() {
                 batch.cursor = FacetScanCursor {
                     phase: next,
-                    ..FacetScanCursor::default()
+                    after: DimensionPosition::new(kernel),
+                    last_emitted: None,
                 };
             } else {
                 batch.exhausted = true;
@@ -976,14 +976,37 @@ fn scan_facet_rows(
             });
             batch.cursor.last_emitted = Some(row_value.clone());
         }
-        batch.cursor.after = Some((row_value, row.get(1)?, row.get(2)?, row.get(3)?));
+        batch.cursor.after.advance(row_value, row)?;
         scanned += 1;
         decoded_bytes += json.len();
     }
     Ok(batch)
 }
 
-const fn facet_query(phase: FacetPhase) -> (&'static str, DashboardFacetDimensionV1) {
+const fn facet_query(
+    phase: FacetPhase,
+    kernel: ReportViewKernel,
+) -> (&'static str, DashboardFacetDimensionV1) {
+    if matches!(kernel, ReportViewKernel::V2) {
+        return match phase {
+            FacetPhase::Repo => (
+                "SELECT repo,source_order,NULL,NULL,span_json FROM spans INDEXED BY spans_repo_order_idx WHERE (repo,source_order) > (?1,?2) ORDER BY repo,source_order LIMIT 512",
+                DashboardFacetDimensionV1::Repo,
+            ),
+            FacetPhase::Session => (
+                "SELECT session_id,source_order,NULL,NULL,span_json FROM spans INDEXED BY spans_session_order_idx WHERE (session_id,source_order) > (?1,?2) ORDER BY session_id,source_order LIMIT 512",
+                DashboardFacetDimensionV1::Session,
+            ),
+            FacetPhase::Agent => (
+                "SELECT agent,source_order,NULL,NULL,span_json FROM spans INDEXED BY spans_agent_order_idx WHERE (agent,source_order) > (?1,?2) ORDER BY agent,source_order LIMIT 512",
+                DashboardFacetDimensionV1::Agent,
+            ),
+            FacetPhase::Model => (
+                "SELECT model,source_order,NULL,NULL,span_json FROM spans INDEXED BY spans_model_order_idx WHERE (model,source_order) > (?1,?2) ORDER BY model,source_order LIMIT 512",
+                DashboardFacetDimensionV1::Model,
+            ),
+        };
+    }
     match phase {
         FacetPhase::Repo => (
             "SELECT repo,start_time_unix_ms,trace_id,span_id,span_json FROM spans INDEXED BY spans_repo_order_idx WHERE (repo,start_time_unix_ms,trace_id,span_id) > (?1,?2,?3,?4) ORDER BY repo,start_time_unix_ms,trace_id,span_id LIMIT 512",
@@ -1016,6 +1039,7 @@ enum SummaryProgress {
     #[default]
     Spans,
     SpansAt {
+        kernel: ReportViewKernel,
         cursor: SpanScanCursor,
         accumulator: DashboardSummaryAccumulator,
     },
@@ -1038,6 +1062,7 @@ enum SummaryStep {
 fn advance_summary(
     connection: &rusqlite::Connection,
     progress: SummaryProgress,
+    kernel: ReportViewKernel,
     filters: &DashboardFiltersV1,
 ) -> Result<SummaryStep, SummaryAdvanceError> {
     match progress {
@@ -1045,23 +1070,38 @@ fn advance_summary(
             connection,
             &SpanScanCursor::default(),
             DashboardSummaryAccumulator::default(),
+            kernel,
             filters,
         ),
         SummaryProgress::SpansAt {
+            kernel: prior,
             cursor,
             accumulator,
-        } => advance_summary_spans(connection, &cursor, accumulator, filters),
+        } => {
+            if prior != kernel {
+                return Err(ReportViewBuildError::InvalidStagingState.into());
+            }
+            advance_summary_spans(connection, &cursor, accumulator, kernel, filters)
+        }
         SummaryProgress::Sessions {
             accumulator,
             cursor,
         } => {
-            let (cursor, exhausted) =
-                scan_identities(connection, IdentityDimension::Session, &cursor, filters)?;
+            let (cursor, exhausted) = scan_identities(
+                connection,
+                IdentityDimension::Session,
+                kernel,
+                &cursor,
+                filters,
+            )?;
             if exhausted {
                 Ok(SummaryStep::Pending(SummaryProgress::Turns {
                     accumulator,
                     sessions: cursor.distinct,
-                    cursor: IdentityScanCursor::default(),
+                    cursor: IdentityScanCursor {
+                        after: DimensionPosition::new(kernel),
+                        ..IdentityScanCursor::default()
+                    },
                 }))
             } else {
                 Ok(SummaryStep::Pending(SummaryProgress::Sessions {
@@ -1075,8 +1115,13 @@ fn advance_summary(
             sessions,
             cursor,
         } => {
-            let (cursor, exhausted) =
-                scan_identities(connection, IdentityDimension::Turn, &cursor, filters)?;
+            let (cursor, exhausted) = scan_identities(
+                connection,
+                IdentityDimension::Turn,
+                kernel,
+                &cursor,
+                filters,
+            )?;
             if exhausted {
                 let kpis = accumulator.finish(sessions, cursor.distinct)?;
                 Ok(SummaryStep::Complete(kpis))
@@ -1095,6 +1140,7 @@ fn advance_summary_spans(
     connection: &rusqlite::Connection,
     cursor: &SpanScanCursor,
     mut accumulator: DashboardSummaryAccumulator,
+    kernel: ReportViewKernel,
     filters: &DashboardFiltersV1,
 ) -> Result<SummaryStep, SummaryAdvanceError> {
     let batch = scan_spans(connection, cursor, filters, None, 512)?;
@@ -1104,10 +1150,14 @@ fn advance_summary_spans(
     if batch.exhausted {
         Ok(SummaryStep::Pending(SummaryProgress::Sessions {
             accumulator,
-            cursor: IdentityScanCursor::default(),
+            cursor: IdentityScanCursor {
+                after: DimensionPosition::new(kernel),
+                ..IdentityScanCursor::default()
+            },
         }))
     } else {
         Ok(SummaryStep::Pending(SummaryProgress::SpansAt {
+            kernel,
             cursor: batch.cursor,
             accumulator,
         }))
@@ -1901,8 +1951,13 @@ mod tests {
         let mut cursor = FacetScanCursor::default();
         let mut rows = Vec::new();
         loop {
-            let batch =
-                scan_facet_rows(&connection, cursor, &DashboardFiltersV1::default()).unwrap();
+            let batch = scan_facet_rows(
+                &connection,
+                cursor,
+                ReportViewKernel::V1,
+                &DashboardFiltersV1::default(),
+            )
+            .unwrap();
             rows.extend(batch.rows);
             cursor = batch.cursor;
             if batch.exhausted {
@@ -1928,5 +1983,205 @@ mod tests {
         assert!(rows.iter().any(|row| {
             row.dimension == DashboardFacetDimensionV1::Model && row.value == "model-a"
         }));
+    }
+    fn narrow_test_indexes(connection: &rusqlite::Connection) {
+        for (name, dimension) in [
+            ("repo", "repo"),
+            ("session", "session_id"),
+            ("turn", "turn_id"),
+            ("agent", "agent"),
+            ("model", "model"),
+        ] {
+            connection.execute_batch(&format!("DROP INDEX IF EXISTS spans_{name}_order_idx; CREATE INDEX spans_{name}_order_idx ON spans({dimension},source_order)")).unwrap();
+        }
+    }
+
+    fn complete_test_summary(
+        connection: &rusqlite::Connection,
+        kernel: ReportViewKernel,
+        filters: &DashboardFiltersV1,
+    ) -> String {
+        let mut progress = SummaryProgress::default();
+        for _ in 0..100 {
+            match advance_summary(connection, progress, kernel, filters)
+                .unwrap_or_else(|_| panic!("summary failed"))
+            {
+                SummaryStep::Pending(next) => progress = next,
+                SummaryStep::Complete(kpis) => return serde_json::to_string(&kpis).unwrap(),
+            }
+        }
+        panic!("summary did not converge")
+    }
+
+    fn complete_test_facets(
+        connection: &rusqlite::Connection,
+        kernel: ReportViewKernel,
+        filters: &DashboardFiltersV1,
+    ) -> Vec<String> {
+        let mut cursor = FacetScanCursor::default();
+        let mut rows = Vec::new();
+        for _ in 0..100 {
+            let batch = scan_facet_rows(connection, cursor, kernel, filters).unwrap();
+            rows.extend(
+                batch
+                    .rows
+                    .iter()
+                    .map(|row| serde_json::to_string(row).unwrap()),
+            );
+            cursor = batch.cursor;
+            if batch.exhausted {
+                return rows;
+            }
+        }
+        panic!("facets did not converge")
+    }
+
+    #[test]
+    fn dual_kernel_summary_and_facets_match_with_sparse_null_reverse_rows() {
+        let connection = query_database(1100);
+        connection.execute_batch("ALTER TABLE spans ADD COLUMN source_order INTEGER; UPDATE spans SET source_order=1101-rowid,start_time_unix_ms=0; ALTER TABLE spans ADD COLUMN turn_id TEXT; UPDATE spans SET turn_id=session_id; CREATE INDEX spans_turn_order_idx ON spans(turn_id,start_time_unix_ms,trace_id,span_id); CREATE INDEX stable ON spans(start_time_unix_ms,trace_id,span_id)").unwrap();
+        let mut statement = connection
+            .prepare("SELECT rowid,span_json FROM spans")
+            .unwrap();
+        let values = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for (id, json) in values {
+            let mut span: ReportSpanV2 = serde_json::from_str(&json).unwrap();
+            span.start_time_unix_ms = 0.0;
+            span.name = if id >= 1098 {
+                "late-match"
+            } else {
+                "not-matching"
+            }
+            .into();
+            span.session_id = if id < 3 {
+                None
+            } else {
+                Some(agent_observability_contracts::hash_opaque_identifier(
+                    if id < 1099 { "a" } else { "b" },
+                ))
+            };
+            connection
+                .execute(
+                    "UPDATE spans SET session_id=?1,turn_id=?1,span_json=?2 WHERE rowid=?3",
+                    params![span.session_id, serde_json::to_string(&span).unwrap(), id],
+                )
+                .unwrap();
+        }
+        let filters = DashboardFiltersV1 {
+            text: Some("late-match".into()),
+            ..DashboardFiltersV1::default()
+        };
+        let summary = complete_test_summary(&connection, ReportViewKernel::V1, &filters);
+        let facets = complete_test_facets(&connection, ReportViewKernel::V1, &filters);
+        assert_eq!(facets.len(), 5);
+        narrow_test_indexes(&connection);
+        assert_eq!(
+            summary,
+            complete_test_summary(&connection, ReportViewKernel::V2, &filters)
+        );
+        assert_eq!(
+            facets,
+            complete_test_facets(&connection, ReportViewKernel::V2, &filters)
+        );
+        for phase in [
+            FacetPhase::Repo,
+            FacetPhase::Session,
+            FacetPhase::Agent,
+            FacetPhase::Model,
+        ] {
+            let sql = format!(
+                "EXPLAIN QUERY PLAN {}",
+                facet_query(phase, ReportViewKernel::V2).0
+            );
+            let plan = connection
+                .prepare(&sql)
+                .unwrap()
+                .query_map(params!["a", 500], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" ");
+            assert!(plan.contains("SEARCH spans USING INDEX spans_"), "{plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+    }
+
+    #[test]
+    fn facets_and_summary_reject_cross_kernel_state_even_at_phase_boundary() {
+        let connection = query_database(0);
+        for (before, after) in [
+            (ReportViewKernel::V1, ReportViewKernel::V2),
+            (ReportViewKernel::V2, ReportViewKernel::V1),
+        ] {
+            let cursor = FacetScanCursor {
+                after: DimensionPosition::new(before),
+                ..FacetScanCursor::default()
+            };
+            assert!(matches!(
+                scan_facet_rows(&connection, cursor, after, &DashboardFiltersV1::default()),
+                Err(ReportViewBuildError::InvalidStagingState)
+            ));
+            let progress = SummaryProgress::SpansAt {
+                kernel: before,
+                cursor: SpanScanCursor::default(),
+                accumulator: DashboardSummaryAccumulator::default(),
+            };
+            assert!(matches!(
+                advance_summary(&connection, progress, after, &DashboardFiltersV1::default()),
+                Err(SummaryAdvanceError::Build(
+                    ReportViewBuildError::InvalidStagingState
+                ))
+            ));
+        }
+    }
+    #[test]
+    fn dual_kernel_facets_cross_output_page_limits_in_lexical_order() {
+        let connection = query_database(700);
+        connection.execute_batch("ALTER TABLE spans ADD COLUMN source_order INTEGER; UPDATE spans SET source_order=701-rowid; ALTER TABLE spans ADD COLUMN turn_id TEXT").unwrap();
+        let mut statement = connection
+            .prepare("SELECT rowid,span_json FROM spans ORDER BY rowid DESC")
+            .unwrap();
+        let values = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for (id, json) in values {
+            let mut span: ReportSpanV2 = serde_json::from_str(&json).unwrap();
+            span.repo = format!("repo-{id:04}");
+            connection
+                .execute(
+                    "UPDATE spans SET repo=?1,span_json=?2 WHERE rowid=?3",
+                    params![span.repo, serde_json::to_string(&span).unwrap(), id],
+                )
+                .unwrap();
+        }
+        let filters = DashboardFiltersV1::default();
+        let expected = complete_test_facets(&connection, ReportViewKernel::V1, &filters);
+        assert_eq!(expected.len(), 703);
+        assert!(expected.first().unwrap().contains("repo-0001"));
+        assert!(expected[699].contains("repo-0700"));
+        narrow_test_indexes(&connection);
+        let first = scan_facet_rows(
+            &connection,
+            FacetScanCursor::default(),
+            ReportViewKernel::V2,
+            &filters,
+        )
+        .unwrap();
+        assert!(first.rows.len() <= DASHBOARD_FACET_MAX_VALUES);
+        assert!(!first.exhausted);
+        assert_eq!(
+            expected,
+            complete_test_facets(&connection, ReportViewKernel::V2, &filters)
+        );
     }
 }

@@ -5,6 +5,7 @@ use rusqlite::{Connection, params, types::ValueRef};
 use std::time::{Duration, Instant};
 
 use super::ReportViewBuildError;
+use super::report_view_catalog::ReportViewKernel;
 
 const MAX_SCAN_ROWS: usize = 512;
 const MAX_DECODED_BYTES: usize = 2 * 1024 * 1024;
@@ -19,9 +20,75 @@ pub(crate) enum IdentityDimension {
     Turn,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) enum DimensionPosition {
+    #[default]
+    Unbound,
+    V1(Option<(String, f64, String, String)>),
+    V2(Option<(String, i64)>),
+}
+
+impl DimensionPosition {
+    pub(crate) const fn new(kernel: ReportViewKernel) -> Self {
+        match kernel {
+            ReportViewKernel::V1 => Self::V1(None),
+            ReportViewKernel::V2 => Self::V2(None),
+        }
+    }
+
+    pub(crate) fn bind(&mut self, kernel: ReportViewKernel) -> Result<(), ReportViewBuildError> {
+        match (&self, kernel) {
+            (Self::Unbound, _) => {
+                *self = Self::new(kernel);
+                Ok(())
+            }
+            (Self::V1(_), ReportViewKernel::V1) | (Self::V2(_), ReportViewKernel::V2) => Ok(()),
+            _ => Err(ReportViewBuildError::InvalidStagingState),
+        }
+    }
+
+    pub(crate) fn parameters(&self) -> Vec<rusqlite::types::Value> {
+        use rusqlite::types::Value;
+        match self {
+            Self::V1(after) => {
+                let (value, time, trace, span) = after.clone().unwrap_or((
+                    String::new(),
+                    f64::MIN,
+                    String::new(),
+                    String::new(),
+                ));
+                vec![
+                    Value::Text(value),
+                    Value::Real(time),
+                    Value::Text(trace),
+                    Value::Text(span),
+                ]
+            }
+            Self::V2(after) => {
+                let (value, order) = after.clone().unwrap_or((String::new(), i64::MIN));
+                vec![Value::Text(value), Value::Integer(order)]
+            }
+            Self::Unbound => unreachable!("position bound before query"),
+        }
+    }
+
+    pub(crate) fn advance(
+        &mut self,
+        value: String,
+        row: &rusqlite::Row<'_>,
+    ) -> Result<(), ReportViewBuildError> {
+        *self = match self {
+            Self::V1(_) => Self::V1(Some((value, row.get(1)?, row.get(2)?, row.get(3)?))),
+            Self::V2(_) => Self::V2(Some((value, row.get(1)?))),
+            Self::Unbound => return Err(ReportViewBuildError::InvalidStagingState),
+        };
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IdentityScanCursor {
-    pub after: Option<(String, f64, String, String)>,
+    pub after: DimensionPosition,
     pub last_matching: Option<String>,
     pub distinct: u64,
 }
@@ -30,26 +97,16 @@ pub(crate) struct IdentityScanCursor {
 pub(crate) fn scan_identities(
     connection: &Connection,
     dimension: IdentityDimension,
+    kernel: ReportViewKernel,
     cursor: &IdentityScanCursor,
     filters: &DashboardFiltersV1,
 ) -> Result<(IdentityScanCursor, bool), ReportViewBuildError> {
-    let sql = match dimension {
-        IdentityDimension::Session => {
-            "SELECT session_id,start_time_unix_ms,trace_id,span_id,span_json FROM spans WHERE (session_id,start_time_unix_ms,trace_id,span_id) > (?1,?2,?3,?4) ORDER BY session_id,start_time_unix_ms,trace_id,span_id LIMIT 512"
-        }
-        IdentityDimension::Turn => {
-            "SELECT turn_id,start_time_unix_ms,trace_id,span_id,span_json FROM spans WHERE (turn_id,start_time_unix_ms,trace_id,span_id) > (?1,?2,?3,?4) ORDER BY turn_id,start_time_unix_ms,trace_id,span_id LIMIT 512"
-        }
-    };
+    let sql = identity_query(dimension, kernel);
     let mut next = cursor.clone();
-    let (identity, time, trace, span) = cursor
-        .after
-        .as_ref()
-        .map_or(("", f64::MIN, "", ""), |(identity, time, trace, span)| {
-            (identity.as_str(), *time, trace.as_str(), span.as_str())
-        });
+    next.after.bind(kernel)?;
+    let parameters = next.after.parameters();
     let mut statement = connection.prepare(sql)?;
-    let mut rows = statement.query(params![identity, time, trace, span])?;
+    let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
     let started = Instant::now();
     let mut decoded = 0;
     for ordinal in 0..MAX_SCAN_ROWS {
@@ -87,9 +144,29 @@ pub(crate) fn scan_identities(
                 .ok_or(ReportViewBuildError::CapacityExceeded)?;
             next.last_matching = Some(identity.clone());
         }
-        next.after = Some((identity, row.get(1)?, row.get(2)?, row.get(3)?));
+        next.after.advance(identity, row)?;
     }
     Ok((next, false))
+}
+
+pub(crate) const fn identity_query(
+    dimension: IdentityDimension,
+    kernel: ReportViewKernel,
+) -> &'static str {
+    match (dimension, kernel) {
+        (IdentityDimension::Session, ReportViewKernel::V1) => {
+            "SELECT session_id,start_time_unix_ms,trace_id,span_id,span_json FROM spans WHERE (session_id,start_time_unix_ms,trace_id,span_id) > (?1,?2,?3,?4) ORDER BY session_id,start_time_unix_ms,trace_id,span_id LIMIT 512"
+        }
+        (IdentityDimension::Turn, ReportViewKernel::V1) => {
+            "SELECT turn_id,start_time_unix_ms,trace_id,span_id,span_json FROM spans WHERE (turn_id,start_time_unix_ms,trace_id,span_id) > (?1,?2,?3,?4) ORDER BY turn_id,start_time_unix_ms,trace_id,span_id LIMIT 512"
+        }
+        (IdentityDimension::Session, ReportViewKernel::V2) => {
+            "SELECT session_id,source_order,NULL,NULL,span_json FROM spans INDEXED BY spans_session_order_idx WHERE (session_id,source_order) > (?1,?2) ORDER BY session_id,source_order LIMIT 512"
+        }
+        (IdentityDimension::Turn, ReportViewKernel::V2) => {
+            "SELECT turn_id,source_order,NULL,NULL,span_json FROM spans INDEXED BY spans_turn_order_idx WHERE (turn_id,source_order) > (?1,?2) ORDER BY turn_id,source_order LIMIT 512"
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -384,6 +461,7 @@ mod tests {
                 let (next, done) = scan_identities(
                     &connection,
                     dimension,
+                    ReportViewKernel::V1,
                     &cursor,
                     &DashboardFiltersV1::default(),
                 )
@@ -403,14 +481,121 @@ mod tests {
         };
         let mut cursor = IdentityScanCursor::default();
         loop {
-            let (next, done) =
-                scan_identities(&connection, IdentityDimension::Session, &cursor, &filtered)
-                    .unwrap();
+            let (next, done) = scan_identities(
+                &connection,
+                IdentityDimension::Session,
+                ReportViewKernel::V1,
+                &cursor,
+                &filtered,
+            )
+            .unwrap();
             cursor = next;
             if done {
                 break;
             }
         }
         assert_eq!(cursor.distinct, 0);
+    }
+    #[test]
+    fn identity_sparse_late_match_null_empty_and_reverse_order_regression() {
+        let connection = database(1100);
+        connection.execute_batch("ALTER TABLE spans ADD COLUMN session_id TEXT; ALTER TABLE spans ADD COLUMN turn_id TEXT; UPDATE spans SET session_id=CASE WHEN rowid=1 THEN NULL WHEN rowid=2 THEN '' WHEN rowid<1099 THEN 'a' ELSE 'b' END,turn_id=CASE WHEN rowid=1 THEN NULL WHEN rowid=2 THEN '' WHEN rowid<1099 THEN 'a' ELSE 'b' END; CREATE INDEX sessions ON spans(session_id,start_time_unix_ms,trace_id,span_id); CREATE INDEX turns ON spans(turn_id,start_time_unix_ms,trace_id,span_id);").unwrap();
+        let filtered = DashboardFiltersV1 {
+            text: Some("late-match".into()),
+            ..DashboardFiltersV1::default()
+        };
+        let mut rows = connection
+            .prepare("SELECT rowid,span_json FROM spans ORDER BY span_id DESC")
+            .unwrap();
+        let values = rows
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for (id, json) in values {
+            let mut span: ReportSpanV2 = serde_json::from_str(&json).unwrap();
+            span.name = if id >= 1098 { "late-match" } else { "no-match" }.into();
+            connection
+                .execute(
+                    "UPDATE spans SET span_json=?1 WHERE rowid=?2",
+                    params![serde_json::to_string(&span).unwrap(), id],
+                )
+                .unwrap();
+        }
+        connection.execute_batch("ALTER TABLE spans ADD COLUMN source_order INTEGER; UPDATE spans SET source_order=1101-rowid").unwrap();
+        for kernel in [ReportViewKernel::V1, ReportViewKernel::V2] {
+            if kernel == ReportViewKernel::V2 {
+                connection.execute_batch("DROP INDEX sessions; DROP INDEX turns; CREATE INDEX spans_session_order_idx ON spans(session_id,source_order); CREATE INDEX spans_turn_order_idx ON spans(turn_id,source_order)").unwrap();
+            }
+            for dimension in [IdentityDimension::Session, IdentityDimension::Turn] {
+                let mut cursor = IdentityScanCursor::default();
+                let mut slices = 0;
+                loop {
+                    let (next, done) =
+                        scan_identities(&connection, dimension, kernel, &cursor, &filtered)
+                            .unwrap();
+                    cursor = next;
+                    slices += 1;
+                    if done {
+                        break;
+                    }
+                    assert!(slices < 30);
+                }
+                assert_eq!(cursor.distinct, 2);
+                assert!(slices >= 3);
+            }
+        }
+    }
+
+    #[test]
+    fn identity_v2_seeks_and_rejects_v1_continuations() {
+        let connection = database(0);
+        connection.execute_batch("ALTER TABLE spans ADD COLUMN source_order INTEGER; ALTER TABLE spans ADD COLUMN session_id TEXT; ALTER TABLE spans ADD COLUMN turn_id TEXT; CREATE INDEX spans_session_order_idx ON spans(session_id,source_order); CREATE INDEX spans_turn_order_idx ON spans(turn_id,source_order)").unwrap();
+        for dimension in [IdentityDimension::Session, IdentityDimension::Turn] {
+            let sql = format!(
+                "EXPLAIN QUERY PLAN {}",
+                identity_query(dimension, ReportViewKernel::V2)
+            );
+            let plan = connection
+                .prepare(&sql)
+                .unwrap()
+                .query_map(params!["a", 500], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" ");
+            assert!(plan.contains("SEARCH spans USING INDEX spans_"), "{plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+            let cursor = IdentityScanCursor {
+                after: DimensionPosition::new(ReportViewKernel::V1),
+                ..IdentityScanCursor::default()
+            };
+            assert!(matches!(
+                scan_identities(
+                    &connection,
+                    dimension,
+                    ReportViewKernel::V2,
+                    &cursor,
+                    &DashboardFiltersV1::default()
+                ),
+                Err(ReportViewBuildError::InvalidStagingState)
+            ));
+            let cursor = IdentityScanCursor {
+                after: DimensionPosition::new(ReportViewKernel::V2),
+                ..IdentityScanCursor::default()
+            };
+            assert!(matches!(
+                scan_identities(
+                    &connection,
+                    dimension,
+                    ReportViewKernel::V1,
+                    &cursor,
+                    &DashboardFiltersV1::default()
+                ),
+                Err(ReportViewBuildError::InvalidStagingState)
+            ));
+        }
     }
 }

@@ -30,6 +30,30 @@ const MAX_TEMP_COLLISIONS: usize = 64;
 const SQLITE_CACHE_KIB: i64 = 8 * 1024;
 static CATALOG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Private sidecar query layout; never part of the HTTP contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReportViewKernel {
+    V1,
+    V2,
+}
+
+/// Whether a validated current sidecar needs rebuilding with the current kernel.
+/// An absent view returns false; callers separately schedule initial publication.
+///
+/// # Errors
+/// Returns an error for unsafe, unknown or incompatible metadata/index layouts.
+pub fn current_report_view_needs_kernel_upgrade(
+    store: &LocalStore,
+) -> Result<bool, ReportViewCatalogError> {
+    let scope = ReportViewReadScope::acquire(store)?;
+    let Some(snapshot) = scope.current()? else {
+        return Ok(false);
+    };
+    scope.with_snapshot_kernel(snapshot.view_id(), |_, _, kernel| {
+        Ok(kernel == ReportViewKernel::V1)
+    })
+}
+
 /// Failure while publishing, reopening, recovering, or retiring report-view snapshots.
 #[derive(Debug)]
 pub enum ReportViewCatalogError {
@@ -307,6 +331,19 @@ impl<'a> ReportViewReadScope<'a> {
         view_id: &str,
         use_snapshot: impl FnOnce(&Connection, &ReportViewSnapshot) -> Result<T, ReportViewCatalogError>,
     ) -> Result<T, ReportViewCatalogError> {
+        with_report_view_snapshot_guarded(self.store, view_id, |connection, snapshot, _| {
+            use_snapshot(connection, snapshot)
+        })
+    }
+    pub(crate) fn with_snapshot_kernel<T>(
+        &self,
+        view_id: &str,
+        use_snapshot: impl FnOnce(
+            &Connection,
+            &ReportViewSnapshot,
+            ReportViewKernel,
+        ) -> Result<T, ReportViewCatalogError>,
+    ) -> Result<T, ReportViewCatalogError> {
         with_report_view_snapshot_guarded(self.store, view_id, use_snapshot)
     }
 }
@@ -348,7 +385,11 @@ pub fn with_report_view_snapshot<T>(
 fn with_report_view_snapshot_guarded<T>(
     store: &LocalStore,
     view_id: &str,
-    use_snapshot: impl FnOnce(&Connection, &ReportViewSnapshot) -> Result<T, ReportViewCatalogError>,
+    use_snapshot: impl FnOnce(
+        &Connection,
+        &ReportViewSnapshot,
+        ReportViewKernel,
+    ) -> Result<T, ReportViewCatalogError>,
 ) -> Result<T, ReportViewCatalogError> {
     validate_view_id(view_id)?;
     let directory = existing_managed_report_view_directory(store)
@@ -375,8 +416,8 @@ fn with_report_view_snapshot_guarded<T>(
     connection.busy_timeout(Duration::ZERO)?;
     connection.pragma_update(None, "query_only", true)?;
     connection.pragma_update(None, "cache_size", -SQLITE_CACHE_KIB)?;
-    validate_snapshot_database(&connection, snapshot)?;
-    use_snapshot(&connection, snapshot)
+    let kernel = validate_snapshot_database(&connection, snapshot)?;
+    use_snapshot(&connection, snapshot, kernel)
 }
 
 /// Removes all report views before a caller advances visibility in a destructive transaction.
@@ -917,12 +958,26 @@ fn validate_catalog_files(
 fn validate_snapshot_database(
     connection: &Connection,
     snapshot: &ReportViewSnapshot,
-) -> Result<(), ReportViewCatalogError> {
+) -> Result<ReportViewKernel, ReportViewCatalogError> {
+    let version: String = connection.query_row(
+        "SELECT value FROM metadata WHERE key='schema_version'",
+        [],
+        |row| row.get(0),
+    )?;
+    let kernel = match version.as_str() {
+        "agent_observability.report_view_staging.v1" => ReportViewKernel::V1,
+        "agent_observability.report_view_staging.v2" => ReportViewKernel::V2,
+        _ => return Err(ReportViewCatalogError::InvalidCatalog),
+    };
+    let metadata_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM metadata LIMIT 8)",
+        [],
+        |row| row.get(0),
+    )?;
+    if metadata_count != 7 {
+        return Err(ReportViewCatalogError::InvalidCatalog);
+    }
     for (key, expected) in [
-        (
-            "schema_version",
-            "agent_observability.report_view_staging.v1".to_owned(),
-        ),
         ("source_generation", snapshot.generation.to_string()),
         ("visibility_epoch", snapshot.visibility_epoch.to_string()),
         ("rate_fingerprint", snapshot.rate_fingerprint.clone()),
@@ -936,6 +991,83 @@ fn validate_snapshot_database(
             })
             .optional()?;
         if actual.as_deref() != Some(expected.as_str()) {
+            return Err(ReportViewCatalogError::InvalidCatalog);
+        }
+    }
+    validate_kernel_indexes(connection, kernel)?;
+    Ok(kernel)
+}
+
+fn validate_kernel_indexes(
+    connection: &Connection,
+    kernel: ReportViewKernel,
+) -> Result<(), ReportViewCatalogError> {
+    let mut keys = connection
+        .prepare("SELECT name,type,pk FROM pragma_table_info('spans') WHERE pk<>0 LIMIT 2")?;
+    let keys = keys
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if keys != vec![("source_order".into(), "INTEGER".into(), 1)] {
+        return Err(ReportViewCatalogError::InvalidCatalog);
+    }
+
+    for (name, dimension) in [
+        ("spans_repo_order_idx", "repo"),
+        ("spans_session_order_idx", "session_id"),
+        ("spans_turn_order_idx", "turn_id"),
+        ("spans_agent_order_idx", "agent"),
+        ("spans_model_order_idx", "model"),
+        ("spans_stable_order_idx", ""),
+        ("spans_trace_repo_idx", ""),
+        ("spans_trace_order_idx", ""),
+    ] {
+        let expected = match name {
+            "spans_stable_order_idx" => vec!["start_time_unix_ms", "trace_id", "span_id"],
+            "spans_trace_repo_idx" => vec!["trace_id", "repo"],
+            "spans_trace_order_idx" => vec!["trace_id", "start_time_unix_ms", "span_id"],
+            _ => match kernel {
+                ReportViewKernel::V1 => {
+                    vec![dimension, "start_time_unix_ms", "trace_id", "span_id"]
+                }
+                ReportViewKernel::V2 => vec![dimension, "source_order"],
+            },
+        };
+        let definition: Option<(i64, i64, String)> = connection
+            .query_row(
+                "SELECT [unique],partial,origin FROM pragma_index_list('spans') WHERE name=?1",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if definition != Some((0, 0, "c".into())) {
+            return Err(ReportViewCatalogError::InvalidCatalog);
+        }
+        let mut statement = connection.prepare(
+            "SELECT name,desc,coll FROM pragma_index_xinfo(?1) WHERE key=1 ORDER BY seqno LIMIT 6",
+        )?;
+        let columns = statement
+            .query_map([name], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns.len() != expected.len()
+            || columns
+                .iter()
+                .zip(expected)
+                .any(|((actual, descending, collation), expected)| {
+                    actual.as_deref() != Some(expected) || *descending != 0 || collation != "BINARY"
+                })
+        {
             return Err(ReportViewCatalogError::InvalidCatalog);
         }
     }
@@ -1279,6 +1411,102 @@ mod tests {
             Err(ReportViewCatalogError::InvalidCatalog)
         ));
         fs::remove_file(link).unwrap();
+        let _ = fs::remove_dir_all(directory);
+    }
+    fn rewrite_kernel(store: &LocalStore, snapshot: &ReportViewSnapshot, version: &str) {
+        let path = managed_report_view_directory(store)
+            .unwrap()
+            .join(&snapshot.file_name);
+        let connection = Connection::open(path).unwrap();
+        for (name, dimension) in [
+            ("repo", "repo"),
+            ("session", "session_id"),
+            ("turn", "turn_id"),
+            ("agent", "agent"),
+            ("model", "model"),
+        ] {
+            let tail = if version == "v1" {
+                "start_time_unix_ms,trace_id,span_id"
+            } else {
+                "source_order"
+            };
+            connection.execute_batch(&format!("DROP INDEX spans_{name}_order_idx; CREATE INDEX spans_{name}_order_idx ON spans({dimension},{tail});")).unwrap();
+        }
+        connection
+            .execute(
+                "UPDATE metadata SET value=?1 WHERE key='schema_version'",
+                [format!("agent_observability.report_view_staging.{version}")],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn dual_kernel_upgrade_preserves_v1_on_failed_build_and_retires_after_v2() {
+        let (directory, store) = open_store("dual-kernel");
+        assert!(!current_report_view_needs_kernel_upgrade(&store).unwrap());
+        let old = publish_report_view(&store, build(&store))
+            .unwrap()
+            .current()
+            .clone();
+        rewrite_kernel(&store, &old, "v1");
+        assert!(current_report_view_needs_kernel_upgrade(&store).unwrap());
+        assert!(
+            crate::build_report_view_staging(&store, MISSING_RATE_FINGERPRINT, 1, None).is_err()
+        );
+        with_report_view_snapshot(&store, old.view_id(), |_, _| Ok(())).unwrap();
+        assert!(current_report_view_needs_kernel_upgrade(&store).unwrap());
+        let new = publish_report_view(&store, build(&store))
+            .unwrap()
+            .current()
+            .clone();
+        assert!(!current_report_view_needs_kernel_upgrade(&store).unwrap());
+        let scope = ReportViewReadScope::acquire(&store).unwrap();
+        assert_eq!(
+            scope
+                .with_snapshot_kernel(old.view_id(), |_, _, kernel| Ok(kernel))
+                .unwrap(),
+            ReportViewKernel::V1
+        );
+        assert_eq!(
+            scope
+                .with_snapshot_kernel(new.view_id(), |_, _, kernel| Ok(kernel))
+                .unwrap(),
+            ReportViewKernel::V2
+        );
+        drop(scope);
+        publish_report_view(&store, build(&store)).unwrap();
+        assert!(matches!(
+            with_report_view_snapshot(&store, old.view_id(), |_, _| Ok(())),
+            Err(ReportViewCatalogError::SnapshotExpired)
+        ));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn unknown_metadata_and_mismatched_index_shapes_fail_closed() {
+        let (directory, store) = open_store("kernel-corrupt");
+        let view = publish_report_view(&store, build(&store))
+            .unwrap()
+            .current()
+            .clone();
+        let path = directory.join(MANAGED_DIRECTORY_NAME).join(&view.file_name);
+        let connection = Connection::open(&path).unwrap();
+        for sql in [
+            "UPDATE metadata SET value='agent_observability.report_view_staging.v9' WHERE key='schema_version'",
+            "UPDATE metadata SET value='agent_observability.report_view_staging.v1' WHERE key='schema_version'",
+            "UPDATE metadata SET value='agent_observability.report_view_staging.v2' WHERE key='schema_version'; INSERT INTO metadata VALUES('unknown','x')",
+            "DELETE FROM metadata WHERE key='unknown'; DROP INDEX spans_repo_order_idx; CREATE INDEX spans_repo_order_idx ON spans(repo,source_order DESC)",
+            "DROP INDEX spans_repo_order_idx; CREATE INDEX spans_repo_order_idx ON spans(repo COLLATE NOCASE,source_order)",
+            "DROP INDEX spans_repo_order_idx; CREATE INDEX spans_repo_order_idx ON spans(repo,source_order) WHERE repo<>''",
+        ] {
+            connection.execute_batch(sql).unwrap();
+            assert!(matches!(
+                current_report_view_needs_kernel_upgrade(&store),
+                Err(ReportViewCatalogError::InvalidCatalog)
+            ));
+            assert!(with_report_view_snapshot(&store, view.view_id(), |_, _| Ok(())).is_err());
+        }
+        drop(connection);
         let _ = fs::remove_dir_all(directory);
     }
 }

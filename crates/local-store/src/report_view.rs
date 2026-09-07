@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const REPORT_VIEW_SCHEMA_VERSION: &str = "agent_observability.report_view_staging.v1";
+const REPORT_VIEW_SCHEMA_VERSION: &str = "agent_observability.report_view_staging.v2";
 const STAGING_FILE_PREFIX: &str = ".report-view.sqlite3.staging.";
 /// Finite per-generation database plus rollback-journal disk ceiling.
 pub const MAX_REPORT_VIEW_BYTES: u64 = 256 * 1024 * 1024;
@@ -64,15 +64,15 @@ CREATE INDEX spans_trace_repo_idx
 CREATE INDEX spans_trace_order_idx
     ON spans(trace_id, start_time_unix_ms, span_id);
 CREATE INDEX spans_repo_order_idx
-    ON spans(repo, start_time_unix_ms, trace_id, span_id);
+    ON spans(repo, source_order);
 CREATE INDEX spans_session_order_idx
-    ON spans(session_id, start_time_unix_ms, trace_id, span_id);
+    ON spans(session_id, source_order);
 CREATE INDEX spans_turn_order_idx
-    ON spans(turn_id, start_time_unix_ms, trace_id, span_id);
+    ON spans(turn_id, source_order);
 CREATE INDEX spans_agent_order_idx
-    ON spans(agent, start_time_unix_ms, trace_id, span_id);
+    ON spans(agent, source_order);
 CREATE INDEX spans_model_order_idx
-    ON spans(model, start_time_unix_ms, trace_id, span_id);
+    ON spans(model, source_order);
 ";
 
 /// Failure while constructing a private report-view staging database.

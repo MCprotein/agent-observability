@@ -13,8 +13,8 @@ pub use report_view::{
 };
 pub use report_view_catalog::{
     ReportViewCatalogError, ReportViewPublication, ReportViewRetirement, ReportViewSnapshot,
-    current_report_view, publish_report_view, recover_report_view_catalog,
-    with_report_view_snapshot,
+    current_report_view, current_report_view_needs_kernel_upgrade, publish_report_view,
+    recover_report_view_catalog, with_report_view_snapshot,
 };
 
 pub use lifecycle::{
