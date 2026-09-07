@@ -28,7 +28,8 @@ use agent_observability_local_runtime::{
     StorageBudget,
 };
 use agent_observability_local_store::{
-    LOCAL_STORE_SCHEMA_VERSION, LocalStore, current_report_view, with_report_view_snapshot,
+    LOCAL_STORE_SCHEMA_VERSION, LocalStore, ReportViewBuildError, ReportViewCatalogError,
+    StoreError, current_report_view, with_report_view_snapshot,
 };
 use serde::Deserialize;
 #[cfg(target_os = "macos")]
@@ -273,6 +274,7 @@ struct AutomaticProtocolWorkload {
     collector_boundary: String,
     payload: String,
     readiness: String,
+    convergence_failures: String,
     collector_shutdown: String,
 }
 
@@ -1474,6 +1476,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
             collector_boundary: "built agent-observability collector-serve subprocess".into(),
             payload: "bounded synthetic Codex-shaped WebSocket-request/completed OTLP log pairs with opaque identifiers; one bounded notify supplement per measured run whose raw sentinels must be absent from the durable tree".into(),
             readiness: "successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, exactly two durable synthetic records per accepted OTLP request plus one notify record, and one current validated published paged snapshot whose generation, visibility epoch, metadata record count, and indexed row count match authoritative SQLite must converge before collector shutdown".into(),
+            convergence_failures: "Retry only explicit SQLite busy/locked, catalog Busy, not-ready or proven snapshot consistency races within the existing startup deadline; durable failures stop on the first poll with zero sleeps and map only published_snapshot_open_failed, published_snapshot_authority_failed, published_snapshot_catalog_failed or published_snapshot_validation_failed into manifest errors; public stderr remains automatic_check_failed".into(),
             collector_shutdown: "bounded child termination and wait".into(),
         },
         metrics: AutomaticProtocolMetrics {
@@ -3492,46 +3495,132 @@ fn wait_for_automatic_ready(root: &Path, collector: &mut ChildGuard) -> Result<(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublishedSnapshotStage {
+    Open,
+    Authority,
+    Catalog,
+    Validation,
+}
+
+impl PublishedSnapshotStage {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Open => "published_snapshot_open_failed",
+            Self::Authority => "published_snapshot_authority_failed",
+            Self::Catalog => "published_snapshot_catalog_failed",
+            Self::Validation => "published_snapshot_validation_failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutomaticConvergenceError {
+    Retry,
+    Fatal(PublishedSnapshotStage),
+    CollectorInspect,
+    CollectorExited,
+}
+
+fn automatic_store_read_error(
+    error: &StoreError,
+    stage: PublishedSnapshotStage,
+) -> AutomaticConvergenceError {
+    if error.is_contention() || matches!(error, StoreError::ReportSnapshotChanged) {
+        AutomaticConvergenceError::Retry
+    } else {
+        AutomaticConvergenceError::Fatal(stage)
+    }
+}
+
+fn automatic_catalog_read_error(
+    error: ReportViewCatalogError,
+    stage: PublishedSnapshotStage,
+) -> AutomaticConvergenceError {
+    match error {
+        ReportViewCatalogError::Busy
+        | ReportViewCatalogError::RefreshPending
+        | ReportViewCatalogError::SnapshotChanged => AutomaticConvergenceError::Retry,
+        // Validation only requests a view just read as current; expiration here proves a race.
+        ReportViewCatalogError::SnapshotExpired if stage == PublishedSnapshotStage::Validation => {
+            AutomaticConvergenceError::Retry
+        }
+        ReportViewCatalogError::Store(error)
+        | ReportViewCatalogError::Build(ReportViewBuildError::Store(error)) => {
+            automatic_store_read_error(&error, stage)
+        }
+        ReportViewCatalogError::Sqlite(error)
+        | ReportViewCatalogError::Build(ReportViewBuildError::Sqlite(error)) => {
+            automatic_store_read_error(&StoreError::Sqlite(error), stage)
+        }
+        _ => AutomaticConvergenceError::Fatal(stage),
+    }
+}
+
 fn wait_for_automatic_report_convergence(
     root: &Path,
     collector: &mut ChildGuard,
 ) -> Result<ReportConvergence, String> {
     let started = Instant::now();
+    wait_for_automatic_convergence(
+        || {
+            if collector
+                .try_wait()
+                .map_err(|_| AutomaticConvergenceError::CollectorInspect)?
+                .is_some()
+            {
+                return Err(AutomaticConvergenceError::CollectorExited);
+            }
+            let store = LocalStore::open_current(root.join("state/store")).map_err(|error| {
+                automatic_store_read_error(&error, PublishedSnapshotStage::Open)
+            })?;
+            let convergence = automatic_published_snapshot_convergence(&store)?;
+            // A degraded health status must not conceal a durable snapshot error.
+            Ok(convergence.filter(|_| check_health(root) == HealthOutcome::Ready))
+        },
+        || started.elapsed(),
+        sleep,
+    )
+}
+
+fn wait_for_automatic_convergence(
+    mut poll: impl FnMut() -> Result<Option<ReportConvergence>, AutomaticConvergenceError>,
+    mut elapsed: impl FnMut() -> Duration,
+    mut pause: impl FnMut(Duration),
+) -> Result<ReportConvergence, String> {
     loop {
-        if collector
-            .try_wait()
-            .map_err(|error| format!("inspect automatic collector convergence: {error}"))?
-            .is_some()
-        {
-            return Err("built automatic collector exited before report convergence".into());
+        match poll() {
+            Ok(Some(convergence)) => return Ok(convergence),
+            Ok(None) | Err(AutomaticConvergenceError::Retry) => {}
+            Err(AutomaticConvergenceError::Fatal(stage)) => return Err(stage.code().into()),
+            Err(AutomaticConvergenceError::CollectorInspect) => {
+                return Err("inspect automatic collector convergence failed".into());
+            }
+            Err(AutomaticConvergenceError::CollectorExited) => {
+                return Err("built automatic collector exited before report convergence".into());
+            }
         }
-        if check_health(root) == HealthOutcome::Ready
-            && let Ok(store) = LocalStore::open_current(root.join("state/store"))
-            && let Ok(Some(convergence)) = automatic_published_snapshot_convergence(&store)
-        {
-            return Ok(convergence);
-        }
-        if started.elapsed() >= AUTOMATIC_START_TIMEOUT {
+        if elapsed() >= AUTOMATIC_START_TIMEOUT {
             return Err("automatic published paged snapshot convergence timed out".into());
         }
-        sleep(Duration::from_millis(20));
+        pause(Duration::from_millis(20));
     }
 }
 
 fn automatic_published_snapshot_convergence(
     store: &LocalStore,
-) -> Result<Option<ReportConvergence>, String> {
+) -> Result<Option<ReportConvergence>, AutomaticConvergenceError> {
     let status_before = store
         .report_status()
-        .map_err(|error| format!("read report status before published snapshot: {error}"))?;
+        .map_err(|error| automatic_store_read_error(&error, PublishedSnapshotStage::Authority))?;
     let visibility_before = store
         .report_visibility_epoch()
-        .map_err(|error| format!("read visibility epoch before published snapshot: {error}"))?;
-    let records_before = store.record_count().map_err(|error| {
-        format!("read authoritative record count before published snapshot: {error}")
-    })?;
+        .map_err(|error| automatic_store_read_error(&error, PublishedSnapshotStage::Authority))?;
+    let records_before = store
+        .record_count()
+        .map_err(|error| automatic_store_read_error(&error, PublishedSnapshotStage::Authority))?;
     let Some(current_before) = current_report_view(store)
-        .map_err(|error| format!("read current published snapshot: {error}"))?
+        .map_err(|error| automatic_catalog_read_error(error, PublishedSnapshotStage::Catalog))?
     else {
         return Ok(None);
     };
@@ -3542,22 +3631,22 @@ fn automatic_published_snapshot_convergence(
                     .query_row("SELECT COUNT(*) FROM spans", [], |row| row.get::<_, i64>(0))?;
             Ok((snapshot.clone(), indexed_records))
         })
-        .map_err(|error| format!("validate current published snapshot: {error}"))?;
+        .map_err(|error| automatic_catalog_read_error(error, PublishedSnapshotStage::Validation))?;
     let status_after = store
         .report_status()
-        .map_err(|error| format!("read report status after published snapshot: {error}"))?;
+        .map_err(|error| automatic_store_read_error(&error, PublishedSnapshotStage::Authority))?;
     let visibility_after = store
         .report_visibility_epoch()
-        .map_err(|error| format!("read visibility epoch after published snapshot: {error}"))?;
-    let records_after = store.record_count().map_err(|error| {
-        format!("read authoritative record count after published snapshot: {error}")
-    })?;
+        .map_err(|error| automatic_store_read_error(&error, PublishedSnapshotStage::Authority))?;
+    let records_after = store
+        .record_count()
+        .map_err(|error| automatic_store_read_error(&error, PublishedSnapshotStage::Authority))?;
     let current_after = current_report_view(store)
-        .map_err(|error| format!("recheck current published snapshot: {error}"))?;
+        .map_err(|error| automatic_catalog_read_error(error, PublishedSnapshotStage::Catalog))?;
     let snapshot_records = u64::try_from(guarded_snapshot.records())
-        .map_err(|_| "published snapshot record count exceeds u64".to_owned())?;
+        .map_err(|_| AutomaticConvergenceError::Fatal(PublishedSnapshotStage::Validation))?;
     let indexed_records = u64::try_from(indexed_records)
-        .map_err(|_| "published snapshot indexed row count is negative".to_owned())?;
+        .map_err(|_| AutomaticConvergenceError::Fatal(PublishedSnapshotStage::Validation))?;
     let evidence = AutomaticPublishedSnapshotEvidence {
         source_generation: status_after.generation,
         acknowledged_generation: status_after.acknowledged_generation,
@@ -3573,6 +3662,15 @@ fn automatic_published_snapshot_convergence(
             && current_before == guarded_snapshot
             && current_after.as_ref() == Some(&guarded_snapshot),
     };
+    if evidence.current_consistent
+        && evidence.authoritative_records != 0
+        && evidence.source_generation == evidence.acknowledged_generation
+        && validate_automatic_published_snapshot(evidence).is_none()
+    {
+        return Err(AutomaticConvergenceError::Fatal(
+            PublishedSnapshotStage::Validation,
+        ));
+    }
     Ok(validate_automatic_published_snapshot(evidence))
 }
 
@@ -5641,8 +5739,19 @@ fn automatic_evidence_error_code(error: &str) -> &'static str {
         } else {
             "code=lifecycle_preflight_failed"
         }
-    } else if error.starts_with("run ") {
-        "code=benchmark_run_failed"
+    } else if let Some(run_error) = error.strip_prefix("run ") {
+        match run_error.split_once(": ") {
+            Some((run, stage)) if run.parse::<usize>().is_ok() => match stage {
+                "published_snapshot_open_failed" => "code=published_snapshot_open_failed",
+                "published_snapshot_authority_failed" => "code=published_snapshot_authority_failed",
+                "published_snapshot_catalog_failed" => "code=published_snapshot_catalog_failed",
+                "published_snapshot_validation_failed" => {
+                    "code=published_snapshot_validation_failed"
+                }
+                _ => "code=benchmark_run_failed",
+            },
+            _ => "code=benchmark_run_failed",
+        }
     } else if error.starts_with("validation: ") {
         "code=evidence_validation_failed"
     } else if error.starts_with("cleanup: ") {
@@ -5982,6 +6091,10 @@ fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
         "  - 'code=lifecycle_reconnect_failed'",
         "  - 'code=lifecycle_cleanup_failed'",
         "  - 'code=benchmark_run_failed'",
+        "  - 'code=published_snapshot_open_failed'",
+        "  - 'code=published_snapshot_authority_failed'",
+        "  - 'code=published_snapshot_catalog_failed'",
+        "  - 'code=published_snapshot_validation_failed'",
         "  - 'code=evidence_validation_failed'",
         "  - 'code=cleanup_failed'",
         "  - 'code=automatic_check_failed'",
@@ -7084,6 +7197,237 @@ mod tests {
     }
 
     #[test]
+    fn automatic_snapshot_fatal_errors_stop_after_one_poll_without_sleep() {
+        for stage in [
+            PublishedSnapshotStage::Open,
+            PublishedSnapshotStage::Authority,
+            PublishedSnapshotStage::Catalog,
+            PublishedSnapshotStage::Validation,
+        ] {
+            for error in [
+                StoreError::SchemaMismatch,
+                StoreError::InsecurePermissions,
+                StoreError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "/tmp/AUTOMATIC_RAW_PROMPT_SENTINEL SELECT * FROM secrets database is locked",
+                )),
+            ] {
+                let classified = automatic_store_read_error(&error, stage);
+                assert_eq!(classified, AutomaticConvergenceError::Fatal(stage));
+                let mut polls = 0;
+                let mut sleeps = 0;
+                let result = wait_for_automatic_convergence(
+                    || {
+                        polls += 1;
+                        Err(classified)
+                    },
+                    || Duration::ZERO,
+                    |_| sleeps += 1,
+                );
+                assert_eq!(result.unwrap_err(), stage.code());
+                assert_eq!((polls, sleeps), (1, 0));
+            }
+        }
+        for error in [
+            ReportViewCatalogError::InvalidCatalog,
+            ReportViewCatalogError::SourceMismatch,
+            ReportViewCatalogError::CatalogCapacityExceeded,
+            ReportViewCatalogError::SnapshotExpired,
+            ReportViewCatalogError::Io(io::Error::other("/tmp/private SELECT raw")),
+        ] {
+            assert_eq!(
+                automatic_catalog_read_error(error, PublishedSnapshotStage::Catalog),
+                AutomaticConvergenceError::Fatal(PublishedSnapshotStage::Catalog)
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_snapshot_transients_retry_and_keep_the_existing_deadline() {
+        let expected = ReportConvergence {
+            generation: 7,
+            records: 51,
+        };
+        let mut outcomes = [
+            Ok(None),
+            Err(automatic_store_read_error(
+                &StoreError::ReportSnapshotChanged,
+                PublishedSnapshotStage::Authority,
+            )),
+            Err(automatic_catalog_read_error(
+                ReportViewCatalogError::Busy,
+                PublishedSnapshotStage::Catalog,
+            )),
+            Err(automatic_catalog_read_error(
+                ReportViewCatalogError::RefreshPending,
+                PublishedSnapshotStage::Catalog,
+            )),
+            Err(automatic_catalog_read_error(
+                ReportViewCatalogError::SnapshotChanged,
+                PublishedSnapshotStage::Catalog,
+            )),
+            Err(automatic_catalog_read_error(
+                ReportViewCatalogError::SnapshotExpired,
+                PublishedSnapshotStage::Validation,
+            )),
+            Ok(Some(expected)),
+        ]
+        .into_iter();
+        let mut polls = 0;
+        let mut sleeps = 0;
+        assert_eq!(
+            wait_for_automatic_convergence(
+                || {
+                    polls += 1;
+                    outcomes.next().unwrap()
+                },
+                || Duration::ZERO,
+                |duration| {
+                    assert_eq!(duration, Duration::from_millis(20));
+                    sleeps += 1;
+                },
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!((polls, sleeps), (7, 6));
+
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let mut polls = 0;
+        let mut sleeps = 0;
+        assert!(
+            wait_for_automatic_convergence(
+                || {
+                    polls += 1;
+                    Ok(None)
+                },
+                || elapsed.get(),
+                |_| {
+                    sleeps += 1;
+                    elapsed.set(AUTOMATIC_START_TIMEOUT);
+                },
+            )
+            .unwrap_err()
+            .contains("timed out")
+        );
+        assert_eq!((polls, sleeps), (2, 1));
+
+        for error in [
+            AutomaticConvergenceError::CollectorExited,
+            AutomaticConvergenceError::CollectorInspect,
+        ] {
+            let mut polls = 0;
+            let mut sleeps = 0;
+            assert!(
+                wait_for_automatic_convergence(
+                    || {
+                        polls += 1;
+                        Err(error)
+                    },
+                    || Duration::ZERO,
+                    |_| sleeps += 1,
+                )
+                .is_err()
+            );
+            assert_eq!((polls, sleeps), (1, 0));
+        }
+    }
+
+    #[test]
+    fn automatic_snapshot_real_store_parity_contention_and_corruption() {
+        use agent_observability_local_store::{
+            MISSING_RATE_FINGERPRINT, build_report_view_staging, publish_report_view,
+        };
+        let root = env::temp_dir().join(format!(
+            "xtask-snapshot-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _cleanup = DirectoryCleanup::new(root.clone(), "snapshot test fixture");
+        let mut store = LocalStore::open(&root).unwrap();
+        store
+            .ingest(&observation("codex|0", &BTreeMap::new()).unwrap())
+            .unwrap();
+        assert_eq!(
+            automatic_published_snapshot_convergence(&store).unwrap(),
+            None
+        );
+        let staging =
+            build_report_view_staging(&store, MISSING_RATE_FINGERPRINT, 16 * 1024 * 1024, None)
+                .unwrap();
+        let publication = publish_report_view(&store, staging).unwrap();
+        store
+            .acknowledge_report_generation(publication.current().generation())
+            .unwrap();
+        assert_eq!(
+            automatic_published_snapshot_convergence(&store).unwrap(),
+            Some(ReportConvergence {
+                generation: publication.current().generation(),
+                records: 1,
+            })
+        );
+        let guard = store.acquire_report_render_guard().unwrap();
+        assert_eq!(
+            automatic_published_snapshot_convergence(&store),
+            Err(AutomaticConvergenceError::Retry)
+        );
+        drop(guard);
+
+        // A real SQLite query error retains its type until the static validation boundary.
+        let sql_error =
+            with_report_view_snapshot(&store, publication.current().view_id(), |connection, _| {
+                connection.execute_batch("SELECT * FROM AUTOMATIC_RAW_PROMPT_SENTINEL")?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(
+            automatic_catalog_read_error(sql_error, PublishedSnapshotStage::Validation),
+            AutomaticConvergenceError::Fatal(PublishedSnapshotStage::Validation)
+        );
+
+        let views = root.join("report-views.v1");
+        let snapshot = fs::read_dir(&views)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "sqlite3")
+            })
+            .unwrap();
+        fs::write(&snapshot, b"AUTOMATIC_RAW_PROMPT_SENTINEL not a database").unwrap();
+        let mut polls = 0;
+        let mut sleeps = 0;
+        assert_eq!(
+            wait_for_automatic_convergence(
+                || {
+                    polls += 1;
+                    automatic_published_snapshot_convergence(&store)
+                },
+                || Duration::ZERO,
+                |_| sleeps += 1,
+            )
+            .unwrap_err(),
+            "published_snapshot_validation_failed"
+        );
+        assert_eq!((polls, sleeps), (1, 0));
+
+        fs::write(
+            views.join("catalog.json"),
+            b"/tmp/AUTOMATIC_RAW_PROMPT_SENTINEL SELECT * FROM secrets",
+        )
+        .unwrap();
+        assert_eq!(
+            automatic_published_snapshot_convergence(&store),
+            Err(AutomaticConvergenceError::Fatal(
+                PublishedSnapshotStage::Catalog
+            ))
+        );
+    }
+
+    #[test]
     fn automatic_report_convergence_is_fail_closed() {
         let mut result = automatic_result(1, vec![1; 100]);
         result.report_converged = false;
@@ -7441,6 +7785,37 @@ mod tests {
             "automatic_evidence_validation_failed"
         );
         assert_eq!(public_error_message(&local, raw), raw);
+    }
+
+    #[test]
+    fn automatic_snapshot_failures_use_exact_content_free_stage_codes() {
+        for stage in [
+            "published_snapshot_open_failed",
+            "published_snapshot_authority_failed",
+            "published_snapshot_catalog_failed",
+            "published_snapshot_validation_failed",
+        ] {
+            let error = format!("run 1: {stage}");
+            let expected = format!("code={stage}");
+            assert_eq!(automatic_evidence_error_code(&error), expected);
+            let manifest = render_automatic_manifest(
+                automatic_config(),
+                &host(),
+                &"a".repeat(40),
+                &[],
+                &[error],
+                "failed",
+            );
+            assert!(manifest.contains(&format!("  - '{expected}'")));
+            validate_automatic_manifest_shape(&manifest).unwrap();
+            validate_automatic_manifest_privacy(&manifest).unwrap();
+            let private =
+                format!("run 1: {stage}: /tmp/AUTOMATIC_RAW_PROMPT_SENTINEL SELECT * FROM secrets");
+            assert_eq!(
+                automatic_evidence_error_code(&private),
+                "code=benchmark_run_failed"
+            );
+        }
     }
 
     #[test]

@@ -33,6 +33,7 @@ workload:
   collector_boundary: built agent-observability collector-serve subprocess
   payload: bounded synthetic Codex-shaped WebSocket-request/completed OTLP log pairs with opaque identifiers; one bounded notify supplement per measured run whose raw sentinels must be absent from the durable tree
   readiness: successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, exactly two durable synthetic records per accepted OTLP request plus one notify record, and one current validated published paged snapshot whose generation, visibility epoch, metadata record count, and indexed row count match authoritative SQLite must converge before collector shutdown
+  convergence_failures: Retry only explicit SQLite busy/locked, catalog Busy, not-ready or proven snapshot consistency races within the existing startup deadline; durable failures stop on the first poll with zero sleeps and map only published_snapshot_open_failed, published_snapshot_authority_failed, published_snapshot_catalog_failed or published_snapshot_validation_failed into manifest errors; public stderr remains automatic_check_failed
   collector_shutdown: bounded child termination and wait
 metrics:
   synthetic_collector_otlp:
