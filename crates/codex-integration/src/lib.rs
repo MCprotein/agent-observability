@@ -1,6 +1,12 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
+mod storage_ownership;
+
+pub use storage_ownership::{
+    LaunchAgentStorageOwnershipError, LaunchAgentStorageOwnershipEvidence,
+};
+
 use agent_observability_codex_config::{
     CodexConfigManager, ConfigError, ConnectionStatus as ConfigConnectionStatus, ExporterSecurity,
     NotifyOwnership,
@@ -1119,6 +1125,11 @@ fn service_label(root: &Path) -> String {
     format!("io.agent-observability.collector.{suffix}")
 }
 
+fn expected_launch_agent_plist_path(root: &Path, home: &Path) -> PathBuf {
+    home.join("Library/LaunchAgents")
+        .join(format!("{}.plist", service_label(root)))
+}
+
 fn collector_service(root: &Path) -> Result<CollectorService, IntegrationError> {
     let home = env::var_os("HOME")
         .filter(|value| !value.is_empty())
@@ -1128,9 +1139,7 @@ fn collector_service(root: &Path) -> Result<CollectorService, IntegrationError> 
     let uid = current_uid()?;
     Ok(CollectorService {
         root: root.to_path_buf(),
-        plist: home
-            .join("Library/LaunchAgents")
-            .join(format!("{label}.plist")),
+        plist: expected_launch_agent_plist_path(root, &home),
         target: format!("gui/{uid}/{label}"),
         ownership: root.join("runtime/integrations/codex/launch-agent-ownership-v1.json"),
         label,
@@ -1922,18 +1931,29 @@ fn load_launch_agent_transaction(
             "LaunchAgent ownership state exceeds size bound".into(),
         ));
     }
-    let transaction: LaunchAgentTransaction = serde_json::from_slice(&bytes).map_err(|error| {
+    Ok(Some(decode_launch_agent_transaction(
+        &bytes,
+        &service.plist,
+    )?))
+}
+
+#[cfg(target_os = "macos")]
+fn decode_launch_agent_transaction(
+    bytes: &[u8],
+    expected_plist: &Path,
+) -> Result<LaunchAgentTransaction, IntegrationError> {
+    let transaction: LaunchAgentTransaction = serde_json::from_slice(bytes).map_err(|error| {
         IntegrationError::Runtime(format!("invalid LaunchAgent ownership state: {error}"))
     })?;
     validate_launch_agent_transaction_file_states(&transaction)?;
     if transaction.schema_version != LAUNCH_AGENT_OWNERSHIP_VERSION
-        || transaction.plist_path != service.plist
+        || transaction.plist_path != expected_plist
     {
         return Err(IntegrationError::Runtime(
             "LaunchAgent ownership state does not match this service".into(),
         ));
     }
-    Ok(Some(transaction))
+    Ok(transaction)
 }
 
 #[cfg(target_os = "macos")]
