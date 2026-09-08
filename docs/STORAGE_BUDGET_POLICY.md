@@ -44,6 +44,8 @@ P2의 `crates/local-runtime/src/storage_policy.rs`는 수치만 판정한다. �
 
 [파일 소유권 기준](STORAGE_OWNERSHIP.md)은 P2의 경로별 근거와 아직 필요한 연결을 정리한다.
 파일 이름 목록 자체를 소유권 검증이나 구현 완료로 취급하지 않는다.
+P2의 다음 개발 조각은 생성 직후 빈 report staging descriptor와 runtime 예약의 연결이다.
+SQLite 쓰기 전 연결과 게시 전 재검증은 전체 파일 분류·일관된 측정·분리 모드 활성화와 구분한다.
 
 | 항목 | 의미 | 부족하거나 초과했을 때 |
 | --- | --- | --- |

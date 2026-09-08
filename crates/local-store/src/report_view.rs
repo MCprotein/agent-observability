@@ -161,6 +161,8 @@ impl From<io::Error> for ReportViewBuildError {
 #[derive(Debug)]
 pub struct ReportViewStaging {
     path: PathBuf,
+    identity_file: fs::File,
+    directory: fs::File,
     connection: Option<Connection>,
     publication_guard: Option<ReportRenderGuard>,
     generation: u64,
@@ -175,6 +177,43 @@ impl ReportViewStaging {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The original create-new descriptor, retained through construction and publication.
+    /// Used by the composition root to validate its reservation binding; this is not a lease
+    /// on a published snapshot or permission to change the file.
+    #[must_use]
+    pub fn identity_file(&self) -> &fs::File {
+        &self.identity_file
+    }
+
+    fn validate_identity(&self) -> Result<(), ReportViewBuildError> {
+        private_file(&self.path)?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or(ReportViewBuildError::InvalidStagingState)?;
+        let named_parent = fs::symlink_metadata(parent)?;
+        let directory = self.directory.metadata()?;
+        if !directory.is_dir() || !named_parent.is_dir() || named_parent.file_type().is_symlink() {
+            return Err(ReportViewBuildError::InvalidStagingState);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = self.identity_file.metadata()?;
+            let named = fs::symlink_metadata(&self.path)?;
+            if !held.is_file()
+                || held.mode() & 0o7777 != 0o600
+                || held.nlink() != 1
+                || (held.dev(), held.ino()) != (named.dev(), named.ino())
+                || (directory.dev(), directory.ino()) != (named_parent.dev(), named_parent.ino())
+                || named_parent.mode() & 0o7777 != 0o700
+            {
+                return Err(ReportViewBuildError::InvalidStagingState);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn connection(&self) -> &Connection {
@@ -225,8 +264,8 @@ impl ReportViewStaging {
             self.connection = Some(connection);
             return Err(error.into());
         }
-        private_file(&self.path)?;
-        fs::File::open(&self.path)?.sync_all()?;
+        self.validate_identity()?;
+        self.identity_file.sync_all()?;
         Ok(())
     }
 }
@@ -236,7 +275,10 @@ impl Drop for ReportViewStaging {
         if let Some(connection) = self.connection.take() {
             let _ = connection.close();
         }
-        let _ = fs::remove_file(&self.path);
+        // A rejected callback or external replacement must not make Drop delete another file.
+        if self.validate_identity().is_ok() {
+            let _ = fs::remove_file(&self.path);
+        }
         drop(self.publication_guard.take());
     }
 }
@@ -281,9 +323,38 @@ pub fn build_report_view_staging_observing(
     rate_fingerprint: &str,
     admitted_bytes: u64,
     rates: Option<&RateTable>,
+    after_project: impl FnMut(usize),
+) -> Result<ReportViewStaging, ReportViewBuildError> {
+    build_report_view_staging_bound(
+        store,
+        rate_fingerprint,
+        admitted_bytes,
+        rates,
+        |_, _| Ok(()),
+        after_project,
+    )
+}
+
+/// Binds a newly created, empty staging file before opening its `SQLite` connection.
+///
+/// The publication guard is held during `before_write`. The composition root may durably
+/// bind its runtime reservation and release its mutation guard there. Returning an error
+/// prevents staging database initialization and source projection. Catalog-directory preparation
+/// precedes the callback; this API is not a complete filesystem-accounting snapshot.
+/// The store retains the original descriptor and rechecks its identity after the callback.
+///
+/// # Errors
+///
+/// Returns a callback error or the same validation/build errors as [`build_report_view_staging`].
+pub fn build_report_view_staging_bound(
+    store: &LocalStore,
+    rate_fingerprint: &str,
+    admitted_bytes: u64,
+    rates: Option<&RateTable>,
+    before_write: impl FnOnce(&Path, &fs::File) -> Result<(), ReportViewBuildError>,
     mut after_project: impl FnMut(usize),
 ) -> Result<ReportViewStaging, ReportViewBuildError> {
-    let mut staging = create_staging(store, rate_fingerprint, admitted_bytes)?;
+    let mut staging = create_staging(store, rate_fingerprint, admitted_bytes, before_write)?;
     let visibility_epoch = staging.visibility_epoch;
 
     let mut pending_error = None;
@@ -382,6 +453,7 @@ fn create_staging(
     store: &LocalStore,
     rate_fingerprint: &str,
     admitted_bytes: u64,
+    before_write: impl FnOnce(&Path, &fs::File) -> Result<(), ReportViewBuildError>,
 ) -> Result<ReportViewStaging, ReportViewBuildError> {
     validate_build_inputs(rate_fingerprint, admitted_bytes)?;
     let publication_guard = store
@@ -391,9 +463,13 @@ fn create_staging(
     let directory = managed_report_view_directory(store)?;
     prepare_managed_report_view_directory(store, &directory, visibility_epoch)?;
     let source_identity = source_store_identity(store)?;
-    let path = create_staging_file(&directory)?;
+    let generated_at = trusted_generated_at()?;
+    let directory_handle = fs::File::open(&directory)?;
+    let (path, identity_file) = create_staging_file(&directory)?;
     let mut staging = ReportViewStaging {
         path,
+        identity_file,
+        directory: directory_handle,
         connection: None,
         publication_guard: Some(publication_guard),
         generation: 0,
@@ -401,8 +477,14 @@ fn create_staging(
         records: 0,
         rate_fingerprint: rate_fingerprint.to_owned(),
         source_identity,
-        generated_at: trusted_generated_at()?,
+        generated_at,
     };
+    staging.validate_identity()?;
+    before_write(staging.path(), staging.identity_file())?;
+    staging.validate_identity()?;
+    if staging.identity_file.metadata()?.len() != 0 {
+        return Err(ReportViewBuildError::InvalidStagingState);
+    }
     staging.connection = Some(open_staging_connection(staging.path(), admitted_bytes)?);
     staging.connection().execute_batch(CREATE_SCHEMA)?;
     enforce_storage_budget(staging.path(), admitted_bytes)?;
@@ -437,7 +519,7 @@ fn validate_build_inputs(
     Ok(())
 }
 
-fn create_staging_file(directory: &Path) -> Result<PathBuf, ReportViewBuildError> {
+fn create_staging_file(directory: &Path) -> Result<(PathBuf, fs::File), ReportViewBuildError> {
     for _ in 0..MAX_STAGING_FILE_COLLISIONS {
         let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = directory.join(format!(
@@ -447,7 +529,7 @@ fn create_staging_file(directory: &Path) -> Result<PathBuf, ReportViewBuildError
         match private_create_new(&path) {
             Ok(file) => {
                 file.sync_all()?;
-                return Ok(path);
+                return Ok((path, file));
             }
             Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
@@ -770,7 +852,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let store = LocalStore::open(&root).unwrap();
         let admitted = MAX_REPORT_VIEW_BYTES - 1;
-        let staging = create_staging(&store, TEST_RATE_FINGERPRINT, admitted).unwrap();
+        let staging =
+            create_staging(&store, TEST_RATE_FINGERPRINT, admitted, |_, _| Ok(())).unwrap();
         let value = |name| {
             staging
                 .connection()
@@ -853,6 +936,131 @@ mod tests {
                     .is_some_and(|name| name.starts_with(STAGING_FILE_PREFIX))
             })
             .collect()
+    }
+
+    #[test]
+    fn binding_precedes_sqlite_writes_and_rejection_keeps_the_file_empty() {
+        let (directory, store) = open_seeded_store("binding-rejection");
+        let mut retained_file = None;
+        let error = build_report_view_staging_bound(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            None,
+            |path, file| {
+                assert_eq!(file.metadata()?.len(), 0);
+                assert_eq!(fs::metadata(path)?.len(), 0);
+                assert!(!PathBuf::from(format!("{}-journal", path.display())).exists());
+                retained_file = Some(file.try_clone()?);
+                Err(ReportViewBuildError::InvalidStagingState)
+            },
+            |_| panic!("projection must not start after binding rejection"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ReportViewBuildError::InvalidStagingState));
+        assert_eq!(retained_file.unwrap().metadata().unwrap().len(), 0);
+        assert!(staging_paths(&directory).is_empty());
+        assert!(store.try_acquire_report_render_guard().unwrap().is_some());
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binding_retains_created_identity_through_projection() {
+        use std::cell::Cell;
+        use std::os::unix::fs::MetadataExt;
+        let (directory, store) = open_seeded_store("binding-identity");
+        let created = Cell::new(None);
+        let bound = Cell::new(false);
+        let staging = build_report_view_staging_bound(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            None,
+            |_, file| {
+                let metadata = file.metadata()?;
+                assert_eq!(metadata.len(), 0);
+                created.set(Some((metadata.dev(), metadata.ino())));
+                bound.set(true);
+                Ok(())
+            },
+            |_| assert!(bound.get()),
+        )
+        .unwrap();
+        let held = staging.identity_file().metadata().unwrap();
+        let named = fs::metadata(staging.path()).unwrap();
+        assert_eq!(created.get(), Some((held.dev(), held.ino())));
+        assert_eq!((held.dev(), held.ino()), (named.dev(), named.ino()));
+        assert!(held.len() > 0);
+        drop(staging);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binding_path_replacement_is_rejected_without_writing_or_removing_replacement() {
+        let (directory, store) = open_seeded_store("binding-replacement");
+        let mut replaced_path = None;
+        let mut original = None;
+        let error = build_report_view_staging_bound(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            None,
+            |path, file| {
+                original = Some(file.try_clone()?);
+                fs::remove_file(path)?;
+                let replacement = private_create_new(path)?;
+                replacement.sync_all()?;
+                replaced_path = Some(path.to_path_buf());
+                Ok(())
+            },
+            |_| panic!("replaced staging must never be projected"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ReportViewBuildError::InvalidStagingState));
+        assert_eq!(original.unwrap().metadata().unwrap().len(), 0);
+        assert_eq!(fs::metadata(replaced_path.unwrap()).unwrap().len(), 0);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binding_rejects_aliases_and_unexpected_writes_before_sqlite_initialization() {
+        use std::io::Write;
+        for alias in [false, true] {
+            let (directory, store) = open_seeded_store(&format!("binding-alias-or-write-{alias}"));
+            let mut held = None;
+            let result = build_report_view_staging_bound(
+                &store,
+                MISSING_RATE_FINGERPRINT,
+                MAX_REPORT_VIEW_BYTES,
+                None,
+                |path, file| {
+                    held = Some(file.try_clone()?);
+                    if alias {
+                        fs::hard_link(path, directory.join("alias"))?;
+                    } else {
+                        (&*file).write_all(b"not-sqlite")?;
+                    }
+                    Ok(())
+                },
+                |_| panic!("invalid staging must not be projected"),
+            );
+            assert!(matches!(
+                result,
+                Err(ReportViewBuildError::InvalidStagingState)
+            ));
+            assert_eq!(
+                held.unwrap().metadata().unwrap().len(),
+                if alias { 0 } else { 10 }
+            );
+            drop(store);
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     fn assert_trace_order_index(connection: &Connection) {

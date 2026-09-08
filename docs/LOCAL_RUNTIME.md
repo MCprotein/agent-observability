@@ -193,6 +193,12 @@ is retained until successful publication. The latest generation is rendered once
 recovery retain their convergence paths. HTML/projection fsync therefore does not occupy the foreground notify
 path indefinitely. A failure never turns raw input into a fallback log or file.
 
+The v1.11 development report builder binds its freshly created empty staging descriptor to the
+runtime reservation before SQLite initialization. Mutation remains held through durable binding,
+then is released during projection; publication revalidates the binding under mutation. The full
+active/stale reservation remains charged. This is not activation of separated storage admission
+or proof of a coherent filesystem inventory; see [Storage Ownership](STORAGE_OWNERSHIP.md).
+
 ## Manual imports
 
 The three `<agent>-ingest` commands remain independent of the automatic collector. They open a private bounded

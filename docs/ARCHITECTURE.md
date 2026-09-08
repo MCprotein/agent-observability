@@ -69,6 +69,12 @@ runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui�
 아니다. 아래 Isolated Ingest는 과거 후보로 보존하며 현재 구현 우선안이 아니다.
 unsafe/FFI 정책 예외나 자체 VFS를 도입하지 않는다.
 
+P2 staging 연결은 local-store가 소유하는 생성 직후 descriptor와 local-runtime의 예약을
+collector composition에서 결합한다. 연결의 내구화까지 mutation guard를 유지하고 이후
+projection 동안 해제하며, publication guard는 계속 유지한다. Runtime은 SQLite schema나
+catalog를 해석하지 않는다. 기존 예약 전액·복구 경계를 유지하며, 이 연결을 전체 파일 분류나
+동시 측정의 증명으로 취급하지 않는다. 구체적인 계약은 [Storage Ownership](STORAGE_OWNERSHIP.md)에 있다.
+
 v1.11 추가 개발 설계인 [Isolated Ingest](ISOLATED_INGEST.md)는 같은 Rust executable의
 수집 전용 자식 프로세스와 쓰기 제한 VFS 후보를 검토한다. 의존성 평가와 private IPC 설계
 범위는 승인됐지만 아직 구현되거나 활성화되지 않았다. 기존 transaction authority,

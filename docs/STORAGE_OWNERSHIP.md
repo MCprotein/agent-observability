@@ -86,9 +86,9 @@ accounting 때문에 이 경로를 순회하거나 snapshot 내용·PEM·사용�
    누락은 U로 남기고 P2 완료로 표시하지 않는다.
 2. 소유 모듈이 정확한 파일 identity와 수명을 검증한다. local-runtime이 local-store를
    의존하거나 SQLite schema/catalog를 직접 해석하지 않는다. collector/CLI가 증거를 조합한다.
-3. report staging 생성과 runtime 예약을 실제로 연결한다. 현재 예약은 nonce/ceiling만
-   저장하고 staging path를 결합하지 않으며 renderer는 mutation guard 밖에서도 쓴다.
-   따라서 현재 순회 결과를 원자적인 cross-writer snapshot이라고 부르지 않는다.
+3. report staging 생성과 runtime 예약을 실제로 연결한다. 이번 개발 단계는 생성한 빈 파일의
+   descriptor를 예약에 묶은 뒤에만 mutation guard를 풀고 SQLite 초기화·projection을 시작한다.
+   아래 연결 계약은 전체 분류기나 원자적인 cross-writer snapshot의 증명이 아니다.
 4. config revision·root identity·reservation·분류 측정의 일관성을 검증한 뒤 숫자 판정에 전달한다.
    관측 중 변경을 발견하면 유예한다. 새로운 writer 수명 규약 없이 단순 전후 숫자 일치만으로
    모든 중간 변경을 배제했다고 주장하지 않는다.
@@ -97,5 +97,20 @@ accounting 때문에 이 경로를 순회하거나 snapshot 내용·PEM·사용�
    동시 render 성장, config 축소, current→retired 전환, 실패 후 예약 보존.
 
 전체 예약 R은 이미 쓴 X만큼 할인하지 않는다. 명시적인 소유자 finalization에서만 그 소유자의
-예약을 제외한다. 이 문서는 검증 체크리스트이며 새로운 파일 schema, 삭제 권한, write permit,
+예약을 제외한다. 위 분류표 자체는 검증 체크리스트이며 새로운 파일 schema, 삭제 권한, write permit,
 물리 quota 또는 분리 모드 활성화를 제공하지 않는다.
+
+## 보고서 staging 연결 — v1.11 개발
+
+- local-store는 `build_report_view_staging_bound`의 callback에 방금 생성한 빈 파일과
+  descriptor를 전달한다. publication guard와 원래 descriptor는 build·publication 동안 유지한다.
+- collector는 같은 root의 mutation guard를 쥔 상태로 runtime 예약에 연결하고, 성공한 뒤에만
+  mutation guard를 풀어 수집과 projection이 병행되게 한다. callback 거부 시 SQLite를 열지 않는다.
+- runtime은 owner nonce·metadata와 root/parent/file identity를 검사한다. 이름만 같은 파일,
+  alias, 교체, 재연결을 승인하지 않는다. 게시 직전에도 같은 연결을 검증한다.
+- 연결은 같은 예약 metadata의 v2에 원자 기록하며 기존 512바이트 상한을 유지한다. 기존 unbound v1 metadata는
+  복구 호환성을 유지하지만 X 분류 근거로 승격하지 않는다. active/stale 예약 R은 줄이지 않는다.
+- 실패로 파일이 교체됐다면 store의 Drop도 그 대체 파일을 삭제하지 않는다. stale 복구는
+  identity 불일치를 숨기지 않으며 기존 guarded catalog 복구가 끝나야 예약을 해제한다.
+- catalog directory 준비·기존 orphan 정리는 callback 전에 수행된다. journal과 다른 writer의
+  소유권, 일관된 전체 측정, 실제 T/W/F admission은 별도 P2/P3 작업이며 아직 활성화하지 않는다.

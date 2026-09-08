@@ -3804,15 +3804,27 @@ fn refresh_report_observing(
             .map_err(|_| ReportFailure::Publish)?;
     }
     let admitted_bytes = automatic_report_view_admitted_bytes(layout, &config)?;
-    let reservation = control
+    let mut reservation = control
         .reserve_report_build(
             &layout.root,
             &mutation,
             admitted_bytes + REPORT_VIEW_PUBLICATION_RESERVE_BYTES,
         )
         .map_err(report_control_failure)?;
-    drop(mutation);
-    let staging = build_automatic_report_view_staging(store, admitted_bytes, on_record)?;
+    let staging = build_automatic_report_view_staging(
+        store,
+        admitted_bytes,
+        |path, file| {
+            reservation
+                .bind_staging(&layout.root, &mutation, path, file)
+                .map_err(|_| ReportViewBuildError::InvalidStagingState)?;
+            // Release only after the created descriptor is durably bound; projection must
+            // not occupy the ingest mutation lock. The publication guard remains held.
+            drop(mutation);
+            Ok(())
+        },
+        on_record,
+    )?;
     // Never wait while holding the publication guard. Other writers can own mutation and
     // attempt publication in the opposite order; contention is retryable, not a deadlock.
     let mutation = try_report_mutation(layout)?;
@@ -3826,6 +3838,14 @@ fn refresh_report_observing(
     if remaining < REPORT_VIEW_PUBLICATION_RESERVE_BYTES {
         return Err(ReportFailure::Capacity);
     }
+    reservation
+        .validate_staging(
+            &layout.root,
+            &mutation,
+            staging.path(),
+            staging.identity_file(),
+        )
+        .map_err(|_| ReportFailure::Publish)?;
     let publication = publish_report_view(store, staging).map_err(report_catalog_failure)?;
     if publication.cleanup_pending() {
         return Err(ReportFailure::Publish);
@@ -3979,32 +3999,23 @@ fn automatic_report_view_admitted_bytes(
         })
 }
 
-#[cfg(not(test))]
 fn build_automatic_report_view_staging(
     store: &LocalStore,
     admitted_bytes: u64,
-    _on_record: impl FnMut(usize),
-) -> Result<agent_observability_local_store::ReportViewStaging, ReportFailure> {
-    agent_observability_local_store::build_report_view_staging(
-        store,
-        MISSING_RATE_FINGERPRINT,
-        admitted_bytes,
-        None,
-    )
-    .map_err(|error| report_view_build_failure(&error))
-}
-
-#[cfg(test)]
-fn build_automatic_report_view_staging(
-    store: &LocalStore,
-    admitted_bytes: u64,
+    before_write: impl FnOnce(&Path, &File) -> Result<(), ReportViewBuildError>,
     on_record: impl FnMut(usize),
 ) -> Result<agent_observability_local_store::ReportViewStaging, ReportFailure> {
-    agent_observability_local_store::build_report_view_staging_observing(
+    #[cfg(not(test))]
+    let on_record = {
+        let _ = on_record;
+        |_| {}
+    };
+    agent_observability_local_store::build_report_view_staging_bound(
         store,
         MISSING_RATE_FINGERPRINT,
         admitted_bytes,
         None,
+        before_write,
         on_record,
     )
     .map_err(|error| report_view_build_failure(&error))
@@ -8290,6 +8301,14 @@ mod tests {
             super::refresh_report_from_root_observing(&root, |_| {
                 let guard = MutationGuard::try_acquire(&collector.layout.runtime)
                     .expect("projection must not hold the ingest mutation lock");
+                let metadata: serde_json::Value = serde_json::from_slice(
+                    &fs::read(collector.layout.runtime.join("report-reservation.meta")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    metadata["version"], 2,
+                    "staging must already be durably bound"
+                );
                 let config = load(&collector.layout.config).unwrap();
                 let control = RuntimeControl::new(&config).unwrap();
                 let allocated = StorageBudget::allocated_tree_bytes(&root).unwrap();
@@ -8339,6 +8358,67 @@ mod tests {
         );
         drop(mutation);
         assert_published_report_view(&root, 1);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_refresh_rejects_replaced_bound_staging_without_deleting_the_replacement() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = test_root("report-bound-staging-replaced");
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        let previous = current_report_view(&collector.store).unwrap();
+        collector.store.invalidate_report().unwrap();
+        let directory = collector.layout.state.join("store/report-views.v1");
+        let mut replacement = None;
+        let result = super::refresh_report_from_root_observing(&root, |_| {
+            if replacement.is_some() {
+                return;
+            }
+            let path = fs::read_dir(&directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .starts_with(".report-view.sqlite3.staging.")
+                        && !path.to_string_lossy().ends_with("-journal")
+                })
+                .unwrap();
+            fs::remove_file(&path).unwrap();
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"replacement-must-survive").unwrap();
+            file.sync_all().unwrap();
+            replacement = Some(path);
+        });
+        assert!(result.is_err());
+        assert_eq!(current_report_view(&collector.store).unwrap(), previous);
+        assert!(collector.store.report_status().unwrap().pending());
+        assert_eq!(
+            fs::read(replacement.as_ref().unwrap()).unwrap(),
+            b"replacement-must-survive"
+        );
+        let metadata_before =
+            fs::read(collector.layout.runtime.join("report-reservation.meta")).unwrap();
+        assert!(refresh_dashboard_snapshot(&root).is_err());
+        assert_eq!(
+            fs::read(collector.layout.runtime.join("report-reservation.meta")).unwrap(),
+            metadata_before
+        );
+        assert_eq!(
+            fs::read(replacement.unwrap()).unwrap(),
+            b"replacement-must-survive"
+        );
         drop(collector);
         fs::remove_dir_all(root).unwrap();
     }

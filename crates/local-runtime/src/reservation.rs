@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 /// Worst-case allocated metadata block, additional to the requested write ceiling.
@@ -21,6 +21,8 @@ const METADATA_NAME: &str = "report-reservation.meta";
 const TEMP_NAME: &str = ".report-reservation.meta.tmp";
 const MAX_METADATA_BYTES: u64 = 512;
 const MAX_BYTE_CEILING: u64 = 20 * 1024 * 1024 * 1024;
+const STAGING_PARENT: &str = "state/store/report-views.v1";
+const STAGING_PREFIX: &str = ".report-view.sqlite3.staging.";
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +31,20 @@ struct Metadata {
     kind: Kind,
     nonce: [u8; 32],
     byte_ceiling: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staging: Option<StagingBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct StagingBinding {
+    root_dev: u64,
+    root_ino: u64,
+    parent_dev: u64,
+    parent_ino: u64,
+    file_dev: u64,
+    file_ino: u64,
+    name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,13 +191,209 @@ fn read(file: &mut File) -> Result<Option<Metadata>, ReservationError> {
         return Err(ReservationError::Corrupt);
     }
     let meta: Metadata = serde_json::from_slice(&bytes).map_err(|_| ReservationError::Corrupt)?;
-    if meta.version != 1
-        || meta.nonce == [0; 32]
+    if !matches!(
+        (meta.version, meta.staging.is_some()),
+        (1, false) | (2, true)
+    ) || meta.nonce == [0; 32]
         || !(1..=MAX_BYTE_CEILING).contains(&meta.byte_ceiling)
+        || meta
+            .staging
+            .as_ref()
+            .is_some_and(|binding| !valid_staging_name(&binding.name))
     {
         return Err(ReservationError::Corrupt);
     }
     Ok(Some(meta))
+}
+
+fn valid_staging_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(STAGING_PREFIX) else {
+        return false;
+    };
+    let Some((pid, sequence)) = suffix.split_once('.') else {
+        return false;
+    };
+    !pid.is_empty()
+        && !sequence.is_empty()
+        && !sequence.contains('.')
+        && pid
+            .parse::<u32>()
+            .is_ok_and(|value| value.to_string() == pid)
+        && sequence
+            .parse::<u64>()
+            .is_ok_and(|value| value.to_string() == sequence)
+}
+
+#[cfg(unix)]
+fn open_private_directory(path: &Path) -> Result<File, ReservationError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    reject_symlink(path)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(no_follow_flag() | nonblocking_flag());
+    let directory = options.open(path)?;
+    let held = directory.metadata()?;
+    let named = std::fs::symlink_metadata(path)?;
+    if !held.is_dir()
+        || held.mode() & 0o7777 != 0o700
+        || !named.is_dir()
+        || named.file_type().is_symlink()
+        || (held.dev(), held.ino()) != (named.dev(), named.ino())
+    {
+        return Err(ReservationError::Corrupt);
+    }
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_private_directory(_path: &Path) -> Result<File, ReservationError> {
+    Err(SingletonError::UnsupportedPlatform.into())
+}
+
+#[cfg(unix)]
+fn directory_identity(directory: &File) -> Result<(u64, u64), ReservationError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn directory_identity(_directory: &File) -> Result<(u64, u64), ReservationError> {
+    Err(SingletonError::UnsupportedPlatform.into())
+}
+
+struct StagingDirectories {
+    entries: Vec<(PathBuf, File)>,
+}
+
+impl StagingDirectories {
+    fn open(root: &Path) -> Result<Self, ReservationError> {
+        let entries = [
+            root.to_path_buf(),
+            root.join("state"),
+            root.join("state/store"),
+            root.join(STAGING_PARENT),
+        ]
+        .into_iter()
+        .map(|path| open_private_directory(&path).map(|file| (path, file)))
+        .collect::<Result<Vec<_>, _>>()?;
+        let directories = Self { entries };
+        directories.revalidate()?;
+        Ok(directories)
+    }
+
+    fn revalidate(&self) -> Result<(), ReservationError> {
+        for (path, directory) in &self.entries {
+            let replacement_check = open_private_directory(path)?;
+            if directory_identity(directory)? != directory_identity(&replacement_check)? {
+                return Err(ReservationError::Corrupt);
+            }
+        }
+        Ok(())
+    }
+
+    fn root_identity(&self) -> Result<(u64, u64), ReservationError> {
+        directory_identity(&self.entries[0].1)
+    }
+
+    fn parent_identity(&self) -> Result<(u64, u64), ReservationError> {
+        directory_identity(&self.entries[3].1)
+    }
+
+    fn sync_parent(&self) -> Result<(), ReservationError> {
+        self.entries[3].1.sync_all()?;
+        self.revalidate()
+    }
+}
+
+fn staging_path(root: &Path, name: &str) -> PathBuf {
+    root.join(STAGING_PARENT).join(name)
+}
+
+fn inspect_staging(
+    root: &Path,
+    path: &Path,
+    file: &File,
+    require_empty: bool,
+) -> Result<StagingBinding, ReservationError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| valid_staging_name(name))
+        .ok_or(ReservationError::Corrupt)?;
+    if path != staging_path(root, name) {
+        return Err(ReservationError::Corrupt);
+    }
+    let directories = StagingDirectories::open(root)?;
+    same_file(file, path)?;
+    #[cfg(unix)]
+    let (file_dev, file_ino) = {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = file.metadata()?;
+        if metadata.mode() & 0o7777 != 0o600
+            || metadata.nlink() != 1
+            || (require_empty && metadata.len() != 0)
+        {
+            return Err(ReservationError::Corrupt);
+        }
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let (file_dev, file_ino) = return Err(SingletonError::UnsupportedPlatform.into());
+    directories.revalidate()?;
+    same_file(file, path)?;
+    let (root_dev, root_ino) = directories.root_identity()?;
+    let (parent_dev, parent_ino) = directories.parent_identity()?;
+    Ok(StagingBinding {
+        root_dev,
+        root_ino,
+        parent_dev,
+        parent_ino,
+        file_dev,
+        file_ino,
+        name: name.to_owned(),
+    })
+}
+
+fn validate_recovery_staging(
+    root: &Path,
+    binding: &StagingBinding,
+) -> Result<(), ReservationError> {
+    if !valid_staging_name(&binding.name) {
+        return Err(ReservationError::Corrupt);
+    }
+    let directories = StagingDirectories::open(root)?;
+    if directories.root_identity()? != (binding.root_dev, binding.root_ino)
+        || directories.parent_identity()? != (binding.parent_dev, binding.parent_ino)
+    {
+        return Err(ReservationError::Corrupt);
+    }
+    let path = staging_path(root, &binding.name);
+    reject_symlink(&path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(no_follow_flag() | nonblocking_flag());
+    }
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            directories.revalidate()?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let observed = inspect_staging(root, &path, &file, false)?;
+    if &observed != binding {
+        return Err(ReservationError::Corrupt);
+    }
+    Ok(())
 }
 
 fn lock(file: File) -> Result<ReservationLock, ReservationError> {
@@ -207,6 +419,51 @@ fn validate_lock(file: &File, root: &Path) -> Result<(), ReservationError> {
     if file.metadata()?.len() != 0 {
         return Err(ReservationError::Corrupt);
     }
+    Ok(())
+}
+
+fn publish_metadata(
+    root: &Path,
+    guard: &MutationGuard,
+    lock: &File,
+    metadata: &Metadata,
+    phases: [&str; 5],
+) -> Result<(), ReservationError> {
+    #[cfg(not(test))]
+    let _ = phases;
+    let body = serde_json::to_vec(metadata).map_err(|_| ReservationError::Corrupt)?;
+    if body.len() as u64 > MAX_METADATA_BYTES {
+        return Err(ReservationError::Corrupt);
+    }
+    let temporary = root.join("runtime").join(TEMP_NAME);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(no_follow_flag() | nonblocking_flag());
+    }
+    let mut temp = options.open(&temporary)?;
+    private_open_file(&temp)?;
+    #[cfg(test)]
+    crash_phase(phases[0]);
+    temp.write_all(&body)?;
+    #[cfg(test)]
+    crash_phase(phases[1]);
+    temp.sync_all()?;
+    #[cfg(test)]
+    crash_phase(phases[2]);
+    guard.require_root(root)?;
+    validate_lock(lock, root)?;
+    same_file(&temp, &temporary)?;
+    std::fs::rename(&temporary, root.join("runtime").join(METADATA_NAME))?;
+    #[cfg(test)]
+    crash_phase(phases[3]);
+    File::open(root.join("runtime"))?.sync_all()?;
+    #[cfg(test)]
+    crash_phase(phases[4]);
     Ok(())
 }
 
@@ -271,41 +528,86 @@ impl WriteReservation {
             kind: Kind::ReportBuild,
             nonce,
             byte_ceiling,
+            staging: None,
         };
-        let body = serde_json::to_vec(&metadata).map_err(|_| ReservationError::Corrupt)?;
-        if body.len() as u64 > MAX_METADATA_BYTES {
+        publish_metadata(
+            root,
+            guard,
+            &lock.file,
+            &metadata,
+            ["created", "written", "synced", "renamed", "published"],
+        )?;
+        Ok(Self { lock, metadata })
+    }
+
+    /// Durably binds this exact reservation owner to a newly created report-view staging file.
+    pub fn bind_staging(
+        &mut self,
+        root: &Path,
+        guard: &MutationGuard,
+        path: &Path,
+        file: &File,
+    ) -> Result<(), ReservationError> {
+        self.validate_owner(root, guard)?;
+        if self.metadata.staging.is_some()
+            || self.metadata.version != 1
+            || self.metadata.byte_ceiling < REPORT_RESERVATION_METADATA_ALLOWANCE
+        {
             return Err(ReservationError::Corrupt);
         }
-        let temporary = root.join("runtime").join(TEMP_NAME);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
+        let binding = inspect_staging(root, path, file, true)?;
+        let directories = StagingDirectories::open(root)?;
+        if directories.root_identity()? != (binding.root_dev, binding.root_ino)
+            || directories.parent_identity()? != (binding.parent_dev, binding.parent_ino)
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(no_follow_flag() | nonblocking_flag());
+            return Err(ReservationError::Corrupt);
         }
-        let mut temp = options.open(&temporary)?;
-        private_open_file(&temp)?;
-        #[cfg(test)]
-        crash_phase("created");
-        temp.write_all(&body)?;
-        #[cfg(test)]
-        crash_phase("written");
-        temp.sync_all()?;
-        #[cfg(test)]
-        crash_phase("synced");
-        guard.require_root(root)?;
-        validate_lock(&lock.file, root)?;
-        same_file(&temp, &temporary)?;
-        std::fs::rename(&temporary, root.join("runtime").join(METADATA_NAME))?;
-        #[cfg(test)]
-        crash_phase("renamed");
-        File::open(root.join("runtime"))?.sync_all()?;
-        #[cfg(test)]
-        crash_phase("published");
-        Ok(Self { lock, metadata })
+        same_file(file, path)?;
+        directories.sync_parent()?;
+        same_file(file, path)?;
+        let metadata = Metadata {
+            version: 2,
+            kind: Kind::ReportBuild,
+            nonce: self.metadata.nonce,
+            byte_ceiling: self.metadata.byte_ceiling,
+            staging: Some(binding),
+        };
+        publish_metadata(
+            root,
+            guard,
+            &self.lock.file,
+            &metadata,
+            [
+                "binding-created",
+                "binding-written",
+                "binding-synced",
+                "binding-renamed",
+                "binding-published",
+            ],
+        )?;
+        self.metadata = metadata;
+        Ok(())
+    }
+
+    /// Revalidates the bound staging path against the retained create-new descriptor.
+    pub fn validate_staging(
+        &self,
+        root: &Path,
+        guard: &MutationGuard,
+        path: &Path,
+        file: &File,
+    ) -> Result<(), ReservationError> {
+        self.validate_owner(root, guard)?;
+        let expected = self
+            .metadata
+            .staging
+            .as_ref()
+            .ok_or(ReservationError::Corrupt)?;
+        let observed = inspect_staging(root, path, file, false)?;
+        if &observed != expected {
+            return Err(ReservationError::Corrupt);
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_owner(
@@ -358,8 +660,15 @@ fn recover_observing(
     };
     let lock = lock(file)?;
     after_lock(&lock.file);
+    let metadata = read_metadata(root)?;
+    if let Some(binding) = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.staging.as_ref())
+    {
+        validate_recovery_staging(root, binding)?;
+    }
     cleanup_temp(root, guard, &lock.file)?;
-    Ok(read_metadata(root)?.map(|metadata| WriteReservation { lock, metadata }))
+    Ok(metadata.map(|metadata| WriteReservation { lock, metadata }))
 }
 
 #[cfg(test)]
@@ -372,7 +681,10 @@ fn crash_phase(phase: &str) {
 #[cfg(test)]
 mod tests {
     use crate::{Admission, LocalRuntimeConfigV3, MutationGuard, RuntimeControl};
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     fn setup(name: &str) -> (PathBuf, RuntimeControl) {
         let root = std::env::temp_dir().join(format!("reservation-{name}-{}", std::process::id()));
@@ -382,6 +694,399 @@ mod tests {
             root,
             RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap(),
         )
+    }
+
+    #[cfg(unix)]
+    fn staging_file(root: &Path, sequence: u64) -> (PathBuf, fs::File) {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = root.join("state/store/report-views.v1");
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(root.join("state"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(root.join("state/store"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join(format!(
+            ".report-view.sqlite3.staging.{}.{sequence}",
+            std::process::id()
+        ));
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        (path, file)
+    }
+
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    #[cfg(unix)]
+    #[test]
+    fn binding_accepts_only_the_exact_fresh_private_staging_identity() {
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+
+        let (root, control) = setup("bind-identity");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let mut reservation = control.reserve_report_build(&root, &guard, 8192).unwrap();
+        let (path, file) = staging_file(&root, 1);
+        reservation
+            .bind_staging(&root, &guard, &path, &file)
+            .unwrap();
+        reservation
+            .validate_staging(&root, &guard, &path, &file)
+            .unwrap();
+        assert!(
+            reservation
+                .bind_staging(&root, &guard, &path, &file)
+                .is_err()
+        );
+
+        let metadata = fs::read(root.join("runtime").join(super::METADATA_NAME)).unwrap();
+        assert!(u64::try_from(metadata.len()).unwrap() <= super::MAX_METADATA_BYTES);
+        assert!(!String::from_utf8_lossy(&metadata).contains(root.to_str().unwrap()));
+
+        let (other_root, _) = setup("bind-other-root");
+        fs::set_permissions(&other_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let other_guard = MutationGuard::try_acquire(&other_root.join("runtime")).unwrap();
+        assert!(
+            reservation
+                .validate_staging(&root, &other_guard, &path, &file)
+                .is_err()
+        );
+
+        fs::hard_link(&path, root.join("staging-alias")).unwrap();
+        assert!(
+            reservation
+                .validate_staging(&root, &guard, &path, &file)
+                .is_err()
+        );
+        fs::remove_file(root.join("staging-alias")).unwrap();
+
+        let saved = root.join("saved-staging");
+        fs::rename(&path, &saved).unwrap();
+        let replacement = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        assert!(
+            reservation
+                .validate_staging(&root, &guard, &path, &file)
+                .is_err()
+        );
+        drop(replacement);
+        fs::remove_file(&path).unwrap();
+        symlink(&saved, &path).unwrap();
+        assert!(
+            reservation
+                .validate_staging(&root, &guard, &path, &file)
+                .is_err()
+        );
+        fs::remove_file(&path).unwrap();
+        fs::rename(&saved, &path).unwrap();
+
+        file.try_clone().unwrap().write_all(b"x").unwrap();
+        assert!(
+            reservation
+                .validate_staging(&root, &guard, &path, &file)
+                .is_ok()
+        );
+        reservation.release(&root, &guard).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(other_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binding_rejects_nonzero_wrong_shape_and_nonce_without_releasing_full_promise() {
+        use std::io::Write;
+
+        let (root, control) = setup("bind-rejections");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let ceiling = 8192;
+        let mut reservation = control
+            .reserve_report_build(&root, &guard, ceiling)
+            .unwrap();
+        let before = control.writable_headroom(&root).unwrap();
+        let allocated_before = crate::StorageBudget::allocated_tree_bytes(&root).unwrap();
+        let (path, mut file) = staging_file(&root, 2);
+        file.write_all(b"not-empty").unwrap();
+        assert!(
+            reservation
+                .bind_staging(&root, &guard, &path, &file)
+                .is_err()
+        );
+        assert_eq!(super::reserved_bytes(&root).unwrap(), ceiling);
+        let allocated_after = crate::StorageBudget::allocated_tree_bytes(&root).unwrap();
+        assert!(allocated_after >= allocated_before);
+        assert!(control.writable_headroom(&root).unwrap() <= before);
+        drop(file);
+        fs::remove_file(&path).unwrap();
+
+        let (bad_path, bad_file) = staging_file(&root, 3);
+        let wrong_name = bad_path.with_file_name(".report-view.sqlite3.staging.bad.3");
+        fs::rename(&bad_path, &wrong_name).unwrap();
+        assert!(
+            reservation
+                .bind_staging(&root, &guard, &wrong_name, &bad_file)
+                .is_err()
+        );
+        fs::rename(&wrong_name, &bad_path).unwrap();
+
+        let metadata_path = root.join("runtime").join(super::METADATA_NAME);
+        let original = fs::read(&metadata_path).unwrap();
+        let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        changed["nonce"] = serde_json::json!(vec![7; 32]);
+        fs::write(&metadata_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(
+            reservation
+                .bind_staging(&root, &guard, &bad_path, &bad_file)
+                .is_err()
+        );
+        assert_eq!(super::reserved_bytes(&root).unwrap(), ceiling);
+        fs::write(&metadata_path, original).unwrap();
+        drop(reservation);
+        assert_eq!(super::reserved_bytes(&root).unwrap(), ceiling);
+        let stale = control
+            .claim_stale_report_reservation(&root, &guard)
+            .unwrap()
+            .unwrap();
+        stale.release(&root, &guard).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_stale_recovery_rejects_present_mismatch_but_allows_missing_after_parent_validation() {
+        let (root, control) = setup("bound-stale-recovery");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let mut reservation = control.reserve_report_build(&root, &guard, 8192).unwrap();
+        let (path, file) = staging_file(&root, 4);
+        reservation
+            .bind_staging(&root, &guard, &path, &file)
+            .unwrap();
+        drop(reservation);
+
+        fs::remove_file(&path).unwrap();
+        let replacement = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        assert!(
+            control
+                .claim_stale_report_reservation(&root, &guard)
+                .is_err()
+        );
+        assert_eq!(super::reserved_bytes(&root).unwrap(), 8192);
+        drop(replacement);
+        fs::remove_file(&path).unwrap();
+
+        let stale = control
+            .claim_stale_report_reservation(&root, &guard)
+            .unwrap()
+            .unwrap();
+        drop(stale);
+        let parent = path.parent().unwrap();
+        let saved_parent = root.join("saved-report-views");
+        fs::rename(parent, &saved_parent).unwrap();
+        fs::create_dir(parent).unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            control
+                .claim_stale_report_reservation(&root, &guard)
+                .is_err()
+        );
+        fs::remove_dir(parent).unwrap();
+        fs::rename(saved_parent, parent).unwrap();
+        control
+            .claim_stale_report_reservation(&root, &guard)
+            .unwrap()
+            .unwrap()
+            .release(&root, &guard)
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_after_staging_rename_does_not_require_the_original_path() {
+        let (root, control) = setup("release-after-publish");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let mut reservation = control.reserve_report_build(&root, &guard, 8192).unwrap();
+        let (path, file) = staging_file(&root, 5);
+        reservation
+            .bind_staging(&root, &guard, &path, &file)
+            .unwrap();
+        reservation
+            .validate_staging(&root, &guard, &path, &file)
+            .unwrap();
+        fs::rename(&path, path.with_file_name("report-view-published.sqlite3")).unwrap();
+        reservation.release(&root, &guard).unwrap();
+        assert_eq!(super::reserved_bytes(&root).unwrap(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v1_unbound_metadata_remains_recoverable_and_can_be_durably_bound() {
+        let (root, control) = setup("v1-compatibility");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let reservation = control.reserve_report_build(&root, &guard, 8192).unwrap();
+        let metadata_path = root.join("runtime").join(super::METADATA_NAME);
+        let v1: serde_json::Value =
+            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+        assert_eq!(v1["version"], 1);
+        assert!(v1.get("staging").is_none());
+        drop(reservation);
+
+        let mut recovered = control
+            .claim_stale_report_reservation(&root, &guard)
+            .unwrap()
+            .unwrap();
+        let (path, file) = staging_file(&root, 6);
+        recovered.bind_staging(&root, &guard, &path, &file).unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+        assert_eq!(v2["version"], 2);
+        recovered
+            .validate_staging(&root, &guard, &path, &file)
+            .unwrap();
+        recovered.release(&root, &guard).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worst_case_bound_metadata_stays_within_the_v1_limit() {
+        let metadata = super::Metadata {
+            version: 2,
+            kind: super::Kind::ReportBuild,
+            nonce: [u8::MAX; 32],
+            byte_ceiling: super::MAX_BYTE_CEILING,
+            staging: Some(super::StagingBinding {
+                root_dev: u64::MAX,
+                root_ino: u64::MAX,
+                parent_dev: u64::MAX,
+                parent_ino: u64::MAX,
+                file_dev: u64::MAX,
+                file_ino: u64::MAX,
+                name: format!("{}{}.{}", super::STAGING_PREFIX, u32::MAX, u64::MAX),
+            }),
+        };
+        let body = serde_json::to_vec(&metadata).unwrap();
+        assert!(body.len() as u64 <= super::MAX_METADATA_BYTES);
+        let decoded: super::Metadata = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded, metadata);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_binding_metadata_update_keeps_the_full_promise_for_stale_recovery() {
+        let (root, control) = setup("binding-update-failure");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let mut reservation = control.reserve_report_build(&root, &guard, 8192).unwrap();
+        let (path, file) = staging_file(&root, 7);
+        let temporary = root.join("runtime").join(super::TEMP_NAME);
+        let blocker = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .unwrap();
+        assert!(
+            reservation
+                .bind_staging(&root, &guard, &path, &file)
+                .is_err()
+        );
+        assert_eq!(super::reserved_bytes(&root).unwrap(), 8192);
+        drop(blocker);
+        drop(reservation);
+        let stale = control
+            .claim_stale_report_reservation(&root, &guard)
+            .unwrap()
+            .unwrap();
+        assert!(!temporary.exists());
+        assert_eq!(super::reserved_bytes(&root).unwrap(), 8192);
+        stale.release(&root, &guard).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_binding_process_death_preserves_v1_or_v2_full_promise() {
+        const ROOT: &str = "RESERVATION_BINDING_CRASH_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = PathBuf::from(root);
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            let control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+            let mut reservation = control.reserve_report_build(&root, &guard, 8192).unwrap();
+            let (path, file) = staging_file(&root, 8);
+            reservation
+                .bind_staging(&root, &guard, &path, &file)
+                .unwrap();
+            panic!("binding crash phase was not reached");
+        }
+
+        for phase in [
+            "binding-created",
+            "binding-written",
+            "binding-synced",
+            "binding-renamed",
+            "binding-published",
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "reservation-binding-phase-{phase}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reservation::tests::atomic_binding_process_death_preserves_v1_or_v2_full_promise",
+                ])
+                .env(ROOT, &root)
+                .env("RESERVATION_ATOMIC_CRASH_PHASE", phase)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(73));
+            assert_eq!(super::reserved_bytes(&root).unwrap(), 8192);
+            let metadata: serde_json::Value = serde_json::from_slice(
+                &fs::read(root.join("runtime").join(super::METADATA_NAME)).unwrap(),
+            )
+            .unwrap();
+            let expected_version = if matches!(phase, "binding-renamed" | "binding-published") {
+                2
+            } else {
+                1
+            };
+            assert_eq!(metadata["version"], expected_version);
+            let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+            let control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
+            let stale = control
+                .claim_stale_report_reservation(&root, &guard)
+                .unwrap()
+                .unwrap();
+            assert!(!root.join("runtime").join(super::TEMP_NAME).exists());
+            assert_eq!(super::reserved_bytes(&root).unwrap(), 8192);
+            stale.release(&root, &guard).unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

@@ -14,7 +14,8 @@ pub use dashboard_query::DashboardQueryService;
 pub use report_ack::MAX_REPORT_ACKNOWLEDGEMENT_BYTES;
 pub use report_view::{
     MAX_REPORT_VIEW_BYTES, MISSING_RATE_FINGERPRINT, ReportViewBuildError, ReportViewStaging,
-    build_report_view_staging, build_report_view_staging_observing,
+    build_report_view_staging, build_report_view_staging_bound,
+    build_report_view_staging_observing,
 };
 pub use report_view_catalog::{
     ReportViewCatalogError, ReportViewPublication, ReportViewRetirement, ReportViewSnapshot,
