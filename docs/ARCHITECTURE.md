@@ -63,6 +63,11 @@ runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui�
 
 ## Deployment profiles
 
+2026-09-08 후속 설계 방향은 [Storage Budget Policy](STORAGE_BUDGET_POLICY.md)다.
+보관 목표·작업 예산·디스크 최소 여유를 구분하고 legacy 설정을 보존하는 계획이며 아직
+제품 동작이 아니다. 아래 Isolated Ingest는 과거 후보로 보존하며 현재 구현 우선안이 아니다.
+unsafe/FFI 정책 예외나 자체 VFS를 도입하지 않는다.
+
 v1.11 추가 개발 설계인 [Isolated Ingest](ISOLATED_INGEST.md)는 같은 Rust executable의
 수집 전용 자식 프로세스와 쓰기 제한 VFS 후보를 검토한다. 의존성 평가와 private IPC 설계
 범위는 승인됐지만 아직 구현되거나 활성화되지 않았다. 기존 transaction authority,

@@ -99,6 +99,23 @@ gate를 통과해 추가한다.
 
 ### v1.11.0 — Local storage lifecycle and paged dashboard (In Progress)
 
+**계획 추가 — 2026-09-08: 저장 예산 분리 (Planning, 구현 전).**
+사용자가 보관 목표·작업용 공간·기기 디스크 비상 여유를 구분하는 정책 방향을 승인했다.
+상세 계획과 검증 표는 [Storage Budget Policy](docs/STORAGE_BUDGET_POLICY.md)에 있다.
+기존 설치의 `storage-bytes` 의미와 삭제 설정은 보존하고, 새 정책은 명시적으로 선택한다.
+`unsafe`/FFI 예외, 자체 VFS, 실제 설치 변경은 포함하지 않는다.
+
+| 순서 | 계획 작업 | 통과 기준 |
+| --- | --- | --- |
+| P0 | 기본값·범위·파일 분류·작업량 산정·호환성 확정 | 독립 설계 검토, 미확정 정책 결정 해소 |
+| P1–P2 | versioned config와 예산/상태 계산 | legacy 보존, Rust/TS parity, 경계값·예약 동시성 테스트 |
+| P3–P4 | 수집·보고서·정리 연결, CLI/웹 설정 | transaction 유지, 명시적 전환, 실제 적용 revision·중단 이유 표시 |
+| P5 | 장애·실제 규모·성능·문서 검증 | 새 수집→보고서 3세대, crash/replay, Chrome QA, exact-head CI와 독립 리뷰 |
+
+이 계획은 기존 hard-budget 연구의 후속 **정책 변경**이다. 보관 목표나 작업 시작 예산을
+순간 최대 물리 사용량 보장으로 표시하지 않는다. 아래 기존 실험과 실패 근거는 역사로
+유지하며, 계획 승인만으로 수집 복구·구현 완료·릴리즈 통과를 선언하지 않는다.
+
 Configurable Hot/Warm/Cold ages, managed-data expiry, independent raw-detail retention and
 bounded automatic maintenance. Existing installations keep automatic deletion disabled until
 explicitly enabled. No Elasticsearch or external storage dependency is introduced.

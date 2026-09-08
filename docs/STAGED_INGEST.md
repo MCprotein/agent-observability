@@ -2,6 +2,12 @@
 
 Status: **v1.11 development design; scope approved, reduced admission not enabled.**
 
+**September 8 planning update:** the user approved separating retention target, operational
+workspace and filesystem free-space floor. [Storage Budget Policy](STORAGE_BUDGET_POLICY.md)
+is the new policy plan, not implemented behavior. The strict-budget investigation below remains
+historical evidence and applies to the preserved legacy mode; its VFS path is not resumed.
+No unsafe exception, automatic configuration reinterpretation or installed change is authorized.
+
 The user additionally approved evaluating new dependencies and an isolated ingestion process.
 [Isolated Ingest](ISOLATED_INGEST.md) defines the proposed enforcement boundary and phased
 feasibility gates. This broadens the design scope; it does not enable reduced admission, waive
