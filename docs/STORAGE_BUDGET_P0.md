@@ -68,6 +68,20 @@ cleanup/recovery/report는 A>=T만으로 차단하지 않지만 1–3과 각 기
 함께 적용한다. 축소 설정을 이유로 기존 예약을 다른 작업에 빌려주지 않는다.
 현재 소유자 검사 근거: `crates/local-runtime/src/control.rs:174`.
 
+### P2/P3 연결 시 확인할 경계
+
+순수 수치 판정의 허용 결과는 파일 소유권, 잠금 또는 설정 revision 검증을 대신하지 않는다.
+미분류 파일은 할당 bytes가 0이어도 거부하므로 U bytes와 미분류 entry 수를 함께 검사한다.
+
+| 경계 | 현재 근거 | 연결 전 조건 |
+| --- | --- | --- |
+| 보고서 예약 | `crates/local-runtime/src/reservation.rs:209`, `:287` | active/stale 모두 전체 ceiling 유지; 자기 예약 제외는 실제 handle·동일 root guard·metadata 검증 후만 허용 |
+| 보고서 작업 파일 | `crates/local-store/src/report_view.rs:162`, `crates/local-collector/src/lib.rs:3763` | builder가 mutation guard 밖에서 쓰므로 단순 경로 순회는 원자 snapshot이 아님; staging handle/publication guard와 경로 identity를 연결 |
+| 임시 파일 분류 | `crates/local-runtime/src/reservation.rs:29`, `crates/local-store/src/report_view_catalog.rs:915` | 예약 nonce/ceiling만으로 특정 staging 파일 소유를 증명하지 않음; cleanup용 prefix 인식도 일반 admission 소유권 증명이 아님 |
+| 수동 import | `crates/cli/src/main.rs:1313`, `:1332` | 항목별 write 및 최종 projection의 비용 포함; parsing만 확인하고 전체 파일을 원자 batch로 표시하지 않음 |
+
+이 경계가 검증되기 전에는 숫자 계산만 통과했다고 분리 모드 실행 차단을 제거하지 않는다.
+
 ## 작업별 allowance와 책임
 
 숫자 축소 최적화는 이번 정책 분리와 분리한다. 기존 산정치도 검증 범위를 벗어나면 hard bound가 아니다.
@@ -81,7 +95,9 @@ cleanup/recovery/report는 A>=T만으로 차단하지 않지만 1–3과 각 기
 | private detail·archive·파일 정리 | 기존 경로의 bounded output/atomic replacement allowance 유지; 전체 작업에 SQL이 있으면 SQL allowance도 합산 | runtime/collector의 해당 파일 작업 주체; collector `lib.rs:3022` |
 
 경로에 산정치가 없으면 0이나 batch 크기로 대체하지 않고 `estimate_unavailable`로 유예한다.
-manual import는 parsing 제한과 원자 batch 계약을 유지하며 추가 output/projection도 합산한다.
+manual import는 parsing 제한과 observation/disposition별 원자 기록 계약을 유지하며 추가
+output/projection도 합산한다. 현재 CLI는 항목별 transaction 뒤 projection을 재생성하므로
+import 파일 전체를 하나의 원자 batch로 취급하지 않는다 (`crates/cli/src/main.rs:1332`).
 P3의 경로별 테스트가 없는 작업은 연결 완료로 취급하지 않는다. 큰 correlation, rehydration,
 topology, pruning은 작은 입력과 무관하게 비용이 커질 수 있어 기존 전체-store allowance를
 제거하지 않는다. 기존 SQLite journal/cache/sync 설정도 변경하지 않는다.

@@ -14,6 +14,7 @@ pub mod policy;
 pub mod reservation;
 pub mod scheduler;
 pub mod storage;
+pub mod storage_policy;
 
 pub use control::{ControlError, RuntimeControl};
 pub use ingress::{Ingress, IngressCounters, IngressMessage, IngressOutcome};

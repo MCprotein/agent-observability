@@ -557,6 +557,47 @@ mod tests {
     }
 
     #[test]
+    fn config_shrink_preserves_full_active_and_stale_promise_until_release() {
+        let (root, control) = setup("config-shrink");
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let ceiling = 300 * crate::storage::MIB;
+        let held = control
+            .reserve_report_build(&root, &guard, ceiling)
+            .unwrap();
+        let mut config = LocalRuntimeConfigV3::default();
+        config.collection.local_storage_budget_bytes = 256 * crate::storage::MIB;
+        let shrunk = RuntimeControl::new(&config).unwrap();
+
+        assert_eq!(super::reserved_bytes(&root).unwrap(), ceiling);
+        assert_eq!(shrunk.writable_headroom(&root).unwrap(), 0);
+        assert_eq!(shrunk.admit(&root, 1).unwrap(), Admission::Denied);
+        let finalization = shrunk
+            .reservation_finalization_headroom(&root, &guard, &held)
+            .unwrap();
+        assert!(finalization > 0);
+        assert!(finalization <= shrunk.storage_budget().writable_limit());
+        assert!(finalization < ceiling);
+
+        drop(held);
+        assert_eq!(super::reserved_bytes(&root).unwrap(), ceiling);
+        assert_eq!(shrunk.admit(&root, 1).unwrap(), Admission::Denied);
+        let recovered = shrunk
+            .claim_stale_report_reservation(&root, &guard)
+            .unwrap()
+            .unwrap();
+        assert_eq!(super::reserved_bytes(&root).unwrap(), ceiling);
+        assert_eq!(shrunk.admit(&root, 1).unwrap(), Admission::Denied);
+        recovered.release(&root, &guard).unwrap();
+        assert_eq!(super::reserved_bytes(&root).unwrap(), 0);
+        assert!(matches!(
+            shrunk.admit(&root, 1).unwrap(),
+            Admission::Allowed { .. }
+        ));
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn stale_is_counted_until_guarded_recovery_and_wrong_root_is_rejected() {
         let (root, control) = setup("stale");
         let (other, _) = setup("other");

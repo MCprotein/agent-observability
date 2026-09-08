@@ -109,7 +109,7 @@ gate를 통과해 추가한다.
 | --- | --- | --- |
 | P0 | [구체적 결정안](docs/STORAGE_BUDGET_P0.md): 기본값·범위·파일 분류·작업량 산정·호환성 | config P1 착수에 한해 독립 APPROVE; 파일 분류·report 연결은 P2/P3 별도 검증 |
 | P1 | v5 config와 기존 설정 보존 검증 완료; 분리 모드 활성화 차단 | legacy 보존, Rust/TS parity, 경계값·revision 테스트 통과; 독립 코드 APPROVE / 아키텍처 CLEAR |
-| P2 | 예산/상태 계산 연결 전 | 분류·예약 동시성·공간 산정 검증 후 별도 승인 |
+| P2 | T/W/F 순수 계산·거부 사유 테스트와 독립 리뷰 통과; 파일 분류와 실행 연결 전 | 수치 부분 코드 APPROVE / 아키텍처 CLEAR; 분류·예약 동시성·실제 공간 산정은 별도 검증 |
 | P3–P4 | 수집·보고서·정리 연결, CLI/웹 설정 | transaction 유지, 명시적 전환, 실제 적용 revision·중단 이유 표시 |
 | P5 | 장애·실제 규모·성능·문서 검증 | 새 수집→보고서 3세대, crash/replay, Chrome QA, exact-head CI와 독립 리뷰 |
 
