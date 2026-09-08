@@ -420,6 +420,10 @@ gate with synthetic collector performance evidence while remaining separate from
 smoke is non-normative and deletes successful temporary output; a failed smoke retains only its sanitized
 manifest so the printed diagnostic path remains usable. release writes sanitized evidence under
 docs/evidence/local/performance/ and exits nonzero when required evidence is missing or a budget is breached.
+The macOS PR check uploads a failed automatic smoke's `manifest.yaml` as
+`automatic-smoke-diagnostics-<commit>` for seven days. It never uploads the runtime tree or raw
+logs. A failure before manifest creation leaves the original check failed and reports a missing
+artifact warning; diagnostic retention does not turn smoke into release evidence.
 For `perf local`, enabled runs permit at most 1% explicit fail-open rejection and must reconcile every enqueued
 event with one durable observation after graceful fixture shutdown; foreground enqueue does not itself imply
 durability. For `perf automatic`, every foreground notify must be accepted and each run independently enforces

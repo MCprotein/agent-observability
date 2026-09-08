@@ -19,6 +19,17 @@ const releasePackage = JSON.parse(
 );
 const releaseWorkflow = readFileSync(".github/workflows/release.yml", "utf8");
 const ciWorkflow = readFileSync(".github/workflows/ci.yml", "utf8");
+test("failed automatic smoke retains only its diagnostic manifest in CI", () => {
+  const macos = ciWorkflow.split("  rust-macos:\n")[1]?.split("  report-ui:\n")[0] ?? "";
+  assert.match(macos, /name: Run automatic performance smoke\n\s+id: automatic-smoke/);
+  const upload = macos.split("      - name: Upload failed automatic smoke diagnostics\n")[1]?.split("      - name:")[0] ?? "";
+  assert.match(upload, /if: always\(\) && steps\.automatic-smoke\.outcome == 'failure'/);
+  assert.match(upload, /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/);
+  assert.match(upload, /name: automatic-smoke-diagnostics-\$\{\{ github\.sha \}\}/);
+  assert.match(upload, /path: docs\/evidence\/local\/performance\/automatic-\*\/manifest\.yaml\n/);
+  assert.match(upload, /retention-days: 7/);
+  assert.doesNotMatch(macos, /continue-on-error:/);
+});
 const readme = readFileSync("README.md", "utf8");
 const roadmap = readFileSync("ROADMAP.md", "utf8");
 const cargoMetadata = JSON.parse(

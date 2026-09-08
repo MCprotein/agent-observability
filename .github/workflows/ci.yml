@@ -64,7 +64,16 @@ jobs:
       - name: Verify exact Codex CLI
         run: test "$(codex --version)" = "codex-cli 0.152.1"
       - name: Run automatic performance smoke
+        id: automatic-smoke
         run: cargo +1.97.0 run --locked -p xtask -- perf automatic --profile smoke --check
+      - name: Upload failed automatic smoke diagnostics
+        if: always() && steps.automatic-smoke.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: automatic-smoke-diagnostics-${{ github.sha }}
+          path: docs/evidence/local/performance/automatic-*/manifest.yaml
+          if-no-files-found: warn
+          retention-days: 7
       - name: Run macOS Clippy
         run: cargo +1.97.0 clippy --workspace --all-targets -- -D warnings
 
