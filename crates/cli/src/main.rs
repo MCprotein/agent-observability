@@ -23,9 +23,9 @@ use agent_observability_local_collector::{
     NotifyOutcome, load_settings, maintain_private_turn_details, serve, submit_notify,
 };
 use agent_observability_local_runtime::{
-    Admission, ConfigMutationGuard, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION,
-    LocalRuntimeConfigV3, MutationGuard, PressureSample, RuntimeControl, Singleton, StorageBudget,
-    install, load, save,
+    Admission, ConfigMutationGuard, CoordinatedSingletonScope, InstalledLayout,
+    LOCAL_RUNTIME_CONFIG_VERSION, LocalRuntimeConfigV3, MutationGuard, PressureSample,
+    ProductionSingleton, RuntimeControl, StorageBudget, install, load, save,
 };
 use agent_observability_local_store::{
     IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore, RetentionPlan,
@@ -813,7 +813,7 @@ fn prepare_dashboard_with(
 
 fn current_record_count(root: &Path) -> Result<usize, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let _singleton = acquire_runtime_singleton(&layout)?;
     let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
     let config = load(&layout.config).map_err(|error| error.to_string())?;
     let store = open_store(&mutation, &layout, &config)?;
@@ -832,6 +832,11 @@ fn open_dashboard_with(
     opener: impl FnOnce(&Path) -> Result<(), PlatformOpenError>,
 ) -> Result<(), String> {
     opener(path).map_err(|error| format!("dashboard {error}"))
+}
+
+fn acquire_runtime_singleton(layout: &InstalledLayout) -> Result<ProductionSingleton, String> {
+    ProductionSingleton::acquire(&layout.root, CoordinatedSingletonScope::Runtime)
+        .map_err(|error| error.to_string())
 }
 
 fn show_config(root: &Path) -> Result<String, String> {
@@ -928,7 +933,7 @@ fn config_output(layout: &InstalledLayout, config: &LocalRuntimeConfigV3) -> Str
 
 fn storage_check(root: &Path) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let _singleton = acquire_runtime_singleton(&layout)?;
     let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
     let config = load(&layout.config).map_err(|error| error.to_string())?;
     let store = open_store(&mutation, &layout, &config)?;
@@ -987,7 +992,7 @@ fn retention(root: &Path, apply: Option<(&str, &Path)>) -> Result<String, String
     let apply = apply
         .map(|(plan_id, path)| normalize_archive_path(&layout.root, plan_id, path))
         .transpose()?;
-    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let _singleton = acquire_runtime_singleton(&layout)?;
     let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
     let config = load(&layout.config).map_err(|error| error.to_string())?;
     let store = open_store(&mutation, &layout, &config)?;
@@ -1089,7 +1094,7 @@ fn report_command(arguments: &[String]) -> Result<String, String> {
 
 fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let _singleton = acquire_runtime_singleton(&layout)?;
     let store = open_report_store(&layout)?;
     let rate_table = rate_table_path
         .map(read_private_rate_table)
@@ -1243,7 +1248,7 @@ fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 
 fn runtime_check(root: &Path) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let _singleton = acquire_runtime_singleton(&layout)?;
     let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
     let config = load(&layout.config).map_err(|error| error.to_string())?;
     let store = open_store(&mutation, &layout, &config)?;
@@ -1953,6 +1958,38 @@ mod tests {
         assert!(output.contains("storage_admission=allowed"));
         assert!(output.contains("team_ingest=disabled"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_singleton_acquisition_joins_initialized_accounting_barrier() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-runtime-singleton-coordination-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+
+        assert_eq!(
+            super::acquire_runtime_singleton(&layout).unwrap_err(),
+            "singleton coherence error: storage accounting barrier is busy"
+        );
+        assert!(!layout.runtime.join("runtime.meta").exists());
+
+        drop(freeze);
+        let owner = super::acquire_runtime_singleton(&layout).unwrap();
+        assert!(layout.runtime.join("runtime.meta").is_file());
+        drop(owner);
+        assert!(!layout.runtime.join("runtime.meta").exists());
+
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

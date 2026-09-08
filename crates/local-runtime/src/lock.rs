@@ -30,6 +30,27 @@ pub struct CoordinatedSingleton {
 }
 
 #[derive(Debug)]
+pub struct ProductionSingleton {
+    owner: ProductionSingletonOwner,
+}
+
+#[derive(Debug)]
+enum ProductionSingletonOwner {
+    Legacy(LegacyProductionSingleton),
+    Coordinated(CoordinatedSingleton),
+}
+
+#[derive(Debug)]
+struct LegacyProductionSingleton {
+    singleton: Singleton,
+    root: PathBuf,
+    root_directory: File,
+    runtime_directory: File,
+    directory: File,
+    metadata: File,
+}
+
+#[derive(Debug)]
 pub enum CoordinatedSingletonError {
     Coherence(crate::storage_coherence::StorageCoherenceError),
     Singleton(SingletonError),
@@ -38,6 +59,13 @@ pub enum CoordinatedSingletonError {
 #[derive(Clone, Copy)]
 enum SingletonAcquireMode<'permit, 'barrier> {
     Legacy,
+    Retained {
+        root: &'permit Path,
+        root_directory: &'permit File,
+        runtime_directory: &'permit File,
+        #[cfg(test)]
+        before_metadata_rename: Option<fn(&Path)>,
+    },
     Coordinated {
         permit: &'permit crate::storage_coherence::StorageWriteGuard<'barrier>,
         #[cfg(test)]
@@ -47,6 +75,42 @@ enum SingletonAcquireMode<'permit, 'barrier> {
 
 const RUNTIME_METADATA_MAX_BYTES: usize = 256;
 const RUNTIME_METADATA_MAX_BYTES_U64: u64 = 256;
+
+impl SingletonAcquireMode<'_, '_> {
+    fn validate_scope(
+        &self,
+        directory: &File,
+        directory_path: &Path,
+        lock: &File,
+        lock_path: &Path,
+    ) -> Result<(), CoordinatedSingletonError> {
+        match self {
+            Self::Legacy => return Ok(()),
+            Self::Coordinated { permit, .. } => {
+                return validate_coordinated_singleton_scope(
+                    permit,
+                    directory,
+                    directory_path,
+                    lock,
+                    lock_path,
+                );
+            }
+            Self::Retained {
+                root,
+                root_directory,
+                runtime_directory,
+                ..
+            } => {
+                same_private_directory(root_directory, root)?;
+                same_private_directory(runtime_directory, &root.join("runtime"))?;
+            }
+        }
+        same_private_directory(directory, directory_path)?;
+        validate_private_empty_lock(lock)?;
+        same_file(lock, lock_path)?;
+        Ok(())
+    }
+}
 
 /// Serializes short-lived mutations that share one runtime accounting root.
 #[derive(Debug)]
@@ -141,6 +205,14 @@ impl Singleton {
         scope: CoordinatedSingletonScope,
     ) -> Result<CoordinatedSingleton, CoordinatedSingletonError> {
         let barrier = crate::storage_coherence::StorageBarrier::open_existing(root)?;
+        Singleton::acquire_with_barrier(barrier, root, scope)
+    }
+
+    fn acquire_with_barrier(
+        barrier: crate::storage_coherence::StorageBarrier,
+        root: &Path,
+        scope: CoordinatedSingletonScope,
+    ) -> Result<CoordinatedSingleton, CoordinatedSingletonError> {
         let permit = barrier.try_begin_write()?;
         let singleton_path = scope.directory(root);
         let (singleton, directory, metadata) = Self::acquire_inner(
@@ -180,7 +252,9 @@ impl Singleton {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(no_follow_flag());
+            options
+                .mode(0o600)
+                .custom_flags(no_follow_flag() | nonblocking_flag());
         }
         let file = options.open(&lock_path)?;
         private_open_file(&file)?;
@@ -194,9 +268,9 @@ impl Singleton {
         let mut coordinated_existing_metadata = None;
         let coordinated_directory = match &mode {
             SingletonAcquireMode::Legacy => None,
-            SingletonAcquireMode::Coordinated { permit, .. } => {
-                let directory = File::open(dir)?;
-                validate_coordinated_singleton_scope(permit, &directory, dir, &file, &lock_path)?;
+            SingletonAcquireMode::Coordinated { .. } | SingletonAcquireMode::Retained { .. } => {
+                let directory = open_retained_private_directory(dir)?;
+                mode.validate_scope(&directory, dir, &file, &lock_path)?;
                 coordinated_existing_metadata = open_existing_coordinated_metadata(&metadata_path)?;
                 Some(directory)
             }
@@ -209,10 +283,7 @@ impl Singleton {
             let _ = fs::remove_file(&temporary);
         }
         let mut meta_options = OpenOptions::new();
-        meta_options
-            .create_new(true)
-            .read(!matches!(&mode, SingletonAcquireMode::Legacy))
-            .write(true);
+        meta_options.create_new(true).read(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -224,28 +295,31 @@ impl Singleton {
         writeln!(meta, "boot_nonce={}", encode_nonce(&nonce))?;
         meta.sync_all()?;
         private_open_file(&meta)?;
-        if let SingletonAcquireMode::Coordinated {
-            permit,
+        if !matches!(mode, SingletonAcquireMode::Legacy) {
             #[cfg(test)]
-            before_metadata_rename,
-        } = &mode
-        {
-            #[cfg(test)]
-            if let Some(hook) = before_metadata_rename {
+            if let SingletonAcquireMode::Coordinated {
+                before_metadata_rename: Some(hook),
+                ..
+            }
+            | SingletonAcquireMode::Retained {
+                before_metadata_rename: Some(hook),
+                ..
+            } = &mode
+            {
                 hook(dir);
             }
             let directory = coordinated_directory
                 .as_ref()
                 .expect("coordinated acquisition retains its directory descriptor");
-            if let Err(error) =
-                validate_coordinated_singleton_scope(permit, directory, dir, &file, &lock_path)
-                    .and_then(|()| {
-                        revalidate_existing_coordinated_metadata(
-                            coordinated_existing_metadata.as_ref(),
-                            &metadata_path,
-                        )
-                        .map_err(CoordinatedSingletonError::from)
-                    })
+            if let Err(error) = mode
+                .validate_scope(directory, dir, &file, &lock_path)
+                .and_then(|()| {
+                    revalidate_existing_coordinated_metadata(
+                        coordinated_existing_metadata.as_ref(),
+                        &metadata_path,
+                    )
+                    .map_err(CoordinatedSingletonError::from)
+                })
             {
                 cleanup_coordinated_temporary(directory, &meta, &temporary)?;
                 return Err(error);
@@ -285,6 +359,140 @@ impl Singleton {
         parse_nonce(&body)
     }
 }
+
+impl ProductionSingleton {
+    pub fn acquire(
+        root: &Path,
+        scope: CoordinatedSingletonScope,
+    ) -> Result<Self, CoordinatedSingletonError> {
+        Self::acquire_observing(root, scope, || {})
+    }
+
+    fn acquire_observing(
+        root: &Path,
+        scope: CoordinatedSingletonScope,
+        after_discovery: impl FnOnce(),
+    ) -> Result<Self, CoordinatedSingletonError> {
+        let root_directory = open_retained_private_directory(root)?;
+        let runtime_directory = open_retained_private_directory(&root.join("runtime"))?;
+        let barrier = crate::storage_coherence::StorageBarrier::open_if_initialized(root)?;
+        after_discovery();
+        let owner = match barrier {
+            Some(barrier) => ProductionSingletonOwner::Coordinated(
+                Singleton::acquire_with_barrier(barrier, root, scope)?,
+            ),
+            None => ProductionSingletonOwner::Legacy(LegacyProductionSingleton::acquire(
+                root,
+                scope,
+                root_directory,
+                runtime_directory,
+            )?),
+        };
+        Ok(Self { owner })
+    }
+
+    pub fn try_begin_write(
+        &self,
+    ) -> Result<Option<crate::storage_coherence::StorageWriteGuard<'_>>, CoordinatedSingletonError>
+    {
+        match &self.owner {
+            ProductionSingletonOwner::Legacy(owner) => {
+                owner.revalidate()?;
+                Ok(None)
+            }
+            ProductionSingletonOwner::Coordinated(owner) => {
+                let permit = owner.barrier.try_begin_write()?;
+                owner.revalidate()?;
+                permit.revalidate()?;
+                Ok(Some(permit))
+            }
+        }
+    }
+
+    pub fn revalidate(&self) -> Result<(), CoordinatedSingletonError> {
+        match &self.owner {
+            ProductionSingletonOwner::Legacy(owner) => owner.revalidate().map_err(Into::into),
+            ProductionSingletonOwner::Coordinated(owner) => owner.revalidate(),
+        }
+    }
+}
+
+impl LegacyProductionSingleton {
+    fn acquire(
+        root: &Path,
+        scope: CoordinatedSingletonScope,
+        root_directory: File,
+        runtime_directory: File,
+    ) -> Result<Self, CoordinatedSingletonError> {
+        same_private_directory(&root_directory, root)?;
+        same_private_directory(&runtime_directory, &root.join("runtime"))?;
+        let (mut singleton, directory, metadata) = Singleton::acquire_inner(
+            &scope.directory(root),
+            SingletonAcquireMode::Retained {
+                root,
+                root_directory: &root_directory,
+                runtime_directory: &runtime_directory,
+                #[cfg(test)]
+                before_metadata_rename: None,
+            },
+        )?;
+        // This owner performs identity-checked cleanup; the inner legacy Drop must
+        // never remove a replacement path after ownership has been lost.
+        singleton.remove_metadata_on_drop = false;
+        let owner = Self {
+            singleton,
+            root: root.to_path_buf(),
+            root_directory,
+            runtime_directory,
+            directory,
+            metadata,
+        };
+        owner.revalidate()?;
+        Ok(owner)
+    }
+
+    fn revalidate(&self) -> Result<(), SingletonError> {
+        same_private_directory(&self.root_directory, &self.root)?;
+        same_private_directory(&self.runtime_directory, &self.root.join("runtime"))?;
+        let directory = self
+            .singleton
+            .metadata_path
+            .parent()
+            .ok_or(SingletonError::WrongMutationRoot)?;
+        same_private_directory(&self.directory, directory)?;
+        validate_private_empty_lock(&self.singleton.file)?;
+        same_file(&self.singleton.file, &directory.join("runtime.lock"))?;
+        validate_private_metadata(&self.metadata)?;
+        same_file(&self.metadata, &self.singleton.metadata_path)?;
+        if read_bounded_nonce_from_file(&self.metadata)? != self.singleton.boot_nonce {
+            return Err(SingletonError::CorruptMetadata);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LegacyProductionSingleton {
+    fn drop(&mut self) {
+        if self.revalidate().is_ok() && fs::remove_file(&self.singleton.metadata_path).is_ok() {
+            let _ = self.directory.sync_all();
+        }
+    }
+}
+
+fn open_retained_private_directory(path: &Path) -> Result<File, SingletonError> {
+    validate_private_runtime_dir(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(no_follow_flag() | nonblocking_flag());
+    }
+    let file = options.open(path)?;
+    same_private_directory(&file, path)?;
+    Ok(file)
+}
+
 impl Drop for Singleton {
     fn drop(&mut self) {
         if self.remove_metadata_on_drop {
@@ -302,6 +510,24 @@ impl CoordinatedSingleton {
     pub fn boot_nonce(&self) -> [u8; 32] {
         self.singleton.boot_nonce
     }
+
+    fn revalidate(&self) -> Result<(), CoordinatedSingletonError> {
+        let directory_path = self
+            .singleton
+            .metadata_path
+            .parent()
+            .ok_or(SingletonError::WrongMutationRoot)?;
+        self.barrier.revalidate()?;
+        same_private_directory(&self.directory, directory_path)?;
+        validate_private_empty_lock(&self.singleton.file)?;
+        same_file(&self.singleton.file, &directory_path.join("runtime.lock"))?;
+        validate_private_metadata(&self.metadata)?;
+        same_file(&self.metadata, &self.singleton.metadata_path)?;
+        if read_nonce_from_file(&self.metadata)? != self.singleton.boot_nonce {
+            return Err(SingletonError::CorruptMetadata.into());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for CoordinatedSingleton {
@@ -309,17 +535,7 @@ impl Drop for CoordinatedSingleton {
         let Ok(permit) = self.barrier.try_begin_write() else {
             return;
         };
-        let Some(directory_path) = self.singleton.metadata_path.parent() else {
-            return;
-        };
-        if permit.revalidate().is_err()
-            || same_private_directory(&self.directory, directory_path).is_err()
-            || validate_private_empty_lock(&self.singleton.file).is_err()
-            || same_file(&self.singleton.file, &directory_path.join("runtime.lock")).is_err()
-            || validate_private_metadata(&self.metadata).is_err()
-            || same_file(&self.metadata, &self.singleton.metadata_path).is_err()
-            || read_nonce_from_file(&self.metadata).ok() != Some(self.singleton.boot_nonce)
-        {
+        if self.revalidate().is_err() || permit.revalidate().is_err() {
             return;
         }
         if fs::remove_file(&self.singleton.metadata_path).is_ok() {
@@ -875,6 +1091,233 @@ mod tests {
         let barrier =
             crate::storage_coherence::StorageBarrier::initialize(&root, &mutation).unwrap();
         (root, mutation, barrier)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_singleton_preserves_legacy_absence_without_initializing_barrier() {
+        let root = std::env::temp_dir().join(format!(
+            "local-runtime-production-legacy-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        private_dir(&root);
+        private_dir(&root.join("runtime"));
+
+        let owner =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::Runtime).unwrap();
+
+        assert!(matches!(owner.owner, ProductionSingletonOwner::Legacy(_)));
+        assert!(!root.join("runtime/storage-accounting.lock").exists());
+        drop(owner);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_legacy_singleton_rejects_replacement_and_preserves_foreign_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for scope in [
+            CoordinatedSingletonScope::Runtime,
+            CoordinatedSingletonScope::DashboardUi,
+        ] {
+            for replacement in ["lock", "directory", "root", "metadata"] {
+                let root = std::env::temp_dir().join(format!(
+                    "local-runtime-production-identity-{scope:?}-{replacement}-{}",
+                    std::process::id()
+                ));
+                let _ = fs::remove_dir_all(&root);
+                private_dir(&root);
+                private_dir(&root.join("runtime"));
+                let owner = ProductionSingleton::acquire(&root, scope).unwrap();
+                let directory = scope.directory(&root);
+                let metadata = directory.join("runtime.meta");
+                match replacement {
+                    "lock" => {
+                        fs::rename(
+                            directory.join("runtime.lock"),
+                            directory.join("retained.lock"),
+                        )
+                        .unwrap();
+                        fs::write(directory.join("runtime.lock"), []).unwrap();
+                        fs::set_permissions(
+                            directory.join("runtime.lock"),
+                            fs::Permissions::from_mode(0o600),
+                        )
+                        .unwrap();
+                    }
+                    "directory" => {
+                        fs::rename(&directory, root.join("retained-directory")).unwrap();
+                        private_dir(&directory);
+                    }
+                    "root" => {
+                        let retained = root.with_extension("retained");
+                        fs::rename(&root, &retained).unwrap();
+                        private_dir(&root);
+                        private_dir(&root.join("runtime"));
+                        private_dir(&directory);
+                        fs::rename(retained, root.join("retained-root")).unwrap();
+                    }
+                    _ => {
+                        fs::rename(&metadata, directory.join("retained.meta")).unwrap();
+                    }
+                }
+                assert!(owner.revalidate().is_err(), "{scope:?}/{replacement}");
+                assert!(owner.try_begin_write().is_err());
+                if metadata.exists() {
+                    fs::remove_file(&metadata).unwrap();
+                }
+                fs::write(&metadata, b"foreign metadata").unwrap();
+                fs::set_permissions(&metadata, fs::Permissions::from_mode(0o600)).unwrap();
+                assert!(owner.revalidate().is_err(), "{scope:?}/{replacement}");
+                assert!(owner.try_begin_write().is_err());
+                drop(owner);
+                assert_eq!(fs::read(&metadata).unwrap(), b"foreign metadata");
+                assert!(!root.join("runtime/storage-accounting.lock").exists());
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_legacy_rejects_nonempty_lock_before_replacing_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "local-runtime-legacy-invalid-lock-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        private_dir(&root);
+        private_dir(&root.join("runtime"));
+        let metadata = root.join("runtime/runtime.meta");
+        let body = format!(
+            "runtime_metadata.v1\npid=1\nboot_nonce={}\n",
+            "a".repeat(64)
+        );
+        for (path, bytes) in [
+            (root.join("runtime/runtime.lock"), b"invalid".as_slice()),
+            (metadata.clone(), body.as_bytes()),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(ProductionSingleton::acquire(&root, CoordinatedSingletonScope::Runtime).is_err());
+        assert_eq!(fs::read_to_string(&metadata).unwrap(), body);
+        assert!(
+            !root
+                .join(format!("runtime/.runtime.meta.tmp.{}", std::process::id()))
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_singleton_rechecks_lock_before_publish_and_cleans_only_owned_temporary() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "local-runtime-retained-prepublish-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        private_dir(&root);
+        let runtime = root.join("runtime");
+        private_dir(&runtime);
+        let prior =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::Runtime).unwrap();
+        let body = fs::read(runtime.join("runtime.meta")).unwrap();
+        drop(prior);
+        fs::write(runtime.join("runtime.meta"), &body).unwrap();
+        fs::set_permissions(
+            runtime.join("runtime.meta"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let root_directory = open_retained_private_directory(&root).unwrap();
+        let runtime_directory = open_retained_private_directory(&runtime).unwrap();
+        let result = Singleton::acquire_inner(
+            &runtime,
+            SingletonAcquireMode::Retained {
+                root: &root,
+                root_directory: &root_directory,
+                runtime_directory: &runtime_directory,
+                before_metadata_rename: Some(|dir| {
+                    fs::rename(dir.join("runtime.lock"), dir.join("retained.lock")).unwrap();
+                    fs::write(dir.join("runtime.lock"), []).unwrap();
+                    fs::set_permissions(
+                        dir.join("runtime.lock"),
+                        fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                }),
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(runtime.join("runtime.meta")).unwrap(), body);
+        assert!(
+            !runtime
+                .join(format!(".runtime.meta.tmp.{}", std::process::id()))
+                .exists()
+        );
+        assert_eq!(fs::read(runtime.join("runtime.lock")).unwrap(), b"");
+        drop(root_directory);
+        drop(runtime_directory);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_singleton_rejects_invalid_present_barrier() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "local-runtime-production-invalid-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        private_dir(&root);
+        private_dir(&root.join("runtime"));
+        let barrier = root.join("runtime/storage-accounting.lock");
+        fs::write(&barrier, b"invalid").unwrap();
+        fs::set_permissions(&barrier, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(ProductionSingleton::acquire(&root, CoordinatedSingletonScope::Runtime).is_err());
+        assert!(!root.join("runtime/runtime.lock").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_singleton_uses_retained_discovered_barrier_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, mutation, barrier) = coordinated_fixture("production-retained-barrier");
+        let path = root.join("runtime/storage-accounting.lock");
+        let retained = root.join("runtime/retained-storage-accounting.lock");
+        let result = ProductionSingleton::acquire_observing(
+            &root,
+            CoordinatedSingletonScope::SettingsUi,
+            || {
+                fs::rename(&path, &retained).unwrap();
+                fs::write(&path, []).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(CoordinatedSingletonError::Coherence(
+                crate::storage_coherence::StorageCoherenceError::InvalidIdentity
+            ))
+        ));
+        assert!(!root.join("runtime/settings-ui/runtime.meta").exists());
+
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

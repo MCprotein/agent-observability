@@ -20,7 +20,10 @@ pub mod storage_policy;
 
 pub use control::{ControlError, RuntimeControl};
 pub use ingress::{Ingress, IngressCounters, IngressMessage, IngressOutcome};
-pub use lock::{MutationGuard, Singleton, SingletonError};
+pub use lock::{
+    CoordinatedSingletonError, CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+    Singleton, SingletonError,
+};
 pub use policy::{
     CollectionPolicyV1, RetentionPolicyV1, StorageBudgetMode, StorageBudgetPolicyV1,
     StorageLifecyclePolicyV1,
