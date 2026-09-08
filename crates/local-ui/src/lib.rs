@@ -960,6 +960,7 @@ fn integration_error() -> ApiError {
 
 fn integration_operation_error(error: &IntegrationError) -> ApiError {
     use agent_observability_local_collector::CollectorError;
+    use agent_observability_local_runtime::storage_coherence::StorageCoherenceError;
 
     let (code, message) = match error {
         IntegrationError::ConnectCommittedSettingsFinalizationUnverified { .. } => (
@@ -981,10 +982,16 @@ fn integration_operation_error(error: &IntegrationError) -> ApiError {
             operation_completed: false,
             ..
         })
+        | IntegrationError::StorageWriteUnverified { .. }
+        | IntegrationError::RecoveryFailed { .. }
         | IntegrationError::SettingsRollbackFailed { .. }
         | IntegrationError::SettingsRollbackUnverified { .. } => (
             "integration_outcome_uncertain",
             "변경 또는 복원 결과를 확정할 수 없습니다. 현재 상태를 다시 확인해야 합니다.",
+        ),
+        IntegrationError::Storage(StorageCoherenceError::Busy) => (
+            "integration_failed",
+            "다른 저장소 작업이 진행 중입니다. 잠시 후 다시 시도해야 합니다.",
         ),
         _ => return integration_error(),
     };
@@ -1732,6 +1739,7 @@ mod tests {
     use agent_observability_contracts::hash_opaque_identifier;
     use agent_observability_local_runtime::{
         ConfigMutationGuard, LocalRuntimeConfigV3, install, load, revision, save,
+        storage_coherence::StorageCoherenceError,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -1794,12 +1802,14 @@ mod tests {
                     finalization: private_error(),
                 },
                 "integration_connect_committed_unverified",
+                true,
             ),
             (
                 IntegrationError::DisconnectCommittedSettingsFinalizationUnverified {
                     finalization: private_error(),
                 },
                 "integration_disconnect_committed_unverified",
+                true,
             ),
             (
                 IntegrationError::Collector(CollectorError::StorageWriteUnverified {
@@ -1808,14 +1818,48 @@ mod tests {
                     verification: Box::new(private_error()),
                 }),
                 "integration_settings_completed_unverified",
+                true,
             ),
             (
                 IntegrationError::Collector(CollectorError::StorageWriteUnverified {
                     operation_completed: false,
-                    primary: None,
+                    primary: Some(Box::new(CollectorError::Runtime(
+                        "/private/PRIMARY_SECRET_TOKEN".into(),
+                    ))),
                     verification: Box::new(private_error()),
                 }),
                 "integration_outcome_uncertain",
+                true,
+            ),
+            (
+                IntegrationError::StorageWriteUnverified {
+                    operation_completed: true,
+                    primary: Some(Box::new(IntegrationError::Runtime(
+                        "PRIMARY_SECRET_TOKEN".into(),
+                    ))),
+                    verification: StorageCoherenceError::Io(std::io::ErrorKind::PermissionDenied),
+                },
+                "integration_outcome_uncertain",
+                true,
+            ),
+            (
+                IntegrationError::StorageWriteUnverified {
+                    operation_completed: false,
+                    primary: Some(Box::new(IntegrationError::Runtime(
+                        "PRIMARY_SECRET_TOKEN".into(),
+                    ))),
+                    verification: StorageCoherenceError::InvalidIdentity,
+                },
+                "integration_outcome_uncertain",
+                true,
+            ),
+            (
+                IntegrationError::RecoveryFailed {
+                    primary: Box::new(IntegrationError::Runtime("PRIMARY_SECRET_TOKEN".into())),
+                    recovery: Box::new(IntegrationError::Runtime("RECOVERY_SECRET_TOKEN".into())),
+                },
+                "integration_outcome_uncertain",
+                true,
             ),
             (
                 IntegrationError::SettingsRollbackUnverified {
@@ -1823,6 +1867,7 @@ mod tests {
                     rollback: private_error(),
                 },
                 "integration_outcome_uncertain",
+                true,
             ),
             (
                 IntegrationError::SettingsRollbackFailed {
@@ -1830,30 +1875,59 @@ mod tests {
                     rollback: private_error(),
                 },
                 "integration_outcome_uncertain",
+                true,
+            ),
+            (
+                IntegrationError::Storage(StorageCoherenceError::Busy),
+                "integration_failed",
+                false,
             ),
         ];
+        for (error, expected, reconciliation_required) in cases {
+            assert_integration_error_response(&error, expected, reconciliation_required);
+        }
+    }
+
+    fn assert_integration_error_response(
+        error: &IntegrationError,
+        expected: &str,
+        reconciliation_required: bool,
+    ) {
+        let uncertain_write = matches!(
+            error,
+            IntegrationError::StorageWriteUnverified { .. }
+                | IntegrationError::RecoveryFailed { .. }
+        );
+        let response = super::integration_operation_error(error);
+        assert_eq!(response.status, StatusCode::CONFLICT);
+        assert_eq!(response.code, expected);
+        assert_eq!(
+            response.message.contains("다시 확인"),
+            reconciliation_required
+        );
+        if uncertain_write {
+            assert!(!response.message.contains("완료"));
+            assert!(!response.message.contains("변경되지"));
+        }
         let schema: Value = serde_json::from_str(include_str!(
             "../../../contracts/codex-integration-error-v1.schema.json"
         ))
         .unwrap();
-        for (error, expected) in cases {
-            let response = super::integration_operation_error(&error);
-            assert_eq!(response.status, StatusCode::CONFLICT);
-            assert_eq!(response.code, expected);
-            assert!(
-                schema["properties"]["code"]["enum"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&Value::String(response.code.into()))
-            );
-            let body = serde_json::to_string(&super::ErrorBody {
-                code: response.code,
-                message: response.message,
-            })
-            .unwrap();
-            assert!(!body.contains("SECRET_TOKEN"));
-            assert!(!body.contains("/private/"));
-        }
+        assert!(
+            schema["properties"]["code"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String(response.code.into()))
+        );
+        let body = serde_json::to_string(&super::ErrorBody {
+            code: response.code,
+            message: response.message,
+        })
+        .unwrap();
+        assert!(!body.contains("SECRET_TOKEN"));
+        assert!(!body.contains("PRIMARY_SECRET_TOKEN"));
+        assert!(!body.contains("RECOVERY_SECRET_TOKEN"));
+        assert!(!body.contains("/private/"));
     }
 
     #[test]
