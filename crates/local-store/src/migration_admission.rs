@@ -453,6 +453,10 @@ mod tests {
     fn final_refusal_rolls_back_authentic_v6_and_retry_preserves_state() {
         let dir = std::env::temp_dir().join(format!("agentobs-staged-v6-{}", std::process::id()));
         super::super::private_dir(&dir).unwrap();
+        // This test invokes migration directly, so retain the same open lock that
+        // LocalStore::open_internal establishes around production migration.
+        let open_guard =
+            super::super::acquire_private_lock(&dir, super::super::STORE_OPEN_LOCK_NAME).unwrap();
         let path = dir.join(super::super::DB_NAME);
         let mut file = super::super::private_create_new(&path).unwrap();
         std::io::Write::write_all(
@@ -486,6 +490,7 @@ mod tests {
         );
         migrate(&db, &path, 16 * 1024 * 1024).unwrap();
         drop(db);
+        drop(open_guard);
         let store = super::super::LocalStore::open_current(&dir).unwrap();
         assert_eq!(store.record_count().unwrap(), 2);
         assert_eq!(store.report_status().unwrap().generation, 2);
