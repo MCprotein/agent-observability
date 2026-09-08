@@ -1,6 +1,7 @@
 # 저장 파일 소유권과 분류 — P2 구현 기준
 
-상태: **개발 중인 설계 기준. 분류기·동시 측정·분리 모드 실행은 아직 구현되지 않았다.**
+상태: **개발 중인 설계 기준. 제한된 파일 분류와 예약 identity 검증은 구현·검증됐으며,
+전체 writer의 동시 측정·분리 모드 실행은 아직 연결되지 않았다.**
 [저장 예산 계획](STORAGE_BUDGET_POLICY.md)과 [P0 계산 계약](STORAGE_BUDGET_P0.md)을
 구체화한다. 아래 경로 목록은 이름만 보고 파일을 승인하거나 삭제하는 allowlist가 아니다.
 
@@ -114,3 +115,91 @@ accounting 때문에 이 경로를 순회하거나 snapshot 내용·PEM·사용�
   identity 불일치를 숨기지 않으며 기존 guarded catalog 복구가 끝나야 예약을 해제한다.
 - catalog directory 준비·기존 orphan 정리는 callback 전에 수행된다. journal과 다른 writer의
   소유권, 일관된 전체 측정, 실제 T/W/F admission은 별도 P2/P3 작업이며 아직 활성화하지 않는다.
+
+## 파일 집계와 예약 증거 — 개발 중인 연결
+
+- `storage_inventory::classify_storage`는 열린 descriptor를 소유 모듈의 검증 callback에
+  전달하고, A/X/U의 실제 할당량을 집계한다. callback 오류는 집계 실패로 전달한다.
+  빈 미분류 파일도 U entry로 남기며, callback은 파일명만으로 소유권을 승인하면 안 된다.
+  이 원시 함수는 crate 내부 전용이며 결과 `StorageAllocationObservationV1`은 정책 입력과
+  다른 타입이다. 정책 입력으로 자동 변환하거나 쓰기 허가로 승격하는 API는 제공하지 않는다.
+- `reservation::ReportReservationEvidence`는 같은 mutation guard 아래 root·lock·metadata의
+  descriptor와 예약 내용을 유지한다. capture는 lock이나 metadata를 생성하지 않으며,
+  경로 identity 또는 예약 내용이 바뀌면 재검증에 실패한다.
+- 예약 v2가 결합한 정확한 staging 파일만 X 후보가 된다. unbound v1은 X 소유권을
+  증명하지 않는다. 실제 staging 할당량이 늘거나 owner가 종료돼도 전체 예약 R은 유지한다.
+  `captured_reserved_bytes`는 캡처 당시 값이며 현재 유효성 확인을 대신하지 않는다.
+- 이 증거와 분류기의 연결 회귀는 unbound→bound, 실제 파일 쓰기, owner 종료와 파일
+  교체를 검사한다. 다른 파일의 A 소유권을 증명하는 테스트나 운영 admission은 아니다.
+- 순회 전후 identity·metadata·directory entry 재검증은 관측된 변경을 거부하지만,
+  모든 writer가 참여하는 동기화 없이 중간 변경이 전혀 없었다고 증명하지 않는다.
+  따라서 이 API 결과만으로 분리 모드 쓰기를 허용하지 않는다.
+
+## 동시 측정의 공통 잠금 — API 구현, 전체 writer 연결 전
+
+기존 mutation guard는 보고서 projection, singleton metadata, integration writer를
+모두 막지 않는다. 분류기에 report publication guard를 추가하면 보고서가 끝날 때까지
+수집이 막히므로, 전체 writer가 참여하는 별도 `runtime/storage-accounting.lock`을 사용한다.
+이 잠금은 설치·명시적 bootstrap에서만 생성하는 빈 private stable lock이며 A에 포함한다.
+일반 측정은 없는 잠금을 생성하거나 손상된 잠금을 복구하지 않는다.
+
+- 집계·admission: root mutation → exclusive accounting guard → 설정·예약·파일·기기 여유
+  검증 → 정책 판정 → 해당 작업 commit/rollback까지 guard 유지.
+- 보고서: 전체 작업의 publication guard는 유지하되, 제한된 SQLite 쓰기 transaction마다
+  shared accounting guard를 획득하고 commit/rollback·journal 처리가 끝난 뒤 반환한다.
+  반환 전 같은 permit의 identity를 다시 검증한다. 초기화와 명시적 폐기도 같은 규칙을
+  따르며, 기존 작업 오류와 재검증 오류가 함께 발생하면 기존 작업 오류를 보존한다.
+  집계와 수집은 보고서의 쓰기 묶음 사이에 진행한다.
+- schema 초기화, repository 보정, 완료 metadata 쓰기도 같은 범위에 포함한다.
+  staging 폐기는 permit을 확보한 명시적 경로로 수행하며, 확보하지 못하면 파일과 예약을
+  남겨 기존 guarded recovery가 처리한다.
+- singleton 생성·종료, 설정과 TLS·ownership snapshot, 정적 HTML, store-open repair와
+  recovery 등 독립 writer도 참여하기 전에는 운영 분리 모드를 활성화하지 않는다.
+- 집계에서 journal이 보이더라도 suffix만으로 X로 승인하지 않는다. 별도 journal 소유권
+  증거가 없으면 U로 남기고 유예한다. 전체 R은 실제 X와 독립적으로 유지한다.
+
+이것은 advisory writer 규약이다. 공통 guard API의 단위 테스트 통과만으로 전체 writer
+적용이나 물리 디스크 quota를 증명하지 않는다. busy는 typed 유예로 처리하며, 잠금을 얻지
+못했다고 이전 측정값으로 쓰기를 허용하지 않는다.
+
+### 남은 쓰기 경로의 연결 기준
+
+수집기는 다음 public 경계를 각각 확인한다. `_locked` 하위 함수가 다시 같은 잠금을
+획득하게 하지 않고, 최상위 작업이 commit·rollback·임시 파일 처리까지 잠금을 유지한다.
+
+| 경계 | 함께 보호할 작업 | 현재 확인할 사항 |
+| --- | --- | --- |
+| 설정 설치·migration commit/rollback·포트 복구 | collector 설정, TLS generation, migration 기록과 정리 | 외부 integration의 lifecycle 잠금과 root mutation을 구별하고 실제 caller별 중첩 획득 검사 |
+| collector 시작 | 예약 복구, private detail 정리, store open/migration, catalog 복구, dirty marker | 기존 root mutation에 accounting freeze 연결 |
+| lifecycle pass | 만료 raw detail 정리, DB tier migration, 보고서 무효화·placeholder·dirty marker | 기존 상한·삭제 선택을 유지하고 같은 작업 범위에서 postcheck |
+| private detail 요청과 명시적 정리 | detail/status 쌍과 실패 정리 | canonical ingest 완료 후 별도 작업임을 보존하고 새로 guard 확보 |
+| report authority watcher | dirty marker 생성·제거 | DB 상태 확인과 파일 변경 사이에 적절한 작업 잠금 확보; 기존 ingest 내부 helper에 중첩 획득 금지 |
+
+완료 후 검증 오류를 저장 실패로 바꾸지 않는다. canonical commit이 확정되었으면 커서와
+저장 완료 응답을 보존하고 건강 상태를 degraded로 표시한다. private detail은 별도 receipt로
+실제 저장 여부를 알리며, canonical commit을 근거로 원문 저장 성공을 주장하지 않는다.
+이 표는 연결·회귀 기준이며 각 경로가 이미 구현되었다는 선언이 아니다.
+
+`storage_coherence::StorageBarrier`의 독립 descriptor 기반 shared/exclusive 잠금과
+config·예약 control 파일의 정확한 identity 검증은 독립 코드·아키텍처 리뷰를 통과했다.
+`OwnedStorageFreezeGuard`는 root mutation과 accounting 잠금을 함께 소유하므로,
+staging 연결 callback에서 두 잠금을 해제하고 게시 전에 새로 획득할 수 있다.
+이 guard 자체는 예산 판정이나 파일 소유권 승인을 대신하지 않는다.
+
+분리 모드 활성화 전의 legacy 호환 writer는 `open_if_initialized`로 이미 존재하는
+잠금에 참여한다. 이 API는 원래 없던 잠금과 삭제된 잠금을 구분하지 못한다.
+따라서 분리 모드의 저장·측정·실행 경로는 설정의 모드를 근거로 `open_existing`을
+필수 사용해야 한다. 현재 설정 또는 저장 후보가 분리 모드일 때 잠금이 사라진 경우,
+legacy로 우회하거나 자동 재생성하지 않는 회귀 검증을 활성화 조건에 포함한다.
+
+합성 데이터 3세대 통합 테스트는 실제 report builder와 catalog를 사용한다. 매 쓰기 묶음
+사이에 root mutation과 exclusive accounting 잠금을 다시 얻고, 쓰기 transaction 안에서는
+exclusive accounting 획득이 거부되는 것을 확인한다. 설정·예약·게시 파일과 정확한 staging
+외에 아직 소유 모듈 검증이 없는 파일은 U로 남긴다. 이 테스트는 설치된 사용자의 데이터,
+동시 source mutation, 전체 writer coverage 또는 분리 모드 활성화 검증이 아니다.
+
+추가 store observer는 생성·열기 시 유지한 directory/DB descriptor와 현재 schema 구조를
+검증하고, 정확한 DB·projection·control lock만 분류 후보로 제공한다. SQLite 내부 file
+descriptor를 얻었다고 주장하지 않으며, construction부터 observation callback 종료까지
+외부 writer 동기화가 필요하다. 연결 회귀에서는 기존 store 후보 다섯 개를 이 observer로
+검증하고, 의도적으로 넣은 0-byte 미소유 파일 하나는 U로 남기는지 검사한다.
