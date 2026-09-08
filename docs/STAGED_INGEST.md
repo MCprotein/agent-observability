@@ -71,6 +71,46 @@ parent. These are concrete reasons why a small input does not imply a small tran
 
 ## Current evidence boundary
 
+### Private page-geometry experiment — September 8
+
+An isolated coherent copy of the installed v4 authority was compacted with Apple SQLite 3.51.0.
+The source was opened read-only for backup and was never opened by `LocalStore` or replaced.
+These are logical file sizes, not resource-enforcement bounds:
+
+| Copy | Database bytes | Integrity |
+| --- | ---: | --- |
+| Original 4096-byte pages | 402,747,392 | Source backup |
+| Repacked 4096-byte pages | 395,587,584 | Passed |
+| Repacked 1024-byte pages | 287,315,968 | Passed |
+| Repacked 2048-byte pages | 313,858,048 | Passed |
+| Repacked 8192-byte pages | 310,525,952 | Passed |
+
+For the 1024-byte copy, all eleven tables including `sqlite_sequence` compared equal in both
+directions with implicit rowids included. Schema/index SQL compared equal in both directions;
+incremental auto-vacuum and DELETE journal mode were preserved. This is observed equality for
+this copy, not a general promise that compaction preserves implicit rowids.
+
+The copied 1024-byte authority migrated through the current Rust implementation and published
+two retained report views, but the first subsequent new notify was refused under unchanged
+collector admission: store allocation 573,317,120 bytes; collector reservation 573,841,408;
+remaining writable headroom 364,105,728; deficit 209,735,680; active report reservation zero.
+Thus page-size reduction alone does **not** pass steady-state ingestion. This test copies only
+the database, not installed JSONL, logs or private detail files, so it understates full-runtime
+occupancy. No installed page-size, budget or reservation policy was changed.
+The final rerun measured a 209,719,296-byte deficit and independently confirmed unchanged
+canonical authority, source cursor, generation/acknowledgement and current view after refusal.
+Small physical-allocation variation between runs does not change the rejection result.
+
+The repeatable test-only entrypoint is `private_backup_new_ingest_three_generations` in
+`crates/local-collector/src/rotation_diagnostic.rs`. It requires explicit `AO_ROTATION_BACKUP_SOURCE`
+and `--ignored --nocapture`, backs up into an owned private runtime, retains two views before
+each new write, and requires three committed unique notifications plus matching authoritative
+and published counts. Its synthetic regression passes; the installed-scale candidate fails.
+Report publication must preserve canonical identity. This is not a replay/idempotence test or
+proof of bounded peak RSS, a page-size migration protocol, or installed-runtime acceptance.
+
+### Remaining proof gates
+
 The installed v1.10 runtime has not been migrated, replaced, or assigned a larger budget.
 Existing v7 migration and report-rotation measurements do not prove this ingestion design.
 Reduced reservation must remain disabled until both memory enforcement and post-publication

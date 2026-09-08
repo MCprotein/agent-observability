@@ -274,6 +274,77 @@ mod rotation_diagnostic {
         three_generations(&runtime.0);
     }
 
+    fn new_ingest_three_generations(root: &Path) {
+        let mut state = collector_state(root);
+        let baseline = state.store.record_count().unwrap();
+        let baseline_observations = state.store.observation_count().unwrap();
+        let budget = StorageBudget::calculate(1024 * 1024 * 1024, false).unwrap();
+        measured_refresh(root);
+        state.store.invalidate_report().unwrap();
+        measured_refresh(root);
+        for rotation in 1..=3_u64 {
+            assert_eq!(catalog_files(root).len(), 2);
+            let config = load(&state.layout.config).unwrap();
+            let admission = crate::RuntimeControl::new(&config)
+                .unwrap()
+                .collector_admission_diagnostic(root, u64::from(config.collection.max_batch_bytes))
+                .unwrap();
+            println!(
+                "new_ingest_rotation={rotation} store_allocated_bytes={} reservation_bytes={} report_reserved_bytes={} writable_headroom_bytes={} deficit_bytes={}",
+                admission.existing_store_allocated_bytes,
+                admission.collector_reservation_bytes,
+                admission.current_report_reserved_bytes,
+                admission.writable_headroom_bytes,
+                admission.deficit_bytes,
+            );
+            let payload = projected_notify(
+                "private-capacity-probe-thread",
+                &format!("private-capacity-probe-turn-{rotation}"),
+            );
+            let before = canonical_identity(&state.store);
+            let before_status = state.store.report_status().unwrap();
+            let before_cursor = state.store.cursor("codex", &state.source_generation).unwrap();
+            let before_view = current_report_view(&state.store).unwrap().unwrap();
+            let outcome = ingest_notify_locked(&mut state, &payload);
+            if outcome.is_err() {
+                assert_eq!(canonical_identity(&state.store), before);
+                assert_eq!(state.store.report_status().unwrap(), before_status);
+                assert_eq!(state.store.cursor("codex", &state.source_generation).unwrap(), before_cursor);
+                assert_eq!(current_report_view(&state.store).unwrap().unwrap().view_id(), before_view.view_id());
+                println!("new_ingest_refusal_preserves_authority_cursor_generation_and_view=true");
+            }
+            assert!(matches!(
+                outcome.unwrap(),
+                super::super::IngestOutcome::Committed
+            ));
+            assert_eq!(state.store.record_count().unwrap(), baseline + rotation);
+            assert_eq!(
+                state.store.observation_count().unwrap(),
+                baseline_observations + rotation,
+            );
+            let identity = canonical_identity(&state.store);
+            let peak = measured_refresh(root);
+            assert!(peak.allocated <= budget.writable_limit());
+            let snapshot = current_report_view(&state.store).unwrap().unwrap();
+            assert_eq!(u64::try_from(snapshot.records()).unwrap(), baseline + rotation);
+            assert!(!state.store.report_status().unwrap().pending());
+            assert_eq!(canonical_identity(&state.store), identity);
+            assert_eq!(catalog_files(root).len(), 2);
+            println!(
+                "new_ingest_rotation={rotation} records={} allocated_tree_bytes={} sampled_peak_tree_bytes={} status=ok",
+                baseline + rotation,
+                StorageBudget::allocated_tree_bytes(root).unwrap(),
+                peak.allocated,
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_new_ingest_rotates_with_current_and_retired_views() {
+        let runtime = PrivateRuntime::new();
+        new_ingest_three_generations(&runtime.0);
+    }
+
     fn fill_to_remaining(root: &Path, budget: StorageBudget, remaining: u64) {
         let file_path = root.join("admission-fixture.bin");
         let mut file = OpenOptions::new()
@@ -479,6 +550,20 @@ mod rotation_diagnostic {
         let runtime = PrivateRuntime::new();
         backup_into(&source, &runtime);
         three_generations(&runtime.0);
+        runtime.cleanup();
+    }
+
+    /// New writes with two retained views; never opens source as a store.
+    #[test]
+    #[ignore = "explicit private-backup new-ingest diagnostic; leader-run only"]
+    fn private_backup_new_ingest_three_generations() {
+        let source = std::env::var_os("AO_ROTATION_BACKUP_SOURCE")
+            .expect("explicit backup source required");
+        let source = fs::canonicalize(source).expect("backup source exists");
+        assert!(source.is_file());
+        let runtime = PrivateRuntime::new();
+        backup_into(&source, &runtime);
+        new_ingest_three_generations(&runtime.0);
         runtime.cleanup();
     }
 

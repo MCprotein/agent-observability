@@ -157,8 +157,12 @@ and repeats the full xtask unit binary on macOS five times. That change was test
 The next run at `1f101a8` passed UI but exposed a staging `Busy` in a macOS repetition and
 a Linux privacy-test notify deadline failure. A deterministic duplicate-descriptor regression
 now covers explicit render-guard unlock; the privacy fixture separates acceptance from the
-unchanged public 250ms fail-open deadline. Remote validation is pending.
+unchanged public 250ms fail-open deadline. Ordinary CI at `4f4155f` passed Linux, macOS and UI;
+the exact-revision long release job was skipped, not passed.
 Private-copy compaction reclaimed only 7,159,808 bytes; it is not a capacity recovery solution.
+A separate 1024-byte-page copy reclaimed 115,431,424 bytes with observed table/schema parity,
+but still failed new ingest after two retained views (209,735,680-byte admission deficit).
+The repeatable new-ingest rotation diagnostic and its boundaries are in Staged Ingest.
 The exact CI trigger remains unconfirmed; neither test stabilization nor smoke substitutes for
 capacity acceptance or release gates. Failed-smoke manifest retention is implemented.
 The earlier long workflow `34135080615` was cancelled before its normative job when those defects
