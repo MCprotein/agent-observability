@@ -2,7 +2,9 @@
 #![cfg(unix)]
 
 use agent_observability_adapter_codex::{AdapterItem, parse_handoff_jsonl};
-use agent_observability_local_collector::storage_ownership::CollectorStorageOwnershipEvidence;
+use agent_observability_local_collector::storage_ownership::{
+    CollectorStorageOwnershipEvidence, CollectorTlsOwnershipEvidence,
+};
 use agent_observability_local_runtime::{
     InstalledLayout, MutationGuard, RuntimeControl, StorageAllocationClass, StorageInventoryError,
     config::ConfigAccountingEvidence,
@@ -60,6 +62,7 @@ fn three_synthetic_generations_preserve_reservations_and_classify_under_real_fre
         "fixture must not overwrite an existing directory"
     );
     let layout = install(&root).unwrap();
+    agent_observability_local_collector::install_settings(&layout.root).unwrap();
     let root = layout.root.clone();
     let config = load(&layout.config).unwrap();
     let control = RuntimeControl::new(&config).unwrap();
@@ -190,6 +193,9 @@ fn assert_accounting(
     let root = layout.root.as_path();
     let config_evidence = ConfigAccountingEvidence::capture(root, mutation).unwrap();
     let collector_evidence = CollectorStorageOwnershipEvidence::capture(layout).unwrap();
+    let tls_evidence = CollectorTlsOwnershipEvidence::capture(layout)
+        .unwrap()
+        .unwrap();
     let reservation_evidence = ReportReservationEvidence::capture(root, mutation).unwrap();
     assert_eq!(
         reservation_evidence.captured_reserved_bytes(),
@@ -241,6 +247,9 @@ fn assert_accounting(
                     || collector_evidence
                         .matches_entry(relative, file)
                         .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                    || tls_evidence
+                        .matches_entry(relative, file)
+                        .map_err(|_| StorageInventoryError::OwnershipMismatch)?
                 {
                     return Ok(StorageAllocationClass::Retained);
                 }
@@ -269,6 +278,7 @@ fn assert_accounting(
     assert_eq!(allocation.unknown_bytes, 0);
     config_evidence.revalidate().unwrap();
     collector_evidence.revalidate().unwrap();
+    tls_evidence.revalidate().unwrap();
     reservation_evidence.revalidate().unwrap();
     assert_eq!(
         reservation_evidence.captured_reserved_bytes(),

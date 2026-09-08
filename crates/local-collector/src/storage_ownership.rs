@@ -6,11 +6,13 @@
 //! cross-writer coherence, or classify any descendant or sibling path.
 
 use agent_observability_local_runtime::InstalledLayout;
+mod tls;
 use std::{
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
 };
+pub use tls::CollectorTlsOwnershipEvidence;
 
 const SETTINGS_RELATIVE_PATH: &str = "runtime/collector.json";
 const MIGRATION_RELATIVE_PATH: &str = "runtime/collector-settings-migration.json";
