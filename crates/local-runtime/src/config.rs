@@ -359,6 +359,9 @@ impl LocalConfigService {
         })?;
         save_if_revision(&mutation, expected_revision, config).map_err(|error| match error {
             ConfigError::Conflict => ConfigServiceError::Conflict,
+            ConfigError::StorageCoherence(
+                crate::storage_coherence::StorageCoherenceError::Busy,
+            ) => ConfigServiceError::Busy,
             ConfigError::Policy(_)
             | ConfigError::UnsupportedVersion
             | ConfigError::StoragePolicyUnavailable => ConfigServiceError::Invalid,
@@ -370,7 +373,7 @@ impl LocalConfigService {
 
 #[derive(Debug)]
 pub struct ConfigMutationGuard {
-    _mutation: MutationGuard,
+    mutation: MutationGuard,
     config_path: PathBuf,
 }
 
@@ -401,6 +404,7 @@ impl std::fmt::Debug for ConfigAccountingEvidence<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigAccountingEvidenceError {
     Io(io::ErrorKind),
+    Coherence(crate::storage_coherence::StorageCoherenceError),
     WrongMutationRoot,
     InvalidConfig,
     RevisionChanged,
@@ -416,6 +420,7 @@ impl std::fmt::Display for ConfigAccountingEvidenceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Io(_) => "config accounting evidence I/O failure",
+            Self::Coherence(_) => "config accounting evidence coordination failed",
             Self::WrongMutationRoot => "config accounting evidence mutation root mismatch",
             Self::InvalidConfig => "config accounting evidence validation failed",
             Self::RevisionChanged => "config accounting evidence revision changed",
@@ -533,6 +538,7 @@ fn map_accounting_guard_error(error: SingletonError) -> ConfigAccountingEvidence
 fn map_accounting_error(error: ConfigError) -> ConfigAccountingEvidenceError {
     match error {
         ConfigError::Io(error) => error.into(),
+        ConfigError::StorageCoherence(error) => ConfigAccountingEvidenceError::Coherence(error),
         ConfigError::InsecurePermissions => ConfigAccountingEvidenceError::InsecurePermissions,
         ConfigError::InvalidPath => ConfigAccountingEvidenceError::InvalidType,
         ConfigError::Symlink => ConfigAccountingEvidenceError::Symlink,
@@ -673,7 +679,7 @@ impl ConfigMutationGuard {
     pub fn acquire(layout: &InstalledLayout) -> Result<Self, SingletonError> {
         let canonical = InstalledLayout::at(&layout.root);
         MutationGuard::try_acquire(&canonical.runtime).map(|mutation| Self {
-            _mutation: mutation,
+            mutation,
             config_path: canonical.config,
         })
     }
@@ -711,6 +717,7 @@ pub enum ConfigError {
     Policy(PolicyError),
     UnsupportedVersion,
     StoragePolicyUnavailable,
+    StorageCoherence(crate::storage_coherence::StorageCoherenceError),
     InsecurePermissions,
     InvalidPath,
     Symlink,
@@ -730,6 +737,7 @@ impl std::fmt::Display for ConfigError {
             Self::StoragePolicyUnavailable => formatter.write_str(
                 "separated storage policy is not available in this development checkpoint",
             ),
+            Self::StorageCoherence(error) => error.fmt(formatter),
             Self::InsecurePermissions => formatter.write_str("local runtime path is not private"),
             Self::InvalidPath => formatter.write_str("local runtime path has the wrong file type"),
             Self::Symlink => formatter.write_str("local runtime paths must not be symlinks"),
@@ -747,6 +755,7 @@ impl std::error::Error for ConfigError {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Policy(error) => Some(error),
+            Self::StorageCoherence(error) => Some(error),
             _ => None,
         }
     }
@@ -814,7 +823,7 @@ fn load_open_file(file: &mut File) -> Result<LocalRuntimeConfigV3, ConfigError> 
 }
 
 pub fn save(guard: &ConfigMutationGuard, config: &LocalRuntimeConfigV3) -> Result<(), ConfigError> {
-    save_with_hook(&guard.config_path, config, None, |_| Ok(()))
+    save_guarded(guard, config, None)
 }
 
 pub fn save_if_revision(
@@ -822,9 +831,27 @@ pub fn save_if_revision(
     expected_revision: &str,
     config: &LocalRuntimeConfigV3,
 ) -> Result<(), ConfigError> {
-    save_with_hook(&guard.config_path, config, Some(expected_revision), |_| {
-        Ok(())
-    })
+    save_guarded(guard, config, Some(expected_revision))
+}
+
+fn save_guarded(
+    guard: &ConfigMutationGuard,
+    config: &LocalRuntimeConfigV3,
+    expected_revision: Option<&str>,
+) -> Result<(), ConfigError> {
+    let root = guard.config_path.parent().ok_or(ConfigError::InvalidPath)?;
+    let barrier = crate::storage_coherence::StorageBarrier::open_if_initialized(root)
+        .map_err(ConfigError::StorageCoherence)?;
+    let freeze = barrier
+        .as_ref()
+        .map(|barrier| barrier.try_freeze(&guard.mutation))
+        .transpose()
+        .map_err(ConfigError::StorageCoherence)?;
+    let result = save_with_hook(&guard.config_path, config, expected_revision, |_| Ok(()));
+    if let Some(freeze) = freeze.as_ref() {
+        freeze.revalidate().map_err(ConfigError::StorageCoherence)?;
+    }
+    result
 }
 
 pub fn revision(config: &LocalRuntimeConfigV3) -> Result<String, ConfigError> {
@@ -1480,6 +1507,51 @@ mod tests {
                 .contains(".update.")
         }));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_accounting_barrier_blocks_config_save_without_modification() {
+        use crate::storage_coherence::{StorageBarrier, StorageCoherenceError};
+        let root = root("config-accounting-coordination");
+        assert!(!root.exists());
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.retention.max_record_age_days = 90;
+        let barrier = StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        let writer = barrier.try_begin_write().unwrap();
+        assert!(matches!(
+            save(&guard, &config),
+            Err(ConfigError::StorageCoherence(StorageCoherenceError::Busy))
+        ));
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+        drop(writer);
+        save_if_revision(
+            &guard,
+            &revision(&load(&layout.config).unwrap()).unwrap(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(load(&layout.config).unwrap(), config);
+        drop(guard);
+        let writer = barrier.try_begin_write().unwrap();
+        assert_eq!(
+            LocalConfigService::new(&layout).save(&revision(&config).unwrap(), &config),
+            Err(ConfigServiceError::Busy)
+        );
+        drop(writer);
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        fs::write(layout.runtime.join("storage-accounting.lock"), b"invalid").unwrap();
+        assert!(matches!(
+            save(&guard, &config),
+            Err(ConfigError::StorageCoherence(_))
+        ));
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

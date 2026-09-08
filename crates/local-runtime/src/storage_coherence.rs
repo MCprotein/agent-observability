@@ -167,6 +167,25 @@ impl StorageBarrier {
         Ok(barrier)
     }
 
+    /// Compatibility discovery for writers before the coordinated policy is enabled.
+    /// Only an absent lock in an intact private layout returns `None`. An existing but
+    /// invalid or disappearing lock is an error, never permission to bypass coordination.
+    /// Separated-mode admission must use `open_existing`, not this optional discovery.
+    pub fn open_if_initialized(root: &Path) -> Result<Option<Self>, StorageCoherenceError> {
+        let root_directory = open_private(root, true, false)?;
+        let runtime_directory = open_private(&root.join("runtime"), true, false)?;
+        match fs::symlink_metadata(root.join("runtime").join(LOCK_NAME)) {
+            Ok(_) => Self::open_existing(root).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                validate_named(&root_directory, root, true)?;
+                validate_named(&runtime_directory, &root.join("runtime"), true)?;
+                same_device(&root_directory, &runtime_directory)?;
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn revalidate(&self) -> Result<(), StorageCoherenceError> {
         validate_named(&self.root_directory, &self.root, true)?;
         validate_named(&self.runtime_directory, &self.root.join("runtime"), true)?;
@@ -503,12 +522,25 @@ mod tests {
     fn existing_open_never_creates_and_initialization_preserves_identity() {
         let (root, mutation) = fixture();
         assert!(StorageBarrier::open_existing(&root).is_err());
+        assert!(
+            StorageBarrier::open_if_initialized(&root)
+                .unwrap()
+                .is_none()
+        );
         assert!(!root.join("runtime/storage-accounting.lock").exists());
         let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        assert!(
+            StorageBarrier::open_if_initialized(&root)
+                .unwrap()
+                .is_some()
+        );
         let second = StorageBarrier::initialize(&root, &mutation).unwrap();
         barrier.revalidate().unwrap();
         second.revalidate().unwrap();
         assert!(!format!("{barrier:?}").contains(root.to_str().unwrap()));
+        std::fs::remove_file(root.join("runtime/storage-accounting.lock")).unwrap();
+        std::os::unix::fs::symlink("absent", root.join("runtime/storage-accounting.lock")).unwrap();
+        assert!(StorageBarrier::open_if_initialized(&root).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
