@@ -1,6 +1,6 @@
 # 저장 예산 P0 결정안
 
-상태: **독립 검토 APPROVE — config P1 착수 가능, 제품 구현 전.** [전체 계획](STORAGE_BUDGET_POLICY.md)의 P0를
+상태: **독립 설계 검토 APPROVE — config P1 검증 완료, 실제 정책 활성화 전.** [전체 계획](STORAGE_BUDGET_POLICY.md)의 P0를
 구체화한다. 아래 숫자는 제품의 초기 운영 선택이지 물리 쓰기량의 검증된 상한이 아니다.
 
 ## 기본값과 호환성
@@ -33,8 +33,8 @@
   downgrade와 다르며 자동 v4 역변환이나 저장 schema downgrade를 제공하지 않는다.
 - 저장할 때 부족한 공간을 이유로 값을 몰래 올리지 않는다. 적용 후 유예될 수 있음을 표시한다.
 
-현재 strict 계약 근거: `crates/local-runtime/src/config.rs:29`,
-`contracts/local-runtime-config-v4.schema.json:7`; 기존 범위는 `storage.rs:23`.
+P1 strict 계약 근거: `crates/local-runtime/src/config.rs:33`,
+`contracts/local-runtime-config-v5.schema.json:7`; 기존 범위는 `storage.rs:23`.
 
 ## 파일 분류와 공간 계산
 
@@ -66,7 +66,7 @@ D는 현재 filesystem free bytes다. 최초 구현은 staging이 커졌다는 �
 cleanup/recovery/report는 A>=T만으로 차단하지 않지만 1–3과 각 기존 권한·보존 조건을 따른다.
 자기 예약의 finalization에서는 검증된 그 예약만 R에서 제외하고 기존 ceiling과 최신 설정을
 함께 적용한다. 축소 설정을 이유로 기존 예약을 다른 작업에 빌려주지 않는다.
-현재 소유자 검사 근거: `crates/local-runtime/src/control.rs:171`.
+현재 소유자 검사 근거: `crates/local-runtime/src/control.rs:174`.
 
 ## 작업별 allowance와 책임
 
@@ -74,7 +74,7 @@ cleanup/recovery/report는 A>=T만으로 차단하지 않지만 1–3과 각 기
 
 | 작업 | 첫 구현의 E | 소유 책임·근거 |
 | --- | --- | --- |
-| 자동 ingest 및 수동 canonical import | 기존 `allocated(state/store) + max_batch_bytes`를 하한으로 유지; 해당 경로의 기존 allowance가 더 크면 큰 값 사용 | runtime의 파일 총량 계산, local-store의 SQLite 검증; `control.rs:54`, collector `lib.rs:2157` |
+| 자동 ingest 및 수동 canonical import | 기존 `allocated(state/store) + max_batch_bytes`를 하한으로 유지; 해당 경로의 기존 allowance가 더 크면 큰 값 사용 | runtime의 파일 총량 계산, local-store의 SQLite 검증; `control.rs:57`, collector `lib.rs:2157` |
 | 보고서 | 가용 작업 공간에서 publication/metadata allowance를 먼저 제외한 기존 bounded build ceiling + publication + metadata | collector 조합, local-store builder; collector `lib.rs:3746`, `:3913` |
 | DB lifecycle | 기존 `page_count * page_size + max_archive_bytes + 2 MiB` | local-store `lifecycle.rs:249`; collector `lib.rs:2402`에서 별도 admission |
 | store migration | 현재 schema별 `migration_required_workspace`와 preflight를 그대로 사용 | local-store `lib.rs:3668`; 미지원 schema는 거부 |

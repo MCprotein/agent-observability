@@ -4,11 +4,11 @@ import standaloneCodeModule from "ajv/dist/standalone/index.js";
 import { build } from "esbuild";
 import { compileFromFile } from "json-schema-to-typescript";
 
-const configSchemaPath = "contracts/local-runtime-config-v4.schema.json";
+const configSchemaPath = "contracts/local-runtime-config-v5.schema.json";
 const integrationStatusSchemaPath = "contracts/codex-integration-status-v1.schema.json";
 const generatedUiPath = "ui/settings/generated";
 const generatedRustPath = "crates/local-ui/src/generated";
-const configBanner = "Generated from contracts/local-runtime-config-v4.schema.json. Do not edit.";
+const configBanner = "Generated from contracts/local-runtime-config-v5.schema.json. Do not edit.";
 const integrationStatusBanner = "Generated from contracts/codex-integration-status-v1.schema.json. Do not edit.";
 const Ajv2020 = Ajv2020Module as unknown as typeof import("ajv/dist/2020.js").default;
 const standaloneCode = standaloneCodeModule as unknown as typeof import("ajv/dist/standalone/index.js").default;
@@ -27,7 +27,7 @@ const integrationStatusDeclarations = await compileFromFile(integrationStatusSch
   style: { singleQuote: false },
 });
 await Promise.all([
-  writeFile(`${generatedUiPath}/local-runtime-config-v4.d.ts`, configDeclarations, "utf8"),
+  writeFile(`${generatedUiPath}/local-runtime-config-v5.d.ts`, configDeclarations, "utf8"),
   writeFile(
     `${generatedUiPath}/codex-integration-status-v1.d.ts`,
     integrationStatusDeclarations,
@@ -46,12 +46,12 @@ const validateConfig = await compileBrowserValidator(configSchemaPath);
 const validateIntegrationStatus = await compileBrowserValidator(integrationStatusSchemaPath);
 await Promise.all([
   writeFile(
-    `${generatedUiPath}/validate-local-runtime-config-v4.js`,
+    `${generatedUiPath}/validate-local-runtime-config-v5.js`,
     standaloneCode(ajv, validateConfig),
     "utf8",
   ),
   writeFile(
-    `${generatedUiPath}/validate-local-runtime-config-v4.d.ts`,
+    `${generatedUiPath}/validate-local-runtime-config-v5.d.ts`,
     "declare const validate: ((value: unknown) => boolean) & { errors?: Array<{ instancePath?: string; message?: string }> | null };\nexport default validate;\n",
     "utf8",
   ),

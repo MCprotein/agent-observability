@@ -99,7 +99,7 @@ gate를 통과해 추가한다.
 
 ### v1.11.0 — Local storage lifecycle and paged dashboard (In Progress)
 
-**계획 추가 — 2026-09-08: 저장 예산 분리 (Planning, 구현 전).**
+**개발 추가 — 2026-09-08: 저장 예산 분리 (P1 설정 계약 검증 완료, 실제 정책 비활성).**
 사용자가 보관 목표·작업용 공간·기기 디스크 비상 여유를 구분하는 정책 방향을 승인했다.
 상세 계획과 검증 표는 [Storage Budget Policy](docs/STORAGE_BUDGET_POLICY.md)에 있다.
 기존 설치의 `storage-bytes` 의미와 삭제 설정은 보존하고, 새 정책은 명시적으로 선택한다.
@@ -108,7 +108,8 @@ gate를 통과해 추가한다.
 | 순서 | 계획 작업 | 통과 기준 |
 | --- | --- | --- |
 | P0 | [구체적 결정안](docs/STORAGE_BUDGET_P0.md): 기본값·범위·파일 분류·작업량 산정·호환성 | config P1 착수에 한해 독립 APPROVE; 파일 분류·report 연결은 P2/P3 별도 검증 |
-| P1–P2 | versioned config와 예산/상태 계산 | legacy 보존, Rust/TS parity, 경계값·예약 동시성 테스트 |
+| P1 | v5 config와 기존 설정 보존 검증 완료; 분리 모드 활성화 차단 | legacy 보존, Rust/TS parity, 경계값·revision 테스트 통과; 독립 코드 APPROVE / 아키텍처 CLEAR |
+| P2 | 예산/상태 계산 연결 전 | 분류·예약 동시성·공간 산정 검증 후 별도 승인 |
 | P3–P4 | 수집·보고서·정리 연결, CLI/웹 설정 | transaction 유지, 명시적 전환, 실제 적용 revision·중단 이유 표시 |
 | P5 | 장애·실제 규모·성능·문서 검증 | 새 수집→보고서 3세대, crash/replay, Chrome QA, exact-head CI와 독립 리뷰 |
 

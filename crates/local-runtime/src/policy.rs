@@ -1,5 +1,46 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageBudgetMode {
+    Legacy,
+    Separated,
+}
+
+/// Versioned configuration only; operational admission is owned by runtime control.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StorageBudgetPolicyV1 {
+    pub mode: StorageBudgetMode,
+    pub retained_target_bytes: u64,
+    pub workspace_budget_bytes: u64,
+    pub minimum_free_bytes: u64,
+}
+
+impl Default for StorageBudgetPolicyV1 {
+    fn default() -> Self {
+        Self {
+            mode: StorageBudgetMode::Legacy,
+            retained_target_bytes: default_budget(),
+            workspace_budget_bytes: default_budget(),
+            minimum_free_bytes: default_budget(),
+        }
+    }
+}
+
+impl StorageBudgetPolicyV1 {
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        for (field, value) in [
+            ("retained_target_bytes", self.retained_target_bytes),
+            ("workspace_budget_bytes", self.workspace_budget_bytes),
+            ("minimum_free_bytes", self.minimum_free_bytes),
+        ] {
+            validate_bounds(field, value, 268_435_456, 21_474_836_480)?;
+        }
+        Ok(())
+    }
+}
+
 const fn default_file() -> u32 {
     5_000
 }

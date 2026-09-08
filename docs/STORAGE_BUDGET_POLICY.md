@@ -1,6 +1,6 @@
 # 저장 예산 분리 계획
 
-상태: **v1.11.0 계획 — 방향 승인, 제품 구현·설치 적용 전.**
+상태: **v1.11.0 개발 — P1 설정 계약 검증 완료, 새 admission·설치 적용 전.**
 
 2026-09-08 사용자 결정: 보관 예산, 작업용 공간, 기기 디스크 비상 여유를 분리한다.
 `unsafe`/FFI 예외는 허용하지 않는다. 이 문서는 새 정책의 설계 기준이며, 현재 동작을
@@ -22,11 +22,11 @@
 | 확인한 사실 | 코드·문서 근거 |
 | --- | --- |
 | 기존 예산은 여러 파티션과 안전 여유를 포함한다 | `crates/local-runtime/src/storage.rs:13`, `:23`, `:155` |
-| 수집 예약은 전체 store 할당량 + 최대 batch의 수치상 사전 검사다 | `crates/local-runtime/src/control.rs:54` |
+| 수집 예약은 전체 store 할당량 + 최대 batch의 수치상 사전 검사다 | `crates/local-runtime/src/control.rs:57` |
 | 수집은 외부 mutation guard 아래에서 검사부터 commit까지 진행한다 | `crates/local-collector/src/lib.rs:2157`, `:2205` |
-| report에는 별도의 활성·중단된 durable 예약이 있다 | `crates/local-runtime/src/control.rs:139`, `:171` |
+| report에는 별도의 활성·중단된 durable 예약이 있다 | `crates/local-runtime/src/control.rs:142`, `:174` |
 | observation/disposition/correlation은 하나의 transaction으로 반영된다 | `crates/local-store/src/lib.rs:914`; cursor 갱신은 `crates/local-collector/src/lib.rs:2302` |
-| config v4는 strict versioned schema이며 웹 UI는 해당 값을 표시한다 | `contracts/local-runtime-config-v4.schema.json:7`, `crates/local-runtime/src/config.rs:29`, `ui/settings/main.ts:129` |
+| P1 config v5는 strict schema이며 v1–v4 값을 보존한다; UI도 v5를 검증한다 | `contracts/local-runtime-config-v5.schema.json:7`, `crates/local-runtime/src/config.rs:33`, `ui/settings/config-validation.ts:1` |
 | 원래 페이지 크기의 복사본에서도 authority-only proxy가 부족했다 | [Staged Ingest](STAGED_INGEST.md#original-page-size-admission-check--september-8) |
 
 마지막 측정은 현재 hard-budget 정책의 실패 근거이지 새 정책의 성공 근거가 아니다.
@@ -34,7 +34,8 @@
 
 ## 정책 모델
 
-아래 이름은 설계 용어이며 아직 사용할 수 있는 config key나 CLI 옵션이 아니다.
+아래는 정책 용어다. P1은 대응하는 v5 config 필드를 제공하지만 분리 모드 실행이나
+CLI/웹 활성화 옵션은 제공하지 않는다.
 기본값·분류·산정식·전환의 구체적인 결정안은 [P0 결정안](STORAGE_BUDGET_P0.md)에 있다.
 결정안은 독립 검토에서 config P1 착수에 한해 승인됐다. P2/P3 파일 분류·report 연결과
 실제 규모 수용성은 별도 검증 대상이다.
@@ -88,13 +89,14 @@ W는 파일을 미리 할당하는 기능도, SQLite의 매번 쓰기를 W에서
 | 단계 | 변경 위치 | 완료 조건 |
 | --- | --- | --- |
 | P0 정책·수치 확정 | 이 문서, `docs/CONFIGURATION.md`, config fixtures | 기본값/범위, 파일 분류표, 작업별 산정식, 보수 추정의 한계, 모드 전환과 초과 시 상태를 독립 검토. 미확정 결정이 남으면 P1 금지 |
-| P1 계약·마이그레이션 | `crates/local-runtime/src/config.rs:29`, `contracts/local-runtime-config-v4.schema.json:7`의 후속 schema, `ui/settings/generated/` | v1–v4 보존, strict unknown/bounds 검사, Rust/TS parity, 명시적 전환 fixture |
-| P2 예산 계산·상태 | `crates/local-runtime/src/storage.rs:13`, `control.rs:54`, `:139` | legacy 결과 불변; 분리 모드의 T/W/F, active/stale 예약, overrun/저장 부족 상태를 결정적 테스트로 검증 |
+| P1 계약·마이그레이션 | `crates/local-runtime/src/config.rs:33`, `contracts/local-runtime-config-v5.schema.json:7`, `ui/settings/generated/` | v1–v4 보존, strict unknown/bounds 검사, Rust/TS parity, 명시적 전환 fixture |
+| P2 예산 계산·상태 | `crates/local-runtime/src/storage.rs:13`, `control.rs:57`, `:142` | legacy 결과 불변; 분리 모드의 T/W/F, active/stale 예약, overrun/저장 부족 상태를 결정적 테스트로 검증 |
 | P3 작업 연결 | `crates/local-collector/src/lib.rs:2157`, `:2205`, `:2302`; `crates/local-store/src/lib.rs:914` | 단일 guard·transaction 유지; 수집/보고서/정리/수동 import/migration 각각 accounting 검증; journal/동기화 설정과 unsafe 금지 유지 |
 | P4 CLI·웹 설정 | `crates/cli/`, `crates/local-ui/`, `ui/settings/main.ts:129`, `DESIGN.md:210` | 목표/사용량/작업 예상/예약/기기 여유/중단 이유 구분, 동시 수정 충돌, 재시작 후 보존, 실제 설정 revision 일치 |
 | P5 수용성·문서 | `crates/local-collector/src/rotation_diagnostic.rs:277`, `:570`, `xtask/`, docs | 아래 검증 표 통과, 독립 리뷰, 정확한 revision 성능·플랫폼 CI, Chrome QA 후에만 release 판단 |
 
-P1과 P2의 contract가 확정된 후에만 UI/테스트를 disjoint ownership으로 병렬화한다.
+P1의 schema/검증기 parity는 확정된 P0 필드 계약으로 병렬 검증한다. 새 정책을 조작하는
+UI/작업 연결은 P1과 P2의 contract가 확정된 후에만 disjoint ownership으로 병렬화한다.
 P0는 현재 버그가 자동으로 해결됐다는 선언이 아니다. 실제 규모에서 적절한 T/W/F 조합으로
 수집·보고서·정리가 반복되지 못하면 그 원인을 수정하고, 예약 숫자만 낮춰 성공 처리하지 않는다.
 
@@ -133,7 +135,8 @@ P0는 현재 버그가 자동으로 해결됐다는 선언이 아니다. 실제 
 [Roadmap](../ROADMAP.md#v1110--local-storage-lifecycle-and-paged-dashboard-in-progress)의
 v1.11.0 하위 계획으로 추적한다. 새 버전 train이나 major line을 임의로 열지 않는다.
 구현 시 `CONFIGURATION`, `LOCAL_RUNTIME`, `ARCHITECTURE`, `STORAGE_LIFECYCLE`, `DESIGN`,
-README와 review checkpoint를 같은 실제 상태로 갱신한다. 현재는 계획 안내만 추가한다.
+README와 review checkpoint를 같은 실제 상태로 갱신한다. 현재 안정판 안내는 그대로 두고
+개발 문서에서 P1 설정 계약과 아직 비활성인 admission 정책을 구분한다.
 
 [Staged Ingest](STAGED_INGEST.md)와 [Isolated Ingest](ISOLATED_INGEST.md)의 과거 strict-quota
 연구는 근거로 보존한다. 새 정책은 그 VFS 실험을 재개하지 않으며 기존 모드를 자동 완화하지 않는다.

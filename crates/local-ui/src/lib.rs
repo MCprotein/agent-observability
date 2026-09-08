@@ -2093,6 +2093,7 @@ mod tests {
                 let mut config: LocalRuntimeConfigV3 =
                     serde_json::from_value(envelope["config"].clone()).unwrap();
                 config.enabled = false;
+                config.storage_budget.workspace_budget_bytes = 805_306_368;
                 let update = serde_json::json!({
                     "config": config,
                     "revision": stale_revision,
@@ -2112,7 +2113,19 @@ mod tests {
                 let bytes = to_bytes(saved.into_body(), 64 * 1024).await.unwrap();
                 let saved_envelope: Value = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(saved_envelope["config"]["enabled"], false);
+                assert_eq!(saved_envelope["config"]["schema_version"], "local_runtime.v5");
+                assert_eq!(saved_envelope["config"]["storage_budget"]["workspace_budget_bytes"], 805_306_368_u64);
                 assert_ne!(saved_envelope["revision"], stale_revision);
+
+                let original_bytes = fs::read(&layout.config).unwrap();
+                let mut separated = saved_envelope["config"].clone();
+                separated["storage_budget"]["mode"] = "separated".into();
+                let denied = app.clone().oneshot(api_request(
+                    "PUT", "/api/config", "127.0.0.1:43191", Some("http://127.0.0.1:43191"),
+                    Some(serde_json::json!({"config": separated, "revision": saved_envelope["revision"]}).to_string()),
+                )).await.unwrap();
+                assert_eq!(denied.status(), StatusCode::UNPROCESSABLE_ENTITY);
+                assert_eq!(fs::read(&layout.config).unwrap(), original_bytes);
 
                 let conflict_response = app
                     .clone()

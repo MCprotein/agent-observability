@@ -64,8 +64,9 @@ runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui�
 ## Deployment profiles
 
 2026-09-08 후속 설계 방향은 [Storage Budget Policy](STORAGE_BUDGET_POLICY.md)다.
-보관 목표·작업 예산·디스크 최소 여유를 구분하고 legacy 설정을 보존하는 계획이며 아직
-제품 동작이 아니다. 아래 Isolated Ingest는 과거 후보로 보존하며 현재 구현 우선안이 아니다.
+보관 목표·작업 예산·디스크 최소 여유를 구분한다. P1은 legacy를 기본으로 보존하는 v5 설정
+계약만 추가하며, 분리 모드의 실제 실행은 P2/P3까지 거부한다. 아직 새 admission 동작이
+아니다. 아래 Isolated Ingest는 과거 후보로 보존하며 현재 구현 우선안이 아니다.
 unsafe/FFI 정책 예외나 자체 VFS를 도입하지 않는다.
 
 v1.11 추가 개발 설계인 [Isolated Ingest](ISOLATED_INGEST.md)는 같은 Rust executable의
@@ -305,8 +306,10 @@ anti-corruption layer다.
 ### Local Runtime
 
 - 게시된 v1.10 standalone 설정은 `local_runtime.v3` strict JSON이다. v1.11 개발 브랜치는
-  `local_runtime.v4`에 opt-in storage lifecycle을 추가한다. v1/v2/v3 migration은 기존 값을 보존하고
-  자동 정리를 끈다. v1/v2의 private Codex detail capture도 기존처럼 기본 off다. 팀 identity, 이메일, endpoint와 transport
+  `local_runtime.v5`에 opt-in storage lifecycle과 필수 `storage_budget` 계약을 포함한다.
+  v1–v4 migration은 기존 값을 보존하고 legacy 예산 모드를 선택한다. v1–v3에는 자동 정리를
+  끈 초기값을 추가하고 v4의 기존 lifecycle 선택은 보존한다. 분리 모드 실행은 P2/P3 전까지
+  차단한다. v1/v2의 private Codex detail capture도 기존처럼 기본 off다. 팀 identity, 이메일, endpoint와 transport
   설정은 포함하지 않는다.
 - Codex automatic integration은 별도 private `runtime/collector.json`,
   `runtime/integrations/codex/tls` credential tree와

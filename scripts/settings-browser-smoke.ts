@@ -394,6 +394,42 @@ try {
   assert.equal(await independentDashboardPage.locator("h1").textContent(), "Agent Observability");
   await dashboardLauncherPage.close();
 
+  const preservedStorageBudget = {
+    mode: "legacy",
+    retained_target_bytes: 2_147_483_648,
+    workspace_budget_bytes: 805_306_368,
+    minimum_free_bytes: 1_610_612_736,
+  };
+  const budgetSeedPage = await qaContext.newPage();
+  await mockCodexApi(budgetSeedPage);
+  await budgetSeedPage.goto(url, { waitUntil: "networkidle" });
+  await budgetSeedPage.locator("#settings-form").waitFor();
+  await budgetSeedPage.evaluate(async (storageBudget) => {
+    const token = sessionStorage.getItem("agent-observability.settings.session.v1");
+    if (!token) throw new Error("settings session token is unavailable");
+    const headers = { "x-agent-observability-session": token, "content-type": "application/json" };
+    const response = await fetch("/api/config", { headers });
+    if (!response.ok) throw new Error(`config seed read failed (${response.status})`);
+    const body = await response.json();
+    body.config.storage_budget = storageBudget;
+    body.config.collection.max_batch_records = 124;
+    const saved = await fetch("/api/config", {
+      method: "PUT", headers, body: JSON.stringify({ config: body.config, revision: body.revision }),
+    });
+    if (!saved.ok) throw new Error(`config seed save failed (${saved.status})`);
+  }, preservedStorageBudget);
+  await budgetSeedPage.reload({ waitUntil: "networkidle" });
+  await budgetSeedPage.locator("#settings-form").waitFor();
+  await budgetSeedPage.locator("#reset").click();
+  await budgetSeedPage.locator("#confirm-reset").click();
+  await budgetSeedPage.locator("#save").click();
+  await budgetSeedPage.waitForFunction(() => (document.querySelector("#save") as HTMLButtonElement).disabled
+    && document.querySelector("#save-title")?.textContent === "저장됨");
+  const resetConfig = JSON.parse(await readFile(join(runtimeRoot, "config.json"), "utf8"));
+  assert.equal(resetConfig.collection.max_batch_records, 100);
+  assert.deepEqual(resetConfig.storage_budget, preservedStorageBudget);
+  await budgetSeedPage.close();
+
   for (const testCase of [
     { name: "desktop", viewport: { width: 1440, height: 900 } },
     { name: "mobile", viewport: { width: 390, height: 844 } },
@@ -473,6 +509,8 @@ try {
       await page.waitForFunction(() => document.activeElement?.id === "save-title");
       const configPath = join(runtimeRoot, "config.json");
       const config = JSON.parse(await readFile(configPath, "utf8"));
+      assert.equal(config.schema_version, "local_runtime.v5");
+      assert.deepEqual(config.storage_budget, preservedStorageBudget);
       assert.equal(config.collection.max_batch_records, 125);
       assert.equal(config.capture_private_codex_turn_details, true);
       assert.equal(config.lifecycle.enabled, false);
@@ -490,6 +528,7 @@ try {
       await page.waitForFunction(() => (document.querySelector("#save") as HTMLButtonElement).disabled
         && document.querySelector("#save-title")?.textContent === "저장됨");
       const lifecycleConfig = JSON.parse(await readFile(configPath, "utf8"));
+      assert.deepEqual(lifecycleConfig.storage_budget, preservedStorageBudget);
       assert.equal(lifecycleConfig.lifecycle.enabled, true);
       assert.equal(lifecycleConfig.lifecycle.hot_days, 10);
       assert.equal(lifecycleConfig.lifecycle.private_raw_days, 3);

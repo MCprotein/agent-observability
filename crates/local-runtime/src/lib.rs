@@ -18,7 +18,10 @@ pub mod storage;
 pub use control::{ControlError, RuntimeControl};
 pub use ingress::{Ingress, IngressCounters, IngressMessage, IngressOutcome};
 pub use lock::{MutationGuard, Singleton, SingletonError};
-pub use policy::{CollectionPolicyV1, RetentionPolicyV1, StorageLifecyclePolicyV1};
+pub use policy::{
+    CollectionPolicyV1, RetentionPolicyV1, StorageBudgetMode, StorageBudgetPolicyV1,
+    StorageLifecyclePolicyV1,
+};
 pub use reservation::{REPORT_RESERVATION_METADATA_ALLOWANCE, ReservationError, WriteReservation};
 pub use scheduler::{PressureSample, Schedule, Scheduler, State};
 pub use storage::{Admission, Partition, StorageAccountingError, StorageBudget, StorageError};
@@ -32,5 +35,6 @@ pub const NORMALIZATION_WORKERS: usize = 1;
 pub use config::{
     ConfigError, ConfigMutationGuard, ConfigServiceError, InstalledLayout,
     LOCAL_RUNTIME_CONFIG_VERSION, LocalConfigService, LocalRuntimeConfigV3, LocalRuntimeConfigV4,
-    VersionedLocalConfig, inspect, install, load, revision, save, save_if_revision,
+    LocalRuntimeConfigV5, VersionedLocalConfig, inspect, install, load, revision, save,
+    save_if_revision,
 };

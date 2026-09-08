@@ -25,7 +25,7 @@ import type {
   CodexIntegrationStatusV1,
   CollectorDegradationReasonV1,
 } from "./generated/codex-integration-status-v1.js";
-import type { LocalRuntimeConfigV4 } from "./generated/local-runtime-config-v4.js";
+import type { LocalRuntimeConfigV5 } from "./generated/local-runtime-config-v5.js";
 
 type FieldPath =
   | "collection.file_reconcile_interval_ms"
@@ -46,8 +46,8 @@ type FieldPath =
   | "lifecycle.max_traces_per_pass";
 
 type Envelope = {
-  config: LocalRuntimeConfigV4;
-  defaults: LocalRuntimeConfigV4;
+  config: LocalRuntimeConfigV5;
+  defaults: LocalRuntimeConfigV5;
   revision: string;
   collection_mode: "automatic_codex" | "manual_import";
 };
@@ -238,9 +238,9 @@ const fragmentToken = new URLSearchParams(location.hash.slice(1)).get("session")
 let token = fragmentToken || readSessionToken();
 if (fragmentToken) writeSessionToken(fragmentToken);
 history.replaceState(null, "", `${location.pathname}${location.search}`);
-let persisted: LocalRuntimeConfigV4 | null = null;
-let draft: LocalRuntimeConfigV4 | null = null;
-let defaults: LocalRuntimeConfigV4 | null = null;
+let persisted: LocalRuntimeConfigV5 | null = null;
+let draft: LocalRuntimeConfigV5 | null = null;
+let defaults: LocalRuntimeConfigV5 | null = null;
 let revision = "";
 let integration: CodexIntegrationStatusV1 | null = null;
 let integrationUnavailable = false;
@@ -411,7 +411,7 @@ function renderSettings(focusTarget?: string): void {
   }
 }
 
-function overviewSection(config: LocalRuntimeConfigV4): string {
+function overviewSection(config: LocalRuntimeConfigV5): string {
   const storage = fields["collection.local_storage_budget_bytes"].format(
     config.collection.local_storage_budget_bytes,
   );
@@ -519,7 +519,7 @@ function collectorNavigationStatus(): string {
   return "collector 중지됨";
 }
 
-function collectionSection(config: LocalRuntimeConfigV4): string {
+function collectionSection(config: LocalRuntimeConfigV5): string {
   return `<section class="settings-section" id="collection" aria-labelledby="collection-title">
     ${sectionTitle("collection", "activity", "수집", "파일 확인과 durable 기록 반영 간격")}
     <div class="section-grid">
@@ -549,7 +549,7 @@ function collectionSection(config: LocalRuntimeConfigV4): string {
   </section>`;
 }
 
-function storageSection(config: LocalRuntimeConfigV4): string {
+function storageSection(config: LocalRuntimeConfigV5): string {
   return `<section class="settings-section" id="storage" aria-labelledby="storage-title">
     ${sectionTitle("storage", "database", "저장소", "로컬 데이터가 넘지 못하는 디스크 예산")}
     <div class="section-grid">
@@ -559,7 +559,7 @@ function storageSection(config: LocalRuntimeConfigV4): string {
   </section>`;
 }
 
-function privacySection(config: LocalRuntimeConfigV4): string {
+function privacySection(config: LocalRuntimeConfigV5): string {
   const enabled = config.capture_private_codex_turn_details ?? false;
   return `<section class="settings-section" id="privacy" aria-labelledby="privacy-title">
     <div class="section-title"><span class="section-icon"><i data-lucide="shield-check"></i></span><div><h2 id="privacy-title">개인정보</h2><p>Codex 작업 경로와 대화 내용을 별도 로컬 상세 저장소에 보관할지 선택합니다.</p></div></div>
@@ -572,7 +572,7 @@ function privacySection(config: LocalRuntimeConfigV4): string {
   </section>`;
 }
 
-function lifecycleSection(config: LocalRuntimeConfigV4): string {
+function lifecycleSection(config: LocalRuntimeConfigV5): string {
   const enabled = config.lifecycle.enabled;
   return `<section class="settings-section" id="lifecycle" aria-labelledby="lifecycle-title">
     <div class="section-title"><span class="section-icon"><i data-lucide="heart-pulse"></i></span><div><h2 id="lifecycle-title">데이터 보관 정책</h2><p>최신 trace 관측 시점부터 누적된 경과 기간으로 Hot(최근) → Warm(이력 축소) → Cold(장기 보관) → Delete(삭제)를 적용합니다.</p></div></div>
@@ -589,7 +589,7 @@ function lifecycleSection(config: LocalRuntimeConfigV4): string {
   </section>`;
 }
 
-function lifecycleTimeline(config: LocalRuntimeConfigV4): string {
+function lifecycleTimeline(config: LocalRuntimeConfigV5): string {
   return `<figure class="policy-visual timeline lifecycle-timeline" data-min="1" data-max="3650" data-log="true">
     <figcaption><span>누적 경과 기간</span><strong data-lifecycle-value>Hot(최근) → Warm(이력 축소) → Cold(장기 보관) → Delete(삭제)</strong></figcaption>
     <div class="timeline-track" aria-hidden="true">
@@ -602,7 +602,7 @@ function lifecycleTimeline(config: LocalRuntimeConfigV4): string {
   </figure>`;
 }
 
-function retentionSection(config: LocalRuntimeConfigV4): string {
+function retentionSection(config: LocalRuntimeConfigV5): string {
   return `<section class="settings-section" id="retention" aria-labelledby="retention-title">
     ${sectionTitle("retention", "archive", "수동 정리", "자동 삭제와 별개인 수동 대상 기준 및 작업별 archive 상한")}
     <div class="section-grid">
@@ -625,7 +625,7 @@ function summaryItem(icon: string, label: string, value: string): string {
   return `<div class="summary-item"><i data-lucide="${icon}"></i><span>${label}</span><strong>${value}</strong></div>`;
 }
 
-function fieldControl(field: Field, config: LocalRuntimeConfigV4): string {
+function fieldControl(field: Field, config: LocalRuntimeConfigV5): string {
   const value = getValue(config, field.path);
   const id = field.path.replaceAll(".", "-");
   return `<div class="field" data-field="${field.path}">
@@ -1036,8 +1036,9 @@ function closeResetDialog(): void {
 }
 
 function resetDefaults(): void {
-  if (!defaults) return;
-  draft = structuredClone(defaults);
+  if (!defaults || !draft) return;
+  // P1 does not expose budget-mode controls: reset only the visible settings.
+  draft = { ...structuredClone(defaults), storage_budget: structuredClone(draft.storage_budget) };
   closeResetDialog();
   renderSettings("reset");
   showToast("기본값을 편집값에 적용했습니다. 저장해야 반영됩니다.", "neutral");
@@ -1254,23 +1255,23 @@ function mountIcons(): void {
   });
 }
 
-function getValue(config: LocalRuntimeConfigV4, path: FieldPath): number {
+function getValue(config: LocalRuntimeConfigV5, path: FieldPath): number {
   const [group, key] = path.split(".") as ["collection" | "retention" | "lifecycle", string];
   return Number((config[group] as unknown as Record<string, number>)[key]);
 }
 
-function setValue(config: LocalRuntimeConfigV4, path: FieldPath, value: number): void {
+function setValue(config: LocalRuntimeConfigV5, path: FieldPath, value: number): void {
   const [group, key] = path.split(".") as ["collection" | "retention" | "lifecycle", string];
   (config[group] as unknown as Record<string, number>)[key] = value;
 }
 
-function changedPaths(left: LocalRuntimeConfigV4, right: LocalRuntimeConfigV4): FieldPath[] {
+function changedPaths(left: LocalRuntimeConfigV5, right: LocalRuntimeConfigV5): FieldPath[] {
   return (Object.keys(fields) as FieldPath[]).filter(
     (path) => getValue(left, path) !== getValue(right, path),
   );
 }
 
-function booleanChangeCount(left: LocalRuntimeConfigV4, right: LocalRuntimeConfigV4): number {
+function booleanChangeCount(left: LocalRuntimeConfigV5, right: LocalRuntimeConfigV5): number {
   return Number(left.enabled !== right.enabled)
     + Number(
       (left.capture_private_codex_turn_details ?? false)

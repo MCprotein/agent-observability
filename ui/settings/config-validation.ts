@@ -1,5 +1,5 @@
-import validateSchema from "./generated/validate-local-runtime-config-v4.js";
-import type { LocalRuntimeConfigV4 } from "./generated/local-runtime-config-v4.js";
+import validateSchema from "./generated/validate-local-runtime-config-v5.js";
+import type { LocalRuntimeConfigV5 } from "./generated/local-runtime-config-v5.js";
 
 export type ConfigValidationResult =
   | { valid: true; errors: [] }
@@ -16,7 +16,7 @@ export function validateLocalRuntimeConfig(value: unknown): ConfigValidationResu
     };
   }
 
-  const config = value as LocalRuntimeConfigV4;
+  const config = value as LocalRuntimeConfigV5;
   const { hot_days: hot, warm_days: warm, delete_after_days: expiry } = config.lifecycle;
   if (hot > warm) {
     return {

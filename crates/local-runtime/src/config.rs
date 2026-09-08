@@ -1,6 +1,9 @@
 use crate::{
     lock::{MutationGuard, SingletonError},
-    policy::{CollectionPolicyV1, PolicyError, RetentionPolicyV1, StorageLifecyclePolicyV1},
+    policy::{
+        CollectionPolicyV1, PolicyError, RetentionPolicyV1, StorageBudgetMode,
+        StorageBudgetPolicyV1, StorageLifecyclePolicyV1,
+    },
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,10 +14,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub const LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v4";
+pub const LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v5";
 const LEGACY_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v1";
 const PRIOR_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v2";
 const PREVIOUS_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v3";
+const LIFECYCLE_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v4";
 static UPDATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,22 +30,38 @@ enum SaveStage {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct LocalRuntimeConfigV4 {
+pub struct LocalRuntimeConfigV5 {
     pub schema_version: String,
     pub enabled: bool,
     pub capture_private_codex_turn_details: bool,
     pub collection: CollectionPolicyV1,
     pub retention: RetentionPolicyV1,
     pub lifecycle: StorageLifecyclePolicyV1,
+    pub storage_budget: StorageBudgetPolicyV1,
 }
 
-/// Compatibility alias for callers migrating to [`LocalRuntimeConfigV4`].
-pub type LocalRuntimeConfigV3 = LocalRuntimeConfigV4;
+/// Compatibility alias for source callers; serialized output uses v5.
+pub type LocalRuntimeConfigV3 = LocalRuntimeConfigV5;
+/// Compatibility alias for source callers; serialized output uses v5.
+pub type LocalRuntimeConfigV4 = LocalRuntimeConfigV5;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictLocalRuntimeConfigV5 {
+    schema_version: String,
+    enabled: bool,
+    capture_private_codex_turn_details: bool,
+    collection: StrictCollectionPolicyV1,
+    retention: StrictRetentionPolicyV1,
+    lifecycle: StrictStorageLifecyclePolicyV1,
+    storage_budget: StorageBudgetPolicyV1,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictLocalRuntimeConfigV4 {
-    schema_version: String,
+    #[serde(rename = "schema_version")]
+    _schema_version: String,
     enabled: bool,
     capture_private_codex_turn_details: bool,
     collection: StrictCollectionPolicyV1,
@@ -93,12 +113,12 @@ struct StrictStorageLifecyclePolicyV1 {
     max_traces_per_pass: u16,
 }
 
-impl<'de> Deserialize<'de> for LocalRuntimeConfigV4 {
+impl<'de> Deserialize<'de> for LocalRuntimeConfigV5 {
     fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
     where
         Deserializer: serde::Deserializer<'de>,
     {
-        let strict = StrictLocalRuntimeConfigV4::deserialize(deserializer)?;
+        let strict = StrictLocalRuntimeConfigV5::deserialize(deserializer)?;
         Ok(Self {
             schema_version: strict.schema_version,
             enabled: strict.enabled,
@@ -126,11 +146,12 @@ impl<'de> Deserialize<'de> for LocalRuntimeConfigV4 {
                 maintenance_interval_seconds: strict.lifecycle.maintenance_interval_seconds,
                 max_traces_per_pass: strict.lifecycle.max_traces_per_pass,
             },
+            storage_budget: strict.storage_budget,
         })
     }
 }
 
-impl Default for LocalRuntimeConfigV4 {
+impl Default for LocalRuntimeConfigV5 {
     fn default() -> Self {
         Self {
             schema_version: LOCAL_RUNTIME_CONFIG_VERSION.into(),
@@ -139,11 +160,12 @@ impl Default for LocalRuntimeConfigV4 {
             collection: CollectionPolicyV1::default(),
             retention: RetentionPolicyV1::default(),
             lifecycle: StorageLifecyclePolicyV1::default(),
+            storage_budget: StorageBudgetPolicyV1::default(),
         }
     }
 }
 
-impl LocalRuntimeConfigV4 {
+impl LocalRuntimeConfigV5 {
     pub fn from_json(input: &str) -> Result<Self, ConfigError> {
         let header: serde_json::Value = serde_json::from_str(input).map_err(ConfigError::Json)?;
         let version = header
@@ -160,6 +182,7 @@ impl LocalRuntimeConfigV4 {
                 collection: legacy.collection,
                 retention: RetentionPolicyV1::default(),
                 lifecycle: StorageLifecyclePolicyV1::default(),
+                storage_budget: StorageBudgetPolicyV1::default(),
             }
         } else if version == PRIOR_LOCAL_RUNTIME_CONFIG_VERSION {
             let prior: LegacyLocalRuntimeConfigV2 =
@@ -171,6 +194,7 @@ impl LocalRuntimeConfigV4 {
                 collection: prior.collection.into(),
                 retention: prior.retention.into(),
                 lifecycle: StorageLifecyclePolicyV1::default(),
+                storage_budget: StorageBudgetPolicyV1::default(),
             }
         } else if version == PREVIOUS_LOCAL_RUNTIME_CONFIG_VERSION {
             let previous: StrictLocalRuntimeConfigV3 =
@@ -182,6 +206,19 @@ impl LocalRuntimeConfigV4 {
                 collection: previous.collection.into(),
                 retention: previous.retention.into(),
                 lifecycle: StorageLifecyclePolicyV1::default(),
+                storage_budget: StorageBudgetPolicyV1::default(),
+            }
+        } else if version == LIFECYCLE_LOCAL_RUNTIME_CONFIG_VERSION {
+            let previous: StrictLocalRuntimeConfigV4 =
+                serde_json::from_str(input).map_err(ConfigError::Json)?;
+            Self {
+                schema_version: LOCAL_RUNTIME_CONFIG_VERSION.into(),
+                enabled: previous.enabled,
+                capture_private_codex_turn_details: previous.capture_private_codex_turn_details,
+                collection: previous.collection.into(),
+                retention: previous.retention.into(),
+                lifecycle: previous.lifecycle.into(),
+                storage_budget: StorageBudgetPolicyV1::default(),
             }
         } else {
             serde_json::from_str(input).map_err(ConfigError::Json)?
@@ -196,7 +233,16 @@ impl LocalRuntimeConfigV4 {
         }
         self.collection.validate().map_err(ConfigError::Policy)?;
         self.retention.validate().map_err(ConfigError::Policy)?;
-        self.lifecycle.validate().map_err(ConfigError::Policy)
+        self.lifecycle.validate().map_err(ConfigError::Policy)?;
+        self.storage_budget.validate().map_err(ConfigError::Policy)
+    }
+
+    /// P1 accepts the new contract but must not activate unfinished admission logic.
+    pub fn require_operational_storage_policy(&self) -> Result<(), ConfigError> {
+        match self.storage_budget.mode {
+            StorageBudgetMode::Legacy => Ok(()),
+            StorageBudgetMode::Separated => Err(ConfigError::StoragePolicyUnavailable),
+        }
     }
 }
 
@@ -241,6 +287,20 @@ impl From<StrictRetentionPolicyV1> for RetentionPolicyV1 {
             max_record_age_days: strict.max_record_age_days,
             max_archive_records: strict.max_archive_records,
             max_archive_bytes: strict.max_archive_bytes,
+        }
+    }
+}
+
+impl From<StrictStorageLifecyclePolicyV1> for StorageLifecyclePolicyV1 {
+    fn from(strict: StrictStorageLifecyclePolicyV1) -> Self {
+        Self {
+            enabled: strict.enabled,
+            hot_days: strict.hot_days,
+            warm_days: strict.warm_days,
+            delete_after_days: strict.delete_after_days,
+            private_raw_days: strict.private_raw_days,
+            maintenance_interval_seconds: strict.maintenance_interval_seconds,
+            max_traces_per_pass: strict.max_traces_per_pass,
         }
     }
 }
@@ -299,7 +359,9 @@ impl LocalConfigService {
         })?;
         save_if_revision(&mutation, expected_revision, config).map_err(|error| match error {
             ConfigError::Conflict => ConfigServiceError::Conflict,
-            ConfigError::Policy(_) | ConfigError::UnsupportedVersion => ConfigServiceError::Invalid,
+            ConfigError::Policy(_)
+            | ConfigError::UnsupportedVersion
+            | ConfigError::StoragePolicyUnavailable => ConfigServiceError::Invalid,
             _ => ConfigServiceError::Unavailable,
         })?;
         self.read()
@@ -353,6 +415,7 @@ pub enum ConfigError {
     Json(serde_json::Error),
     Policy(PolicyError),
     UnsupportedVersion,
+    StoragePolicyUnavailable,
     InsecurePermissions,
     InvalidPath,
     Symlink,
@@ -369,6 +432,9 @@ impl std::fmt::Display for ConfigError {
             Self::UnsupportedVersion => {
                 formatter.write_str("unsupported local runtime config version")
             }
+            Self::StoragePolicyUnavailable => formatter.write_str(
+                "separated storage policy is not available in this development checkpoint",
+            ),
             Self::InsecurePermissions => formatter.write_str("local runtime path is not private"),
             Self::InvalidPath => formatter.write_str("local runtime path has the wrong file type"),
             Self::Symlink => formatter.write_str("local runtime paths must not be symlinks"),
@@ -443,7 +509,9 @@ pub fn load(path: &Path) -> Result<LocalRuntimeConfigV3, ConfigError> {
     let mut file = open_private_read(path)?;
     let mut body = String::new();
     file.read_to_string(&mut body)?;
-    LocalRuntimeConfigV3::from_json(&body)
+    let config = LocalRuntimeConfigV3::from_json(&body)?;
+    config.require_operational_storage_policy()?;
+    Ok(config)
 }
 
 pub fn save(guard: &ConfigMutationGuard, config: &LocalRuntimeConfigV3) -> Result<(), ConfigError> {
@@ -473,6 +541,7 @@ fn save_with_hook(
     mut before: impl FnMut(SaveStage) -> io::Result<()>,
 ) -> Result<(), ConfigError> {
     config.validate()?;
+    config.require_operational_storage_policy()?;
     reject_symlink(path)?;
     let parent = path.parent().ok_or(ConfigError::InvalidPath)?;
     private_dir(parent, false)?;
@@ -653,6 +722,235 @@ const fn no_follow_flag() -> i32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn v4_migration_preserves_all_existing_values_and_selects_legacy() {
+        let mut input: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/local-runtime-config-v4.fixture.json"
+        ))
+        .unwrap();
+        input["enabled"] = false.into();
+        input["capture_private_codex_turn_details"] = true.into();
+        input["collection"]["local_storage_budget_bytes"] = 536_870_912_u64.into();
+        input["lifecycle"]["enabled"] = true.into();
+        let config = LocalRuntimeConfigV3::from_json(&input.to_string()).unwrap();
+        let output = serde_json::to_value(&config).unwrap();
+        assert_eq!(output["schema_version"], "local_runtime.v5");
+        assert_eq!(output["storage_budget"]["mode"], "legacy");
+        for field in [
+            "enabled",
+            "capture_private_codex_turn_details",
+            "collection",
+            "retention",
+            "lifecycle",
+        ] {
+            assert_eq!(output[field], input[field], "{field}");
+        }
+        assert_eq!(
+            output["storage_budget"]["retained_target_bytes"],
+            1_073_741_824_u64
+        );
+    }
+
+    #[test]
+    fn historical_migrations_preserve_nondefault_collection_and_retention() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/local-runtime-config-v4.fixture.json"
+        ))
+        .unwrap();
+        for version in 1..=4 {
+            let mut input = fixture.clone();
+            input["schema_version"] = format!("local_runtime.v{version}").into();
+            input["enabled"] = false.into();
+            input["collection"]["local_storage_budget_bytes"] = 2_147_483_648_u64.into();
+            input["collection"]["flush_interval_ms"] = 12_000.into();
+            input["retention"]["max_record_age_days"] = 234.into();
+            if version < 4 {
+                input.as_object_mut().unwrap().remove("lifecycle");
+            }
+            if version < 3 {
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("capture_private_codex_turn_details");
+            }
+            if version < 2 {
+                input.as_object_mut().unwrap().remove("retention");
+            }
+            let migrated = LocalRuntimeConfigV5::from_json(&input.to_string()).unwrap();
+            let output = serde_json::to_value(&migrated).unwrap();
+            for (field, value) in input.as_object().unwrap() {
+                if field != "schema_version" {
+                    assert_eq!(&output[field], value, "v{version}/{field}");
+                }
+            }
+            assert_eq!(migrated.storage_budget, StorageBudgetPolicyV1::default());
+            input["storage_budget"] =
+                serde_json::to_value(StorageBudgetPolicyV1::default()).unwrap();
+            assert!(
+                LocalRuntimeConfigV5::from_json(&input.to_string()).is_err(),
+                "v{version} must reject new fields"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reading_v4_does_not_rewrite_config_or_change_revision_between_reads() {
+        let root = root("p1-read-migration");
+        let layout = install(&root).unwrap();
+        let fixture = include_str!("../../../contracts/local-runtime-config-v4.fixture.json");
+        fs::write(&layout.config, fixture).unwrap();
+        let service = LocalConfigService::new(&layout);
+        let first = service.read().unwrap();
+        assert_eq!(first, service.read().unwrap());
+        assert_eq!(fs::read_to_string(&layout.config).unwrap(), fixture);
+        let second = service.save(&first.revision, &first.config).unwrap();
+        assert_eq!(first, second);
+        assert!(
+            fs::read_to_string(&layout.config)
+                .unwrap()
+                .contains("local_runtime.v5")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v5_storage_fields_are_required_strict_and_bounded_even_when_inactive() {
+        let fixture = serde_json::to_value(LocalRuntimeConfigV5::default()).unwrap();
+        let mut missing = fixture.clone();
+        missing.as_object_mut().unwrap().remove("storage_budget");
+        assert!(LocalRuntimeConfigV5::from_json(&missing.to_string()).is_err());
+        for mode in ["legacy", "separated"] {
+            for field in [
+                "retained_target_bytes",
+                "workspace_budget_bytes",
+                "minimum_free_bytes",
+            ] {
+                for (bytes, accepted) in [
+                    (268_435_455_u64, false),
+                    (268_435_456, true),
+                    (21_474_836_480, true),
+                    (21_474_836_481, false),
+                    (u64::MAX, false),
+                ] {
+                    let mut input = fixture.clone();
+                    input["storage_budget"]["mode"] = mode.into();
+                    input["storage_budget"][field] = bytes.into();
+                    assert_eq!(
+                        LocalRuntimeConfigV5::from_json(&input.to_string()).is_ok(),
+                        accepted,
+                        "{mode}/{field}/{bytes}"
+                    );
+                }
+                let mut input = fixture.clone();
+                input["storage_budget"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+                assert!(LocalRuntimeConfigV5::from_json(&input.to_string()).is_err());
+                for value in [
+                    serde_json::json!(-1),
+                    serde_json::json!(268_435_456.5),
+                    serde_json::json!("1073741824"),
+                    serde_json::Value::Null,
+                ] {
+                    input["storage_budget"][field] = value;
+                    assert!(LocalRuntimeConfigV5::from_json(&input.to_string()).is_err());
+                }
+            }
+        }
+        for value in [
+            serde_json::json!("auto"),
+            serde_json::json!("LEGACY"),
+            serde_json::Value::Null,
+        ] {
+            let mut input = fixture.clone();
+            input["storage_budget"]["mode"] = value;
+            assert!(LocalRuntimeConfigV5::from_json(&input.to_string()).is_err());
+        }
+        let mut unknown = fixture.clone();
+        unknown["storage_budget"]["extra"] = true.into();
+        assert!(LocalRuntimeConfigV5::from_json(&unknown.to_string()).is_err());
+        let mut missing_mode = fixture;
+        missing_mode["storage_budget"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mode");
+        assert!(LocalRuntimeConfigV5::from_json(&missing_mode.to_string()).is_err());
+    }
+
+    #[test]
+    fn storage_mode_round_trip_preserves_inactive_values_and_changes_revision() {
+        let mut config = LocalRuntimeConfigV5::default();
+        config.collection.local_storage_budget_bytes = 536_870_912;
+        config.storage_budget.retained_target_bytes = 2_147_483_648;
+        config.storage_budget.workspace_budget_bytes = 805_306_368;
+        config.storage_budget.minimum_free_bytes = 1_610_612_736;
+        config.lifecycle.enabled = true;
+        let original = config.clone();
+        let original_revision = revision(&config).unwrap();
+        config.storage_budget.mode = StorageBudgetMode::Separated;
+        assert_ne!(revision(&config).unwrap(), original_revision);
+        let serialized = serde_json::to_string(&config).unwrap();
+        let mut reopened = LocalRuntimeConfigV5::from_json(&serialized).unwrap();
+        assert_eq!(reopened, config);
+        reopened.storage_budget.mode = StorageBudgetMode::Legacy;
+        assert_eq!(reopened, original);
+        assert_eq!(revision(&reopened).unwrap(), original_revision);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unfinished_separated_policy_cannot_save_load_or_create_runtime_control() {
+        let root = root("p1-activation-gate");
+        let layout = install(&root).unwrap();
+        let service = LocalConfigService::new(&layout);
+        let current = service.read().unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        let mut candidate = current.config.clone();
+        candidate.storage_budget.mode = StorageBudgetMode::Separated;
+        assert!(candidate.validate().is_ok());
+        assert_eq!(
+            service.save(&current.revision, &candidate),
+            Err(ConfigServiceError::Invalid)
+        );
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+        assert!(matches!(
+            crate::RuntimeControl::new(&candidate),
+            Err(crate::ControlError::Config(
+                ConfigError::StoragePolicyUnavailable
+            ))
+        ));
+        // Simulate a hand-edited config only inside this disposable private fixture.
+        fs::write(&layout.config, serde_json::to_vec(&candidate).unwrap()).unwrap();
+        assert!(matches!(
+            load(&layout.config),
+            Err(ConfigError::StoragePolicyUnavailable)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v5_inactive_budget_save_preserves_values_and_rejects_stale_revision() {
+        let root = root("p1-revision");
+        let layout = install(&root).unwrap();
+        let service = LocalConfigService::new(&layout);
+        let before = service.read().unwrap();
+        let mut candidate = before.config.clone();
+        candidate.storage_budget.workspace_budget_bytes = 805_306_368;
+        candidate.lifecycle.enabled = true;
+        let after = service.save(&before.revision, &candidate).unwrap();
+        assert_eq!(after.config, candidate);
+        assert_ne!(after.revision, before.revision);
+        assert_eq!(
+            service.save(&before.revision, &before.config),
+            Err(ConfigServiceError::Conflict)
+        );
+        assert_eq!(service.read().unwrap(), after);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "agent-observability-config-{name}-{}",
@@ -671,7 +969,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            LocalRuntimeConfigV4::from_json(r#"{"schema_version":"local_runtime.v5"}"#).is_err()
+            LocalRuntimeConfigV4::from_json(r#"{"schema_version":"local_runtime.v6"}"#).is_err()
         );
         let legacy = LocalRuntimeConfigV3::from_json(
             r#"{"schema_version":"local_runtime.v1","enabled":true,"collection":{}}"#,
@@ -681,6 +979,7 @@ mod tests {
         assert!(!legacy.capture_private_codex_turn_details);
         assert_eq!(legacy.retention, RetentionPolicyV1::default());
         assert_eq!(legacy.lifecycle, StorageLifecyclePolicyV1::default());
+        assert_eq!(legacy.storage_budget, StorageBudgetPolicyV1::default());
 
         let prior_v2 = LocalRuntimeConfigV3::from_json(
             r#"{"schema_version":"local_runtime.v2","enabled":true,"collection":{"file_reconcile_interval_ms":5000,"flush_interval_ms":5000,"max_batch_records":100,"max_batch_bytes":524288,"active_heartbeat_interval_ms":60000,"idle_heartbeat_interval_ms":300000,"local_storage_budget_bytes":1073741824},"retention":{"max_record_age_days":30,"max_archive_records":10000,"max_archive_bytes":16777216}}"#,
@@ -688,6 +987,7 @@ mod tests {
         .unwrap();
         assert!(!prior_v2.capture_private_codex_turn_details);
         assert_eq!(prior_v2.lifecycle, StorageLifecyclePolicyV1::default());
+        assert_eq!(prior_v2.storage_budget, StorageBudgetPolicyV1::default());
 
         let mut previous_fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../contracts/local-runtime-config-v3.fixture.json"
@@ -704,6 +1004,7 @@ mod tests {
         assert_eq!(previous_v3.collection.max_batch_records, 321);
         assert_eq!(previous_v3.retention.max_record_age_days, 123);
         assert_eq!(previous_v3.lifecycle, StorageLifecyclePolicyV1::default());
+        assert_eq!(previous_v3.storage_budget, StorageBudgetPolicyV1::default());
 
         let mut malformed_v3 = previous_fixture.clone();
         malformed_v3["collection"]
@@ -744,6 +1045,29 @@ mod tests {
             let accepted = LocalRuntimeConfigV3::from_json(&document.to_string()).is_ok();
             assert_eq!(
                 accepted,
+                case["valid"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn v5_fixture_and_shared_parity_match_rust() {
+        let fixture = include_str!("../../../contracts/local-runtime-config-v5.fixture.json");
+        assert_eq!(
+            LocalRuntimeConfigV5::from_json(fixture).unwrap(),
+            LocalRuntimeConfigV5::default()
+        );
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/local-runtime-config-v5.parity.json"
+        ))
+        .unwrap();
+        for case in cases.as_array().unwrap() {
+            let mut document: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            apply_parity_case(&mut document, case);
+            assert_eq!(
+                LocalRuntimeConfigV5::from_json(&document.to_string()).is_ok(),
                 case["valid"].as_bool().unwrap(),
                 "{}",
                 case["name"]

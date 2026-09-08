@@ -13,7 +13,7 @@ test("tracked settings JavaScript matches the TypeScript bundle", async () => {
     target: ["es2022"],
     legalComments: "none",
     banner: {
-      js: "/* Generated from contracts/local-runtime-config-v4.schema.json. Do not edit. */",
+      js: "/* Generated from contracts/local-runtime-config-v5.schema.json. Do not edit. */",
     },
     write: false,
   });
@@ -22,6 +22,15 @@ test("tracked settings JavaScript matches the TypeScript bundle", async () => {
     result.outputFiles[0]?.text,
     await readFile("crates/local-ui/src/generated/settings-ui.js", "utf8"),
   );
+});
+
+test("settings v5 keeps separated-budget fields outside the activation controls and save projection", async () => {
+  const source = await readFile("ui/settings/main.ts", "utf8");
+  assert.match(source, /local-runtime-config-v5/);
+  assert.match(source, /body: JSON\.stringify\(\{ config: draft, revision \}\)/);
+  assert.match(source, /draft = structuredClone\(envelope\.config\)/);
+  assert.match(source, /storage_budget: structuredClone\(draft\.storage_budget\)/);
+  assert.doesNotMatch(source, /storage_budget\.(mode|retained_target_bytes|workspace_budget_bytes|minimum_free_bytes)/);
 });
 
 test("degraded collector copy maps typed reasons and retains a generic fallback", async () => {

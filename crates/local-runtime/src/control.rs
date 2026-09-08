@@ -26,6 +26,9 @@ pub struct CollectorDiagnostic {
 impl RuntimeControl {
     pub fn new(config: &LocalRuntimeConfigV3) -> Result<Self, ControlError> {
         config.validate().map_err(ControlError::Config)?;
+        config
+            .require_operational_storage_policy()
+            .map_err(ControlError::Config)?;
         let storage = StorageBudget::calculate(config.collection.local_storage_budget_bytes, false)
             .map_err(ControlError::Storage)?;
         Ok(Self {
@@ -291,6 +294,20 @@ mod tests {
             Admission::Denied
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_partitions_ignore_but_preserve_inactive_separated_values() {
+        let mut config = LocalRuntimeConfigV3::default();
+        let expected = RuntimeControl::new(&config).unwrap().storage_budget();
+        config.storage_budget.retained_target_bytes = 268_435_456;
+        config.storage_budget.workspace_budget_bytes = 21_474_836_480;
+        config.storage_budget.minimum_free_bytes = 536_870_912;
+        assert_eq!(
+            RuntimeControl::new(&config).unwrap().storage_budget(),
+            expected
+        );
+        assert_eq!(config.storage_budget.workspace_budget_bytes, 21_474_836_480);
     }
 
     #[test]

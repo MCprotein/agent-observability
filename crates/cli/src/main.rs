@@ -874,7 +874,14 @@ fn set_config_value(
         "batch-bytes" => config.collection.max_batch_bytes = parse!(u32),
         "active-heartbeat-ms" => config.collection.active_heartbeat_interval_ms = parse!(u32),
         "idle-heartbeat-ms" => config.collection.idle_heartbeat_interval_ms = parse!(u32),
-        "storage-bytes" => config.collection.local_storage_budget_bytes = parse!(u64),
+        "storage-bytes" => {
+            if config.storage_budget.mode
+                != agent_observability_local_runtime::StorageBudgetMode::Legacy
+            {
+                return Err("storage-bytes requires legacy storage budget mode".into());
+            }
+            config.collection.local_storage_budget_bytes = parse!(u64);
+        }
         "retention-days" => config.retention.max_record_age_days = parse!(u16),
         "archive-records" => config.retention.max_archive_records = parse!(u32),
         "archive-bytes" => config.retention.max_archive_bytes = parse!(u64),
@@ -1498,7 +1505,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         let init = run(["init".into(), root.to_string_lossy().into_owned()].into_iter()).unwrap();
-        assert!(init.contains("config_schema=local_runtime.v4"));
+        assert!(init.contains("config_schema=local_runtime.v5"));
         let config = root.join("config.json");
         let check = run(["config-check".into(), config.to_string_lossy().into_owned()].into_iter())
             .unwrap();
@@ -1826,6 +1833,17 @@ mod tests {
         .unwrap_err();
         assert_eq!(dashboard, "dashboard automatic open failed");
         assert!(!dashboard.contains("AUTOMATIC_PRIVATE_TARGET_SENTINEL"));
+    }
+
+    #[test]
+    fn storage_bytes_never_reinterprets_separated_target() {
+        let mut config = super::LocalRuntimeConfigV3::default();
+        config.storage_budget.mode =
+            agent_observability_local_runtime::StorageBudgetMode::Separated;
+        let original = config.clone();
+        let error = super::set_config_value(&mut config, "storage-bytes", "536870912").unwrap_err();
+        assert_eq!(error, "storage-bytes requires legacy storage budget mode");
+        assert_eq!(config, original);
     }
 
     #[cfg(not(target_os = "macos"))]

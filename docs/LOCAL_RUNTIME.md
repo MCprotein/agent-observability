@@ -201,11 +201,11 @@ They do not require a LaunchAgent, local HTTP receiver, login or network access.
 collection does not disable or remove this path.
 
 The v1.11.0 development branch writes the following configuration. Published v1.10.0 uses v3
-without the `lifecycle` section; the automatic lifecycle feature is not released yet.
+without `lifecycle` or `storage_budget`; these development additions are not released yet.
 
 ~~~json
 {
-  "schema_version": "local_runtime.v4",
+  "schema_version": "local_runtime.v5",
   "enabled": true,
   "capture_private_codex_turn_details": false,
   "collection": {
@@ -230,14 +230,24 @@ without the `lifecycle` section; the automatic lifecycle feature is not released
     "private_raw_days": 7,
     "maintenance_interval_seconds": 300,
     "max_traces_per_pass": 32
+  },
+  "storage_budget": {
+    "mode": "legacy",
+    "retained_target_bytes": 1073741824,
+    "workspace_budget_bytes": 1073741824,
+    "minimum_free_bytes": 1073741824
   }
 }
 ~~~
 
-The development runtime reads strict `local_runtime.v1`, `local_runtime.v2` and `local_runtime.v3`
-documents through explicit migrations. Existing values are preserved, automatic lifecycle stays off,
-and v1/v2 private Codex turn-detail capture stays disabled. Earlier schemas remain compatibility
-contracts; new writes in this branch emit v4.
+The development runtime reads v1–v4 documents through their existing version-specific validation
+and explicit migrations. Existing values are preserved; v1–v3 automatic lifecycle stays off, existing
+v4 lifecycle choices are preserved, and v1/v2 private capture stays disabled. New and migrated
+configurations select legacy budget mode. Reading does not rewrite the config file; supported saves
+emit v5. The three new byte values are inactive in legacy mode and are preserved during unrelated edits.
+At P1, separated mode is accepted only by pure contract validation: operational load/save and runtime
+control refuse it until P2/P3 admission integration is verified. Older binaries reject v5; changing
+budget mode is not a binary/schema downgrade. See [P0 decisions](STORAGE_BUDGET_P0.md).
 
 `config set [root] <option> <value>` acquires the runtime singleton, validates the complete updated
 configuration, writes a private temporary file, syncs it, and atomically replaces `config.json`.
