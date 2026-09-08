@@ -63,6 +63,12 @@ runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui�
 
 ## Deployment profiles
 
+v1.11 추가 개발 설계인 [Isolated Ingest](ISOLATED_INGEST.md)는 같은 Rust executable의
+수집 전용 자식 프로세스와 쓰기 제한 VFS 후보를 검토한다. 의존성 평가와 private IPC 설계
+범위는 승인됐지만 아직 구현되거나 활성화되지 않았다. 기존 transaction authority,
+privacy, 전역 예약과 `unsafe_code = "forbid"`를 유지하며, process 분리를 quota나 hard RSS
+보장으로 취급하지 않는다. OS quota·Docker·외부 서버를 standalone의 필수 조건으로 추가하지 않는다.
+
 The approved v1.11 local-state extension uses a fixed-width report acknowledgement separate from
 variable-size metadata. [Acknowledgement Storage](ACKNOWLEDGEMENT_STORAGE.md) owns its v6→v7
 migration, equality fence and disk-allocation contract. This changes only Rust local infrastructure;

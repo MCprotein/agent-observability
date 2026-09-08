@@ -139,6 +139,13 @@ proof, not deletion or a larger budget. Details and evidence boundaries are in t
 The user approved [staged-ingest design and implementation scope](docs/STAGED_INGEST.md).
 Reduced admission remains disabled until write-set/memory bounds, atomic rollback and
 post-publication ingestion capacity pass review and tests; approval does not mean installed recovery.
+The approved scope now includes new-dependency evaluation and a dedicated local ingestion process.
+[Isolated Ingest](docs/ISOLATED_INGEST.md) orders enforcement feasibility, private IPC, guarded
+storage integration, collector parity, real-scale acceptance and release gates. P0 must establish
+the disk/memory enforcement boundary before product integration; no dependency is adopted yet.
+The first shim dependency preflight found no suitable safe pass-through candidate under current
+Rust/unsafe policy. P1 is blocked for that candidate; compare alternatives without treating the
+design-scope approval as runtime recovery or permission to weaken the policy.
 The earlier long workflow `34135080615` was cancelled before its normative job when those defects
 required a new candidate. Settle final changes before dispatching exact-revision long evidence.
 

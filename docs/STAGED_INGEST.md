@@ -2,6 +2,11 @@
 
 Status: **v1.11 development design; scope approved, reduced admission not enabled.**
 
+The user additionally approved evaluating new dependencies and an isolated ingestion process.
+[Isolated Ingest](ISOLATED_INGEST.md) defines the proposed enforcement boundary and phased
+feasibility gates. This broadens the design scope; it does not enable reduced admission, waive
+the memory/rollback gates below, or authorize an unsafe-code policy exception.
+
 ## Problem and preserved contract
 
 The configured disk budget remains unchanged. Its default is a planning choice, not a measured
