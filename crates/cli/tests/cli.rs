@@ -40,9 +40,87 @@ fn spawn_codex_ingest(root: &Path, handoff: &Path) -> Child {
 }
 
 #[cfg(unix)]
-fn assert_ingest_waits(child: &mut Child) {
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    assert!(child.try_wait().unwrap().is_none());
+struct WaitingIngest {
+    child: Child,
+    stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+}
+
+#[cfg(unix)]
+impl WaitingIngest {
+    fn finish(mut self) -> std::process::Output {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ingest completion timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        std::process::Output {
+            status,
+            stdout: self.stdout.take().unwrap().join().unwrap(),
+            stderr: self.stderr.take().unwrap().join().unwrap(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for WaitingIngest {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.stdout.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.stderr.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_ingest_waits(mut child: Child) -> WaitingIngest {
+    use std::io::Read as _;
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let stdout = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.take(1024 * 1024).read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let stderr = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut reader = BufReader::new(stderr.take(1024 * 1024));
+        loop {
+            let mut line = Vec::new();
+            if reader.read_until(b'\n', &mut line).unwrap() == 0 {
+                break;
+            }
+            if line == b"waiting=runtime_mutation\n" {
+                let _ = ready_tx.send(());
+            }
+            bytes.extend(line);
+        }
+        bytes
+    });
+    let ingest = WaitingIngest {
+        child,
+        stdout: Some(stdout),
+        stderr: Some(stderr),
+    };
+    assert!(
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .is_ok(),
+        "ingest did not acknowledge root contention: binary={}",
+        env!("CARGO_BIN_EXE_agent-observability"),
+    );
+    ingest
 }
 
 #[cfg(unix)]
@@ -697,15 +775,14 @@ fn concurrent_disable_blocks_manual_ingest_before_admission() {
     let layout = install(&root).unwrap();
     let handoff = private_codex_handoff(&root);
     let guard = ConfigMutationGuard::acquire(&layout).unwrap();
-    let mut ingest = spawn_codex_ingest(&root, &handoff);
-    assert_ingest_waits(&mut ingest);
+    let ingest = assert_ingest_waits(spawn_codex_ingest(&root, &handoff));
 
     let mut config = load(&layout.config).unwrap();
     config.enabled = false;
     save(&guard, &config).unwrap();
     drop(guard);
 
-    let output = ingest.wait_with_output().unwrap();
+    let output = ingest.finish();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("collection_disabled=1"));
     assert!(!root.join("state/store/local-store.sqlite3").exists());
@@ -724,15 +801,14 @@ fn concurrent_budget_reduction_blocks_manual_ingest_before_commit() {
     let handoff = private_codex_handoff(&root);
     inflate_allocated_accounting(&root);
     let guard = ConfigMutationGuard::acquire(&layout).unwrap();
-    let mut ingest = spawn_codex_ingest(&root, &handoff);
-    assert_ingest_waits(&mut ingest);
+    let ingest = assert_ingest_waits(spawn_codex_ingest(&root, &handoff));
 
     let mut config = load(&layout.config).unwrap();
     config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
     save(&guard, &config).unwrap();
     drop(guard);
 
-    let output = ingest.wait_with_output().unwrap();
+    let output = ingest.finish();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("storage_blocked=1"));
     assert!(!root.join("state/store/local-store.sqlite3").exists());

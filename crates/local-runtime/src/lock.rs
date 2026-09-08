@@ -564,21 +564,38 @@ impl MutationGuard {
     }
 
     pub fn acquire(runtime_dir: &Path) -> Result<Self, SingletonError> {
-        Self::acquire_with(runtime_dir, false)
+        Self::acquire_with(runtime_dir, false, || {})
     }
 
     pub fn try_acquire(runtime_dir: &Path) -> Result<Self, SingletonError> {
-        Self::acquire_with(runtime_dir, true)
+        Self::acquire_with(runtime_dir, true, || {})
     }
 
     pub(crate) fn try_acquire_existing(runtime_dir: &Path) -> Result<Self, SingletonError> {
         Self::try_acquire_existing_observing(runtime_dir, || {})
     }
 
+    pub(crate) fn acquire_existing(
+        runtime_dir: &Path,
+        on_contention: impl FnOnce(),
+    ) -> Result<Self, SingletonError> {
+        Self::acquire_existing_with(runtime_dir, false, || {}, on_contention)
+    }
+
     #[cfg(unix)]
     fn try_acquire_existing_observing(
         runtime_dir: &Path,
         before_open: impl FnOnce(),
+    ) -> Result<Self, SingletonError> {
+        Self::acquire_existing_with(runtime_dir, true, before_open, || {})
+    }
+
+    #[cfg(unix)]
+    fn acquire_existing_with(
+        runtime_dir: &Path,
+        nonblocking: bool,
+        before_open: impl FnOnce(),
+        on_contention: impl FnOnce(),
     ) -> Result<Self, SingletonError> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
@@ -612,13 +629,7 @@ impl MutationGuard {
         }
         same_file(&file, &lock_path)?;
         same_private_directory(&directory, runtime_dir)?;
-        file.try_lock_exclusive().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                SingletonError::AlreadyRunning
-            } else {
-                SingletonError::Io(error)
-            }
-        })?;
+        acquire_mutation_file(&file, nonblocking, on_contention)?;
         validate_private_empty_lock(&file)?;
         same_file(&file, &lock_path)?;
         same_private_directory(&directory, runtime_dir)?;
@@ -640,6 +651,16 @@ impl MutationGuard {
         Err(SingletonError::UnsupportedPlatform)
     }
 
+    #[cfg(not(unix))]
+    fn acquire_existing_with(
+        _runtime_dir: &Path,
+        _nonblocking: bool,
+        _before_open: impl FnOnce(),
+        _before_lock: impl FnOnce(),
+    ) -> Result<Self, SingletonError> {
+        Err(SingletonError::UnsupportedPlatform)
+    }
+
     pub fn matches_accounting_lock(
         &self,
         root: &Path,
@@ -656,7 +677,18 @@ impl MutationGuard {
         Ok(true)
     }
 
-    fn acquire_with(runtime_dir: &Path, nonblocking: bool) -> Result<Self, SingletonError> {
+    pub(crate) fn acquire_waiting(
+        runtime_dir: &Path,
+        on_contention: impl FnOnce(),
+    ) -> Result<Self, SingletonError> {
+        Self::acquire_with(runtime_dir, false, on_contention)
+    }
+
+    fn acquire_with(
+        runtime_dir: &Path,
+        nonblocking: bool,
+        on_contention: impl FnOnce(),
+    ) -> Result<Self, SingletonError> {
         private_runtime_dir(runtime_dir)?;
         let lock_path = runtime_dir.join("mutation.lock");
         reject_symlink(&lock_path)?;
@@ -669,17 +701,7 @@ impl MutationGuard {
         }
         let file = options.open(&lock_path)?;
         private_open_file(&file)?;
-        if nonblocking {
-            file.try_lock_exclusive().map_err(|error| {
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    SingletonError::AlreadyRunning
-                } else {
-                    SingletonError::Io(error)
-                }
-            })?;
-        } else {
-            file.lock_exclusive().map_err(SingletonError::Io)?;
-        }
+        acquire_mutation_file(&file, nonblocking, on_contention)?;
         let directory = File::open(runtime_dir)?;
         let runtime_dir = fs::canonicalize(runtime_dir)?;
         same_file(&file, &runtime_dir.join("mutation.lock"))?;
@@ -688,6 +710,24 @@ impl MutationGuard {
             directory,
             runtime_dir,
         })
+    }
+}
+
+fn acquire_mutation_file(
+    file: &File,
+    nonblocking: bool,
+    on_contention: impl FnOnce(),
+) -> Result<(), SingletonError> {
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            if nonblocking {
+                return Err(SingletonError::AlreadyRunning);
+            }
+            on_contention();
+            file.lock_exclusive().map_err(SingletonError::Io)
+        }
+        Err(error) => Err(SingletonError::Io(error)),
     }
 }
 
@@ -1350,6 +1390,146 @@ mod tests {
             drop(barrier);
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_contention_notification_is_absent_for_try_only_and_immediate_success() {
+        let (root, mutation, barrier) = coordinated_fixture("mutation-notification-policy");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("runtime/mutation.lock"))
+            .unwrap();
+        assert!(matches!(
+            super::acquire_mutation_file(&file, true, || panic!("try-only must not notify")),
+            Err(SingletonError::AlreadyRunning)
+        ));
+        drop(mutation);
+        super::acquire_mutation_file(&file, false, || panic!("immediate success must not notify"))
+            .unwrap();
+        fs2::FileExt::unlock(&file).unwrap();
+        drop(file);
+        drop(barrier);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_existing_mutation_acquisition_does_not_recreate_missing_lock() {
+        let (root, mutation, barrier) = coordinated_fixture("blocking-existing-missing");
+        drop(mutation);
+        let path = root.join("runtime/mutation.lock");
+        fs::remove_file(&path).unwrap();
+
+        assert!(MutationGuard::acquire_existing(&root.join("runtime"), || {}).is_err());
+        assert!(!path.exists());
+
+        drop(barrier);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_existing_mutation_wait_rejects_replaced_lock_without_recreating() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, mutation, barrier) = coordinated_fixture("blocking-existing-replaced");
+        let runtime = root.join("runtime");
+        let path = runtime.join("mutation.lock");
+        let retained = runtime.join("retained-mutation.lock");
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let wait_runtime = runtime.clone();
+            scope.spawn(move || {
+                let result = MutationGuard::acquire_existing_with(
+                    &wait_runtime,
+                    false,
+                    || {},
+                    || {
+                        opened_tx.send(()).unwrap();
+                        continue_rx.recv().unwrap();
+                    },
+                );
+                result_tx.send(result).unwrap();
+            });
+            opened_rx.recv().unwrap();
+            fs::rename(&path, &retained).unwrap();
+            fs::write(&path, []).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            continue_tx.send(()).unwrap();
+            drop(mutation);
+            assert!(
+                result_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                    .is_err()
+            );
+        });
+
+        assert!(path.is_file());
+        assert!(retained.is_file());
+        drop(barrier);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_existing_mutation_open_rejects_fifo_without_waiting() {
+        const PROBE: &str = "AGENTOBS_BLOCKING_MUTATION_FIFO_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lock::tests::blocking_existing_mutation_open_rejects_fifo_without_waiting",
+                ])
+                .env(PROBE, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("blocking existing mutation open waited on a FIFO");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        let (root, mutation, barrier) = coordinated_fixture("blocking-existing-fifo");
+        drop(mutation);
+        let runtime = root.join("runtime");
+        let path = runtime.join("mutation.lock");
+        let retained = runtime.join("retained-mutation.lock");
+        let result = MutationGuard::acquire_existing_with(
+            &runtime,
+            false,
+            || {
+                fs::rename(&path, &retained).unwrap();
+                assert!(
+                    std::process::Command::new("mkfifo")
+                        .args(["-m", "600"])
+                        .arg(&path)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            },
+            || {},
+        );
+        assert!(result.is_err());
+        assert!(path.exists());
+        assert!(retained.is_file());
+        drop(barrier);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

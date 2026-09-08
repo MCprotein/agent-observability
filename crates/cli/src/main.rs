@@ -1492,8 +1492,12 @@ fn ingest_items_observing<'a>(
     let paths = ingest_paths(Path::new(directory))?;
     let barrier = StorageBarrier::open_if_initialized(&paths.accounting_root)
         .map_err(|error| error.to_string())?;
-    let scope = StorageMutationWriter::acquire_exclusive(&paths.accounting_root, barrier.as_ref())
-        .map_err(|error| error.to_string())?;
+    let scope = StorageMutationWriter::acquire_exclusive_waiting_for_root(
+        &paths.accounting_root,
+        barrier.as_ref(),
+        || eprintln!("waiting=runtime_mutation"),
+    )
+    .map_err(|error| error.to_string())?;
     let mut progress = IngestResult {
         source: source.into(),
         observations: 0,
