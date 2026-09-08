@@ -10,6 +10,7 @@ use agent_observability_local_runtime::{
     InstalledLayout, MutationGuard, RuntimeControl, StorageAllocationClass, StorageInventoryError,
     config::ConfigAccountingEvidence,
     install, load,
+    lock::storage_ownership::SingletonStorageOwnershipEvidence,
     reservation::ReportReservationEvidence,
     storage_coherence::{StorageBarrier, StorageCoherenceError, StorageWriteGuard},
 };
@@ -74,6 +75,7 @@ fn three_synthetic_generations_preserve_reservations_and_classify_under_real_fre
     write_synthetic_accounting_artifacts(&layout);
     drop(setup_freeze);
     drop(mutation);
+    let singleton_owners = production_singletons(&root);
     let mut previous_view = None;
     for generation in 0..3 {
         let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
@@ -136,8 +138,23 @@ fn three_synthetic_generations_preserve_reservations_and_classify_under_real_fre
         freeze.revalidate().unwrap();
         drop(freeze);
     }
-    drop(store);
+    drop((store, singleton_owners));
     fs::remove_dir_all(root).unwrap();
+}
+
+fn production_singletons(
+    root: &std::path::Path,
+) -> Vec<agent_observability_local_runtime::ProductionSingleton> {
+    use agent_observability_local_runtime::{CoordinatedSingletonScope, ProductionSingleton};
+    [
+        CoordinatedSingletonScope::Runtime,
+        CoordinatedSingletonScope::Collector,
+        CoordinatedSingletonScope::SettingsUi,
+        CoordinatedSingletonScope::DashboardUi,
+    ]
+    .into_iter()
+    .map(|scope| ProductionSingleton::acquire(root, scope).unwrap())
+    .collect()
 }
 
 fn write_synthetic_accounting_artifacts(layout: &InstalledLayout) {
@@ -236,6 +253,7 @@ fn assert_accounting(
     let root = layout.root.as_path();
     let config_evidence = ConfigAccountingEvidence::capture(root, mutation).unwrap();
     let collector_evidence = CollectorStorageOwnershipEvidence::capture(layout).unwrap();
+    let singleton_evidence = SingletonStorageOwnershipEvidence::capture(root, mutation).unwrap();
     let mut private_observation = CollectorPrivateStorageObservation::capture(layout).unwrap();
     let tls_evidence = CollectorTlsOwnershipEvidence::capture(layout)
         .unwrap()
@@ -246,25 +264,7 @@ fn assert_accounting(
         MAX_REPORT_VIEW_BYTES
     );
     assert!(store.try_acquire_report_render_guard().unwrap().is_none());
-    let mutation_path = std::path::Path::new("runtime/mutation.lock");
-    assert!(
-        mutation
-            .matches_accounting_lock(
-                root,
-                mutation_path,
-                &fs::File::open(root.join(mutation_path)).unwrap()
-            )
-            .unwrap()
-    );
-    let accounting_path = std::path::Path::new("runtime/storage-accounting.lock");
-    assert!(
-        freeze
-            .matches_accounting_lock(
-                accounting_path,
-                &fs::File::open(root.join(accounting_path)).unwrap()
-            )
-            .unwrap()
-    );
+    assert_accounting_control_locks(root, mutation, freeze);
     let mut unknown = std::collections::BTreeSet::new();
     let allocation = with_storage_ownership_observation(store, |authority| {
         with_report_view_ownership_observation(store, |published| {
@@ -289,6 +289,9 @@ fn assert_accounting(
                         .recognizes(&path, file)
                         .map_err(|_| StorageInventoryError::OwnershipMismatch)?
                     || collector_evidence
+                        .matches_entry(relative, file)
+                        .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                    || singleton_evidence
                         .matches_entry(relative, file)
                         .map_err(|_| StorageInventoryError::OwnershipMismatch)?
                     || tls_evidence
@@ -325,11 +328,38 @@ fn assert_accounting(
     assert_eq!(allocation.unknown_bytes, 0);
     config_evidence.revalidate().unwrap();
     collector_evidence.revalidate().unwrap();
+    singleton_evidence.revalidate().unwrap();
     tls_evidence.revalidate().unwrap();
     private_observation.revalidate().unwrap();
     reservation_evidence.revalidate().unwrap();
     assert_eq!(
         reservation_evidence.captured_reserved_bytes(),
         MAX_REPORT_VIEW_BYTES
+    );
+}
+
+fn assert_accounting_control_locks(
+    root: &std::path::Path,
+    mutation: &MutationGuard,
+    freeze: &agent_observability_local_runtime::storage_coherence::StorageFreezeGuard<'_, '_>,
+) {
+    let mutation_path = std::path::Path::new("runtime/mutation.lock");
+    assert!(
+        mutation
+            .matches_accounting_lock(
+                root,
+                mutation_path,
+                &fs::File::open(root.join(mutation_path)).unwrap()
+            )
+            .unwrap()
+    );
+    let accounting_path = std::path::Path::new("runtime/storage-accounting.lock");
+    assert!(
+        freeze
+            .matches_accounting_lock(
+                accounting_path,
+                &fs::File::open(root.join(accounting_path)).unwrap()
+            )
+            .unwrap()
     );
 }
