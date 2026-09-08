@@ -28,6 +28,9 @@ test("Linux CI repeats report refresh regressions without hiding failures", () =
 });
 test("failed automatic smoke retains only its diagnostic manifest in CI", () => {
   const macos = ciWorkflow.split("  rust-macos:\n")[1]?.split("  report-ui:\n")[0] ?? "";
+  assert.match(macos, /for iteration in 1 2 3 4 5; do/);
+  assert.match(macos, /cargo \+1\.97\.0 test --locked -p xtask --bin xtask\n/);
+  assert.doesNotMatch(macos, /\|\| true/);
   assert.match(macos, /name: Run automatic performance smoke\n\s+id: automatic-smoke/);
   const upload = macos.split("      - name: Upload failed automatic smoke diagnostics\n")[1]?.split("      - name:")[0] ?? "";
   assert.match(upload, /if: always\(\) && steps\.automatic-smoke\.outcome == 'failure'/);

@@ -7431,19 +7431,34 @@ mod tests {
         store
             .acknowledge_report_generation(publication.current().generation())
             .unwrap();
-        assert_eq!(
-            automatic_published_snapshot_convergence(&store).unwrap(),
-            Some(ReportConvergence {
-                generation: publication.current().generation(),
-                records: 1,
-            })
-        );
-        let guard = store.acquire_report_render_guard().unwrap();
+        let mut guard = Some(store.acquire_report_render_guard().unwrap());
         assert_eq!(
             automatic_published_snapshot_convergence(&store),
             Err(AutomaticConvergenceError::Retry)
         );
-        drop(guard);
+        // Publication is queried through the same bounded retry contract as production.
+        // Force one real contention result, then release the guard on the first retry.
+        // An unreleased guard still fails at the existing deadline; fatal errors never retry.
+        let started = Instant::now();
+        let mut retries = 0;
+        let convergence = wait_for_automatic_convergence(
+            || automatic_published_snapshot_convergence(&store),
+            || started.elapsed(),
+            |duration| {
+                retries += 1;
+                drop(guard.take());
+                sleep(duration);
+            },
+        );
+        assert_eq!(
+            convergence.unwrap(),
+            ReportConvergence {
+                generation: publication.current().generation(),
+                records: 1,
+            },
+        );
+        assert!(retries >= 1);
+        assert!(guard.is_none());
 
         // A real SQLite query error retains its type until the static validation boundary.
         let sql_error =
