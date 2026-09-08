@@ -153,7 +153,12 @@ This does not lower admission or close the physical-write/memory proof gate.
 Ordinary CI at `739d60f` passed Linux including five report-refresh repetitions and Report UI;
 macOS collector passed but a separate xtask snapshot test failed on a one-shot `Retry` unwrap.
 The follow-up verifies real contention and exact convergence through the existing bounded loop,
-and repeats the full xtask unit binary on macOS five times. Production behavior is unchanged.
+and repeats the full xtask unit binary on macOS five times. That change was test-only.
+The next run at `1f101a8` passed UI but exposed a staging `Busy` in a macOS repetition and
+a Linux privacy-test notify deadline failure. A deterministic duplicate-descriptor regression
+now covers explicit render-guard unlock; the privacy fixture separates acceptance from the
+unchanged public 250ms fail-open deadline. Remote validation is pending.
+Private-copy compaction reclaimed only 7,159,808 bytes; it is not a capacity recovery solution.
 The exact CI trigger remains unconfirmed; neither test stabilization nor smoke substitutes for
 capacity acceptance or release gates. Failed-smoke manifest retention is implemented.
 The earlier long workflow `34135080615` was cancelled before its normative job when those defects

@@ -604,10 +604,6 @@ fn try_guard(store: &LocalStore) -> Result<ReportRenderGuard, ReportViewCatalogE
 }
 
 #[cfg(unix)]
-#[expect(
-    clippy::used_underscore_binding,
-    reason = "the leader-owned guard field is intentionally named for RAII but its file identity binds retirement authority"
-)]
 fn report_render_guard_matches(
     store: &LocalStore,
     guard: &ReportRenderGuard,
@@ -621,15 +617,11 @@ fn report_render_guard_matches(
         Err(error) => return Err(error.into()),
     }
     let expected = fs::metadata(lock_path)?;
-    let actual = guard._file.metadata()?;
+    let actual = guard.file.metadata()?;
     Ok(expected.dev() == actual.dev() && expected.ino() == actual.ino())
 }
 
 #[cfg(windows)]
-#[expect(
-    clippy::used_underscore_binding,
-    reason = "the leader-owned guard field is intentionally named for RAII but its file identity binds retirement authority"
-)]
 fn report_render_guard_matches(
     store: &LocalStore,
     guard: &ReportRenderGuard,
@@ -643,7 +635,7 @@ fn report_render_guard_matches(
         Err(error) => return Err(error.into()),
     }
     let expected = fs::metadata(lock_path)?;
-    let actual = guard._file.metadata()?;
+    let actual = guard.file.metadata()?;
     Ok(
         expected.volume_serial_number() == actual.volume_serial_number()
             && expected.file_index() == actual.file_index(),

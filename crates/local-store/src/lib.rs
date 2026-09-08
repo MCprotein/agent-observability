@@ -265,7 +265,16 @@ pub struct ReportStatus {
 
 #[derive(Debug)]
 pub struct ReportRenderGuard {
-    _file: File,
+    file: File,
+}
+
+impl Drop for ReportRenderGuard {
+    fn drop(&mut self) {
+        // Closing only this descriptor can leave the lock held by a concurrent
+        // process spawn until exec closes its inherited descriptor. Release the
+        // shared lock at the guard boundary; closing the file remains the fallback.
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 impl ReportStatus {
@@ -1678,7 +1687,7 @@ impl LocalStore {
     /// Returns [`StoreError`] when the private render lock cannot be safely acquired.
     pub fn acquire_report_render_guard(&self) -> Result<ReportRenderGuard, StoreError> {
         let file = acquire_private_lock(&self.dir, REPORT_RENDER_LOCK_NAME)?;
-        Ok(ReportRenderGuard { _file: file })
+        Ok(ReportRenderGuard { file })
     }
 
     /// Attempts to serialize report artifact publication without waiting for another renderer.
@@ -1689,7 +1698,7 @@ impl LocalStore {
     pub fn try_acquire_report_render_guard(&self) -> Result<Option<ReportRenderGuard>, StoreError> {
         Ok(
             try_acquire_private_lock(&self.dir, REPORT_RENDER_LOCK_NAME)?
-                .map(|file| ReportRenderGuard { _file: file }),
+                .map(|file| ReportRenderGuard { file }),
         )
     }
 
@@ -8490,6 +8499,31 @@ mod tests {
         drop(guard);
         assert!(peer.try_acquire_report_render_guard().unwrap().is_some());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_render_guard_release_is_independent_of_duplicate_descriptor_lifetime() {
+        let dir = temp_dir("report-render-duplicate-descriptor");
+        let store = LocalStore::open(&dir).unwrap();
+        let peer = LocalStore::open_current(&dir).unwrap();
+        let guard = store.try_acquire_report_render_guard().unwrap().unwrap();
+        // A descriptor inherited before exec shares the same open file description.
+        // A duplicate reproduces that lifetime without unsafe fork/pre_exec test code.
+        let duplicate = guard.file.try_clone().unwrap();
+        assert!(peer.try_acquire_report_render_guard().unwrap().is_none());
+        drop(guard);
+        let next = peer.try_acquire_report_render_guard().unwrap();
+        assert!(
+            next.is_some(),
+            "guard lifetime must bound publication ownership"
+        );
+        drop(duplicate);
+        assert!(store.try_acquire_report_render_guard().unwrap().is_none());
+        drop(next);
+        assert!(store.try_acquire_report_render_guard().unwrap().is_some());
+        drop(peer);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

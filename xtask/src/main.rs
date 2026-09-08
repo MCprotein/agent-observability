@@ -6780,10 +6780,7 @@ mod tests {
         let binary = root.join("agent-observability");
         fs::write(
             &binary,
-            format!(
-                "#!/bin/sh\nsleep 2\nprintf '{}\\n'\n",
-                env!("CARGO_PKG_VERSION")
-            ),
+            format!("#!/bin/sh\nprintf '{}\\n'\n", env!("CARGO_PKG_VERSION")),
         )
         .unwrap();
         fs::set_permissions(&binary, Permissions::from_mode(0o700)).unwrap();

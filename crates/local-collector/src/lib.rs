@@ -8824,8 +8824,12 @@ mod tests {
                 .await
                 .unwrap();
             configure_port(&root, listener.local_addr().unwrap().port());
-            let transport =
-                super::TransportListener::new(listener, server_config, Duration::from_secs(1), 2);
+            let transport = super::TransportListener::new(
+                listener,
+                server_config,
+                Duration::from_secs(1),
+                super::MAX_CONNECTIONS,
+            );
             let app = router(app_state(&root));
             let server = tokio::spawn(async move { axum::serve(transport, app).await });
             let health_root = root.clone();
@@ -8848,19 +8852,34 @@ mod tests {
             .await
             .unwrap();
             let notify_root = root.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                submit_notify(
+            // Privacy acceptance is not the callback's 250ms fail-open latency test.
+            // Use the same projector and authenticated transport with a bounded test deadline.
+            let response = tokio::task::spawn_blocking(move || {
+                let projected =
+                    super::project_notify_json(&raw_notify("RAW_THREAD_SECRET", "RAW_TURN_SECRET"))
+                        .unwrap();
+                let body = serde_json::to_vec(&projected).unwrap();
+                super::authenticated_request(
                     &notify_root,
-                    &raw_notify("RAW_THREAD_SECRET", "RAW_TURN_SECRET"),
+                    "POST",
+                    "/v1/notify",
+                    Some(&body),
+                    Duration::from_secs(1),
+                    Duration::from_secs(5),
                 )
             })
             .await
             .unwrap();
-            assert_eq!(outcome, NotifyOutcome::Accepted);
+            assert_eq!(response.unwrap().status, 200);
             server.abort();
             let _ = server.await;
         });
+        let store = LocalStore::open_current(root.join("state/store")).unwrap();
+        assert_eq!(store.observation_count().unwrap(), 2);
+        assert_eq!(store.record_count().unwrap(), 2);
+        drop(store);
         refresh_report_from_root(&root).unwrap();
+        assert_published_report_view(&root, 2);
 
         assert_tree_excludes(
             &root,
