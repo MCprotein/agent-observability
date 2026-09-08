@@ -19,6 +19,13 @@ const releasePackage = JSON.parse(
 );
 const releaseWorkflow = readFileSync(".github/workflows/release.yml", "utf8");
 const ciWorkflow = readFileSync(".github/workflows/ci.yml", "utf8");
+test("Linux CI repeats report refresh regressions without hiding failures", () => {
+  const linux = ciWorkflow.split("  rust:\n")[1]?.split("  rust-macos:\n")[0] ?? "";
+  assert.match(linux, /for iteration in 1 2 3 4 5; do/);
+  assert.match(linux, /set -euo pipefail/);
+  assert.match(linux, /cargo \+1\.97\.0 test --locked -p agent-observability-local-collector report_refresh_\n/);
+  assert.doesNotMatch(linux, /continue-on-error:|\|\| true/);
+});
 test("failed automatic smoke retains only its diagnostic manifest in CI", () => {
   const macos = ciWorkflow.split("  rust-macos:\n")[1]?.split("  report-ui:\n")[0] ?? "";
   assert.match(macos, /name: Run automatic performance smoke\n\s+id: automatic-smoke/);

@@ -38,6 +38,14 @@ jobs:
         run: cargo +1.97.0 fmt --all -- --check
       - name: Run tests
         run: cargo +1.97.0 test --workspace --no-fail-fast
+      - name: Repeat report refresh regressions on Linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          for iteration in 1 2 3 4 5; do
+            echo "Report refresh repetition $iteration"
+            cargo +1.97.0 test --locked -p agent-observability-local-collector report_refresh_
+          done
       - name: Run Clippy
         run: cargo +1.97.0 clippy --workspace --all-targets -- -D warnings
 

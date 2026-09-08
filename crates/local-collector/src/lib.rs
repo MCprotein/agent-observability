@@ -5058,6 +5058,73 @@ mod tests {
         }
     }
 
+    fn report_refresh_diagnostics(state: &AppState) -> String {
+        format!(
+            "attempts={} scheduled={} requested={} quiet_ms={} state={:?}",
+            state.report_refresh_attempts.load(Ordering::Acquire),
+            state.report_refresh_scheduled.load(Ordering::Acquire),
+            state.report_refresh_requested.load(Ordering::Acquire),
+            state.report_contention_quiet_ms.load(Ordering::Acquire),
+            state.collector.try_lock().ok().map(|collector| (
+                collector.report_dirty,
+                collector.report_degraded,
+                collector.report_refresh_failures,
+                collector.report_failure,
+                collector
+                    .store
+                    .report_status()
+                    .ok()
+                    .map(agent_observability_local_store::ReportStatus::pending),
+            )),
+        )
+    }
+
+    async fn wait_for_report_refresh_completion(state: &AppState) {
+        // After the last wakeup, debounce can finish its current quiet interval and
+        // repeat it once. This is a finite hang guard, not a publication latency SLO.
+        let guard = super::REPORT_CONTENTION_QUIET_LIMIT * 2 + Duration::from_secs(5);
+        let completed = tokio::time::timeout(guard, async {
+            loop {
+                let collector = state.collector.lock().await;
+                let published = collector.store.report_status().unwrap();
+                if !state.report_refresh_scheduled.load(Ordering::Acquire) && !published.pending() {
+                    break;
+                }
+                drop(collector);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            completed.is_ok(),
+            "refresh did not converge: {}",
+            report_refresh_diagnostics(state)
+        );
+    }
+
+    #[test]
+    fn report_refresh_contention_quiet_obeys_duration_and_ceiling_without_wall_clock() {
+        for (previous, attempt, expected) in [
+            (20, 120, 480),
+            (480, 1, 960),
+            (20, 900, 3600),
+            (20, 8000, 30_000),
+            (30_000, 1, 30_000),
+        ] {
+            assert_eq!(
+                super::contention_quiet_period(
+                    Duration::from_millis(previous),
+                    Duration::from_millis(attempt)
+                ),
+                Duration::from_millis(expected),
+            );
+        }
+        assert_eq!(
+            super::contention_quiet_period(Duration::MAX, Duration::MAX),
+            super::REPORT_CONTENTION_QUIET_LIMIT,
+        );
+    }
+
     fn configure_port(root: &Path, port: u16) {
         let mut settings = install_settings(root).unwrap();
         settings.port = port;
@@ -7793,13 +7860,7 @@ mod tests {
                 .report_snapshot_test
                 .delay_ms
                 .store(0, Ordering::Release);
-            tokio::time::timeout(Duration::from_secs(3), async {
-                while state.report_refresh_scheduled.load(Ordering::Acquire) {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .unwrap();
+            wait_for_report_refresh_completion(&state).await;
             let collector = state.collector.lock().await;
             assert!(!collector.store.report_status().unwrap().pending());
             assert_eq!(collector.report_refresh_failures, 0);
@@ -7908,8 +7969,29 @@ mod tests {
                     .unwrap();
             }
             schedule_report_refresh(&state);
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            // Keep the obstruction until the scheduler has recorded a real failure.
+            // A sleep shorter than debounce could otherwise test only a successful first try.
+            let failed = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let collector = state.collector.lock().await;
+                    if collector.report_refresh_failures > 0
+                        && collector.report_failure == Some(super::ReportFailure::Snapshot)
+                    {
+                        break;
+                    }
+                    drop(collector);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(
+                failed.is_ok(),
+                "injected failure was not observed: {}",
+                report_refresh_diagnostics(&state)
+            );
             assert!(state.report_refresh_scheduled.load(Ordering::Acquire));
+            let failed_attempts = state.report_refresh_attempts.load(Ordering::Acquire);
+            assert!(failed_attempts > 0);
 
             {
                 let mut collector = state.collector.lock().await;
@@ -7919,13 +8001,12 @@ mod tests {
             schedule_report_refresh(&state);
             fs::remove_file(&report_views).unwrap();
 
-            for _ in 0..100 {
-                if !state.report_refresh_scheduled.load(Ordering::Acquire) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            assert!(!state.report_refresh_scheduled.load(Ordering::Acquire));
+            wait_for_report_refresh_completion(&state).await;
+            assert!(state.report_refresh_attempts.load(Ordering::Acquire) > failed_attempts);
+            let collector = state.collector.lock().await;
+            assert_eq!(collector.report_refresh_failures, 0);
+            assert!(!collector.report_degraded);
+            assert!(collector.report_failure.is_none());
         });
 
         assert_published_report_view(&root, 2);

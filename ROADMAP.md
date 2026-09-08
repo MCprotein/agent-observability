@@ -150,9 +150,11 @@ A first existing-schema prerequisite replaces disposition retained-set materiali
 scalar rowid cutoff. Regression and synthetic VM-work evidence are in
 [Staged Ingest](docs/STAGED_INGEST.md#structural-path-investigation--disposition-pruning).
 This does not lower admission or close the physical-write/memory proof gate.
-Ordinary CI at `5c72448` failed the macOS automatic smoke; Linux Rust and Report UI passed.
-Failed-smoke manifest upload is being added so CI retains diagnostic evidence. The failure's
-cause remains unconfirmed; neither this diagnostics change nor smoke substitutes for release gates.
+Ordinary CI at `ac7baee` passed macOS including automatic smoke and Report UI, but two Linux
+report-refresh tests failed. The follow-up corrects their timing assumptions, positively verifies
+failed-attempt/retry/publication transitions, and repeats related Linux tests five times.
+The exact CI trigger remains unconfirmed; neither test stabilization nor smoke substitutes for
+capacity acceptance or release gates. Failed-smoke manifest retention is implemented.
 The earlier long workflow `34135080615` was cancelled before its normative job when those defects
 required a new candidate. Settle final changes before dispatching exact-revision long evidence.
 

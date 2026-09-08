@@ -424,6 +424,9 @@ The macOS PR check uploads a failed automatic smoke's `manifest.yaml` as
 `automatic-smoke-diagnostics-<commit>` for seven days. It never uploads the runtime tree or raw
 logs. A failure before manifest creation leaves the original check failed and reports a missing
 artifact warning; diagnostic retention does not turn smoke into release evidence.
+Linux CI also repeats the report-refresh regression group five times. Convergence tests check
+failure/retry/publication state using bounded hang guards that accommodate adaptive quiet windows;
+the performance protocols below, not those test guards, define latency and resource budgets.
 For `perf local`, enabled runs permit at most 1% explicit fail-open rejection and must reconcile every enqueued
 event with one durable observation after graceful fixture shutdown; foreground enqueue does not itself imply
 durability. For `perf automatic`, every foreground notify must be accepted and each run independently enforces
