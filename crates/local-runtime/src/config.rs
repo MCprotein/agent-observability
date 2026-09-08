@@ -374,6 +374,301 @@ pub struct ConfigMutationGuard {
     config_path: PathBuf,
 }
 
+/// Read-only identity and revision evidence for the exact managed layout entries.
+///
+/// This does not classify any descendant, lock file, or temporary file, and it
+/// is not a write permit or a coherent snapshot across unrelated writers.
+pub struct ConfigAccountingEvidence<'guard> {
+    guard: &'guard MutationGuard,
+    layout: InstalledLayout,
+    expected_revision: String,
+    root: File,
+    config: File,
+    logs: File,
+    queue: File,
+    state: File,
+    runtime: File,
+}
+
+impl std::fmt::Debug for ConfigAccountingEvidence<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfigAccountingEvidence")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigAccountingEvidenceError {
+    Io(io::ErrorKind),
+    WrongMutationRoot,
+    InvalidConfig,
+    RevisionChanged,
+    Replaced,
+    InsecurePermissions,
+    Symlink,
+    Hardlink,
+    InvalidType,
+    UnsupportedPlatform,
+}
+
+impl std::fmt::Display for ConfigAccountingEvidenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Io(_) => "config accounting evidence I/O failure",
+            Self::WrongMutationRoot => "config accounting evidence mutation root mismatch",
+            Self::InvalidConfig => "config accounting evidence validation failed",
+            Self::RevisionChanged => "config accounting evidence revision changed",
+            Self::Replaced => "config accounting evidence identity changed",
+            Self::InsecurePermissions => "config accounting evidence path is not private",
+            Self::Symlink => "config accounting evidence refuses symbolic links",
+            Self::Hardlink => "config accounting evidence refuses hard-linked config",
+            Self::InvalidType => "config accounting evidence path has the wrong file type",
+            Self::UnsupportedPlatform => "config accounting evidence is unsupported",
+        })
+    }
+}
+
+impl std::error::Error for ConfigAccountingEvidenceError {}
+
+impl From<io::Error> for ConfigAccountingEvidenceError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error.kind())
+    }
+}
+
+impl<'guard> ConfigAccountingEvidence<'guard> {
+    /// Capture the current validated config and exact installed layout without creating paths.
+    pub fn capture(
+        root: &Path,
+        guard: &'guard MutationGuard,
+    ) -> Result<Self, ConfigAccountingEvidenceError> {
+        capture_config_accounting_evidence(root, guard)
+    }
+
+    pub fn expected_revision(&self) -> &str {
+        &self.expected_revision
+    }
+
+    /// Match only root, config.json, logs, queue, state, or runtime themselves.
+    pub fn matches_entry(
+        &self,
+        relative: &Path,
+        candidate: &File,
+    ) -> Result<bool, ConfigAccountingEvidenceError> {
+        let expected = if relative.as_os_str().is_empty() {
+            Some((&self.root, true))
+        } else if relative == Path::new("config.json") {
+            Some((&self.config, false))
+        } else if relative == Path::new("logs") {
+            Some((&self.logs, true))
+        } else if relative == Path::new("queue") {
+            Some((&self.queue, true))
+        } else if relative == Path::new("state") {
+            Some((&self.state, true))
+        } else if relative == Path::new("runtime") {
+            Some((&self.runtime, true))
+        } else {
+            None
+        };
+        let Some((expected, directory)) = expected else {
+            return Ok(false);
+        };
+        if !same_accounting_identity(expected, candidate, directory)? {
+            return Err(ConfigAccountingEvidenceError::Replaced);
+        }
+        Ok(true)
+    }
+
+    /// Revalidate the captured revision and every retained named identity.
+    pub fn revalidate(&self) -> Result<(), ConfigAccountingEvidenceError> {
+        self.guard
+            .require_root(&self.layout.root)
+            .map_err(map_accounting_guard_error)?;
+        self.revalidate_identities()?;
+        let mut current_file =
+            open_private_read(&self.layout.config).map_err(map_accounting_error)?;
+        if !same_accounting_identity(&self.config, &current_file, false)? {
+            return Err(ConfigAccountingEvidenceError::Replaced);
+        }
+        let current = load_open_file(&mut current_file).map_err(map_accounting_error)?;
+        let current_revision = revision(&current).map_err(map_accounting_error)?;
+        if current_revision != self.expected_revision {
+            return Err(ConfigAccountingEvidenceError::RevisionChanged);
+        }
+        self.revalidate_identities()?;
+        self.guard
+            .require_root(&self.layout.root)
+            .map_err(map_accounting_guard_error)
+    }
+
+    fn revalidate_identities(&self) -> Result<(), ConfigAccountingEvidenceError> {
+        for (file, path) in [
+            (&self.root, &self.layout.root),
+            (&self.logs, &self.layout.logs),
+            (&self.queue, &self.layout.queue),
+            (&self.state, &self.layout.state),
+            (&self.runtime, &self.layout.runtime),
+        ] {
+            revalidate_accounting_identity(file, path, true)?;
+        }
+        revalidate_accounting_identity(&self.config, &self.layout.config, false)?;
+        Ok(())
+    }
+}
+
+fn map_accounting_guard_error(error: SingletonError) -> ConfigAccountingEvidenceError {
+    match error {
+        SingletonError::WrongMutationRoot => ConfigAccountingEvidenceError::WrongMutationRoot,
+        SingletonError::InsecurePermissions => ConfigAccountingEvidenceError::InsecurePermissions,
+        SingletonError::Symlink => ConfigAccountingEvidenceError::Symlink,
+        SingletonError::UnsupportedPlatform => ConfigAccountingEvidenceError::UnsupportedPlatform,
+        SingletonError::Io(error) => error.into(),
+        SingletonError::AlreadyRunning | SingletonError::CorruptMetadata => {
+            ConfigAccountingEvidenceError::WrongMutationRoot
+        }
+    }
+}
+
+fn map_accounting_error(error: ConfigError) -> ConfigAccountingEvidenceError {
+    match error {
+        ConfigError::Io(error) => error.into(),
+        ConfigError::InsecurePermissions => ConfigAccountingEvidenceError::InsecurePermissions,
+        ConfigError::InvalidPath => ConfigAccountingEvidenceError::InvalidType,
+        ConfigError::Symlink => ConfigAccountingEvidenceError::Symlink,
+        ConfigError::UnsupportedPlatform => ConfigAccountingEvidenceError::UnsupportedPlatform,
+        ConfigError::Json(_)
+        | ConfigError::Policy(_)
+        | ConfigError::UnsupportedVersion
+        | ConfigError::StoragePolicyUnavailable
+        | ConfigError::Conflict => ConfigAccountingEvidenceError::InvalidConfig,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn capture_config_accounting_evidence<'guard>(
+    root: &Path,
+    guard: &'guard MutationGuard,
+) -> Result<ConfigAccountingEvidence<'guard>, ConfigAccountingEvidenceError> {
+    guard
+        .require_root(root)
+        .map_err(map_accounting_guard_error)?;
+    let root_file = open_accounting_directory(root)?;
+    let canonical_root = fs::canonicalize(root)?;
+    let layout = InstalledLayout::at(&canonical_root);
+    let logs = open_accounting_directory(&layout.logs)?;
+    let queue = open_accounting_directory(&layout.queue)?;
+    let state = open_accounting_directory(&layout.state)?;
+    let runtime = open_accounting_directory(&layout.runtime)?;
+    let mut config = open_private_read(&layout.config).map_err(map_accounting_error)?;
+    let parsed = load_open_file(&mut config).map_err(map_accounting_error)?;
+    let expected_revision = revision(&parsed).map_err(map_accounting_error)?;
+    let evidence = ConfigAccountingEvidence {
+        guard,
+        layout,
+        expected_revision,
+        root: root_file,
+        config,
+        logs,
+        queue,
+        state,
+        runtime,
+    };
+    evidence.revalidate()?;
+    Ok(evidence)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn capture_config_accounting_evidence(
+    _root: &Path,
+    _guard: &MutationGuard,
+) -> Result<ConfigAccountingEvidence<'_>, ConfigAccountingEvidenceError> {
+    Err(ConfigAccountingEvidenceError::UnsupportedPlatform)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn open_accounting_directory(path: &Path) -> Result<File, ConfigAccountingEvidenceError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    private_dir(path, false).map_err(map_accounting_error)?;
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(no_follow_flag());
+    let file = options.open(path)?;
+    let held = file.metadata()?;
+    validate_accounting_metadata(&held, true)?;
+    let named = fs::symlink_metadata(path)?;
+    validate_accounting_metadata(&named, true)?;
+    if !same_accounting_metadata_identity(&held, &named) {
+        return Err(ConfigAccountingEvidenceError::Replaced);
+    }
+    Ok(file)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn validate_accounting_metadata(
+    metadata: &fs::Metadata,
+    directory: bool,
+) -> Result<(), ConfigAccountingEvidenceError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if directory != metadata.is_dir() || (!directory && !metadata.is_file()) {
+        return Err(ConfigAccountingEvidenceError::InvalidType);
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(ConfigAccountingEvidenceError::InsecurePermissions);
+    }
+    if !directory && metadata.nlink() != 1 {
+        return Err(ConfigAccountingEvidenceError::Hardlink);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn same_accounting_identity(
+    expected: &File,
+    candidate: &File,
+    directory: bool,
+) -> Result<bool, ConfigAccountingEvidenceError> {
+    let expected = expected.metadata()?;
+    let candidate = candidate.metadata()?;
+    validate_accounting_metadata(&expected, directory)?;
+    validate_accounting_metadata(&candidate, directory)?;
+    Ok(same_accounting_metadata_identity(&expected, &candidate))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn same_accounting_metadata_identity(expected: &fs::Metadata, candidate: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    expected.dev() == candidate.dev() && expected.ino() == candidate.ino()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn same_accounting_identity(
+    _expected: &File,
+    _candidate: &File,
+    _directory: bool,
+) -> Result<bool, ConfigAccountingEvidenceError> {
+    Err(ConfigAccountingEvidenceError::UnsupportedPlatform)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn revalidate_accounting_identity(
+    expected: &File,
+    path: &Path,
+    directory: bool,
+) -> Result<(), ConfigAccountingEvidenceError> {
+    let current = if directory {
+        open_accounting_directory(path)?
+    } else {
+        open_private_read(path).map_err(map_accounting_error)?
+    };
+    if !same_accounting_identity(expected, &current, directory)? {
+        return Err(ConfigAccountingEvidenceError::Replaced);
+    }
+    Ok(())
+}
+
 impl ConfigMutationGuard {
     pub fn acquire(layout: &InstalledLayout) -> Result<Self, SingletonError> {
         let canonical = InstalledLayout::at(&layout.root);
@@ -507,6 +802,10 @@ pub fn install(root: &Path) -> Result<InstalledLayout, ConfigError> {
 
 pub fn load(path: &Path) -> Result<LocalRuntimeConfigV3, ConfigError> {
     let mut file = open_private_read(path)?;
+    load_open_file(&mut file)
+}
+
+fn load_open_file(file: &mut File) -> Result<LocalRuntimeConfigV3, ConfigError> {
     let mut body = String::new();
     file.read_to_string(&mut body)?;
     let config = LocalRuntimeConfigV3::from_json(&body)?;
@@ -1432,5 +1731,188 @@ mod tests {
                 .contains(".update.")
         }));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_rejects_equal_bytes_replacement_and_changed_revision() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let replaced_root = root("accounting-replaced-config");
+        let _ = fs::remove_dir_all(&replaced_root);
+        let replaced_layout = install(&replaced_root).unwrap();
+        let replaced_guard = MutationGuard::try_acquire(&replaced_layout.runtime).unwrap();
+        let replaced = ConfigAccountingEvidence::capture(&replaced_root, &replaced_guard).unwrap();
+        let original = fs::read(&replaced_layout.config).unwrap();
+        fs::rename(
+            &replaced_layout.config,
+            replaced_layout.root.join("saved-config"),
+        )
+        .unwrap();
+        let mut replacement = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&replaced_layout.config)
+            .unwrap();
+        replacement.write_all(&original).unwrap();
+        assert_eq!(
+            replaced.revalidate(),
+            Err(ConfigAccountingEvidenceError::Replaced)
+        );
+        drop(replaced);
+        drop(replaced_guard);
+        fs::remove_dir_all(&replaced_root).unwrap();
+
+        let changed_root = root("accounting-changed-revision");
+        let _ = fs::remove_dir_all(&changed_root);
+        let changed_layout = install(&changed_root).unwrap();
+        let changed_guard = MutationGuard::try_acquire(&changed_layout.runtime).unwrap();
+        let changed = ConfigAccountingEvidence::capture(&changed_root, &changed_guard).unwrap();
+        let mut config = load(&changed_layout.config).unwrap();
+        config.retention.max_record_age_days = 90;
+        let mut body = serde_json::to_vec_pretty(&config).unwrap();
+        body.push(b'\n');
+        fs::write(&changed_layout.config, body).unwrap();
+        assert_eq!(
+            changed.revalidate(),
+            Err(ConfigAccountingEvidenceError::RevisionChanged)
+        );
+        drop(changed);
+        drop(changed_guard);
+        fs::remove_dir_all(&changed_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_rejects_root_replacement_and_wrong_guard() {
+        let first_root = root("accounting-root-first");
+        let second_root = root("accounting-root-second");
+        let saved_root = root("accounting-root-saved");
+        for path in [&first_root, &second_root, &saved_root] {
+            let _ = fs::remove_dir_all(path);
+        }
+        let first_layout = install(&first_root).unwrap();
+        let second_layout = install(&second_root).unwrap();
+        let first_guard = MutationGuard::try_acquire(&first_layout.runtime).unwrap();
+        assert_eq!(
+            ConfigAccountingEvidence::capture(&second_root, &first_guard).unwrap_err(),
+            ConfigAccountingEvidenceError::WrongMutationRoot
+        );
+
+        let evidence = ConfigAccountingEvidence::capture(&first_root, &first_guard).unwrap();
+        fs::rename(&first_root, &saved_root).unwrap();
+        install(&first_root).unwrap();
+        assert_eq!(
+            evidence.revalidate(),
+            Err(ConfigAccountingEvidenceError::WrongMutationRoot)
+        );
+        drop(evidence);
+        drop(first_guard);
+        fs::remove_dir_all(&first_root).unwrap();
+        fs::remove_dir_all(&saved_root).unwrap();
+        fs::remove_dir_all(&second_root).unwrap();
+        drop(second_layout);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_matches_only_exact_layout_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root("accounting-exact-entry");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let child = layout.state.join("child");
+        fs::create_dir(&child).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let evidence = ConfigAccountingEvidence::capture(&root, &guard).unwrap();
+        let debug = format!("{evidence:?}");
+        assert_eq!(debug, "ConfigAccountingEvidence { .. }");
+        assert!(!debug.contains(root.to_string_lossy().as_ref()));
+        assert!(!debug.contains(evidence.expected_revision()));
+
+        for (relative, path) in [
+            (Path::new(""), &layout.root),
+            (Path::new("config.json"), &layout.config),
+            (Path::new("logs"), &layout.logs),
+            (Path::new("queue"), &layout.queue),
+            (Path::new("state"), &layout.state),
+            (Path::new("runtime"), &layout.runtime),
+        ] {
+            assert!(
+                evidence
+                    .matches_entry(relative, &File::open(path).unwrap())
+                    .unwrap()
+            );
+        }
+        assert!(
+            !evidence
+                .matches_entry(
+                    Path::new("state/child"),
+                    &File::open(layout.state.join("child")).unwrap(),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            evidence.matches_entry(
+                Path::new("state"),
+                &File::open(layout.state.join("child")).unwrap(),
+            ),
+            Err(ConfigAccountingEvidenceError::Replaced)
+        );
+        assert!(
+            !evidence
+                .matches_entry(
+                    Path::new("runtime/mutation.lock"),
+                    &File::open(layout.runtime.join("mutation.lock")).unwrap(),
+                )
+                .unwrap()
+        );
+
+        drop(evidence);
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_is_noncreating_and_requires_private_layout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let missing_layout_root = root("accounting-noncreating");
+        let _ = fs::remove_dir_all(&missing_layout_root);
+        let layout = install(&missing_layout_root).unwrap();
+        fs::remove_dir(&layout.queue).unwrap();
+        let guard = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        assert!(ConfigAccountingEvidence::capture(&missing_layout_root, &guard).is_err());
+        assert!(!layout.queue.exists());
+        drop(guard);
+        fs::remove_dir_all(&missing_layout_root).unwrap();
+
+        let config_root = root("accounting-config-permission");
+        let _ = fs::remove_dir_all(&config_root);
+        let config_layout = install(&config_root).unwrap();
+        fs::set_permissions(&config_layout.config, fs::Permissions::from_mode(0o644)).unwrap();
+        let config_guard = MutationGuard::try_acquire(&config_layout.runtime).unwrap();
+        assert_eq!(
+            ConfigAccountingEvidence::capture(&config_root, &config_guard).unwrap_err(),
+            ConfigAccountingEvidenceError::InsecurePermissions
+        );
+        drop(config_guard);
+        fs::remove_dir_all(&config_root).unwrap();
+
+        let directory_root = root("accounting-directory-permission");
+        let _ = fs::remove_dir_all(&directory_root);
+        let directory_layout = install(&directory_root).unwrap();
+        fs::set_permissions(&directory_layout.logs, fs::Permissions::from_mode(0o755)).unwrap();
+        let directory_guard = MutationGuard::try_acquire(&directory_layout.runtime).unwrap();
+        assert_eq!(
+            ConfigAccountingEvidence::capture(&directory_root, &directory_guard).unwrap_err(),
+            ConfigAccountingEvidenceError::InsecurePermissions
+        );
+        drop(directory_guard);
+        fs::remove_dir_all(directory_root).unwrap();
     }
 }

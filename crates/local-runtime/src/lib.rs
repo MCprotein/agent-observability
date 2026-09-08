@@ -14,6 +14,8 @@ pub mod policy;
 pub mod reservation;
 pub mod scheduler;
 pub mod storage;
+pub mod storage_coherence;
+pub mod storage_inventory;
 pub mod storage_policy;
 
 pub use control::{ControlError, RuntimeControl};
@@ -26,6 +28,7 @@ pub use policy::{
 pub use reservation::{REPORT_RESERVATION_METADATA_ALLOWANCE, ReservationError, WriteReservation};
 pub use scheduler::{PressureSample, Schedule, Scheduler, State};
 pub use storage::{Admission, Partition, StorageAccountingError, StorageBudget, StorageError};
+pub use storage_inventory::{StorageAllocationClass, StorageInventoryError};
 
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;

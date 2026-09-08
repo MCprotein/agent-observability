@@ -93,6 +93,133 @@ pub struct WriteReservation {
     metadata: Metadata,
 }
 
+/// Read-only reservation evidence tied to the caller's mutation guard.
+///
+/// Retains descriptor identities without acquiring or releasing the owner's lifetime
+/// lock. Full promises survive owner death. This does not freeze staging growth,
+/// authenticate journals, authorize recovery, or establish cross-writer coherence.
+pub struct ReportReservationEvidence<'guard> {
+    root: PathBuf,
+    root_directory: File,
+    guard: &'guard MutationGuard,
+    lock: Option<File>,
+    metadata_file: Option<File>,
+    metadata: Option<Metadata>,
+}
+
+impl std::fmt::Debug for ReportReservationEvidence<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReportReservationEvidence")
+            .field("captured_reserved_bytes", &self.captured_reserved_bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'guard> ReportReservationEvidence<'guard> {
+    pub fn capture(root: &Path, guard: &'guard MutationGuard) -> Result<Self, ReservationError> {
+        guard.require_root(root)?;
+        let lock = open(root, false)?;
+        let mut metadata_file = open_named(root, METADATA_NAME, false)?;
+        let metadata = match metadata_file.as_mut() {
+            Some(file) => read(file)?,
+            None => None,
+        };
+        let evidence = Self {
+            root: root.to_path_buf(),
+            root_directory: open_private_directory(root)?,
+            guard,
+            lock,
+            metadata_file,
+            metadata,
+        };
+        evidence.revalidate()?;
+        Ok(evidence)
+    }
+
+    /// The entire promise, regardless of whether its owner is still running.
+    pub fn captured_reserved_bytes(&self) -> u64 {
+        self.metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.byte_ceiling)
+    }
+
+    pub fn revalidate(&self) -> Result<(), ReservationError> {
+        self.guard.require_root(&self.root)?;
+        if directory_identity(&self.root_directory)?
+            != directory_identity(&open_private_directory(&self.root)?)?
+        {
+            return Err(ReservationError::Corrupt);
+        }
+        match &self.lock {
+            Some(file) => {
+                validate_lock(file, &self.root)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if file.metadata()?.permissions().mode() & 0o7777 != 0o600 {
+                        return Err(SingletonError::InsecurePermissions.into());
+                    }
+                }
+            }
+            None if self.metadata.is_some() || open(&self.root, false)?.is_some() => {
+                return Err(ReservationError::Corrupt);
+            }
+            None => (),
+        }
+        if let Some(file) = &self.metadata_file {
+            same_file(file, &self.root.join("runtime").join(METADATA_NAME))?;
+        }
+        if read_metadata(&self.root)? != self.metadata {
+            return Err(ReservationError::Corrupt);
+        }
+        Ok(())
+    }
+
+    /// Matches only the captured reservation lock or metadata identity for A accounting.
+    /// The full captured R remains separate from these files' allocated bytes.
+    pub fn matches_control_entry(
+        &self,
+        relative: &Path,
+        candidate: &File,
+    ) -> Result<bool, ReservationError> {
+        let expected = if relative == Path::new("runtime").join(FILE_NAME) {
+            &self.lock
+        } else if relative == Path::new("runtime").join(METADATA_NAME) {
+            &self.metadata_file
+        } else {
+            return Ok(false);
+        };
+        self.revalidate()?;
+        let expected = expected.as_ref().ok_or(ReservationError::Corrupt)?;
+        same_private_file_identity(expected, candidate)?;
+        same_file(candidate, &self.root.join(relative))?;
+        self.revalidate()?;
+        Ok(true)
+    }
+
+    /// Matches only the exact bound report staging file, not similarly named files.
+    /// Legacy unbound metadata proves the promise but never workspace ownership.
+    pub fn matches_staging(&self, path: &Path, file: &File) -> Result<bool, ReservationError> {
+        self.revalidate()?;
+        let Some(binding) = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.staging.as_ref())
+        else {
+            return Ok(false);
+        };
+        if path != self.root.join(STAGING_PARENT).join(&binding.name) {
+            return Ok(false);
+        }
+        if &inspect_staging(&self.root, path, file, false)? != binding {
+            return Err(ReservationError::Corrupt);
+        }
+        self.revalidate()?;
+        Ok(true)
+    }
+}
+
 /// Unlock every acquired lock, including validation failures before an owner
 /// exists and empty recovery. Closing one descriptor is insufficient when a
 /// concurrent fork or duplicate retains the same open-file description.
@@ -105,6 +232,26 @@ impl Drop for ReservationLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
+}
+
+#[cfg(unix)]
+fn same_private_file_identity(expected: &File, candidate: &File) -> Result<(), ReservationError> {
+    use std::os::unix::fs::MetadataExt;
+    let expected = expected.metadata()?;
+    let candidate = candidate.metadata()?;
+    for metadata in [&expected, &candidate] {
+        if !metadata.is_file() || metadata.mode() & 0o7777 != 0o600 || metadata.nlink() != 1 {
+            return Err(ReservationError::Corrupt);
+        }
+    }
+    if (expected.dev(), expected.ino()) != (candidate.dev(), candidate.ino()) {
+        return Err(ReservationError::Corrupt);
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn same_private_file_identity(_: &File, _: &File) -> Result<(), ReservationError> {
+    Err(SingletonError::UnsupportedPlatform.into())
 }
 
 fn open(root: &Path, create: bool) -> Result<Option<File>, ReservationError> {
@@ -721,6 +868,263 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_inventory_requires_binding_and_preserves_full_reservation() {
+        use crate::{
+            StorageAllocationClass, StorageInventoryError, storage_inventory::classify_storage,
+        };
+        use std::io::Write;
+
+        let (root, control) = setup("accounting-inventory-binding");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let mut owner = control.reserve_report_build(&root, &guard, 16384).unwrap();
+        let (path, mut file) = staging_file(&root, 44);
+        let unbound = super::ReportReservationEvidence::capture(&root, &guard).unwrap();
+        let before = classify_storage(&root, &guard, |relative, descriptor| {
+            Ok(
+                if unbound
+                    .matches_staging(&root.join(relative), descriptor)
+                    .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                {
+                    StorageAllocationClass::Workspace
+                } else {
+                    StorageAllocationClass::Unknown
+                },
+            )
+        })
+        .unwrap();
+        assert_eq!(before.workspace_bytes, 0);
+        drop(unbound);
+        owner.bind_staging(&root, &guard, &path, &file).unwrap();
+        file.write_all(&[0x5a; 4096]).unwrap();
+        file.sync_all().unwrap();
+        let evidence = super::ReportReservationEvidence::capture(&root, &guard).unwrap();
+        let after = classify_storage(&root, &guard, |relative, descriptor| {
+            Ok(
+                if evidence
+                    .matches_staging(&root.join(relative), descriptor)
+                    .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                {
+                    StorageAllocationClass::Workspace
+                } else {
+                    StorageAllocationClass::Unknown
+                },
+            )
+        })
+        .unwrap();
+        assert!(after.workspace_bytes >= 4096);
+        assert_eq!(after.unknown_entry_count + 1, before.unknown_entry_count);
+        assert_eq!(after.retained_bytes, 0);
+        assert_eq!(evidence.captured_reserved_bytes(), 16384);
+        drop(owner);
+        evidence.revalidate().unwrap();
+        assert_eq!(evidence.captured_reserved_bytes(), 16384);
+        fs::remove_file(&path).unwrap();
+        let _replacement = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            classify_storage(&root, &guard, |relative, descriptor| {
+                evidence
+                    .matches_staging(&root.join(relative), descriptor)
+                    .map(|owned| {
+                        if owned {
+                            StorageAllocationClass::Workspace
+                        } else {
+                            StorageAllocationClass::Unknown
+                        }
+                    })
+                    .map_err(|_| StorageInventoryError::OwnershipMismatch)
+            }),
+            Err(StorageInventoryError::OwnershipMismatch)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_keeps_full_promise_and_only_matches_bound_identity() {
+        let (root, control) = setup("accounting-evidence-bound");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let mut owner = control.reserve_report_build(&root, &guard, 8192).unwrap();
+        let (path, file) = staging_file(&root, 41);
+        owner.bind_staging(&root, &guard, &path, &file).unwrap();
+        let evidence = super::ReportReservationEvidence::capture(&root, &guard).unwrap();
+        assert_eq!(evidence.captured_reserved_bytes(), 8192);
+        assert!(evidence.matches_staging(&path, &file).unwrap());
+        let (other, other_file) = staging_file(&root, 42);
+        assert!(!evidence.matches_staging(&other, &other_file).unwrap());
+        drop(owner);
+        evidence.revalidate().unwrap();
+        assert_eq!(evidence.captured_reserved_bytes(), 8192);
+        assert!(evidence.matches_staging(&path, &file).unwrap());
+        fs::remove_file(&path).unwrap();
+        let replacement = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        assert!(evidence.matches_staging(&path, &replacement).is_err());
+        assert!(evidence.matches_staging(&path, &file).is_err());
+        assert_eq!(evidence.captured_reserved_bytes(), 8192);
+        drop(evidence);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_is_noncreating_and_rejects_metadata_replacement() {
+        let (root, control) = setup("accounting-evidence-metadata");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let empty = super::ReportReservationEvidence::capture(&root, &guard).unwrap();
+        assert_eq!(empty.captured_reserved_bytes(), 0);
+        assert!(!root.join("runtime/report-reservation.lock").exists());
+        assert!(!root.join("runtime/report-reservation.meta").exists());
+        let owner = control.reserve_report_build(&root, &guard, 8192).unwrap();
+        assert!(empty.revalidate().is_err());
+        let evidence = super::ReportReservationEvidence::capture(&root, &guard).unwrap();
+        let (path, file) = staging_file(&root, 43);
+        assert!(!evidence.matches_staging(&path, &file).unwrap());
+        let metadata = root.join("runtime/report-reservation.meta");
+        let bytes = fs::read(&metadata).unwrap();
+        fs::remove_file(&metadata).unwrap();
+        let mut replacement = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&metadata)
+            .unwrap();
+        std::io::Write::write_all(&mut replacement, &bytes).unwrap();
+        assert!(evidence.revalidate().is_err());
+        assert_eq!(evidence.captured_reserved_bytes(), 8192);
+        drop(owner);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_rejects_root_replacement_even_with_original_runtime_directory() {
+        let (root, _) = setup("accounting-evidence-root-replacement");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let evidence = super::ReportReservationEvidence::capture(&root, &guard).unwrap();
+        let original = root.with_extension("original");
+        fs::rename(&root, &original).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(original.join("runtime"), root.join("runtime")).unwrap();
+        assert!(evidence.revalidate().is_err());
+        assert!(!format!("{evidence:?}").contains(root.to_str().unwrap()));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(original).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_rejects_same_name_lock_replacement() {
+        let (root, control) = setup("accounting-evidence-lock-replacement");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let owner = control.reserve_report_build(&root, &guard, 8192).unwrap();
+        let evidence = super::ReportReservationEvidence::capture(&root, &guard).unwrap();
+        let lock = root.join("runtime/report-reservation.lock");
+        fs::remove_file(&lock).unwrap();
+        let _replacement = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lock)
+            .unwrap();
+        assert!(evidence.revalidate().is_err());
+        assert_eq!(evidence.captured_reserved_bytes(), 8192);
+        assert!(root.join("runtime/report-reservation.meta").exists());
+        drop(owner);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_control_entries_require_their_captured_descriptors() {
+        let (root, control) = setup("accounting-control-descriptors");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let owner = control.reserve_report_build(&root, &guard, 8192).unwrap();
+        let evidence = super::ReportReservationEvidence::capture(&root, &guard).unwrap();
+        let lock_path = Path::new("runtime/report-reservation.lock");
+        let meta_path = Path::new("runtime/report-reservation.meta");
+        let lock = fs::File::open(root.join(lock_path)).unwrap();
+        let metadata = fs::File::open(root.join(meta_path)).unwrap();
+        assert!(evidence.matches_control_entry(lock_path, &lock).unwrap());
+        assert!(
+            evidence
+                .matches_control_entry(meta_path, &metadata)
+                .unwrap()
+        );
+        assert!(evidence.matches_control_entry(meta_path, &lock).is_err());
+        fs::set_permissions(root.join(lock_path), fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(evidence.matches_control_entry(lock_path, &lock).is_err());
+        fs::set_permissions(root.join(lock_path), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            !evidence
+                .matches_control_entry(Path::new("runtime/unowned"), &lock)
+                .unwrap()
+        );
+        assert_eq!(evidence.captured_reserved_bytes(), 8192);
+        drop(owner);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_control_binding_rejects_replace_restore_with_equal_metadata() {
+        let (root, control) = setup("accounting-control-aba");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let _owner = control.reserve_report_build(&root, &guard, 8192).unwrap();
+        let evidence = super::ReportReservationEvidence::capture(&root, &guard).unwrap();
+        let path = root.join("runtime/report-reservation.meta");
+        let original = root.join("runtime/original-meta");
+        let alternate = root.join("runtime/alternate-meta");
+        let mut replacement = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&alternate)
+            .unwrap();
+        std::io::Write::write_all(&mut replacement, &fs::read(&path).unwrap()).unwrap();
+        evidence.revalidate().unwrap();
+        fs::rename(&path, &original).unwrap();
+        fs::rename(&alternate, &path).unwrap();
+        super::same_file(&replacement, &path).unwrap();
+        fs::rename(&path, &alternate).unwrap();
+        fs::rename(&original, &path).unwrap();
+        evidence.revalidate().unwrap();
+        assert!(
+            super::same_private_file_identity(
+                evidence.metadata_file.as_ref().unwrap(),
+                &replacement
+            )
+            .is_err()
+        );
+        assert!(
+            evidence
+                .matches_control_entry(Path::new("runtime/report-reservation.meta"), &replacement)
+                .is_err()
+        );
+        assert_eq!(evidence.captured_reserved_bytes(), 8192);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]
