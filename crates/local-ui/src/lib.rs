@@ -17,8 +17,8 @@ use agent_observability_local_collector::{
     PrivateTurnDetailLookup, REPORT_FILE_NAME, lookup_private_turn_detail,
 };
 use agent_observability_local_runtime::{
-    ConfigServiceError, InstalledLayout, LocalConfigService, LocalRuntimeConfigV3, Singleton,
-    VersionedLocalConfig,
+    ConfigServiceError, CoordinatedSingletonScope, InstalledLayout, LocalConfigService,
+    LocalRuntimeConfigV3, ProductionSingleton, VersionedLocalConfig,
 };
 use agent_observability_local_store::{DashboardQueryService, LocalStore};
 use axum::{
@@ -88,6 +88,7 @@ pub enum UiError {
     Runtime(String),
     Random(String),
     DashboardArtifact(DashboardArtifactError),
+    DashboardCapabilityCleanup { primary: Box<UiError> },
 }
 
 impl std::fmt::Display for UiError {
@@ -99,11 +100,21 @@ impl std::fmt::Display for UiError {
             Self::DashboardArtifact(error) => {
                 write!(formatter, "local dashboard artifact error: {error}")
             }
+            Self::DashboardCapabilityCleanup { primary } => {
+                write!(formatter, "{primary}; dashboard capability cleanup failed")
+            }
         }
     }
 }
 
-impl std::error::Error for UiError {}
+impl std::error::Error for UiError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DashboardCapabilityCleanup { primary } => Some(primary.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DashboardArtifactError {
@@ -170,7 +181,7 @@ pub struct PreparedUi {
     url: String,
     shutdown: Arc<Notify>,
     last_seen: Arc<Mutex<Instant>>,
-    _ui_singleton: Singleton,
+    _ui_singleton: ProductionSingleton,
 }
 
 impl PreparedUi {
@@ -218,7 +229,7 @@ pub struct PreparedDashboard {
     url: String,
     shutdown: Arc<Notify>,
     last_seen: Arc<Mutex<Instant>>,
-    _dashboard_singleton: Singleton,
+    _dashboard_singleton: ProductionSingleton,
 }
 
 impl PreparedDashboard {
@@ -411,8 +422,9 @@ impl IntoResponse for ApiError {
 }
 
 pub async fn prepare(layout: &InstalledLayout) -> Result<PreparedUi, UiError> {
-    let ui_singleton = Singleton::acquire(&layout.runtime.join("settings-ui"))
-        .map_err(|error| UiError::Runtime(error.to_string()))?;
+    let ui_singleton =
+        ProductionSingleton::acquire(&layout.root, CoordinatedSingletonScope::SettingsUi)
+            .map_err(|error| UiError::Runtime(error.to_string()))?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let address = listener.local_addr()?;
     let host = address.to_string();
@@ -451,20 +463,22 @@ pub async fn prepare_dashboard_with_status(
     layout: &InstalledLayout,
     initial_snapshot_failure: Option<DashboardStatusReasonV1>,
 ) -> Result<PreparedDashboard, UiError> {
-    let dashboard_singleton = Singleton::acquire(&layout.runtime.join("dashboard-ui"))
-        .map_err(|error| UiError::Runtime(error.to_string()))?;
+    let dashboard_singleton =
+        ProductionSingleton::acquire(&layout.root, CoordinatedSingletonScope::DashboardUi)
+            .map_err(|error| UiError::Runtime(error.to_string()))?;
     prepare_dashboard_path(layout, dashboard_singleton, initial_snapshot_failure).await
 }
 
 async fn prepare_dashboard_path(
     layout: &InstalledLayout,
-    dashboard_singleton: Singleton,
+    dashboard_singleton: ProductionSingleton,
     initial_snapshot_failure: Option<DashboardStatusReasonV1>,
 ) -> Result<PreparedDashboard, UiError> {
     // The interactive shell must be available even when the manual HTML export is absent
     // or exceeds its independent size bound. Snapshot availability is a query response.
     let report = layout.root.join("logs").join(REPORT_FILE_NAME);
-    let token = load_or_create_dashboard_token(&layout.runtime.join("dashboard-ui"))?;
+    let token =
+        load_or_create_dashboard_token(&layout.runtime.join("dashboard-ui"), &dashboard_singleton)?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, dashboard_port(&layout.root))).await?;
     let address = listener.local_addr()?;
     let host = address.to_string();
@@ -1199,13 +1213,21 @@ fn dashboard_probe(url: &str) -> bool {
 
 #[cfg(unix)]
 fn read_dashboard_token(dir: &Path) -> Result<Option<String>, DashboardArtifactError> {
+    read_dashboard_token_observing(dir, |_| {}).map(|capability| capability.map(|(_, token)| token))
+}
+
+#[cfg(unix)]
+fn read_dashboard_token_observing(
+    dir: &Path,
+    after_metadata: impl FnOnce(&Path),
+) -> Result<Option<(fs::File, String)>, DashboardArtifactError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let path = dir.join(DASHBOARD_CAPABILITY_FILE);
     let mut file = match fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1215,9 +1237,15 @@ fn read_dashboard_token(dir: &Path) -> Result<Option<String>, DashboardArtifactE
     if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 || metadata.len() > 65 {
         return Err(DashboardArtifactError::Unsafe);
     }
+    after_metadata(&path);
     let mut token = String::new();
-    file.read_to_string(&mut token)
+    (&mut file)
+        .take(66)
+        .read_to_string(&mut token)
         .map_err(|_| DashboardArtifactError::Io)?;
+    if token.len() > 65 {
+        return Err(DashboardArtifactError::Unsafe);
+    }
     let token = token.trim_end();
     if token.len() != 64
         || !token
@@ -1226,7 +1254,7 @@ fn read_dashboard_token(dir: &Path) -> Result<Option<String>, DashboardArtifactE
     {
         return Err(DashboardArtifactError::Unsafe);
     }
-    Ok(Some(token.to_owned()))
+    Ok(Some((file, token.to_owned())))
 }
 
 #[cfg(not(unix))]
@@ -1235,10 +1263,169 @@ fn read_dashboard_token(_dir: &Path) -> Result<Option<String>, DashboardArtifact
 }
 
 #[cfg(unix)]
-fn load_or_create_dashboard_token(dir: &Path) -> Result<String, UiError> {
+fn load_or_create_dashboard_token(
+    dir: &Path,
+    singleton: &ProductionSingleton,
+) -> Result<String, UiError> {
+    load_or_create_dashboard_token_observing(dir, singleton, |_| Ok(()))
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DashboardCapabilityCleanupFailure {
+    Authorization,
+    Identity,
+    Unlink,
+    DirectorySync,
+    Postcondition,
+}
+
+#[cfg(unix)]
+fn dashboard_capability_has_exact_identity(file: &fs::File, path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let held = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    Ok(held.is_file()
+        && named.is_file()
+        && held.permissions().mode() & 0o7777 == 0o600
+        && named.permissions().mode() & 0o7777 == 0o600
+        && held.nlink() == 1
+        && named.nlink() == 1
+        && (held.dev(), held.ino()) == (named.dev(), named.ino()))
+}
+
+#[cfg(unix)]
+fn cleanup_failed_dashboard_capability(
+    dir: &Path,
+    directory: &fs::File,
+    path: &Path,
+    file: &fs::File,
+    singleton: &ProductionSingleton,
+    permit: Option<&agent_observability_local_runtime::storage_coherence::StorageWriteGuard<'_>>,
+    before_sync: &mut impl FnMut(&Path),
+) -> Result<(), DashboardCapabilityCleanupFailure> {
+    let revalidate = || {
+        if let Some(permit) = permit {
+            permit
+                .revalidate()
+                .map_err(|_| DashboardCapabilityCleanupFailure::Authorization)?;
+        }
+        singleton
+            .revalidate()
+            .map_err(|_| DashboardCapabilityCleanupFailure::Authorization)
+    };
+
+    revalidate()?;
+    validate_dashboard_directory(directory, dir)
+        .map_err(|_| DashboardCapabilityCleanupFailure::Identity)?;
+    if !dashboard_capability_has_exact_identity(file, path)
+        .map_err(|_| DashboardCapabilityCleanupFailure::Identity)?
+    {
+        return Err(DashboardCapabilityCleanupFailure::Identity);
+    }
+    fs::remove_file(path).map_err(|_| DashboardCapabilityCleanupFailure::Unlink)?;
+    sync_dashboard_directory(directory, dir, before_sync)
+        .map_err(|_| DashboardCapabilityCleanupFailure::DirectorySync)?;
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(DashboardCapabilityCleanupFailure::Postcondition),
+    }
+    revalidate()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn load_or_create_dashboard_token_observing(
+    dir: &Path,
+    singleton: &ProductionSingleton,
+    after_persist: impl FnOnce(&Path) -> Result<(), UiError>,
+) -> Result<String, UiError> {
+    load_or_create_dashboard_token_with_read_observer(dir, singleton, after_persist, |_| {})
+}
+
+#[cfg(unix)]
+fn load_or_create_dashboard_token_with_read_observer(
+    dir: &Path,
+    singleton: &ProductionSingleton,
+    after_persist: impl FnOnce(&Path) -> Result<(), UiError>,
+    after_read: impl FnOnce(&Path),
+) -> Result<String, UiError> {
+    load_or_create_dashboard_token_with_sync_observer(
+        dir,
+        singleton,
+        after_persist,
+        after_read,
+        |_| {},
+    )
+}
+
+#[cfg(unix)]
+fn validate_dashboard_directory(directory: &fs::File, dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let held = directory.metadata()?;
+    let named = fs::symlink_metadata(dir)?;
+    if !held.is_dir()
+        || !named.is_dir()
+        || held.permissions().mode() & 0o7777 != 0o700
+        || named.permissions().mode() & 0o7777 != 0o700
+        || (held.dev(), held.ino()) != (named.dev(), named.ino())
+    {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_dashboard_directory(
+    directory: &fs::File,
+    dir: &Path,
+    before_sync: &mut impl FnMut(&Path),
+) -> std::io::Result<()> {
+    before_sync(dir);
+    validate_dashboard_directory(directory, dir)?;
+    directory.sync_all()?;
+    validate_dashboard_directory(directory, dir)
+}
+
+#[cfg(unix)]
+fn load_or_create_dashboard_token_with_sync_observer(
+    dir: &Path,
+    singleton: &ProductionSingleton,
+    after_persist: impl FnOnce(&Path) -> Result<(), UiError>,
+    after_read: impl FnOnce(&Path),
+    mut before_sync: impl FnMut(&Path),
+) -> Result<String, UiError> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    if let Some(token) = read_dashboard_token(dir).map_err(UiError::DashboardArtifact)? {
+    let permit = singleton
+        .try_begin_write()
+        .map_err(|error| UiError::Runtime(error.to_string()))?;
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_DIRECTORY)
+        .open(dir)?;
+    validate_dashboard_directory(&directory, dir)?;
+
+    if let Some((file, token)) =
+        read_dashboard_token_observing(dir, |_| {}).map_err(UiError::DashboardArtifact)?
+    {
+        after_read(&dir.join(DASHBOARD_CAPABILITY_FILE));
+        if let Some(permit) = permit.as_ref() {
+            permit
+                .revalidate()
+                .map_err(|error| UiError::Runtime(error.to_string()))?;
+        }
+        singleton
+            .revalidate()
+            .map_err(|error| UiError::Runtime(error.to_string()))?;
+        if !dashboard_capability_has_exact_identity(&file, &dir.join(DASHBOARD_CAPABILITY_FILE))
+            .map_err(|_| UiError::DashboardArtifact(DashboardArtifactError::Io))?
+        {
+            return Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe));
+        }
+        validate_dashboard_directory(&directory, dir)?;
         return Ok(token);
     }
     let token = session_token()?;
@@ -1247,15 +1434,66 @@ fn load_or_create_dashboard_token(dir: &Path) -> Result<String, UiError> {
         .create_new(true)
         .write(true)
         .mode(0o600)
-        .open(path)?;
-    file.write_all(token.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
+        .open(&path)?;
+    let result = (|| {
+        file.write_all(token.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        sync_dashboard_directory(&directory, dir, &mut before_sync)?;
+        after_persist(&path)?;
+        if !dashboard_capability_has_exact_identity(&file, &path)
+            .map_err(|_| UiError::DashboardArtifact(DashboardArtifactError::Io))?
+        {
+            return Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe));
+        }
+        if read_dashboard_token(dir)
+            .map_err(UiError::DashboardArtifact)?
+            .as_deref()
+            != Some(token.as_str())
+        {
+            return Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe));
+        }
+        if let Some(permit) = permit.as_ref() {
+            permit
+                .revalidate()
+                .map_err(|error| UiError::Runtime(error.to_string()))?;
+        }
+        singleton
+            .revalidate()
+            .map_err(|error| UiError::Runtime(error.to_string()))?;
+        if !dashboard_capability_has_exact_identity(&file, &path)
+            .map_err(|_| UiError::DashboardArtifact(DashboardArtifactError::Io))?
+        {
+            return Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe));
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if cleanup_failed_dashboard_capability(
+            dir,
+            &directory,
+            &path,
+            &file,
+            singleton,
+            permit.as_ref(),
+            &mut before_sync,
+        )
+        .is_err()
+        {
+            return Err(UiError::DashboardCapabilityCleanup {
+                primary: Box::new(error),
+            });
+        }
+        return Err(error);
+    }
     Ok(token)
 }
 
 #[cfg(not(unix))]
-fn load_or_create_dashboard_token(_dir: &Path) -> Result<String, UiError> {
+fn load_or_create_dashboard_token(
+    _dir: &Path,
+    _singleton: &ProductionSingleton,
+) -> Result<String, UiError> {
     Err(UiError::DashboardArtifact(
         DashboardArtifactError::Unsupported,
     ))
@@ -1449,11 +1687,13 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, DASHBOARD_IDENTITY_HEADER, DashboardArtifactError, DashboardOpenError,
-        DashboardState, LocalConfigService, MAX_REPORT_ARTIFACT_BYTES, PLATFORM_OPEN_CALLS,
-        PLATFORM_OPEN_TEST_LOCK, PlatformOpenError, REPORT_FILE_NAME, constant_time_equal,
-        dashboard_error, dashboard_router, platform_open_command, prepare, prepare_dashboard,
-        read_private_report, router, run_integration, run_platform_opener, session_token,
+        AppState, DASHBOARD_CAPABILITY_FILE, DASHBOARD_IDENTITY_HEADER, DashboardArtifactError,
+        DashboardOpenError, DashboardState, LocalConfigService, MAX_REPORT_ARTIFACT_BYTES,
+        PLATFORM_OPEN_CALLS, PLATFORM_OPEN_TEST_LOCK, PlatformOpenError, REPORT_FILE_NAME, UiError,
+        constant_time_equal, dashboard_error, dashboard_router, load_or_create_dashboard_token,
+        load_or_create_dashboard_token_observing, platform_open_command, prepare,
+        prepare_dashboard, read_private_report, router, run_integration, run_platform_opener,
+        session_token,
     };
     use agent_observability_codex_integration::{CodexIntegrationStatus, IntegrationError};
     use agent_observability_contracts::hash_opaque_identifier;
@@ -1767,6 +2007,436 @@ mod tests {
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_directory_fifo_before_sync_returns_and_releases_permit() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+        use std::os::unix::fs::FileTypeExt;
+
+        const PROBE: &str = "AGENTOBS_DASHBOARD_DIRECTORY_SYNC_PROBE";
+        let Ok(phase) = std::env::var(PROBE) else {
+            for phase in ["publication", "cleanup"] {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::dashboard_directory_fifo_before_sync_returns_and_releases_permit",
+                    ])
+                    .env(PROBE, phase)
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        assert!(status.success(), "{phase}");
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        child.kill().unwrap();
+                        child.wait().unwrap();
+                        panic!("{phase} directory sync blocked on FIFO");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("dashboard-dir-sync-{}", std::process::id()));
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let dir = layout.runtime.join("dashboard-ui");
+        let displaced = layout.runtime.join("displaced-dashboard");
+        let mut syncs = 0;
+        let result = super::load_or_create_dashboard_token_with_sync_observer(
+            &dir,
+            &singleton,
+            |_| Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe)),
+            |_| {},
+            |path| {
+                syncs += 1;
+                if syncs == if phase == "publication" { 1 } else { 2 } {
+                    fs::rename(path, &displaced).unwrap();
+                    assert!(
+                        Command::new("mkfifo")
+                            .args(["-m", "600"])
+                            .arg(path)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert!(fs::symlink_metadata(&dir).unwrap().file_type().is_fifo());
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+        drop(freeze);
+        drop(singleton);
+        assert!(fs::symlink_metadata(&dir).unwrap().file_type().is_fifo());
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_capability_growth_after_metadata_is_rejected() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("dashboard-growth-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join(DASHBOARD_CAPABILITY_FILE);
+        fs::write(&path, "a".repeat(64)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let result = super::read_dashboard_token_observing(&root, |path| {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(&[b' '; 4096])
+                .unwrap();
+        });
+        fs::remove_dir_all(&root).unwrap();
+        assert!(matches!(result, Err(DashboardArtifactError::Unsafe)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_capability_existing_replacement_is_rejected() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "dashboard-existing-replacement-{}",
+            std::process::id()
+        ));
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let dir = layout.runtime.join("dashboard-ui");
+        let token = load_or_create_dashboard_token(&dir, &singleton).unwrap();
+        let result = super::load_or_create_dashboard_token_with_read_observer(
+            &dir,
+            &singleton,
+            |_| Ok(()),
+            |path| {
+                fs::rename(path, dir.join("original")).unwrap();
+                fs::write(path, &token).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            },
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(DASHBOARD_CAPABILITY_FILE)).unwrap(),
+            token
+        );
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+        drop(freeze);
+        drop(singleton);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+        assert!(matches!(
+            result,
+            Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coordinated_dashboard_capability_write_is_busy_without_partial_artifact() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-capability-busy-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = root.join("runtime");
+        let mutation = MutationGuard::try_acquire(&runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+        let dashboard_dir = runtime.join("dashboard-ui");
+
+        let error = load_or_create_dashboard_token(&dashboard_dir, &singleton).unwrap_err();
+        assert!(matches!(
+            error,
+            UiError::Runtime(ref message)
+                if message == "singleton coherence error: storage accounting barrier is busy"
+        ));
+        assert!(!dashboard_dir.join(DASHBOARD_CAPABILITY_FILE).exists());
+
+        drop(freeze);
+        drop(singleton);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_capability_fifo_is_rejected_without_blocking_and_releases_permit() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+
+        const PROBE: &str = "AGENTOBS_DASHBOARD_CAPABILITY_FIFO_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::dashboard_capability_fifo_is_rejected_without_blocking_and_releases_permit",
+                ])
+                .env(PROBE, "1")
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("dashboard capability read blocked on a FIFO");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-capability-fifo-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let capability = layout
+            .runtime
+            .join("dashboard-ui")
+            .join(DASHBOARD_CAPABILITY_FILE);
+        assert!(
+            Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&capability)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert!(matches!(
+            load_or_create_dashboard_token(capability.parent().unwrap(), &singleton),
+            Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        ));
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+
+        drop(freeze);
+        drop(singleton);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_dashboard_capability_creation_removes_owned_artifact() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-capability-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let dashboard_dir = layout.runtime.join("dashboard-ui");
+        let capability = dashboard_dir.join(DASHBOARD_CAPABILITY_FILE);
+
+        let error = load_or_create_dashboard_token_observing(&dashboard_dir, &singleton, |_| {
+            Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            UiError::DashboardArtifact(DashboardArtifactError::Unsafe)
+        ));
+        assert!(!capability.exists());
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+
+        drop(freeze);
+        drop(singleton);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_dashboard_capability_creation_preserves_foreign_replacement() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-capability-replacement-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let dashboard_dir = layout.runtime.join("dashboard-ui");
+        let capability = dashboard_dir.join(DASHBOARD_CAPABILITY_FILE);
+        let displaced = dashboard_dir.join("displaced-capability");
+
+        let error = load_or_create_dashboard_token_observing(&dashboard_dir, &singleton, |path| {
+            fs::rename(path, &displaced)?;
+            let mut foreign = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)?;
+            foreign.write_all(b"FOREIGN_CAPABILITY_SENTINEL")?;
+            foreign.sync_all()?;
+            Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            UiError::DashboardCapabilityCleanup { ref primary }
+                if matches!(primary.as_ref(), UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        ));
+        assert_eq!(
+            fs::read(&capability).unwrap(),
+            b"FOREIGN_CAPABILITY_SENTINEL"
+        );
+        assert_eq!(
+            error.to_string(),
+            "local dashboard artifact error: report is not a private regular file; dashboard capability cleanup failed"
+        );
+
+        drop(singleton);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_capability_cleanup_failure_is_explicit_and_sanitized() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-capability-cleanup-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let dashboard_dir = layout.runtime.join("dashboard-ui");
+        let capability = dashboard_dir.join(DASHBOARD_CAPABILITY_FILE);
+
+        let error = load_or_create_dashboard_token_observing(&dashboard_dir, &singleton, |path| {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o640))?;
+            Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        })
+        .unwrap_err();
+        let token = fs::read_to_string(&capability).unwrap();
+        let rendered = error.to_string();
+        assert!(matches!(
+            error,
+            UiError::DashboardCapabilityCleanup { ref primary }
+                if matches!(primary.as_ref(), UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        ));
+        assert_eq!(
+            rendered,
+            "local dashboard artifact error: report is not a private regular file; dashboard capability cleanup failed"
+        );
+        assert!(!rendered.contains(root.to_string_lossy().as_ref()));
+        assert!(!rendered.contains(token.trim()));
+        assert!(capability.exists());
+
+        drop(singleton);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coordinated_dashboard_releases_write_permit_and_preserves_metadata_on_busy_drop() {
+        use agent_observability_local_runtime::{MutationGuard, storage_coherence::StorageBarrier};
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-coordinated-lifetime-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dashboard = runtime.block_on(prepare_dashboard(&layout)).unwrap();
+        let metadata = layout.runtime.join("dashboard-ui/runtime.meta");
+        let capability = layout.runtime.join("dashboard-ui/capability");
+        let original_metadata = fs::read(&metadata).unwrap();
+        assert!(capability.is_file());
+
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+        drop(dashboard);
+        assert_eq!(fs::read(&metadata).unwrap(), original_metadata);
+        assert!(capability.is_file());
+
+        drop(freeze);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
