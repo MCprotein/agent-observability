@@ -4350,9 +4350,9 @@ struct RssSampler {
     stop: Option<mpsc::Sender<()>>,
     result: mpsc::Receiver<Result<RssPeaks, String>>,
     handle: Option<thread::JoinHandle<()>>,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     sample_count: Arc<AtomicU64>,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     initial_rss_kib: f64,
 }
 
@@ -4439,7 +4439,7 @@ impl RssSampler {
         Ok(peaks)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn wait_for_samples(&self, minimum: u64, timeout: Duration) -> Result<(), String> {
         let started = Instant::now();
         while self.sample_count.load(Ordering::Acquire) < minimum {
@@ -4463,9 +4463,9 @@ fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String>
     let initial = reader.sample_kib()?;
     let (stop_tx, stop_rx) = mpsc::channel();
     let (result_tx, result_rx) = mpsc::channel();
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     let sample_count = Arc::new(AtomicU64::new(1));
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     let sampler_sample_count = Arc::clone(&sample_count);
     let handle = thread::spawn(move || {
         let result = (|| {
@@ -4488,7 +4488,7 @@ fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String>
                 rss_samples_kib.push(rss_kib);
                 peaks.peak_rss_kib = peaks.peak_rss_kib.max(rss_kib);
                 peaks.samples = peaks.samples.saturating_add(1);
-                #[cfg(test)]
+                #[cfg(all(test, target_os = "macos"))]
                 sampler_sample_count.store(peaks.samples, Ordering::Release);
                 let sampled_at = Instant::now();
                 peaks.max_gap_ms = peaks
@@ -4511,9 +4511,9 @@ fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String>
         stop: Some(stop_tx),
         result: result_rx,
         handle: Some(handle),
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "macos"))]
         sample_count,
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "macos"))]
         initial_rss_kib: initial,
     })
 }
@@ -7113,7 +7113,9 @@ mod tests {
             stop: Some(stop_tx),
             result: result_rx,
             handle: Some(handle),
+            #[cfg(target_os = "macos")]
             sample_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(target_os = "macos")]
             initial_rss_kib: 0.0,
         };
         let started = Instant::now();
