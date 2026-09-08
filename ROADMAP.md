@@ -146,6 +146,10 @@ the disk/memory enforcement boundary before product integration; no dependency i
 The first shim dependency preflight found no suitable safe pass-through candidate under current
 Rust/unsafe policy. P1 is blocked for that candidate; compare alternatives without treating the
 design-scope approval as runtime recovery or permission to weaken the policy.
+A first existing-schema prerequisite replaces disposition retained-set materialization with a
+scalar rowid cutoff. Regression and synthetic VM-work evidence are in
+[Staged Ingest](docs/STAGED_INGEST.md#structural-path-investigation--disposition-pruning).
+This does not lower admission or close the physical-write/memory proof gate.
 The earlier long workflow `34135080615` was cancelled before its normative job when those defects
 required a new candidate. Settle final changes before dispatching exact-revision long evidence.
 

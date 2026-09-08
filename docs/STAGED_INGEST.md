@@ -84,3 +84,32 @@ precommit point, not the peak or an enforceable dirty-page/RSS bound; collector 
 Further proof must cover topology fan-out, ledger pruning and steady-state paged snapshots.
 Progress and CI status live in the
 [v1.11 review checkpoint](reviews/v1.11.0.md).
+
+## Structural-path investigation — disposition pruning
+
+The first prerequisite is implemented in development: `prune_adapter_dispositions` now deletes
+through one scalar rowid cutoff instead of materializing the newest 100,000 rowids for `NOT IN`.
+It still keeps the largest 100,000 rowids, including gaps and signed extremes; no rowid arithmetic,
+schema, transaction boundary, public API, PRAGMA or admission allowance changes are involved.
+Other retention/expired-state pruning statements are outside this slice and remain unchanged.
+
+`crates/local-store/src/disposition_pruning_tests.rs` compares the old/new SQL, covers empty and
+below/at/above-limit sets, the production-sized bound, reverse insertion order, rollback and
+repeated pruning. The exact production SQL's pinned SQLite program must not use `OpenEphemeral`,
+`SorterOpen` or `IdxInsert` to build the retained set. This test failed with the old statement
+and passed with the scalar cutoff. A fixed 100,001-row synthetic case, deleting one row in either
+transaction with the full current schema/indexes, used 1,400,040 VM steps before and 200,044 after. These are instruction counts, not
+latency, RSS measurements or a resource-quota proof. The cutoff still scans up to the retained bound.
+
+| Candidate path | What is established | What is not established |
+| --- | --- | --- |
+| Existing matching disposition replay, without correlation update | The matching branch returns `Duplicate` before any SQL writes in that routine | Entire collector retry has other state/marker behavior; it is not a new-data recovery path |
+| New disposition only, no correlation update | Writes disposition ledger and source cursor; with a validated pre-ledger count at most 100,000, each insert can require at most one pruned row | No runtime eligibility check has been enabled; B-tree/index balancing, overflow, freelist/pointer-map and error-path journal/RAM bounds remain open |
+| New observation, even when hot | Normalization/reduction and record/topology writes remain in the atomic batch | Rehydration, child fan-out, existing-record decoding and correlated metadata prevent assuming a small write/memory set |
+| Oversized legacy ledger or migration | Scalar cutoff preserves the old retained-row semantics | Many rows may still be deleted; no fixed small write allowance follows from removing the retained set |
+
+The 512-byte domain identifier limit is not a bound on the existing database's total content or
+on all SQLite internal allocations. Before reducing admission for a new-data path, the remaining
+physical write and memory bounds must be proved under the same mutation guard/transaction. Until
+then the existing conservative admission remains in force; this optimization alone does not
+unblock installed collection or make the isolated-shim candidate viable.

@@ -1,6 +1,8 @@
 //! Private, replayable `SQLite` authority for standalone observations.
 
 mod dashboard_query;
+#[cfg(test)]
+mod disposition_pruning_tests;
 mod lifecycle;
 mod migration_admission;
 mod report_ack;
@@ -76,6 +78,9 @@ const MAX_CODEX_RECENTLY_COMPLETED_CORRELATIONS: usize = 1024;
 const MAX_EXPIRED_SPAN_GUARDS: u64 = 100_000;
 const MAX_RETENTION_RECEIPTS: u64 = 1_024;
 const MAX_ADAPTER_DISPOSITIONS: u64 = 100_000;
+// The scalar is the first row beyond the retained bound (NULL means nothing to prune).
+// Avoid constructing the retained 100,000-row set; rowid gaps and extremes require no arithmetic.
+const PRUNE_ADAPTER_DISPOSITIONS_SQL: &str = "DELETE FROM adapter_dispositions WHERE rowid <= (SELECT rowid FROM adapter_dispositions ORDER BY rowid DESC LIMIT 1 OFFSET ?1)";
 const MIN_ARCHIVE_RECORDS: u32 = 1;
 const MAX_ARCHIVE_RECORDS: u32 = 100_000;
 const MIN_ARCHIVE_BYTES: u64 = 64 * 1024;
@@ -1999,7 +2004,7 @@ fn pending_retention_receipt_exists(tx: &Transaction<'_>) -> Result<bool, StoreE
 
 fn prune_adapter_dispositions(tx: &Transaction<'_>) -> Result<(), StoreError> {
     tx.execute(
-        "DELETE FROM adapter_dispositions WHERE rowid NOT IN (SELECT rowid FROM adapter_dispositions ORDER BY rowid DESC LIMIT ?1)",
+        PRUNE_ADAPTER_DISPOSITIONS_SQL,
         [i64::try_from(MAX_ADAPTER_DISPOSITIONS).map_err(|_| StoreError::SchemaMismatch)?],
     )?;
     Ok(())
