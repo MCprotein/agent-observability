@@ -2823,6 +2823,12 @@ fn refresh_report_from_root_observing(
 #[must_use]
 pub fn submit_notify(root: &Path, payload: &[u8]) -> NotifyOutcome {
     let deadline = StdInstant::now() + PRIVATE_NOTIFY_FOREGROUND_DEADLINE;
+    submit_notify_until(root, payload, deadline)
+}
+
+// Keep the production deadline fixed at entry while allowing functional transport
+// tests to exercise this same path independently of host scheduling latency.
+fn submit_notify_until(root: &Path, payload: &[u8], deadline: StdInstant) -> NotifyOutcome {
     let Ok(projected) = project_notify_json(payload) else {
         return NotifyOutcome::Rejected;
     };
@@ -5899,7 +5905,13 @@ mod tests {
             tokio::task::yield_now().await;
             let root = accepted.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                submit_notify(&root, &raw_notify("thread-ok", "turn-ok"))
+                // This is an authenticated functional-success check, not a claim
+                // that a loaded debug CI host completes durable ingest in 250ms.
+                super::submit_notify_until(
+                    &root,
+                    &raw_notify("thread-ok", "turn-ok"),
+                    super::StdInstant::now() + Duration::from_secs(5),
+                )
             })
             .await
             .unwrap();
@@ -5910,6 +5922,32 @@ mod tests {
         for root in [refused, rogue, accepted] {
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn notify_expired_deadline_never_connects_or_changes_the_foreground_budget() {
+        assert_eq!(
+            super::PRIVATE_NOTIFY_FOREGROUND_DEADLINE,
+            Duration::from_millis(250)
+        );
+        let root = test_root("notify-expired-deadline");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        configure_port(&root, listener.local_addr().unwrap().port());
+        let expired = super::StdInstant::now();
+        assert_eq!(
+            super::submit_notify_until(&root, &raw_notify("expired", "expired"), expired),
+            NotifyOutcome::Unavailable
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            super::submit_notify_until(&root, b"{}", expired),
+            NotifyOutcome::Rejected
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
