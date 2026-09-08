@@ -2,8 +2,9 @@
 #![cfg(unix)]
 
 use agent_observability_adapter_codex::{AdapterItem, parse_handoff_jsonl};
+use agent_observability_local_collector::storage_ownership::CollectorStorageOwnershipEvidence;
 use agent_observability_local_runtime::{
-    MutationGuard, RuntimeControl, StorageAllocationClass, StorageInventoryError,
+    InstalledLayout, MutationGuard, RuntimeControl, StorageAllocationClass, StorageInventoryError,
     config::ConfigAccountingEvidence,
     install, load,
     reservation::ReportReservationEvidence,
@@ -66,6 +67,19 @@ fn three_synthetic_generations_preserve_reservations_and_classify_under_real_fre
     let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
     let setup_freeze = barrier.try_freeze(&mutation).unwrap();
     let mut store = LocalStore::open(layout.state.join("store")).unwrap();
+    // This exact semantic marker must be owned by the collector authority, not
+    // accepted merely because it is a private runtime file.
+    {
+        use std::io::Write;
+        let mut marker = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(layout.runtime.join("report-dirty"))
+            .unwrap();
+        marker.write_all(b"dirty\n").unwrap();
+        marker.sync_all().unwrap();
+    }
     // Even a zero-allocation file needs semantic ownership; its name never suffices.
     fs::OpenOptions::new()
         .write(true)
@@ -122,7 +136,7 @@ fn three_synthetic_generations_preserve_reservations_and_classify_under_real_fre
         assert!(permits.phases >= 3);
         let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
         let freeze = barrier.try_freeze(&mutation).unwrap();
-        assert_accounting(&root, &mutation, &freeze, &store);
+        assert_accounting(&layout, &mutation, &freeze, &store);
         reservation
             .validate_staging(&root, &mutation, staging.path(), staging.identity_file())
             .unwrap();
@@ -168,12 +182,14 @@ fn ingest_generation(store: &mut LocalStore, generation: u32) {
 }
 
 fn assert_accounting(
-    root: &std::path::Path,
+    layout: &InstalledLayout,
     mutation: &MutationGuard,
     freeze: &agent_observability_local_runtime::storage_coherence::StorageFreezeGuard<'_, '_>,
     store: &LocalStore,
 ) {
+    let root = layout.root.as_path();
     let config_evidence = ConfigAccountingEvidence::capture(root, mutation).unwrap();
+    let collector_evidence = CollectorStorageOwnershipEvidence::capture(layout).unwrap();
     let reservation_evidence = ReportReservationEvidence::capture(root, mutation).unwrap();
     assert_eq!(
         reservation_evidence.captured_reserved_bytes(),
@@ -222,6 +238,9 @@ fn assert_accounting(
                     || authority
                         .recognizes(&path, file)
                         .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                    || collector_evidence
+                        .matches_entry(relative, file)
+                        .map_err(|_| StorageInventoryError::OwnershipMismatch)?
                 {
                     return Ok(StorageAllocationClass::Retained);
                 }
@@ -249,6 +268,7 @@ fn assert_accounting(
     assert_eq!(allocation.unknown_entry_count, 1);
     assert_eq!(allocation.unknown_bytes, 0);
     config_evidence.revalidate().unwrap();
+    collector_evidence.revalidate().unwrap();
     reservation_evidence.revalidate().unwrap();
     assert_eq!(
         reservation_evidence.captured_reserved_bytes(),
