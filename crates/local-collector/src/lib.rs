@@ -2,6 +2,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 mod report_coherence;
+mod settings_coordination;
 pub mod storage_ownership;
 
 use report_coherence::{ReportMutationScope, ReportWritePermits, report_coherence_failure};
@@ -15,10 +16,11 @@ use agent_observability_adapter_codex::{
 #[cfg(test)]
 use agent_observability_application::project_report;
 use agent_observability_contracts::{CollectorDegradationReasonV1, LOCAL_COLLECTOR_HEALTH_VERSION};
+use agent_observability_local_runtime::storage_coherence::{StorageBarrier, StorageMutationWriter};
 use agent_observability_local_runtime::{
-    Admission, ControlError, InstalledLayout, LocalRuntimeConfigV3, MutationGuard, PressureSample,
-    REPORT_RESERVATION_METADATA_ALLOWANCE, ReservationError, RuntimeControl, Singleton,
-    SingletonError, StorageBudget, inspect, install, load,
+    Admission, ControlError, CoordinatedSingletonScope, InstalledLayout, LocalRuntimeConfigV3,
+    MutationGuard, PressureSample, ProductionSingleton, REPORT_RESERVATION_METADATA_ALLOWANCE,
+    ReservationError, RuntimeControl, SingletonError, StorageBudget, inspect, install, load,
 };
 use agent_observability_local_store::{
     LocalStore, MISSING_RATE_FINGERPRINT, ReportViewBuildError, ReportViewCatalogError,
@@ -323,6 +325,13 @@ impl PrivateTurnDetailReceiptV1 {
 
 #[derive(Debug)]
 pub enum CollectorError {
+    StorageWriteUnverified {
+        /// Publication was crossed or the operation returned successfully.
+        /// False means completion is unknown, not that nothing was written.
+        operation_completed: bool,
+        primary: Option<Box<CollectorError>>,
+        verification: Box<CollectorError>,
+    },
     LifecycleStoragePressure,
     DashboardStorageCapacity,
     Io(std::io::Error),
@@ -335,27 +344,28 @@ pub enum CollectorError {
 
 /// Creates or loads the private, idempotent local collector settings.
 pub fn install_settings(root: &Path) -> Result<CollectorSettings, CollectorError> {
-    let layout = install(root).map_err(runtime_error)?;
-    recover_settings_migration_before_install(&layout)?;
-    let path = settings_path(&layout);
-    match fs::symlink_metadata(&path) {
-        Ok(_) => {
-            let snapshot = read_private_snapshot(&path, MAX_SETTINGS_BYTES)?;
-            if let Ok(settings) = parse_owned_settings(&snapshot.bytes) {
-                if settings.credentials.expires_at_unix_ms > current_unix_ms()? {
-                    validate_owned_credentials(&layout, &settings)?;
-                    return Ok(settings);
+    settings_coordination::with_settings_writer(root, |layout| {
+        recover_settings_migration_before_install(layout)?;
+        let path = settings_path(layout);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let snapshot = read_private_snapshot(&path, MAX_SETTINGS_BYTES)?;
+                if let Ok(settings) = parse_owned_settings(&snapshot.bytes) {
+                    if settings.credentials.expires_at_unix_ms > current_unix_ms()? {
+                        validate_owned_credentials(layout, &settings)?;
+                        return Ok(settings);
+                    }
+                    validate_owned_credentials(layout, &settings)?;
+                    return replace_settings(layout, Some(&snapshot));
                 }
-                validate_owned_credentials(&layout, &settings)?;
-                return replace_settings(&layout, Some(&snapshot));
+                let legacy_generation =
+                    validate_legacy_settings_for_migration(layout, &snapshot.bytes)?;
+                begin_settings_migration(layout, &snapshot, legacy_generation)
             }
-            let legacy_generation =
-                validate_legacy_settings_for_migration(&layout, &snapshot.bytes)?;
-            begin_settings_migration(&layout, &snapshot, legacy_generation)
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => rotate_settings(layout),
+            Err(error) => Err(error.into()),
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => rotate_settings(&layout),
-        Err(error) => Err(error.into()),
-    }
+    })
 }
 
 fn validate_legacy_settings_for_migration(
@@ -505,6 +515,9 @@ fn begin_settings_migration(
         previous,
         MAX_SETTINGS_BYTES,
     ) {
+        if matches!(error, CollectorError::StorageWriteUnverified { .. }) {
+            return Err(error);
+        }
         let cleanup = cleanup_credential_generation(layout, &settings.generation)
             .and_then(|()| remove_private_file(&migration_path));
         return Err(match cleanup {
@@ -532,6 +545,9 @@ fn replace_settings(
         None => write_private_json(&settings_path(layout), &settings),
     };
     if let Err(error) = write_result {
+        if matches!(error, CollectorError::StorageWriteUnverified { .. }) {
+            return Err(error);
+        }
         return Err(
             match cleanup_credential_generation(layout, &settings.generation) {
                 Ok(()) => error,
@@ -594,12 +610,19 @@ fn cleanup_credential_generation(
     generation: &str,
 ) -> Result<(), CollectorError> {
     let tls_root = layout.runtime.join(TLS_DIRECTORY);
+    let directory = match settings_coordination::SettingsDirectory::open(&tls_root) {
+        Ok(directory) => directory,
+        Err(CollectorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     match fs::remove_dir_all(tls_root.join(generation)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     }
-    File::open(tls_root)?.sync_all()?;
+    directory.sync()?;
     Ok(())
 }
 
@@ -629,64 +652,67 @@ fn load_settings_from_layout(
 
 /// Commits a pending legacy settings migration after collector service and Codex config commit.
 pub fn commit_settings_migration(root: &Path) -> Result<(), CollectorError> {
-    let layout = install(root).map_err(runtime_error)?;
-    let Some(mut migration) = load_settings_migration(&layout)? else {
-        return Ok(());
-    };
-    let current = read_private_snapshot(&settings_path(&layout), MAX_SETTINGS_BYTES)?;
-    let settings = parse_owned_settings(&current.bytes)?;
-    if settings.generation != migration.replacement_generation {
-        return Err(CollectorError::Runtime(
-            "collector settings changed before migration commit".into(),
-        ));
-    }
-    if migration.phase == SettingsMigrationPhase::Pending {
-        let path = settings_migration_path(&layout);
-        let snapshot = read_private_snapshot(&path, MAX_SETTINGS_MIGRATION_BYTES)?;
-        migration.phase = SettingsMigrationPhase::IntegrationCommitted;
-        write_private_json_if_unchanged(
-            &path,
-            &migration,
-            &snapshot,
-            MAX_SETTINGS_MIGRATION_BYTES,
-        )?;
-    }
-    finalize_committed_settings_migration(&layout, &migration)
+    settings_coordination::with_settings_writer(root, |layout| {
+        let Some(mut migration) = load_settings_migration(layout)? else {
+            return Ok(());
+        };
+        let current = read_private_snapshot(&settings_path(layout), MAX_SETTINGS_BYTES)?;
+        let settings = parse_owned_settings(&current.bytes)?;
+        if settings.generation != migration.replacement_generation {
+            return Err(CollectorError::Runtime(
+                "collector settings changed before migration commit".into(),
+            ));
+        }
+        if migration.phase == SettingsMigrationPhase::Pending {
+            let path = settings_migration_path(layout);
+            let snapshot = read_private_snapshot(&path, MAX_SETTINGS_MIGRATION_BYTES)?;
+            migration.phase = SettingsMigrationPhase::IntegrationCommitted;
+            write_private_json_if_unchanged(
+                &path,
+                &migration,
+                &snapshot,
+                MAX_SETTINGS_MIGRATION_BYTES,
+            )?;
+        }
+        finalize_committed_settings_migration(layout, &migration)
+    })
 }
 
 /// Restores exact legacy settings when a collector/config integration transaction fails.
 pub fn rollback_settings_migration(root: &Path) -> Result<(), CollectorError> {
-    let layout = install(root).map_err(runtime_error)?;
-    let Some(migration) = load_settings_migration(&layout)? else {
-        return Ok(());
-    };
-    if migration.phase == SettingsMigrationPhase::IntegrationCommitted {
-        return finalize_committed_settings_migration(&layout, &migration);
-    }
-    let path = settings_path(&layout);
-    let current = read_private_snapshot(&path, MAX_SETTINGS_BYTES)?;
-    let previous = PrivateFileSnapshot {
-        bytes: migration.previous_settings.clone(),
-        mode: migration.previous_mode,
-    };
-    if current != previous {
-        let settings = parse_owned_settings(&current.bytes)?;
-        if settings.generation != migration.replacement_generation {
-            return Err(CollectorError::Runtime(
-                "collector settings changed before migration rollback".into(),
-            ));
+    settings_coordination::with_settings_writer(root, |layout| {
+        let Some(migration) = load_settings_migration(layout)? else {
+            return Ok(());
+        };
+        if migration.phase == SettingsMigrationPhase::IntegrationCommitted {
+            return finalize_committed_settings_migration(layout, &migration);
         }
-        let validated_generation =
-            validate_legacy_settings_for_migration(&layout, &previous.bytes)?;
-        if validated_generation != migration.previous_generation {
-            return Err(CollectorError::Runtime(
-                "collector migration rollback generation mismatch".into(),
-            ));
+        let path = settings_path(layout);
+        let current = read_private_snapshot(&path, MAX_SETTINGS_BYTES)?;
+        let previous = PrivateFileSnapshot {
+            bytes: migration.previous_settings.clone(),
+            mode: migration.previous_mode,
+        };
+        if current != previous {
+            let settings = parse_owned_settings(&current.bytes)?;
+            if settings.generation != migration.replacement_generation {
+                return Err(CollectorError::Runtime(
+                    "collector settings changed before migration rollback".into(),
+                ));
+            }
+            let validated_generation =
+                validate_legacy_settings_for_migration(layout, &previous.bytes)?;
+            if validated_generation != migration.previous_generation {
+                return Err(CollectorError::Runtime(
+                    "collector migration rollback generation mismatch".into(),
+                ));
+            }
+            write_private_bytes_if_unchanged(&path, &previous, &current)?;
         }
-        write_private_bytes_if_unchanged(&path, &previous, &current)?;
-    }
-    cleanup_credential_generation(&layout, &migration.replacement_generation)?;
-    remove_private_file(&settings_migration_path(&layout))
+        cleanup_credential_generation(layout, &migration.replacement_generation)
+            .and_then(|()| remove_private_file(&settings_migration_path(layout)))
+            .map_err(settings_coordination::published_finalization_error)
+    })
 }
 
 /// Reports whether an exact settings migration journal still requires settlement.
@@ -750,17 +776,20 @@ fn finalize_committed_settings_migration(
     layout: &InstalledLayout,
     migration: &SettingsMigrationV1,
 ) -> Result<(), CollectorError> {
-    let current = read_private_snapshot(&settings_path(layout), MAX_SETTINGS_BYTES)?;
-    let settings = parse_owned_settings(&current.bytes)?;
-    if settings.generation != migration.replacement_generation {
-        return Err(CollectorError::Runtime(
-            "committed collector settings migration cannot be finalized".into(),
-        ));
-    }
-    if let Some(previous_generation) = &migration.previous_generation {
-        cleanup_credential_generation(layout, previous_generation)?;
-    }
-    remove_private_file(&settings_migration_path(layout))
+    (|| {
+        let current = read_private_snapshot(&settings_path(layout), MAX_SETTINGS_BYTES)?;
+        let settings = parse_owned_settings(&current.bytes)?;
+        if settings.generation != migration.replacement_generation {
+            return Err(CollectorError::Runtime(
+                "committed collector settings migration cannot be finalized".into(),
+            ));
+        }
+        if let Some(previous_generation) = &migration.previous_generation {
+            cleanup_credential_generation(layout, previous_generation)?;
+        }
+        remove_private_file(&settings_migration_path(layout))
+    })()
+    .map_err(settings_coordination::published_finalization_error)
 }
 
 fn valid_generation(generation: &str) -> bool {
@@ -793,29 +822,30 @@ pub fn recover_occupied_persisted_port(
     root: &Path,
     expected: &CollectorSettings,
 ) -> Result<CollectorSettings, CollectorError> {
-    let layout = install(root).map_err(runtime_error)?;
-    let current = load_settings(root)?;
-    if current != *expected {
-        return Err(CollectorError::Runtime(
-            "collector settings changed during port recovery".into(),
-        ));
-    }
-
-    match StdTcpListener::bind((Ipv4Addr::LOCALHOST, current.port)) {
-        Ok(listener) => {
-            drop(listener);
-            return Ok(current);
+    settings_coordination::with_settings_writer(root, |layout| {
+        let current = load_settings_from_layout(layout)?;
+        if current != *expected {
+            return Err(CollectorError::Runtime(
+                "collector settings changed during port recovery".into(),
+            ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
-        Err(error) => return Err(error.into()),
-    }
 
-    let reservation = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-    let mut recovered = current;
-    recovered.port = reservation.local_addr()?.port();
-    write_private_json(&settings_path(&layout), &recovered)?;
-    drop(reservation);
-    Ok(recovered)
+        match StdTcpListener::bind((Ipv4Addr::LOCALHOST, current.port)) {
+            Ok(listener) => {
+                drop(listener);
+                return Ok(current);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let reservation = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let mut recovered = current;
+        recovered.port = reservation.local_addr()?.port();
+        write_private_json(&settings_path(layout), &recovered)?;
+        drop(reservation);
+        Ok(recovered)
+    })
 }
 
 fn settings_path(layout: &InstalledLayout) -> PathBuf {
@@ -894,8 +924,10 @@ fn generate_credentials(
 ) -> Result<CredentialMetadata, CollectorError> {
     let tls_root = layout.runtime.join(TLS_DIRECTORY);
     ensure_private_directory_tree(&layout.runtime, &tls_root)?;
+    let tls_directory = settings_coordination::SettingsDirectory::open(&tls_root)?;
     let generation_dir = tls_root.join(generation);
     create_private_directory(&generation_dir)?;
+    let directory = settings_coordination::SettingsDirectory::open(&generation_dir)?;
 
     let now = OffsetDateTime::now_utc();
     let not_after = now
@@ -936,8 +968,8 @@ fn generate_credentials(
     ] {
         write_private_file(&generation_dir.join(name), &bytes)?;
     }
-    File::open(&generation_dir)?.sync_all()?;
-    File::open(&tls_root)?.sync_all()?;
+    directory.sync()?;
+    tls_directory.sync()?;
 
     let prefix = format!("{TLS_DIRECTORY}/{generation}");
     Ok(CredentialMetadata {
@@ -1034,10 +1066,7 @@ fn settings_temporary_path(parent: &Path) -> PathBuf {
     ))
 }
 
-fn write_private_json_temporary<T: Serialize>(
-    path: &Path,
-    value: &T,
-) -> Result<File, CollectorError> {
+fn create_settings_temporary(path: &Path) -> Result<File, CollectorError> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -1045,29 +1074,89 @@ fn write_private_json_temporary<T: Serialize>(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(path)?;
-    serde_json::to_writer_pretty(&mut file, value)
-        .map_err(|_| CollectorError::Runtime("collector settings serialization failed".into()))?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    Ok(file)
+    options.open(path).map_err(Into::into)
+}
+
+fn finish_settings_temporary(
+    directory: &settings_coordination::SettingsDirectory,
+    path: &Path,
+    file: &File,
+    result: Result<(), CollectorError>,
+) -> Result<(), CollectorError> {
+    let cleanup = (|| {
+        directory.revalidate().map_err(|_| ())?;
+        let named = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(()),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = file.metadata().map_err(|_| ())?;
+            if !named.is_file() || (named.dev(), named.ino()) != (held.dev(), held.ino()) {
+                return Err(());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (named, file);
+            return Err(());
+        }
+        match fs::remove_file(path) {
+            Ok(()) => directory.sync().map_err(|_| ()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(()),
+        }
+    })();
+    match (result, cleanup) {
+        (result, Ok(())) => result,
+        (Err(error @ CollectorError::StorageWriteUnverified { .. }), Err(())) => {
+            let operation_completed = matches!(
+                &error,
+                CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    ..
+                }
+            );
+            Err(CollectorError::StorageWriteUnverified {
+                operation_completed,
+                primary: Some(Box::new(error)),
+                verification: Box::new(CollectorError::Runtime(
+                    "collector temporary cleanup failed".into(),
+                )),
+            })
+        }
+        (Ok(()), Err(())) => Err(CollectorError::StorageWriteUnverified {
+            operation_completed: true,
+            primary: None,
+            verification: Box::new(CollectorError::Runtime(
+                "collector temporary cleanup failed".into(),
+            )),
+        }),
+        (Err(error), Err(())) => Err(CollectorError::Runtime(format!(
+            "{error}; collector temporary cleanup failed"
+        ))),
+    }
 }
 
 fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CollectorError> {
     let parent = path
         .parent()
         .ok_or_else(|| CollectorError::Runtime("collector settings have no parent".into()))?;
-    validate_private_directory(parent)?;
+    let directory = settings_coordination::SettingsDirectory::open(parent)?;
     let temporary = settings_temporary_path(parent);
+    let mut file = create_settings_temporary(&temporary)?;
     let result = (|| {
-        let file = write_private_json_temporary(&temporary, value)?;
-        drop(file);
-        fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
+        serde_json::to_writer_pretty(&mut file, value).map_err(|_| {
+            CollectorError::Runtime("collector settings serialization failed".into())
+        })?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        directory.publish(&temporary, &file, path)?;
         Ok(())
     })();
-    let _ = fs::remove_file(&temporary);
-    result
+    finish_settings_temporary(&directory, &temporary, &file, result)
 }
 
 fn write_private_json_if_unchanged<T: Serialize>(
@@ -1079,23 +1168,25 @@ fn write_private_json_if_unchanged<T: Serialize>(
     let parent = path
         .parent()
         .ok_or_else(|| CollectorError::Runtime("collector settings have no parent".into()))?;
-    validate_private_directory(parent)?;
+    let directory = settings_coordination::SettingsDirectory::open(parent)?;
     let temporary = settings_temporary_path(parent);
+    let mut file = create_settings_temporary(&temporary)?;
     let result = (|| {
-        let file = write_private_json_temporary(&temporary, value)?;
-        drop(file);
+        serde_json::to_writer_pretty(&mut file, value).map_err(|_| {
+            CollectorError::Runtime("collector settings serialization failed".into())
+        })?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
         let current = read_private_snapshot(path, max_bytes)?;
         if current != *expected {
             return Err(CollectorError::Runtime(
                 "collector settings changed during credential replacement".into(),
             ));
         }
-        fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
+        directory.publish(&temporary, &file, path)?;
         Ok(())
     })();
-    let _ = fs::remove_file(&temporary);
-    result
+    finish_settings_temporary(&directory, &temporary, &file, result)
 }
 
 fn write_private_bytes_if_unchanged(
@@ -1106,42 +1197,40 @@ fn write_private_bytes_if_unchanged(
     let parent = path
         .parent()
         .ok_or_else(|| CollectorError::Runtime("collector settings have no parent".into()))?;
-    validate_private_directory(parent)?;
+    let directory = settings_coordination::SettingsDirectory::open(parent)?;
     let temporary = settings_temporary_path(parent);
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(replacement.mode & 0o777)
+            .custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&temporary)?;
     let result = (|| {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(replacement.mode & 0o777)
-                .custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = options.open(&temporary)?;
         file.write_all(&replacement.bytes)?;
         file.sync_all()?;
-        drop(file);
         let current = read_private_snapshot(path, MAX_SETTINGS_BYTES)?;
         if current != *expected {
             return Err(CollectorError::Runtime(
                 "collector settings changed during migration rollback".into(),
             ));
         }
-        fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
+        directory.publish(&temporary, &file, path)?;
         Ok(())
     })();
-    let _ = fs::remove_file(&temporary);
-    result
+    finish_settings_temporary(&directory, &temporary, &file, result)
 }
 
 fn remove_private_file(path: &Path) -> Result<(), CollectorError> {
     let parent = path
         .parent()
         .ok_or_else(|| CollectorError::Runtime("collector file has no parent".into()))?;
+    let directory = settings_coordination::SettingsDirectory::open(parent)?;
     match fs::remove_file(path) {
-        Ok(()) => File::open(parent)?.sync_all().map_err(Into::into),
+        Ok(()) => directory.sync(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -1156,7 +1245,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), CollectorError> {
     let parent = path
         .parent()
         .ok_or_else(|| CollectorError::Runtime("collector credential has no parent".into()))?;
-    validate_private_directory(parent)?;
+    let directory = settings_coordination::SettingsDirectory::open(parent)?;
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -1167,6 +1256,8 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), CollectorError> {
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    settings_coordination::require_named_identity(path, &file)?;
+    directory.sync()?;
     Ok(())
 }
 
@@ -1254,6 +1345,8 @@ fn credential_path(layout: &InstalledLayout, relative: &str) -> Result<PathBuf, 
 impl std::fmt::Display for CollectorError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::StorageWriteUnverified { .. } => formatter
+                .write_str("collector settings write unverified; secondary verification failed"),
             Self::LifecycleStoragePressure => {
                 formatter.write_str("lifecycle temporary storage headroom unavailable")
             }
@@ -1272,6 +1365,11 @@ impl std::fmt::Display for CollectorError {
 impl std::error::Error for CollectorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::StorageWriteUnverified {
+                primary,
+                verification,
+                ..
+            } => Some(primary.as_deref().unwrap_or(verification.as_ref())),
             Self::Io(error) | Self::RequestIo { source: error, .. } => Some(error),
             Self::Runtime(_) | Self::LifecycleStoragePressure | Self::DashboardStorageCapacity => {
                 None
@@ -1499,51 +1597,15 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         },
     )?;
     let tls_config = build_server_config(&layout, &options.credentials)?;
-    let singleton = Singleton::acquire(&layout.runtime.join("collector")).map_err(runtime_error)?;
-    let mutation = try_collector_mutation(&layout.runtime)?;
-    let config = load(&layout.config).map_err(runtime_error)?;
-    recover_report_reservation_for_startup(&layout, &config, &mutation)?;
-    maintain_private_turn_details_locked(&layout, &config, SystemTime::now())?;
-    let store = open_store(&mutation, &layout, &config)?;
-    recover_report_view_catalog_for_startup(&store)?;
-    let report_status = store.report_status().map_err(runtime_error)?;
-    let report_missing = automatic_report_view_missing(&store)?;
-    let report_wakeup = reconcile_report_state(&layout, report_status.pending() || report_missing);
-    let report_dirty = report_status.pending() || report_missing;
-    let source_generation = SOURCE_GENERATION.to_owned();
-    let last_cursor = store
-        .cursor("codex", &source_generation)
-        .map_err(runtime_error)?;
-    let now = current_unix_ms()?;
-    let request_correlation = store
-        .codex_request_correlation_state(&source_generation)
-        .map_err(runtime_error)?
-        .map(|snapshot| OtlpRequestCorrelationState::from_persisted_json(&snapshot, now))
-        .transpose()
-        .map_err(runtime_error)?
-        .unwrap_or_default();
-    drop(mutation);
+    let singleton =
+        ProductionSingleton::acquire(&layout.root, CoordinatedSingletonScope::Collector)
+            .map_err(runtime_error)?;
+    let (collector, report_wakeup, report_generation) = prepare_collector_state(layout)?;
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), options.port);
     let initial_bind = TcpListener::bind(address).await;
     let listener = bind_persisted_port(initial_bind)?;
     let private_detail_failures = Arc::new(AtomicU64::new(0));
-    let collector = Arc::new(Mutex::new(CollectorState {
-        #[cfg(test)]
-        ingest_completion_test: IngestCompletionTest::default(),
-        layout,
-        store,
-        source_generation,
-        last_cursor,
-        request_correlation,
-        accepted_requests: 0,
-        rejected_requests: 0,
-        suppressed_requests: 0,
-        last_ingest_unix_ms: None,
-        report_dirty,
-        report_degraded: report_dirty,
-        report_refresh_failures: 0,
-        report_failure: None,
-    }));
+    let collector = Arc::new(Mutex::new(collector));
     let state = AppState {
         collector,
         auth_token: Arc::from(options.auth_token),
@@ -1564,7 +1626,7 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     }
     let report_watcher = tokio::spawn(watch_report_authority(
         state.clone(),
-        report_status.generation,
+        report_generation,
         REPORT_AUTHORITY_POLL_INTERVAL,
     ));
     let lifecycle_watcher = tokio::spawn(watch_storage_lifecycle(state.clone()));
@@ -1583,6 +1645,83 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let _ = lifecycle_watcher.await;
     drop(singleton);
     result
+}
+
+fn verify_collector_write_result<T>(
+    result: Result<T, CollectorError>,
+    verification: Result<
+        (),
+        agent_observability_local_runtime::storage_coherence::StorageCoherenceError,
+    >,
+) -> Result<T, CollectorError> {
+    match verification {
+        Ok(()) => result,
+        Err(verification) => Err(CollectorError::StorageWriteUnverified {
+            operation_completed: result.is_ok()
+                || matches!(
+                    &result,
+                    Err(CollectorError::StorageWriteUnverified {
+                        operation_completed: true,
+                        ..
+                    })
+                ),
+            primary: result.err().map(Box::new),
+            verification: Box::new(runtime_error(verification)),
+        }),
+    }
+}
+
+fn prepare_collector_state(
+    layout: InstalledLayout,
+) -> Result<(CollectorState, bool, u64), CollectorError> {
+    let barrier = StorageBarrier::open_if_initialized(&layout.root).map_err(runtime_error)?;
+    let scope = StorageMutationWriter::acquire_exclusive(&layout.root, barrier.as_ref())
+        .map_err(runtime_error)?;
+    let result = (|| {
+        let config = load(&layout.config).map_err(runtime_error)?;
+        recover_report_reservation_for_startup(&layout, &config, scope.mutation())?;
+        maintain_private_turn_details_locked(&layout, &config, SystemTime::now())?;
+        let store = open_store(scope.mutation(), &layout, &config)?;
+        recover_report_view_catalog_for_startup(&store)?;
+        let report_status = store.report_status().map_err(runtime_error)?;
+        let report_missing = automatic_report_view_missing(&store)?;
+        let report_dirty = report_status.pending() || report_missing;
+        let report_wakeup = reconcile_report_state(&layout, report_dirty);
+        let source_generation = SOURCE_GENERATION.to_owned();
+        let last_cursor = store
+            .cursor("codex", &source_generation)
+            .map_err(runtime_error)?;
+        let now = current_unix_ms()?;
+        let request_correlation = store
+            .codex_request_correlation_state(&source_generation)
+            .map_err(runtime_error)?
+            .map(|snapshot| OtlpRequestCorrelationState::from_persisted_json(&snapshot, now))
+            .transpose()
+            .map_err(runtime_error)?
+            .unwrap_or_default();
+        Ok((
+            CollectorState {
+                #[cfg(test)]
+                ingest_completion_test: IngestCompletionTest::default(),
+                layout,
+                store,
+                source_generation,
+                last_cursor,
+                request_correlation,
+                accepted_requests: 0,
+                rejected_requests: 0,
+                suppressed_requests: 0,
+                last_ingest_unix_ms: None,
+                report_dirty,
+                report_degraded: report_dirty,
+                report_refresh_failures: 0,
+                report_failure: None,
+            },
+            report_wakeup,
+            report_status.generation,
+        ))
+    })();
+    verify_collector_write_result(result, scope.revalidate())
 }
 
 fn bind_persisted_port(
@@ -1984,7 +2123,12 @@ fn persist_private_turn_detail_request(
 ) -> Response {
     #[cfg(test)]
     let lock_started = StdInstant::now();
-    let mutation = match acquire_private_turn_detail_mutation(&layout.runtime) {
+    let barrier = StorageBarrier::open_if_initialized(&layout.root);
+    let acquisition = match &barrier {
+        Ok(barrier) => acquire_private_turn_detail_mutation(layout, barrier.as_ref()),
+        Err(error) => Err(runtime_error(error)),
+    };
+    let mutation = match acquisition {
         Ok(Some(mutation)) => mutation,
         Ok(None) => {
             state.private_detail_failures.fetch_add(1, Ordering::AcqRel);
@@ -2009,6 +2153,7 @@ fn persist_private_turn_detail_request(
         lock_started.elapsed()
     );
     let result = capture_private_turn_detail_locked(layout, private_detail, config);
+    let result = verify_collector_write_result(result, mutation.revalidate());
     drop(mutation);
     match result {
         Ok((PrivateTurnDetailReceiptState::Available, code)) => {
@@ -2185,10 +2330,12 @@ enum IngestError {
 impl IngestError {
     const fn status(&self) -> StatusCode {
         match self {
-            Self::Coherence => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Invalid(CollectorError::Io(_) | CollectorError::RequestIo { .. }) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::Coherence
+            | Self::Invalid(
+                CollectorError::StorageWriteUnverified { .. }
+                | CollectorError::Io(_)
+                | CollectorError::RequestIo { .. },
+            ) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Invalid(CollectorError::Runtime(_)) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Busy | Self::Pressure => StatusCode::SERVICE_UNAVAILABLE,
             Self::Policy => StatusCode::PAYLOAD_TOO_LARGE,
@@ -2291,27 +2438,21 @@ fn with_ingest_storage_scope<T>(
     state: &mut CollectorState,
     operation: impl FnOnce(&mut CollectorState) -> Result<(IngestOutcome, T), IngestError>,
 ) -> Result<(IngestOutcome, T), IngestError> {
-    let mutation = try_ingest_mutation(&state.layout.runtime)?;
     let barrier =
         agent_observability_local_runtime::storage_coherence::StorageBarrier::open_if_initialized(
             &state.layout.root,
         )
         .map_err(ingest_coherence_failure)?;
-    let freeze = barrier
-        .as_ref()
-        .map(|barrier| barrier.try_freeze(&mutation))
-        .transpose()
-        .map_err(ingest_coherence_failure)?;
+    let scope = agent_observability_local_runtime::storage_coherence::StorageMutationWriter::acquire_exclusive(
+        &state.layout.root,
+        barrier.as_ref(),
+    ).map_err(ingest_coherence_failure)?;
     let result = operation(state);
     #[cfg(test)]
     if let Some(after_operation) = state.ingest_completion_test.after_operation.take() {
         after_operation(&state.layout.runtime);
     }
-    let revalidation = freeze
-        .as_ref()
-        .map(agent_observability_local_runtime::storage_coherence::StorageFreezeGuard::revalidate)
-        .transpose()
-        .map_err(ingest_coherence_failure);
+    let revalidation = scope.revalidate().map_err(ingest_coherence_failure);
     match result {
         Ok((outcome @ (IngestOutcome::Committed | IngestOutcome::CommittedUnverified), value))
             if revalidation.is_err() =>
@@ -2344,20 +2485,6 @@ fn ingest_coherence_failure(
         }
         _ => IngestError::Coherence,
     }
-}
-
-fn try_ingest_mutation(runtime: &Path) -> Result<MutationGuard, IngestError> {
-    MutationGuard::try_acquire(runtime).map_err(|error| match error {
-        SingletonError::AlreadyRunning => IngestError::Busy,
-        error => IngestError::Invalid(runtime_error(error)),
-    })
-}
-
-fn try_collector_mutation(runtime: &Path) -> Result<MutationGuard, CollectorError> {
-    MutationGuard::try_acquire(runtime).map_err(|error| match error {
-        SingletonError::AlreadyRunning => CollectorError::Runtime("runtime mutation busy".into()),
-        error => runtime_error(error),
-    })
 }
 
 fn admit_request(
@@ -2512,17 +2639,25 @@ fn schedule_report_refresh(state: &AppState) {
 /// A busy writer is not waited on; the next scheduled pass can retry.
 pub fn maintain_storage_lifecycle(root: &Path) -> Result<String, CollectorError> {
     let layout = inspect(root).map_err(runtime_error)?;
-    let _mutation = match MutationGuard::try_acquire(&layout.runtime) {
+    let barrier = StorageBarrier::open_if_initialized(&layout.root).map_err(runtime_error)?;
+    let scope = match StorageMutationWriter::acquire_exclusive(&layout.root, barrier.as_ref()) {
         Ok(guard) => guard,
-        Err(SingletonError::AlreadyRunning) => return Ok("lifecycle=busy".into()),
+        Err(agent_observability_local_runtime::storage_coherence::StorageCoherenceError::Busy) => {
+            return Ok("lifecycle=busy".into());
+        }
         Err(error) => return Err(runtime_error(error)),
     };
+    let result = maintain_storage_lifecycle_locked(&layout);
+    verify_collector_write_result(result, scope.revalidate())
+}
+
+fn maintain_storage_lifecycle_locked(layout: &InstalledLayout) -> Result<String, CollectorError> {
     let config = load(&layout.config).map_err(runtime_error)?;
     if !config.lifecycle.enabled {
         return Ok("lifecycle=disabled".into());
     }
     // Raw expiry needs no database copy and must still run when tier migration lacks disk space.
-    maintain_private_turn_details_locked(&layout, &config, SystemTime::now())?;
+    maintain_private_turn_details_locked(layout, &config, SystemTime::now())?;
     let store = LocalStore::open_current(layout.state.join("store")).map_err(runtime_error)?;
     let policy = &config.lifecycle;
     let request = agent_observability_local_store::LifecycleRequest {
@@ -2554,7 +2689,7 @@ pub fn maintain_storage_lifecycle(root: &Path) -> Result<String, CollectorError>
     store.invalidate_report().map_err(runtime_error)?;
     agent_observability_static_report::write_refresh_pending(&layout.logs.join(REPORT_FILE_NAME))
         .map_err(runtime_error)?;
-    mark_report_dirty(&layout)?;
+    mark_report_dirty(layout)?;
     let result = store
         .maintain_lifecycle_guarded(request, render_guard)
         .map_err(runtime_error)?;
@@ -2651,29 +2786,55 @@ async fn watch_report_authority(state: AppState, mut observed_generation: u64, i
     loop {
         ticker.tick().await;
         let mut collector = state.collector.lock().await;
-        let Ok(status) = collector.store.report_status() else {
+        let Ok(wakeup) = poll_report_authority(&mut collector, &mut observed_generation) else {
             collector.report_dirty = true;
             collector.report_degraded = true;
             collector.report_failure = Some(ReportFailure::Status);
             continue;
         };
-        collector.report_dirty = status.pending();
-        let changed = status.generation != observed_generation;
-        observed_generation = status.generation;
-        if !status.pending() {
-            collector.report_degraded = false;
-            collector.report_refresh_failures = 0;
-            collector.report_failure = None;
-            let _ = clear_report_dirty(&collector.layout);
-            continue;
-        }
-        if !changed {
-            continue;
-        }
-        let _ = mark_report_dirty(&collector.layout);
         drop(collector);
-        schedule_report_refresh(&state);
+        if wakeup {
+            schedule_report_refresh(&state);
+        }
     }
+}
+
+fn poll_report_authority(
+    collector: &mut CollectorState,
+    observed_generation: &mut u64,
+) -> Result<bool, CollectorError> {
+    poll_report_authority_observing(collector, observed_generation, |_| {})
+}
+
+fn poll_report_authority_observing(
+    collector: &mut CollectorState,
+    observed_generation: &mut u64,
+    before_postcheck: impl FnOnce(&MutationGuard),
+) -> Result<bool, CollectorError> {
+    let barrier =
+        StorageBarrier::open_if_initialized(&collector.layout.root).map_err(runtime_error)?;
+    let scope = StorageMutationWriter::acquire(&collector.layout.root, barrier.as_ref())
+        .map_err(runtime_error)?;
+    let result = (|| {
+        let status = collector.store.report_status().map_err(runtime_error)?;
+        let changed = status.generation != *observed_generation;
+        if !status.pending() {
+            clear_report_dirty(&collector.layout)?;
+        } else if changed {
+            mark_report_dirty(&collector.layout)?;
+        }
+        Ok((status, changed))
+    })();
+    before_postcheck(scope.mutation());
+    let (status, changed) = verify_collector_write_result(result, scope.revalidate())?;
+    collector.report_dirty = status.pending();
+    *observed_generation = status.generation;
+    if !status.pending() {
+        collector.report_degraded = false;
+        collector.report_refresh_failures = 0;
+        collector.report_failure = None;
+    }
+    Ok(status.pending() && changed)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3038,13 +3199,16 @@ fn capture_private_turn_detail_if_enabled(
         .map_err(runtime_error)
 }
 
-fn acquire_private_turn_detail_mutation(
-    runtime: &Path,
-) -> Result<Option<MutationGuard>, CollectorError> {
+fn acquire_private_turn_detail_mutation<'barrier>(
+    layout: &InstalledLayout,
+    barrier: Option<&'barrier StorageBarrier>,
+) -> Result<Option<StorageMutationWriter<'barrier>>, CollectorError> {
     for attempt in 0..PRIVATE_TURN_DETAIL_LOCK_RETRIES {
-        match MutationGuard::try_acquire(runtime) {
+        match StorageMutationWriter::acquire_exclusive(&layout.root, barrier) {
             Ok(mutation) => return Ok(Some(mutation)),
-            Err(SingletonError::AlreadyRunning) => {
+            Err(
+                agent_observability_local_runtime::storage_coherence::StorageCoherenceError::Busy,
+            ) => {
                 if attempt + 1 < PRIVATE_TURN_DETAIL_LOCK_RETRIES {
                     thread::sleep(PRIVATE_TURN_DETAIL_LOCK_RETRY_DELAY);
                 }
@@ -3394,9 +3558,12 @@ fn prune_private_turn_files_with_limit(
 /// on a subsequent private capture.
 pub fn maintain_private_turn_details(root: &Path) -> Result<(), CollectorError> {
     let layout = install(root).map_err(runtime_error)?;
+    let barrier = StorageBarrier::open_if_initialized(&layout.root).map_err(runtime_error)?;
+    let scope = StorageMutationWriter::acquire_exclusive(&layout.root, barrier.as_ref())
+        .map_err(runtime_error)?;
     let config = load(&layout.config).map_err(runtime_error)?;
-    let _mutation = MutationGuard::acquire(&layout.runtime).map_err(runtime_error)?;
-    maintain_private_turn_details_locked(&layout, &config, SystemTime::now())
+    let result = maintain_private_turn_details_locked(&layout, &config, SystemTime::now());
+    verify_collector_write_result(result, scope.revalidate())
 }
 
 fn maintain_private_turn_details_locked(
@@ -3493,6 +3660,7 @@ fn maintain_private_turn_directory_locked(
 
 fn private_turn_detail_error_code(error: &CollectorError) -> &'static str {
     match error {
+        CollectorError::StorageWriteUnverified { .. } => "settings_write_unverified",
         CollectorError::LifecycleStoragePressure | CollectorError::DashboardStorageCapacity => {
             "storage_budget"
         }
@@ -4680,6 +4848,10 @@ mod tests {
         ))
     }
 
+    pub(crate) fn occupy_loopback_port(port: u16) -> TcpListener {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap()
+    }
+
     fn assert_published_report_view(root: &Path, expected_records: usize) {
         let store = LocalStore::open_current(root.join("state/store")).unwrap();
         let snapshot = current_report_view(&store).unwrap().unwrap();
@@ -4846,6 +5018,128 @@ mod tests {
             b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\ntrailing".as_slice(),
         ] {
             assert!(parse_complete_http_response(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn report_authority_marker_holds_accounting_and_rejects_failed_postcheck() {
+        use agent_observability_local_runtime::storage_coherence::{
+            StorageBarrier, StorageCoherenceError,
+        };
+        for invalidate in [false, true] {
+            let root = test_root(&format!("report-marker-accounting-{invalidate}"));
+            let mut collector = collector_state(&root);
+            ingest_notify_locked(&mut collector, &projected_notify("thread", "turn")).unwrap();
+            let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+            let barrier = StorageBarrier::initialize(&collector.layout.root, &mutation).unwrap();
+            drop(mutation);
+            let mut observed = 0;
+            let result =
+                super::poll_report_authority_observing(&mut collector, &mut observed, |mutation| {
+                    assert!(matches!(
+                        barrier.try_freeze(mutation),
+                        Err(StorageCoherenceError::Busy)
+                    ));
+                    if invalidate {
+                        fs::write(root.join("runtime/storage-accounting.lock"), b"invalid")
+                            .unwrap();
+                    }
+                });
+            if invalidate {
+                assert!(matches!(
+                    result,
+                    Err(super::CollectorError::StorageWriteUnverified { .. })
+                ));
+                assert_eq!(observed, 0);
+            } else {
+                assert!(result.unwrap());
+                assert_eq!(
+                    observed,
+                    collector.store.report_status().unwrap().generation
+                );
+                let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+                barrier.try_freeze(&mutation).unwrap().revalidate().unwrap();
+            }
+            drop(barrier);
+            drop(collector);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn collector_startup_maintenance_and_private_capture_respect_accounting_writers() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        let root = test_root("collector-all-accounting-writers");
+        let state = app_state(&root);
+        set_private_turn_details(&root, true);
+        let layout = state.collector.blocking_lock().layout.clone();
+        let config = load(&layout.config).unwrap();
+        let (_, detail) =
+            project_notify_with_private_detail(&raw_notify("thread", "turn")).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&layout.root, &mutation).unwrap();
+        drop(mutation);
+        let writer = barrier.try_begin_write().unwrap();
+        assert!(super::prepare_collector_state(layout.clone()).is_err());
+        assert_eq!(
+            super::maintain_storage_lifecycle(&root).unwrap(),
+            "lifecycle=busy"
+        );
+        assert!(super::maintain_private_turn_details(&root).is_err());
+        let response = persist_private_turn_detail_request(&state, &layout, &config, &detail);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            state
+                .collector
+                .blocking_lock()
+                .store
+                .record_count()
+                .unwrap(),
+            0
+        );
+        assert!(
+            !layout
+                .state
+                .join(super::PRIVATE_TURN_DETAIL_DIRECTORY)
+                .exists()
+        );
+        drop(writer);
+        let response = persist_private_turn_detail_request(&state, &layout, &config, &detail);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(
+            lookup_private_turn_detail(&root, detail.turn_id()),
+            PrivateTurnDetailLookup::Available(_)
+        ));
+        drop(barrier);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn automatic_ingest_never_recreates_an_initialized_mutation_lock() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        for notify in [false, true] {
+            let root = test_root(&format!("ingest-missing-stable-mutation-{notify}"));
+            let mut state = collector_state(&root);
+            let mutation = MutationGuard::try_acquire(&state.layout.runtime).unwrap();
+            let barrier = StorageBarrier::initialize(&state.layout.root, &mutation).unwrap();
+            drop(mutation);
+            let lock = state.layout.runtime.join("mutation.lock");
+            fs::remove_file(&lock).unwrap();
+            let status = state.store.report_status().unwrap();
+            let result = if notify {
+                ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1"))
+            } else {
+                ingest_locked(&mut state, &otlp_start_records(1))
+            };
+            assert!(matches!(result, Err(IngestError::Coherence)));
+            assert!(!lock.exists());
+            assert_eq!(state.last_cursor, None);
+            assert_eq!(state.store.record_count().unwrap(), 0);
+            assert_eq!(state.store.report_status().unwrap(), status);
+            drop(barrier);
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
         }
     }
 
@@ -5570,11 +5864,18 @@ mod tests {
         // After the last wakeup, debounce can finish its current quiet interval and
         // repeat it once. This is a finite hang guard, not a publication latency SLO.
         let guard = super::REPORT_CONTENTION_QUIET_LIMIT * 2 + Duration::from_secs(5);
+        wait_for_report_refresh_completion_within(state, guard).await;
+    }
+
+    async fn wait_for_report_refresh_completion_within(state: &AppState, guard: Duration) {
         let completed = tokio::time::timeout(guard, async {
             loop {
                 let collector = state.collector.lock().await;
                 let published = collector.store.report_status().unwrap();
-                if !state.report_refresh_scheduled.load(Ordering::Acquire) && !published.pending() {
+                if state.report_refresh_attempts.load(Ordering::Acquire) > 0
+                    && !state.report_refresh_scheduled.load(Ordering::Acquire)
+                    && !published.pending()
+                {
                     break;
                 }
                 drop(collector);
@@ -8262,13 +8563,7 @@ mod tests {
             for _ in 0..20 {
                 super::schedule_report_refresh_with_timing(&state, fast_report_timing());
             }
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while state.report_refresh_scheduled.load(Ordering::Acquire) {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            wait_for_report_refresh_completion_within(&state, Duration::from_secs(1)).await;
 
             assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 1);
             assert!(
@@ -8309,13 +8604,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 0);
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while state.report_refresh_scheduled.load(Ordering::Acquire) {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            wait_for_report_refresh_completion_within(&state, Duration::from_secs(1)).await;
             assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 1);
         });
         assert_published_report_view(&root, 10);
@@ -8453,13 +8742,7 @@ mod tests {
             super::schedule_report_refresh_with_timing(&state, fast_report_timing());
             drop(render_guard);
 
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while state.report_refresh_scheduled.load(Ordering::Acquire) {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            wait_for_report_refresh_completion_within(&state, Duration::from_secs(1)).await;
             let collector = state.collector.lock().await;
             assert!(!collector.store.report_status().unwrap().pending());
             assert_eq!(collector.store.record_count().unwrap(), 2);
