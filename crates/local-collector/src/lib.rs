@@ -1377,8 +1377,17 @@ fn build_legacy_client_config(
     Ok(Arc::new(config))
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct IngestCompletionTest {
+    after_operation: Option<fn(&Path)>,
+    fail_report_status: bool,
+}
+
 #[derive(Debug)]
 struct CollectorState {
+    #[cfg(test)]
+    ingest_completion_test: IngestCompletionTest,
     layout: InstalledLayout,
     store: LocalStore,
     source_generation: String,
@@ -1519,6 +1528,8 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let listener = bind_persisted_port(initial_bind)?;
     let private_detail_failures = Arc::new(AtomicU64::new(0));
     let collector = Arc::new(Mutex::new(CollectorState {
+        #[cfg(test)]
+        ingest_completion_test: IngestCompletionTest::default(),
         layout,
         store,
         source_generation,
@@ -1852,7 +1863,7 @@ async fn ingest_preflight(
 async fn ingest_notify(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
     let mut collector = state.collector.lock().await;
     let (outcome, committed) = match ingest_notify_locked(&mut collector, &body) {
-        Ok(IngestOutcome::Committed) => {
+        Ok(IngestOutcome::Committed | IngestOutcome::CommittedUnverified) => {
             collector.accepted_requests = collector.accepted_requests.saturating_add(1);
             (StatusCode::OK.into_response(), true)
         }
@@ -1883,6 +1894,19 @@ async fn ingest_notify_with_private_detail(State(state): State<AppState>, body: 
 
     let mut collector = state.collector.lock().await;
     match ingest_notify_locked_with_config(&mut collector, &projected) {
+        Ok((IngestOutcome::CommittedUnverified, Some(_))) => {
+            // The projected observation is committed, but do not start another
+            // private-file write after its completion fence failed.
+            collector.accepted_requests = collector.accepted_requests.saturating_add(1);
+            drop(collector);
+            schedule_report_refresh(&state);
+            state.private_detail_failures.fetch_add(1, Ordering::AcqRel);
+            private_turn_detail_receipt_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                PrivateTurnDetailReceiptState::Failed,
+                "storage_coherence",
+            )
+        }
         Ok((IngestOutcome::Committed, Some(config))) => {
             collector.accepted_requests = collector.accepted_requests.saturating_add(1);
             let layout = collector.layout.clone();
@@ -1944,6 +1968,7 @@ async fn ingest_notify_with_private_detail(State(state): State<AppState>, body: 
                     IngestError::Pressure => "pressure",
                     IngestError::Storage => "storage_budget",
                     IngestError::Policy => "policy",
+                    IngestError::Coherence => "storage_coherence",
                     IngestError::Invalid(_) => "invalid_request",
                 },
             )
@@ -2112,7 +2137,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 async fn ingest_logs(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
     let mut collector = state.collector.lock().await;
     let (outcome, committed) = match ingest_locked(&mut collector, &body) {
-        Ok(IngestOutcome::Committed) => {
+        Ok(IngestOutcome::Committed | IngestOutcome::CommittedUnverified) => {
             collector.accepted_requests = collector.accepted_requests.saturating_add(1);
             (StatusCode::OK.into_response(), true)
         }
@@ -2143,12 +2168,14 @@ fn is_json(headers: &HeaderMap) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IngestOutcome {
     Committed,
+    CommittedUnverified,
     Disabled,
 }
 
 #[derive(Debug)]
 enum IngestError {
     Invalid(CollectorError),
+    Coherence,
     Busy,
     Policy,
     Pressure,
@@ -2158,6 +2185,7 @@ enum IngestError {
 impl IngestError {
     const fn status(&self) -> StatusCode {
         match self {
+            Self::Coherence => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Invalid(CollectorError::Io(_) | CollectorError::RequestIo { .. }) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -2186,44 +2214,46 @@ impl From<CollectorError> for IngestError {
 }
 
 fn ingest_locked(state: &mut CollectorState, body: &[u8]) -> Result<IngestOutcome, IngestError> {
-    let _mutation = try_ingest_mutation(&state.layout.runtime)?;
-    let Some(config) = admit_request(state, body.len())? else {
-        return Ok(IngestOutcome::Disabled);
-    };
-    let now = current_unix_ms()?;
-    let next_cursor = state
-        .last_cursor
-        .as_deref()
-        .map_or(Ok(1), |cursor| {
-            cursor
-                .parse::<u64>()
-                .map_err(|_| CollectorError::Runtime("invalid durable Codex cursor".into()))
-        })?
-        .checked_add(u64::from(state.last_cursor.is_some()))
-        .ok_or_else(|| CollectorError::Runtime("Codex cursor overflow".into()))?;
-    let mut request_correlation = state.request_correlation.clone();
-    let (batch, last_cursor) = parse_otlp_http_json_with_state(
-        body,
-        &state.source_generation,
-        state.last_cursor.as_deref(),
-        next_cursor,
-        now,
-        &mut request_correlation,
-    )
-    .map_err(runtime_error)?;
-    enforce_batch_policy(&batch, &config)?;
-    let persisted_correlation = request_correlation
-        .to_persisted_json()
+    with_ingest_storage_scope(state, |state| {
+        let Some(config) = admit_request(state, body.len())? else {
+            return Ok((IngestOutcome::Disabled, ()));
+        };
+        let now = current_unix_ms()?;
+        let next_cursor = state
+            .last_cursor
+            .as_deref()
+            .map_or(Ok(1), |cursor| {
+                cursor
+                    .parse::<u64>()
+                    .map_err(|_| CollectorError::Runtime("invalid durable Codex cursor".into()))
+            })?
+            .checked_add(u64::from(state.last_cursor.is_some()))
+            .ok_or_else(|| CollectorError::Runtime("Codex cursor overflow".into()))?;
+        let mut request_correlation = state.request_correlation.clone();
+        let (batch, last_cursor) = parse_otlp_http_json_with_state(
+            body,
+            &state.source_generation,
+            state.last_cursor.as_deref(),
+            next_cursor,
+            now,
+            &mut request_correlation,
+        )
         .map_err(runtime_error)?;
-    commit_batch(
-        state,
-        &batch,
-        last_cursor,
-        now,
-        Some(&persisted_correlation),
-    )?;
-    state.request_correlation = request_correlation;
-    Ok(IngestOutcome::Committed)
+        enforce_batch_policy(&batch, &config)?;
+        let persisted_correlation = request_correlation
+            .to_persisted_json()
+            .map_err(runtime_error)?;
+        let outcome = commit_batch(
+            state,
+            &batch,
+            last_cursor,
+            now,
+            Some(&persisted_correlation),
+        )?;
+        state.request_correlation = request_correlation;
+        Ok((outcome, ()))
+    })
+    .map(|(outcome, ())| outcome)
 }
 
 fn ingest_notify_locked(
@@ -2237,23 +2267,83 @@ fn ingest_notify_locked_with_config(
     state: &mut CollectorState,
     body: &[u8],
 ) -> Result<(IngestOutcome, Option<LocalRuntimeConfigV3>), IngestError> {
-    let _mutation = try_ingest_mutation(&state.layout.runtime)?;
-    let Some(config) = admit_request(state, body.len())? else {
-        return Ok((IngestOutcome::Disabled, None));
-    };
-    let now = current_unix_ms()?;
-    let cursor = next_cursor(state)?;
-    let batch = parse_projected_notify_json(
-        body,
-        &state.source_generation,
-        state.last_cursor.as_deref(),
-        cursor,
-        now,
-    )
-    .map_err(runtime_error)?;
-    enforce_batch_policy(&batch, &config)?;
-    commit_batch(state, &batch, Some(cursor.to_string()), now, None)?;
-    Ok((IngestOutcome::Committed, Some(config)))
+    with_ingest_storage_scope(state, |state| {
+        let Some(config) = admit_request(state, body.len())? else {
+            return Ok((IngestOutcome::Disabled, None));
+        };
+        let now = current_unix_ms()?;
+        let cursor = next_cursor(state)?;
+        let batch = parse_projected_notify_json(
+            body,
+            &state.source_generation,
+            state.last_cursor.as_deref(),
+            cursor,
+            now,
+        )
+        .map_err(runtime_error)?;
+        enforce_batch_policy(&batch, &config)?;
+        let outcome = commit_batch(state, &batch, Some(cursor.to_string()), now, None)?;
+        Ok((outcome, Some(config)))
+    })
+}
+
+fn with_ingest_storage_scope<T>(
+    state: &mut CollectorState,
+    operation: impl FnOnce(&mut CollectorState) -> Result<(IngestOutcome, T), IngestError>,
+) -> Result<(IngestOutcome, T), IngestError> {
+    let mutation = try_ingest_mutation(&state.layout.runtime)?;
+    let barrier =
+        agent_observability_local_runtime::storage_coherence::StorageBarrier::open_if_initialized(
+            &state.layout.root,
+        )
+        .map_err(ingest_coherence_failure)?;
+    let freeze = barrier
+        .as_ref()
+        .map(|barrier| barrier.try_freeze(&mutation))
+        .transpose()
+        .map_err(ingest_coherence_failure)?;
+    let result = operation(state);
+    #[cfg(test)]
+    if let Some(after_operation) = state.ingest_completion_test.after_operation.take() {
+        after_operation(&state.layout.runtime);
+    }
+    let revalidation = freeze
+        .as_ref()
+        .map(agent_observability_local_runtime::storage_coherence::StorageFreezeGuard::revalidate)
+        .transpose()
+        .map_err(ingest_coherence_failure);
+    match result {
+        Ok((outcome @ (IngestOutcome::Committed | IngestOutcome::CommittedUnverified), value))
+            if revalidation.is_err() =>
+        {
+            // Durable commit/cursor state remains authoritative. ACK the committed
+            // observation without inviting a retry as though nothing was saved.
+            // Keep refresh scheduled and health degraded; future work must acquire
+            // and validate its own barrier, never reuse this failed assessment.
+            state.report_dirty = true;
+            state.report_degraded = true;
+            if outcome == IngestOutcome::Committed {
+                state.report_failure = Some(ReportFailure::Publish);
+            }
+            Ok((IngestOutcome::CommittedUnverified, value))
+        }
+        Ok(value) => {
+            revalidation?;
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn ingest_coherence_failure(
+    error: agent_observability_local_runtime::storage_coherence::StorageCoherenceError,
+) -> IngestError {
+    match error {
+        agent_observability_local_runtime::storage_coherence::StorageCoherenceError::Busy => {
+            IngestError::Busy
+        }
+        _ => IngestError::Coherence,
+    }
 }
 
 fn try_ingest_mutation(runtime: &Path) -> Result<MutationGuard, IngestError> {
@@ -2336,7 +2426,7 @@ fn commit_batch(
     last_cursor: Option<String>,
     now: u64,
     persisted_correlation: Option<&str>,
-) -> Result<(), CollectorError> {
+) -> Result<IngestOutcome, CollectorError> {
     let items = batch
         .items
         .iter()
@@ -2366,28 +2456,46 @@ fn commit_batch(
     match result {
         Ok(_) => {}
         Err(error) => {
-            state.report_dirty = state
-                .store
-                .report_status()
-                .map_err(runtime_error)?
-                .pending();
-            if !state.report_dirty {
-                let _ = clear_report_dirty(&state.layout);
-            }
+            reconcile_ingest_report_state(state);
             return Err(runtime_error(error));
         }
     }
     state.last_cursor = last_cursor;
     state.last_ingest_unix_ms = Some(now);
-    state.report_dirty = state
+    Ok(if reconcile_ingest_report_state(state) {
+        IngestOutcome::Committed
+    } else {
+        IngestOutcome::CommittedUnverified
+    })
+}
+
+fn reconcile_ingest_report_state(state: &mut CollectorState) -> bool {
+    if let Ok(pending) = ingest_report_pending(state) {
+        state.report_dirty = pending;
+        if !pending {
+            let _ = clear_report_dirty(&state.layout);
+        }
+        true
+    } else {
+        state.report_dirty = true;
+        state.report_degraded = true;
+        state.report_failure = Some(ReportFailure::Status);
+        false
+    }
+}
+
+fn ingest_report_pending(state: &CollectorState) -> Result<bool, CollectorError> {
+    #[cfg(test)]
+    if state.ingest_completion_test.fail_report_status {
+        return Err(CollectorError::Runtime(
+            "injected report status failure".into(),
+        ));
+    }
+    state
         .store
         .report_status()
-        .map_err(runtime_error)?
-        .pending();
-    if !state.report_dirty {
-        let _ = clear_report_dirty(&state.layout);
-    }
-    Ok(())
+        .map(agent_observability_local_store::ReportStatus::pending)
+        .map_err(runtime_error)
 }
 
 fn schedule_report_refresh(state: &AppState) {
@@ -4497,8 +4605,8 @@ mod tests {
     }
 
     use super::{
-        AUTH_HEADER_NAME, AppState, CollectorState, IngestError, IngestOutcome, LocalStore,
-        MISSING_RATE_FINGERPRINT, NotifyOutcome, OtlpRejectionCategory,
+        AUTH_HEADER_NAME, AppState, CollectorState, IngestCompletionTest, IngestError,
+        IngestOutcome, LocalStore, MISSING_RATE_FINGERPRINT, NotifyOutcome, OtlpRejectionCategory,
         OtlpRequestCorrelationState, OtlpSubmissionOutcome, PrivateTurnDetailLookup,
         REPORT_FILE_NAME, ReportFailure, admit_request, authenticated_request, build_client_config,
         build_server_config, capture_private_turn_detail, capture_private_turn_detail_if_enabled,
@@ -4655,6 +4763,7 @@ mod tests {
             })
             .unwrap_or_default();
         CollectorState {
+            ingest_completion_test: IngestCompletionTest::default(),
             layout,
             store,
             source_generation,
@@ -4738,6 +4847,250 @@ mod tests {
         ] {
             assert!(parse_complete_http_response(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn automatic_ingest_defers_before_cursor_or_records_change_when_accounting_is_busy() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        for notify in [false, true] {
+            let root = test_root(&format!("ingest-accounting-contention-{notify}"));
+            let mut state = collector_state(&root);
+            let mutation = MutationGuard::try_acquire(&state.layout.runtime).unwrap();
+            let barrier = StorageBarrier::initialize(&state.layout.root, &mutation).unwrap();
+            drop(mutation);
+            let writer = barrier.try_begin_write().unwrap();
+            let body = if notify {
+                projected_notify("thread-1", "turn-1")
+            } else {
+                otlp_start_records(1)
+            };
+            let before = state.store.report_status().unwrap();
+            let result = if notify {
+                ingest_notify_locked(&mut state, &body)
+            } else {
+                ingest_locked(&mut state, &body)
+            };
+            assert!(matches!(result, Err(IngestError::Busy)));
+            assert_eq!(state.last_cursor, None);
+            assert_eq!(state.store.record_count().unwrap(), 0);
+            assert_eq!(state.store.report_status().unwrap(), before);
+            drop(writer);
+            let result = if notify {
+                ingest_notify_locked(&mut state, &body)
+            } else {
+                ingest_locked(&mut state, &body)
+            };
+            assert_eq!(result.unwrap(), IngestOutcome::Committed);
+            assert_eq!(state.store.record_count().unwrap(), 1);
+            let mutation = MutationGuard::try_acquire(&state.layout.runtime).unwrap();
+            barrier.try_freeze(&mutation).unwrap().revalidate().unwrap();
+            drop(mutation);
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_ingest_keeps_ack_cursor_and_refresh_when_completion_check_fails() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        use axum::{body::Bytes, extract::State, response::IntoResponse};
+
+        for (notify, status_failure) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let root = test_root(&format!(
+                "ingest-committed-coherence-{notify}-{status_failure}"
+            ));
+            let state = app_state(&root);
+            // Check scheduling without launching a renderer in this regression.
+            state
+                .report_refresh_scheduled
+                .store(true, Ordering::Release);
+            let runtime = {
+                let mut collector = state.collector.lock().await;
+                let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+                StorageBarrier::initialize(&collector.layout.root, &mutation).unwrap();
+                collector.ingest_completion_test.after_operation = Some(|runtime| {
+                    fs::write(runtime.join("storage-accounting.lock"), b"invalid").unwrap();
+                });
+                if status_failure {
+                    collector.ingest_completion_test.after_operation = None;
+                    collector.ingest_completion_test.fail_report_status = true;
+                }
+                collector.layout.runtime.clone()
+            };
+            let body = if notify {
+                projected_notify("thread-1", "turn-1")
+            } else {
+                otlp_start_records(1)
+            };
+            for attempt in 1..=2 {
+                let response = if notify {
+                    super::ingest_notify(State(state.clone()), Bytes::from(body.clone()))
+                        .await
+                        .into_response()
+                } else {
+                    super::ingest_logs(State(state.clone()), Bytes::from(body.clone()))
+                        .await
+                        .into_response()
+                };
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "a durable commit is not a rejected payload"
+                );
+                {
+                    let collector = state.collector.lock().await;
+                    assert_eq!(collector.accepted_requests, attempt);
+                    assert_eq!(collector.rejected_requests, 0);
+                    assert_eq!(collector.store.record_count().unwrap(), 1);
+                    assert_eq!(
+                        collector
+                            .store
+                            .cursor("codex", &collector.source_generation)
+                            .unwrap(),
+                        collector.last_cursor
+                    );
+                    assert!(collector.last_cursor.is_some());
+                    assert!(collector.report_degraded);
+                    assert!(collector.report_dirty);
+                }
+                assert_eq!(
+                    state.report_refresh_requested.load(Ordering::Acquire),
+                    attempt
+                );
+                // Restore only this test's lock, then replay the identical source observation.
+                fs::write(runtime.join("storage-accounting.lock"), b"").unwrap();
+                state
+                    .collector
+                    .lock()
+                    .await
+                    .ingest_completion_test
+                    .fail_report_status = false;
+            }
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn ingest_scope_checks_completion_and_preserves_primary_failure() {
+        use agent_observability_local_runtime::storage_coherence::{
+            StorageBarrier, StorageCoherenceError,
+        };
+        for primary_failure in [false, true] {
+            let root = test_root(&format!("ingest-accounting-completion-{primary_failure}"));
+            let mut state = collector_state(&root);
+            let runtime = state.layout.runtime.clone();
+            let mutation = MutationGuard::try_acquire(&runtime).unwrap();
+            let barrier = StorageBarrier::initialize(&state.layout.root, &mutation).unwrap();
+            drop(mutation);
+            let path = runtime.join("storage-accounting.lock");
+            let result = super::with_ingest_storage_scope(&mut state, |_| {
+                assert!(matches!(
+                    barrier.try_begin_write(),
+                    Err(StorageCoherenceError::Busy)
+                ));
+                assert!(matches!(
+                    MutationGuard::try_acquire(&runtime),
+                    Err(agent_observability_local_runtime::SingletonError::AlreadyRunning)
+                ));
+                fs::write(&path, b"invalid").unwrap();
+                if primary_failure {
+                    Err(IngestError::Policy)
+                } else {
+                    Ok((IngestOutcome::Disabled, ()))
+                }
+            });
+            if primary_failure {
+                assert!(matches!(result, Err(IngestError::Policy)));
+            } else {
+                assert!(matches!(result, Err(IngestError::Coherence)));
+            }
+            // Corrupt coordination never falls back to uncoordinated ingest.
+            assert!(matches!(
+                ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1")),
+                Err(IngestError::Coherence)
+            ));
+            assert_eq!(state.last_cursor, None);
+            assert_eq!(state.store.record_count().unwrap(), 0);
+            let mutation = MutationGuard::try_acquire(&runtime).unwrap();
+            fs::write(&path, b"").unwrap();
+            barrier.try_freeze(&mutation).unwrap().revalidate().unwrap();
+            drop(mutation);
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_private_notify_reports_capture_failure_without_rejecting_projection() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+
+        let root = test_root("private-commit-coherence");
+        set_private_turn_details(&root, true);
+        let state = app_state(&root);
+        state
+            .report_refresh_scheduled
+            .store(true, Ordering::Release);
+        let layout = {
+            let mut collector = state.collector.lock().await;
+            let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+            StorageBarrier::initialize(&collector.layout.root, &mutation).unwrap();
+            collector.ingest_completion_test.after_operation = Some(|runtime| {
+                fs::write(runtime.join("storage-accounting.lock"), b"invalid").unwrap();
+            });
+            collector.layout.clone()
+        };
+        let body = capture_private_turn_detail_if_enabled(&root, &raw_notify("thread-1", "turn-1"))
+            .unwrap()
+            .unwrap();
+        let response = ingest_notify_with_private_detail(State(state.clone()), body.into()).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(receipt["state"], "failed");
+        assert_eq!(receipt["code"], "storage_coherence");
+        {
+            let collector = state.collector.lock().await;
+            assert_eq!(collector.accepted_requests, 1);
+            assert_eq!(collector.rejected_requests, 0);
+            assert_eq!(collector.store.record_count().unwrap(), 1);
+            assert!(collector.last_cursor.is_some());
+            assert!(collector.report_degraded);
+        }
+        assert_eq!(state.report_refresh_requested.load(Ordering::Acquire), 1);
+        assert_eq!(state.private_detail_failures.load(Ordering::Acquire), 1);
+        assert!(
+            !layout
+                .state
+                .join(super::PRIVATE_TURN_DETAIL_DIRECTORY)
+                .exists()
+        );
+        assert!(!private_turn_detail_status_directory(&layout).exists());
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_ingest_preserves_primary_error_when_report_status_also_fails() {
+        let root = test_root("ingest-primary-status-error");
+        let mut state = collector_state(&root);
+        let (batch, cursor) =
+            parse_otlp_http_json(&otlp_start_records(1), "codex-test", None, 1, 0).unwrap();
+        let expected = super::commit_batch(&mut state, &batch, cursor.clone(), 1, Some("invalid"))
+            .unwrap_err();
+        state.ingest_completion_test.fail_report_status = true;
+        let actual =
+            super::commit_batch(&mut state, &batch, cursor, 1, Some("invalid")).unwrap_err();
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        assert_eq!(state.store.record_count().unwrap(), 0);
+        assert_eq!(state.last_cursor, None);
+        assert!(state.report_degraded);
+        assert_eq!(state.report_failure, Some(ReportFailure::Status));
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -7626,6 +7979,7 @@ mod tests {
         let config = load(&layout.config).unwrap();
         let store = open_store_for_test(&layout, &config);
         let mut state = CollectorState {
+            ingest_completion_test: IngestCompletionTest::default(),
             layout: layout.clone(),
             store,
             source_generation: "codex-test".into(),
@@ -9282,6 +9636,7 @@ mod tests {
         let initial = load(&layout.config).unwrap();
         let store = open_store_for_test(&layout, &initial);
         let mut state = CollectorState {
+            ingest_completion_test: IngestCompletionTest::default(),
             layout: layout.clone(),
             store,
             source_generation: "codex-test".into(),
