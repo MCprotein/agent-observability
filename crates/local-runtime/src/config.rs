@@ -768,16 +768,96 @@ impl From<io::Error> for ConfigError {
 }
 
 pub fn install(root: &Path) -> Result<InstalledLayout, ConfigError> {
+    // An intact layout needs no write authority. Presence discovery is noncreating:
+    // legacy owner-only read layouts keep their historical semantics, while an
+    // initialized layout must satisfy the barrier's stricter exact identities.
+    if let Ok(layout) = inspect(root) {
+        if accounting_barrier_exists(&layout.root)? {
+            crate::storage_coherence::StorageBarrier::open_existing(&layout.root)
+                .map_err(ConfigError::StorageCoherence)?;
+        }
+        return Ok(layout);
+    }
+
+    if accounting_barrier_exists(root)? {
+        install_initialized(root)
+    } else {
+        // Legacy bootstrap cannot claim coordination with writers that do not yet
+        // have a barrier. It preserves the original fresh/partial-install behavior.
+        install_legacy(root)
+    }
+}
+
+fn accounting_barrier_exists(root: &Path) -> Result<bool, ConfigError> {
+    match fs::symlink_metadata(root.join("runtime/storage-accounting.lock")) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn install_initialized(root: &Path) -> Result<InstalledLayout, ConfigError> {
+    let barrier = crate::storage_coherence::StorageBarrier::open_existing(root)
+        .map_err(ConfigError::StorageCoherence)?;
+    let root = fs::canonicalize(root)?;
+    let layout = InstalledLayout::at(&root);
+    let mutation =
+        MutationGuard::try_acquire_existing(&layout.runtime).map_err(map_install_mutation_error)?;
+    let freeze = barrier
+        .try_freeze(&mutation)
+        .map_err(ConfigError::StorageCoherence)?;
+
+    let result = complete_install(&layout, InstallCoordination::Initialized);
+    freeze.revalidate().map_err(ConfigError::StorageCoherence)?;
+    result?;
+    let installed = inspect(&layout.root)?;
+    freeze.revalidate().map_err(ConfigError::StorageCoherence)?;
+    Ok(installed)
+}
+
+fn map_install_mutation_error(error: SingletonError) -> ConfigError {
+    use crate::storage_coherence::StorageCoherenceError;
+
+    let error = match error {
+        SingletonError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+            StorageCoherenceError::Missing
+        }
+        SingletonError::Io(error) => StorageCoherenceError::Io(error.kind()),
+        SingletonError::AlreadyRunning => StorageCoherenceError::Busy,
+        SingletonError::CorruptMetadata | SingletonError::WrongMutationRoot => {
+            StorageCoherenceError::InvalidIdentity
+        }
+        SingletonError::InsecurePermissions => StorageCoherenceError::InsecurePermissions,
+        SingletonError::Symlink => StorageCoherenceError::Symlink,
+        SingletonError::UnsupportedPlatform => StorageCoherenceError::UnsupportedPlatform,
+    };
+    ConfigError::StorageCoherence(error)
+}
+
+fn install_legacy(root: &Path) -> Result<InstalledLayout, ConfigError> {
     private_dir(root, true)?;
     let root = fs::canonicalize(root)?;
     let layout = InstalledLayout::at(&root);
+    complete_install(&layout, InstallCoordination::Legacy)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallCoordination {
+    Legacy,
+    Initialized,
+}
+
+fn complete_install(
+    layout: &InstalledLayout,
+    coordination: InstallCoordination,
+) -> Result<InstalledLayout, ConfigError> {
     for directory in [&layout.logs, &layout.queue, &layout.state, &layout.runtime] {
         private_dir(directory, true)?;
     }
 
     if layout.config.exists() {
         let _ = load(&layout.config)?;
-        return Ok(layout);
+        return Ok(layout.clone());
     }
 
     reject_symlink(&layout.config)?;
@@ -786,7 +866,9 @@ pub fn install(root: &Path) -> Result<InstalledLayout, ConfigError> {
     let temporary = layout
         .root
         .join(format!(".config.json.tmp.{}", std::process::id()));
-    let _ = fs::remove_file(&temporary);
+    if coordination == InstallCoordination::Legacy {
+        let _ = fs::remove_file(&temporary);
+    }
     let mut file = private_create_new(&temporary)?;
     file.write_all(&body)?;
     file.write_all(b"\n")?;
@@ -795,18 +877,80 @@ pub fn install(root: &Path) -> Result<InstalledLayout, ConfigError> {
     match fs::hard_link(&temporary, &layout.config) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            fs::remove_file(&temporary)?;
+            cleanup_install_temporary(layout, &temporary, &file, coordination, None)?;
             let _ = load(&layout.config)?;
-            return Ok(layout);
+            return Ok(layout.clone());
         }
         Err(error) => {
-            let _ = fs::remove_file(&temporary);
+            if coordination == InstallCoordination::Legacy {
+                let _ = fs::remove_file(&temporary);
+            } else {
+                cleanup_install_temporary(layout, &temporary, &file, coordination, None)?;
+            }
             return Err(error.into());
         }
     }
-    fs::remove_file(&temporary)?;
+    cleanup_install_temporary(
+        layout,
+        &temporary,
+        &file,
+        coordination,
+        Some(&layout.config),
+    )?;
+    Ok(layout.clone())
+}
+
+fn cleanup_install_temporary(
+    layout: &InstalledLayout,
+    temporary: &Path,
+    file: &File,
+    coordination: InstallCoordination,
+    published: Option<&Path>,
+) -> Result<(), ConfigError> {
+    if coordination == InstallCoordination::Initialized {
+        validate_install_temporary_identity(file, temporary, published)?;
+    }
+    fs::remove_file(temporary)?;
     File::open(&layout.root)?.sync_all()?;
-    Ok(layout)
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn validate_install_temporary_identity(
+    file: &File,
+    temporary: &Path,
+    published: Option<&Path>,
+) -> Result<(), ConfigError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let held = file.metadata()?;
+    let named = fs::symlink_metadata(temporary)?;
+    let expected_links = if published.is_some() { 2 } else { 1 };
+    let valid = |metadata: &fs::Metadata| {
+        metadata.is_file()
+            && metadata.permissions().mode() & 0o7777 == 0o600
+            && metadata.nlink() == expected_links
+    };
+    if !valid(&held) || !valid(&named) || !same_accounting_metadata_identity(&held, &named) {
+        return Err(ConfigError::InvalidPath);
+    }
+    if let Some(published) = published {
+        let published = open_private_read(published)?;
+        let published = published.metadata()?;
+        if !valid(&published) || !same_accounting_metadata_identity(&held, &published) {
+            return Err(ConfigError::InvalidPath);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn validate_install_temporary_identity(
+    _file: &File,
+    _temporary: &Path,
+    _published: Option<&Path>,
+) -> Result<(), ConfigError> {
+    Err(ConfigError::UnsupportedPlatform)
 }
 
 pub fn load(path: &Path) -> Result<LocalRuntimeConfigV3, ConfigError> {
@@ -1448,6 +1592,244 @@ mod tests {
             LocalRuntimeConfigV3::default()
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intact_initialized_install_is_nonmutating_and_does_not_contend_with_writer() {
+        use crate::storage_coherence::StorageBarrier;
+
+        let root = root("install-initialized-intact");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let barrier = StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        let writer = barrier.try_begin_write().unwrap();
+        let original = fs::read(&layout.config).unwrap();
+
+        assert_eq!(install(&root).unwrap(), layout);
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+
+        drop(writer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_install_repairs_layout_without_rewriting_legacy_config() {
+        let root = root("install-legacy-config");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let legacy =
+            b"{\"schema_version\":\"local_runtime.v1\",\"enabled\":true,\"collection\":{}}\n";
+        fs::write(&layout.config, legacy).unwrap();
+        fs::remove_dir(&layout.queue).unwrap();
+
+        assert_eq!(install(&root).unwrap(), layout);
+        assert_eq!(fs::read(&layout.config).unwrap(), legacy);
+        assert!(layout.queue.is_dir());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intact_legacy_install_accepts_owner_read_only_runtime_without_barrier() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root("install-legacy-owner-read-only");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        fs::set_permissions(&layout.runtime, fs::Permissions::from_mode(0o500)).unwrap();
+
+        assert_eq!(install(&root).unwrap(), layout);
+        assert_eq!(
+            fs::metadata(&layout.runtime).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        assert!(!layout.runtime.join("storage-accounting.lock").exists());
+
+        fs::set_permissions(&layout.runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_install_does_not_repair_while_accounting_writer_is_busy() {
+        use crate::storage_coherence::{StorageBarrier, StorageCoherenceError};
+
+        let root = root("install-initialized-busy");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let barrier = StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        fs::remove_dir(&layout.queue).unwrap();
+        fs::remove_file(&layout.config).unwrap();
+        let writer = barrier.try_begin_write().unwrap();
+
+        assert!(matches!(
+            install(&root),
+            Err(ConfigError::StorageCoherence(StorageCoherenceError::Busy))
+        ));
+        assert!(!layout.queue.exists());
+        assert!(!layout.config.exists());
+
+        drop(writer);
+        assert_eq!(install(&root).unwrap(), layout);
+        assert!(layout.queue.is_dir());
+        assert_eq!(
+            load(&layout.config).unwrap(),
+            LocalRuntimeConfigV3::default()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_install_rejects_invalid_barrier_without_repair() {
+        use crate::storage_coherence::StorageBarrier;
+
+        let root = root("install-initialized-invalid");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        fs::remove_dir(&layout.queue).unwrap();
+        fs::remove_file(&layout.config).unwrap();
+        fs::write(layout.runtime.join("storage-accounting.lock"), b"invalid").unwrap();
+
+        assert!(matches!(
+            install(&root),
+            Err(ConfigError::StorageCoherence(_))
+        ));
+        assert!(!layout.queue.exists());
+        assert!(!layout.config.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intact_initialized_install_rejects_owner_read_only_runtime() {
+        use crate::storage_coherence::StorageBarrier;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root("install-initialized-owner-read-only");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        fs::set_permissions(&layout.runtime, fs::Permissions::from_mode(0o500)).unwrap();
+
+        assert!(matches!(
+            install(&root),
+            Err(ConfigError::StorageCoherence(_))
+        ));
+        assert_eq!(
+            fs::metadata(&layout.runtime).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+
+        fs::set_permissions(&layout.runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_install_does_not_recreate_missing_mutation_lock() {
+        use crate::storage_coherence::{StorageBarrier, StorageCoherenceError};
+
+        let root = root("install-initialized-missing-mutation-lock");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        let mutation_lock = layout.runtime.join("mutation.lock");
+        fs::remove_file(&mutation_lock).unwrap();
+        fs::remove_dir(&layout.queue).unwrap();
+
+        assert!(matches!(
+            install(&root),
+            Err(ConfigError::StorageCoherence(
+                StorageCoherenceError::Missing
+            ))
+        ));
+        assert!(!mutation_lock.exists());
+        assert!(!layout.queue.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_install_preserves_preexisting_config_temporary_collision() {
+        use crate::storage_coherence::StorageBarrier;
+
+        let root = root("install-initialized-temp-collision");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        fs::remove_file(&layout.config).unwrap();
+        let temporary = layout
+            .root
+            .join(format!(".config.json.tmp.{}", std::process::id()));
+        fs::write(&temporary, b"preexisting-user-file").unwrap();
+
+        assert!(matches!(
+            install(&root),
+            Err(ConfigError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(fs::read(&temporary).unwrap(), b"preexisting-user-file");
+        assert!(!layout.config.exists());
+
+        fs::remove_file(&temporary).unwrap();
+        assert_eq!(install(&root).unwrap(), layout);
+        assert!(!temporary.exists());
+        assert_eq!(
+            load(&layout.config).unwrap(),
+            LocalRuntimeConfigV3::default()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_cleanup_refuses_to_unlink_a_replaced_created_temporary() {
+        let root = root("install-initialized-replaced-temp");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let temporary = layout
+            .root
+            .join(format!(".config.json.tmp.{}", std::process::id()));
+        let displaced = layout.root.join("displaced-install-temp");
+        let mut created = private_create_new(&temporary).unwrap();
+        created.write_all(b"created-by-install").unwrap();
+        fs::rename(&temporary, &displaced).unwrap();
+        let mut replacement = private_create_new(&temporary).unwrap();
+        replacement.write_all(b"replacement").unwrap();
+
+        assert!(matches!(
+            cleanup_install_temporary(
+                &layout,
+                &temporary,
+                &created,
+                InstallCoordination::Initialized,
+                None,
+            ),
+            Err(ConfigError::InvalidPath)
+        ));
+        assert_eq!(fs::read(&temporary).unwrap(), b"replacement");
+        assert_eq!(fs::read(&displaced).unwrap(), b"created-by-install");
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

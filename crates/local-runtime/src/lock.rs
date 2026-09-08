@@ -355,6 +355,75 @@ impl MutationGuard {
         Self::acquire_with(runtime_dir, true)
     }
 
+    pub(crate) fn try_acquire_existing(runtime_dir: &Path) -> Result<Self, SingletonError> {
+        Self::try_acquire_existing_observing(runtime_dir, || {})
+    }
+
+    #[cfg(unix)]
+    fn try_acquire_existing_observing(
+        runtime_dir: &Path,
+        before_open: impl FnOnce(),
+    ) -> Result<Self, SingletonError> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        validate_private_runtime_dir(runtime_dir)?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(no_follow_flag() | nonblocking_flag())
+            .open(runtime_dir)?;
+        same_private_directory(&directory, runtime_dir)?;
+        let lock_path = runtime_dir.join("mutation.lock");
+        let expected = fs::symlink_metadata(&lock_path)?;
+        if expected.file_type().is_symlink() {
+            return Err(SingletonError::Symlink);
+        }
+        if !expected.is_file() || expected.nlink() != 1 || expected.len() != 0 {
+            return Err(SingletonError::WrongMutationRoot);
+        }
+        if expected.mode() & 0o7777 != 0o600 {
+            return Err(SingletonError::InsecurePermissions);
+        }
+        before_open();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(no_follow_flag() | nonblocking_flag())
+            .open(&lock_path)?;
+        validate_private_empty_lock(&file)?;
+        let opened = file.metadata()?;
+        if (expected.dev(), expected.ino()) != (opened.dev(), opened.ino()) {
+            return Err(SingletonError::WrongMutationRoot);
+        }
+        same_file(&file, &lock_path)?;
+        same_private_directory(&directory, runtime_dir)?;
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                SingletonError::AlreadyRunning
+            } else {
+                SingletonError::Io(error)
+            }
+        })?;
+        validate_private_empty_lock(&file)?;
+        same_file(&file, &lock_path)?;
+        same_private_directory(&directory, runtime_dir)?;
+        let runtime_dir = fs::canonicalize(runtime_dir)?;
+        same_private_directory(&directory, &runtime_dir)?;
+        same_file(&file, &runtime_dir.join("mutation.lock"))?;
+        Ok(Self {
+            file,
+            directory,
+            runtime_dir,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn try_acquire_existing_observing(
+        _runtime_dir: &Path,
+        _before_open: impl FnOnce(),
+    ) -> Result<Self, SingletonError> {
+        Err(SingletonError::UnsupportedPlatform)
+    }
+
     pub fn matches_accounting_lock(
         &self,
         root: &Path,
@@ -806,6 +875,38 @@ mod tests {
         let barrier =
             crate::storage_coherence::StorageBarrier::initialize(&root, &mutation).unwrap();
         (root, mutation, barrier)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_mutation_acquisition_never_recreates_or_accepts_replaced_lock() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for replace in [false, true] {
+            let (root, mutation, barrier) = coordinated_fixture(if replace {
+                "existing-mutation-replaced"
+            } else {
+                "existing-mutation-removed"
+            });
+            drop(mutation);
+            let runtime = root.join("runtime");
+            let path = runtime.join("mutation.lock");
+            let result = MutationGuard::try_acquire_existing_observing(&runtime, || {
+                fs::rename(&path, runtime.join("retained-mutation.lock")).unwrap();
+                if replace {
+                    fs::write(&path, []).unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            });
+            assert!(
+                result.is_err(),
+                "missing/replaced stable lock must fail closed"
+            );
+            assert_eq!(path.exists(), replace, "acquisition must not create a lock");
+            drop(result);
+            drop(barrier);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[cfg(unix)]
