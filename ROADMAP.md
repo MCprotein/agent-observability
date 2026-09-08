@@ -168,6 +168,12 @@ Ordinary CI at `4f8c848` also passed all three platforms/surfaces. Local-only re
 Geometry work is closed as insufficient. Future-write accounting or a separately reviewed
 authority representation remains the blocker; no reduced reservation or installed migration
 is enabled.
+
+The original-page-size private-copy check also leaves 158,167,040 bytes of deficit even under
+an optimistic whole-authority-only reservation, before journal overhead. Merely excluding
+derived views from the reservation is not a recovery for that copy. The numeric breakdown and
+unchanged-authority refusal check are in
+[Staged Ingest](docs/STAGED_INGEST.md#original-page-size-admission-check--september-8).
 The exact CI trigger remains unconfirmed; neither test stabilization nor smoke substitutes for
 capacity acceptance or release gates. Failed-smoke manifest retention is implemented.
 The earlier long workflow `34135080615` was cancelled before its normative job when those defects

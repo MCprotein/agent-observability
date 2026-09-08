@@ -289,6 +289,13 @@ mod rotation_diagnostic {
                 .unwrap()
                 .collector_admission_diagnostic(root, u64::from(config.collection.max_batch_bytes))
                 .unwrap();
+            // This deliberately optimistic comparison is diagnostic only, not a
+            // safe journal allowance: framing, growth and materialization are omitted.
+            let authority_logical_bytes = fs::metadata(state.store.database_path()).unwrap().len();
+            let retained_view_allocated_bytes = catalog_files(root)
+                .iter()
+                .map(|path| StorageBudget::allocated_bytes(path).unwrap())
+                .sum::<u64>();
             println!(
                 "new_ingest_rotation={rotation} store_allocated_bytes={} reservation_bytes={} report_reserved_bytes={} writable_headroom_bytes={} deficit_bytes={}",
                 admission.existing_store_allocated_bytes,
@@ -296,6 +303,10 @@ mod rotation_diagnostic {
                 admission.current_report_reserved_bytes,
                 admission.writable_headroom_bytes,
                 admission.deficit_bytes,
+            );
+            println!(
+                "authority_logical_bytes={authority_logical_bytes} retained_view_allocated_bytes={retained_view_allocated_bytes} optimistic_authority_only_deficit_bytes={}",
+                authority_logical_bytes.saturating_sub(admission.writable_headroom_bytes),
             );
             let payload = projected_notify(
                 "private-capacity-probe-thread",

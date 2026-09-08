@@ -125,6 +125,33 @@ proof of bounded peak RSS, a page-size migration protocol, or installed-runtime 
 
 ### Remaining proof gates
 
+#### Original-page-size admission check — September 8
+
+The existing private-backup new-ingest diagnostic was also run without compaction or a page-size
+change. The installed source was read only by SQLite backup; migration and publication operated
+on the disposable copy. Before the first new write, with two retained views, it measured:
+
+| Component | Bytes |
+| --- | ---: |
+| Migrated authority, logical size | 406,126,592 |
+| Two retained view files, allocated size | 269,934,592 |
+| Store tree, allocated size | 689,463,296 |
+| Writable headroom | 247,959,552 |
+| Existing collector reservation | 689,987,584 |
+| Existing admission deficit | 442,028,032 |
+| Authority logical size minus headroom | 158,167,040 |
+
+Even an optimistic reservation equal to just the authority's logical size would not fit.
+That comparison is **not a valid journal allowance**: it omits framing, growth and sparse
+materialization. It rules out that whole-authority-sized reservation as a recovery for this
+copy, not every possible bounded-write algorithm. The copy omits installed non-database files,
+so it is still optimistic. The first ingest was refused; canonical authority, cursor,
+generation/acknowledgement and current view were unchanged. The owned copy was removed.
+
+The diagnostic now emits these numeric components without source content or identifiers.
+No production admission, page size, schema, memory policy or installed runtime changed.
+Do not repeat geometry or substitute a whole-authority proxy expecting this deficit to vanish.
+
 The installed v1.10 runtime has not been migrated, replaced, or assigned a larger budget.
 Existing v7 migration and report-rotation measurements do not prove this ingestion design.
 Reduced reservation must remain disabled until both memory enforcement and post-publication
