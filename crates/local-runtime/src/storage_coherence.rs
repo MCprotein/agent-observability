@@ -265,6 +265,91 @@ impl StorageWriteGuard<'_> {
         self.barrier.revalidate()
     }
 }
+
+impl Drop for StorageWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Release this acquisition even if a process-creation window has duplicated
+        // its descriptor. Independently opened writer permits keep their own locks.
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+/// Root-serialized writer participation; this scope makes no admission decision.
+#[derive(Debug)]
+pub struct StorageMutationWriter<'barrier> {
+    permit: Option<StorageWriteGuard<'barrier>>,
+    mutation: MutationGuard,
+    root: PathBuf,
+}
+
+impl<'barrier> StorageMutationWriter<'barrier> {
+    pub fn acquire(
+        root: &Path,
+        barrier: Option<&'barrier StorageBarrier>,
+    ) -> Result<Self, StorageCoherenceError> {
+        Self::acquire_with(root, barrier, false)
+    }
+
+    /// Excludes other accounting participants without making an admission decision.
+    pub fn acquire_exclusive(
+        root: &Path,
+        barrier: Option<&'barrier StorageBarrier>,
+    ) -> Result<Self, StorageCoherenceError> {
+        Self::acquire_with(root, barrier, true)
+    }
+
+    fn acquire_with(
+        root: &Path,
+        barrier: Option<&'barrier StorageBarrier>,
+        exclusive: bool,
+    ) -> Result<Self, StorageCoherenceError> {
+        match barrier {
+            Some(barrier) if barrier.root != root => {
+                return Err(StorageCoherenceError::WrongMutationRoot);
+            }
+            None if StorageBarrier::open_if_initialized(root)?.is_some() => {
+                return Err(StorageCoherenceError::InvalidIdentity);
+            }
+            _ => {}
+        }
+        let mutation = if barrier.is_some() {
+            MutationGuard::try_acquire_existing(&root.join("runtime"))
+        } else {
+            MutationGuard::try_acquire(&root.join("runtime"))
+        }
+        .map_err(map_mutation_error)?;
+        mutation.require_root(root).map_err(map_mutation_error)?;
+        let permit = barrier
+            .map(|barrier| barrier.acquire(exclusive))
+            .transpose()?;
+        let scope = Self {
+            permit,
+            mutation,
+            root: root.to_path_buf(),
+        };
+        scope.revalidate()?;
+        Ok(scope)
+    }
+
+    pub fn mutation(&self) -> &MutationGuard {
+        &self.mutation
+    }
+
+    pub fn revalidate(&self) -> Result<(), StorageCoherenceError> {
+        self.mutation
+            .require_root(&self.root)
+            .map_err(map_mutation_error)?;
+        if let Some(permit) = &self.permit {
+            if permit.barrier.root != self.root {
+                return Err(StorageCoherenceError::WrongMutationRoot);
+            }
+            permit.revalidate()?;
+        } else if StorageBarrier::open_if_initialized(&self.root)?.is_some() {
+            return Err(StorageCoherenceError::InvalidIdentity);
+        }
+        Ok(())
+    }
+}
 impl StorageFreezeGuard<'_, '_> {
     pub fn revalidate(&self) -> Result<(), StorageCoherenceError> {
         self.mutation
@@ -430,6 +515,28 @@ mod tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mutation = crate::MutationGuard::try_acquire(&root.join("runtime")).unwrap();
         (root, mutation)
+    }
+
+    #[test]
+    fn writer_release_is_not_delayed_by_a_duplicate_descriptor() {
+        let (root, mutation) = fixture();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let writer = barrier.try_begin_write().unwrap();
+        let duplicate = writer.file.try_clone().unwrap();
+        let other_writer = barrier.try_begin_write().unwrap();
+        drop(writer);
+        assert!(matches!(
+            barrier.try_freeze(&mutation),
+            Err(StorageCoherenceError::Busy)
+        ));
+        drop(other_writer);
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+        freeze.revalidate().unwrap();
+        drop(freeze);
+        drop(duplicate);
+        drop(barrier);
+        drop(mutation);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
