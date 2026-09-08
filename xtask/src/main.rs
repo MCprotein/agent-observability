@@ -4350,6 +4350,10 @@ struct RssSampler {
     stop: Option<mpsc::Sender<()>>,
     result: mpsc::Receiver<Result<RssPeaks, String>>,
     handle: Option<thread::JoinHandle<()>>,
+    #[cfg(test)]
+    sample_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    initial_rss_kib: f64,
 }
 
 struct ProcessRssReader {
@@ -4434,6 +4438,21 @@ impl RssSampler {
         }
         Ok(peaks)
     }
+
+    #[cfg(test)]
+    fn wait_for_samples(&self, minimum: u64, timeout: Duration) -> Result<(), String> {
+        let started = Instant::now();
+        while self.sample_count.load(Ordering::Acquire) < minimum {
+            if started.elapsed() >= timeout {
+                return Err(format!(
+                    "RSS sampler did not complete {minimum} samples within {} ms",
+                    timeout.as_millis()
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
 }
 
 fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String> {
@@ -4444,6 +4463,10 @@ fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String>
     let initial = reader.sample_kib()?;
     let (stop_tx, stop_rx) = mpsc::channel();
     let (result_tx, result_rx) = mpsc::channel();
+    #[cfg(test)]
+    let sample_count = Arc::new(AtomicU64::new(1));
+    #[cfg(test)]
+    let sampler_sample_count = Arc::clone(&sample_count);
     let handle = thread::spawn(move || {
         let result = (|| {
             let mut rss_samples_kib = vec![initial];
@@ -4465,6 +4488,8 @@ fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String>
                 rss_samples_kib.push(rss_kib);
                 peaks.peak_rss_kib = peaks.peak_rss_kib.max(rss_kib);
                 peaks.samples = peaks.samples.saturating_add(1);
+                #[cfg(test)]
+                sampler_sample_count.store(peaks.samples, Ordering::Release);
                 let sampled_at = Instant::now();
                 peaks.max_gap_ms = peaks
                     .max_gap_ms
@@ -4486,6 +4511,10 @@ fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String>
         stop: Some(stop_tx),
         result: result_rx,
         handle: Some(handle),
+        #[cfg(test)]
+        sample_count,
+        #[cfg(test)]
+        initial_rss_kib: initial,
     })
 }
 
@@ -7084,6 +7113,8 @@ mod tests {
             stop: Some(stop_tx),
             result: result_rx,
             handle: Some(handle),
+            sample_count: Arc::new(AtomicU64::new(0)),
+            initial_rss_kib: 0.0,
         };
         let started = Instant::now();
         let error = sampler
@@ -7098,23 +7129,49 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn rss_sampler_observes_a_bounded_subprocess_memory_spike() {
-        let mut child = Command::new("/usr/bin/perl")
-            .args([
-                "-e",
-                "select(undef,undef,undef,0.05); $x = 'x' x (64*1024*1024); select(undef,undef,undef,1.0);",
-            ])
-            .spawn()
-            .unwrap();
+    fn rss_sampler_observes_a_ready_subprocess_memory_spike_after_bounded_samples() {
+        let mut child = ChildGuard(
+            Command::new("/usr/bin/perl")
+                .args([
+                    "-e",
+                    "$| = 1; print \"ready\\n\"; <STDIN>; $x = 'x' x (64*1024*1024); print \"allocated\\n\"; <STDIN>;",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut output = WorkerOutput::new(child.stdout.take().unwrap());
+        assert_eq!(
+            output
+                .read(WORKER_EXIT_TIMEOUT, "RSS fixture readiness")
+                .unwrap(),
+            "ready"
+        );
         let mut sampler = start_rss_sampler(child.id(), Duration::from_millis(10)).unwrap();
-        thread::sleep(Duration::from_millis(600));
+        let baseline = sampler.initial_rss_kib;
+        let mut input = child.stdin.take().unwrap();
+        writeln!(input, "allocate").unwrap();
+        assert_eq!(
+            output
+                .read(WORKER_EXIT_TIMEOUT, "RSS fixture allocation")
+                .unwrap(),
+            "allocated"
+        );
+        let after_allocation = sampler.sample_count.load(Ordering::Acquire);
+        sampler
+            .wait_for_samples(after_allocation + 2, WORKER_EXIT_TIMEOUT)
+            .unwrap();
         let peaks = sampler.stop().unwrap();
-        let status = child.wait().unwrap();
+        writeln!(input, "stop").unwrap();
+        let status = wait_for_child(&mut child, WORKER_EXIT_TIMEOUT).unwrap();
+        output.join().unwrap();
 
         assert!(status.success());
         assert!(peaks.peak_rss_kib >= 32.0 * 1024.0);
+        assert!(peaks.peak_rss_kib - baseline >= 32.0 * 1024.0);
         assert!(peaks.samples >= 3);
-        assert!(peaks.max_gap_ms <= 100);
     }
 
     #[test]
@@ -7144,8 +7201,13 @@ mod tests {
                 .contains("exact durable report evidence")
         );
 
+        let max_gap_ms = u64::try_from(AUTOMATIC_RSS_MAX_OBSERVED_GAP.as_millis()).unwrap();
         let mut result = automatic_result(1, vec![1; automatic_config().events]);
-        result.rss_observed_max_gap_ms = 101;
+        result.rss_observed_max_gap_ms = max_gap_ms;
+        assert!(validate_single_automatic(result).is_ok());
+
+        let mut result = automatic_result(1, vec![1; automatic_config().events]);
+        result.rss_observed_max_gap_ms = max_gap_ms + 1;
         assert!(
             validate_single_automatic(result)
                 .unwrap_err()
