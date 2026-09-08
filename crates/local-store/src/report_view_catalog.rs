@@ -235,6 +235,213 @@ struct ReportViewCatalog {
     retired: Option<ReportViewSnapshot>,
 }
 
+/// Semantic role of one exact path retained by report-view ownership evidence.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ReportViewOwnedEntryKind {
+    ManagedDirectory,
+    Catalog,
+    CurrentSnapshot,
+    RetiredSnapshot,
+}
+
+/// One exact path enumerated by validated report-view ownership evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReportViewOwnedEntry<'a> {
+    kind: ReportViewOwnedEntryKind,
+    path: &'a Path,
+}
+
+impl<'a> ReportViewOwnedEntry<'a> {
+    #[must_use]
+    pub const fn kind(self) -> ReportViewOwnedEntryKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn path(self) -> &'a Path {
+        self.path
+    }
+}
+
+#[derive(Debug)]
+struct OwnedDescriptor {
+    kind: ReportViewOwnedEntryKind,
+    path: PathBuf,
+    file: File,
+}
+
+/// Callback-scoped observation of the exact report-view directory, catalog, and retained snapshots.
+///
+/// File descriptors, including the existing render-lock identity, remain private and live until
+/// this value is dropped. Callers can enumerate paths and test an already-open descriptor, but
+/// cannot turn a matching filename into ownership evidence.
+pub struct ReportViewOwnershipObservation<'a> {
+    store: &'a LocalStore,
+    render_lock_path: PathBuf,
+    render_lock: File,
+    source_identity: String,
+    visibility_epoch: u64,
+    catalog: Option<ReportViewCatalog>,
+    owned: Vec<OwnedDescriptor>,
+}
+
+impl fmt::Debug for ReportViewOwnershipObservation<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let kinds = self
+            .owned
+            .iter()
+            .map(|entry| entry.kind)
+            .collect::<BTreeSet<_>>();
+        formatter
+            .debug_struct("ReportViewOwnershipObservation")
+            .field("entry_count", &self.owned.len())
+            .field("kinds", &kinds)
+            .finish()
+    }
+}
+
+impl ReportViewOwnershipObservation<'_> {
+    /// Enumerates the exact paths and roles validated at acquisition.
+    #[must_use]
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = ReportViewOwnedEntry<'_>> {
+        self.owned.iter().map(|entry| ReportViewOwnedEntry {
+            kind: entry.kind,
+            path: &entry.path,
+        })
+    }
+
+    /// Tests whether `descriptor` is the retained private identity for the exact known `path`.
+    ///
+    /// Unknown paths return false. A known path with a replaced, aliased, or otherwise mismatched
+    /// descriptor fails closed with [`ReportViewCatalogError::InvalidCatalog`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReportViewCatalogError::InvalidCatalog`] when a known path does not match its
+    /// retained private descriptor, or an I/O error when descriptor metadata cannot be read.
+    pub fn recognizes(
+        &self,
+        path: &Path,
+        descriptor: &File,
+    ) -> Result<bool, ReportViewCatalogError> {
+        let Some(owned) = self.owned.iter().find(|owned| owned.path == path) else {
+            return Ok(false);
+        };
+        validate_descriptor_for_kind(descriptor, owned.kind)?;
+        if !same_descriptor_identity(&owned.file, descriptor)? {
+            return Err(ReportViewCatalogError::InvalidCatalog);
+        }
+        Ok(true)
+    }
+
+    fn validate_authority(&self) -> Result<(), ReportViewCatalogError> {
+        validate_render_lock_identity(&self.render_lock_path, &self.render_lock)?;
+        let source_identity =
+            source_store_identity(self.store).map_err(ReportViewCatalogError::Build)?;
+        if source_identity != self.source_identity {
+            return Err(ReportViewCatalogError::SourceMismatch);
+        }
+        let visibility_epoch = self.store.report_visibility_epoch()?;
+        if visibility_epoch != self.visibility_epoch {
+            return Err(ReportViewCatalogError::RefreshPending);
+        }
+        let directory = existing_managed_report_view_directory(self.store)
+            .map_err(ReportViewCatalogError::Build)?
+            .ok_or(ReportViewCatalogError::InvalidCatalog)?;
+        if self
+            .owned
+            .first()
+            .is_none_or(|owned| owned.path != directory)
+        {
+            return Err(ReportViewCatalogError::InvalidCatalog);
+        }
+        for owned in &self.owned {
+            validate_named_identity(owned)?;
+        }
+        let catalog = read_catalog(&directory)?;
+        validate_catalog_authority(catalog.as_ref(), &source_identity, visibility_epoch)?;
+        if catalog != self.catalog {
+            return Err(ReportViewCatalogError::InvalidCatalog);
+        }
+        if let Some(catalog) = catalog.as_ref() {
+            validate_catalog_snapshot_databases(&directory, catalog)?;
+        }
+        Ok(())
+    }
+}
+
+/// Supplies a bounded, read-only observation of report-view ownership.
+///
+/// This operation requires an existing managed report-view directory and existing render lock.
+/// It never creates, repairs, cleans up, publishes, or migrates an artifact. Current and retired
+/// snapshots are validated only through their bounded metadata and index contracts. It retains and
+/// revalidates the render-lock identity without acquiring that lock, so an immutable published view
+/// can be observed while a new report is building.
+///
+/// This before/after observation is not an ABA-safe or coherent all-writer filesystem snapshot.
+/// A caller must hold the external all-writer freeze before using it as storage-admission evidence;
+/// no marker or value supplied by the caller is accepted as authority here.
+///
+/// # Errors
+///
+/// Returns [`ReportViewCatalogError`] if the existing render lock is absent, catalog authority is
+/// invalid, a retained snapshot is invalid, or any exact path identity changes.
+pub fn with_report_view_ownership_observation<T>(
+    store: &LocalStore,
+    use_observation: impl FnOnce(&ReportViewOwnershipObservation<'_>) -> T,
+) -> Result<T, ReportViewCatalogError> {
+    let directory = existing_managed_report_view_directory(store)
+        .map_err(ReportViewCatalogError::Build)?
+        .ok_or(ReportViewCatalogError::RefreshPending)?;
+    let (render_lock_path, render_lock) = open_existing_render_lock_identity(store)?;
+    let source_identity = source_store_identity(store).map_err(ReportViewCatalogError::Build)?;
+    let visibility_epoch = store.report_visibility_epoch()?;
+    let catalog = read_catalog(&directory)?;
+    validate_catalog_authority(catalog.as_ref(), &source_identity, visibility_epoch)?;
+
+    let mut owned = Vec::with_capacity(4);
+    owned.push(open_owned_descriptor(
+        ReportViewOwnedEntryKind::ManagedDirectory,
+        directory.clone(),
+    )?);
+    if let Some(catalog) = catalog.as_ref() {
+        owned.push(open_owned_descriptor(
+            ReportViewOwnedEntryKind::Catalog,
+            directory.join(CATALOG_FILE_NAME),
+        )?);
+        for (kind, snapshot) in [
+            (
+                ReportViewOwnedEntryKind::CurrentSnapshot,
+                catalog.current.as_ref(),
+            ),
+            (
+                ReportViewOwnedEntryKind::RetiredSnapshot,
+                catalog.retired.as_ref(),
+            ),
+        ] {
+            if let Some(snapshot) = snapshot {
+                owned.push(open_owned_descriptor(
+                    kind,
+                    directory.join(&snapshot.file_name),
+                )?);
+            }
+        }
+    }
+    let observation = ReportViewOwnershipObservation {
+        store,
+        render_lock_path,
+        render_lock,
+        source_identity,
+        visibility_epoch,
+        catalog,
+        owned,
+    };
+    observation.validate_authority()?;
+    let result = use_observation(&observation);
+    observation.validate_authority()?;
+    Ok(result)
+}
+
 /// Publishes a complete staging database as an immutable current snapshot.
 ///
 /// The staging handle retains the nonblocking publication guard through the immutable rename,
@@ -603,6 +810,115 @@ fn try_guard(store: &LocalStore) -> Result<ReportRenderGuard, ReportViewCatalogE
         .ok_or(ReportViewCatalogError::Busy)
 }
 
+fn open_existing_render_lock_identity(
+    store: &LocalStore,
+) -> Result<(PathBuf, File), ReportViewCatalogError> {
+    let path = store.dir.join(REPORT_RENDER_LOCK_NAME);
+    private_file(&path)?;
+    let file = open_private_read(&path)?;
+    validate_descriptor_for_kind(&file, ReportViewOwnedEntryKind::Catalog)?;
+    validate_render_lock_identity(&path, &file)?;
+    Ok((path, file))
+}
+
+fn validate_render_lock_identity(
+    path: &Path,
+    retained: &File,
+) -> Result<(), ReportViewCatalogError> {
+    let named = open_private_read(path)?;
+    validate_descriptor_for_kind(&named, ReportViewOwnedEntryKind::Catalog)?;
+    if !same_descriptor_identity(retained, &named)? {
+        return Err(ReportViewCatalogError::InvalidCatalog);
+    }
+    Ok(())
+}
+
+fn open_owned_descriptor(
+    kind: ReportViewOwnedEntryKind,
+    path: PathBuf,
+) -> Result<OwnedDescriptor, ReportViewCatalogError> {
+    let file = open_owned_descriptor_for_validation(kind, &path)?;
+    let owned = OwnedDescriptor { kind, path, file };
+    validate_named_identity(&owned)?;
+    Ok(owned)
+}
+
+fn validate_named_identity(owned: &OwnedDescriptor) -> Result<(), ReportViewCatalogError> {
+    let named = open_owned_descriptor_for_validation(owned.kind, &owned.path)?;
+    if !same_descriptor_identity(&owned.file, &named)? {
+        return Err(ReportViewCatalogError::InvalidCatalog);
+    }
+    Ok(())
+}
+
+fn open_owned_descriptor_for_validation(
+    kind: ReportViewOwnedEntryKind,
+    path: &Path,
+) -> Result<File, ReportViewCatalogError> {
+    let file = if kind == ReportViewOwnedEntryKind::ManagedDirectory {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(no_follow_flag());
+        }
+        options.open(path)?
+    } else {
+        open_private_read(path)?
+    };
+    validate_descriptor_for_kind(&file, kind)?;
+    Ok(file)
+}
+
+fn validate_descriptor_for_kind(
+    file: &File,
+    kind: ReportViewOwnedEntryKind,
+) -> Result<(), ReportViewCatalogError> {
+    let metadata = file.metadata()?;
+    let valid_kind = if kind == ReportViewOwnedEntryKind::ManagedDirectory {
+        metadata.is_dir()
+    } else {
+        metadata.is_file()
+    };
+    if !valid_kind {
+        return Err(ReportViewCatalogError::InvalidCatalog);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let expected_mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+        if metadata.permissions().mode() & 0o777 != expected_mode
+            || (metadata.is_file() && metadata.nlink() != 1)
+        {
+            return Err(ReportViewCatalogError::InvalidCatalog);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_descriptor_identity(left: &File, right: &File) -> Result<bool, ReportViewCatalogError> {
+    use std::os::unix::fs::MetadataExt;
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(windows)]
+fn same_descriptor_identity(left: &File, right: &File) -> Result<bool, ReportViewCatalogError> {
+    use std::os::windows::fs::MetadataExt;
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index() == right.file_index())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_descriptor_identity(_left: &File, _right: &File) -> Result<bool, ReportViewCatalogError> {
+    Ok(false)
+}
+
 #[cfg(unix)]
 fn report_render_guard_matches(
     store: &LocalStore,
@@ -947,6 +1263,30 @@ fn validate_catalog_files(
     Ok(())
 }
 
+fn validate_catalog_snapshot_databases(
+    directory: &Path,
+    catalog: &ReportViewCatalog,
+) -> Result<(), ReportViewCatalogError> {
+    for snapshot in [catalog.current.as_ref(), catalog.retired.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let path = directory.join(&snapshot.file_name);
+        private_file(&path)?;
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        connection.busy_timeout(Duration::ZERO)?;
+        connection.pragma_update(None, "query_only", true)?;
+        connection.pragma_update(None, "cache_size", -SQLITE_CACHE_KIB)?;
+        validate_snapshot_database(&connection, snapshot)?;
+    }
+    Ok(())
+}
+
 fn validate_snapshot_database(
     connection: &Connection,
     snapshot: &ReportViewSnapshot,
@@ -1274,6 +1614,224 @@ mod tests {
             .count();
         assert_eq!(immutable_files, 2);
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn ownership_observation_enumerates_current_retired_catalog_and_directory() {
+        let (directory, store) = open_store("ownership-membership");
+        let peer = LocalStore::open_current(&directory).unwrap();
+        let first = publish_report_view(&store, build(&store)).unwrap();
+        store.invalidate_report().unwrap();
+        let second = publish_report_view(&store, build(&store)).unwrap();
+
+        with_report_view_ownership_observation(&store, |observation| {
+            let entries = observation.entries().collect::<Vec<_>>();
+            assert_eq!(entries.len(), 4);
+            let debug = format!("{observation:?}");
+            assert!(debug.contains("entry_count: 4"));
+            assert!(debug.contains("ManagedDirectory"));
+            assert!(debug.contains("Catalog"));
+            assert!(debug.contains("CurrentSnapshot"));
+            assert!(debug.contains("RetiredSnapshot"));
+            assert!(!debug.contains(directory.to_string_lossy().as_ref()));
+            assert!(!debug.contains("store:sha256:"));
+            assert!(!debug.contains("LocalStore"));
+            assert!(!debug.contains("File"));
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.kind())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([
+                    ReportViewOwnedEntryKind::ManagedDirectory,
+                    ReportViewOwnedEntryKind::Catalog,
+                    ReportViewOwnedEntryKind::CurrentSnapshot,
+                    ReportViewOwnedEntryKind::RetiredSnapshot,
+                ])
+            );
+            assert!(peer.try_acquire_report_render_guard().unwrap().is_some());
+            for entry in entries {
+                let descriptor = File::open(entry.path()).unwrap();
+                assert!(observation.recognizes(entry.path(), &descriptor).unwrap());
+            }
+            let paths = observation
+                .entries()
+                .map(|entry| entry.path().to_path_buf())
+                .collect::<BTreeSet<_>>();
+            assert!(paths.iter().any(|path| {
+                path.file_name().and_then(|name| name.to_str())
+                    == Some(first.current().file_name.as_str())
+            }));
+            assert!(paths.iter().any(|path| {
+                path.file_name().and_then(|name| name.to_str())
+                    == Some(second.current().file_name.as_str())
+            }));
+        })
+        .unwrap();
+        assert!(peer.try_acquire_report_render_guard().unwrap().is_some());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn ownership_observation_rejects_matching_orphan_and_zero_length_bogus_names() {
+        let (directory, store) = open_store("ownership-orphans");
+        publish_report_view(&store, build(&store)).unwrap();
+        let managed = managed_report_view_directory(&store).unwrap();
+        let orphan = managed.join(format!(
+            "{IMMUTABLE_FILE_PREFIX}{}{IMMUTABLE_FILE_SUFFIX}",
+            "0".repeat(64)
+        ));
+        drop(private_create_new(&orphan).unwrap());
+        let bogus = managed.join(format!("{STAGING_FILE_PREFIX}0.0"));
+        drop(private_create_new(&bogus).unwrap());
+
+        with_report_view_ownership_observation(&store, |observation| {
+            assert!(
+                !observation
+                    .recognizes(&orphan, &File::open(&orphan).unwrap())
+                    .unwrap()
+            );
+            assert!(
+                !observation
+                    .recognizes(&bogus, &File::open(&bogus).unwrap())
+                    .unwrap()
+            );
+        })
+        .unwrap();
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_observation_refuses_replacement_alias_and_lock_replacement() {
+        let (directory, store) = open_store("ownership-identity");
+        let published = publish_report_view(&store, build(&store)).unwrap();
+        let managed = managed_report_view_directory(&store).unwrap();
+        let snapshot = managed.join(&published.current().file_name);
+
+        let replacement_result = with_report_view_ownership_observation(&store, |observation| {
+            let displaced = managed.join("displaced.sqlite3");
+            fs::rename(&snapshot, &displaced).unwrap();
+            drop(private_create_new(&snapshot).unwrap());
+            observation.recognizes(&snapshot, &File::open(&snapshot).unwrap())
+        });
+        assert!(matches!(
+            replacement_result,
+            Ok(Err(ReportViewCatalogError::InvalidCatalog))
+                | Err(ReportViewCatalogError::InvalidCatalog)
+        ));
+
+        fs::remove_file(&snapshot).unwrap();
+        fs::rename(managed.join("displaced.sqlite3"), &snapshot).unwrap();
+        let alias_result = with_report_view_ownership_observation(&store, |observation| {
+            let alias = managed.join("snapshot-alias");
+            fs::hard_link(&snapshot, &alias).unwrap();
+            observation.recognizes(&snapshot, &File::open(&alias).unwrap())
+        });
+        assert!(matches!(
+            alias_result,
+            Ok(Err(ReportViewCatalogError::InvalidCatalog))
+                | Err(ReportViewCatalogError::InvalidCatalog)
+        ));
+        fs::remove_file(managed.join("snapshot-alias")).unwrap();
+
+        let (lock_directory, lock_store) = open_store("ownership-lock-replacement");
+        publish_report_view(&lock_store, build(&lock_store)).unwrap();
+        let lock = lock_directory.join(REPORT_RENDER_LOCK_NAME);
+        let lock_result = with_report_view_ownership_observation(&lock_store, |_observation| {
+            let displaced = lock_directory.join("displaced-report-render.lock");
+            fs::rename(&lock, &displaced).unwrap();
+            drop(private_create_new(&lock).unwrap());
+        });
+        assert!(matches!(
+            lock_result,
+            Err(ReportViewCatalogError::InvalidCatalog)
+        ));
+        let _ = fs::remove_dir_all(directory);
+        let _ = fs::remove_dir_all(lock_directory);
+    }
+
+    #[test]
+    fn ownership_observation_is_invalidated_by_visibility_or_catalog_mutation() {
+        let (visibility_directory, visibility_store) = open_store("ownership-visibility");
+        publish_report_view(&visibility_store, build(&visibility_store)).unwrap();
+        let visibility_result =
+            with_report_view_ownership_observation(&visibility_store, |_observation| {
+                visibility_store
+                    .db
+                    .execute(
+                        "UPDATE metadata SET value='1' WHERE key='report_visibility_epoch'",
+                        [],
+                    )
+                    .unwrap();
+            });
+        assert!(matches!(
+            visibility_result,
+            Err(ReportViewCatalogError::RefreshPending)
+        ));
+
+        let (catalog_directory, catalog_store) = open_store("ownership-catalog-mutation");
+        publish_report_view(&catalog_store, build(&catalog_store)).unwrap();
+        let catalog_path = managed_report_view_directory(&catalog_store)
+            .unwrap()
+            .join(CATALOG_FILE_NAME);
+        let catalog_result =
+            with_report_view_ownership_observation(&catalog_store, |_observation| {
+                let catalog = ReportViewCatalog {
+                    schema_version: CATALOG_SCHEMA_VERSION.to_owned(),
+                    source_identity: source_store_identity(&catalog_store).unwrap(),
+                    visibility_epoch: 0,
+                    current: None,
+                    retired: None,
+                };
+                fs::write(&catalog_path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+            });
+        assert!(matches!(
+            catalog_result,
+            Err(ReportViewCatalogError::InvalidCatalog)
+        ));
+        let _ = fs::remove_dir_all(visibility_directory);
+        let _ = fs::remove_dir_all(catalog_directory);
+    }
+
+    #[test]
+    fn ownership_observation_never_creates_lock_and_reads_current_during_build() {
+        let (missing_directory, missing_store) = open_store("ownership-missing-guard");
+        let managed = missing_directory.join(MANAGED_DIRECTORY_NAME);
+        private_dir(&managed).unwrap();
+        let lock = missing_directory.join(REPORT_RENDER_LOCK_NAME);
+        assert!(!lock.exists());
+        assert!(with_report_view_ownership_observation(&missing_store, |_| ()).is_err());
+        assert!(!lock.exists());
+
+        let (busy_directory, busy_store) = open_store("ownership-during-build");
+        let published = publish_report_view(&busy_store, build(&busy_store)).unwrap();
+        busy_store.invalidate_report().unwrap();
+        let staging = build(&busy_store);
+        with_report_view_ownership_observation(&busy_store, |observation| {
+            let current = observation
+                .entries()
+                .find(|entry| entry.kind() == ReportViewOwnedEntryKind::CurrentSnapshot)
+                .unwrap();
+            assert_eq!(
+                current.path().file_name().and_then(|name| name.to_str()),
+                Some(published.current().file_name.as_str())
+            );
+            assert!(
+                observation
+                    .recognizes(current.path(), &File::open(current.path()).unwrap())
+                    .unwrap()
+            );
+            assert!(
+                !observation
+                    .recognizes(staging.path(), &File::open(staging.path()).unwrap())
+                    .unwrap()
+            );
+        })
+        .unwrap();
+        drop(staging);
+        let _ = fs::remove_dir_all(missing_directory);
+        let _ = fs::remove_dir_all(busy_directory);
     }
 
     #[test]

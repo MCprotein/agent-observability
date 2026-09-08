@@ -38,6 +38,11 @@ struct CompleteMetadata<'a> {
     records: usize,
 }
 
+struct ProjectionRow {
+    index: usize,
+    span_json: String,
+}
+
 const CREATE_SCHEMA: &str = r"
 CREATE TABLE metadata (
     key TEXT PRIMARY KEY,
@@ -89,6 +94,7 @@ pub enum ReportViewBuildError {
     Busy,
     SnapshotChanged,
     InvalidStagingState,
+    CoordinationDenied,
 }
 
 impl Display for ReportViewBuildError {
@@ -105,7 +111,59 @@ impl Display for ReportViewBuildError {
             Self::Busy => "another report view staging or publication operation is active",
             Self::SnapshotChanged => "report view source generation changed during construction",
             Self::InvalidStagingState => "report view staging state is invalid",
+            Self::CoordinationDenied => "report view storage coordination permit was denied",
         })
+    }
+}
+
+/// A bounded report-view write phase requiring composition-level coordination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportViewWritePhase {
+    Initialize,
+    ProjectionBatch,
+    RepositoryResolutionBatch,
+    FinalMetadata,
+    Discard,
+}
+
+/// Supplies an owned shared permit for one bounded report-view write phase.
+///
+/// The store intentionally knows nothing about the runtime barrier. The composition root owns the
+/// concrete factory and maps a denied runtime acquisition to [`ReportViewBuildError`]. Each permit
+/// is dropped only after the corresponding commit, rollback, close, and rollback-journal cleanup.
+pub trait ReportViewPermitFactory {
+    type Permit;
+
+    /// Acquires one shared permit. Returning an error must not mutate the staging database.
+    ///
+    /// # Errors
+    /// Returns a build error when the composition root cannot authorize this write phase.
+    fn acquire(
+        &mut self,
+        phase: ReportViewWritePhase,
+    ) -> Result<Self::Permit, ReportViewBuildError>;
+
+    /// Revalidates the coordination state after the write phase has fully cleaned up.
+    ///
+    /// # Errors
+    /// Returns a build error when publication or the next write phase is no longer authorized.
+    fn revalidate(&mut self, permit: &Self::Permit) -> Result<(), ReportViewBuildError>;
+}
+
+struct NoopReportViewPermitFactory;
+
+impl ReportViewPermitFactory for NoopReportViewPermitFactory {
+    type Permit = ();
+
+    fn acquire(
+        &mut self,
+        _phase: ReportViewWritePhase,
+    ) -> Result<Self::Permit, ReportViewBuildError> {
+        Ok(())
+    }
+
+    fn revalidate(&mut self, _permit: &Self::Permit) -> Result<(), ReportViewBuildError> {
+        Ok(())
     }
 }
 
@@ -171,6 +229,7 @@ pub struct ReportViewStaging {
     rate_fingerprint: String,
     source_identity: String,
     generated_at: String,
+    cleanup_on_drop: bool,
 }
 
 impl ReportViewStaging {
@@ -268,12 +327,48 @@ impl ReportViewStaging {
         self.identity_file.sync_all()?;
         Ok(())
     }
+
+    /// Closes and removes coordinated staging while holding a composition-supplied permit.
+    ///
+    /// If permit acquisition fails, the connection, staging file, and publication guard remain
+    /// owned by this handle. Coordinated handles never unlink their staging path from [`Drop`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an acquisition, close, identity, synchronization, or removal error. A failure does
+    /// not authorize releasing any external full-build reservation.
+    pub fn discard_with_permit<P: ReportViewPermitFactory>(
+        &mut self,
+        permits: &mut P,
+    ) -> Result<(), ReportViewBuildError> {
+        let permit = permits.acquire(ReportViewWritePhase::Discard)?;
+        let result = (|| {
+            close_staging_connection(self)?;
+            self.validate_identity()?;
+            fs::remove_file(&self.path)?;
+            self.directory.sync_all()?;
+            self.cleanup_on_drop = false;
+            Ok(())
+        })();
+        let revalidation = permits.revalidate(&permit);
+        match result {
+            Ok(()) => revalidation,
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl Drop for ReportViewStaging {
     fn drop(&mut self) {
+        // Every coordinated transaction borrows this handle through `ActiveWrite`, whose Drop
+        // rolls back (and closes on unwind/failure) before releasing its permit. Therefore a
+        // remaining connection is idle: closing it cannot perform transaction or journal cleanup.
         if let Some(connection) = self.connection.take() {
             let _ = connection.close();
+        }
+        if !self.cleanup_on_drop {
+            drop(self.publication_guard.take());
+            return;
         }
         // A rejected callback or external replacement must not make Drop delete another file.
         if self.validate_identity().is_ok() {
@@ -352,14 +447,77 @@ pub fn build_report_view_staging_bound(
     admitted_bytes: u64,
     rates: Option<&RateTable>,
     before_write: impl FnOnce(&Path, &fs::File) -> Result<(), ReportViewBuildError>,
-    mut after_project: impl FnMut(usize),
+    after_project: impl FnMut(usize),
 ) -> Result<ReportViewStaging, ReportViewBuildError> {
-    let mut staging = create_staging(store, rate_fingerprint, admitted_bytes, before_write)?;
+    let mut permits = NoopReportViewPermitFactory;
+    build_report_view_staging_bound_impl(
+        store,
+        rate_fingerprint,
+        admitted_bytes,
+        rates,
+        before_write,
+        &mut permits,
+        after_project,
+        true,
+    )
+}
+
+/// Builds bound staging with composition-supplied permits around every bounded write phase.
+///
+/// The existing publication guard remains held across the complete build; the binding callback
+/// runs once before initialization and may release the caller's initial mutation scope.
+/// A coordinated handle never performs implicit path cleanup in [`Drop`]; callers must use
+/// [`ReportViewStaging::discard_with_permit`] when abandoning it. Failed permit acquisition leaves
+/// staging and any composition-owned full-build reservation intact for guarded recovery.
+///
+/// # Errors
+///
+/// Returns a permit acquisition error or the same validation/build errors as
+/// [`build_report_view_staging_bound`].
+pub fn build_report_view_staging_bound_coordinated<P: ReportViewPermitFactory>(
+    store: &LocalStore,
+    rate_fingerprint: &str,
+    admitted_bytes: u64,
+    rates: Option<&RateTable>,
+    before_write: impl FnOnce(&Path, &fs::File) -> Result<(), ReportViewBuildError>,
+    permits: &mut P,
+    after_project: impl FnMut(usize),
+) -> Result<ReportViewStaging, ReportViewBuildError> {
+    build_report_view_staging_bound_impl(
+        store,
+        rate_fingerprint,
+        admitted_bytes,
+        rates,
+        before_write,
+        permits,
+        after_project,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_report_view_staging_bound_impl<P: ReportViewPermitFactory>(
+    store: &LocalStore,
+    rate_fingerprint: &str,
+    admitted_bytes: u64,
+    rates: Option<&RateTable>,
+    before_write: impl FnOnce(&Path, &fs::File) -> Result<(), ReportViewBuildError>,
+    permits: &mut P,
+    mut after_project: impl FnMut(usize),
+    cleanup_on_drop: bool,
+) -> Result<ReportViewStaging, ReportViewBuildError> {
+    let mut staging = create_staging_with_permits(
+        store,
+        rate_fingerprint,
+        admitted_bytes,
+        before_write,
+        permits,
+        cleanup_on_drop,
+    )?;
     let visibility_epoch = staging.visibility_epoch;
 
     let mut pending_error = None;
-    let mut transaction_open = false;
-    let mut batch_records = 0_usize;
+    let mut batch = Vec::with_capacity(WRITE_BATCH_RECORDS);
     let mut batch_bytes = 0_u64;
     let visit = store.visit_report_snapshot_bounded(|index, record| {
         if pending_error.is_some() {
@@ -377,29 +535,26 @@ pub fn build_report_view_staging_bound(
             if span_bytes > WRITE_BATCH_BYTES {
                 return Err(ReportViewBuildError::CapacityExceeded);
             }
-            if transaction_open
-                && (batch_records == WRITE_BATCH_RECORDS
+            if !batch.is_empty()
+                && (batch.len() == WRITE_BATCH_RECORDS
                     || batch_bytes
                         .checked_add(span_bytes)
                         .is_none_or(|bytes| bytes > WRITE_BATCH_BYTES))
             {
-                enforce_storage_budget(staging.path(), admitted_bytes)?;
-                staging.connection().execute_batch("COMMIT")?;
-                transaction_open = false;
-                batch_records = 0;
+                write_projection_batch(
+                    &mut staging,
+                    &batch,
+                    admitted_bytes,
+                    permits,
+                    &mut after_project,
+                )?;
+                batch.clear();
                 batch_bytes = 0;
-                enforce_storage_budget(staging.path(), admitted_bytes)?;
             }
-            if !transaction_open {
-                staging.connection().execute_batch("BEGIN IMMEDIATE")?;
-                transaction_open = true;
-            }
-            insert_span(staging.connection(), index, &span, &span_json)?;
-            batch_records += 1;
+            batch.push(ProjectionRow { index, span_json });
             batch_bytes = batch_bytes
                 .checked_add(span_bytes)
                 .ok_or(ReportViewBuildError::CapacityExceeded)?;
-            after_project(index);
             Ok(())
         })();
         if let Err(error) = result {
@@ -407,37 +562,34 @@ pub fn build_report_view_staging_bound(
         }
     });
 
-    if transaction_open {
-        if pending_error.is_none() && visit.is_ok() {
-            enforce_storage_budget(staging.path(), admitted_bytes)?;
-            staging.connection().execute_batch("COMMIT")?;
-        } else {
-            let _ = staging.connection().execute_batch("ROLLBACK");
-        }
-    }
     if let Some(error) = pending_error {
         return Err(error);
     }
     let visit = visit?;
+    if !batch.is_empty() {
+        write_projection_batch(
+            &mut staging,
+            &batch,
+            admitted_bytes,
+            permits,
+            &mut after_project,
+        )?;
+    }
     enforce_storage_budget(staging.path(), admitted_bytes)?;
 
-    resolve_unknown_repositories(staging.connection(), admitted_bytes, staging.path())?;
+    resolve_unknown_repositories(&mut staging, admitted_bytes, permits)?;
     if !source_snapshot_is_current(store, visit.generation, visibility_epoch)? {
         return Err(ReportViewBuildError::SnapshotChanged);
     }
+    let generated_at = staging.generated_at().to_owned();
     let complete_metadata = CompleteMetadata {
         generation: visit.generation,
         visibility_epoch,
         rate_fingerprint,
-        generated_at: staging.generated_at(),
+        generated_at: &generated_at,
         records: visit.records,
     };
-    write_complete_metadata(
-        staging.connection(),
-        &complete_metadata,
-        staging.path(),
-        admitted_bytes,
-    )?;
+    write_complete_metadata(&mut staging, &complete_metadata, admitted_bytes, permits)?;
     enforce_storage_budget(staging.path(), admitted_bytes)?;
     if !source_snapshot_is_current(store, visit.generation, visibility_epoch)? {
         return Err(ReportViewBuildError::SnapshotChanged);
@@ -449,11 +601,31 @@ pub fn build_report_view_staging_bound(
     Ok(staging)
 }
 
+#[cfg(test)]
 fn create_staging(
     store: &LocalStore,
     rate_fingerprint: &str,
     admitted_bytes: u64,
     before_write: impl FnOnce(&Path, &fs::File) -> Result<(), ReportViewBuildError>,
+) -> Result<ReportViewStaging, ReportViewBuildError> {
+    let mut permits = NoopReportViewPermitFactory;
+    create_staging_with_permits(
+        store,
+        rate_fingerprint,
+        admitted_bytes,
+        before_write,
+        &mut permits,
+        true,
+    )
+}
+
+fn create_staging_with_permits<P: ReportViewPermitFactory>(
+    store: &LocalStore,
+    rate_fingerprint: &str,
+    admitted_bytes: u64,
+    before_write: impl FnOnce(&Path, &fs::File) -> Result<(), ReportViewBuildError>,
+    permits: &mut P,
+    cleanup_on_drop: bool,
 ) -> Result<ReportViewStaging, ReportViewBuildError> {
     validate_build_inputs(rate_fingerprint, admitted_bytes)?;
     let publication_guard = store
@@ -478,6 +650,7 @@ fn create_staging(
         rate_fingerprint: rate_fingerprint.to_owned(),
         source_identity,
         generated_at,
+        cleanup_on_drop,
     };
     staging.validate_identity()?;
     before_write(staging.path(), staging.identity_file())?;
@@ -485,9 +658,32 @@ fn create_staging(
     if staging.identity_file.metadata()?.len() != 0 {
         return Err(ReportViewBuildError::InvalidStagingState);
     }
-    staging.connection = Some(open_staging_connection(staging.path(), admitted_bytes)?);
-    staging.connection().execute_batch(CREATE_SCHEMA)?;
-    enforce_storage_budget(staging.path(), admitted_bytes)?;
+    let permit = permits.acquire(ReportViewWritePhase::Initialize)?;
+    let result = (|| {
+        let connection = match open_staging_connection(staging.path(), admitted_bytes) {
+            Ok(connection) => connection,
+            Err(error) => {
+                ensure_rollback_journal_clean(staging.path())?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = connection.execute_batch(CREATE_SCHEMA) {
+            close_connection(connection, staging.path())?;
+            return Err(error.into());
+        }
+        if let Err(error) = enforce_storage_budget(staging.path(), admitted_bytes) {
+            close_connection(connection, staging.path())?;
+            return Err(error);
+        }
+        ensure_rollback_journal_clean(staging.path())?;
+        staging.connection = Some(connection);
+        Ok(())
+    })();
+    let revalidation = permits.revalidate(&permit);
+    match result {
+        Ok(()) => revalidation?,
+        Err(error) => return Err(error),
+    }
     Ok(staging)
 }
 
@@ -600,15 +796,38 @@ fn insert_span(
     Ok(())
 }
 
-fn resolve_unknown_repositories(
-    connection: &Connection,
+fn write_projection_batch<P: ReportViewPermitFactory>(
+    staging: &mut ReportViewStaging,
+    batch: &[ProjectionRow],
     admitted_bytes: u64,
-    path: &Path,
+    permits: &mut P,
+    after_project: &mut impl FnMut(usize),
+) -> Result<(), ReportViewBuildError> {
+    let path = staging.path().to_owned();
+    with_write_transaction(
+        staging,
+        permits,
+        ReportViewWritePhase::ProjectionBatch,
+        |connection| {
+            for row in batch {
+                let span: ReportSpanV2 = serde_json::from_str(&row.span_json)?;
+                insert_span(connection, row.index, &span, &row.span_json)?;
+                after_project(row.index);
+            }
+            enforce_storage_budget(&path, admitted_bytes)
+        },
+    )
+}
+
+fn resolve_unknown_repositories<P: ReportViewPermitFactory>(
+    staging: &mut ReportViewStaging,
+    admitted_bytes: u64,
+    permits: &mut P,
 ) -> Result<(), ReportViewBuildError> {
     let mut last_source_order = -1_i64;
     loop {
         let batch = {
-            let mut statement = connection.prepare(
+            let mut statement = staging.connection().prepare(
                 "SELECT source_order, trace_id, repo, span_json FROM spans WHERE source_order>?1 ORDER BY source_order LIMIT ?2",
             )?;
             let batch_limit = i64::try_from(WRITE_BATCH_RECORDS)
@@ -643,73 +862,214 @@ fn resolve_unknown_repositories(
             break;
         }
 
-        connection.execute_batch("BEGIN IMMEDIATE")?;
-        let update_result = (|| {
-            let mut repositories = connection.prepare(
-                "SELECT DISTINCT repo FROM spans WHERE trace_id=?1 AND repo!='unknown' LIMIT 2",
-            )?;
-            let mut update = connection
-                .prepare("UPDATE spans SET repo=?1, span_json=?2 WHERE source_order=?3")?;
-            for (source_order, trace_id, repo, span_json) in &batch {
-                if repo != "unknown" {
-                    continue;
+        let path = staging.path().to_owned();
+        with_write_transaction(
+            staging,
+            permits,
+            ReportViewWritePhase::RepositoryResolutionBatch,
+            |connection| {
+                let mut repositories = connection.prepare(
+                    "SELECT DISTINCT repo FROM spans WHERE trace_id=?1 AND repo!='unknown' LIMIT 2",
+                )?;
+                let mut update = connection
+                    .prepare("UPDATE spans SET repo=?1, span_json=?2 WHERE source_order=?3")?;
+                for (source_order, trace_id, repo, span_json) in &batch {
+                    if repo != "unknown" {
+                        continue;
+                    }
+                    let known = repositories
+                        .query_map([trace_id], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut span: ReportSpanV2 = serde_json::from_str(span_json)?;
+                    resolve_report_repository(&mut span, known.iter().map(String::as_str));
+                    span.validate().map_err(|error| {
+                        ReportViewBuildError::Projection(ReportProjectionError::InvalidReport(
+                            error,
+                        ))
+                    })?;
+                    let resolved_json = serde_json::to_string(&span)?;
+                    update.execute(params![span.repo, resolved_json, source_order])?;
                 }
-                let known = repositories
-                    .query_map([trace_id], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut span: ReportSpanV2 = serde_json::from_str(span_json)?;
-                resolve_report_repository(&mut span, known.iter().map(String::as_str));
-                span.validate().map_err(|error| {
-                    ReportViewBuildError::Projection(ReportProjectionError::InvalidReport(error))
-                })?;
-                let resolved_json = serde_json::to_string(&span)?;
-                update.execute(params![span.repo, resolved_json, source_order])?;
-            }
-            enforce_storage_budget(path, admitted_bytes)?;
-            Ok::<(), ReportViewBuildError>(())
-        })();
-        match update_result {
-            Ok(()) => connection.execute_batch("COMMIT")?,
-            Err(error) => {
-                let _ = connection.execute_batch("ROLLBACK");
-                return Err(error);
-            }
-        }
+                enforce_storage_budget(&path, admitted_bytes)
+            },
+        )?;
         last_source_order = batch
             .last()
             .map(|row| row.0)
             .ok_or(ReportViewBuildError::InvalidStagingState)?;
-        enforce_storage_budget(path, admitted_bytes)?;
+        enforce_storage_budget(staging.path(), admitted_bytes)?;
     }
     Ok(())
 }
 
-fn write_complete_metadata(
-    connection: &Connection,
+fn write_complete_metadata<P: ReportViewPermitFactory>(
+    staging: &mut ReportViewStaging,
     metadata: &CompleteMetadata<'_>,
-    path: &Path,
     admitted_bytes: u64,
+    permits: &mut P,
 ) -> Result<(), ReportViewBuildError> {
     let records =
         u64::try_from(metadata.records).map_err(|_| ReportViewBuildError::CapacityExceeded)?;
-    let transaction = connection.unchecked_transaction()?;
-    {
-        let mut insert = transaction.prepare("INSERT INTO metadata(key, value) VALUES (?1, ?2)")?;
-        for (key, value) in [
-            ("schema_version", REPORT_VIEW_SCHEMA_VERSION.to_owned()),
-            ("source_generation", metadata.generation.to_string()),
-            ("visibility_epoch", metadata.visibility_epoch.to_string()),
-            ("rate_fingerprint", metadata.rate_fingerprint.to_owned()),
-            ("generated_at", metadata.generated_at.to_owned()),
-            ("records", records.to_string()),
-            ("complete", "1".to_owned()),
-        ] {
-            insert.execute(params![key, value])?;
+    let path = staging.path().to_owned();
+    with_write_transaction(
+        staging,
+        permits,
+        ReportViewWritePhase::FinalMetadata,
+        |connection| {
+            let mut insert =
+                connection.prepare("INSERT INTO metadata(key, value) VALUES (?1, ?2)")?;
+            for (key, value) in [
+                ("schema_version", REPORT_VIEW_SCHEMA_VERSION.to_owned()),
+                ("source_generation", metadata.generation.to_string()),
+                ("visibility_epoch", metadata.visibility_epoch.to_string()),
+                ("rate_fingerprint", metadata.rate_fingerprint.to_owned()),
+                ("generated_at", metadata.generated_at.to_owned()),
+                ("records", records.to_string()),
+                ("complete", "1".to_owned()),
+            ] {
+                insert.execute(params![key, value])?;
+            }
+            enforce_storage_budget(&path, admitted_bytes)
+        },
+    )
+}
+
+struct ActiveWrite<'staging, 'permit, Permit> {
+    staging: &'staging mut ReportViewStaging,
+    _permit: &'permit Permit,
+    transaction_active: bool,
+}
+
+impl<'staging, 'permit, Permit> ActiveWrite<'staging, 'permit, Permit> {
+    fn begin(
+        staging: &'staging mut ReportViewStaging,
+        permit: &'permit Permit,
+    ) -> Result<Self, ReportViewBuildError> {
+        let mut write = Self {
+            staging,
+            _permit: permit,
+            transaction_active: false,
+        };
+        if let Err(error) = write.staging.connection().execute_batch("BEGIN IMMEDIATE") {
+            write.close_connection()?;
+            return Err(error.into());
+        }
+        write.transaction_active = true;
+        Ok(write)
+    }
+
+    fn connection(&self) -> &Connection {
+        self.staging.connection()
+    }
+
+    fn commit(mut self) -> Result<(), ReportViewBuildError> {
+        if let Err(error) = self.staging.connection().execute_batch("COMMIT") {
+            self.close_connection()?;
+            return Err(error.into());
+        }
+        self.transaction_active = false;
+        if let Err(error) = ensure_rollback_journal_clean(self.staging.path()) {
+            self.close_connection()?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn rollback(mut self) -> Result<(), ReportViewBuildError> {
+        if let Err(error) = self.staging.connection().execute_batch("ROLLBACK") {
+            self.close_connection()?;
+            return Err(error.into());
+        }
+        self.transaction_active = false;
+        if let Err(error) = ensure_rollback_journal_clean(self.staging.path()) {
+            self.close_connection()?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn close_connection(&mut self) -> Result<(), ReportViewBuildError> {
+        self.transaction_active = false;
+        close_staging_connection(self.staging)
+    }
+}
+
+impl<Permit> Drop for ActiveWrite<'_, '_, Permit> {
+    fn drop(&mut self) {
+        if self.transaction_active {
+            let rolled_back = self.staging.connection().execute_batch("ROLLBACK").is_ok()
+                && ensure_rollback_journal_clean(self.staging.path()).is_ok();
+            self.transaction_active = false;
+            if !rolled_back || std::thread::panicking() {
+                let _ = close_staging_connection(self.staging);
+            }
         }
     }
-    enforce_storage_budget(path, admitted_bytes)?;
-    transaction.commit()?;
-    Ok(())
+}
+
+fn with_write_transaction<P, T>(
+    staging: &mut ReportViewStaging,
+    permits: &mut P,
+    phase: ReportViewWritePhase,
+    operation: impl FnOnce(&Connection) -> Result<T, ReportViewBuildError>,
+) -> Result<T, ReportViewBuildError>
+where
+    P: ReportViewPermitFactory,
+{
+    let permit = permits.acquire(phase)?;
+    let result = (|| {
+        let write = ActiveWrite::begin(staging, &permit)?;
+        match operation(write.connection()) {
+            Ok(value) => {
+                write.commit()?;
+                Ok(value)
+            }
+            Err(error) => {
+                write.rollback()?;
+                Err(error)
+            }
+        }
+    })();
+    let revalidation = permits.revalidate(&permit);
+    match result {
+        Ok(value) => {
+            revalidation?;
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn close_staging_connection(staging: &mut ReportViewStaging) -> Result<(), ReportViewBuildError> {
+    if let Some(connection) = staging.connection.take() {
+        close_connection(connection, staging.path())?;
+    }
+    ensure_rollback_journal_clean(staging.path())
+}
+
+fn close_connection(connection: Connection, path: &Path) -> Result<(), ReportViewBuildError> {
+    let close_error = match connection.close() {
+        Ok(()) => None,
+        Err((connection, error)) => {
+            drop(connection);
+            Some(error)
+        }
+    };
+    ensure_rollback_journal_clean(path)?;
+    match close_error {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
+    }
+}
+
+fn ensure_rollback_journal_clean(path: &Path) -> Result<(), ReportViewBuildError> {
+    let mut journal_name = path.as_os_str().to_owned();
+    journal_name.push("-journal");
+    match fs::symlink_metadata(PathBuf::from(journal_name)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => Err(ReportViewBuildError::InvalidStagingState),
+    }
 }
 
 fn trusted_generated_at() -> Result<String, ReportViewBuildError> {
@@ -836,11 +1196,110 @@ mod tests {
         CorrelationIds, LifecycleState, ObservationId, SourceCursor, SourceGeneration, SpanId,
         Timing, TokenUsage, TraceId,
     };
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
     const TEST_ADMISSION: u64 = MAX_REPORT_VIEW_BYTES;
     const TEST_RATE_FINGERPRINT: &str =
         "0000000000000000000000000000000000000000000000000000000000000000";
     const TEST_RAW_SENTINEL: &str = "RAW_PRIVATE_CONTENT_SENTINEL";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PermitEvent {
+        Acquired(ReportViewWritePhase),
+        Revalidated(ReportViewWritePhase),
+        Released(ReportViewWritePhase),
+    }
+
+    struct RecordingPermit {
+        phase: ReportViewWritePhase,
+        events: Rc<RefCell<Vec<PermitEvent>>>,
+        active: Rc<Cell<bool>>,
+        staging_path: Rc<RefCell<Option<PathBuf>>>,
+        assert_journal_clean: bool,
+    }
+
+    impl Drop for RecordingPermit {
+        fn drop(&mut self) {
+            if self.assert_journal_clean {
+                let path = self.staging_path.borrow().clone().unwrap();
+                assert!(!PathBuf::from(format!("{}-journal", path.display())).exists());
+            }
+            assert!(self.active.replace(false));
+            self.events
+                .borrow_mut()
+                .push(PermitEvent::Released(self.phase));
+        }
+    }
+
+    struct RecordingPermitFactory {
+        events: Rc<RefCell<Vec<PermitEvent>>>,
+        active: Rc<Cell<bool>>,
+        staging_path: Rc<RefCell<Option<PathBuf>>>,
+        denied: Option<ReportViewWritePhase>,
+        revalidation_denied: Option<ReportViewWritePhase>,
+        assert_projection_journal_clean: bool,
+        projection_acquires: usize,
+        lifecycle_between_batches: Rc<Cell<bool>>,
+    }
+
+    impl RecordingPermitFactory {
+        fn new(staging_path: Rc<RefCell<Option<PathBuf>>>) -> Self {
+            Self {
+                events: Rc::new(RefCell::new(Vec::new())),
+                active: Rc::new(Cell::new(false)),
+                staging_path,
+                denied: None,
+                revalidation_denied: None,
+                assert_projection_journal_clean: false,
+                projection_acquires: 0,
+                lifecycle_between_batches: Rc::new(Cell::new(false)),
+            }
+        }
+    }
+
+    impl ReportViewPermitFactory for RecordingPermitFactory {
+        type Permit = RecordingPermit;
+
+        fn acquire(
+            &mut self,
+            phase: ReportViewWritePhase,
+        ) -> Result<Self::Permit, ReportViewBuildError> {
+            if self.denied == Some(phase) {
+                return Err(ReportViewBuildError::CoordinationDenied);
+            }
+            assert!(!self.active.replace(true));
+            if phase == ReportViewWritePhase::ProjectionBatch {
+                self.projection_acquires += 1;
+                if self.projection_acquires == 2 {
+                    self.lifecycle_between_batches.set(true);
+                }
+            }
+            self.events.borrow_mut().push(PermitEvent::Acquired(phase));
+            Ok(RecordingPermit {
+                phase,
+                events: Rc::clone(&self.events),
+                active: Rc::clone(&self.active),
+                staging_path: Rc::clone(&self.staging_path),
+                assert_journal_clean: self.assert_projection_journal_clean
+                    && phase == ReportViewWritePhase::ProjectionBatch,
+            })
+        }
+
+        fn revalidate(&mut self, permit: &Self::Permit) -> Result<(), ReportViewBuildError> {
+            assert!(self.active.get());
+            if let Some(path) = self.staging_path.borrow().clone() {
+                assert!(!PathBuf::from(format!("{}-journal", path.display())).exists());
+            }
+            self.events
+                .borrow_mut()
+                .push(PermitEvent::Revalidated(permit.phase));
+            if self.revalidation_denied == Some(permit.phase) {
+                return Err(ReportViewBuildError::CoordinationDenied);
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn staging_cap_and_sqlite_bounds_preserve_non_disk_limits() {
@@ -1061,6 +1520,524 @@ mod tests {
             drop(store);
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn coordinated_build_acquires_and_releases_one_permit_per_write_phase() {
+        let (directory, mut store) = open_seeded_store("coordinated-sequence");
+        for ordinal in 2..=129 {
+            store
+                .ingest(&observation(
+                    ordinal,
+                    &format!("span-{ordinal}"),
+                    Some("raw-session"),
+                    ObservationEvent::Turn,
+                ))
+                .unwrap();
+        }
+        let path = Rc::new(RefCell::new(None));
+        let mut permits = RecordingPermitFactory::new(Rc::clone(&path));
+        let lifecycle_between_batches = Rc::clone(&permits.lifecycle_between_batches);
+        let mut staging = build_report_view_staging_bound_coordinated(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            None,
+            |staging_path, _| {
+                *path.borrow_mut() = Some(staging_path.to_owned());
+                Ok(())
+            },
+            &mut permits,
+            |index| {
+                if index >= WRITE_BATCH_RECORDS {
+                    assert!(lifecycle_between_batches.get());
+                }
+            },
+        )
+        .unwrap();
+        assert!(!permits.active.get());
+        assert_eq!(
+            permits.events.borrow().as_slice(),
+            &[
+                PermitEvent::Acquired(ReportViewWritePhase::Initialize),
+                PermitEvent::Revalidated(ReportViewWritePhase::Initialize),
+                PermitEvent::Released(ReportViewWritePhase::Initialize),
+                PermitEvent::Acquired(ReportViewWritePhase::ProjectionBatch),
+                PermitEvent::Revalidated(ReportViewWritePhase::ProjectionBatch),
+                PermitEvent::Released(ReportViewWritePhase::ProjectionBatch),
+                PermitEvent::Acquired(ReportViewWritePhase::ProjectionBatch),
+                PermitEvent::Revalidated(ReportViewWritePhase::ProjectionBatch),
+                PermitEvent::Released(ReportViewWritePhase::ProjectionBatch),
+                PermitEvent::Acquired(ReportViewWritePhase::RepositoryResolutionBatch),
+                PermitEvent::Revalidated(ReportViewWritePhase::RepositoryResolutionBatch),
+                PermitEvent::Released(ReportViewWritePhase::RepositoryResolutionBatch),
+                PermitEvent::Acquired(ReportViewWritePhase::RepositoryResolutionBatch),
+                PermitEvent::Revalidated(ReportViewWritePhase::RepositoryResolutionBatch),
+                PermitEvent::Released(ReportViewWritePhase::RepositoryResolutionBatch),
+                PermitEvent::Acquired(ReportViewWritePhase::FinalMetadata),
+                PermitEvent::Revalidated(ReportViewWritePhase::FinalMetadata),
+                PermitEvent::Released(ReportViewWritePhase::FinalMetadata),
+            ]
+        );
+        staging.discard_with_permit(&mut permits).unwrap();
+        assert_eq!(
+            &permits.events.borrow()[permits.events.borrow().len() - 3..],
+            &[
+                PermitEvent::Acquired(ReportViewWritePhase::Discard),
+                PermitEvent::Revalidated(ReportViewWritePhase::Discard),
+                PermitEvent::Released(ReportViewWritePhase::Discard),
+            ]
+        );
+        assert!(staging_paths(&directory).is_empty());
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn coordinated_initialization_denial_leaves_empty_staging_untouched() {
+        let (directory, store) = open_seeded_store("coordinated-init-denied");
+        let path = Rc::new(RefCell::new(None));
+        let mut permits = RecordingPermitFactory::new(Rc::clone(&path));
+        permits.denied = Some(ReportViewWritePhase::Initialize);
+        let error = build_report_view_staging_bound_coordinated(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            None,
+            |staging_path, _| {
+                *path.borrow_mut() = Some(staging_path.to_owned());
+                Ok(())
+            },
+            &mut permits,
+            |_| panic!("projection must not start without an initialization permit"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ReportViewBuildError::CoordinationDenied));
+        let path = path.borrow().clone().unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+        assert!(!PathBuf::from(format!("{}-journal", path.display())).exists());
+        assert!(path.is_file());
+        assert_eq!(staging_paths(&directory).len(), 1);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn initialization_postcheck_denial_stops_projection_and_preserves_staging() {
+        let (directory, store) = open_seeded_store("coordinated-init-postcheck-denied");
+        let path = Rc::new(RefCell::new(None));
+        let mut permits = RecordingPermitFactory::new(Rc::clone(&path));
+        permits.revalidation_denied = Some(ReportViewWritePhase::Initialize);
+        let error = build_report_view_staging_bound_coordinated(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            None,
+            |staging_path, _| {
+                *path.borrow_mut() = Some(staging_path.to_owned());
+                Ok(())
+            },
+            &mut permits,
+            |_| panic!("projection must not start after initialization postcheck denial"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ReportViewBuildError::CoordinationDenied));
+        assert_eq!(
+            permits.events.borrow().as_slice(),
+            &[
+                PermitEvent::Acquired(ReportViewWritePhase::Initialize),
+                PermitEvent::Revalidated(ReportViewWritePhase::Initialize),
+                PermitEvent::Released(ReportViewWritePhase::Initialize),
+            ]
+        );
+        let path = path.borrow().clone().unwrap();
+        assert!(path.is_file());
+        let connection =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let records: i64 = connection
+            .query_row("SELECT COUNT(*) FROM spans", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(records, 0);
+        drop(connection);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn coordinated_projection_denial_does_not_start_a_write_transaction() {
+        let (directory, store) = open_seeded_store("coordinated-projection-denied");
+        let path = Rc::new(RefCell::new(None));
+        let mut permits = RecordingPermitFactory::new(Rc::clone(&path));
+        permits.denied = Some(ReportViewWritePhase::ProjectionBatch);
+        let error = build_report_view_staging_bound_coordinated(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            None,
+            |staging_path, _| {
+                *path.borrow_mut() = Some(staging_path.to_owned());
+                Ok(())
+            },
+            &mut permits,
+            |_| panic!("projection callback must not run after permit denial"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ReportViewBuildError::CoordinationDenied));
+        let path = path.borrow().clone().unwrap();
+        let connection =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let records: i64 = connection
+            .query_row("SELECT COUNT(*) FROM spans", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(records, 0);
+        assert!(!PathBuf::from(format!("{}-journal", path.display())).exists());
+        drop(connection);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn projection_postcheck_denial_stops_before_the_next_batch_and_preserves_staging() {
+        let (directory, mut store) = open_seeded_store("coordinated-postcheck-batch-denied");
+        for ordinal in 2..=129 {
+            store
+                .ingest(&observation(
+                    ordinal,
+                    &format!("span-{ordinal}"),
+                    Some("raw-session"),
+                    ObservationEvent::Turn,
+                ))
+                .unwrap();
+        }
+        let path = Rc::new(RefCell::new(None));
+        let mut permits = RecordingPermitFactory::new(Rc::clone(&path));
+        permits.revalidation_denied = Some(ReportViewWritePhase::ProjectionBatch);
+        let error = build_report_view_staging_bound_coordinated(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            None,
+            |staging_path, _| {
+                *path.borrow_mut() = Some(staging_path.to_owned());
+                Ok(())
+            },
+            &mut permits,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(error, ReportViewBuildError::CoordinationDenied));
+        assert_eq!(
+            permits
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        PermitEvent::Acquired(ReportViewWritePhase::ProjectionBatch)
+                    )
+                })
+                .count(),
+            1
+        );
+        let path = path.borrow().clone().unwrap();
+        let connection =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let records: i64 = connection
+            .query_row("SELECT COUNT(*) FROM spans", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(records, i64::try_from(WRITE_BATCH_RECORDS).unwrap());
+        let complete: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key='complete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(complete, 0);
+        assert!(path.is_file());
+        drop(connection);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn final_metadata_postcheck_denial_prevents_publication_and_preserves_staging() {
+        let (directory, store) = open_seeded_store("coordinated-postcheck-publish-denied");
+        let path = Rc::new(RefCell::new(None));
+        let mut permits = RecordingPermitFactory::new(Rc::clone(&path));
+        permits.revalidation_denied = Some(ReportViewWritePhase::FinalMetadata);
+        let error = build_report_view_staging_bound_coordinated(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            None,
+            |staging_path, _| {
+                *path.borrow_mut() = Some(staging_path.to_owned());
+                Ok(())
+            },
+            &mut permits,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(error, ReportViewBuildError::CoordinationDenied));
+        let path = path.borrow().clone().unwrap();
+        assert!(path.is_file());
+        let connection =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let complete: String = connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key='complete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(complete, "1");
+        drop(connection);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn begin_error_is_revalidated_after_cleanup_without_losing_primary_error() {
+        let (directory, store) = open_seeded_store("coordinated-begin-error-ordering");
+        let path = Rc::new(RefCell::new(None));
+        let mut staging = create_staging(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            |staging_path, _| {
+                *path.borrow_mut() = Some(staging_path.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+        staging
+            .connection()
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+        let mut permits = RecordingPermitFactory::new(Rc::clone(&path));
+        permits.revalidation_denied = Some(ReportViewWritePhase::ProjectionBatch);
+        let error = with_write_transaction(
+            &mut staging,
+            &mut permits,
+            ReportViewWritePhase::ProjectionBatch,
+            |_| -> Result<(), ReportViewBuildError> {
+                panic!("operation must not run after BEGIN failure")
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ReportViewBuildError::Sqlite(_)));
+        assert_eq!(
+            permits.events.borrow().as_slice(),
+            &[
+                PermitEvent::Acquired(ReportViewWritePhase::ProjectionBatch),
+                PermitEvent::Revalidated(ReportViewWritePhase::ProjectionBatch),
+                PermitEvent::Released(ReportViewWritePhase::ProjectionBatch),
+            ]
+        );
+        assert!(staging.connection.is_none());
+        drop(staging);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn operation_error_remains_primary_when_postcheck_is_also_denied() {
+        let (directory, store) = open_seeded_store("coordinated-operation-error-ordering");
+        let path = Rc::new(RefCell::new(None));
+        let mut staging = create_staging(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            |staging_path, _| {
+                *path.borrow_mut() = Some(staging_path.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut permits = RecordingPermitFactory::new(Rc::clone(&path));
+        permits.revalidation_denied = Some(ReportViewWritePhase::ProjectionBatch);
+        let error = with_write_transaction(
+            &mut staging,
+            &mut permits,
+            ReportViewWritePhase::ProjectionBatch,
+            |_| Err::<(), _>(ReportViewBuildError::InvalidStagingState),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ReportViewBuildError::InvalidStagingState));
+        assert_eq!(
+            permits.events.borrow().as_slice(),
+            &[
+                PermitEvent::Acquired(ReportViewWritePhase::ProjectionBatch),
+                PermitEvent::Revalidated(ReportViewWritePhase::ProjectionBatch),
+                PermitEvent::Released(ReportViewWritePhase::ProjectionBatch),
+            ]
+        );
+        drop(staging);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn coordinated_final_batch_capacity_error_rolls_back_before_permit_release() {
+        let (directory, store) = open_seeded_store("coordinated-rollback");
+        let mut durable: agent_observability_contracts::DurableRecordV1 = store
+            .db
+            .query_row("SELECT record_json FROM records LIMIT 1", [], |row| {
+                let json: String = row.get(0)?;
+                Ok(serde_json::from_str(&json).unwrap())
+            })
+            .unwrap();
+        durable.agent.version = Some("v".repeat(1024 * 1024));
+        store
+            .db
+            .execute(
+                "UPDATE records SET record_json=?1",
+                [serde_json::to_string(&durable).unwrap()],
+            )
+            .unwrap();
+        let path = Rc::new(RefCell::new(None));
+        let mut permits = RecordingPermitFactory::new(Rc::clone(&path));
+        permits.assert_projection_journal_clean = true;
+        let error = build_report_view_staging_bound_coordinated(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            SQLITE_WRITE_HEADROOM_BYTES + (32 * SQLITE_PAGE_BYTES),
+            None,
+            |staging_path, _| {
+                *path.borrow_mut() = Some(staging_path.to_owned());
+                Ok(())
+            },
+            &mut permits,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ReportViewBuildError::CapacityExceeded | ReportViewBuildError::Sqlite(_)
+        ));
+        assert!(!permits.active.get());
+        assert!(permits.events.borrow().contains(&PermitEvent::Acquired(
+            ReportViewWritePhase::ProjectionBatch
+        )));
+        let path = path.borrow().clone().unwrap();
+        let connection =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let records: i64 = connection
+            .query_row("SELECT COUNT(*) FROM spans", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(records, 0);
+        assert!(!PathBuf::from(format!("{}-journal", path.display())).exists());
+        drop(connection);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn coordinated_panic_closes_active_transaction_before_permit_release() {
+        let (directory, store) = open_seeded_store("coordinated-panic");
+        let path = Rc::new(RefCell::new(None));
+        let mut permits = RecordingPermitFactory::new(Rc::clone(&path));
+        permits.assert_projection_journal_clean = true;
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = build_report_view_staging_bound_coordinated(
+                &store,
+                MISSING_RATE_FINGERPRINT,
+                MAX_REPORT_VIEW_BYTES,
+                None,
+                |staging_path, _| {
+                    *path.borrow_mut() = Some(staging_path.to_owned());
+                    Ok(())
+                },
+                &mut permits,
+                |_| panic!("projection callback panic"),
+            );
+        }));
+        assert!(unwind.is_err());
+        assert!(!permits.active.get());
+        let path = path.borrow().clone().unwrap();
+        assert!(path.is_file());
+        assert!(!PathBuf::from(format!("{}-journal", path.display())).exists());
+        let connection =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let records: i64 = connection
+            .query_row("SELECT COUNT(*) FROM spans", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(records, 0);
+        drop(connection);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn coordinated_discard_denial_preserves_staging_and_render_guard() {
+        let (directory, store) = open_seeded_store("coordinated-discard-denied");
+        let path = Rc::new(RefCell::new(None));
+        let mut permits = RecordingPermitFactory::new(Rc::clone(&path));
+        let mut staging = build_report_view_staging_bound_coordinated(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            None,
+            |staging_path, _| {
+                *path.borrow_mut() = Some(staging_path.to_owned());
+                Ok(())
+            },
+            &mut permits,
+            |_| {},
+        )
+        .unwrap();
+        permits.denied = Some(ReportViewWritePhase::Discard);
+        assert!(matches!(
+            staging.discard_with_permit(&mut permits),
+            Err(ReportViewBuildError::CoordinationDenied)
+        ));
+        let staging_path = staging.path().to_owned();
+        assert!(staging_path.is_file());
+        assert!(store.try_acquire_report_render_guard().unwrap().is_none());
+        drop(staging);
+        assert!(staging_path.is_file());
+        assert!(store.try_acquire_report_render_guard().unwrap().is_some());
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn discard_postcheck_runs_after_removal_and_returns_denial_on_success() {
+        let (directory, store) = open_seeded_store("coordinated-discard-postcheck-denied");
+        let path = Rc::new(RefCell::new(None));
+        let mut permits = RecordingPermitFactory::new(Rc::clone(&path));
+        let mut staging = build_report_view_staging_bound_coordinated(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            None,
+            |staging_path, _| {
+                *path.borrow_mut() = Some(staging_path.to_owned());
+                Ok(())
+            },
+            &mut permits,
+            |_| {},
+        )
+        .unwrap();
+        permits.events.borrow_mut().clear();
+        permits.revalidation_denied = Some(ReportViewWritePhase::Discard);
+        let error = staging.discard_with_permit(&mut permits).unwrap_err();
+        assert!(matches!(error, ReportViewBuildError::CoordinationDenied));
+        assert_eq!(
+            permits.events.borrow().as_slice(),
+            &[
+                PermitEvent::Acquired(ReportViewWritePhase::Discard),
+                PermitEvent::Revalidated(ReportViewWritePhase::Discard),
+                PermitEvent::Released(ReportViewWritePhase::Discard),
+            ]
+        );
+        assert!(!path.borrow().as_ref().unwrap().exists());
+        drop(staging);
+        assert!(store.try_acquire_report_render_guard().unwrap().is_some());
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn assert_trace_order_index(connection: &Connection) {

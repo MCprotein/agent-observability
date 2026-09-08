@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
+mod report_coherence;
+pub mod storage_ownership;
+
+use report_coherence::{ReportMutationScope, ReportWritePermits, report_coherence_failure};
+
 use agent_observability_adapter_codex::{
     AdapterBatch, AdapterItem, MAX_HANDOFF_BYTES, MAX_PRIVATE_TURN_DETAIL_BYTES,
     OtlpRequestCorrelationState, PrivateCodexTurnDetailV1, ProjectedNotifyV2,
@@ -358,11 +363,7 @@ fn validate_legacy_settings_for_migration(
     bytes: &[u8],
 ) -> Result<Option<String>, CollectorError> {
     if let Ok(legacy) = serde_json::from_slice::<LegacyCollectorSettingsV1>(bytes)
-        && legacy.schema_version == "local_collector.v1"
-        && legacy.port != 0
-        && legacy.token.len() == 64
-        && legacy.token.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && legacy.source_generation == SOURCE_GENERATION
+        && valid_legacy_v1_metadata(&legacy)
     {
         return Ok(None);
     }
@@ -372,8 +373,15 @@ fn validate_legacy_settings_for_migration(
     Ok(Some(legacy.generation))
 }
 
-fn validate_legacy_v2_mtls(
-    layout: &InstalledLayout,
+fn valid_legacy_v1_metadata(settings: &LegacyCollectorSettingsV1) -> bool {
+    settings.schema_version == "local_collector.v1"
+        && settings.port != 0
+        && settings.token.len() == 64
+        && settings.token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && settings.source_generation == SOURCE_GENERATION
+}
+
+fn validate_legacy_v2_metadata(
     settings: &LegacyCollectorSettingsV2Mtls,
 ) -> Result<(), CollectorError> {
     if settings.schema_version != "local_collector.v2"
@@ -415,6 +423,22 @@ fn validate_legacy_v2_mtls(
                 "invalid legacy collector credential path".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_legacy_v2_mtls(
+    layout: &InstalledLayout,
+    settings: &LegacyCollectorSettingsV2Mtls,
+) -> Result<(), CollectorError> {
+    validate_legacy_v2_metadata(settings)?;
+    for path in [
+        &settings.credentials.ca_certificate,
+        &settings.credentials.server_certificate,
+        &settings.credentials.server_private_key,
+        &settings.credentials.client_certificate,
+        &settings.credentials.client_private_key,
+    ] {
         read_private_bounded(&credential_path(layout, path)?, MAX_CREDENTIAL_BYTES)?;
     }
     let generation_dir = layout
@@ -2820,8 +2844,22 @@ fn refresh_report_from_root_observing(
     on_record: impl FnMut(usize),
 ) -> Result<bool, ReportFailure> {
     let layout = install(root).map_err(|_| ReportFailure::Install)?;
+    let barrier =
+        agent_observability_local_runtime::storage_coherence::StorageBarrier::open_if_initialized(
+            &layout.root,
+        )
+        .map_err(report_coherence_failure)?;
+    let permit = barrier
+        .as_ref()
+        .map(agent_observability_local_runtime::storage_coherence::StorageBarrier::try_begin_write)
+        .transpose()
+        .map_err(report_coherence_failure)?;
     let store = LocalStore::open_current(layout.state.join("store"))
         .map_err(|_| ReportFailure::OpenStore)?;
+    if let Some(permit) = permit.as_ref() {
+        permit.revalidate().map_err(report_coherence_failure)?;
+    }
+    drop(permit);
     refresh_report_observing(&layout, &store, on_record)
 }
 
@@ -3791,36 +3829,46 @@ fn refresh_report_observing(
     on_record: impl FnMut(usize),
 ) -> Result<bool, ReportFailure> {
     let mutation = try_report_mutation(layout)?;
+    let barrier =
+        agent_observability_local_runtime::storage_coherence::StorageBarrier::open_if_initialized(
+            &layout.root,
+        )
+        .map_err(report_coherence_failure)?;
+    let scope = ReportMutationScope::acquire(mutation, barrier.as_ref())?;
     let config = load(&layout.config).map_err(|_| ReportFailure::Publish)?;
     let control = RuntimeControl::new(&config).map_err(report_control_failure)?;
     if let Some(stale) = control
-        .claim_stale_report_reservation(&layout.root, &mutation)
+        .claim_stale_report_reservation(&layout.root, scope.mutation())
         .map_err(report_control_failure)?
     {
         // Keep both locks until cleanup succeeds. Failed cleanup preserves the stale promise.
         recover_report_view_catalog(store).map_err(report_catalog_failure)?;
         stale
-            .release(&layout.root, &mutation)
+            .release(&layout.root, scope.mutation())
             .map_err(|_| ReportFailure::Publish)?;
     }
     let admitted_bytes = automatic_report_view_admitted_bytes(layout, &config)?;
     let mut reservation = control
         .reserve_report_build(
             &layout.root,
-            &mutation,
+            scope.mutation(),
             admitted_bytes + REPORT_VIEW_PUBLICATION_RESERVE_BYTES,
         )
         .map_err(report_control_failure)?;
     let staging = build_automatic_report_view_staging(
         store,
         admitted_bytes,
+        barrier.as_ref(),
         |path, file| {
             reservation
-                .bind_staging(&layout.root, &mutation, path, file)
+                .bind_staging(&layout.root, scope.mutation(), path, file)
                 .map_err(|_| ReportViewBuildError::InvalidStagingState)?;
             // Release only after the created descriptor is durably bound; projection must
             // not occupy the ingest mutation lock. The publication guard remains held.
-            drop(mutation);
+            scope
+                .revalidate()
+                .map_err(|_| ReportViewBuildError::InvalidStagingState)?;
+            drop(scope);
             Ok(())
         },
         on_record,
@@ -3828,12 +3876,13 @@ fn refresh_report_observing(
     // Never wait while holding the publication guard. Other writers can own mutation and
     // attempt publication in the opposite order; contention is retryable, not a deadlock.
     let mutation = try_report_mutation(layout)?;
+    let scope = ReportMutationScope::acquire(mutation, barrier.as_ref())?;
     // Settings may change during projection. Publication must obey the latest budget, not
     // the admission-time copy, even though the original reservation remains conservative.
     let config = load(&layout.config).map_err(|_| ReportFailure::Publish)?;
     let control = RuntimeControl::new(&config).map_err(report_control_failure)?;
     let remaining = control
-        .reservation_finalization_headroom(&layout.root, &mutation, &reservation)
+        .reservation_finalization_headroom(&layout.root, scope.mutation(), &reservation)
         .map_err(report_control_failure)?;
     if remaining < REPORT_VIEW_PUBLICATION_RESERVE_BYTES {
         return Err(ReportFailure::Capacity);
@@ -3841,7 +3890,7 @@ fn refresh_report_observing(
     reservation
         .validate_staging(
             &layout.root,
-            &mutation,
+            scope.mutation(),
             staging.path(),
             staging.identity_file(),
         )
@@ -3850,13 +3899,15 @@ fn refresh_report_observing(
     if publication.cleanup_pending() {
         return Err(ReportFailure::Publish);
     }
-    acknowledge_report_reservation(
+    let acknowledged = acknowledge_report_reservation(
         layout,
         store,
         publication.current().generation(),
-        &mutation,
+        scope.mutation(),
         reservation,
-    )
+    )?;
+    scope.revalidate()?;
+    Ok(acknowledged)
 }
 
 fn acknowledge_report_reservation(
@@ -3948,19 +3999,25 @@ async fn cleanup_report_reservation_with_retry(
 
 fn cleanup_report_reservation(layout: &InstalledLayout) -> Result<(), ReportFailure> {
     let mutation = try_report_mutation(layout)?;
+    let barrier =
+        agent_observability_local_runtime::storage_coherence::StorageBarrier::open_if_initialized(
+            &layout.root,
+        )
+        .map_err(report_coherence_failure)?;
+    let scope = ReportMutationScope::acquire(mutation, barrier.as_ref())?;
     let config = load(&layout.config).map_err(|_| ReportFailure::Publish)?;
     let control = RuntimeControl::new(&config).map_err(|_| ReportFailure::Publish)?;
     if let Some(stale) = control
-        .claim_stale_report_reservation(&layout.root, &mutation)
+        .claim_stale_report_reservation(&layout.root, scope.mutation())
         .map_err(report_control_failure)?
     {
         recover_report_view_catalog_before_migration(layout.state.join("store"))
             .map_err(report_catalog_failure)?;
         stale
-            .release(&layout.root, &mutation)
+            .release(&layout.root, scope.mutation())
             .map_err(|error| report_control_failure(ControlError::Reservation(error)))?;
     }
-    Ok(())
+    scope.revalidate()
 }
 
 fn automatic_report_view_missing(store: &LocalStore) -> Result<bool, CollectorError> {
@@ -4002,6 +4059,7 @@ fn automatic_report_view_admitted_bytes(
 fn build_automatic_report_view_staging(
     store: &LocalStore,
     admitted_bytes: u64,
+    barrier: Option<&agent_observability_local_runtime::storage_coherence::StorageBarrier>,
     before_write: impl FnOnce(&Path, &File) -> Result<(), ReportViewBuildError>,
     on_record: impl FnMut(usize),
 ) -> Result<agent_observability_local_store::ReportViewStaging, ReportFailure> {
@@ -4010,6 +4068,19 @@ fn build_automatic_report_view_staging(
         let _ = on_record;
         |_| {}
     };
+    if let Some(barrier) = barrier {
+        let mut permits = ReportWritePermits { barrier };
+        return agent_observability_local_store::build_report_view_staging_bound_coordinated(
+            store,
+            MISSING_RATE_FINGERPRINT,
+            admitted_bytes,
+            None,
+            before_write,
+            &mut permits,
+            on_record,
+        )
+        .map_err(|error| report_view_build_failure(&error));
+    }
     agent_observability_local_store::build_report_view_staging_bound(
         store,
         MISSING_RATE_FINGERPRINT,
@@ -4038,6 +4109,7 @@ fn report_view_build_failure(error: &ReportViewBuildError) -> ReportFailure {
         ReportViewBuildError::Sqlite(_)
         | ReportViewBuildError::Io(_)
         | ReportViewBuildError::InvalidRateFingerprint
+        | ReportViewBuildError::CoordinationDenied
         | ReportViewBuildError::InvalidStagingState => ReportFailure::Publish,
         ReportViewBuildError::InvalidByteBudget | ReportViewBuildError::CapacityExceeded => {
             ReportFailure::Capacity
@@ -8329,10 +8401,149 @@ mod tests {
     }
 
     #[test]
-    fn report_finalization_contention_preserves_reservation_until_guarded_recovery() {
-        let root = test_root("report-reservation-finalization-contention");
+    fn report_refresh_honors_initialized_accounting_between_bounded_writes() {
+        use agent_observability_local_runtime::storage_coherence::{
+            StorageBarrier, StorageCoherenceError,
+        };
+        let root = test_root("report-accounting-permit-boundary");
         let mut collector = collector_state(&root);
         ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&collector.layout.root, &mutation).unwrap();
+        drop(mutation);
+        let blocked_writer = barrier.try_begin_write().unwrap();
+        assert!(!refresh_dashboard_snapshot(&root).unwrap());
+        assert!(
+            !collector
+                .layout
+                .runtime
+                .join("report-reservation.meta")
+                .exists()
+        );
+        drop(blocked_writer);
+        let mut observed = false;
+        assert!(
+            super::refresh_report_from_root_observing(&root, |_| {
+                let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+                assert!(matches!(
+                    barrier.try_freeze(&mutation),
+                    Err(StorageCoherenceError::Busy)
+                ));
+                observed = true;
+            })
+            .unwrap()
+        );
+        assert!(observed);
+        assert_published_report_view(&root, 1);
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        barrier.try_freeze(&mutation).unwrap().revalidate().unwrap();
+        assert!(
+            !collector
+                .layout
+                .runtime
+                .join("report-reservation.meta")
+                .exists()
+        );
+        drop(mutation);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_barrier_replacement_stops_projection_and_preserves_recovery_promise() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = test_root("report-accounting-replacement");
+        let mut collector = collector_state(&root);
+        for index in 0..129 {
+            ingest_notify_locked(
+                &mut collector,
+                &projected_notify(&format!("thread-{index}"), "turn-1"),
+            )
+            .unwrap();
+        }
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&collector.layout.root, &mutation).unwrap();
+        drop(mutation);
+        let path = collector.layout.runtime.join("storage-accounting.lock");
+        let original = collector.layout.runtime.join("original-accounting.lock");
+        let metadata = collector.layout.runtime.join("report-reservation.meta");
+        let mut observed = 0;
+        let mut promise = None;
+        let result = super::refresh_report_from_root_observing(&root, |_| {
+            observed += 1;
+            if promise.is_none() {
+                promise = Some(fs::read(&metadata).unwrap());
+                fs::rename(&path, &original).unwrap();
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .unwrap();
+            }
+        });
+        assert_eq!(result.unwrap_err(), super::ReportFailure::Publish);
+        assert_eq!(observed, 128);
+        assert_eq!(fs::read(&metadata).unwrap(), promise.unwrap());
+        assert!(current_report_view(&collector.store).unwrap().is_none());
+        assert!(collector.store.report_status().unwrap().pending());
+        assert!(barrier.revalidate().is_err());
+        // Restore only this test's explicitly retained lock, then exercise guarded recovery.
+        fs::remove_file(&path).unwrap();
+        fs::rename(&original, &path).unwrap();
+        barrier.revalidate().unwrap();
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        assert_published_report_view(&root, 129);
+        assert!(!metadata.exists());
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_cleanup_defers_while_accounting_writer_is_active() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        let root = test_root("report-cleanup-accounting-contention");
+        let collector = collector_state(&root);
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&collector.layout.root, &mutation).unwrap();
+        drop(mutation);
+        let writer = barrier.try_begin_write().unwrap();
+        assert_eq!(
+            super::cleanup_report_reservation(&collector.layout),
+            Err(super::ReportFailure::RenderGuard)
+        );
+        drop(writer);
+        assert_eq!(super::cleanup_report_reservation(&collector.layout), Ok(()));
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        barrier.try_freeze(&mutation).unwrap().revalidate().unwrap();
+        drop(mutation);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_finalization_contention_preserves_reservation_until_guarded_recovery() {
+        for coordinated in [false, true] {
+            assert_report_finalization_recovers(coordinated);
+        }
+    }
+
+    fn assert_report_finalization_recovers(coordinated: bool) {
+        let root = test_root(&format!(
+            "report-reservation-finalization-contention-{coordinated}"
+        ));
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        if coordinated {
+            let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+            agent_observability_local_runtime::storage_coherence::StorageBarrier::initialize(
+                &collector.layout.root,
+                &mutation,
+            )
+            .unwrap();
+        }
         let mut blocker = None;
         let result = super::refresh_report_from_root_observing(&root, |_| {
             blocker = Some(MutationGuard::try_acquire(&collector.layout.runtime).unwrap());

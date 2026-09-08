@@ -9,18 +9,22 @@ mod report_ack;
 mod report_view;
 mod report_view_catalog;
 mod report_view_query;
+pub mod storage_ownership;
 
 pub use dashboard_query::DashboardQueryService;
 pub use report_ack::MAX_REPORT_ACKNOWLEDGEMENT_BYTES;
 pub use report_view::{
-    MAX_REPORT_VIEW_BYTES, MISSING_RATE_FINGERPRINT, ReportViewBuildError, ReportViewStaging,
-    build_report_view_staging, build_report_view_staging_bound,
+    MAX_REPORT_VIEW_BYTES, MISSING_RATE_FINGERPRINT, ReportViewBuildError, ReportViewPermitFactory,
+    ReportViewStaging, ReportViewWritePhase, build_report_view_staging,
+    build_report_view_staging_bound, build_report_view_staging_bound_coordinated,
     build_report_view_staging_observing,
 };
 pub use report_view_catalog::{
-    ReportViewCatalogError, ReportViewPublication, ReportViewRetirement, ReportViewSnapshot,
-    current_report_view, current_report_view_needs_kernel_upgrade, publish_report_view,
-    recover_report_view_catalog, with_report_view_snapshot,
+    ReportViewCatalogError, ReportViewOwnedEntry, ReportViewOwnedEntryKind,
+    ReportViewOwnershipObservation, ReportViewPublication, ReportViewRetirement,
+    ReportViewSnapshot, current_report_view, current_report_view_needs_kernel_upgrade,
+    publish_report_view, recover_report_view_catalog, with_report_view_ownership_observation,
+    with_report_view_snapshot,
 };
 
 pub use lifecycle::{
@@ -412,6 +416,7 @@ pub enum StoreError {
     MigrationAdmissionRequired,
     ReportViewRetirement,
     ReportSnapshotChanged,
+    OpenLockBusy,
     ReportSnapshotRecordTooLarge {
         record_bytes: u64,
         max_batch_bytes: u64,
@@ -452,6 +457,7 @@ impl Display for StoreError {
             Self::ReportSnapshotChanged => {
                 f.write_str("report snapshot changed while it was being visited")
             }
+            Self::OpenLockBusy => f.write_str("local store open is busy"),
             Self::ReportSnapshotRecordTooLarge {
                 record_bytes,
                 max_batch_bytes,
@@ -463,10 +469,11 @@ impl Display for StoreError {
     }
 }
 impl StoreError {
-    /// Whether a read may be retried because `SQLite` reported an active competing operation.
+    /// Whether a read may be retried because the store-open lock or `SQLite` is busy.
     #[must_use]
     pub fn is_contention(&self) -> bool {
-        matches!(self, Self::Sqlite(error) if matches!(error.sqlite_error_code(),
+        matches!(self, Self::OpenLockBusy)
+            || matches!(self, Self::Sqlite(error) if matches!(error.sqlite_error_code(),
             Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)))
     }
 }
@@ -529,6 +536,8 @@ impl From<serde_json::Error> for StoreError {
 pub struct LocalStore {
     dir: PathBuf,
     db: Connection,
+    authority_directory: File,
+    authority_database: File,
 }
 
 /// Recovers interrupted report sidecars before an admitted authority migration.
@@ -598,8 +607,10 @@ impl LocalStore {
     fn open_report_recovery_source(dir: &Path, allow_v6: bool) -> Result<Self, StoreError> {
         validate_existing_private_dir(dir)?;
         let dir = fs::canonicalize(dir)?;
+        let _open_guard = acquire_existing_private_lock(&dir, STORE_OPEN_LOCK_NAME, false)?;
         let db_path = dir.join(DB_NAME);
-        private_file(&db_path)?;
+        let (authority_directory, authority_database) =
+            storage_ownership::capture_store_identity(&dir, &db_path)?;
         let _journal_guard =
             migration_admission::open_private_journal(&db_path.with_extension("sqlite3-journal"))?;
         let db = Connection::open_with_flags(
@@ -608,6 +619,13 @@ impl LocalStore {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        storage_ownership::validate_connection_path(&db, &db_path)?;
+        storage_ownership::validate_captured_store_identity(
+            &dir,
+            &db_path,
+            &authority_directory,
+            &authority_database,
         )?;
         db.busy_timeout(Duration::from_secs(5))?;
         db.pragma_update(None, "foreign_keys", true)?;
@@ -630,7 +648,7 @@ impl LocalStore {
             report_ack::read(&db)?;
         }
         metadata_generation(&db, REPORT_VISIBILITY_EPOCH_KEY)?;
-        Ok(Self { dir, db })
+        Self::from_open_connection(dir, db, authority_directory, authority_database)
     }
 
     /// Opens an existing current-schema store as a fail-fast report query reader.
@@ -647,8 +665,10 @@ impl LocalStore {
         let dir = dir.as_ref();
         validate_existing_private_dir(dir)?;
         let dir = fs::canonicalize(dir)?;
+        let _open_guard = acquire_existing_private_lock(&dir, STORE_OPEN_LOCK_NAME, true)?;
         let db_path = dir.join(DB_NAME);
-        private_file(&db_path)?;
+        let (authority_directory, authority_database) =
+            storage_ownership::capture_store_identity(&dir, &db_path)?;
         let _journal_guard =
             migration_admission::open_private_journal(&db_path.with_extension("sqlite3-journal"))?;
         let db = Connection::open_with_flags(
@@ -656,6 +676,13 @@ impl LocalStore {
             OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        storage_ownership::validate_connection_path(&db, &db_path)?;
+        storage_ownership::validate_captured_store_identity(
+            &dir,
+            &db_path,
+            &authority_directory,
+            &authority_database,
         )?;
         db.busy_timeout(Duration::ZERO)?;
         db.pragma_update(None, "query_only", true)?;
@@ -666,7 +693,7 @@ impl LocalStore {
         }
         metadata_generation(&db, REPORT_GENERATION_KEY)?;
         metadata_generation(&db, REPORT_VISIBILITY_EPOCH_KEY)?;
-        Ok(Self { dir, db })
+        Self::from_open_connection(dir, db, authority_directory, authority_database)
     }
 
     fn open_internal(
@@ -685,6 +712,8 @@ impl LocalStore {
             }
             Err(error) => return Err(error),
         }
+        let (authority_directory, authority_database) =
+            storage_ownership::capture_store_identity(&dir, &db_path)?;
         let _journal_guard =
             migration_admission::open_private_journal(&db_path.with_extension("sqlite3-journal"))?;
         let db = Connection::open_with_flags(
@@ -694,6 +723,13 @@ impl LocalStore {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        storage_ownership::validate_connection_path(&db, &db_path)?;
+        storage_ownership::validate_captured_store_identity(
+            &dir,
+            &db_path,
+            &authority_directory,
+            &authority_database,
         )?;
         db.busy_timeout(Duration::from_secs(5))?;
         preflight_store_migration(&db, admitted_temporary_bytes)?;
@@ -753,12 +789,32 @@ impl LocalStore {
         }
         validate_schema(&db)?;
         metadata_generation(&db, REPORT_VISIBILITY_EPOCH_KEY)?;
-        let store = Self { dir, db };
+        let store = Self::from_open_connection(dir, db, authority_directory, authority_database)?;
         store.report_status()?;
         if repair_projection {
             store.repair_projection_if_needed()?;
         }
         Ok(store)
+    }
+
+    fn from_open_connection(
+        dir: PathBuf,
+        db: Connection,
+        authority_directory: File,
+        authority_database: File,
+    ) -> Result<Self, StoreError> {
+        storage_ownership::validate_captured_store_identity(
+            &dir,
+            &dir.join(DB_NAME),
+            &authority_directory,
+            &authority_database,
+        )?;
+        Ok(Self {
+            dir,
+            db,
+            authority_directory,
+            authority_database,
+        })
     }
 
     /// Repairs the JSONL projection only when it is missing or marked dirty.
@@ -2482,6 +2538,41 @@ fn acquire_private_lock(parent: &Path, name: &str) -> Result<File, StoreError> {
     Ok(file)
 }
 
+fn acquire_existing_private_lock(
+    parent: &Path,
+    name: &str,
+    nonblocking: bool,
+) -> Result<File, StoreError> {
+    let path = parent.join(name);
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(StoreError::Symlink);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(no_follow_flag());
+    }
+    let file = options.open(&path)?;
+    private_open_file(&file)?;
+    if nonblocking {
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                StoreError::OpenLockBusy
+            } else {
+                StoreError::Io(error)
+            }
+        })?;
+    } else {
+        file.lock_exclusive()?;
+    }
+    storage_ownership::validate_private_file_identity(&path, &file)?;
+    Ok(file)
+}
+
 fn try_acquire_private_lock(parent: &Path, name: &str) -> Result<Option<File>, StoreError> {
     let path = parent.join(name);
     if let Ok(metadata) = fs::symlink_metadata(&path)
@@ -3508,6 +3599,16 @@ const fn no_follow_flag() -> i32 {
 #[cfg(target_os = "macos")]
 const fn no_follow_flag() -> i32 {
     0x100
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const fn nonblocking_open_flag() -> i32 {
+    0x800
+}
+
+#[cfg(target_os = "macos")]
+const fn nonblocking_open_flag() -> i32 {
+    0x4
 }
 #[cfg(not(unix))]
 fn set_private_file(path: &Path) -> Result<(), StoreError> {
@@ -4860,6 +4961,52 @@ mod tests {
         );
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn existing_store_opens_require_the_authority_lock_without_recreating_it() {
+        let dir = temp_dir("existing-store-missing-open-lock");
+        let store = LocalStore::open(&dir).unwrap();
+        drop(store);
+        let lock = dir.join(STORE_OPEN_LOCK_NAME);
+        fs::remove_file(&lock).unwrap();
+        for reader in [false, true] {
+            let result = if reader {
+                LocalStore::open_report_reader(&dir)
+            } else {
+                LocalStore::open_current(&dir)
+            };
+            assert!(
+                matches!(result, Err(StoreError::Io(ref error)) if error.kind() == io::ErrorKind::NotFound)
+            );
+            assert!(!lock.exists());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn report_reader_returns_typed_contention_for_an_owned_open_lock() {
+        let dir = temp_dir("report-reader-open-lock-busy");
+        let store = LocalStore::open(&dir).unwrap();
+        drop(store);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(STORE_OPEN_LOCK_NAME))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        // Bound the pre-fix blocking implementation so a regression cannot hang the harness.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            drop(lock);
+        });
+        let started = std::time::Instant::now();
+        let result = LocalStore::open_report_reader(&dir);
+        let elapsed = started.elapsed();
+        release.join().unwrap();
+        assert!(result.unwrap_err().is_contention());
+        assert!(elapsed < Duration::from_millis(250), "elapsed: {elapsed:?}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
