@@ -49,6 +49,10 @@ P1 strict 계약 근거: `crates/local-runtime/src/config.rs:33`,
 현재 순회 근거: `crates/local-runtime/src/storage.rs:88`; snapshot 소유/경로 검사는
 `crates/local-store/src/report_view_catalog.rs:238`.
 
+구체적인 경로·소유 모듈·검증 공백은 [파일 소유권 기준](STORAGE_OWNERSHIP.md)에 기록한다.
+runtime 밖으로 제한되는 수동 retention archive는 root의 A/X에 포함하지 않는다.
+외부 archive 작업량과 destination 여유 검사는 별도 책임이며, DB 내부 cold blob은 A다.
+
 추가 변수: R은 다른 작업의 **전체 미해제 예약**, E는 시작할 작업의 추가 공간 allowance,
 D는 현재 filesystem free bytes다. 최초 구현은 staging이 커졌다는 이유로 R에서 그 크기를
 빼지 않는다. 따라서 X와 R의 보수적 중첩 심사는 허용하지만 실제 사용량 표시는 A+X+U로
