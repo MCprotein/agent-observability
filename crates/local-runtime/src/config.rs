@@ -547,7 +547,8 @@ fn map_accounting_error(error: ConfigError) -> ConfigAccountingEvidenceError {
         | ConfigError::Policy(_)
         | ConfigError::UnsupportedVersion
         | ConfigError::StoragePolicyUnavailable
-        | ConfigError::Conflict => ConfigAccountingEvidenceError::InvalidConfig,
+        | ConfigError::Conflict
+        | ConfigError::WriteUnverified { .. } => ConfigAccountingEvidenceError::InvalidConfig,
     }
 }
 
@@ -678,7 +679,21 @@ fn revalidate_accounting_identity(
 impl ConfigMutationGuard {
     pub fn acquire(layout: &InstalledLayout) -> Result<Self, SingletonError> {
         let canonical = InstalledLayout::at(&layout.root);
-        MutationGuard::try_acquire(&canonical.runtime).map(|mutation| Self {
+        let barrier =
+            crate::storage_coherence::StorageBarrier::open_if_initialized(&canonical.root)
+                .map_err(|error| SingletonError::Io(io::Error::other(error)))?;
+        let mutation = if barrier.is_some() {
+            MutationGuard::try_acquire_existing(&canonical.runtime)?
+        } else {
+            MutationGuard::try_acquire(&canonical.runtime)?
+        };
+        mutation.require_root(&canonical.root)?;
+        if let Some(barrier) = barrier {
+            barrier
+                .revalidate()
+                .map_err(|error| SingletonError::Io(io::Error::other(error)))?;
+        }
+        Ok(Self {
             mutation,
             config_path: canonical.config,
         })
@@ -718,6 +733,11 @@ pub enum ConfigError {
     UnsupportedVersion,
     StoragePolicyUnavailable,
     StorageCoherence(crate::storage_coherence::StorageCoherenceError),
+    WriteUnverified {
+        primary: Option<Box<Self>>,
+        mutation: Option<Box<Self>>,
+        accounting: Option<crate::storage_coherence::StorageCoherenceError>,
+    },
     InsecurePermissions,
     InvalidPath,
     Symlink,
@@ -738,6 +758,14 @@ impl std::fmt::Display for ConfigError {
                 "separated storage policy is not available in this development checkpoint",
             ),
             Self::StorageCoherence(error) => error.fmt(formatter),
+            Self::WriteUnverified { primary, .. } => {
+                if let Some(primary) = primary {
+                    write!(formatter, "{primary}; ")?;
+                }
+                formatter.write_str(
+                    "configuration write verification failed; publication may have completed",
+                )
+            }
             Self::InsecurePermissions => formatter.write_str("local runtime path is not private"),
             Self::InvalidPath => formatter.write_str("local runtime path has the wrong file type"),
             Self::Symlink => formatter.write_str("local runtime paths must not be symlinks"),
@@ -756,6 +784,19 @@ impl std::error::Error for ConfigError {
             Self::Json(error) => Some(error),
             Self::Policy(error) => Some(error),
             Self::StorageCoherence(error) => Some(error),
+            Self::WriteUnverified {
+                primary,
+                mutation,
+                accounting,
+            } => primary
+                .as_deref()
+                .or(mutation.as_deref())
+                .map(|error| error as &(dyn std::error::Error + 'static))
+                .or_else(|| {
+                    accounting
+                        .as_ref()
+                        .map(|error| error as &(dyn std::error::Error + 'static))
+                }),
             _ => None,
         }
     }
@@ -983,7 +1024,20 @@ fn save_guarded(
     config: &LocalRuntimeConfigV3,
     expected_revision: Option<&str>,
 ) -> Result<(), ConfigError> {
+    save_guarded_observing(guard, config, expected_revision, || {})
+}
+
+fn save_guarded_observing(
+    guard: &ConfigMutationGuard,
+    config: &LocalRuntimeConfigV3,
+    expected_revision: Option<&str>,
+    before_postcheck: impl FnOnce(),
+) -> Result<(), ConfigError> {
     let root = guard.config_path.parent().ok_or(ConfigError::InvalidPath)?;
+    guard
+        .mutation
+        .require_root(root)
+        .map_err(map_install_mutation_error)?;
     let barrier = crate::storage_coherence::StorageBarrier::open_if_initialized(root)
         .map_err(ConfigError::StorageCoherence)?;
     let freeze = barrier
@@ -992,9 +1046,30 @@ fn save_guarded(
         .transpose()
         .map_err(ConfigError::StorageCoherence)?;
     let result = save_with_hook(&guard.config_path, config, expected_revision, |_| Ok(()));
-    if let Some(freeze) = freeze.as_ref() {
-        freeze.revalidate().map_err(ConfigError::StorageCoherence)?;
+    before_postcheck();
+    let mutation = guard
+        .mutation
+        .require_root(root)
+        .map_err(map_install_mutation_error);
+    // Validate the accounting identity independently even if the mutation identity
+    // is already lost; neither secondary failure may erase the primary result.
+    let barrier_check = barrier
+        .as_ref()
+        .map(crate::storage_coherence::StorageBarrier::revalidate)
+        .transpose();
+    let freeze_check = freeze
+        .as_ref()
+        .map(crate::storage_coherence::StorageFreezeGuard::revalidate)
+        .transpose();
+    let accounting = barrier_check.and(freeze_check);
+    if mutation.is_err() || accounting.is_err() {
+        return Err(ConfigError::WriteUnverified {
+            primary: result.err().map(Box::new),
+            mutation: mutation.err().map(Box::new),
+            accounting: accounting.err(),
+        });
     }
+    drop(freeze);
     result
 }
 
@@ -1932,6 +2007,98 @@ mod tests {
             Err(ConfigError::StorageCoherence(_))
         ));
         assert_eq!(fs::read(&layout.config).unwrap(), original);
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_retains_primary_and_both_postcheck_failures() {
+        use crate::storage_coherence::StorageBarrier;
+        use std::os::unix::fs::PermissionsExt;
+        for fail_operation in [false, true] {
+            let root = root(if fail_operation {
+                "config-dual-failure"
+            } else {
+                "config-published-unverified"
+            });
+            assert!(!root.exists());
+            let layout = install(&root).unwrap();
+            let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+            let barrier = StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+            let mut config = load(&layout.config).unwrap();
+            config.retention.max_record_age_days = if fail_operation { 0 } else { 90 };
+            let result = super::save_guarded_observing(&guard, &config, None, || {
+                let path = layout.runtime.join("mutation.lock");
+                fs::rename(&path, layout.runtime.join("retained-mutation.lock")).unwrap();
+                fs::write(&path, []).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::write(layout.runtime.join("storage-accounting.lock"), b"invalid").unwrap();
+            });
+            let Err(ConfigError::WriteUnverified {
+                primary,
+                mutation,
+                accounting,
+            }) = result
+            else {
+                panic!("expected explicit write verification failure");
+            };
+            assert_eq!(primary.is_some(), fail_operation);
+            if let Some(primary) = primary {
+                assert!(matches!(*primary, ConfigError::Policy(_)));
+            }
+            assert!(mutation.is_some());
+            assert!(accounting.is_some());
+            let published = load(&layout.config).unwrap();
+            if fail_operation {
+                assert_eq!(published, LocalRuntimeConfigV3::default());
+            } else {
+                assert_eq!(published, config);
+            }
+            drop(barrier);
+            drop(guard);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_config_guard_never_recreates_missing_mutation_lock() {
+        use crate::storage_coherence::StorageBarrier;
+        let root = root("config-missing-stable-mutation");
+        assert!(!root.exists());
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let barrier = StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        let path = layout.runtime.join("mutation.lock");
+        fs::remove_file(&path).unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        assert!(ConfigMutationGuard::acquire(&layout).is_err());
+        assert!(!path.exists());
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+        drop(barrier);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_config_save_rejects_replaced_mutation_before_publication() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = root("config-replaced-legacy-mutation");
+        assert!(!root.exists());
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let path = layout.runtime.join("mutation.lock");
+        fs::rename(&path, layout.runtime.join("retained-mutation.lock")).unwrap();
+        fs::write(&path, []).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.retention.max_record_age_days = 90;
+        assert!(save(&guard, &config).is_err());
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+        assert!(!layout.runtime.join("storage-accounting.lock").exists());
         drop(guard);
         fs::remove_dir_all(root).unwrap();
     }
