@@ -3754,8 +3754,15 @@ fn read_private_turn_detail_status(
         }
         Err(_) => return Err("status_storage_unavailable"),
     };
+    validate_private_turn_detail_status(&bytes, turn_id).map(Some)
+}
+
+fn validate_private_turn_detail_status(
+    bytes: &[u8],
+    turn_id: &str,
+) -> Result<&'static str, &'static str> {
     let status: PrivateTurnDetailCaptureStatusV1 =
-        serde_json::from_slice(&bytes).map_err(|_| "status_artifact_invalid")?;
+        serde_json::from_slice(bytes).map_err(|_| "status_artifact_invalid")?;
     if status.schema_version != PRIVATE_TURN_DETAIL_STATUS_VERSION
         || status.turn_id != turn_id
         || status.state
@@ -3779,7 +3786,7 @@ fn read_private_turn_detail_status(
         "conflict" => "conflict",
         _ => return Err("status_artifact_invalid"),
     };
-    Ok(Some(code))
+    Ok(code)
 }
 
 fn private_turn_detail_path(directory: &Path, turn_id: &str) -> Result<PathBuf, CollectorError> {

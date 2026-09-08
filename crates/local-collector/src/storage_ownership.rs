@@ -6,7 +6,9 @@
 //! cross-writer coherence, or classify any descendant or sibling path.
 
 use agent_observability_local_runtime::InstalledLayout;
+mod private;
 mod tls;
+pub use private::CollectorPrivateStorageObservation;
 use std::{
     fs::{self, File, OpenOptions},
     io,

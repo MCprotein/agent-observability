@@ -3,7 +3,8 @@
 
 use agent_observability_adapter_codex::{AdapterItem, parse_handoff_jsonl};
 use agent_observability_local_collector::storage_ownership::{
-    CollectorStorageOwnershipEvidence, CollectorTlsOwnershipEvidence,
+    CollectorPrivateStorageObservation, CollectorStorageOwnershipEvidence,
+    CollectorTlsOwnershipEvidence,
 };
 use agent_observability_local_runtime::{
     InstalledLayout, MutationGuard, RuntimeControl, StorageAllocationClass, StorageInventoryError,
@@ -70,26 +71,7 @@ fn three_synthetic_generations_preserve_reservations_and_classify_under_real_fre
     let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
     let setup_freeze = barrier.try_freeze(&mutation).unwrap();
     let mut store = LocalStore::open(layout.state.join("store")).unwrap();
-    // This exact semantic marker must be owned by the collector authority, not
-    // accepted merely because it is a private runtime file.
-    {
-        use std::io::Write;
-        let mut marker = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(layout.runtime.join("report-dirty"))
-            .unwrap();
-        marker.write_all(b"dirty\n").unwrap();
-        marker.sync_all().unwrap();
-    }
-    // Even a zero-allocation file needs semantic ownership; its name never suffices.
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(layout.logs.join("unowned.control"))
-        .unwrap();
+    write_synthetic_accounting_artifacts(&layout);
     drop(setup_freeze);
     drop(mutation);
     let mut previous_view = None;
@@ -158,6 +140,67 @@ fn three_synthetic_generations_preserve_reservations_and_classify_under_real_fre
     fs::remove_dir_all(root).unwrap();
 }
 
+fn write_synthetic_accounting_artifacts(layout: &InstalledLayout) {
+    // Synthetic unpaired private artifacts must be classified by their own semantics,
+    // not by the existence of a counterpart or a permissive directory prefix.
+    for (directory, digest, value) in [
+        (
+            "private-codex-turn-details",
+            "a".repeat(64),
+            serde_json::json!({
+                "schemaVersion": agent_observability_adapter_codex::PRIVATE_TURN_DETAIL_SCHEMA_VERSION,
+                "turnId":format!("id:sha256:{}", "a".repeat(64)), "cwd":"/synthetic-only",
+                "inputMessages":["synthetic-only"], "lastAssistantMessage":null
+            }),
+        ),
+        (
+            "private-codex-turn-detail-statuses",
+            "b".repeat(64),
+            serde_json::json!({
+                "schema_version":"private_codex_turn_detail_status.v1",
+                "turn_id":format!("id:sha256:{}", "b".repeat(64)),
+                "state":"failed", "code":"capture_disabled"
+            }),
+        ),
+    ] {
+        use std::{io::Write, os::unix::fs::DirBuilderExt};
+        let directory = layout.state.join(directory);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(format!("{digest}.json")))
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&value).unwrap())
+            .unwrap();
+        file.sync_all().unwrap();
+    }
+    // This exact semantic marker must be owned by the collector authority, not
+    // accepted merely because it is a private runtime file.
+    {
+        use std::io::Write;
+        let mut marker = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(layout.runtime.join("report-dirty"))
+            .unwrap();
+        marker.write_all(b"dirty\n").unwrap();
+        marker.sync_all().unwrap();
+    }
+    // Even a zero-allocation file needs semantic ownership; its name never suffices.
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(layout.logs.join("unowned.control"))
+        .unwrap();
+}
+
 fn ingest_generation(store: &mut LocalStore, generation: u32) {
     let input = include_str!("../../../examples/codex-handoff.v1.jsonl")
         .replace("example-v1.5.0", &format!("accounting-{generation}"))
@@ -193,6 +236,7 @@ fn assert_accounting(
     let root = layout.root.as_path();
     let config_evidence = ConfigAccountingEvidence::capture(root, mutation).unwrap();
     let collector_evidence = CollectorStorageOwnershipEvidence::capture(layout).unwrap();
+    let mut private_observation = CollectorPrivateStorageObservation::capture(layout).unwrap();
     let tls_evidence = CollectorTlsOwnershipEvidence::capture(layout)
         .unwrap()
         .unwrap();
@@ -250,6 +294,9 @@ fn assert_accounting(
                     || tls_evidence
                         .matches_entry(relative, file)
                         .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                    || private_observation
+                        .matches_entry(relative, file)
+                        .map_err(|_| StorageInventoryError::OwnershipMismatch)?
                 {
                     return Ok(StorageAllocationClass::Retained);
                 }
@@ -279,6 +326,7 @@ fn assert_accounting(
     config_evidence.revalidate().unwrap();
     collector_evidence.revalidate().unwrap();
     tls_evidence.revalidate().unwrap();
+    private_observation.revalidate().unwrap();
     reservation_evidence.revalidate().unwrap();
     assert_eq!(
         reservation_evidence.captured_reserved_bytes(),
