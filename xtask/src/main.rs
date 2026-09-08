@@ -1992,7 +1992,13 @@ impl AutomaticLifecycleStage {
     }
 
     fn from_failure(error: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|stage| stage.failure() == error)
+        // combine_cleanup appends this exact delimiter; never inspect or emit its payload.
+        let primary = error
+            .split_once("; cleanup failed: ")
+            .map_or(error, |(primary, _)| primary);
+        Self::ALL
+            .into_iter()
+            .find(|stage| stage.failure() == primary)
     }
 }
 
@@ -8304,6 +8310,39 @@ mod tests {
             assert!(!manifest.contains("private-key.pem"));
             validate_automatic_manifest_shape(&manifest).unwrap();
             validate_automatic_manifest_privacy(&manifest).unwrap();
+        }
+    }
+
+    #[test]
+    fn lifecycle_stage_survives_private_cleanup_failure_without_prefix_guessing() {
+        for stage in AutomaticLifecycleStage::ALL {
+            let error = combine_cleanup(
+                Err(stage.failure().into()),
+                Err("/private/AUTOMATIC_RAW_PROMPT_SENTINEL credential".into()),
+            )
+            .unwrap_err();
+            let evidence_error = format!("lifecycle preflight: {error}");
+            assert_eq!(automatic_evidence_error_code(&evidence_error), stage.code());
+            let manifest = render_automatic_manifest(
+                automatic_config(),
+                &host(),
+                &"a".repeat(40),
+                &[],
+                &[evidence_error],
+                "failed",
+            );
+            assert!(manifest.contains("status: failed"));
+            assert!(manifest.contains("release_readiness: not_verified"));
+            assert!(!manifest.contains("AUTOMATIC_RAW_PROMPT_SENTINEL"));
+            assert!(!manifest.contains("/private"));
+            validate_automatic_manifest_shape(&manifest).unwrap();
+            validate_automatic_manifest_privacy(&manifest).unwrap();
+            for suffix in [" extra", "; cleanup", "; cleanup failed", "-other"] {
+                assert!(
+                    AutomaticLifecycleStage::from_failure(&format!("{}{suffix}", stage.failure()))
+                        .is_none()
+                );
+            }
         }
     }
 
