@@ -1909,6 +1909,100 @@ fn local_codex_sse_response() -> String {
         })
 }
 
+#[derive(Clone, Copy)]
+enum AutomaticLifecycleStage {
+    Plist,
+    Status,
+    PreFailureOtlp,
+    PreFailureNotify,
+    PreFailurePrivacy,
+    Kill,
+    RecoveryWait,
+    RecoverySnapshot,
+    PostRecoveryOtlp,
+    PostRecoveryNotify,
+    PostRecoveryPrivacy,
+    Reconnect,
+    ConcurrentConnect,
+    Disconnect,
+    Restore,
+    InheritedPlist,
+}
+
+impl AutomaticLifecycleStage {
+    const ALL: [Self; 16] = [
+        Self::Plist,
+        Self::Status,
+        Self::PreFailureOtlp,
+        Self::PreFailureNotify,
+        Self::PreFailurePrivacy,
+        Self::Kill,
+        Self::RecoveryWait,
+        Self::RecoverySnapshot,
+        Self::PostRecoveryOtlp,
+        Self::PostRecoveryNotify,
+        Self::PostRecoveryPrivacy,
+        Self::Reconnect,
+        Self::ConcurrentConnect,
+        Self::Disconnect,
+        Self::Restore,
+        Self::InheritedPlist,
+    ];
+
+    const fn failure(self) -> &'static str {
+        match self {
+            Self::Plist => "automatic lifecycle stage plist failed",
+            Self::Status => "automatic lifecycle stage status failed",
+            Self::PreFailureOtlp => "automatic lifecycle stage pre-failure OTLP failed",
+            Self::PreFailureNotify => "automatic lifecycle stage pre-failure notify failed",
+            Self::PreFailurePrivacy => "automatic lifecycle stage pre-failure privacy failed",
+            Self::Kill => "automatic lifecycle stage kill failed",
+            Self::RecoveryWait => "automatic lifecycle stage recovery wait failed",
+            Self::RecoverySnapshot => "automatic lifecycle stage recovery snapshot failed",
+            Self::PostRecoveryOtlp => "automatic lifecycle stage post-recovery OTLP failed",
+            Self::PostRecoveryNotify => "automatic lifecycle stage post-recovery notify failed",
+            Self::PostRecoveryPrivacy => "automatic lifecycle stage post-recovery privacy failed",
+            Self::Reconnect => "automatic lifecycle stage reconnect failed",
+            Self::ConcurrentConnect => "automatic lifecycle stage concurrent connect failed",
+            Self::Disconnect => "automatic lifecycle stage disconnect failed",
+            Self::Restore => "automatic lifecycle stage restore failed",
+            Self::InheritedPlist => "automatic lifecycle stage inherited plist failed",
+        }
+    }
+
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Plist => "code=lifecycle_plist_failed",
+            Self::Status => "code=lifecycle_status_failed",
+            Self::PreFailureOtlp => "code=lifecycle_pre_failure_otlp_failed",
+            Self::PreFailureNotify => "code=lifecycle_pre_failure_notify_failed",
+            Self::PreFailurePrivacy => "code=lifecycle_pre_failure_privacy_failed",
+            Self::Kill => "code=lifecycle_kill_failed",
+            Self::RecoveryWait => "code=lifecycle_recovery_wait_failed",
+            Self::RecoverySnapshot => "code=lifecycle_recovery_snapshot_failed",
+            Self::PostRecoveryOtlp => "code=lifecycle_post_recovery_otlp_failed",
+            Self::PostRecoveryNotify => "code=lifecycle_post_recovery_notify_failed",
+            Self::PostRecoveryPrivacy => "code=lifecycle_post_recovery_privacy_failed",
+            Self::Reconnect => "code=lifecycle_reconnect_stage_failed",
+            Self::ConcurrentConnect => "code=lifecycle_concurrent_connect_failed",
+            Self::Disconnect => "code=lifecycle_disconnect_stage_failed",
+            Self::Restore => "code=lifecycle_restore_failed",
+            Self::InheritedPlist => "code=lifecycle_inherited_plist_failed",
+        }
+    }
+
+    fn from_failure(error: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|stage| stage.failure() == error)
+    }
+}
+
+fn automatic_lifecycle_stage<T>(
+    stage: AutomaticLifecycleStage,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    result.map_err(|_| stage.failure().to_owned())
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(), String> {
     if env::consts::OS != "macos" {
@@ -1969,118 +2063,197 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
         let target = format!("gui/{}/{service}", uid.trim());
         cleanup.plist = Some(plist.clone());
         cleanup.target = Some(target.clone());
-        verify_automatic_launch_agent_plist(&plist, binary, &root)?;
-
-        let status = run_bounded_product_command_with_env(
-            binary,
-            &["status", "codex"],
-            AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
-            &cleanup.environment(),
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Plist,
+            verify_automatic_launch_agent_plist(&plist, binary, &root),
         )?;
-        require_output_line(&status, "config", "connected")?;
-        require_collector_ready_or_degraded(&status)?;
+
+        let status = automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Status,
+            run_bounded_product_command_with_env(
+                binary,
+                &["status", "codex"],
+                AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+                &cleanup.environment(),
+            ),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Status,
+            require_output_line(&status, "config", "connected"),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Status,
+            require_collector_ready_or_degraded(&status),
+        )?;
         let initial_records = automatic_report_record_count(binary, &root, &cleanup)
             .map_err(|_| "automatic lifecycle initial report stage failed")?;
         let live_codex_records = verify_real_codex_e2e(binary, &root, &cleanup, initial_records)
             .map_err(|_| "automatic lifecycle real Codex stage failed")?;
-        submit_automatic_synthetic_otlp(&root, 0, 0)?;
-        let pre_failure_otlp_records = require_automatic_record_growth(
-            binary,
-            &root,
-            &cleanup,
-            live_codex_records,
-            "pre-failure synthetic collector OTLP",
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PreFailureOtlp,
+            submit_automatic_synthetic_otlp(&root, 0, 0),
         )?;
-        submit_automatic_notify(binary, &root, &cleanup, 0)?;
-        require_automatic_record_growth(
-            binary,
-            &root,
-            &cleanup,
-            pre_failure_otlp_records,
-            "pre-failure notify",
+        let pre_failure_otlp_records = automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PreFailureOtlp,
+            require_automatic_record_growth(
+                binary,
+                &root,
+                &cleanup,
+                live_codex_records,
+                "pre-failure synthetic collector OTLP",
+            ),
         )?;
-        assert_automatic_notify_sentinels_absent(&root)?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PreFailureNotify,
+            submit_automatic_notify(binary, &root, &cleanup, 0),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PreFailureNotify,
+            require_automatic_record_growth(
+                binary,
+                &root,
+                &cleanup,
+                pre_failure_otlp_records,
+                "pre-failure notify",
+            ),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PreFailurePrivacy,
+            assert_automatic_notify_sentinels_absent(&root),
+        )?;
 
-        run_bounded_status_command(
-            "/bin/launchctl",
-            &["kill", "SIGKILL", &target],
-            AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
-            &[0],
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Kill,
+            run_bounded_status_command(
+                "/bin/launchctl",
+                &["kill", "SIGKILL", &target],
+                AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
+                &[0],
+            ),
         )?;
-        wait_for_automatic_lifecycle_recovery(binary, &cleanup)?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::RecoveryWait,
+            wait_for_automatic_lifecycle_recovery(binary, &cleanup),
+        )?;
 
-        let recovered_records = automatic_report_record_count(binary, &root, &cleanup)?;
-        submit_automatic_synthetic_otlp(&root, 0, 1)?;
-        let post_recovery_otlp_records = require_automatic_record_growth(
-            binary,
-            &root,
-            &cleanup,
-            recovered_records,
-            "post-recovery synthetic collector OTLP",
+        let recovered_records = automatic_lifecycle_stage(
+            AutomaticLifecycleStage::RecoverySnapshot,
+            automatic_report_record_count(binary, &root, &cleanup),
         )?;
-        submit_automatic_notify(binary, &root, &cleanup, 1)?;
-        require_automatic_record_growth(
-            binary,
-            &root,
-            &cleanup,
-            post_recovery_otlp_records,
-            "post-recovery notify",
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PostRecoveryOtlp,
+            submit_automatic_synthetic_otlp(&root, 0, 1),
         )?;
-        assert_automatic_notify_sentinels_absent(&root)?;
+        let post_recovery_otlp_records = automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PostRecoveryOtlp,
+            require_automatic_record_growth(
+                binary,
+                &root,
+                &cleanup,
+                recovered_records,
+                "post-recovery synthetic collector OTLP",
+            ),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PostRecoveryNotify,
+            submit_automatic_notify(binary, &root, &cleanup, 1),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PostRecoveryNotify,
+            require_automatic_record_growth(
+                binary,
+                &root,
+                &cleanup,
+                post_recovery_otlp_records,
+                "post-recovery notify",
+            ),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PostRecoveryPrivacy,
+            assert_automatic_notify_sentinels_absent(&root),
+        )?;
 
-        let occupied_port = load_settings(&root)
-            .map_err(|error| error.to_string())?
-            .port;
-        run_bounded_status_command(
-            "/bin/launchctl",
-            &["bootout", &target],
-            AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
-            &[0],
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Reconnect,
+            (|| {
+                let occupied_port = load_settings(&root)
+                    .map_err(|error| error.to_string())?
+                    .port;
+                run_bounded_status_command(
+                    "/bin/launchctl",
+                    &["bootout", &target],
+                    AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
+                    &[0],
+                )?;
+                let occupied = occupy_automatic_lifecycle_port(occupied_port)?;
+                let reconnected = run_bounded_product_command_with_env(
+                    binary,
+                    &["connect", "codex", path_text(&root)?],
+                    AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+                    &cleanup.environment(),
+                )?;
+                require_output_line(&reconnected, "config", "connected")?;
+                require_collector_ready_or_degraded(&reconnected)?;
+                let recovered_port = load_settings(&root)
+                    .map_err(|error| error.to_string())?
+                    .port;
+                if recovered_port == occupied_port {
+                    return Err("automatic lifecycle occupied port was not recovered".into());
+                }
+                drop(occupied);
+                Ok(())
+            })(),
         )?;
-        let occupied = occupy_automatic_lifecycle_port(occupied_port)?;
-        let reconnected = run_bounded_product_command_with_env(
-            binary,
-            &["connect", "codex", path_text(&root)?],
-            AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
-            &cleanup.environment(),
-        )?;
-        require_output_line(&reconnected, "config", "connected")?;
-        require_collector_ready_or_degraded(&reconnected)?;
-        let recovered_port = load_settings(&root)
-            .map_err(|error| error.to_string())?
-            .port;
-        if recovered_port == occupied_port {
-            return Err("automatic lifecycle occupied port was not recovered".into());
-        }
-        drop(occupied);
 
-        run_concurrent_automatic_connects(binary, &root, &cleanup)?;
-        fs::remove_file(root.join("runtime/collector.json"))
-            .map_err(|error| format!("remove automatic lifecycle settings: {error}"))?;
-
-        let disconnected = run_bounded_product_command_with_env(
-            binary,
-            &["disconnect", "codex", path_text(&root)?],
-            AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
-            &cleanup.environment(),
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::ConcurrentConnect,
+            run_concurrent_automatic_connects(binary, &root, &cleanup),
         )?;
-        require_output_line(&disconnected, "config", "disconnected")?;
-        require_output_line(&disconnected, "collector", "stopped")?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Disconnect,
+            (|| {
+                fs::remove_file(root.join("runtime/collector.json"))
+                    .map_err(|error| format!("remove automatic lifecycle settings: {error}"))?;
+                let disconnected = run_bounded_product_command_with_env(
+                    binary,
+                    &["disconnect", "codex", path_text(&root)?],
+                    AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+                    &cleanup.environment(),
+                )?;
+                require_output_line(&disconnected, "config", "disconnected")?;
+                require_output_line(&disconnected, "collector", "stopped")
+            })(),
+        )?;
         cleanup.connection_may_exist = false;
-        verify_exact_file(
-            &cleanup.config,
-            &cleanup.seed,
-            AUTOMATIC_LIFECYCLE_SEED_MODE,
-            "Codex config",
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Restore,
+            verify_exact_file(
+                &cleanup.config,
+                &cleanup.seed,
+                AUTOMATIC_LIFECYCLE_SEED_MODE,
+                "Codex config",
+            ),
         )?;
-        if plist.exists() {
-            return Err("automatic lifecycle disconnect left the LaunchAgent plist".into());
-        }
-        if launch_agent_is_loaded(&target)? {
-            return Err("automatic lifecycle disconnect left the LaunchAgent loaded".into());
-        }
-        verify_inherited_automatic_plist(binary, &root, &mut cleanup, &plist, &target, false)?;
-        verify_inherited_automatic_plist(binary, &root, &mut cleanup, &plist, &target, true)?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Disconnect,
+            (|| {
+                if plist.exists() {
+                    return Err("automatic lifecycle disconnect left the LaunchAgent plist".into());
+                }
+                if launch_agent_is_loaded(&target)? {
+                    return Err("automatic lifecycle disconnect left the LaunchAgent loaded".into());
+                }
+                Ok(())
+            })(),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::InheritedPlist,
+            verify_inherited_automatic_plist(binary, &root, &mut cleanup, &plist, &target, false),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::InheritedPlist,
+            verify_inherited_automatic_plist(binary, &root, &mut cleanup, &plist, &target, true),
+        )?;
         Ok(())
     })();
     drop(model_server);
@@ -5722,7 +5895,9 @@ fn render_automatic_manifest(
 
 fn automatic_evidence_error_code(error: &str) -> &'static str {
     if let Some(error) = error.strip_prefix("lifecycle preflight: ") {
-        if error.contains("requires codex") {
+        if let Some(stage) = AutomaticLifecycleStage::from_failure(error) {
+            stage.code()
+        } else if error.contains("requires codex") {
             "code=lifecycle_codex_version_failed"
         } else if error.contains("compatibility diagnostic")
             || error.contains("strict config")
@@ -6102,6 +6277,22 @@ fn validate_automatic_release_aggregates(
 fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
     let allowed_errors = [
         "  - 'code=lifecycle_preflight_failed'",
+        "  - 'code=lifecycle_plist_failed'",
+        "  - 'code=lifecycle_status_failed'",
+        "  - 'code=lifecycle_pre_failure_otlp_failed'",
+        "  - 'code=lifecycle_pre_failure_notify_failed'",
+        "  - 'code=lifecycle_pre_failure_privacy_failed'",
+        "  - 'code=lifecycle_kill_failed'",
+        "  - 'code=lifecycle_recovery_wait_failed'",
+        "  - 'code=lifecycle_recovery_snapshot_failed'",
+        "  - 'code=lifecycle_post_recovery_otlp_failed'",
+        "  - 'code=lifecycle_post_recovery_notify_failed'",
+        "  - 'code=lifecycle_post_recovery_privacy_failed'",
+        "  - 'code=lifecycle_reconnect_stage_failed'",
+        "  - 'code=lifecycle_concurrent_connect_failed'",
+        "  - 'code=lifecycle_disconnect_stage_failed'",
+        "  - 'code=lifecycle_restore_failed'",
+        "  - 'code=lifecycle_inherited_plist_failed'",
         "  - 'code=lifecycle_codex_version_failed'",
         "  - 'code=lifecycle_codex_config_failed'",
         "  - 'code=lifecycle_codex_e2e_failed'",
@@ -8015,6 +8206,102 @@ mod tests {
                 "failed",
             );
             assert!(manifest.contains(&format!("  - '{code}'")));
+            validate_automatic_manifest_shape(&manifest).unwrap();
+            validate_automatic_manifest_privacy(&manifest).unwrap();
+        }
+    }
+
+    #[test]
+    fn automatic_lifecycle_stage_diagnostics_are_specific_private_and_not_verified() {
+        assert_eq!(
+            automatic_lifecycle_stage(AutomaticLifecycleStage::Status, Ok::<_, String>(7)),
+            Ok(7)
+        );
+        let private = Err::<(), _>(
+            "/private/tmp/AUTOMATIC_RAW_PROMPT_SENTINEL token private-key.pem".to_owned(),
+        );
+        for (stage, code) in [
+            (
+                AutomaticLifecycleStage::Plist,
+                "code=lifecycle_plist_failed",
+            ),
+            (
+                AutomaticLifecycleStage::Status,
+                "code=lifecycle_status_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PreFailureOtlp,
+                "code=lifecycle_pre_failure_otlp_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PreFailureNotify,
+                "code=lifecycle_pre_failure_notify_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PreFailurePrivacy,
+                "code=lifecycle_pre_failure_privacy_failed",
+            ),
+            (AutomaticLifecycleStage::Kill, "code=lifecycle_kill_failed"),
+            (
+                AutomaticLifecycleStage::RecoveryWait,
+                "code=lifecycle_recovery_wait_failed",
+            ),
+            (
+                AutomaticLifecycleStage::RecoverySnapshot,
+                "code=lifecycle_recovery_snapshot_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PostRecoveryOtlp,
+                "code=lifecycle_post_recovery_otlp_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PostRecoveryNotify,
+                "code=lifecycle_post_recovery_notify_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PostRecoveryPrivacy,
+                "code=lifecycle_post_recovery_privacy_failed",
+            ),
+            (
+                AutomaticLifecycleStage::Reconnect,
+                "code=lifecycle_reconnect_stage_failed",
+            ),
+            (
+                AutomaticLifecycleStage::ConcurrentConnect,
+                "code=lifecycle_concurrent_connect_failed",
+            ),
+            (
+                AutomaticLifecycleStage::Disconnect,
+                "code=lifecycle_disconnect_stage_failed",
+            ),
+            (
+                AutomaticLifecycleStage::Restore,
+                "code=lifecycle_restore_failed",
+            ),
+            (
+                AutomaticLifecycleStage::InheritedPlist,
+                "code=lifecycle_inherited_plist_failed",
+            ),
+        ] {
+            let error = automatic_lifecycle_stage(stage, private.clone()).unwrap_err();
+            assert_eq!(
+                automatic_evidence_error_code(&format!("lifecycle preflight: {error}")),
+                code
+            );
+            let manifest = render_automatic_manifest(
+                automatic_config(),
+                &host(),
+                &"a".repeat(40),
+                &[],
+                &[format!("lifecycle preflight: {error}")],
+                "failed",
+            );
+            assert!(manifest.contains("status: failed"));
+            assert!(manifest.contains("release_readiness: not_verified"));
+            assert!(manifest.contains(&format!("  - '{code}'")));
+            assert!(!manifest.contains("/private/tmp"));
+            assert!(!manifest.contains("AUTOMATIC_RAW_PROMPT_SENTINEL"));
+            assert!(!manifest.contains("private-key.pem"));
             validate_automatic_manifest_shape(&manifest).unwrap();
             validate_automatic_manifest_privacy(&manifest).unwrap();
         }
