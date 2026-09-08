@@ -163,6 +163,11 @@ Private-copy compaction reclaimed only 7,159,808 bytes; it is not a capacity rec
 A separate 1024-byte-page copy reclaimed 115,431,424 bytes with observed table/schema parity,
 but still failed new ingest after two retained views (209,735,680-byte admission deficit).
 The repeatable new-ingest rotation diagnostic and its boundaries are in Staged Ingest.
+Ordinary CI at `4f8c848` also passed all three platforms/surfaces. Local-only report-page
+1024/2048 experiments did not reduce the capacity deficit; the default4096 was restored.
+Geometry work is closed as insufficient. Future-write accounting or a separately reviewed
+authority representation remains the blocker; no reduced reservation or installed migration
+is enabled.
 The exact CI trigger remains unconfirmed; neither test stabilization nor smoke substitutes for
 capacity acceptance or release gates. Failed-smoke manifest retention is implemented.
 The earlier long workflow `34135080615` was cancelled before its normative job when those defects

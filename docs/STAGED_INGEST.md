@@ -101,6 +101,20 @@ The final rerun measured a 209,719,296-byte deficit and independently confirmed 
 canonical authority, source cursor, generation/acknowledgement and current view after refusal.
 Small physical-allocation variation between runs does not change the rejection result.
 
+A final bounded experiment configured the normal report staging builder for 1024-byte and
+2048-byte pages in local test builds only. With the same 1024-byte private authority and two
+retained views, the admission deficits were 210,513,920 and 210,735,104 bytes respectively.
+Both new writes were refused and both refusal-invariance checks passed. Neither configuration
+met the minimum 104,867,840-byte aggregate allocation reduction needed even for the optimistic
+database-only copy. The report-page constant was restored to 4096 and the remaining temporary
+copies removed. Page-geometry investigation is closed as insufficient, not activated as a fix.
+
+The unresolved implementation gate is future-write accounting against authoritative files with
+enforced growth/materialization bounds, or a separately reviewed authority representation.
+Do not subtract derived views from admission solely because this experiment identifies their
+cost. Whole-transaction atomicity, journal framing, rehydration/fan-out and memory bounds remain
+required before collector integration.
+
 The repeatable test-only entrypoint is `private_backup_new_ingest_three_generations` in
 `crates/local-collector/src/rotation_diagnostic.rs`. It requires explicit `AO_ROTATION_BACKUP_SOURCE`
 and `--ignored --nocapture`, backs up into an owned private runtime, retains two views before
