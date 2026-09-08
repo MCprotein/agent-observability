@@ -11,6 +11,7 @@ const generatedJavaScript = new Set([
   "ui/settings/generated/validate-local-runtime-config-v4.js",
   "ui/settings/generated/validate-local-runtime-config-v5.js",
   "ui/settings/generated/validate-codex-integration-status-v1.js",
+  "ui/settings/generated/validate-codex-integration-error-v1.js",
 ]);
 const managedToolingPrefixes = [".anamnesis/", ".claude/", ".codex/", ".cursor/"];
 

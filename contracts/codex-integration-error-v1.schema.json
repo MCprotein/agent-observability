@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-observability.local/contracts/codex-integration-error-v1.schema.json",
+  "title": "CodexIntegrationErrorV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["code", "message"],
+  "properties": {
+    "code": {
+      "enum": ["integration_failed", "integration_connect_committed_unverified", "integration_disconnect_committed_unverified", "integration_settings_completed_unverified", "integration_outcome_uncertain"]
+    },
+    "message": {"type": "string", "pattern": "^.{1,256}$"}
+  }
+}

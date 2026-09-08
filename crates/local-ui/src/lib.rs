@@ -817,7 +817,7 @@ async fn run_integration(
     tokio::task::spawn_blocking(move || operation(&root, &executable))
         .await
         .map_err(|_| integration_error())?
-        .map_err(|_| integration_error())
+        .map_err(|error| integration_operation_error(&error))
 }
 
 async fn open_dashboard(
@@ -956,6 +956,39 @@ fn integration_error() -> ApiError {
         "integration_failed",
         "Codex 자동 수집 상태를 확인하거나 변경할 수 없습니다.",
     )
+}
+
+fn integration_operation_error(error: &IntegrationError) -> ApiError {
+    use agent_observability_local_collector::CollectorError;
+
+    let (code, message) = match error {
+        IntegrationError::ConnectCommittedSettingsFinalizationUnverified { .. } => (
+            "integration_connect_committed_unverified",
+            "Codex 연결 변경은 완료됐지만 설정 마무리를 확인하지 못했습니다. 현재 상태를 다시 확인해야 합니다.",
+        ),
+        IntegrationError::DisconnectCommittedSettingsFinalizationUnverified { .. } => (
+            "integration_disconnect_committed_unverified",
+            "Codex 연결 해제 변경은 완료됐지만 설정 마무리를 확인하지 못했습니다. 현재 상태를 다시 확인해야 합니다.",
+        ),
+        IntegrationError::Collector(CollectorError::StorageWriteUnverified {
+            operation_completed: true,
+            ..
+        }) => (
+            "integration_settings_completed_unverified",
+            "설정 쓰기는 완료됐지만 검증하지 못했습니다. Codex 연결 상태를 다시 확인해야 합니다.",
+        ),
+        IntegrationError::Collector(CollectorError::StorageWriteUnverified {
+            operation_completed: false,
+            ..
+        })
+        | IntegrationError::SettingsRollbackFailed { .. }
+        | IntegrationError::SettingsRollbackUnverified { .. } => (
+            "integration_outcome_uncertain",
+            "변경 또는 복원 결과를 확정할 수 없습니다. 현재 상태를 다시 확인해야 합니다.",
+        ),
+        _ => return integration_error(),
+    };
+    ApiError::new(StatusCode::CONFLICT, code, message)
 }
 
 fn dashboard_error(error: DashboardOpenError) -> ApiError {
@@ -1748,6 +1781,79 @@ mod tests {
         Err(IntegrationError::Runtime(
             "/Users/private/AUTOMATIC_RAW_PROMPT_SENTINEL private-key.pem".into(),
         ))
+    }
+
+    #[test]
+    fn integration_unverified_outcomes_are_explicit_and_content_free() {
+        use agent_observability_local_collector::CollectorError;
+
+        let private_error = || CollectorError::Io(std::io::Error::other("/private/SECRET_TOKEN"));
+        let cases = [
+            (
+                IntegrationError::ConnectCommittedSettingsFinalizationUnverified {
+                    finalization: private_error(),
+                },
+                "integration_connect_committed_unverified",
+            ),
+            (
+                IntegrationError::DisconnectCommittedSettingsFinalizationUnverified {
+                    finalization: private_error(),
+                },
+                "integration_disconnect_committed_unverified",
+            ),
+            (
+                IntegrationError::Collector(CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    primary: None,
+                    verification: Box::new(private_error()),
+                }),
+                "integration_settings_completed_unverified",
+            ),
+            (
+                IntegrationError::Collector(CollectorError::StorageWriteUnverified {
+                    operation_completed: false,
+                    primary: None,
+                    verification: Box::new(private_error()),
+                }),
+                "integration_outcome_uncertain",
+            ),
+            (
+                IntegrationError::SettingsRollbackUnverified {
+                    primary: Box::new(IntegrationError::Runtime("SECRET_TOKEN".into())),
+                    rollback: private_error(),
+                },
+                "integration_outcome_uncertain",
+            ),
+            (
+                IntegrationError::SettingsRollbackFailed {
+                    primary: Box::new(IntegrationError::Runtime("SECRET_TOKEN".into())),
+                    rollback: private_error(),
+                },
+                "integration_outcome_uncertain",
+            ),
+        ];
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../contracts/codex-integration-error-v1.schema.json"
+        ))
+        .unwrap();
+        for (error, expected) in cases {
+            let response = super::integration_operation_error(&error);
+            assert_eq!(response.status, StatusCode::CONFLICT);
+            assert_eq!(response.code, expected);
+            assert!(
+                schema["properties"]["code"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&Value::String(response.code.into()))
+            );
+            let body = serde_json::to_string(&super::ErrorBody {
+                code: response.code,
+                message: response.message,
+            })
+            .unwrap();
+            assert!(!body.contains("SECRET_TOKEN"));
+            assert!(!body.contains("/private/"));
+        }
     }
 
     #[test]

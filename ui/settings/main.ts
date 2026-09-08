@@ -21,6 +21,7 @@ import {
 } from "lucide";
 import { validateLocalRuntimeConfig } from "./config-validation.js";
 import { validateCodexIntegrationStatus } from "./integration-status-validation.js";
+import validateIntegrationError from "./generated/validate-codex-integration-error-v1.js";
 import type {
   CodexIntegrationStatusV1,
   CollectorDegradationReasonV1,
@@ -450,7 +451,7 @@ function integrationPanel(): string {
           ? "수집기 응답 없음"
           : "연결 안 됨";
   const detail = integrationUnavailable
-    ? "로컬 설정은 사용할 수 있지만 Codex 자동 수집 상태를 확인하지 못했습니다."
+    ? "Codex 상태를 확인할 때까지 연결 변경을 잠갔습니다. 다시 확인을 눌러 상태를 조회해 주세요."
     : conflicted
     ? "Codex 설정이 연결 후 변경되어 자동 복원을 중단했습니다."
     : connected && degraded
@@ -702,45 +703,73 @@ function bindEvents(): void {
 }
 
 async function toggleIntegration(): Promise<void> {
-  if (busy || !integration) return;
+  if (busy || !integration || integrationUnavailable) return;
   const lifecycleToken = token;
   const generation = ++integrationRequestGeneration;
+  busy = true;
   setBusy(true);
   try {
     const method = integration.config === "connected" ? "DELETE" : "POST";
     const nextIntegration = await integrationApi("/api/integrations/codex", { method });
     if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
     integration = nextIntegration;
+    integrationUnavailable = false;
+    busy = false;
     renderSettings("toggle-integration");
     showToast(
       integration.config === "connected" ? "Codex 자동 수집을 연결했습니다." : "Codex 자동 수집을 해제했습니다.",
       "success",
     );
   } catch (error) {
-    if (token !== lifecycleToken) return;
-    setBusy(false);
-    showToast(messageOf(error), "error");
+    if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+    integration = null;
+    integrationUnavailable = true;
+    // A failed response can follow a committed write. Keep mutations locked until GET settles.
+    try {
+      const next = await integrationApi("/api/integrations/codex");
+      if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+      integration = next;
+      integrationUnavailable = false;
+    } catch (statusError) {
+      if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+      if ((statusError as Error & { code?: string }).code === "invalid_session") {
+        busy = false;
+        expireSession();
+        return;
+      }
+    }
+    busy = false;
+    renderSettings(integrationUnavailable ? "refresh-integration" : "toggle-integration");
+    showToast(`${messageOf(error)} ${integrationUnavailable
+      ? "상태를 확인할 수 없어 변경을 잠갔습니다. 다시 확인을 눌러 주세요."
+      : "현재 상태를 다시 확인했습니다."}`, "error");
   }
 }
 
 async function refreshIntegration(): Promise<void> {
   if (busy) return;
   const generation = ++integrationRequestGeneration;
+  busy = true;
   setBusy(true);
   try {
     const next = await integrationApi("/api/integrations/codex");
     if (generation !== integrationRequestGeneration || !token) return;
     integration = next;
     integrationUnavailable = false;
+    busy = false;
     renderSettings("toggle-integration");
     showToast("Codex 자동 수집 상태를 확인했습니다.", "success");
   } catch (error) {
+    if (generation !== integrationRequestGeneration || !token) return;
+    busy = false;
     const apiError = error as Error & { code?: string };
-    if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
+    if (apiError.code === "invalid_session") {
       expireSession();
       return;
     }
-    setBusy(false);
+    integration = null;
+    integrationUnavailable = true;
+    renderSettings("refresh-integration");
     showToast(messageOf(error), "error");
   }
 }
@@ -761,7 +790,7 @@ async function refreshIntegrationStatus(): Promise<void> {
   } catch (error) {
     if (generation !== integrationRequestGeneration) return;
     const apiError = error as Error & { code?: string };
-    if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
+    if (apiError.code === "invalid_session") {
       expireSession();
       return;
     }
@@ -1173,7 +1202,17 @@ async function integrationApi(
   path: string,
   init: RequestInit = {},
 ): Promise<CodexIntegrationStatusV1> {
-  const value = await api<unknown>(path, init);
+  let value: unknown;
+  try {
+    value = await api<unknown>(path, { ...init, signal: AbortSignal.timeout(5000) });
+  } catch (error) {
+    const failure = error as Error & { code?: string };
+    if (failure.code?.startsWith("integration_") &&
+        !validateIntegrationError({ code: failure.code, message: failure.message })) {
+      throw new Error("Codex 변경 결과 응답을 확인할 수 없습니다. 상태를 다시 확인해야 합니다.");
+    }
+    throw error;
+  }
   if (!validateCodexIntegrationStatus(value)) {
     throw new Error("Codex 자동 수집 상태 응답이 올바르지 않습니다.");
   }

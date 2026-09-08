@@ -1366,6 +1366,79 @@
     return validate_codex_integration_status_v1_default(value);
   }
 
+  // ui/settings/generated/validate-codex-integration-error-v1.js
+  var validate_codex_integration_error_v1_default = validate22;
+  var schema41 = { "title": "CodexIntegrationErrorV1", "type": "object", "additionalProperties": false, "required": ["code", "message"], "properties": { "code": { "enum": ["integration_failed", "integration_connect_committed_unverified", "integration_disconnect_committed_unverified", "integration_settings_completed_unverified", "integration_outcome_uncertain"] }, "message": { "type": "string", "pattern": "^.{1,256}$" } } };
+  var pattern4 = new RegExp("^.{1,256}$", "u");
+  function validate22(data, { instancePath = "", parentData, parentDataProperty, rootData = data, dynamicAnchors = {} } = {}) {
+    let vErrors = null;
+    let errors = 0;
+    const evaluated0 = validate22.evaluated;
+    if (evaluated0.dynamicProps) {
+      evaluated0.props = void 0;
+    }
+    if (evaluated0.dynamicItems) {
+      evaluated0.items = void 0;
+    }
+    if (errors === 0) {
+      if (data && typeof data == "object" && !Array.isArray(data)) {
+        let missing0;
+        if (data.code === void 0 && (missing0 = "code") || data.message === void 0 && (missing0 = "message")) {
+          validate22.errors = [{ instancePath, schemaPath: "#/required", keyword: "required", params: { missingProperty: missing0 }, message: "must have required property '" + missing0 + "'" }];
+          return false;
+        } else {
+          const _errs1 = errors;
+          for (const key0 in data) {
+            if (!(key0 === "code" || key0 === "message")) {
+              validate22.errors = [{ instancePath, schemaPath: "#/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key0 }, message: "must NOT have additional properties" }];
+              return false;
+              break;
+            }
+          }
+          if (_errs1 === errors) {
+            if (data.code !== void 0) {
+              let data0 = data.code;
+              const _errs2 = errors;
+              if (!(data0 === "integration_failed" || data0 === "integration_connect_committed_unverified" || data0 === "integration_disconnect_committed_unverified" || data0 === "integration_settings_completed_unverified" || data0 === "integration_outcome_uncertain")) {
+                validate22.errors = [{ instancePath: instancePath + "/code", schemaPath: "#/properties/code/enum", keyword: "enum", params: { allowedValues: schema41.properties.code.enum }, message: "must be equal to one of the allowed values" }];
+                return false;
+              }
+              var valid0 = _errs2 === errors;
+            } else {
+              var valid0 = true;
+            }
+            if (valid0) {
+              if (data.message !== void 0) {
+                let data1 = data.message;
+                const _errs3 = errors;
+                if (errors === _errs3) {
+                  if (typeof data1 === "string") {
+                    if (!pattern4.test(data1)) {
+                      validate22.errors = [{ instancePath: instancePath + "/message", schemaPath: "#/properties/message/pattern", keyword: "pattern", params: { pattern: "^.{1,256}$" }, message: 'must match pattern "^.{1,256}$"' }];
+                      return false;
+                    }
+                  } else {
+                    validate22.errors = [{ instancePath: instancePath + "/message", schemaPath: "#/properties/message/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                    return false;
+                  }
+                }
+                var valid0 = _errs3 === errors;
+              } else {
+                var valid0 = true;
+              }
+            }
+          }
+        }
+      } else {
+        validate22.errors = [{ instancePath, schemaPath: "#/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+        return false;
+      }
+    }
+    validate22.errors = vErrors;
+    return errors === 0;
+  }
+  validate22.evaluated = { "props": true, "dynamicProps": false, "dynamicItems": false };
+
   // ui/settings/main.ts
   var fields = {
     "collection.file_reconcile_interval_ms": {
@@ -1724,7 +1797,7 @@
       integration?.collector_degradation_reasons ?? []
     );
     const state = integrationUnavailable ? "\uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00" : conflicted2 ? "\uC124\uC815 \uCDA9\uB3CC" : connected && degraded ? degradedCopy.state : connected && ready ? "\uC218\uC9D1 \uC911" : connected ? "\uC218\uC9D1\uAE30 \uC751\uB2F5 \uC5C6\uC74C" : "\uC5F0\uACB0 \uC548 \uB428";
-    const detail = integrationUnavailable ? "\uB85C\uCEEC \uC124\uC815\uC740 \uC0AC\uC6A9\uD560 \uC218 \uC788\uC9C0\uB9CC Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC\uB97C \uD655\uC778\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4." : conflicted2 ? "Codex \uC124\uC815\uC774 \uC5F0\uACB0 \uD6C4 \uBCC0\uACBD\uB418\uC5B4 \uC790\uB3D9 \uBCF5\uC6D0\uC744 \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4." : connected && degraded ? degradedCopy.detail : connected && ready ? "Codex \uC774\uBCA4\uD2B8\uB97C private local runtime\uC5D0 \uBC18\uC601\uD569\uB2C8\uB2E4." : connected ? "Codex \uC5F0\uACB0\uC740 \uC720\uC9C0\uB418\uC9C0\uB9CC \uB85C\uCEEC \uC218\uC9D1\uAE30\uC5D0 \uC5F0\uACB0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD558\uBA74 \uB2E4\uC74C \uC791\uC5C5\uBD80\uD130 \uAE30\uB85D\uD569\uB2C8\uB2E4.";
+    const detail = integrationUnavailable ? "Codex \uC0C1\uD0DC\uB97C \uD655\uC778\uD560 \uB54C\uAE4C\uC9C0 \uC5F0\uACB0 \uBCC0\uACBD\uC744 \uC7A0\uAC14\uC2B5\uB2C8\uB2E4. \uB2E4\uC2DC \uD655\uC778\uC744 \uB20C\uB7EC \uC0C1\uD0DC\uB97C \uC870\uD68C\uD574 \uC8FC\uC138\uC694." : conflicted2 ? "Codex \uC124\uC815\uC774 \uC5F0\uACB0 \uD6C4 \uBCC0\uACBD\uB418\uC5B4 \uC790\uB3D9 \uBCF5\uC6D0\uC744 \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4." : connected && degraded ? degradedCopy.detail : connected && ready ? "Codex \uC774\uBCA4\uD2B8\uB97C private local runtime\uC5D0 \uBC18\uC601\uD569\uB2C8\uB2E4." : connected ? "Codex \uC5F0\uACB0\uC740 \uC720\uC9C0\uB418\uC9C0\uB9CC \uB85C\uCEEC \uC218\uC9D1\uAE30\uC5D0 \uC5F0\uACB0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD558\uBA74 \uB2E4\uC74C \uC791\uC5C5\uBD80\uD130 \uAE30\uB85D\uD569\uB2C8\uB2E4.";
     const action = integrationUnavailable ? `<button class="button secondary" id="refresh-integration" type="button"><i data-lucide="refresh-cw"></i>\uB2E4\uC2DC \uD655\uC778</button>` : connected ? `<button class="button secondary" id="toggle-integration" type="button"><i data-lucide="power"></i>\uC5F0\uACB0 \uD574\uC81C</button>` : `<button class="button primary" id="toggle-integration" type="button"><i data-lucide="cable"></i>Codex \uC5F0\uACB0</button>`;
     const panelState = integrationUnavailable ? "unavailable" : conflicted2 ? "conflict" : degraded ? "degraded" : ready ? "ready" : "idle";
     const collectorLabel = integrationUnavailable ? "\uD655\uC778 \uBD88\uAC00" : degraded ? "\uC0C1\uD0DC \uC800\uD558" : ready ? "\uC815\uC0C1" : "\uC911\uC9C0";
@@ -1943,44 +2016,69 @@
     document.querySelectorAll(".settings-section").forEach((section) => navigationObserver?.observe(section));
   }
   async function toggleIntegration() {
-    if (busy || !integration) return;
+    if (busy || !integration || integrationUnavailable) return;
     const lifecycleToken = token;
     const generation = ++integrationRequestGeneration;
+    busy = true;
     setBusy(true);
     try {
       const method = integration.config === "connected" ? "DELETE" : "POST";
       const nextIntegration = await integrationApi("/api/integrations/codex", { method });
       if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
       integration = nextIntegration;
+      integrationUnavailable = false;
+      busy = false;
       renderSettings("toggle-integration");
       showToast(
         integration.config === "connected" ? "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD588\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uD574\uC81C\uD588\uC2B5\uB2C8\uB2E4.",
         "success"
       );
     } catch (error) {
-      if (token !== lifecycleToken) return;
-      setBusy(false);
-      showToast(messageOf(error), "error");
+      if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+      integration = null;
+      integrationUnavailable = true;
+      try {
+        const next = await integrationApi("/api/integrations/codex");
+        if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+        integration = next;
+        integrationUnavailable = false;
+      } catch (statusError) {
+        if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+        if (statusError.code === "invalid_session") {
+          busy = false;
+          expireSession();
+          return;
+        }
+      }
+      busy = false;
+      renderSettings(integrationUnavailable ? "refresh-integration" : "toggle-integration");
+      showToast(`${messageOf(error)} ${integrationUnavailable ? "\uC0C1\uD0DC\uB97C \uD655\uC778\uD560 \uC218 \uC5C6\uC5B4 \uBCC0\uACBD\uC744 \uC7A0\uAC14\uC2B5\uB2C8\uB2E4. \uB2E4\uC2DC \uD655\uC778\uC744 \uB20C\uB7EC \uC8FC\uC138\uC694." : "\uD604\uC7AC \uC0C1\uD0DC\uB97C \uB2E4\uC2DC \uD655\uC778\uD588\uC2B5\uB2C8\uB2E4."}`, "error");
     }
   }
   async function refreshIntegration() {
     if (busy) return;
     const generation = ++integrationRequestGeneration;
+    busy = true;
     setBusy(true);
     try {
       const next = await integrationApi("/api/integrations/codex");
       if (generation !== integrationRequestGeneration || !token) return;
       integration = next;
       integrationUnavailable = false;
+      busy = false;
       renderSettings("toggle-integration");
       showToast("Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC\uB97C \uD655\uC778\uD588\uC2B5\uB2C8\uB2E4.", "success");
     } catch (error) {
+      if (generation !== integrationRequestGeneration || !token) return;
+      busy = false;
       const apiError = error;
-      if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
+      if (apiError.code === "invalid_session") {
         expireSession();
         return;
       }
-      setBusy(false);
+      integration = null;
+      integrationUnavailable = true;
+      renderSettings("refresh-integration");
       showToast(messageOf(error), "error");
     }
   }
@@ -2000,7 +2098,7 @@
     } catch (error) {
       if (generation !== integrationRequestGeneration) return;
       const apiError = error;
-      if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
+      if (apiError.code === "invalid_session") {
         expireSession();
         return;
       }
@@ -2355,7 +2453,16 @@
     return await response.json();
   }
   async function integrationApi(path, init = {}) {
-    const value = await api(path, init);
+    let value;
+    try {
+      value = await api(path, { ...init, signal: AbortSignal.timeout(5e3) });
+    } catch (error) {
+      const failure = error;
+      if (failure.code?.startsWith("integration_") && !validate_codex_integration_error_v1_default({ code: failure.code, message: failure.message })) {
+        throw new Error("Codex \uBCC0\uACBD \uACB0\uACFC \uC751\uB2F5\uC744 \uD655\uC778\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4. \uC0C1\uD0DC\uB97C \uB2E4\uC2DC \uD655\uC778\uD574\uC57C \uD569\uB2C8\uB2E4.");
+      }
+      throw error;
+    }
     if (!validateCodexIntegrationStatus(value)) {
       throw new Error("Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC \uC751\uB2F5\uC774 \uC62C\uBC14\uB974\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.");
     }

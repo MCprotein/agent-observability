@@ -44,6 +44,12 @@ const compileBrowserValidator = async (path: string) => {
 };
 const validateConfig = await compileBrowserValidator(configSchemaPath);
 const validateIntegrationStatus = await compileBrowserValidator(integrationStatusSchemaPath);
+const integrationErrorPath = "contracts/codex-integration-error-v1.schema.json";
+await writeFile(`${generatedUiPath}/codex-integration-error-v1.d.ts`, await compileFromFile(integrationErrorPath), "utf8");
+await writeFile(`${generatedUiPath}/validate-codex-integration-error-v1.js`,
+  standaloneCode(ajv, await compileBrowserValidator(integrationErrorPath)), "utf8");
+await writeFile(`${generatedUiPath}/validate-codex-integration-error-v1.d.ts`,
+  "declare const validate: (value: unknown) => boolean;\nexport default validate;\n", "utf8");
 await Promise.all([
   writeFile(
     `${generatedUiPath}/validate-local-runtime-config-v5.js`,
