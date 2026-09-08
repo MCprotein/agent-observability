@@ -37,7 +37,15 @@ jobs:
       - name: Check formatting
         run: cargo +1.97.0 fmt --all -- --check
       - name: Run tests
-        run: cargo +1.97.0 test --workspace --no-fail-fast
+        shell: bash
+        run: |
+          set -euo pipefail
+          timing_test=tests::private_turn_detail_foreground_path_is_bounded_at_status_capacity_and_lock_contention
+          listed="$(cargo +1.97.0 test --locked -p agent-observability-local-collector --lib "$timing_test" -- --exact --list)"
+          printf '%s\n' "$listed" | grep -Fxq "$timing_test: test"
+          cargo +1.97.0 test --workspace --no-fail-fast -- --skip "$timing_test"
+          # Keep the same 250ms assertions mandatory, without unrelated test I/O contention.
+          cargo +1.97.0 test --locked -p agent-observability-local-collector --lib "$timing_test" -- --exact --test-threads=1
       - name: Repeat report refresh regressions on Linux
         shell: bash
         run: |
@@ -61,7 +69,15 @@ jobs:
           rustup toolchain install 1.97.0 --profile minimal
           rustup component add --toolchain 1.97.0 clippy
       - name: Run macOS tests
-        run: cargo +1.97.0 test --workspace --no-fail-fast
+        shell: bash
+        run: |
+          set -euo pipefail
+          timing_test=tests::private_turn_detail_foreground_path_is_bounded_at_status_capacity_and_lock_contention
+          listed="$(cargo +1.97.0 test --locked -p agent-observability-local-collector --lib "$timing_test" -- --exact --list)"
+          printf '%s\n' "$listed" | grep -Fxq "$timing_test: test"
+          cargo +1.97.0 test --workspace --no-fail-fast -- --skip "$timing_test"
+          # Keep the same 250ms assertions mandatory, without unrelated test I/O contention.
+          cargo +1.97.0 test --locked -p agent-observability-local-collector --lib "$timing_test" -- --exact --test-threads=1
       - name: Repeat snapshot convergence regressions on macOS
         shell: bash
         run: |
