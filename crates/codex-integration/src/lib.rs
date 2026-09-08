@@ -84,6 +84,20 @@ pub enum IntegrationError {
     Config(ConfigError),
     Io(std::io::Error),
     Runtime(String),
+    ConnectCommittedSettingsFinalizationUnverified {
+        finalization: CollectorError,
+    },
+    DisconnectCommittedSettingsFinalizationUnverified {
+        finalization: CollectorError,
+    },
+    SettingsRollbackFailed {
+        primary: Box<IntegrationError>,
+        rollback: CollectorError,
+    },
+    SettingsRollbackUnverified {
+        primary: Box<IntegrationError>,
+        rollback: CollectorError,
+    },
 }
 
 impl fmt::Display for IntegrationError {
@@ -93,6 +107,21 @@ impl fmt::Display for IntegrationError {
             Self::Config(error) => error.fmt(formatter),
             Self::Io(error) => error.fmt(formatter),
             Self::Runtime(message) => formatter.write_str(message),
+            Self::ConnectCommittedSettingsFinalizationUnverified { finalization } => write!(
+                formatter,
+                "Codex integration connect committed; settings finalization unverified: {finalization}"
+            ),
+            Self::DisconnectCommittedSettingsFinalizationUnverified { finalization } => write!(
+                formatter,
+                "Codex integration disconnect committed; settings finalization unverified: {finalization}"
+            ),
+            Self::SettingsRollbackFailed { primary, rollback } => {
+                write!(formatter, "{primary}; settings rollback failed: {rollback}")
+            }
+            Self::SettingsRollbackUnverified { primary, rollback } => write!(
+                formatter,
+                "{primary}; settings rollback final state unverified: {rollback}"
+            ),
         }
     }
 }
@@ -104,6 +133,12 @@ impl std::error::Error for IntegrationError {
             Self::Config(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::Runtime(_) => None,
+            Self::ConnectCommittedSettingsFinalizationUnverified { finalization }
+            | Self::DisconnectCommittedSettingsFinalizationUnverified { finalization } => {
+                Some(finalization)
+            }
+            Self::SettingsRollbackFailed { rollback, .. }
+            | Self::SettingsRollbackUnverified { rollback, .. } => Some(rollback),
         }
     }
 }
@@ -150,9 +185,19 @@ fn finish_settings_migration(
     root: &Path,
     result: Result<CodexIntegrationStatus, IntegrationError>,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
+    finish_settings_migration_with(root, result, commit_settings_migration)
+}
+
+fn finish_settings_migration_with(
+    root: &Path,
+    result: Result<CodexIntegrationStatus, IntegrationError>,
+    finalize: impl FnOnce(&Path) -> Result<(), CollectorError>,
+) -> Result<CodexIntegrationStatus, IntegrationError> {
     match result {
         Ok(status) => {
-            commit_settings_migration(root)?;
+            finalize(root).map_err(|finalization| {
+                IntegrationError::ConnectCommittedSettingsFinalizationUnverified { finalization }
+            })?;
             Ok(status)
         }
         Err(error) => Err(error),
@@ -291,9 +336,19 @@ fn finish_disconnect_settings_migration(
     root: &Path,
     result: Result<CodexIntegrationStatus, IntegrationError>,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
+    finish_disconnect_settings_migration_with(root, result, rollback_settings_migration)
+}
+
+fn finish_disconnect_settings_migration_with(
+    root: &Path,
+    result: Result<CodexIntegrationStatus, IntegrationError>,
+    finalize: impl FnOnce(&Path) -> Result<(), CollectorError>,
+) -> Result<CodexIntegrationStatus, IntegrationError> {
     match result {
         Ok(status) => {
-            rollback_settings_migration(root)?;
+            finalize(root).map_err(|finalization| {
+                IntegrationError::DisconnectCommittedSettingsFinalizationUnverified { finalization }
+            })?;
             Ok(status)
         }
         Err(error) => Err(error),
@@ -552,10 +607,37 @@ fn recover_failed_config_connect(
 }
 
 fn rollback_migration_without_service(root: &Path, error: IntegrationError) -> IntegrationError {
-    match rollback_settings_migration(root) {
-        Ok(()) => error,
-        Err(rollback) => rollback_error(&error, &rollback.into()),
+    if is_storage_write_unverified(&error) {
+        return error;
     }
+    rollback_migration_without_service_with(root, error, rollback_settings_migration)
+}
+
+fn rollback_migration_without_service_with(
+    root: &Path,
+    error: IntegrationError,
+    rollback_settings: impl FnOnce(&Path) -> Result<(), CollectorError>,
+) -> IntegrationError {
+    match rollback_settings(root) {
+        Ok(()) => error,
+        Err(rollback @ CollectorError::StorageWriteUnverified { .. }) => {
+            IntegrationError::SettingsRollbackUnverified {
+                primary: Box::new(error),
+                rollback,
+            }
+        }
+        Err(rollback) => IntegrationError::SettingsRollbackFailed {
+            primary: Box::new(error),
+            rollback,
+        },
+    }
+}
+
+fn is_storage_write_unverified(error: &IntegrationError) -> bool {
+    matches!(
+        error,
+        IntegrationError::Collector(CollectorError::StorageWriteUnverified { .. })
+    )
 }
 
 fn rollback_error(error: &IntegrationError, rollback: &IntegrationError) -> IntegrationError {
@@ -2046,12 +2128,14 @@ mod tests {
         ConfigConnectionStatus, ConfigError, ConfigLifecycle, ConnectionStatus, IntegrationError,
         LaunchAgentOwnershipStatus, NotifyOwnership, NotifyStatus, codex_detected_at,
         collector_status, connect_prepared, connect_with_reloaded_settings,
-        disconnect_owned_prepared, disconnect_prepared, ensure_codex_home, exporter_security,
-        finish_disconnect_settings_migration, finish_settings_migration, launch_agent_body,
-        missing_settings_status, recover_connect_settings, recover_connect_settings_with,
-        service_label, settle_pending_migration_before_disconnect,
-        settle_pending_migration_before_status, settle_settings_migration_for_status, status,
-        with_lifecycle_lock,
+        disconnect_owned_prepared, disconnect_prepared, disconnected_status, ensure_codex_home,
+        exporter_security, finish_disconnect_settings_migration,
+        finish_disconnect_settings_migration_with, finish_settings_migration,
+        finish_settings_migration_with, launch_agent_body, missing_settings_status,
+        recover_connect_settings, recover_connect_settings_with,
+        rollback_migration_without_service_with, service_label,
+        settle_pending_migration_before_disconnect, settle_pending_migration_before_status,
+        settle_settings_migration_for_status, status, with_lifecycle_lock,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -2093,6 +2177,19 @@ mod tests {
 
     fn test_exporter_security(root: &Path) -> ExporterSecurity {
         ExporterSecurity::new(root.join("ca-certificate.pem"), "private-token").unwrap()
+    }
+
+    fn connected_status() -> CodexIntegrationStatus {
+        CodexIntegrationStatus {
+            schema_version: super::CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: Vec::new(),
+            config: ConnectionStatus::Connected,
+            notify: Some(NotifyStatus::AgentobsOwned),
+            collector: CollectorStatus::Ready,
+            endpoint: Some("https://127.0.0.1:4318/v1/logs".into()),
+            service: Some("io.agent-observability.collector.test".into()),
+            data_retained: true,
+        }
     }
 
     #[test]
@@ -2417,6 +2514,139 @@ mod tests {
 
         let _ = fs::remove_dir_all(success_root);
         let _ = fs::remove_dir_all(failure_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_connect_reports_unverified_settings_finalization_without_mutating_fixture() {
+        use agent_observability_local_collector::CollectorError;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("connect-finalization-unverified");
+        let layout = install(&root).unwrap();
+        let settings_path = layout.runtime.join("collector.json");
+        let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
+        fs::write(&settings_path, legacy).unwrap();
+        fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = install_settings(&root).unwrap();
+        let journal_path = layout.runtime.join("collector-settings-migration.json");
+        let settings_bytes = fs::read(&settings_path).unwrap();
+        let journal_bytes = fs::read(&journal_path).unwrap();
+
+        let error = finish_settings_migration_with(&root, Ok(connected_status()), |_| {
+            Err(CollectorError::StorageWriteUnverified {
+                operation_completed: true,
+                primary: None,
+                verification: Box::new(CollectorError::Runtime(
+                    "settings finalization postcheck failed".into(),
+                )),
+            })
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IntegrationError::ConnectCommittedSettingsFinalizationUnverified {
+                finalization: CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(fs::read(settings_path).unwrap(), settings_bytes);
+        assert_eq!(fs::read(journal_path).unwrap(), journal_bytes);
+        assert!(
+            layout
+                .runtime
+                .join("integrations/codex/tls")
+                .join(replacement.generation)
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_disconnect_reports_unverified_settings_finalization_without_mutating_fixture() {
+        use agent_observability_local_collector::CollectorError;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("disconnect-finalization-unverified");
+        let layout = install(&root).unwrap();
+        let settings_path = layout.runtime.join("collector.json");
+        let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
+        fs::write(&settings_path, legacy).unwrap();
+        fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = install_settings(&root).unwrap();
+        let journal_path = layout.runtime.join("collector-settings-migration.json");
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        journal["phase"] = serde_json::Value::String("integration_committed".into());
+        fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let settings_bytes = fs::read(&settings_path).unwrap();
+        let journal_bytes = fs::read(&journal_path).unwrap();
+
+        let error =
+            finish_disconnect_settings_migration_with(&root, Ok(disconnected_status()), |_| {
+                Err(CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    primary: None,
+                    verification: Box::new(CollectorError::Runtime(
+                        "settings finalization postcheck failed".into(),
+                    )),
+                })
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IntegrationError::DisconnectCommittedSettingsFinalizationUnverified {
+                finalization: CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(fs::read(settings_path).unwrap(), settings_bytes);
+        assert_eq!(fs::read(journal_path).unwrap(), journal_bytes);
+        assert!(
+            layout
+                .runtime
+                .join("integrations/codex/tls")
+                .join(replacement.generation)
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn settings_rollback_uncertainty_preserves_typed_primary_and_verification() {
+        use agent_observability_local_collector::CollectorError;
+
+        let error = rollback_migration_without_service_with(
+            Path::new("/runtime"),
+            IntegrationError::Config(ConfigError::Conflict),
+            |_| {
+                Err(CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    primary: None,
+                    verification: Box::new(CollectorError::Runtime(
+                        "settings rollback postcheck failed".into(),
+                    )),
+                })
+            },
+        );
+
+        assert!(matches!(
+            error,
+            IntegrationError::SettingsRollbackUnverified {
+                primary,
+                rollback: CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    ..
+                }
+            } if matches!(*primary, IntegrationError::Config(ConfigError::Conflict))
+        ));
     }
 
     #[cfg(unix)]
@@ -2860,6 +3090,46 @@ mod tests {
         assert_eq!(config.state.get(), ConfigConnectionStatus::Connected);
         assert_eq!(*config.events.borrow(), ["config-connect"]);
         assert_eq!(*lifecycle.events.borrow(), ["install", "health", "commit"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unverified_settings_failure_does_not_trigger_blind_migration_rollback() {
+        use agent_observability_local_collector::CollectorError;
+        use std::os::unix::fs::PermissionsExt;
+
+        for operation_completed in [false, true] {
+            let root = temporary_root("settings-unverified-no-rollback");
+            let layout = install(&root).unwrap();
+            let settings_path = layout.runtime.join("collector.json");
+            let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
+            fs::write(&settings_path, legacy).unwrap();
+            fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let replacement = install_settings(&root).unwrap();
+            let journal = layout.runtime.join("collector-settings-migration.json");
+            let journal_bytes = fs::read(&journal).unwrap();
+            let error = IntegrationError::Collector(CollectorError::StorageWriteUnverified {
+                operation_completed,
+                primary: (!operation_completed)
+                    .then(|| Box::new(CollectorError::Runtime("primary".into()))),
+                verification: Box::new(CollectorError::Runtime("storage identity changed".into())),
+            });
+            let result = super::rollback_migration_without_service(&root, error);
+            assert!(matches!(
+                result,
+                IntegrationError::Collector(CollectorError::StorageWriteUnverified { .. })
+            ));
+            assert_eq!(load_settings(&root).unwrap(), replacement);
+            assert_eq!(fs::read(journal).unwrap(), journal_bytes);
+            assert!(
+                layout
+                    .runtime
+                    .join("integrations/codex/tls")
+                    .join(replacement.generation)
+                    .exists()
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[cfg(unix)]
