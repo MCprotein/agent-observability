@@ -73,8 +73,22 @@ impl std::error::Error for ReservationError {}
 /// conservatively accounted stale reservation, including after build failure.
 #[derive(Debug)]
 pub struct WriteReservation {
-    file: File,
+    lock: ReservationLock,
     metadata: Metadata,
+}
+
+/// Unlock every acquired lock, including validation failures before an owner
+/// exists and empty recovery. Closing one descriptor is insufficient when a
+/// concurrent fork or duplicate retains the same open-file description.
+#[derive(Debug)]
+struct ReservationLock {
+    file: File,
+}
+
+impl Drop for ReservationLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 fn open(root: &Path, create: bool) -> Result<Option<File>, ReservationError> {
@@ -170,14 +184,15 @@ fn read(file: &mut File) -> Result<Option<Metadata>, ReservationError> {
     Ok(Some(meta))
 }
 
-fn lock(file: &File) -> Result<(), ReservationError> {
+fn lock(file: File) -> Result<ReservationLock, ReservationError> {
     file.try_lock_exclusive().map_err(|error| {
         if error.kind() == std::io::ErrorKind::WouldBlock {
             ReservationError::Busy
         } else {
             error.into()
         }
-    })
+    })?;
+    Ok(ReservationLock { file })
 }
 
 fn read_metadata(root: &Path) -> Result<Option<Metadata>, ReservationError> {
@@ -227,13 +242,22 @@ impl WriteReservation {
         guard: &MutationGuard,
         byte_ceiling: u64,
     ) -> Result<Self, ReservationError> {
+        Self::acquire_observing(root, guard, byte_ceiling, |_| {})
+    }
+
+    fn acquire_observing(
+        root: &Path,
+        guard: &MutationGuard,
+        byte_ceiling: u64,
+        after_lock: impl FnOnce(&File),
+    ) -> Result<Self, ReservationError> {
         guard.require_root(root)?;
         if !(1..=MAX_BYTE_CEILING).contains(&byte_ceiling) {
             return Err(ReservationError::Capacity);
         }
-        let file = open(root, true)?.ok_or(ReservationError::Corrupt)?;
-        lock(&file)?;
-        cleanup_temp(root, guard, &file)?;
+        let lock = lock(open(root, true)?.ok_or(ReservationError::Corrupt)?)?;
+        after_lock(&lock.file);
+        cleanup_temp(root, guard, &lock.file)?;
         if read_metadata(root)?.is_some() {
             return Err(ReservationError::Stale);
         }
@@ -273,7 +297,7 @@ impl WriteReservation {
         #[cfg(test)]
         crash_phase("synced");
         guard.require_root(root)?;
-        validate_lock(&file, root)?;
+        validate_lock(&lock.file, root)?;
         same_file(&temp, &temporary)?;
         std::fs::rename(&temporary, root.join("runtime").join(METADATA_NAME))?;
         #[cfg(test)]
@@ -281,7 +305,7 @@ impl WriteReservation {
         File::open(root.join("runtime"))?.sync_all()?;
         #[cfg(test)]
         crash_phase("published");
-        Ok(Self { file, metadata })
+        Ok(Self { lock, metadata })
     }
 
     pub(crate) fn validate_owner(
@@ -290,7 +314,7 @@ impl WriteReservation {
         guard: &MutationGuard,
     ) -> Result<(), ReservationError> {
         guard.require_root(root)?;
-        validate_lock(&self.file, root)?;
+        validate_lock(&self.lock.file, root)?;
         if read_metadata(root)?.as_ref() != Some(&self.metadata) {
             return Err(ReservationError::Corrupt);
         }
@@ -300,7 +324,7 @@ impl WriteReservation {
     /// Call only after publication or guarded staging cleanup has finished.
     pub fn release(self, root: &Path, guard: &MutationGuard) -> Result<(), ReservationError> {
         self.validate_owner(root, guard)?;
-        cleanup_temp(root, guard, &self.file)?;
+        cleanup_temp(root, guard, &self.lock.file)?;
         std::fs::remove_file(root.join("runtime").join(METADATA_NAME))?;
         #[cfg(test)]
         crash_phase("removed");
@@ -311,17 +335,19 @@ impl WriteReservation {
     }
 }
 
-impl Drop for WriteReservation {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-    }
-}
-
 /// Claim stale metadata without clearing it. The caller must clean interrupted
 /// staging under the mutation guard before releasing the returned owner.
 pub(crate) fn recover(
     root: &Path,
     guard: &MutationGuard,
+) -> Result<Option<WriteReservation>, ReservationError> {
+    recover_observing(root, guard, |_| {})
+}
+
+fn recover_observing(
+    root: &Path,
+    guard: &MutationGuard,
+    after_lock: impl FnOnce(&File),
 ) -> Result<Option<WriteReservation>, ReservationError> {
     guard.require_root(root)?;
     let Some(file) = open(root, false)? else {
@@ -330,9 +356,10 @@ pub(crate) fn recover(
         }
         return Ok(None);
     };
-    lock(&file)?;
-    cleanup_temp(root, guard, &file)?;
-    Ok(read_metadata(root)?.map(|metadata| WriteReservation { file, metadata }))
+    let lock = lock(file)?;
+    after_lock(&lock.file);
+    cleanup_temp(root, guard, &lock.file)?;
+    Ok(read_metadata(root)?.map(|metadata| WriteReservation { lock, metadata }))
 }
 
 #[cfg(test)]
@@ -593,6 +620,78 @@ mod tests {
             shrunk.admit(&root, 1).unwrap(),
             Admission::Allowed { .. }
         ));
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn empty_and_corrupt_recovery_unlock_with_a_surviving_duplicate() {
+        use std::os::unix::fs::PermissionsExt;
+        for corrupt in [false, true] {
+            let (root, control) = setup(if corrupt {
+                "corrupt-recovery-duplicate"
+            } else {
+                "empty-recovery-duplicate"
+            });
+            let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+            control
+                .reserve_report_build(&root, &guard, 8192)
+                .unwrap()
+                .release(&root, &guard)
+                .unwrap();
+            let metadata_path = root.join("runtime/report-reservation.meta");
+            if corrupt {
+                fs::write(&metadata_path, b"invalid").unwrap();
+                fs::set_permissions(&metadata_path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let mut duplicate = None;
+            let attempt = super::recover_observing(&root, &guard, |file| {
+                duplicate = Some(file.try_clone().unwrap());
+            });
+            if corrupt {
+                assert!(matches!(attempt, Err(super::ReservationError::Corrupt)));
+                assert_eq!(fs::read(&metadata_path).unwrap(), b"invalid");
+            } else {
+                assert!(matches!(attempt, Ok(None)));
+                assert!(!metadata_path.exists());
+            }
+            let next = super::lock(super::open(&root, false).unwrap().unwrap()).unwrap();
+            assert!(duplicate.is_some());
+            drop(next);
+            drop(duplicate);
+            drop(guard);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_acquire_unlocks_even_while_a_duplicate_descriptor_survives() {
+        let (root, control) = setup("failed-acquire-duplicate");
+        let guard = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        let held = control.reserve_report_build(&root, &guard, 8192).unwrap();
+        drop(held);
+        let metadata_before = fs::read(root.join("runtime/report-reservation.meta")).unwrap();
+        let mut duplicate = None;
+        let attempt = super::WriteReservation::acquire_observing(&root, &guard, 4096, |file| {
+            duplicate = Some(file.try_clone().unwrap());
+        });
+        assert!(matches!(attempt, Err(super::ReservationError::Stale)));
+        assert_eq!(
+            fs::read(root.join("runtime/report-reservation.meta")).unwrap(),
+            metadata_before
+        );
+        // A fork/dup shares the open-file description. Closing only the failed
+        // attempt's descriptor must not leave its transient lock attached to it.
+        let recovered = control
+            .claim_stale_report_reservation(&root, &guard)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.byte_ceiling(), 8192);
+        assert!(duplicate.is_some());
+        recovered.release(&root, &guard).unwrap();
+        drop(duplicate);
         drop(guard);
         fs::remove_dir_all(root).unwrap();
     }
