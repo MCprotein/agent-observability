@@ -1933,6 +1933,8 @@ fn persist_private_turn_detail_request(
     config: &LocalRuntimeConfigV3,
     private_detail: &PrivateCodexTurnDetailV1,
 ) -> Response {
+    #[cfg(test)]
+    let lock_started = StdInstant::now();
     let mutation = match acquire_private_turn_detail_mutation(&layout.runtime) {
         Ok(Some(mutation)) => mutation,
         Ok(None) => {
@@ -1952,6 +1954,11 @@ fn persist_private_turn_detail_request(
             );
         }
     };
+    #[cfg(test)]
+    eprintln!(
+        "private_capture_stage=lock elapsed={:?}",
+        lock_started.elapsed()
+    );
     let result = capture_private_turn_detail_locked(layout, private_detail, config);
     drop(mutation);
     match result {
@@ -3049,11 +3056,22 @@ fn persist_private_turn_detail_locked(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    // Test-only, content-free timings keep a failed latency gate attributable
+    // without changing admission, durability, retention, or the time limit.
+    #[cfg(test)]
+    let prune_started = StdInstant::now();
     prune_private_turn_details(&directory, Some(&path), config, SystemTime::now())?;
+    #[cfg(test)]
+    eprintln!(
+        "private_capture_stage=detail_prune elapsed={:?}",
+        prune_started.elapsed()
+    );
     let reservation = u64::try_from(MAX_PRIVATE_TURN_DETAIL_BYTES)
         .map_err(|_| CollectorError::Runtime("private detail size bound overflow".into()))?
         .checked_add(additional_reservation)
         .ok_or_else(|| CollectorError::Runtime("private detail size bound overflow".into()))?;
+    #[cfg(test)]
+    let admission_started = StdInstant::now();
     let control = RuntimeControl::new(config).map_err(runtime_error)?;
     if control
         .admit(&layout.root, reservation)
@@ -3064,6 +3082,13 @@ fn persist_private_turn_detail_locked(
             "private turn detail exceeds local storage budget".into(),
         ));
     }
+    #[cfg(test)]
+    eprintln!(
+        "private_capture_stage=admission elapsed={:?}",
+        admission_started.elapsed()
+    );
+    #[cfg(test)]
+    let publication_started = StdInstant::now();
     let temporary = settings_temporary_path(&directory);
     let result = (|| {
         let mut options = OpenOptions::new();
@@ -3082,6 +3107,11 @@ fn persist_private_turn_detail_locked(
         Ok(())
     })();
     let _ = fs::remove_file(&temporary);
+    #[cfg(test)]
+    eprintln!(
+        "private_capture_stage=detail_publication elapsed={:?}",
+        publication_started.elapsed()
+    );
     result
 }
 
@@ -3357,6 +3387,8 @@ fn write_private_turn_detail_status_locked(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    #[cfg(test)]
+    let prune_started = StdInstant::now();
     prune_private_turn_files_with_limit(
         &directory,
         Some(&path),
@@ -3365,13 +3397,26 @@ fn write_private_turn_detail_status_locked(
         MAX_PRIVATE_TURN_DETAIL_FILES,
         MAX_PRIVATE_TURN_DETAIL_STATUS_BYTES,
     )?;
+    #[cfg(test)]
+    eprintln!(
+        "private_capture_stage=status_prune elapsed={:?}",
+        prune_started.elapsed()
+    );
     let status = PrivateTurnDetailCaptureStatusV1 {
         schema_version: PRIVATE_TURN_DETAIL_STATUS_VERSION.into(),
         turn_id: turn_id.into(),
         state: state.into(),
         code: code.into(),
     };
-    write_private_json(&path, &status)
+    #[cfg(test)]
+    let publication_started = StdInstant::now();
+    let result = write_private_json(&path, &status);
+    #[cfg(test)]
+    eprintln!(
+        "private_capture_stage=status_publication elapsed={:?}",
+        publication_started.elapsed()
+    );
+    result
 }
 
 fn read_private_turn_detail_status(
