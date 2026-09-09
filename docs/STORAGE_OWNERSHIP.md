@@ -463,3 +463,19 @@ foreground 응답 기준이나 실제 규모 검증을 대체하지 않으며, �
 추가했다. 두 변경은 독립 코드·아키텍처 리뷰와 명시적 릴리즈 테스트를 통과했다. 최적화 빌드의
 표본은 [검토 기록](reviews/v1.11.0.md)에 남기며, 내용 파싱이 지배적이라는 가정이나 새 SLO의
 근거로 삼지 않는다. 현재 store는 빈 최신 schema이며, 실제 규모·보고서 catalog·동시성은 별도다.
+
+### 동시 연결의 설정 준비 경합 수정 계획
+
+CI `34314891405`의 storage-busy 분기와 같은 오류를, lifecycle 진입 후 root mutation을
+다른 thread가 보유한 상태의 `install_settings`에서 재현했다. legacy·initialized 환경 모두
+설정/TLS bytes는 보존된다. 새 CI root에는 accounting barrier를 생성하는 운영 경로가 없으므로
+이 root 경합을 우선 수정하되, artifact가 정확한 호출 단계를 보존하지 않아 역사적 CI 원인이
+확정됐다고 표현하지 않는다.
+
+독립 아키텍처 검토를 통과한 변경 범위는 foreground `connect`의 첫 설정 준비뿐이다.
+별도 `install_settings_waiting_for_root`가 기존 설정 본문과 마지막 재검증을 공유하고,
+기존 `StorageMutationWriter::acquire_waiting_for_root`를 사용한다. 기본 `install_settings`의
+try-only 동작은 유지한다. root를 얻은 뒤 accounting은 한 번만 시도하고, 작업은 한 번만
+실행한다. 새 deadline·전체 작업 재시도·예산 예외·자동 barrier 생성은 추가하지 않는다.
+두 환경에서 기다린 뒤 한 번 성공하는 회귀, 기존 즉시 거부, accounting 경합의 즉시 거부,
+설정/TLS 보존 및 기존 postcheck·primary-error 보존을 검증한 뒤 통합한다.
