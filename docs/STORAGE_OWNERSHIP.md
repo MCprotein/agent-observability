@@ -435,8 +435,8 @@ regular file인지 확인한 뒤 읽는다. FIFO를 먼저 blocking open하거�
 교체·비생성 및 운영 모드 차단을 회귀 검증했고 독립 코드 APPROVE / 아키텍처 CLEAR를 받았다.
 이는 설정 입력 한정의 자원 보강이며, 전체 소유권 관측이나 실제 guard의 지연 검증은 별도다.
 
-그 다음 실제 계산 조합은 CLI의 기존 `storage_accounting.rs` 안에 비활성 private
-`CliCollectorIngestPrecommitGuard`로 둔다. 전달받은 owned freeze를 다시 획득하지 않고
+실제 계산 조합은 `bac7bdd`에서 CLI의 기존 `storage_accounting.rs` 안에 비활성 private
+`CliCollectorIngestPrecommitGuard`로 구현했다. 전달받은 owned freeze를 다시 획득하지 않고
 동일 설정 revision·정책, A/X/U, 전체 R, 현재 D와 기존 E를 검증한 뒤 ingest 수치 판정을
 수행한다. 수치 거부는 `Denied`, 관측·identity·revision 실패는 `Unavailable`로 구분한다.
 callback의 허용 결과도 전체 관측의 마지막 재검증을 통과해야 반환한다. 명시적으로 전달된
@@ -444,3 +444,6 @@ batch 상한과 설정의 불일치도 거부하며 원문·경로·secret을 �
 이 단계는 아직 `main.rs`나 `serve`에 연결하지 않는다. 자원 보강과 테스트를 먼저 통과하고
 다른 작업 경계 및 모드 전환 검증을 마치기 전까지 좁게 설명된 dead-code 허용으로
 비활성임을 드러낸다. 별도 로더·범용 service·새 dependency는 추가하지 않는다.
+고정본 `554588bc`의 독립 코드 APPROVE / 아키텍처 CLEAR와 소유권·판정 테스트 19개,
+CLI strict Clippy 및 Rust 1.97.0 formatting을 확인했다. 이는 실제 수집 연결이나 전체
+관측 지연의 적합성을 검증한 결과가 아니며 다른 쓰기 경로와 운영 차단은 그대로다.

@@ -110,7 +110,7 @@ gate를 통과해 추가한다.
 | P0 | [구체적 결정안](docs/STORAGE_BUDGET_P0.md): 기본값·범위·파일 분류·작업량 산정·호환성 | config P1 착수에 한해 독립 APPROVE; 파일 분류·report 연결은 P2/P3 별도 검증 |
 | P1 | v5 config와 기존 설정 보존 검증 완료; 분리 모드 활성화 차단 | legacy 보존, Rust/TS parity, 경계값·revision 테스트 통과; 독립 코드 APPROVE / 아키텍처 CLEAR |
 | P2 | T/W/F 순수 계산, 제한된 A/X/U 분류, config·예약 descriptor 증거와 공통 잠금 검증; [파일 소유권 기준](docs/STORAGE_OWNERSHIP.md)의 전체 조합을 `runtime-check` 진단에 연결 | TLS·원문/상태·Codex 설정·singleton·LaunchAgent·정적 HTML 분류, 읽기 전용 store/view 조합과 journal 사전 차단을 검증·커밋. 진단은 기존 store 준비 이후이며 쓰기 전 허가가 아님. macOS lifecycle 동시 연결 실패를 분석 중이고, 운영 활성화·장시간 검증은 남아 있음. 정확한 증분·플랫폼 결과는 [review checkpoint](docs/reviews/v1.11.0.md) 참조 |
-| P3–P4 | 수집·보고서·정리 연결, CLI/웹 설정; 선택적 수집 commit 직전 검사 경계, 전체 예약 R 계산, 현재 디스크 여유 D와 기존 작업 추정 E API를 독립 검증·커밋, 실제 검사 구현·작업별 연결 진행 중 | transaction 유지, 명시적 전환, 실제 적용 revision·중단 이유 표시; 기본 수집 경로와 분리 모드 활성화는 아직 변경하지 않음 |
+| P3–P4 | 수집·보고서·정리 연결, CLI/웹 설정; 선택적 수집 commit 직전 검사 경계, 전체 예약 R 계산, 현재 디스크 여유 D와 기존 작업 추정 E API 및 비활성 CLI 판정 구현(`bac7bdd`)을 독립 검증·커밋. 실제 작업별 연결·전체 판정 자원 검증 진행 중 | transaction 유지, 명시적 전환, 실제 적용 revision·중단 이유 표시; 기본 수집 경로와 분리 모드 활성화는 아직 변경하지 않음 |
 | P5 | 장애·실제 규모·성능·문서 검증 | 새 수집→보고서 3세대, crash/replay, Chrome QA, exact-head CI와 독립 리뷰 |
 
 이 계획은 기존 hard-budget 연구의 후속 **정책 변경**이다. 보관 목표나 작업 시작 예산을
