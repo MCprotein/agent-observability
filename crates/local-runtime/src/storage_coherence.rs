@@ -123,10 +123,29 @@ impl OwnedStorageFreezeGuard<'_> {
     }
 
     pub fn revalidate(&self) -> Result<(), StorageCoherenceError> {
-        self.mutation
-            .require_root(&self.held.barrier.root)
-            .map_err(map_mutation_error)?;
-        self.held.revalidate()
+        revalidate_freeze(&self.held, &self.mutation)
+    }
+
+    /// Recognizes only this freeze's exact stable accounting lock, not descendants.
+    pub fn matches_accounting_lock(
+        &self,
+        relative: &Path,
+        candidate: &File,
+    ) -> Result<bool, StorageCoherenceError> {
+        matches_frozen_accounting_lock(&self.held, &self.mutation, relative, candidate)
+    }
+
+    /// Classifies under this exact root's exclusive cut, without releasing it.
+    pub fn classify(
+        &self,
+        classifier: impl FnMut(
+            &Path,
+            &File,
+        )
+            -> Result<crate::StorageAllocationClass, crate::StorageInventoryError>,
+    ) -> Result<crate::storage_inventory::StorageAllocationObservationV1, StorageCoherenceError>
+    {
+        classify_frozen_storage(&self.held, &self.mutation, classifier)
     }
 }
 
@@ -216,6 +235,17 @@ impl StorageBarrier {
 
     pub fn try_begin_write(&self) -> Result<StorageWriteGuard<'_>, StorageCoherenceError> {
         self.acquire(false)
+    }
+
+    /// Tries existing root ownership, then accounting exclusion, once each.
+    /// Never creates or repairs lock identities; either contention returns `Busy`.
+    pub fn try_freeze_existing_root(
+        &self,
+    ) -> Result<OwnedStorageFreezeGuard<'_>, StorageCoherenceError> {
+        self.revalidate()?;
+        let mutation = MutationGuard::try_acquire_existing(&self.root.join("runtime"))
+            .map_err(map_mutation_error)?;
+        self.try_freeze_owned(mutation)
     }
 
     /// Consumes root mutation ownership, retaining it through the exclusive cut.
@@ -379,10 +409,7 @@ impl<'barrier> StorageMutationWriter<'barrier> {
 }
 impl StorageFreezeGuard<'_, '_> {
     pub fn revalidate(&self) -> Result<(), StorageCoherenceError> {
-        self.mutation
-            .require_root(&self.held.barrier.root)
-            .map_err(map_mutation_error)?;
-        self.held.revalidate()
+        revalidate_freeze(&self.held, self.mutation)
     }
 
     /// Recognizes only this freeze's exact stable accounting lock, not descendants.
@@ -391,14 +418,7 @@ impl StorageFreezeGuard<'_, '_> {
         relative: &Path,
         candidate: &File,
     ) -> Result<bool, StorageCoherenceError> {
-        if relative != Path::new("runtime").join(LOCK_NAME) {
-            return Ok(false);
-        }
-        self.revalidate()?;
-        same_lock_identity(candidate, &self.held.barrier.identity)?;
-        validate_named(candidate, &self.held.barrier.root.join(relative), false)?;
-        self.revalidate()?;
-        Ok(true)
+        matches_frozen_accounting_lock(&self.held, self.mutation, relative, candidate)
     }
 
     /// Classifies under this exact root's exclusive cut, without releasing it.
@@ -412,16 +432,50 @@ impl StorageFreezeGuard<'_, '_> {
             -> Result<crate::StorageAllocationClass, crate::StorageInventoryError>,
     ) -> Result<crate::storage_inventory::StorageAllocationObservationV1, StorageCoherenceError>
     {
-        self.revalidate()?;
-        let inventory = crate::storage_inventory::classify_storage(
-            &self.held.barrier.root,
-            self.mutation,
-            classifier,
-        )
-        .map_err(StorageCoherenceError::Inventory)?;
-        self.revalidate()?;
-        Ok(inventory)
+        classify_frozen_storage(&self.held, self.mutation, classifier)
     }
+}
+
+fn revalidate_freeze(
+    held: &StorageWriteGuard<'_>,
+    mutation: &MutationGuard,
+) -> Result<(), StorageCoherenceError> {
+    mutation
+        .require_root(&held.barrier.root)
+        .map_err(map_mutation_error)?;
+    held.revalidate()
+}
+
+fn matches_frozen_accounting_lock(
+    held: &StorageWriteGuard<'_>,
+    mutation: &MutationGuard,
+    relative: &Path,
+    candidate: &File,
+) -> Result<bool, StorageCoherenceError> {
+    if relative != Path::new("runtime").join(LOCK_NAME) {
+        return Ok(false);
+    }
+    revalidate_freeze(held, mutation)?;
+    same_lock_identity(candidate, &held.barrier.identity)?;
+    validate_named(candidate, &held.barrier.root.join(relative), false)?;
+    revalidate_freeze(held, mutation)?;
+    Ok(true)
+}
+
+fn classify_frozen_storage(
+    held: &StorageWriteGuard<'_>,
+    mutation: &MutationGuard,
+    classifier: impl FnMut(
+        &Path,
+        &File,
+    ) -> Result<crate::StorageAllocationClass, crate::StorageInventoryError>,
+) -> Result<crate::storage_inventory::StorageAllocationObservationV1, StorageCoherenceError> {
+    revalidate_freeze(held, mutation)?;
+    let inventory =
+        crate::storage_inventory::classify_storage(&held.barrier.root, mutation, classifier)
+            .map_err(StorageCoherenceError::Inventory)?;
+    revalidate_freeze(held, mutation)?;
+    Ok(inventory)
 }
 
 #[cfg(unix)]
@@ -542,6 +596,123 @@ mod tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mutation = crate::MutationGuard::try_acquire(&root.join("runtime")).unwrap();
         (root, mutation)
+    }
+
+    #[test]
+    fn existing_root_freeze_is_noncreating_and_releases_root_after_accounting_rejection() {
+        if run_isolated(
+            "existing_root_freeze_is_noncreating_and_releases_root_after_accounting_rejection",
+        ) {
+            return;
+        }
+        let (root, mutation) = fixture();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            barrier.try_freeze_existing_root(),
+            Err(StorageCoherenceError::Busy)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(mutation);
+        let writer = barrier.try_begin_write().unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            barrier.try_freeze_existing_root(),
+            Err(StorageCoherenceError::Busy)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        MutationGuard::try_acquire_existing(&root.join("runtime")).unwrap();
+        drop(writer);
+        barrier
+            .try_freeze_existing_root()
+            .unwrap()
+            .revalidate()
+            .unwrap();
+        let path = root.join("runtime/mutation.lock");
+        fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            barrier.try_freeze_existing_root(),
+            Err(StorageCoherenceError::Missing)
+        ));
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owned_and_borrowed_freeze_classification_and_identity_are_equivalent() {
+        if run_isolated("owned_and_borrowed_freeze_classification_and_identity_are_equivalent") {
+            return;
+        }
+        let (root, mutation) = fixture();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let relative = Path::new("runtime/storage-accounting.lock");
+        let candidate = File::open(root.join(relative)).unwrap();
+        let wrong = File::open(root.join("runtime/mutation.lock")).unwrap();
+        let classify = |path: &Path, _: &File| {
+            Ok(if path == relative {
+                crate::StorageAllocationClass::Unknown
+            } else {
+                crate::StorageAllocationClass::Retained
+            })
+        };
+        let borrowed = barrier.try_freeze(&mutation).unwrap();
+        let expected = borrowed.classify(classify).unwrap();
+        assert!(
+            borrowed
+                .matches_accounting_lock(relative, &candidate)
+                .unwrap()
+        );
+        let identity_error = borrowed
+            .matches_accounting_lock(relative, &wrong)
+            .unwrap_err();
+        let classify_error = borrowed
+            .classify(|_, _| Err(crate::StorageInventoryError::OwnershipMismatch))
+            .unwrap_err();
+        drop(borrowed);
+        drop(mutation);
+        let owned = barrier.try_freeze_existing_root().unwrap();
+        let actual = owned.classify(classify).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.unknown_bytes, 0);
+        assert_eq!(actual.unknown_entry_count, 1);
+        assert!(owned.matches_accounting_lock(relative, &candidate).unwrap());
+        assert!(
+            !owned
+                .matches_accounting_lock(Path::new("other"), &candidate)
+                .unwrap()
+        );
+        assert_eq!(
+            owned.matches_accounting_lock(relative, &wrong),
+            Err(identity_error)
+        );
+        assert_eq!(
+            owned.classify(|_, _| Err(crate::StorageInventoryError::OwnershipMismatch)),
+            Err(classify_error)
+        );
+        fs::rename(
+            root.join(relative),
+            root.join("runtime/original-accounting.lock"),
+        )
+        .unwrap();
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join(relative))
+            .unwrap();
+        assert!(owned.matches_accounting_lock(relative, &candidate).is_err());
+        assert!(
+            owned
+                .classify(|_, _| Ok(crate::StorageAllocationClass::Unknown))
+                .is_err()
+        );
+        drop(owned);
+        assert!(matches!(
+            barrier.try_freeze_existing_root(),
+            Err(StorageCoherenceError::InvalidIdentity)
+        ));
+        MutationGuard::try_acquire_existing(&root.join("runtime")).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
