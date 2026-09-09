@@ -68,6 +68,18 @@ team outbox는 현재 활성화되지 않은 계약이다.
 recovery로 귀속과 정리 가능성을 검증하고, 정리 및 durable metadata 해제가 끝나야 R을 반환한다.
 분류기는 cleanup을 실행하지 않으며, 기존 cleanup API의 prefix 인식을 일반 소유 증명으로 재사용하지 않는다.
 
+## singleton 분류의 별도 완료 조건
+
+생산 singleton의 writer 참여는 파일 분류기 구현과 구분한다. 다음 읽기 전용 증거는
+정확한 네 scope의 디렉터리와 `runtime.lock`/`runtime.meta`만 대상으로 한다.
+root mutation 소유권과 외부 accounting freeze를 유지한 상태에서 기존 descriptor와
+부재를 보존하고, 빈 private lock 및 기존 256바이트 metadata 문법을 검증해야 한다.
+PID나 nonce 문법은 파일 의미의 검증이지 실행 중인 process나 삭제 권한의 증명이 아니다.
+임의 sibling, metadata temp, 다른 이름의 scope는 승인하지 않는다. 디렉터리·파일의 교체,
+권한 변경, hardlink/FIFO, capture 후 출현·소멸과 metadata 변경은 최종 재검증에서 거부한다.
+이 제한된 증거와 synthetic collector 연결은 구현·독립 검증됐다. 일반 경로 목록만으로
+A를 승인하지 않으며, 전체 production 분류·admission 연결 완료를 뜻하지 않는다.
+
 ## runtime 바깥 경계
 
 수동 `retention-apply` archive는 CLI `normalize_archive_path`가 **runtime root 밖**으로
@@ -137,6 +149,35 @@ accounting 때문에 이 경로를 순회하거나 snapshot 내용·PEM·사용�
 
 ## 동시 측정의 공통 잠금 — API 구현, 전체 writer 연결 전
 
+### 현재 TLS generation의 제한된 소유권 증거
+
+개발 중인 `CollectorTlsOwnershipEvidence`는 설정 v3가 정확히 참조하는 generation의
+디렉터리와 CA·서버 인증서·서버 키만 대상으로 한다. 설정 및 credential은 기존 byte 상한
+안에서 열린 private descriptor로 검증하고, 설정 bytes와 경로 identity를 전후 재검증한다.
+credential bytes는 해당 증거의 제한된 수명 동안 메모리에만 유지하며 출력하지 않는다.
+이 검사는 TLS 서버 설정 생성에 필요한 기존 parser 검증이며 새로운 인증서 chain 검증을
+제공한다고 주장하지 않는다. v1/v2 legacy 및 참조되지 않은 generation은 이 증거로 승인하지 않는다.
+
+호출자는 전체 capture·분류·재검증 동안 공통 freeze를 유지해야 한다. synthetic 통합 검사는
+실제 생성한 TLS 파일을 A로 분류하되 미분류 sentinel과 전체 예약 R을 그대로 유지한다.
+이 제한된 소유권 연결만으로 전체 P2 완료나 운영 admission을 활성화하지 않는다.
+
+### private detail/status 소유권 연결 기준
+
+다음 연결은 원문을 집계 결과에 포함하거나 전체 원문을 캐시에 복제하지 않는다.
+공통 freeze 아래 scanner가 넘긴 descriptor 하나씩 기존 detail parser 및 status 계약으로
+검증한다. 정확한 turn ID와 `<digest>.json` 경로의 일치, private 권한·단일 link·동일 named
+identity를 함께 확인한다. 정상 파일명만으로는 승인하지 않는다. 내용이 없는 status/detail
+짝도 각각 유효한 보관 artifact일 수 있으며, 짝이 없다고 삭제하거나 작업 공간으로 할인하지 않는다.
+
+열린 descriptor 수는 state 및 두 parent와 현재 검사 파일로 제한하고, 파일별 기존 상한
+(detail 64 KiB, status 1 KiB)과 디렉터리별 기존 1,024개 상한을 유지한다. scanner의 전체
+entry 재검증과 소유 parent의 전후 identity 검증을 함께 사용한다. 이 관측은 새로운 영구
+소유 manifest나 admission cache를 만들지 않는다. 전체 용량에서의 읽기·파싱 비용은 P5에서
+측정하며, 성능 검증 없이 수집 foreground에 운영 연결하지 않는다.
+
+### 공통 잠금 계약
+
 기존 mutation guard는 보고서 projection, singleton metadata, integration writer를
 모두 막지 않는다. 분류기에 report publication guard를 추가하면 보고서가 끝날 때까지
 수집이 막히므로, 전체 writer가 참여하는 별도 `runtime/storage-accounting.lock`을 사용한다.
@@ -180,6 +221,39 @@ accounting 때문에 이 경로를 순회하거나 snapshot 내용·PEM·사용�
 실제 저장 여부를 알리며, canonical commit을 근거로 원문 저장 성공을 주장하지 않는다.
 이 표는 연결·회귀 기준이며 각 경로가 이미 구현되었다는 선언이 아니다.
 
+### Integration writer 연결과 남은 소유권 증거
+
+`codex-integration`의 lifecycle 잠금은 동일 integration 작업을 직렬화하지만,
+root accounting 측정을 막는 잠금은 아니다. `f8d2c12`는 다음 작업의 실제 쓰기 구간에
+root mutation과 accounting 참여를 연결했다. 독립 코드·아키텍처 검토와 integration 71개,
+UI 27개 테스트를 통과했지만, 아래 파일의 의미적 소유권을 집계에 연결하는 작업은 별개다.
+
+- lifecycle 디렉터리와 잠금 파일의 최초 생성.
+- `CodexConfigManager`의 connect/disconnect뿐 아니라 `ownership_status`의
+  중단된 rotation 복구·snapshot 정리, `notify_ownership`의 상태 디렉터리 준비.
+- LaunchAgent transaction의 생성·단계 갱신·복구·삭제.
+
+연결된 구현은 실제 파일 변경 구간을 root mutation → accounting으로 감싸고,
+완료·오류 모두에서 identity를 확인한다. collector 시작을 기다리는 health 확인이나
+LaunchAgent 프로세스 대기까지 root mutation을 유지하면 시작 경로가 같은 잠금을
+필요로 하므로, 외부 프로세스 대기와 파일 쓰기 범위를 분리해야 한다.
+실제 사용자 Codex 설정과 LaunchAgent를 바꾸지 않는 fake lifecycle 회귀로 먼저 검증한다.
+이 검증은 해당 writer 구간에 한정되며 분리 모드 활성화 선언이 아니다.
+
+Codex config snapshot의 소유권 관측은 `5611cf5`에서 소유 모듈의 기존 snapshot 검증을
+재사용하도록 구현·독립 검증됐다. 호출자가 전달한 정확한 root 및 config manager의 외부 config 경로에 결합하고,
+private snapshot의 schema·phase·prior/connected/pending hash를 검사한다. 외부 config를
+읽거나 복구하지 않으며 snapshot/status 메서드의 부수 효과를 집계에서 호출하지 않는다.
+기존 snapshot byte 상한, parent/file descriptor identity와 bounded 재검증을 유지하고,
+원문 snapshot bytes나 경로를 집계 결과·Debug로 노출하지 않는다. snapshot이 없으면 생성하지 않는다.
+
+LaunchAgent 쪽 관측도 현재 프로세스나 외부 plist를 조사하지 않는다. 명시적인 root와
+home 경계에서 기존 service-label 계산으로 기대 plist 경로를 만들고, 소유 transaction의
+기존 schema·phase·file-state 검증을 재사용한다. `id`, `launchctl`, health 요청을 집계 중
+실행하지 않으며, 유효한 복구 snapshot의 보관 소유권과 실제 외부 서비스 상태를 구분한다.
+정확한 lifecycle 디렉터리 및 빈 private stable lock도 retained descriptor로 확인한다.
+없는 경로는 생성하지 않으며, 운영체제가 해석하지 못하는 transaction을 이름만으로 승인하지 않는다.
+
 `storage_coherence::StorageBarrier`의 독립 descriptor 기반 shared/exclusive 잠금과
 config·예약 control 파일의 정확한 identity 검증은 독립 코드·아키텍처 리뷰를 통과했다.
 `OwnedStorageFreezeGuard`는 root mutation과 accounting 잠금을 함께 소유하므로,
@@ -203,3 +277,55 @@ exclusive accounting 획득이 거부되는 것을 확인한다. 설정·예약�
 descriptor를 얻었다고 주장하지 않으며, construction부터 observation callback 종료까지
 외부 writer 동기화가 필요하다. 연결 회귀에서는 기존 store 후보 다섯 개를 이 observer로
 검증하고, 의도적으로 넣은 0-byte 미소유 파일 하나는 U로 남기는지 검사한다.
+
+### 정적 HTML 의미 검증
+
+상태: 활성화 전 의미 검증 단계이며, 파일 소유권 또는 admission 완료를 뜻하지 않는다.
+
+정적 HTML의 의미 검증은 `static-report`의 기존 renderer 계약을 재사용한다.
+정확한 갱신 대기 placeholder 또는 한 개의 `ReportDtoV2`를 계약 검증한 뒤 기존
+`write_rendered` 출력과 스트리밍 비교한 artifact만 인정한다. 입력은 기존 32 MiB
+상한을 유지하며 두 번째 완성 HTML을 만들거나 raw HTML을 evidence에 보관하지 않는다.
+현재 renderer와 다른 이전 template은 U로 남기고 활성화 전 재생성 필요 상태를
+보고한다. 이를 이유로 admission 이전에 자동 재생성하지 않는다. 파일 descriptor와
+동일성 검증은 별도 저장소 관측 경계이며, DTO 검증만으로 파일 소유권을 승인하지 않는다.
+
+파일 관측 연결은 정확한 root와 `logs` 디렉터리, 고정 report 파일의 열린 descriptor 및
+부재를 유지한다. 기존 no-follow/nonblocking·identity helper를 재사용하고 owner 경계에서
+정확한 0700/0600·단일 link를 확인한다. 입력은 한 번의 bounded 읽기 동안만 유지하며
+evidence에 원문을 캐시하지 않는다. 전후 할당·크기·권한·수정 metadata와 named identity를
+재검증하고 caller는 공통 freeze를 유지한다. 이는 비협조적인 외부 writer에 대한 원자적
+filesystem snapshot 보장이 아니다. 실제 32 MiB 입력의 파싱·메모리 비용은 P5에서 별도 검증한다.
+
+### rollback journal과 복구 전 검사
+
+SQLite rollback journal header에는 page 수·크기·checksum nonce 등이 있지만 DB inode나
+파일 identity를 결합하는 필드는 없다. 따라서 header가 그럴듯하거나 DB와 page size가
+같다는 사실을 journal 소유권 증명으로 사용하지 않는다.
+근거: [SQLite rollback journal 형식](https://www.sqlite.org/fileformat.html#the_rollback_journal).
+
+일반 SQLite 연결의 읽기조차 hot journal rollback을 먼저 수행하면서 DB와 journal을
+변경할 수 있다. 그러므로 보통의 store open을 읽기 전용 accounting 검사라고 취급하거나,
+U를 없애기 위해 admission 전에 자동 복구를 실행하면 안 된다.
+근거: [SQLite hot journal 처리 순서](https://www.sqlite.org/lockingv3.html#dealing_with_hot_journals).
+현재 분리 모드는 여전히 비활성이며, P3는 이 비쓰기 사전 검사·복구 필요 상태를 기존
+U 거부 계약과 일치시켜 검증해야 한다. journal을 직접 삭제·이름 변경하거나, filename API,
+header parser, unsafe/VFS 우회로 A/X를 만들어내는 것은 허용하지 않는다.
+
+P3 사전 검사 준비에서는 기존 journal 파일 열기의 좁은 안전 경계도 검증한다.
+검사와 open 사이에 FIFO나 다른 inode로 바뀌어도 무기한 대기하거나 대체 파일을 수용하지
+않도록 기존 nonblocking/no-follow flag와 private file identity 검사를 재사용한다.
+이 변경은 안전한 파일 열기일 뿐 SQLite 내부 journal descriptor를 얻거나 journal을
+A/X로 승인하는 근거가 아니다. 정상 private journal·부재 동작은 유지하고, 바꿔치기와
+hardlink에 대한 회귀를 먼저 고정한 뒤 적용한다.
+
+분리 모드 사전 관측은 별도의 store evidence 모델을 만들지 않고 기존
+`LocalStore::open_report_reader`와 `with_storage_ownership_observation`을 callback 수명으로
+조합한다. 정확한 store 디렉터리가 없을 때만 부재로 관측하고 callback 이후에도 부재를
+확인한다. 디렉터리는 있는데 DB나 필수 lock이 없으면 손상으로 거부한다. 디렉터리가 있으면
+SQLite를 열기 전에 정확한 journal 경로의 부재를 확인하고, 빈 파일을 포함해 journal이
+존재하면 typed journal-present 결과로 유예한다. callback 이후에도 journal 부재를 재확인한다.
+복구·생성·정리·migration은 실행하지 않고, caller의 root mutation과 accounting freeze가
+전체 관측을 감싸야 한다. composer는 검증된 root에서 도출한 정규화된 정확한 `state/store`
+경로를 전달해야 하며, facade 자체는 임의 입력 경로를 runtime root에 결합하지 않는다.
+부재 관측 자체는 신규 파일 생성이나 admission 허가가 아니다.

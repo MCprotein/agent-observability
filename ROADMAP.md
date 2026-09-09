@@ -109,7 +109,7 @@ gate를 통과해 추가한다.
 | --- | --- | --- |
 | P0 | [구체적 결정안](docs/STORAGE_BUDGET_P0.md): 기본값·범위·파일 분류·작업량 산정·호환성 | config P1 착수에 한해 독립 APPROVE; 파일 분류·report 연결은 P2/P3 별도 검증 |
 | P1 | v5 config와 기존 설정 보존 검증 완료; 분리 모드 활성화 차단 | legacy 보존, Rust/TS parity, 경계값·revision 테스트 통과; 독립 코드 APPROVE / 아키텍처 CLEAR |
-| P2 | T/W/F 순수 계산, 제한된 A/X/U 분류, config·예약 descriptor 증거와 공통 잠금 검증; [파일 소유권 기준](docs/STORAGE_OWNERSHIP.md)의 나머지 owner·writer 연결 중 | core `09c3cab`, report/owner `9d034e0`, 설치 `f7ced7b`까지 독립 리뷰 후 커밋. 이전 `2650aa5` CI는 통과했지만 최신 `f7ced7b` CI의 시간 민감 테스트 실패를 수정 중이다. 전체 writer 동기화·운영 활성화·장시간 배포 검증은 아직 아님 |
+| P2 | T/W/F 순수 계산, 제한된 A/X/U 분류, config·예약 descriptor 증거와 공통 잠금 검증; [파일 소유권 기준](docs/STORAGE_OWNERSHIP.md)의 나머지 owner·writer 연결 중 | TLS·원문/상태·Codex 설정 스냅샷·singleton·LaunchAgent 분류와 integration writer를 독립 리뷰 후 커밋. `83a0820`의 CI `34301237765`에서 Linux Rust·웹 UI 검사는 통과했으나, macOS automatic smoke는 성능 측정 전 lifecycle 재연결 단계에서 실패해 원인 확인 중. 전체 분류 연결, 운영 활성화와 장시간 검증은 남아 있음. 정확한 증분·검증은 [review checkpoint](docs/reviews/v1.11.0.md) 참조 |
 | P3–P4 | 수집·보고서·정리 연결, CLI/웹 설정 | transaction 유지, 명시적 전환, 실제 적용 revision·중단 이유 표시 |
 | P5 | 장애·실제 규모·성능·문서 검증 | 새 수집→보고서 3세대, crash/replay, Chrome QA, exact-head CI와 독립 리뷰 |
 
