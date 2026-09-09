@@ -1,6 +1,7 @@
 //! Self-contained, private HTML artifact assembly for validated report DTOs.
 
 mod semantic_validation;
+mod storage_ownership;
 
 use agent_observability_contracts::{ContractError, MAX_REPORT_ARTIFACT_BYTES, ReportDtoV2};
 use std::fmt::{self, Display, Formatter};
@@ -18,6 +19,9 @@ const PENDING: &str = "<!doctype html><html lang=\"ko\"><meta charset=\"utf-8\">
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub use semantic_validation::validate_semantic_artifact;
+pub use storage_ownership::{
+    StaticReportStorageOwnershipError, StaticReportStorageOwnershipEvidence,
+};
 
 #[derive(Debug)]
 pub enum ReportArtifactError {
