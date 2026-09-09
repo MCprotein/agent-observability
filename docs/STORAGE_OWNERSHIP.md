@@ -366,7 +366,9 @@ root mutation 다음 exclusive freeze를 한 번씩만 획득한다. 이미 excl
 없으면 새 분류 검사 자체가 생성·복구하지 않는다. barrier 미초기화는 기존 명령과 출력을
 그대로 유지하고 새 분류 필드를 내보내지 않는다.
 Codex config/home 해석은 integration의 기존 resolver를 재사용하고 외부 config/plist를
-읽거나 process·서비스를 조회하지 않는다. 이 조합과 호출 경로는 아직 구현·검증 중이다.
+읽거나 process·서비스를 조회하지 않는다. 이 조합과 진단 호출 경로는 `35cf297`에서
+구현·독립 검증됐다. 실제 process 회귀는 수집된 fixture의 record 수와 config·보고서 bytes,
+stable lock identity 보존 및 누락 lock 비생성을 확인한다. 실제 사용자 runtime 검증은 별도다.
 
 `runtime-check` 전체가 읽기 전용인 것은 아니다. 기존 설치·singleton 및 store 준비는
 생성·복구·migration 가능 동작을 유지하고, 같은 freeze를 유지한 상태에서 store를 닫은 뒤
@@ -375,3 +377,22 @@ Codex config/home 해석은 integration의 기존 resolver를 재사용하고 �
 admission 검사로 사용해서는 안 된다. 초기화된 경계의 owner 오류는 명령 실패이며
 legacy 결과로 대체하지 않는다. 정상 관측의 U는 진단에 남기되 아직 legacy admission을
 새 분리 정책으로 바꾸지는 않는다.
+
+### 다음 P3 증분: 수집 commit 직전 검사 경계
+
+collector가 integration이나 CLI를 의존하면 순환 의존성이 생긴다. 다음 증분은 collector가
+소유하는 좁은 `CollectorIngestPrecommitGuard`와 명시적 실행 진입점으로 이 경계를 연결한다.
+기존 `serve`와 CLI 기본 실행은 추가 검사를 사용하지 않아 legacy 동작·비용을 유지한다.
+명시적 검사 경로만 이미 초기화된 accounting barrier를 요구하며 요청 중 생성하지 않는다.
+같은 owned freeze를 검사부터 commit·실패 후 확인까지 유지하고, 기존 요청·batch·pressure·
+예산 검사를 통과한 뒤 첫 durable mutation 직전에 한 번만 검사한다. 원문이나 쓰기 가능한
+store를 port에 넘기지 않으며, callback 재시도·비동기 실행·관측 cache를 만들지 않는다.
+이 port는 추가 precommit 조건이지 기존 admission의 대체물이 아니다. 수집 외 writer,
+정확한 전체 예약·현재 filesystem 여유·작업량 산정 연결과 자원 검증 전에는 분리 모드를
+활성화하지 않는다. 현재는 독립 설계 WATCH를 받은 구현 예정 경계다.
+
+예약 수치 연결은 실제 확인된 전체 R을 그대로 받는 순수 계산 진입점을 추가한다.
+전체 R만 아는 관측에서 `active=R, stale=0` 같은 상태를 만들어내지 않는다. 기존 active/stale
+합산 API는 유지하고 한 개의 내부 계산을 공유한다. 기존 오류 우선순위와 합산 overflow를
+먼저 회귀 테스트로 고정하며, 새 함수도 소유권·동시성·쓰기 권한이나 예약 해제를 증명하지
+않는다. 이는 독립 설계 CLEAR를 받은 범위이며 운영 모드 활성화는 별도다.
