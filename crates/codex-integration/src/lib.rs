@@ -2,8 +2,10 @@
 #![allow(clippy::missing_errors_doc)]
 
 pub mod storage_accounting;
+#[cfg(target_os = "macos")]
 mod storage_ownership;
 
+#[cfg(target_os = "macos")]
 pub use storage_ownership::{
     LaunchAgentStorageOwnershipError, LaunchAgentStorageOwnershipEvidence,
 };
