@@ -1920,6 +1920,8 @@ enum AutomaticLifecycleStage {
     RecoveryWait,
     RecoverySnapshot,
     PostRecoveryOtlp,
+    PostRecoveryOtlpSubmit,
+    PostRecoveryOtlpGrowth,
     PostRecoveryNotify,
     PostRecoveryPrivacy,
     Reconnect,
@@ -1945,7 +1947,7 @@ enum AutomaticLifecycleStage {
 }
 
 impl AutomaticLifecycleStage {
-    const ALL: [Self; 31] = [
+    const ALL: [Self; 33] = [
         Self::Plist,
         Self::Status,
         Self::PreFailureOtlp,
@@ -1955,6 +1957,8 @@ impl AutomaticLifecycleStage {
         Self::RecoveryWait,
         Self::RecoverySnapshot,
         Self::PostRecoveryOtlp,
+        Self::PostRecoveryOtlpSubmit,
+        Self::PostRecoveryOtlpGrowth,
         Self::PostRecoveryNotify,
         Self::PostRecoveryPrivacy,
         Self::Reconnect,
@@ -1990,6 +1994,12 @@ impl AutomaticLifecycleStage {
             Self::RecoveryWait => "automatic lifecycle stage recovery wait failed",
             Self::RecoverySnapshot => "automatic lifecycle stage recovery snapshot failed",
             Self::PostRecoveryOtlp => "automatic lifecycle stage post-recovery OTLP failed",
+            Self::PostRecoveryOtlpSubmit => {
+                "automatic lifecycle stage post-recovery OTLP submit failed"
+            }
+            Self::PostRecoveryOtlpGrowth => {
+                "automatic lifecycle stage post-recovery OTLP growth failed"
+            }
             Self::PostRecoveryNotify => "automatic lifecycle stage post-recovery notify failed",
             Self::PostRecoveryPrivacy => "automatic lifecycle stage post-recovery privacy failed",
             Self::Reconnect => "automatic lifecycle stage reconnect failed",
@@ -2046,6 +2056,8 @@ impl AutomaticLifecycleStage {
             Self::RecoveryWait => "code=lifecycle_recovery_wait_failed",
             Self::RecoverySnapshot => "code=lifecycle_recovery_snapshot_failed",
             Self::PostRecoveryOtlp => "code=lifecycle_post_recovery_otlp_failed",
+            Self::PostRecoveryOtlpSubmit => "code=lifecycle_post_recovery_otlp_submit_failed",
+            Self::PostRecoveryOtlpGrowth => "code=lifecycle_post_recovery_otlp_growth_failed",
             Self::PostRecoveryNotify => "code=lifecycle_post_recovery_notify_failed",
             Self::PostRecoveryPrivacy => "code=lifecycle_post_recovery_privacy_failed",
             Self::Reconnect => "code=lifecycle_reconnect_stage_failed",
@@ -2229,11 +2241,11 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
         let recovered_records = automatic_report_record_count(binary, &root, &cleanup)
             .map_err(|error| automatic_recovery_snapshot_error(&error))?;
         automatic_lifecycle_stage(
-            AutomaticLifecycleStage::PostRecoveryOtlp,
+            AutomaticLifecycleStage::PostRecoveryOtlpSubmit,
             submit_automatic_synthetic_otlp(&root, 0, 1),
         )?;
         let post_recovery_otlp_records = automatic_lifecycle_stage(
-            AutomaticLifecycleStage::PostRecoveryOtlp,
+            AutomaticLifecycleStage::PostRecoveryOtlpGrowth,
             require_automatic_record_growth(
                 binary,
                 &root,
@@ -6481,6 +6493,8 @@ fn validate_automatic_release_aggregates(
     Ok(())
 }
 
+// Keep the finite error allowlist and its rejection checks together.
+#[allow(clippy::too_many_lines)]
 fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
     let allowed_errors = [
         "  - 'code=lifecycle_preflight_failed'",
@@ -6497,6 +6511,8 @@ fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
         "  - 'code=lifecycle_recovery_snapshot_store_failed'",
         "  - 'code=lifecycle_recovery_snapshot_output_failed'",
         "  - 'code=lifecycle_post_recovery_otlp_failed'",
+        "  - 'code=lifecycle_post_recovery_otlp_submit_failed'",
+        "  - 'code=lifecycle_post_recovery_otlp_growth_failed'",
         "  - 'code=lifecycle_post_recovery_notify_failed'",
         "  - 'code=lifecycle_post_recovery_privacy_failed'",
         "  - 'code=lifecycle_reconnect_stage_failed'",
@@ -8719,6 +8735,14 @@ mod tests {
             (
                 AutomaticLifecycleStage::PostRecoveryOtlp,
                 "code=lifecycle_post_recovery_otlp_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PostRecoveryOtlpSubmit,
+                "code=lifecycle_post_recovery_otlp_submit_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PostRecoveryOtlpGrowth,
+                "code=lifecycle_post_recovery_otlp_growth_failed",
             ),
             (
                 AutomaticLifecycleStage::PostRecoveryNotify,
