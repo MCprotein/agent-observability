@@ -2422,6 +2422,92 @@ mod tests {
     }
 
     #[test]
+    fn settings_install_after_lifecycle_entry_rejects_legacy_root_contention() {
+        assert_settings_install_after_lifecycle_entry_rejects_root_contention(false);
+    }
+
+    #[test]
+    fn settings_install_after_lifecycle_entry_rejects_initialized_root_contention() {
+        assert_settings_install_after_lifecycle_entry_rejects_root_contention(true);
+    }
+
+    fn assert_settings_install_after_lifecycle_entry_rejects_root_contention(coordinated: bool) {
+        use agent_observability_local_collector::CollectorError;
+        use agent_observability_local_runtime::MutationGuard;
+
+        const CHANNEL_TIMEOUT: Duration = Duration::from_secs(5);
+        let root = temporary_root(if coordinated {
+            "settings-after-lifecycle-initialized-root-contention"
+        } else {
+            "settings-after-lifecycle-legacy-root-contention"
+        });
+        let layout = install(&root).unwrap();
+        let settings = install_settings(&root).unwrap();
+        let barrier_path = layout.runtime.join("storage-accounting.lock");
+        assert!(!barrier_path.exists());
+        if coordinated {
+            initialize_accounting(&root);
+        }
+        assert_eq!(barrier_path.exists(), coordinated);
+        let snapshots = [
+            layout.runtime.join("collector.json"),
+            layout.runtime.join(&settings.credentials.ca_certificate),
+            layout
+                .runtime
+                .join(&settings.credentials.server_certificate),
+            layout
+                .runtime
+                .join(&settings.credentials.server_private_key),
+        ]
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        });
+        let entered = Cell::new(false);
+        let result = with_lifecycle_lock(&layout, || {
+            entered.set(true);
+            let (held_tx, held_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let runtime = layout.runtime.clone();
+            let worker = thread::spawn(move || {
+                let mutation = MutationGuard::try_acquire(&runtime).unwrap();
+                held_tx.send(()).unwrap();
+                let released = release_rx.recv_timeout(CHANNEL_TIMEOUT);
+                drop(mutation);
+                released
+            });
+            let held = held_rx.recv_timeout(CHANNEL_TIMEOUT);
+            let attempted = held.as_ref().ok().map(|()| install_settings(&root));
+            let released = release_tx.send(());
+            let worker_result = worker.join().unwrap();
+            assert!(
+                held.is_ok(),
+                "helper must hold root mutation before settings install"
+            );
+            assert!(released.is_ok());
+            assert!(worker_result.is_ok());
+            attempted.unwrap().map_err(IntegrationError::Collector)
+        });
+        assert!(
+            entered.get(),
+            "contention must occur after lifecycle closure entry"
+        );
+        assert!(matches!(
+            result,
+            Err(IntegrationError::Collector(CollectorError::Runtime(ref message)))
+                if message == "storage accounting barrier is busy"
+        ));
+        for (path, bytes) in snapshots {
+            assert!(
+                fs::read(path).unwrap() == bytes,
+                "settings/TLS bytes changed"
+            );
+        }
+        assert_eq!(barrier_path.exists(), coordinated);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn lifecycle_creation_respects_held_accounting_permit() {
         use agent_observability_local_runtime::{MutationGuard, storage_coherence::StorageBarrier};
         let root = temporary_root("lifecycle-accounting");
