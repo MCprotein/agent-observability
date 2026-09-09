@@ -692,7 +692,126 @@ pub fn retire_report_views_for_visibility_change(
 ///
 /// Returns [`ReportViewCatalogError`] when the guard is busy or managed state is unsafe.
 pub fn recover_report_view_catalog(store: &LocalStore) -> Result<(), ReportViewCatalogError> {
-    let _guard = try_guard(store)?;
+    let guard = try_guard(store)?;
+    recover_report_view_catalog_locked(store, &guard)
+}
+
+/// Existing-only render exclusion retained from assessment through catalog cleanup.
+/// This permit neither creates a lock nor authorizes policy admission or proves E=0.
+/// Callers must separately hold the required root/accounting ownership throughout.
+pub struct ExistingReportRenderGuard {
+    root: PathBuf,
+    directory: File,
+    database: File,
+    guard: ReportRenderGuard,
+}
+
+impl fmt::Debug for ExistingReportRenderGuard {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExistingReportRenderGuard")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExistingReportRenderGuard {
+    /// Acquires the existing private render lock once, without creating or waiting.
+    ///
+    /// # Errors
+    /// Returns Busy on contention; missing, unsafe, or replaced paths fail closed.
+    pub fn try_acquire(store: &LocalStore) -> Result<Self, ReportViewCatalogError> {
+        validate_render_store_authority(store)?;
+        let directory = store.authority_directory.try_clone()?;
+        let database = store.authority_database.try_clone()?;
+        let file = open_existing_render_lock(&store.dir.join(REPORT_RENDER_LOCK_NAME))?;
+        fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                ReportViewCatalogError::Busy
+            } else {
+                ReportViewCatalogError::Io(error)
+            }
+        })?;
+        let guard = Self {
+            root: store.dir.clone(),
+            directory,
+            database,
+            guard: ReportRenderGuard { file },
+        };
+        guard.revalidate(store)?;
+        Ok(guard)
+    }
+
+    /// Revalidates the original store directory/database and locked descriptor against
+    /// their paths and the supplied store's retained authority, not just its pathname.
+    /// No pathname-based lock acquisition or creation is performed.
+    ///
+    /// # Errors
+    /// Rejects a different root, replacement, absence, or unsafe descriptor.
+    pub fn revalidate(&self, store: &LocalStore) -> Result<(), ReportViewCatalogError> {
+        if self.root != store.dir {
+            return Err(ReportViewCatalogError::SourceMismatch);
+        }
+        validate_render_store_authority(store)?;
+        super::storage_ownership::validate_captured_store_identity(
+            &self.root,
+            &store.database_path(),
+            &self.directory,
+            &self.database,
+        )?;
+        let file = open_existing_render_lock(&self.root.join(REPORT_RENDER_LOCK_NAME))?;
+        validate_descriptor_for_kind(&self.guard.file, ReportViewOwnedEntryKind::Catalog)?;
+        if !same_descriptor_identity(&self.guard.file, &file)? {
+            return Err(ReportViewCatalogError::InvalidCatalog);
+        }
+        Ok(())
+    }
+}
+
+fn validate_render_store_authority(store: &LocalStore) -> Result<(), ReportViewCatalogError> {
+    super::storage_ownership::validate_captured_store_identity(
+        &store.dir,
+        &store.database_path(),
+        &store.authority_directory,
+        &store.authority_database,
+    )?;
+    super::storage_ownership::validate_connection_path(&store.db, &store.database_path())?;
+    Ok(())
+}
+
+fn open_existing_render_lock(path: &Path) -> Result<File, ReportViewCatalogError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(super::no_follow_flag() | super::nonblocking_open_flag());
+    }
+    let file = options.open(path)?;
+    validate_descriptor_for_kind(&file, ReportViewOwnedEntryKind::Catalog)?;
+    Ok(file)
+}
+
+/// Reuses the retained existing-only permit for catalog cleanup, without reacquiring a lock.
+/// The caller must retain its separate root/accounting ownership across assessment and cleanup.
+/// This does not change legacy recovery or establish policy admission or a zero-write estimate.
+///
+/// # Errors
+/// Rejects wrong-root or replaced permits before cleanup and revalidates after cleanup.
+/// Cleanup failures remain primary when the final identity check also fails.
+pub fn recover_report_view_catalog_with_existing_guard(
+    store: &LocalStore,
+    guard: &ExistingReportRenderGuard,
+) -> Result<(), ReportViewCatalogError> {
+    guard.revalidate(store)?;
+    let result = recover_report_view_catalog_locked(store, &guard.guard);
+    let postcheck = guard.revalidate(store);
+    result.and(postcheck)
+}
+
+fn recover_report_view_catalog_locked(
+    store: &LocalStore,
+    _guard: &ReportRenderGuard,
+) -> Result<(), ReportViewCatalogError> {
     let Some(directory) =
         existing_managed_report_view_directory(store).map_err(ReportViewCatalogError::Build)?
     else {
@@ -2232,6 +2351,246 @@ mod tests {
         recover_report_view_catalog(&store).unwrap();
         assert_eq!(fs::read_dir(managed).unwrap().count(), 0);
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn existing_render_guard_missing_lock_is_noncreating_and_legacy_recovery_still_creates() {
+        let (directory, store) = open_store("existing-render-missing");
+        let lock = directory.join(REPORT_RENDER_LOCK_NAME);
+        if lock.exists() {
+            fs::remove_file(&lock).unwrap();
+        }
+        assert!(matches!(ExistingReportRenderGuard::try_acquire(&store),
+            Err(ReportViewCatalogError::Io(error)) if error.kind() == io::ErrorKind::NotFound));
+        assert!(!lock.exists());
+        recover_report_view_catalog(&store).unwrap();
+        assert!(lock.exists());
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn existing_render_guard_retains_exclusion_through_cleanup_and_releases() {
+        let (directory, store) = open_store("existing-render-held");
+        drop(try_guard(&store).unwrap());
+        let managed = managed_report_view_directory(&store).unwrap();
+        let orphan = managed.join(format!("{STAGING_FILE_PREFIX}orphan"));
+        drop(private_create_new(&orphan).unwrap());
+        let guard = ExistingReportRenderGuard::try_acquire(&store).unwrap();
+        assert!(matches!(
+            ExistingReportRenderGuard::try_acquire(&store),
+            Err(ReportViewCatalogError::Busy)
+        ));
+        guard.revalidate(&store).unwrap();
+        recover_report_view_catalog_with_existing_guard(&store, &guard).unwrap();
+        assert!(!orphan.exists());
+        assert!(matches!(
+            ExistingReportRenderGuard::try_acquire(&store),
+            Err(ReportViewCatalogError::Busy)
+        ));
+        drop(guard);
+        ExistingReportRenderGuard::try_acquire(&store)
+            .unwrap()
+            .revalidate(&store)
+            .unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn existing_render_guard_rejects_foreign_root_and_replaced_lock_without_cleanup() {
+        let (directory, store) = open_store("existing-render-original");
+        let (other_directory, other) = open_store("existing-render-foreign");
+        drop(try_guard(&store).unwrap());
+        let guard = ExistingReportRenderGuard::try_acquire(&store).unwrap();
+        assert!(matches!(
+            recover_report_view_catalog_with_existing_guard(&other, &guard),
+            Err(ReportViewCatalogError::SourceMismatch)
+        ));
+        let managed = managed_report_view_directory(&store).unwrap();
+        let orphan = managed.join(format!("{STAGING_FILE_PREFIX}orphan"));
+        drop(private_create_new(&orphan).unwrap());
+        let lock = directory.join(REPORT_RENDER_LOCK_NAME);
+        let retained = directory.join("retained-render.lock");
+        fs::rename(&lock, &retained).unwrap();
+        drop(private_create_new(&lock).unwrap());
+        assert!(guard.revalidate(&store).is_err());
+        assert!(recover_report_view_catalog_with_existing_guard(&store, &guard).is_err());
+        assert!(orphan.exists());
+        assert!(retained.exists());
+        assert_eq!(fs::read(lock).unwrap(), b"");
+        drop(guard);
+        drop(store);
+        drop(other);
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(other_directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_render_guard_rejects_unsafe_locks_and_replaced_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (directory, store) = open_store("existing-render-unsafe");
+        let lock = directory.join(REPORT_RENDER_LOCK_NAME);
+        drop(try_guard(&store).unwrap());
+        let retained = directory.join("retained-lock");
+        fs::rename(&lock, &retained).unwrap();
+        symlink(&retained, &lock).unwrap();
+        assert!(ExistingReportRenderGuard::try_acquire(&store).is_err());
+        fs::remove_file(&lock).unwrap();
+        fs::hard_link(&retained, &lock).unwrap();
+        assert!(ExistingReportRenderGuard::try_acquire(&store).is_err());
+        fs::remove_file(&lock).unwrap();
+        fs::rename(&retained, &lock).unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(ExistingReportRenderGuard::try_acquire(&store).is_err());
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        let guard = ExistingReportRenderGuard::try_acquire(&store).unwrap();
+        let original = directory.with_extension("retained-root");
+        fs::rename(&directory, &original).unwrap();
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(private_create_new(&lock).unwrap());
+        assert!(guard.revalidate(&store).is_err());
+        assert!(recover_report_view_catalog_with_existing_guard(&store, &guard).is_err());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        drop(guard);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(original).unwrap();
+    }
+
+    fn replace_render_test_authority(
+        directory: &Path,
+        store: &LocalStore,
+        database_only: bool,
+    ) -> (PathBuf, LocalStore) {
+        let retained = directory.with_extension("retained-authority");
+        if database_only {
+            fs::rename(store.database_path(), &retained).unwrap();
+            fs::copy(&retained, store.database_path()).unwrap();
+        } else {
+            fs::rename(directory, &retained).unwrap();
+        }
+        let replacement = LocalStore::open(directory).unwrap();
+        drop(try_guard(&replacement).unwrap());
+        (retained, replacement)
+    }
+
+    #[test]
+    fn existing_render_guard_rejects_authority_replaced_before_acquisition() {
+        for database_only in [false, true] {
+            let (directory, store) = open_store(&format!("existing-render-before-{database_only}"));
+            drop(try_guard(&store).unwrap());
+            let (retained, replacement) =
+                replace_render_test_authority(&directory, &store, database_only);
+            assert!(ExistingReportRenderGuard::try_acquire(&store).is_err());
+            ExistingReportRenderGuard::try_acquire(&replacement)
+                .unwrap()
+                .revalidate(&replacement)
+                .unwrap();
+            drop(store);
+            drop(replacement);
+            fs::remove_dir_all(directory).unwrap();
+            if database_only {
+                fs::remove_file(retained).unwrap();
+            } else {
+                fs::remove_dir_all(retained).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn existing_render_guard_rejects_replaced_database_and_new_store_at_same_path() {
+        let (directory, store) = open_store("existing-render-after-database");
+        drop(try_guard(&store).unwrap());
+        let guard = ExistingReportRenderGuard::try_acquire(&store).unwrap();
+        let retained = directory.join("retained-database");
+        fs::rename(store.database_path(), &retained).unwrap();
+        fs::copy(&retained, store.database_path()).unwrap();
+        let replacement = LocalStore::open_current(&directory).unwrap();
+        let managed = managed_report_view_directory(&replacement).unwrap();
+        let orphan = managed.join(format!("{STAGING_FILE_PREFIX}orphan"));
+        drop(private_create_new(&orphan).unwrap());
+        assert!(guard.revalidate(&store).is_err());
+        assert!(guard.revalidate(&replacement).is_err());
+        assert!(recover_report_view_catalog_with_existing_guard(&store, &guard).is_err());
+        assert!(recover_report_view_catalog_with_existing_guard(&replacement, &guard).is_err());
+        assert!(orphan.exists());
+        assert!(retained.exists());
+        drop(guard);
+        ExistingReportRenderGuard::try_acquire(&replacement)
+            .unwrap()
+            .revalidate(&replacement)
+            .unwrap();
+        drop(store);
+        drop(replacement);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_render_guard_fifo_opens_are_nonblocking() {
+        use std::os::unix::fs::FileTypeExt;
+        // The same finite subprocess pattern as storage_ownership FIFO coverage keeps a
+        // blocking-open regression from hanging the test runner. No global env mutation.
+        const PROBE: &str = "AGENTOBS_EXISTING_RENDER_FIFO_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "report_view_catalog::tests::existing_render_guard_fifo_opens_are_nonblocking",
+                ])
+                .env(PROBE, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("existing render guard blocked on FIFO");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let (directory, store) = open_store("existing-render-fifo");
+        drop(try_guard(&store).unwrap());
+        let guard = ExistingReportRenderGuard::try_acquire(&store).unwrap();
+        let lock = directory.join(REPORT_RENDER_LOCK_NAME);
+        fs::rename(&lock, directory.join("retained-lock")).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&lock)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(ExistingReportRenderGuard::try_acquire(&store).is_err());
+        assert!(guard.revalidate(&store).is_err());
+        assert!(recover_report_view_catalog_with_existing_guard(&store, &guard).is_err());
+        assert!(fs::symlink_metadata(&lock).unwrap().file_type().is_fifo());
+        let original = directory.with_extension("retained-root");
+        fs::rename(&directory, &original).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&directory)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(ExistingReportRenderGuard::try_acquire(&store).is_err());
+        assert!(guard.revalidate(&store).is_err());
+        drop(guard);
+        drop(store);
+        fs::remove_file(directory).unwrap();
+        fs::remove_dir_all(original).unwrap();
     }
 
     #[test]

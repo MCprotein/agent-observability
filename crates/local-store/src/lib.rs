@@ -20,10 +20,11 @@ pub use report_view::{
     build_report_view_staging_observing,
 };
 pub use report_view_catalog::{
-    ReportViewCatalogError, ReportViewOwnedEntry, ReportViewOwnedEntryKind,
-    ReportViewOwnershipObservation, ReportViewPublication, ReportViewRetirement,
-    ReportViewSnapshot, current_report_view, current_report_view_needs_kernel_upgrade,
-    publish_report_view, recover_report_view_catalog, with_report_view_ownership_observation,
+    ExistingReportRenderGuard, ReportViewCatalogError, ReportViewOwnedEntry,
+    ReportViewOwnedEntryKind, ReportViewOwnershipObservation, ReportViewPublication,
+    ReportViewRetirement, ReportViewSnapshot, current_report_view,
+    current_report_view_needs_kernel_upgrade, publish_report_view, recover_report_view_catalog,
+    recover_report_view_catalog_with_existing_guard, with_report_view_ownership_observation,
     with_report_view_snapshot,
 };
 
