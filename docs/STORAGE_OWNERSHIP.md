@@ -447,3 +447,8 @@ batch 상한과 설정의 불일치도 거부하며 원문·경로·secret을 �
 고정본 `554588bc`의 독립 코드 APPROVE / 아키텍처 CLEAR와 소유권·판정 테스트 19개,
 CLI strict Clippy 및 Rust 1.97.0 formatting을 확인했다. 이는 실제 수집 연결이나 전체
 관측 지연의 적합성을 검증한 결과가 아니며 다른 쓰기 경로와 운영 차단은 그대로다.
+
+보고서 연결의 첫 준비 `7a7eee6`은 기존 headroom에서 publication·metadata 여유를 빼고
+기존 build ceiling으로 제한하는 수치 계산만 private 순수 함수로 분리했다. 기존 caller의
+오류·포화 뺄셈·상한은 바꾸지 않았고, 경계값 회귀와 독립 코드/아키텍처 검토를 통과했다.
+보고서 시작·게시 직전 admission, 검증된 자기 예약 제외, 복구·정리 경로 연결은 아직 남아 있다.
