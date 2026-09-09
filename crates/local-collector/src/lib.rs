@@ -7357,8 +7357,15 @@ mod tests {
                 .open(path)
                 .unwrap();
             file.write_all(b"{}").unwrap();
+            file.sync_all().unwrap();
         }
 
+        // Production status files are durable before the next foreground capture.
+        // Complete fixture setup before measuring the unchanged 250ms contract.
+        fs::File::open(&status_directory)
+            .unwrap()
+            .sync_all()
+            .unwrap();
         let state = app_state(&root);
         let (_, detail) =
             project_notify_with_private_detail(&raw_notify("thread-capacity", "turn-capacity"))
