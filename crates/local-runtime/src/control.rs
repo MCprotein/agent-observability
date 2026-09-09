@@ -23,6 +23,38 @@ pub struct CollectorDiagnostic {
     pub admission: Admission,
 }
 
+/// Estimates the existing conservative full-store ingest allowance without mode checks.
+/// This noncreating observation makes no admission decision. Callers enforcing admission
+/// must retain matching root mutation ownership and, when accounting is initialized,
+/// an exclusive all-writer accounting freeze through collection of all snapshot inputs,
+/// evaluation, and commit or rollback. Root mutation ownership alone is not coherent.
+pub fn collector_ingest_estimated_allowance(
+    root: &Path,
+    max_batch_bytes: u64,
+) -> Result<u64, ControlError> {
+    collector_ingest_allowance_parts(root, max_batch_bytes).map(|(_, allowance)| allowance)
+}
+
+fn collector_ingest_allowance_parts(
+    root: &Path,
+    max_batch_bytes: u64,
+) -> Result<(u64, u64), ControlError> {
+    let store = root.join("state/store");
+    let existing_store_allocated_bytes = match std::fs::symlink_metadata(&store) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            return Err(ControlError::Accounting(StorageAccountingError::Io(error)));
+        }
+        Ok(_) => {
+            StorageBudget::allocated_tree_bytes_strict(&store).map_err(ControlError::Accounting)?
+        }
+    };
+    let allowance = existing_store_allocated_bytes
+        .checked_add(max_batch_bytes)
+        .ok_or(ControlError::CollectorAdmissionOverflow)?;
+    Ok((existing_store_allocated_bytes, allowance))
+}
+
 impl RuntimeControl {
     pub fn new(config: &LocalRuntimeConfigV3) -> Result<Self, ControlError> {
         config.validate().map_err(ControlError::Config)?;
@@ -51,26 +83,18 @@ impl RuntimeControl {
     /// Reports the collector's existing conservative full-store reservation
     /// without changing the admission policy or creating runtime state.
     ///
-    /// Callers using this assessment to enforce admission must hold the
-    /// matching root's [`MutationGuard`] for the full assessment-to-write
-    /// boundary. Observation-only callers may accept a non-coherent snapshot.
+    /// Callers using this assessment to enforce admission must retain the matching
+    /// root's [`MutationGuard`] and, when accounting is initialized, an exclusive
+    /// all-writer accounting freeze through collection of all snapshot inputs,
+    /// evaluation, and commit or rollback. Root mutation ownership alone is not
+    /// coherent. Observation-only callers may accept a non-coherent snapshot.
     pub fn collector_admission_diagnostic(
         &self,
         root: &Path,
         max_batch_bytes: u64,
     ) -> Result<CollectorDiagnostic, ControlError> {
-        let store = root.join("state/store");
-        let existing_store_allocated_bytes = match std::fs::symlink_metadata(&store) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => {
-                return Err(ControlError::Accounting(StorageAccountingError::Io(error)));
-            }
-            Ok(_) => StorageBudget::allocated_tree_bytes_strict(&store)
-                .map_err(ControlError::Accounting)?,
-        };
-        let collector_reservation_bytes = existing_store_allocated_bytes
-            .checked_add(max_batch_bytes)
-            .ok_or(ControlError::CollectorAdmissionOverflow)?;
+        let (existing_store_allocated_bytes, collector_reservation_bytes) =
+            collector_ingest_allowance_parts(root, max_batch_bytes)?;
         let current_report_reserved_bytes =
             crate::reservation::reserved_bytes(root).map_err(ControlError::Reservation)?;
         let allocated =
@@ -308,6 +332,86 @@ mod tests {
             expected
         );
         assert_eq!(config.storage_budget.workspace_budget_bytes, 21_474_836_480);
+    }
+
+    #[test]
+    fn collector_estimated_allowance_matches_existing_diagnostic() {
+        let root = std::env::temp_dir().join(format!(
+            "collector-estimate-existing-{}",
+            std::process::id()
+        ));
+        let layout = crate::install(&root).unwrap();
+        std::fs::create_dir(layout.state.join("store")).unwrap();
+        std::fs::write(layout.state.join("store/data"), vec![1_u8; 8192]).unwrap();
+        let control = RuntimeControl::new(&crate::load(&layout.config).unwrap()).unwrap();
+        let diagnostic = control.collector_admission_diagnostic(&root, 4096).unwrap();
+        assert!(diagnostic.existing_store_allocated_bytes > 0);
+        assert_eq!(
+            super::collector_ingest_estimated_allowance(&root, 4096).unwrap(),
+            diagnostic.collector_reservation_bytes
+        );
+        assert_eq!(
+            diagnostic.collector_reservation_bytes,
+            diagnostic.existing_store_allocated_bytes + 4096
+        );
+        assert!(matches!(
+            super::collector_ingest_estimated_allowance(&root, u64::MAX),
+            Err(super::ControlError::CollectorAdmissionOverflow)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn collector_estimated_allowance_preserves_absence_without_creation() {
+        let root =
+            std::env::temp_dir().join(format!("collector-estimate-absent-{}", std::process::id()));
+        assert!(!root.exists());
+        assert_eq!(
+            super::collector_ingest_estimated_allowance(&root, 4096).unwrap(),
+            4096
+        );
+        assert!(!root.exists());
+        let layout = crate::install(&root).unwrap();
+        assert_eq!(
+            super::collector_ingest_estimated_allowance(&root, u64::MAX).unwrap(),
+            u64::MAX
+        );
+        assert!(!layout.state.join("store").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collector_estimated_allowance_preserves_unsafe_accounting_errors() {
+        let root = std::env::temp_dir().join(format!("ce-unsafe-{}", std::process::id()));
+        let layout = crate::install(&root).unwrap();
+        std::os::unix::fs::symlink(root.join("absent"), layout.state.join("store")).unwrap();
+        assert!(matches!(
+            super::collector_ingest_estimated_allowance(&root, 4096),
+            Err(super::ControlError::Accounting(
+                crate::StorageAccountingError::Symlink
+            ))
+        ));
+        std::fs::remove_file(layout.state.join("store")).unwrap();
+        std::fs::create_dir(layout.state.join("store")).unwrap();
+        std::os::unix::fs::symlink(root.join("absent"), layout.state.join("store/unsafe")).unwrap();
+        assert!(matches!(
+            super::collector_ingest_estimated_allowance(&root, 4096),
+            Err(super::ControlError::Accounting(
+                crate::StorageAccountingError::Symlink
+            ))
+        ));
+        std::fs::remove_file(layout.state.join("store/unsafe")).unwrap();
+        let socket =
+            std::os::unix::net::UnixListener::bind(layout.state.join("store/unsafe")).unwrap();
+        assert!(matches!(
+            super::collector_ingest_estimated_allowance(&root, 4096),
+            Err(super::ControlError::Accounting(
+                crate::StorageAccountingError::UnsupportedFileType
+            ))
+        ));
+        drop(socket);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
