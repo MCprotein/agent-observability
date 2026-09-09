@@ -1273,8 +1273,12 @@ fn report_acknowledging(
         let report = projector
             .finish(current_timestamp()?, "Agent Observability Report")
             .map_err(|error| error.to_string())?;
-        let writer = StorageMutationWriter::acquire(&layout.root, barrier.as_ref())
-            .map_err(|error| error.to_string())?;
+        let writer = StorageMutationWriter::acquire_waiting_for_root(
+            &layout.root,
+            barrier.as_ref(),
+            || eprintln!("waiting=runtime_mutation"),
+        )
+        .map_err(|error| error.to_string())?;
         let mut published_bytes = None;
         let publication = (|| {
             let bytes = write_private(&output_path, &report).map_err(|error| error.to_string())?;
@@ -1331,8 +1335,12 @@ fn report_acknowledging(
 fn open_report_store(layout: &InstalledLayout) -> Result<LocalStore, String> {
     let barrier =
         StorageBarrier::open_if_initialized(&layout.root).map_err(|error| error.to_string())?;
-    let scope = StorageMutationWriter::acquire_exclusive(&layout.root, barrier.as_ref())
-        .map_err(|error| error.to_string())?;
+    let scope = StorageMutationWriter::acquire_exclusive_waiting_for_root(
+        &layout.root,
+        barrier.as_ref(),
+        || eprintln!("waiting=runtime_mutation"),
+    )
+    .map_err(|error| error.to_string())?;
     let config = load(&layout.config).map_err(|error| error.to_string())?;
     let result = open_store(scope.mutation(), layout, &config);
     let revalidation = scope.revalidate().map_err(|error| error.to_string());

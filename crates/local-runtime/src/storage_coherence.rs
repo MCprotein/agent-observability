@@ -298,6 +298,16 @@ impl<'barrier> StorageMutationWriter<'barrier> {
         Self::acquire_with(root, barrier, true, false, || {})
     }
 
+    /// Waits for root mutation ownership, then tries shared accounting once.
+    /// Calls the fast, non-reentrant callback once only after actual root contention.
+    pub fn acquire_waiting_for_root(
+        root: &Path,
+        barrier: Option<&'barrier StorageBarrier>,
+        on_contention: impl FnOnce(),
+    ) -> Result<Self, StorageCoherenceError> {
+        Self::acquire_with(root, barrier, false, true, on_contention)
+    }
+
     /// Waits for root mutation ownership, then tries accounting exclusion once.
     /// Intended for foreground/manual operations whose caller owns the wait policy.
     /// Calls the fast, non-reentrant callback once only after actual root contention.
@@ -606,6 +616,113 @@ mod tests {
         drop(accounting_writer);
         let mutation = crate::MutationGuard::try_acquire(&root.join("runtime")).unwrap();
         drop(mutation);
+        drop(barrier);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_foreground_writer_waits_for_actual_root_contention() {
+        for initialized in [false, true] {
+            let (root, mutation) = fixture();
+            let barrier =
+                initialized.then(|| StorageBarrier::initialize(&root, &mutation).unwrap());
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+            std::thread::scope(|scope| {
+                let root = &root;
+                let barrier = barrier.as_ref();
+                scope.spawn(move || {
+                    let result =
+                        StorageMutationWriter::acquire_waiting_for_root(root, barrier, || {
+                            started_tx.send(()).unwrap();
+                        })
+                        .and_then(|writer| writer.revalidate());
+                    result_tx.send(result).unwrap();
+                });
+                let contention = started_rx.recv_timeout(std::time::Duration::from_secs(5));
+                drop(mutation);
+                contention.unwrap();
+                result_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+            });
+
+            drop(barrier);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_foreground_writer_coexists_but_does_not_retry_accounting_freeze() {
+        let (root, mutation) = fixture();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+
+        let participant = barrier.try_begin_write().unwrap();
+        let writer = StorageMutationWriter::acquire_waiting_for_root(&root, Some(&barrier), || {
+            panic!("uncontended root must not notify")
+        })
+        .unwrap();
+        participant.revalidate().unwrap();
+        writer.revalidate().unwrap();
+        drop(writer);
+        drop(participant);
+
+        let accounting_freeze = barrier.acquire(true).unwrap();
+        assert!(matches!(
+            StorageMutationWriter::acquire_waiting_for_root(&root, Some(&barrier), || {
+                panic!("uncontended root must not notify for accounting contention");
+            }),
+            Err(StorageCoherenceError::Busy)
+        ));
+        crate::MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        drop(accounting_freeze);
+        drop(barrier);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_foreground_writer_fails_closed_for_missing_or_replaced_identity() {
+        let (root, mutation) = fixture();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        std::fs::remove_file(root.join("runtime/mutation.lock")).unwrap();
+        assert!(matches!(
+            StorageMutationWriter::acquire_waiting_for_root(&root, Some(&barrier), || {
+                panic!("missing identity is not contention");
+            }),
+            Err(StorageCoherenceError::Missing)
+        ));
+        drop(barrier);
+        std::fs::remove_dir_all(root).unwrap();
+
+        let (root, mutation) = fixture();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let path = root.join("runtime/storage-accounting.lock");
+        std::fs::rename(&path, root.join("runtime/original-accounting.lock")).unwrap();
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(
+            StorageMutationWriter::acquire_waiting_for_root(&root, Some(&barrier), || {
+                panic!("replaced identity is not contention");
+            }),
+            Err(StorageCoherenceError::InvalidIdentity)
+        ));
+        assert!(matches!(
+            StorageMutationWriter::acquire_waiting_for_root(&root, None, || {
+                panic!("initialized accounting is not root contention");
+            }),
+            Err(StorageCoherenceError::InvalidIdentity)
+        ));
+        crate::MutationGuard::try_acquire(&root.join("runtime")).unwrap();
         drop(barrier);
         std::fs::remove_dir_all(root).unwrap();
     }

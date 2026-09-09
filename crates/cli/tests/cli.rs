@@ -12,6 +12,48 @@ fn binary() -> Command {
 }
 
 #[cfg(unix)]
+#[test]
+fn report_waits_for_root_contention_before_creating_the_store() {
+    use agent_observability_local_runtime::{MutationGuard, storage_coherence::StorageBarrier};
+    for initialized in [false, true] {
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-report-root-wait-{}-{initialized}",
+            std::process::id()
+        ));
+        assert!(!root.exists());
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        if initialized {
+            StorageBarrier::initialize(&root, &mutation).unwrap();
+        }
+        let child = binary()
+            .args(["report", root.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let waiting = assert_command_waits(child);
+        assert!(!layout.state.join("store").exists());
+        assert!(!layout.logs.join("agent-observability-report.html").exists());
+        drop(mutation);
+        let output = waiting.finish();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("records=0\n"));
+        assert!(
+            layout
+                .logs
+                .join("agent-observability-report.html")
+                .is_file()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
 fn private_codex_handoff(root: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
@@ -40,14 +82,14 @@ fn spawn_codex_ingest(root: &Path, handoff: &Path) -> Child {
 }
 
 #[cfg(unix)]
-struct WaitingIngest {
+struct WaitingCommand {
     child: Child,
     stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
     stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
 }
 
 #[cfg(unix)]
-impl WaitingIngest {
+impl WaitingCommand {
     fn finish(mut self) -> std::process::Output {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let status = loop {
@@ -56,7 +98,7 @@ impl WaitingIngest {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "ingest completion timed out"
+                "command completion timed out"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
@@ -69,7 +111,7 @@ impl WaitingIngest {
 }
 
 #[cfg(unix)]
-impl Drop for WaitingIngest {
+impl Drop for WaitingCommand {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -83,7 +125,7 @@ impl Drop for WaitingIngest {
 }
 
 #[cfg(unix)]
-fn assert_ingest_waits(mut child: Child) -> WaitingIngest {
+fn assert_command_waits(mut child: Child) -> WaitingCommand {
     use std::io::Read as _;
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -108,7 +150,7 @@ fn assert_ingest_waits(mut child: Child) -> WaitingIngest {
         }
         bytes
     });
-    let ingest = WaitingIngest {
+    let ingest = WaitingCommand {
         child,
         stdout: Some(stdout),
         stderr: Some(stderr),
@@ -117,7 +159,7 @@ fn assert_ingest_waits(mut child: Child) -> WaitingIngest {
         ready_rx
             .recv_timeout(std::time::Duration::from_secs(15))
             .is_ok(),
-        "ingest did not acknowledge root contention: binary={}",
+        "command did not acknowledge root contention: binary={}",
         env!("CARGO_BIN_EXE_agent-observability"),
     );
     ingest
@@ -775,7 +817,7 @@ fn concurrent_disable_blocks_manual_ingest_before_admission() {
     let layout = install(&root).unwrap();
     let handoff = private_codex_handoff(&root);
     let guard = ConfigMutationGuard::acquire(&layout).unwrap();
-    let ingest = assert_ingest_waits(spawn_codex_ingest(&root, &handoff));
+    let ingest = assert_command_waits(spawn_codex_ingest(&root, &handoff));
 
     let mut config = load(&layout.config).unwrap();
     config.enabled = false;
@@ -801,7 +843,7 @@ fn concurrent_budget_reduction_blocks_manual_ingest_before_commit() {
     let handoff = private_codex_handoff(&root);
     inflate_allocated_accounting(&root);
     let guard = ConfigMutationGuard::acquire(&layout).unwrap();
-    let ingest = assert_ingest_waits(spawn_codex_ingest(&root, &handoff));
+    let ingest = assert_command_waits(spawn_codex_ingest(&root, &handoff));
 
     let mut config = load(&layout.config).unwrap();
     config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
