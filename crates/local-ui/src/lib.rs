@@ -2,6 +2,11 @@
 #![allow(clippy::missing_errors_doc)]
 
 mod dashboard_request;
+mod storage_ownership;
+
+pub use storage_ownership::{
+    DashboardCapabilityStorageOwnershipError, DashboardCapabilityStorageOwnershipEvidence,
+};
 
 use agent_observability_codex_integration::{
     CodexIntegrationStatus, IntegrationError, connect as connect_codex,
@@ -61,6 +66,7 @@ const DASHBOARD_PORT_SPAN: u16 = 12_000;
 const DASHBOARD_START_TIMEOUT: Duration = Duration::from_secs(5);
 const DASHBOARD_PROBE_INTERVAL: Duration = Duration::from_millis(25);
 const DASHBOARD_CAPABILITY_FILE: &str = "capability";
+const DASHBOARD_CAPABILITY_MAX_BYTES: u64 = 65;
 const DASHBOARD_IDENTITY_HEADER: &str = "x-agent-observability-dashboard";
 const IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 const MAX_SESSION_LIFETIME: Duration = Duration::from_hours(1);
@@ -1274,27 +1280,32 @@ fn read_dashboard_token_observing(
         Err(_) => return Err(DashboardArtifactError::Unsafe),
     };
     let metadata = file.metadata().map_err(|_| DashboardArtifactError::Io)?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 || metadata.len() > 65 {
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > DASHBOARD_CAPABILITY_MAX_BYTES
+    {
         return Err(DashboardArtifactError::Unsafe);
     }
     after_metadata(&path);
     let mut token = String::new();
     (&mut file)
-        .take(66)
+        .take(DASHBOARD_CAPABILITY_MAX_BYTES + 1)
         .read_to_string(&mut token)
         .map_err(|_| DashboardArtifactError::Io)?;
-    if token.len() > 65 {
+    if u64::try_from(token.len()).unwrap_or(u64::MAX) > DASHBOARD_CAPABILITY_MAX_BYTES {
         return Err(DashboardArtifactError::Unsafe);
     }
-    let token = token.trim_end();
-    if token.len() != 64
-        || !token
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(DashboardArtifactError::Unsafe);
-    }
+    let token = validated_dashboard_token(&token).ok_or(DashboardArtifactError::Unsafe)?;
     Ok(Some((file, token.to_owned())))
+}
+
+fn validated_dashboard_token(value: &str) -> Option<&str> {
+    let token = value.trim_end();
+    (token.len() == 64
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    .then_some(token)
 }
 
 #[cfg(not(unix))]
