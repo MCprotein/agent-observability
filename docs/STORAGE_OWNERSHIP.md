@@ -452,3 +452,10 @@ CLI strict Clippy 및 Rust 1.97.0 formatting을 확인했다. 이는 실제 수�
 기존 build ceiling으로 제한하는 수치 계산만 private 순수 함수로 분리했다. 기존 caller의
 오류·포화 뺄셈·상한은 바꾸지 않았고, 경계값 회귀와 독립 코드/아키텍처 검토를 통과했다.
 보고서 시작·게시 직전 admission, 검증된 자기 예약 제외, 복구·정리 경로 연결은 아직 남아 있다.
+
+다음 자원 진단은 실제 설치 대신 synthetic current store와 private detail/status 각 1,024개를
+별도 fixture에 만들고, 최대 64 KiB detail을 포함한 전체 비활성 guard 호출 시간을 측정한다.
+fixture 준비는 측정 구간 밖에 두고 inventory 한도 초과의 명시적 거부도 확인한다. 이 진단은
+기본 테스트에서 제외된 명시적 실행이며 출력은 숫자·결과 코드로 제한한다. 새 latency SLO나
+임의의 통과 임계값을 만들지 않는다. 소수의 로컬 표본은 전체 collector의 CPU/RSS·동시성·
+foreground 응답 기준이나 실제 규모 검증을 대체하지 않으며, 결과만으로 정책을 활성화하지 않는다.
