@@ -69,6 +69,49 @@ pub struct StorageOwnershipObservation<'a> {
     report_render_lock_present: bool,
 }
 
+/// Failure from an optional, read-only local-store ownership preflight.
+pub enum StorageOwnershipPreflightError {
+    /// An exact rollback-journal entry exists, so `SQLite` must not be opened by this preflight.
+    JournalPresent,
+    /// The absent-store boundary or existing store failed validation.
+    Store(StoreError),
+}
+
+impl fmt::Debug for StorageOwnershipPreflightError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::JournalPresent => "StorageOwnershipPreflightError::JournalPresent",
+            Self::Store(_) => "StorageOwnershipPreflightError::Store",
+        })
+    }
+}
+
+impl fmt::Display for StorageOwnershipPreflightError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::JournalPresent => {
+                "local store ownership preflight deferred because a rollback journal is present"
+            }
+            Self::Store(_) => "local store ownership preflight failed",
+        })
+    }
+}
+
+impl std::error::Error for StorageOwnershipPreflightError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::JournalPresent => None,
+            Self::Store(error) => Some(error),
+        }
+    }
+}
+
+impl From<StoreError> for StorageOwnershipPreflightError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
 impl fmt::Debug for StorageOwnershipObservation<'_> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         let kinds = self
@@ -192,6 +235,88 @@ pub fn with_storage_ownership_observation<T>(
     let result = use_observation(&observation);
     observation.validate_authority()?;
     Ok(result)
+}
+
+/// Supplies optional, callback-scoped ownership evidence without creating or recovering a store.
+///
+/// Only an absent exact store-directory entry is reported as `None`. Its existing private parent
+/// is retained and the absence is revalidated after the callback. A present directory must be a
+/// complete current-schema store and must have no rollback-journal entry before `SQLite` is opened.
+/// Any regular journal, including an empty or malformed one, returns
+/// [`StorageOwnershipPreflightError::JournalPresent`] without reading it. The journal absence and
+/// retained store identity are checked again after the callback.
+///
+/// This preflight does not create, recover, repair, migrate, clean, or cache store artifacts. The
+/// caller must hold the external all-writer freeze for the entire call. The checks are not an
+/// ABA-safe filesystem snapshot against an uncoordinated same-user writer.
+///
+/// # Errors
+///
+/// Returns [`StorageOwnershipPreflightError::JournalPresent`] when the exact journal is a valid
+/// private regular file, or [`StorageOwnershipPreflightError::Store`] when path identity, privacy,
+/// required store entries, current schema, or read-only reader validation fails.
+pub fn with_optional_report_reader_storage_ownership<T>(
+    store_directory: impl AsRef<Path>,
+    use_observation: impl FnOnce(Option<&StorageOwnershipObservation<'_>>) -> T,
+) -> Result<T, StorageOwnershipPreflightError> {
+    let store_directory = store_directory.as_ref();
+    match fs::symlink_metadata(store_directory) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return with_exact_directory_absence(store_directory, use_observation);
+        }
+        Err(error) => return Err(StoreError::Io(error).into()),
+        Ok(_) => {}
+    }
+
+    validate_existing_private_dir(store_directory)?;
+    let journal = store_directory
+        .join(DB_NAME)
+        .with_extension("sqlite3-journal");
+    validate_journal_absence(&journal)?;
+    let store = LocalStore::open_report_reader(store_directory)?;
+    let observed = with_storage_ownership_observation(&store, |observation| {
+        let result = use_observation(Some(observation));
+        validate_journal_absence(&journal).map(|()| result)
+    });
+    validate_journal_absence(&journal)?;
+    let result = observed.map_err(StorageOwnershipPreflightError::Store)??;
+    validate_retained_store_identity(&store)?;
+    Ok(result)
+}
+
+fn with_exact_directory_absence<T>(
+    store_directory: &Path,
+    use_observation: impl FnOnce(Option<&StorageOwnershipObservation<'_>>) -> T,
+) -> Result<T, StorageOwnershipPreflightError> {
+    let parent = store_directory
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_descriptor = open_directory(parent)?;
+    validate_exact_absence(store_directory)?;
+    let result = use_observation(None);
+    validate_exact_absence(store_directory)?;
+    validate_named_descriptor(
+        parent,
+        &parent_descriptor,
+        StorageOwnedEntryKind::AuthorityDirectory,
+    )?;
+    Ok(result)
+}
+
+fn validate_exact_absence(path: &Path) -> Result<(), StorageOwnershipPreflightError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StoreError::Io(error).into()),
+        Ok(_) => Err(StoreError::InvalidPath.into()),
+    }
+}
+
+fn validate_journal_absence(path: &Path) -> Result<(), StorageOwnershipPreflightError> {
+    match crate::migration_admission::open_private_journal(path)? {
+        None => Ok(()),
+        Some(_) => Err(StorageOwnershipPreflightError::JournalPresent),
+    }
 }
 
 pub(super) fn capture_store_identity(
@@ -439,8 +564,10 @@ mod tests {
         LocalStore, PROJECTION_NAME, REPORT_RENDER_LOCK_NAME, STORE_OPEN_LOCK_NAME, StoreError,
         private_create_new,
     };
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::OsString;
     use std::fs::{self, File};
+    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -452,6 +579,293 @@ mod tests {
             std::process::id(),
             TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    fn private_test_directory(label: &str) -> PathBuf {
+        let directory = test_directory(label);
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        directory
+    }
+
+    fn snapshot_directory_bytes(directory: &Path) -> BTreeMap<OsString, Vec<u8>> {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    }
+
+    fn write_private_file(path: &Path, bytes: &[u8]) {
+        let mut file = private_create_new(path).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn optional_preflight_reports_exact_absence_without_creating_store() {
+        let parent = private_test_directory("optional-absent-parent");
+        let directory = parent.join("store");
+        let result = with_optional_report_reader_storage_ownership(&directory, |observation| {
+            assert!(observation.is_none());
+            "absent"
+        })
+        .unwrap();
+
+        assert_eq!(result, "absent");
+        assert!(!directory.exists());
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+        fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn optional_preflight_classifies_current_store_without_changing_bytes() {
+        let directory = test_directory("optional-current");
+        let _ = fs::remove_dir_all(&directory);
+        drop(LocalStore::open(&directory).unwrap());
+        let before = snapshot_directory_bytes(&directory);
+
+        let entry_count =
+            with_optional_report_reader_storage_ownership(&directory, |observation| {
+                observation.unwrap().entries().len()
+            })
+            .unwrap();
+
+        assert_eq!(entry_count, 4);
+        assert_eq!(snapshot_directory_bytes(&directory), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn optional_preflight_does_not_flatten_incomplete_store_to_absence() {
+        let parent = private_test_directory("optional-missing-parent");
+        let missing_parent_store = parent.join("missing-parent").join("store");
+        let mut missing_parent_callback_called = false;
+        let missing_parent =
+            with_optional_report_reader_storage_ownership(&missing_parent_store, |_| {
+                missing_parent_callback_called = true;
+            });
+        assert!(matches!(
+            missing_parent,
+            Err(StorageOwnershipPreflightError::Store(StoreError::Io(_)))
+        ));
+        assert!(!missing_parent_callback_called);
+        fs::remove_dir(parent).unwrap();
+
+        for missing in ["database", "lock"] {
+            let directory = test_directory(&format!("optional-missing-{missing}"));
+            let _ = fs::remove_dir_all(&directory);
+            drop(LocalStore::open(&directory).unwrap());
+            let missing_path = if missing == "database" {
+                directory.join(DB_NAME)
+            } else {
+                directory.join(STORE_OPEN_LOCK_NAME)
+            };
+            fs::remove_file(&missing_path).unwrap();
+            let mut callback_called = false;
+
+            let result = with_optional_report_reader_storage_ownership(&directory, |_| {
+                callback_called = true;
+            });
+
+            assert!(matches!(
+                result,
+                Err(StorageOwnershipPreflightError::Store(StoreError::Io(_)))
+            ));
+            assert!(!callback_called);
+            assert!(!missing_path.exists());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn optional_preflight_defers_all_private_regular_journals_before_sqlite_open() {
+        for (label, bytes) in [
+            ("empty", &[][..]),
+            ("zeroed", &[0_u8; 28][..]),
+            (
+                "valid-looking",
+                &[
+                    0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0,
+                    0, 1, 0, 0, 2, 0, 0, 0x10, 0, 0,
+                ][..],
+            ),
+            ("malformed", b"not-a-rollback-journal".as_slice()),
+        ] {
+            let directory = private_test_directory(&format!("optional-journal-{label}"));
+            let journal = directory.join("local-store.sqlite3-journal");
+            write_private_file(&journal, bytes);
+            let mut callback_called = false;
+
+            let result = with_optional_report_reader_storage_ownership(&directory, |_| {
+                callback_called = true;
+            });
+
+            assert!(matches!(
+                result,
+                Err(StorageOwnershipPreflightError::JournalPresent)
+            ));
+            assert!(!callback_called);
+            assert_eq!(fs::read(&journal).unwrap(), bytes);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn optional_preflight_rejects_callback_created_journal_and_preserves_it() {
+        let directory = test_directory("optional-created-journal");
+        let _ = fs::remove_dir_all(&directory);
+        drop(LocalStore::open(&directory).unwrap());
+        let journal = directory.join("local-store.sqlite3-journal");
+        let bytes = b"callback-created-journal";
+
+        let result = with_optional_report_reader_storage_ownership(&directory, |observation| {
+            assert!(observation.is_some());
+            write_private_file(&journal, bytes);
+        });
+
+        assert!(matches!(
+            result,
+            Err(StorageOwnershipPreflightError::JournalPresent)
+        ));
+        assert_eq!(fs::read(&journal).unwrap(), bytes);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn optional_preflight_rejects_store_appearing_after_absent_callback() {
+        let parent = private_test_directory("optional-appearing-parent");
+        let directory = parent.join("store");
+
+        let result = with_optional_report_reader_storage_ownership(&directory, |observation| {
+            assert!(observation.is_none());
+            fs::create_dir(&directory).unwrap();
+        });
+
+        assert!(matches!(
+            result,
+            Err(StorageOwnershipPreflightError::Store(
+                StoreError::InvalidPath
+            ))
+        ));
+        assert!(directory.is_dir());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_preflight_rejects_directory_replacement_and_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("optional-directory-replacement");
+        let _ = fs::remove_dir_all(&directory);
+        drop(LocalStore::open(&directory).unwrap());
+        let displaced = directory.with_extension("displaced");
+        let _ = fs::remove_dir_all(&displaced);
+
+        let replacement =
+            with_optional_report_reader_storage_ownership(&directory, |observation| {
+                assert!(observation.is_some());
+                fs::rename(&directory, &displaced).unwrap();
+                fs::create_dir(&directory).unwrap();
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            });
+        assert!(matches!(
+            replacement,
+            Err(StorageOwnershipPreflightError::Store(
+                StoreError::InvalidPath | StoreError::Io(_)
+            ))
+        ));
+
+        fs::remove_dir(&directory).unwrap();
+        std::os::unix::fs::symlink(&displaced, &directory).unwrap();
+        let mut callback_called = false;
+        let symlink = with_optional_report_reader_storage_ownership(&directory, |_| {
+            callback_called = true;
+        });
+        assert!(matches!(
+            symlink,
+            Err(StorageOwnershipPreflightError::Store(StoreError::Symlink))
+        ));
+        assert!(!callback_called);
+        fs::remove_file(directory).unwrap();
+        fs::remove_dir_all(displaced).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_preflight_rejects_directory_disappearance_and_special_journals() {
+        let directory = test_directory("optional-directory-disappearance");
+        let _ = fs::remove_dir_all(&directory);
+        drop(LocalStore::open(&directory).unwrap());
+        let displaced = directory.with_extension("disappeared");
+        let _ = fs::remove_dir_all(&displaced);
+
+        let disappeared =
+            with_optional_report_reader_storage_ownership(&directory, |observation| {
+                assert!(observation.is_some());
+                fs::rename(&directory, &displaced).unwrap();
+            });
+        assert!(matches!(
+            disappeared,
+            Err(StorageOwnershipPreflightError::Store(
+                StoreError::InvalidPath | StoreError::Io(_)
+            ))
+        ));
+        assert!(!directory.exists());
+        fs::remove_dir_all(displaced).unwrap();
+
+        for special in ["symlink", "fifo"] {
+            let directory = private_test_directory(&format!("optional-journal-{special}"));
+            let journal = directory.join("local-store.sqlite3-journal");
+            if special == "symlink" {
+                let target = directory.join("journal-target");
+                write_private_file(&target, b"target");
+                std::os::unix::fs::symlink(&target, &journal).unwrap();
+            } else {
+                assert!(
+                    std::process::Command::new("mkfifo")
+                        .args(["-m", "600"])
+                        .arg(&journal)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            let mut callback_called = false;
+
+            let result = with_optional_report_reader_storage_ownership(&directory, |_| {
+                callback_called = true;
+            });
+
+            assert!(matches!(
+                result,
+                Err(StorageOwnershipPreflightError::Store(
+                    StoreError::Symlink | StoreError::InvalidPath
+                ))
+            ));
+            assert!(!callback_called);
+            assert!(fs::symlink_metadata(&journal).is_ok());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn optional_preflight_error_debug_and_display_are_sanitized() {
+        let secret = "/private/store/secret-payload";
+        let error = StorageOwnershipPreflightError::Store(StoreError::Io(io::Error::other(secret)));
+
+        for rendered in [format!("{error:?}"), error.to_string()] {
+            assert!(!rendered.contains(secret));
+            assert!(!rendered.contains("secret"));
+        }
     }
 
     #[test]
