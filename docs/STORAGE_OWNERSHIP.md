@@ -329,3 +329,49 @@ SQLite를 열기 전에 정확한 journal 경로의 부재를 확인하고, 빈 
 전체 관측을 감싸야 한다. composer는 검증된 root에서 도출한 정규화된 정확한 `state/store`
 경로를 전달해야 하며, facade 자체는 임의 입력 경로를 runtime root에 결합하지 않는다.
 부재 관측 자체는 신규 파일 생성이나 admission 허가가 아니다.
+
+authority observation의 좁은 callback API로 기존 report-view
+ownership 관측을 중첩한다. composer에 쓰기 가능한 `LocalStore`를 노출하지 않는다.
+정확한 report-view 디렉터리 부재만 `None`으로 표현하고 callback 이후 재검증한다.
+디렉터리가 있으면 기존 catalog/current/retired 의미 검증을 그대로 사용하며,
+손상·교체·symlink·기타 오류를 부재로 바꾸지 않는다. 이 연결도 동일한 전체 writer
+freeze 안에서 수행하며, 별도 캐시·복구·쓰기·정책 활성화를 추가하지 않는다.
+
+게시된 report-view SQLite도 원본 DB와 같은 journal 사전 차단 원칙을 따른다.
+정확한 snapshot의 `-journal` 항목이 있으면 내용이 비어 있어도 SQLite 연결을 열기 전에
+거부하고 파일을 보존한다. query callback 이후와 ownership 최종 재검증에서도 부재를
+확인한다. 정상적인 immutable snapshot은 복구를 요구하지 않아야 하며, 이 검사는
+저널의 소유권을 인정하거나 복구·정리 권한을 부여하지 않는다.
+
+수동 integration 작업의 root mutation 대기는 accounting 충돌 처리와 구분한다.
+root의 짧은 쓰기와 경합하면 기존 foreground root-wait 경계에서 같은 검증된 lock을
+기다릴 수 있지만, accounting exclusion은 한 번만 시도하고 실패 시 operation을 실행하지
+않는다. 시작된 operation이나 실패 후 복구 전체를 재시도하지 않는다. 이 경계는 collector
+foreground ingest나 hook의 대기 정책을 변경하지 않으며, 실제 `WouldBlock` 관측·한 번 실행·
+accounting 거부·identity 교체 회귀로 검증됐다. 기존 root 대기 primitive에는 내부 timeout이
+없으며 이를 bounded wait로 표현하지 않는다.
+
+### 전체 소유권 조합의 연결 순서
+
+CLI는 runtime, store, collector, integration, UI, static-report를 모두 의존하는 현재의
+조합 위치다. private callback 함수에서 각 소유자의 검증을 수행하고 A/X/U, 전체 예약 R,
+설정 revision만 전달한다. 쓰기 가능한 store나 owner handle은 결과로 반환하지 않는다.
+동일 경로를 여러 소유자가 검사해도 모든 matcher를 실행한다. 앞선 승인으로 뒤의 오류를
+가리는 short-circuit은 금지하며, A와 X가 동시에 참이면 불일치로 거부한다.
+
+첫 연결은 `runtime-check`의 추가 진단이다. 분리 모드나 collector admission 활성화와
+구분하고 기존 legacy 예산 결과를 새 숫자로 대체하지 않는다. 초기화된 accounting 경계는
+root mutation 다음 exclusive freeze를 한 번씩만 획득한다. 이미 exclusive writer를 가진
+상태에서 또 다른 descriptor로 freeze를 중첩하지 않는다. 기존 barrier나 mutation lock이
+없으면 새 분류 검사 자체가 생성·복구하지 않는다. barrier 미초기화는 기존 명령과 출력을
+그대로 유지하고 새 분류 필드를 내보내지 않는다.
+Codex config/home 해석은 integration의 기존 resolver를 재사용하고 외부 config/plist를
+읽거나 process·서비스를 조회하지 않는다. 이 조합과 호출 경로는 아직 구현·검증 중이다.
+
+`runtime-check` 전체가 읽기 전용인 것은 아니다. 기존 설치·singleton 및 store 준비는
+생성·복구·migration 가능 동작을 유지하고, 같은 freeze를 유지한 상태에서 store를 닫은 뒤
+새 관측을 수행한다. `accounting_stage=post_store_open`은 이 순서를 명시한다. journal 사전
+검사 계약은 관측 함수의 SQLite open 경계에 적용되며, 이 명령 전체를 P3의 쓰기 전
+admission 검사로 사용해서는 안 된다. 초기화된 경계의 owner 오류는 명령 실패이며
+legacy 결과로 대체하지 않는다. 정상 관측의 U는 진단에 남기되 아직 legacy admission을
+새 분리 정책으로 바꾸지는 않는다.

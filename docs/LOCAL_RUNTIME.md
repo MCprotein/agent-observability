@@ -323,6 +323,20 @@ Storage admission remains fail-closed at the configured disk budget. Retention i
 operator command rather than an ingest-side implicit delete: pressure never silently overwrites
 accepted observations.
 
+## v1.11 development: ownership diagnostics
+
+When the storage-accounting barrier is already initialized, `runtime-check <root>`
+adds a separate post-store-open observation: retained/workspace/unknown allocated bytes,
+unknown entry count, full report reservations, and config revision. A zero-byte unknown
+file still counts as an unknown entry. `accounting_stage=post_store_open` explicitly means
+the existing store creation/migration step has already run; the whole command is not a
+read-only preflight. Ownership errors fail the command without success output.
+
+Uninitialized layouts retain the existing command behavior and output; diagnostics do
+not initialize the accounting barrier. The new observations do not replace legacy
+`storage_admission`, activate separated mode, or authorize writes. See
+[Storage Ownership](STORAGE_OWNERSHIP.md#전체-소유권-조합의-연결-순서).
+
 ## Retention and private archive
 
 This section describes published v1.10.0 manual retention. The next version's opt-in automatic
