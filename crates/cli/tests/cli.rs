@@ -421,7 +421,88 @@ fn init_and_runtime_check_create_only_private_local_paths() {
     assert!(stdout.contains("singleton=held"));
     assert!(stdout.contains("storage_admission=allowed"));
     assert!(stdout.contains("team_ingest=disabled"));
+    assert!(!stdout.contains("storage_accounting="));
+    assert!(!root.join("runtime/storage-accounting.lock").exists());
     let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_check_observes_initialized_ownership_after_store_preparation() {
+    use agent_observability_local_runtime::{MutationGuard, storage_coherence::StorageBarrier};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agentobs-runtime-ownership-process-{}",
+        std::process::id()
+    ));
+    assert!(!root.exists());
+    let layout = install(&root).unwrap();
+    let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+    StorageBarrier::initialize(&root, &mutation).unwrap();
+    drop(mutation);
+    let sentinel = layout.logs.join("unknown-empty");
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&sentinel)
+        .unwrap();
+
+    let check = binary()
+        .args(["runtime-check", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(stdout.contains("storage_accounting=observed\n"), "{stdout}");
+    assert!(stdout.contains("accounting_stage=post_store_open\n"));
+    assert!(stdout.contains("accounting_unknown_bytes=0\n"));
+    assert!(stdout.contains("accounting_unknown_entries=1\n"));
+    assert!(stdout.contains("storage_admission=allowed\n"));
+    assert!(stdout.contains("separated_admission=disabled"));
+    assert!(layout.state.join("store/local-store.sqlite3").is_file());
+    assert_eq!(fs::metadata(&sentinel).unwrap().len(), 0);
+    assert!(!stdout.contains(root.to_str().unwrap()));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_check_rejects_invalid_ownership_without_success_output() {
+    use agent_observability_local_runtime::{MutationGuard, storage_coherence::StorageBarrier};
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agentobs-runtime-invalid-owner-process-{}",
+        std::process::id()
+    ));
+    assert!(!root.exists());
+    let layout = install(&root).unwrap();
+    let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+    StorageBarrier::initialize(&root, &mutation).unwrap();
+    drop(mutation);
+    let marker = layout.runtime.join("report-dirty");
+    let private = b"private malformed owner sentinel";
+    fs::write(&marker, private).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    let check = binary()
+        .args(["runtime-check", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+    assert!(check.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&check.stderr).contains("storage accounting unavailable"));
+    assert!(!String::from_utf8_lossy(&check.stderr).contains("private malformed owner sentinel"));
+    assert!(!String::from_utf8_lossy(&check.stderr).contains(root.to_str().unwrap()));
+    assert_eq!(fs::read(&marker).unwrap(), private);
+    // The command remains migration-capable; only its subsequent observation is read-only.
+    assert!(layout.state.join("store/local-store.sqlite3").is_file());
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]

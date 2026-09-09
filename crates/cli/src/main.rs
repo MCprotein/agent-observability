@@ -1,3 +1,5 @@
+mod storage_accounting;
+
 use agent_observability_adapter_claude_code::{
     AdapterItem as ClaudeAdapterItem, read_handoff_file as read_claude_handoff_file,
 };
@@ -1273,12 +1275,11 @@ fn report_acknowledging(
         let report = projector
             .finish(current_timestamp()?, "Agent Observability Report")
             .map_err(|error| error.to_string())?;
-        let writer = StorageMutationWriter::acquire_waiting_for_root(
-            &layout.root,
-            barrier.as_ref(),
-            || eprintln!("waiting=runtime_mutation"),
-        )
-        .map_err(|error| error.to_string())?;
+        let writer =
+            StorageMutationWriter::acquire_waiting_for_root(&layout.root, barrier.as_ref(), || {
+                eprintln!("waiting=runtime_mutation");
+            })
+            .map_err(|error| error.to_string())?;
         let mut published_bytes = None;
         let publication = (|| {
             let bytes = write_private(&output_path, &report).map_err(|error| error.to_string())?;
@@ -1448,11 +1449,59 @@ fn runtime_check(root: &Path) -> Result<String, String> {
     let _singleton = acquire_runtime_singleton(&layout)?;
     let barrier =
         StorageBarrier::open_if_initialized(&layout.root).map_err(|error| error.to_string())?;
+    if let Some(barrier) = &barrier {
+        let freeze = barrier
+            .try_freeze_existing_root()
+            .map_err(|error| error.to_string())?;
+        let result = runtime_check_locked(&layout, freeze.mutation(), || {
+            use agent_observability_codex_integration::storage_accounting::capture_current_codex_config_snapshot_ownership;
+            let codex = capture_current_codex_config_snapshot_ownership(&layout.root)
+                .map_err(|error| error.to_string())?;
+            #[cfg(target_os = "macos")]
+            let launch = agent_observability_codex_integration::storage_accounting::capture_current_launch_agent_storage_ownership(&layout.root)
+                .map_err(|error| error.to_string())?;
+            storage_accounting::with_all_owner_storage_observation(
+                &layout,
+                &freeze,
+                &codex,
+                #[cfg(target_os = "macos")]
+                Some(&launch),
+                #[cfg(not(target_os = "macos"))]
+                None,
+                |observation| {
+                    Ok(format!(
+                        "\nstorage_accounting=observed\naccounting_stage=post_store_open\naccounting_retained_bytes={}\naccounting_workspace_bytes={}\naccounting_unknown_bytes={}\naccounting_unknown_entries={}\naccounting_report_reserved_bytes={}\naccounting_config_revision={}\nseparated_admission=disabled",
+                        observation.allocation.retained_bytes,
+                        observation.allocation.workspace_bytes,
+                        observation.allocation.unknown_bytes,
+                        observation.allocation.unknown_entry_count,
+                        observation.report_reserved_bytes,
+                        observation.config_revision,
+                    ))
+                },
+            )
+        });
+        let revalidation = freeze.revalidate().map_err(|error| error.to_string());
+        return result.and_then(|output| revalidation.map(|()| output));
+    }
     let scope = StorageMutationWriter::acquire_exclusive(&layout.root, barrier.as_ref())
         .map_err(|error| error.to_string())?;
+    let output = runtime_check_locked(&layout, scope.mutation(), || Ok(String::new()))?;
+    scope.revalidate().map_err(|error| error.to_string())?;
+    Ok(output)
+}
+
+// Store preparation retains its existing migration/repair behavior. The optional
+// observation runs afterward and is not a pre-write admission or recovery gate.
+fn runtime_check_locked(
+    layout: &InstalledLayout,
+    mutation: &MutationGuard,
+    observe_after_store: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
     let config = load(&layout.config).map_err(|error| error.to_string())?;
-    let store = open_store(scope.mutation(), &layout, &config)?;
+    let store = open_store(mutation, layout, &config)?;
     drop(store);
+    let ownership = observe_after_store()?;
     let allocated =
         StorageBudget::allocated_tree_bytes(&layout.root).map_err(|error| error.to_string())?;
     let mut control = RuntimeControl::new(&config).map_err(|error| error.to_string())?;
@@ -1479,8 +1528,7 @@ fn runtime_check(root: &Path) -> Result<String, String> {
         diagnostic.deficit_bytes,
         schedule.state
     );
-    scope.revalidate().map_err(|error| error.to_string())?;
-    Ok(output)
+    Ok(output + &ownership)
 }
 
 fn ingest_items<'a>(
