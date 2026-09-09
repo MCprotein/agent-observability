@@ -13,7 +13,8 @@ use agent_observability_local_collector::storage_ownership::{
     CollectorTlsOwnershipEvidence,
 };
 use agent_observability_local_collector::{
-    CollectorIngestPrecommitError, CollectorIngestPrecommitGuard,
+    CollectorIngestPrecommitError, CollectorIngestPrecommitGuard, CollectorReportPrecommitError,
+    CollectorReportPrecommitGuard,
 };
 use agent_observability_local_runtime::{
     InstalledLayout, LocalRuntimeConfigV3, StorageAllocationClass, StorageBudgetPolicyV1,
@@ -24,7 +25,7 @@ use agent_observability_local_runtime::{
     storage_coherence::OwnedStorageFreezeGuard,
     storage_inventory::StorageAllocationObservationV1,
     storage_policy::{
-        StorageAllocationSnapshotV1, StorageOperation,
+        StorageAdmissionRejection, StorageAllocationSnapshotV1, StorageOperation,
         evaluate_storage_admission_with_reserved_total,
     },
 };
@@ -52,6 +53,11 @@ pub(crate) struct AllOwnerStorageObservation {
 #[allow(dead_code)]
 #[derive(Debug)]
 struct CliCollectorIngestPrecommitGuard;
+
+/// Dormant until the CLI collector composition explicitly installs report admission.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct CliCollectorReportPrecommitGuard;
 
 impl CollectorIngestPrecommitGuard for CliCollectorIngestPrecommitGuard {
     fn check_precommit(
@@ -92,6 +98,74 @@ impl CollectorIngestPrecommitGuard for CliCollectorIngestPrecommitGuard {
                 )
                 .map_err(|_| ())
             },
+        )
+    }
+}
+
+impl CliCollectorReportPrecommitGuard {
+    // Used only through the dormant trait methods and their focused tests.
+    #[allow(dead_code)]
+    fn check(
+        layout: &InstalledLayout,
+        freeze: &OwnedStorageFreezeGuard<'_>,
+        config: &LocalRuntimeConfigV3,
+        estimated_allowance_bytes: u64,
+        validated_self_reservation_bytes: Option<u64>,
+    ) -> Result<(), CollectorReportPrecommitError> {
+        use agent_observability_codex_integration::storage_accounting::capture_current_codex_config_snapshot_ownership;
+
+        validate_layout(layout).map_err(|_| CollectorReportPrecommitError::Unavailable)?;
+        freeze
+            .revalidate()
+            .map_err(|_| CollectorReportPrecommitError::Unavailable)?;
+
+        let codex = capture_current_codex_config_snapshot_ownership(&layout.root)
+            .map_err(|_| CollectorReportPrecommitError::Unavailable)?;
+        #[cfg(target_os = "macos")]
+        let launch = agent_observability_codex_integration::storage_accounting::capture_current_launch_agent_storage_ownership(&layout.root)
+            .map_err(|_| CollectorReportPrecommitError::Unavailable)?;
+
+        check_cli_collector_report_precommit_with(
+            layout,
+            freeze,
+            config,
+            estimated_allowance_bytes,
+            validated_self_reservation_bytes,
+            &codex,
+            #[cfg(target_os = "macos")]
+            Some(&launch),
+            #[cfg(not(target_os = "macos"))]
+            None,
+            OwnedStorageFreezeGuard::available_space,
+        )
+    }
+}
+
+impl CollectorReportPrecommitGuard for CliCollectorReportPrecommitGuard {
+    fn check_start(
+        &self,
+        layout: &InstalledLayout,
+        freeze: &OwnedStorageFreezeGuard<'_>,
+        config: &LocalRuntimeConfigV3,
+        estimated_allowance: u64,
+    ) -> Result<(), CollectorReportPrecommitError> {
+        Self::check(layout, freeze, config, estimated_allowance, None)
+    }
+
+    fn check_publication(
+        &self,
+        layout: &InstalledLayout,
+        freeze: &OwnedStorageFreezeGuard<'_>,
+        config: &LocalRuntimeConfigV3,
+        publication_allowance: u64,
+        validated_self_reservation_bytes: u64,
+    ) -> Result<(), CollectorReportPrecommitError> {
+        Self::check(
+            layout,
+            freeze,
+            config,
+            publication_allowance,
+            Some(validated_self_reservation_bytes),
         )
     }
 }
@@ -155,6 +229,63 @@ where
     .map_err(|_| CollectorIngestPrecommitError::Unavailable)?
 }
 
+#[allow(clippy::too_many_arguments)]
+// Called only by the dormant report guard and its focused tests until activation is reviewed.
+#[allow(dead_code)]
+fn check_cli_collector_report_precommit_with<'freeze, 'barrier, AvailableSpace>(
+    layout: &InstalledLayout,
+    freeze: &'freeze OwnedStorageFreezeGuard<'barrier>,
+    config: &LocalRuntimeConfigV3,
+    estimated_allowance_bytes: u64,
+    validated_self_reservation_bytes: Option<u64>,
+    codex: &CodexConfigSnapshotOwnershipEvidence,
+    launch: Option<&LaunchAgentStorageOwnershipEvidence>,
+    available_space: AvailableSpace,
+) -> Result<(), CollectorReportPrecommitError>
+where
+    AvailableSpace: FnOnce(
+        &'freeze OwnedStorageFreezeGuard<'barrier>,
+    ) -> Result<
+        u64,
+        agent_observability_local_runtime::storage_coherence::StorageCoherenceError,
+    >,
+{
+    config
+        .validate()
+        .map_err(|_| CollectorReportPrecommitError::Unavailable)?;
+    let supplied_revision = agent_observability_local_runtime::revision(config)
+        .map_err(|_| CollectorReportPrecommitError::Unavailable)?;
+
+    with_all_owner_storage_observation(layout, freeze, codex, launch, |observation| {
+        let numeric = (|| {
+            if observation.config_revision != supplied_revision
+                || observation.storage_budget_policy != config.storage_budget
+            {
+                return Err(CollectorReportPrecommitError::Unavailable);
+            }
+            let reserved_total_bytes = match validated_self_reservation_bytes {
+                Some(0) => return Err(CollectorReportPrecommitError::Unavailable),
+                Some(validated_self) => observation
+                    .report_reserved_bytes
+                    .checked_sub(validated_self)
+                    .ok_or(CollectorReportPrecommitError::Unavailable)?,
+                None => observation.report_reserved_bytes,
+            };
+            let filesystem_free_bytes =
+                available_space(freeze).map_err(|_| CollectorReportPrecommitError::Unavailable)?;
+            evaluate_report_precommit(
+                observation,
+                reserved_total_bytes,
+                estimated_allowance_bytes,
+                filesystem_free_bytes,
+            )
+        })();
+        // Keep typed rejection nested so owner/store/global postchecks still run.
+        Ok(numeric)
+    })
+    .map_err(|_| CollectorReportPrecommitError::Unavailable)?
+}
+
 // Called only by the dormant guard and its focused tests until activation is reviewed.
 #[allow(dead_code)]
 fn evaluate_collector_ingest_precommit(
@@ -162,6 +293,25 @@ fn evaluate_collector_ingest_precommit(
     estimated_allowance_bytes: u64,
     filesystem_free_bytes: u64,
 ) -> Result<(), CollectorIngestPrecommitError> {
+    evaluate_storage_precommit(
+        observation,
+        observation.report_reserved_bytes,
+        estimated_allowance_bytes,
+        filesystem_free_bytes,
+        StorageOperation::Ingest,
+    )
+    .map_err(|_| CollectorIngestPrecommitError::Denied)
+}
+
+// Shared only by the two concrete dormant CLI collector guards.
+#[allow(dead_code)]
+fn evaluate_storage_precommit(
+    observation: &AllOwnerStorageObservation,
+    reserved_total_bytes: u64,
+    estimated_allowance_bytes: u64,
+    filesystem_free_bytes: u64,
+    operation: StorageOperation,
+) -> Result<(), StorageAdmissionRejection> {
     evaluate_storage_admission_with_reserved_total(
         &observation.storage_budget_policy,
         StorageAllocationSnapshotV1 {
@@ -170,13 +320,30 @@ fn evaluate_collector_ingest_precommit(
             unknown_bytes: observation.allocation.unknown_bytes,
             unknown_entry_count: observation.allocation.unknown_entry_count,
         },
-        observation.report_reserved_bytes,
+        reserved_total_bytes,
         Some(estimated_allowance_bytes),
         filesystem_free_bytes,
-        StorageOperation::Ingest,
+        operation,
     )
     .map(|_| ())
-    .map_err(|_| CollectorIngestPrecommitError::Denied)
+}
+
+// Called only by the dormant report guard and its focused tests until activation is reviewed.
+#[allow(dead_code)]
+fn evaluate_report_precommit(
+    observation: &AllOwnerStorageObservation,
+    reserved_total_bytes: u64,
+    estimated_allowance_bytes: u64,
+    filesystem_free_bytes: u64,
+) -> Result<(), CollectorReportPrecommitError> {
+    evaluate_storage_precommit(
+        observation,
+        reserved_total_bytes,
+        estimated_allowance_bytes,
+        filesystem_free_bytes,
+        StorageOperation::Report,
+    )
+    .map_err(|_| CollectorReportPrecommitError::Denied)
 }
 
 /// Composes all currently supported ownership evidence under one caller-owned freeze.
@@ -625,6 +792,26 @@ mod tests {
                     )
                     .map_err(|_| ())
                 },
+            )
+        }
+
+        fn check_report_precommit(
+            &self,
+            freeze: &OwnedStorageFreezeGuard<'_>,
+            config: &LocalRuntimeConfigV3,
+            estimated_allowance: u64,
+            validated_self_reservation_bytes: Option<u64>,
+        ) -> Result<(), CollectorReportPrecommitError> {
+            let (codex, launch) = self.captures();
+            check_cli_collector_report_precommit_with(
+                &self.layout,
+                freeze,
+                config,
+                estimated_allowance,
+                validated_self_reservation_bytes,
+                &codex,
+                launch.as_ref(),
+                OwnedStorageFreezeGuard::available_space,
             )
         }
 
@@ -1311,5 +1498,187 @@ mod tests {
             },
         );
         assert_eq!(result, Err(CollectorIngestPrecommitError::Unavailable));
+    }
+
+    #[test]
+    fn report_precommit_uses_full_start_reservation_self_exclusion_and_report_operation() {
+        const MIB: u64 = 1_048_576;
+        let observation = AllOwnerStorageObservation {
+            allocation: StorageAllocationObservationV1 {
+                retained_bytes: 256 * MIB,
+                workspace_bytes: 64 * MIB,
+                unknown_bytes: 0,
+                unknown_entry_count: 0,
+            },
+            report_reserved_bytes: 128 * MIB,
+            config_revision: "revision".into(),
+            storage_budget_policy: StorageBudgetPolicyV1 {
+                mode: StorageBudgetMode::Separated,
+                retained_target_bytes: 256 * MIB,
+                workspace_budget_bytes: 256 * MIB,
+                minimum_free_bytes: 256 * MIB,
+            },
+        };
+        let allowance = 192 * MIB;
+        let free = 448 * MIB;
+
+        assert_eq!(
+            evaluate_report_precommit(
+                &observation,
+                observation.report_reserved_bytes,
+                allowance,
+                free,
+            ),
+            Err(CollectorReportPrecommitError::Denied)
+        );
+        assert_eq!(
+            evaluate_report_precommit(&observation, 0, allowance, free),
+            Ok(())
+        );
+        assert_eq!(
+            evaluate_report_precommit(&observation, 0, allowance + 1, free + 1),
+            Err(CollectorReportPrecommitError::Denied)
+        );
+    }
+
+    #[test]
+    fn report_precommit_maps_underflow_revision_unknown_and_observation_failures() {
+        let fixture = Fixture::new("report-precommit-errors");
+        let config = fixture.separated_config();
+        let freeze = fixture.freeze();
+        assert_eq!(
+            fixture.check_report_precommit(&freeze, &config, 1, Some(1)),
+            Err(CollectorReportPrecommitError::Unavailable)
+        );
+        let mut stale = config.clone();
+        stale.enabled = !stale.enabled;
+        assert_eq!(
+            fixture.check_report_precommit(&freeze, &stale, 1, None),
+            Err(CollectorReportPrecommitError::Unavailable)
+        );
+
+        let unknown = Fixture::new("report-precommit-unknown");
+        let unknown_config = unknown.separated_config();
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(unknown.layout.logs.join("unknown.empty"))
+            .unwrap();
+        let unknown_freeze = unknown.freeze();
+        assert_eq!(
+            unknown.check_report_precommit(&unknown_freeze, &unknown_config, 1, None),
+            Err(CollectorReportPrecommitError::Denied)
+        );
+
+        let wrong = Fixture::new("report-precommit-wrong-observation");
+        let wrong_freeze = wrong.freeze();
+        assert_eq!(
+            fixture.check_report_precommit(&wrong_freeze, &config, 1, None),
+            Err(CollectorReportPrecommitError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn report_precommit_postchecks_override_denial_and_probe_unavailability() {
+        for probe_unavailable in [false, true] {
+            let fixture = Fixture::new(if probe_unavailable {
+                "report-precommit-probe-postcheck"
+            } else {
+                "report-precommit-denied-postcheck"
+            });
+            let config = fixture.separated_config();
+            if !probe_unavailable {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(fixture.layout.logs.join("unknown.empty"))
+                    .unwrap();
+            }
+            let freeze = fixture.freeze();
+            let (codex, launch) = fixture.captures();
+            let result = check_cli_collector_report_precommit_with(
+                &fixture.layout,
+                &freeze,
+                &config,
+                1,
+                None,
+                &codex,
+                launch.as_ref(),
+                |_| {
+                    let replacement = fixture.layout.root.join("replacement-config.json");
+                    fs::write(&replacement, fs::read(&fixture.layout.config).unwrap()).unwrap();
+                    fs::rename(replacement, &fixture.layout.config).unwrap();
+                    if probe_unavailable {
+                        Err(agent_observability_local_runtime::storage_coherence::StorageCoherenceError::Io(
+                            std::io::ErrorKind::Other,
+                        ))
+                    } else {
+                        Ok(u64::MAX)
+                    }
+                },
+            );
+            assert_eq!(result, Err(CollectorReportPrecommitError::Unavailable));
+        }
+    }
+
+    #[test]
+    fn dormant_report_trait_entries_use_current_read_only_evidence_facades() {
+        let start_fixture = Fixture::new("report-precommit-start-trait-entry");
+        let start_config = start_fixture.separated_config();
+        let start_freeze = start_fixture.freeze();
+        assert_eq!(
+            CollectorReportPrecommitGuard::check_start(
+                &CliCollectorReportPrecommitGuard,
+                &start_fixture.layout,
+                &start_freeze,
+                &start_config,
+                1,
+            ),
+            Ok(())
+        );
+
+        let fixture = Fixture::new("report-precommit-publication-trait-entry");
+        let legacy_config = load(&fixture.layout.config).unwrap();
+        let control = RuntimeControl::new(&legacy_config).unwrap();
+        let freeze = fixture.freeze();
+        let reservation = control
+            .reserve_report_build(&fixture.layout.root, freeze.mutation(), 8192)
+            .unwrap();
+        let validated_self = control
+            .validated_report_reservation_bytes(
+                &fixture.layout.root,
+                freeze.mutation(),
+                &reservation,
+            )
+            .unwrap();
+        assert_eq!(validated_self, 8192);
+        let config = fixture.separated_config();
+        assert_eq!(
+            CollectorReportPrecommitGuard::check_publication(
+                &CliCollectorReportPrecommitGuard,
+                &fixture.layout,
+                &freeze,
+                &config,
+                1,
+                0,
+            ),
+            Err(CollectorReportPrecommitError::Unavailable)
+        );
+        assert_eq!(
+            CollectorReportPrecommitGuard::check_publication(
+                &CliCollectorReportPrecommitGuard,
+                &fixture.layout,
+                &freeze,
+                &config,
+                1,
+                validated_self,
+            ),
+            Ok(())
+        );
+        reservation
+            .release(&fixture.layout.root, freeze.mutation())
+            .unwrap();
     }
 }
