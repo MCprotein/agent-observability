@@ -442,6 +442,26 @@ pub fn with_report_view_ownership_observation<T>(
     Ok(result)
 }
 
+// The enclosing storage ownership observation retains and revalidates the store directory.
+pub(crate) fn with_optional_report_view_ownership_observation<T>(
+    store: &LocalStore,
+    use_observation: impl FnOnce(Option<&ReportViewOwnershipObservation<'_>>) -> T,
+) -> Result<T, ReportViewCatalogError> {
+    let directory = managed_report_view_path(store).map_err(ReportViewCatalogError::Build)?;
+    match fs::symlink_metadata(&directory) {
+        Ok(_) => with_report_view_ownership_observation(store, |view| use_observation(Some(view))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let result = use_observation(None);
+            match fs::symlink_metadata(&directory) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(result),
+                Err(error) => Err(error.into()),
+                Ok(_) => Err(ReportViewCatalogError::InvalidCatalog),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Publishes a complete staging database as an immutable current snapshot.
 ///
 /// The staging handle retains the nonblocking publication guard through the immutable rename,
@@ -1480,6 +1500,152 @@ mod tests {
     fn build(store: &LocalStore) -> ReportViewStaging {
         crate::build_report_view_staging(store, MISSING_RATE_FINGERPRINT, TEST_ADMISSION, None)
             .unwrap()
+    }
+
+    #[test]
+    fn nested_optional_ownership_preserves_absence_and_rejects_appearance() {
+        let (directory, store) = open_store("nested-absent");
+        let managed = directory.join(MANAGED_DIRECTORY_NAME);
+        crate::storage_ownership::with_optional_report_reader_storage_ownership(
+            &directory,
+            |owner| {
+                owner
+                    .unwrap()
+                    .with_report_view_ownership_observation(|view| {
+                        assert!(view.is_none());
+                    })
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!managed.exists());
+        assert!(!directory.join(REPORT_RENDER_LOCK_NAME).exists());
+        let result =
+            crate::storage_ownership::with_storage_ownership_observation(&store, |owner| {
+                owner.with_report_view_ownership_observation(|view| {
+                    assert!(view.is_none());
+                    fs::create_dir(&managed).unwrap();
+                })
+            })
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(ReportViewCatalogError::InvalidCatalog)
+        ));
+        assert!(managed.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn nested_optional_ownership_preserves_published_membership() {
+        let (directory, store) = open_store("nested-membership");
+        publish_report_view(&store, build(&store)).unwrap();
+        store.invalidate_report().unwrap();
+        publish_report_view(&store, build(&store)).unwrap();
+        crate::storage_ownership::with_optional_report_reader_storage_ownership(
+            &directory,
+            |owner| {
+                owner
+                    .unwrap()
+                    .with_report_view_ownership_observation(|view| {
+                        let view = view.unwrap();
+                        assert_eq!(
+                            view.entries()
+                                .map(ReportViewOwnedEntry::kind)
+                                .collect::<BTreeSet<_>>(),
+                            BTreeSet::from([
+                                ReportViewOwnedEntryKind::ManagedDirectory,
+                                ReportViewOwnedEntryKind::Catalog,
+                                ReportViewOwnedEntryKind::CurrentSnapshot,
+                                ReportViewOwnedEntryKind::RetiredSnapshot
+                            ])
+                        );
+                        for entry in view.entries() {
+                            assert!(
+                                view.recognizes(entry.path(), &File::open(entry.path()).unwrap())
+                                    .unwrap()
+                            );
+                        }
+                    })
+            },
+        )
+        .unwrap()
+        .unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn nested_optional_ownership_keeps_present_store_errors() {
+        let (directory, store) = open_store("nested-errors");
+        publish_report_view(&store, build(&store)).unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE metadata SET value='1' WHERE key='report_visibility_epoch'",
+                [],
+            )
+            .unwrap();
+        let result =
+            crate::storage_ownership::with_storage_ownership_observation(&store, |owner| {
+                owner.with_report_view_ownership_observation(|_| panic!("stale view accepted"))
+            })
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(ReportViewCatalogError::RefreshPending)
+        ));
+        store
+            .db
+            .execute(
+                "UPDATE metadata SET value='0' WHERE key='report_visibility_epoch'",
+                [],
+            )
+            .unwrap();
+        fs::remove_file(directory.join(REPORT_RENDER_LOCK_NAME)).unwrap();
+        let result =
+            crate::storage_ownership::with_storage_ownership_observation(&store, |owner| {
+                owner.with_report_view_ownership_observation(|_| panic!("missing lock accepted"))
+            })
+            .unwrap();
+        assert!(result.is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_optional_ownership_rejects_replacement_symlink_and_invalid_catalog() {
+        let (directory, store) = open_store("nested-invalid");
+        publish_report_view(&store, build(&store)).unwrap();
+        let managed = directory.join(MANAGED_DIRECTORY_NAME);
+        let displaced = directory.join("displaced-view");
+        let result =
+            crate::storage_ownership::with_storage_ownership_observation(&store, |owner| {
+                owner.with_report_view_ownership_observation(|view| {
+                    assert!(view.is_some());
+                    fs::rename(&managed, &displaced).unwrap();
+                    fs::create_dir(&managed).unwrap();
+                })
+            })
+            .unwrap();
+        assert!(result.is_err());
+        fs::remove_dir(&managed).unwrap();
+        std::os::unix::fs::symlink(&displaced, &managed).unwrap();
+        let result =
+            crate::storage_ownership::with_storage_ownership_observation(&store, |owner| {
+                owner.with_report_view_ownership_observation(|_| panic!("invalid path accepted"))
+            })
+            .unwrap();
+        assert!(result.is_err());
+        fs::remove_file(&managed).unwrap();
+        fs::rename(&displaced, &managed).unwrap();
+        fs::write(managed.join(CATALOG_FILE_NAME), b"invalid catalog").unwrap();
+        let result =
+            crate::storage_ownership::with_storage_ownership_observation(&store, |owner| {
+                owner.with_report_view_ownership_observation(|_| panic!("invalid catalog accepted"))
+            })
+            .unwrap();
+        assert!(result.is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

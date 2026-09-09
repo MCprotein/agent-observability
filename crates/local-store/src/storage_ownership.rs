@@ -128,6 +128,28 @@ impl fmt::Debug for StorageOwnershipObservation<'_> {
 }
 
 impl StorageOwnershipObservation<'_> {
+    /// Observes optional published report-view ownership within this authority observation.
+    ///
+    /// The caller must retain the external all-writer freeze throughout this call. Only the exact
+    /// managed-directory absence produces `None`; present entries use the existing catalog checks.
+    /// No store connection or write capability is exposed to the callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when store authority, report-view authority, or final absence changes.
+    pub fn with_report_view_ownership_observation<T>(
+        &self,
+        use_observation: impl FnOnce(Option<&crate::ReportViewOwnershipObservation<'_>>) -> T,
+    ) -> Result<T, crate::ReportViewCatalogError> {
+        self.validate_authority()?;
+        let result = crate::report_view_catalog::with_optional_report_view_ownership_observation(
+            self.store,
+            use_observation,
+        );
+        self.validate_authority()?;
+        result
+    }
+
     /// Enumerates only exact entries validated for this observation.
     #[must_use]
     pub fn entries(&self) -> impl ExactSizeIterator<Item = StorageOwnedEntry<'_>> {
