@@ -399,14 +399,19 @@ trait 자체가 구현체의 I/O·대기·변경을 컴파일 시점에 금지�
 회귀 테스트로 고정했고, 새 함수도 소유권·동시성·쓰기 권한이나 예약 해제를 증명하지
 않는다. 독립 코드 APPROVE / 아키텍처 CLEAR 범위이며 운영 모드 활성화는 별도다.
 
-다음 filesystem 여유 D 연결은 기존 owned freeze가 소유한 정확한 root에서 기존 `fs2`
+filesystem 여유 D 관측은 `9c2dbe1`에서 기존 owned freeze가 소유한 정확한 root의 `fs2`
 조회만 수행한다. 조회 전후 guard identity를 확인하고 I/O 실패를 0이나 이전 값으로
 대체하지 않는다. 0은 실제 관측값으로 유지한다. 별도 잠금·cache·새 dependency를 만들지
 않으며, 다른 앱의 디스크 사용을 잠그거나 미래의 여유를 보장하는 API로 표시하지 않는다.
-원자적인 전체 기기 snapshot이나 쓰기 허가가 아닌 P3의 관측 경계로 구현·검증한다.
+원자적인 전체 기기 snapshot이나 쓰기 허가가 아닌 P3의 관측 경계다. 독립 코드 APPROVE /
+아키텍처 CLEAR를 받았고, 조회의 WouldBlock·NotFound도 잠금 경합이나 barrier 누락이 아닌
+조회 I/O 오류로 유지한다. 실제 admission 연결과 자원 검증은 남아 있다.
 
-다음 E 증분은 `control.rs`의 기존 `allocated_tree_bytes_strict(state/store) +
-max_batch_bytes` 산정만 공통 함수로 분리한다. 기존 legacy 진단도 같은 함수와 한 번의
-store scan을 사용하며, 없는 store의 비생성·checked overflow·경로 오류 계약을 유지한다.
+E 증분 `1f5e6f6`은 `control.rs`의 기존 `allocated_tree_bytes_strict(state/store) +
+max_batch_bytes` 산정만 공통 함수로 분리했다. 기존 legacy 진단도 같은 함수를 사용해
+E 산정 전용 `state/store` 순회를 한 번 수행한다. 이후 store를 포함하는 기존 전체 root
+headroom 순회는 그대로 유지하며, 없는 store의 비생성·checked overflow·경로 오류 계약을 보존한다.
 모드와 무관한 수치 산정 API이지 config 로딩의 분리 모드 차단을 우회하는 API가 아니다.
-실제 collector guard 배선보다 먼저 이 하한의 동일성을 회귀로 검증한다.
+실제 collector guard 배선보다 먼저 기존 추정값의 동일성을 회귀로 검증했고 독립 코드
+APPROVE / 아키텍처 CLEAR를 받았다. 집행 시 root mutation뿐 아니라 초기화된 exclusive
+all-writer freeze를 모든 snapshot 입력·판정·commit/rollback 동안 유지해야 한다.
