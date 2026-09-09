@@ -89,22 +89,43 @@ pub(super) fn migrate(db: &Connection, path: &Path, admitted: u64) -> Result<(),
 }
 
 pub(super) fn open_private_journal(path: &Path) -> Result<Option<fs::File>, StoreError> {
-    match fs::symlink_metadata(path) {
+    open_private_journal_observing(path, || {})
+}
+
+fn open_private_journal_observing(
+    path: &Path,
+    before_open: impl FnOnce(),
+) -> Result<Option<fs::File>, StoreError> {
+    let initial_metadata = match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
         Ok(metadata) if metadata.file_type().is_symlink() => return Err(StoreError::Symlink),
         Ok(metadata) if !metadata.is_file() => return Err(StoreError::InvalidPath),
-        Ok(_) => {}
-    }
+        Ok(metadata) => metadata,
+    };
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(super::no_follow_flag());
+        options.custom_flags(super::no_follow_flag() | super::nonblocking_open_flag());
     }
+    before_open();
     let file = options.open(path)?;
     private_open_file(&file)?;
+    super::storage_ownership::validate_private_file_identity(path, &file)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened_metadata = file.metadata()?;
+        if initial_metadata.dev() != opened_metadata.dev()
+            || initial_metadata.ino() != opened_metadata.ino()
+        {
+            return Err(StoreError::InvalidPath);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = initial_metadata;
     Ok(Some(file))
 }
 
@@ -447,6 +468,105 @@ mod tests {
             assert_eq!(fs::read(target).unwrap(), b"preserve operator bytes");
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn journal_open_rejects_replacement_and_hardlink_alias_without_modification() {
+        for alias in [false, true] {
+            let (dir, path) = fixture(if alias {
+                "journal-open-hardlink"
+            } else {
+                "journal-open-replaced"
+            });
+            let journal = path.with_extension("sqlite3-journal");
+            let retained = dir.join("retained-journal");
+            let mut file = super::super::private_create_new(&journal).unwrap();
+            std::io::Write::write_all(&mut file, b"original journal bytes").unwrap();
+            drop(file);
+            let result = open_private_journal_observing(&journal, || {
+                if alias {
+                    fs::hard_link(&journal, &retained).unwrap();
+                } else {
+                    fs::rename(&journal, &retained).unwrap();
+                    let mut replacement = super::super::private_create_new(&journal).unwrap();
+                    std::io::Write::write_all(&mut replacement, b"replacement journal bytes")
+                        .unwrap();
+                }
+            });
+            assert!(
+                result.is_err(),
+                "journal open accepted replacement or alias"
+            );
+            assert_eq!(fs::read(&retained).unwrap(), b"original journal bytes");
+            assert_eq!(
+                fs::read(&journal).unwrap(),
+                if alias {
+                    b"original journal bytes".as_slice()
+                } else {
+                    b"replacement journal bytes".as_slice()
+                }
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn journal_open_rejects_fifo_swap_without_waiting_or_modification() {
+        use std::os::unix::fs::FileTypeExt;
+        const PROBE: &str = "AGENTOBS_JOURNAL_OPEN_FIFO_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "migration_admission::tests::journal_open_rejects_fifo_swap_without_waiting_or_modification",
+                ])
+                .env(PROBE, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("journal open blocked on FIFO replacement");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let (dir, path) = fixture("journal-open-fifo");
+        let journal = path.with_extension("sqlite3-journal");
+        let retained = dir.join("retained-journal");
+        let mut file = super::super::private_create_new(&journal).unwrap();
+        std::io::Write::write_all(&mut file, b"original journal bytes").unwrap();
+        drop(file);
+        assert!(
+            open_private_journal_observing(&journal, || {
+                fs::rename(&journal, &retained).unwrap();
+                assert!(
+                    std::process::Command::new("mkfifo")
+                        .args(["-m", "600"])
+                        .arg(&journal)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(retained).unwrap(), b"original journal bytes");
+        assert!(
+            fs::symlink_metadata(&journal)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
