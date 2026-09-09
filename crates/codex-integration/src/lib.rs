@@ -915,9 +915,23 @@ fn with_storage_writer<T>(
     root: &Path,
     operation: impl FnOnce() -> Result<T, IntegrationError>,
 ) -> Result<T, IntegrationError> {
+    with_storage_writer_observing(root, operation, || {})
+}
+
+fn with_storage_writer_observing<T>(
+    root: &Path,
+    operation: impl FnOnce() -> Result<T, IntegrationError>,
+    on_contention: impl FnOnce(),
+) -> Result<T, IntegrationError> {
     let barrier = StorageBarrier::open_if_initialized(root).map_err(IntegrationError::Storage)?;
-    let writer = StorageMutationWriter::acquire_exclusive(root, barrier.as_ref())
-        .map_err(IntegrationError::Storage)?;
+    // Integration is a foreground/manual workflow. Wait for the validated root
+    // mutation lock, then try accounting exclusion once. Never retry operation.
+    let writer = StorageMutationWriter::acquire_exclusive_waiting_for_root(
+        root,
+        barrier.as_ref(),
+        on_contention,
+    )
+    .map_err(IntegrationError::Storage)?;
     let result = operation();
     let verification = writer.revalidate();
     match verification {
@@ -2364,6 +2378,47 @@ mod tests {
 
     fn test_exporter_security(root: &Path) -> ExporterSecurity {
         ExporterSecurity::new(root.join("ca-certificate.pem"), "private-token").unwrap()
+    }
+
+    #[test]
+    fn foreground_storage_writer_waits_for_root_without_repeating_operation() {
+        use agent_observability_local_runtime::MutationGuard;
+        use std::sync::mpsc;
+        for coordinated in [false, true] {
+            let root = temporary_root("foreground-root-wait");
+            let layout = install(&root).unwrap();
+            if coordinated {
+                initialize_accounting(&root);
+            }
+            let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+            let (contended_tx, contended_rx) = mpsc::channel();
+            let (executed_tx, executed_rx) = mpsc::channel();
+            let thread_root = root.clone();
+            let child = thread::spawn(move || {
+                super::with_storage_writer_observing(
+                    &thread_root,
+                    || {
+                        executed_tx.send(()).unwrap();
+                        Ok(7)
+                    },
+                    || {
+                        contended_tx.send(()).unwrap();
+                    },
+                )
+            });
+            let contention = contended_rx.recv_timeout(Duration::from_secs(5));
+            let before_release = executed_rx.try_recv();
+            drop(mutation);
+            let result = child.join().unwrap();
+            fs::remove_dir_all(root).unwrap();
+            assert!(
+                contention.is_ok(),
+                "root contention must be observed before proceeding"
+            );
+            assert!(matches!(before_release, Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(result.unwrap(), 7);
+            assert_eq!(executed_rx.try_iter().count(), 1);
+        }
     }
 
     #[test]
