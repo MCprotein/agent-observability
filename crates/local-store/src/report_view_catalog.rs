@@ -634,6 +634,7 @@ fn with_report_view_snapshot_guarded<T>(
         .ok_or(ReportViewCatalogError::SnapshotExpired)?;
     let path = directory.join(&snapshot.file_name);
     private_file(&path)?;
+    validate_snapshot_journal_absence(&path)?;
     let connection = Connection::open_with_flags(
         &path,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -644,7 +645,9 @@ fn with_report_view_snapshot_guarded<T>(
     connection.pragma_update(None, "query_only", true)?;
     connection.pragma_update(None, "cache_size", -SQLITE_CACHE_KIB)?;
     let kernel = validate_snapshot_database(&connection, snapshot)?;
-    use_snapshot(&connection, snapshot, kernel)
+    let result = use_snapshot(&connection, snapshot, kernel);
+    validate_snapshot_journal_absence(&path)?;
+    result
 }
 
 /// Removes all report views before a caller advances visibility in a destructive transaction.
@@ -1293,6 +1296,7 @@ fn validate_catalog_snapshot_databases(
     {
         let path = directory.join(&snapshot.file_name);
         private_file(&path)?;
+        validate_snapshot_journal_absence(&path)?;
         let connection = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -1303,8 +1307,19 @@ fn validate_catalog_snapshot_databases(
         connection.pragma_update(None, "query_only", true)?;
         connection.pragma_update(None, "cache_size", -SQLITE_CACHE_KIB)?;
         validate_snapshot_database(&connection, snapshot)?;
+        validate_snapshot_journal_absence(&path)?;
     }
     Ok(())
+}
+
+fn validate_snapshot_journal_absence(path: &Path) -> Result<(), ReportViewCatalogError> {
+    // A missing snapshot or parent must not be mistaken for an absent sibling journal.
+    private_file(path)?;
+    match crate::migration_admission::open_private_journal(&path.with_extension("sqlite3-journal"))?
+    {
+        None => Ok(()),
+        Some(_) => Err(ReportViewCatalogError::InvalidCatalog),
+    }
 }
 
 fn validate_snapshot_database(
@@ -1500,6 +1515,151 @@ mod tests {
     fn build(store: &LocalStore) -> ReportViewStaging {
         crate::build_report_view_staging(store, MISSING_RATE_FINGERPRINT, TEST_ADMISSION, None)
             .unwrap()
+    }
+
+    #[test]
+    fn snapshot_journals_rejected_before_open_for_current_and_retired() {
+        let (directory, store) = open_store("snapshot-journal-preopen");
+        let first = publish_report_view(&store, build(&store)).unwrap();
+        store.invalidate_report().unwrap();
+        let second = publish_report_view(&store, build(&store)).unwrap();
+        for snapshot in [first.current(), second.current()] {
+            let path = directory
+                .join(MANAGED_DIRECTORY_NAME)
+                .join(&snapshot.file_name);
+            let original = fs::read(&path).unwrap();
+            let journal = path.with_extension("sqlite3-journal");
+            for bytes in [&[][..], &[0_u8; 28][..], b"malformed".as_slice()] {
+                use std::io::Write;
+                private_create_new(&journal)
+                    .unwrap()
+                    .write_all(bytes)
+                    .unwrap();
+                for invalid_database in [false, true] {
+                    if invalid_database {
+                        fs::write(&path, b"invalid database").unwrap();
+                    }
+                    let result =
+                        with_report_view_snapshot::<()>(&store, snapshot.view_id(), |_, _| {
+                            panic!("journal must prevent callback")
+                        });
+                    assert!(matches!(
+                        result,
+                        Err(ReportViewCatalogError::InvalidCatalog)
+                    ));
+                    assert!(matches!(
+                        with_report_view_ownership_observation(&store, |_| {
+                            panic!("journal must prevent ownership callback")
+                        }),
+                        Err(ReportViewCatalogError::InvalidCatalog)
+                    ));
+                    assert_eq!(fs::read(&journal).unwrap(), bytes);
+                    assert_eq!(
+                        fs::read(&path).unwrap(),
+                        if invalid_database {
+                            b"invalid database".to_vec()
+                        } else {
+                            original.clone()
+                        }
+                    );
+                }
+                fs::write(&path, &original).unwrap();
+                fs::remove_file(&journal).unwrap();
+            }
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn snapshot_callback_created_journals_are_rejected_and_preserved() {
+        let (directory, store) = open_store("snapshot-journal-callback");
+        let first = publish_report_view(&store, build(&store)).unwrap();
+        store.invalidate_report().unwrap();
+        let second = publish_report_view(&store, build(&store)).unwrap();
+        for snapshot in [first.current(), second.current()] {
+            let path = directory
+                .join(MANAGED_DIRECTORY_NAME)
+                .join(&snapshot.file_name);
+            let original = fs::read(&path).unwrap();
+            let journal = path.with_extension("sqlite3-journal");
+            let result = with_report_view_snapshot(&store, snapshot.view_id(), |_, _| {
+                drop(private_create_new(&journal).unwrap());
+                Ok(())
+            });
+            assert!(matches!(
+                result,
+                Err(ReportViewCatalogError::InvalidCatalog)
+            ));
+            assert_eq!(fs::read(&journal).unwrap(), b"");
+            fs::remove_file(&journal).unwrap();
+            let result = with_report_view_ownership_observation(&store, |_| {
+                drop(private_create_new(&journal).unwrap());
+            });
+            assert!(matches!(
+                result,
+                Err(ReportViewCatalogError::InvalidCatalog)
+            ));
+            assert_eq!(fs::read(&journal).unwrap(), b"");
+            assert_eq!(fs::read(&path).unwrap(), original);
+            fs::remove_file(&journal).unwrap();
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_journal_unsafe_entries_preserve_store_errors() {
+        let (directory, store) = open_store("snapshot-journal-unsafe");
+        let published = publish_report_view(&store, build(&store)).unwrap();
+        let path = directory
+            .join(MANAGED_DIRECTORY_NAME)
+            .join(&published.current().file_name);
+        let journal = path.with_extension("sqlite3-journal");
+        let target = directory.join("journal-target");
+        drop(private_create_new(&target).unwrap());
+        for kind in ["symlink", "hardlink", "directory"] {
+            match kind {
+                "symlink" => std::os::unix::fs::symlink(&target, &journal).unwrap(),
+                "hardlink" => fs::hard_link(&target, &journal).unwrap(),
+                _ => fs::create_dir(&journal).unwrap(),
+            }
+            let query =
+                with_report_view_snapshot::<()>(&store, published.current().view_id(), |_, _| {
+                    panic!("unsafe journal accepted")
+                });
+            let owner = with_report_view_ownership_observation(&store, |_| {
+                panic!("unsafe journal accepted")
+            });
+            for result in [query, owner] {
+                assert!(matches!(result, Err(ReportViewCatalogError::Store(_))));
+            }
+            assert!(fs::symlink_metadata(&journal).is_ok());
+            if kind == "directory" {
+                fs::remove_dir(&journal).unwrap();
+            } else {
+                fs::remove_file(&journal).unwrap();
+            }
+        }
+        assert_eq!(fs::read(&target).unwrap(), b"");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn snapshot_journal_postcheck_rejects_missing_parent() {
+        let (directory, store) = open_store("snapshot-journal-missing-parent");
+        let published = publish_report_view(&store, build(&store)).unwrap();
+        let managed = directory.join(MANAGED_DIRECTORY_NAME);
+        let displaced = directory.join("displaced-views");
+        let result = with_report_view_snapshot(&store, published.current().view_id(), |_, _| {
+            fs::rename(&managed, &displaced).unwrap();
+            Ok(())
+        });
+        assert!(matches!(
+            result,
+            Err(ReportViewCatalogError::Store(StoreError::Io(_)))
+        ));
+        assert!(displaced.is_dir());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
