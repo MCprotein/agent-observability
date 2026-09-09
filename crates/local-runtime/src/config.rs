@@ -19,6 +19,7 @@ const LEGACY_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v1";
 const PRIOR_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v2";
 const PREVIOUS_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v3";
 const LIFECYCLE_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v4";
+const MAX_CONFIG_FILE_BYTES: usize = 64 * 1024;
 static UPDATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,7 +343,10 @@ impl LocalConfigService {
     }
 
     pub fn read(&self) -> Result<VersionedLocalConfig, ConfigServiceError> {
-        let config = load(&self.layout.config).map_err(|_| ConfigServiceError::Unavailable)?;
+        let config = load(&self.layout.config).map_err(|error| match error {
+            ConfigError::InputTooLarge => ConfigServiceError::Invalid,
+            _ => ConfigServiceError::Unavailable,
+        })?;
         let revision = revision(&config).map_err(|_| ConfigServiceError::Unavailable)?;
         Ok(VersionedLocalConfig { config, revision })
     }
@@ -363,6 +367,7 @@ impl LocalConfigService {
                 crate::storage_coherence::StorageCoherenceError::Busy,
             ) => ConfigServiceError::Busy,
             ConfigError::Policy(_)
+            | ConfigError::InputTooLarge
             | ConfigError::UnsupportedVersion
             | ConfigError::StoragePolicyUnavailable => ConfigServiceError::Invalid,
             _ => ConfigServiceError::Unavailable,
@@ -551,6 +556,7 @@ fn map_accounting_error(error: ConfigError) -> ConfigAccountingEvidenceError {
         ConfigError::Symlink => ConfigAccountingEvidenceError::Symlink,
         ConfigError::UnsupportedPlatform => ConfigAccountingEvidenceError::UnsupportedPlatform,
         ConfigError::Json(_)
+        | ConfigError::InputTooLarge
         | ConfigError::Policy(_)
         | ConfigError::UnsupportedVersion
         | ConfigError::StoragePolicyUnavailable
@@ -735,6 +741,7 @@ pub fn inspect(root: &Path) -> Result<InstalledLayout, ConfigError> {
 
 #[derive(Debug)]
 pub enum ConfigError {
+    InputTooLarge,
     Io(io::Error),
     Json(serde_json::Error),
     Policy(PolicyError),
@@ -756,6 +763,9 @@ pub enum ConfigError {
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InputTooLarge => {
+                formatter.write_str("local runtime configuration input is too large")
+            }
             Self::Io(error) => write!(formatter, "local runtime configuration I/O error: {error}"),
             Self::Json(error) => write!(formatter, "invalid local runtime configuration: {error}"),
             Self::Policy(error) => error.fmt(formatter),
@@ -1014,9 +1024,15 @@ fn load_open_file(file: &mut File) -> Result<LocalRuntimeConfigV3, ConfigError> 
 }
 
 fn decode_open_file(file: &mut File) -> Result<LocalRuntimeConfigV3, ConfigError> {
-    let mut body = String::new();
-    file.read_to_string(&mut body)?;
-    LocalRuntimeConfigV3::from_json(&body)
+    let mut body = Vec::new();
+    file.take(MAX_CONFIG_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut body)?;
+    if body.len() > MAX_CONFIG_FILE_BYTES {
+        return Err(ConfigError::InputTooLarge);
+    }
+    let body = std::str::from_utf8(&body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    LocalRuntimeConfigV3::from_json(body)
 }
 
 pub fn save(guard: &ConfigMutationGuard, config: &LocalRuntimeConfigV3) -> Result<(), ConfigError> {
@@ -1248,7 +1264,9 @@ fn open_private_read(path: &Path) -> Result<File, ConfigError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let mut options = OpenOptions::new();
-    options.read(true).custom_flags(no_follow_flag());
+    options
+        .read(true)
+        .custom_flags(no_follow_flag() | crate::lock::nonblocking_flag());
     let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -1278,6 +1296,188 @@ const fn no_follow_flag() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn file_decode_enforces_byte_limit_without_changing_private_config() {
+        use std::io::Seek;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root("decode-byte-limit");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let config = load(&layout.config).unwrap();
+        let mut body = serde_json::to_vec(&config).unwrap();
+        body.resize(65_536, b' ');
+        fs::write(&layout.config, &body).unwrap();
+        assert_eq!(load(&layout.config).unwrap(), config);
+        let guard = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let evidence = ConfigAccountingEvidence::capture(&root, &guard).unwrap();
+        let mut file = open_private_read(&layout.config).unwrap();
+        // Grow after opening: the read limit must not depend on an earlier file size.
+        body.extend_from_slice(&[b' '; 32]);
+        fs::write(&layout.config, &body).unwrap();
+        assert!(matches!(
+            decode_open_file(&mut file),
+            Err(ConfigError::InputTooLarge)
+        ));
+        assert_eq!(file.stream_position().unwrap(), 65_537);
+        assert_eq!(
+            evidence.revalidate(),
+            Err(ConfigAccountingEvidenceError::InvalidConfig)
+        );
+        drop(evidence);
+        drop(guard);
+        body.truncate(65_537);
+        fs::write(&layout.config, &body).unwrap();
+        assert!(matches!(
+            load(&layout.config),
+            Err(ConfigError::InputTooLarge)
+        ));
+        assert_eq!(
+            LocalConfigService::new(&layout).read(),
+            Err(ConfigServiceError::Invalid)
+        );
+        let guard = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        assert_eq!(
+            ConfigAccountingEvidence::capture(&root, &guard).unwrap_err(),
+            ConfigAccountingEvidenceError::InvalidConfig
+        );
+        drop(guard);
+        assert_eq!(fs::read(&layout.config).unwrap(), body);
+        assert_eq!(
+            fs::metadata(&layout.config).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Oversized input has precedence over both malformed JSON and invalid UTF-8.
+        for first in [b'!', 0xff] {
+            body[0] = first;
+            fs::write(&layout.config, &body).unwrap();
+            assert!(matches!(
+                load(&layout.config),
+                Err(ConfigError::InputTooLarge)
+            ));
+            assert_eq!(fs::read(&layout.config).unwrap(), body);
+        }
+        assert_eq!(
+            ConfigError::InputTooLarge.to_string(),
+            "local runtime configuration input is too large"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn maximum_valid_config_serialization_fits_file_decode_limit() {
+        let config = LocalRuntimeConfigV5 {
+            enabled: false,
+            capture_private_codex_turn_details: false,
+            collection: CollectionPolicyV1 {
+                file_reconcile_interval_ms: 60_000,
+                flush_interval_ms: 60_000,
+                max_batch_records: 500,
+                max_batch_bytes: 2_097_152,
+                active_heartbeat_interval_ms: 300_000,
+                idle_heartbeat_interval_ms: 900_000,
+                local_storage_budget_bytes: 21_474_836_480,
+            },
+            retention: RetentionPolicyV1 {
+                max_record_age_days: 3_650,
+                max_archive_records: 100_000,
+                max_archive_bytes: 268_435_456,
+            },
+            lifecycle: StorageLifecyclePolicyV1 {
+                enabled: false,
+                hot_days: 3_649,
+                warm_days: 3_649,
+                delete_after_days: 3_650,
+                private_raw_days: 3_650,
+                maintenance_interval_seconds: 86_400,
+                max_traces_per_pass: 128,
+            },
+            storage_budget: StorageBudgetPolicyV1 {
+                mode: StorageBudgetMode::Separated,
+                retained_target_bytes: 21_474_836_480,
+                workspace_budget_bytes: 21_474_836_480,
+                minimum_free_bytes: 21_474_836_480,
+            },
+            ..LocalRuntimeConfigV5::default()
+        };
+        config.validate().unwrap();
+        let mut body = serde_json::to_vec_pretty(&config).unwrap();
+        body.push(b'\n');
+        assert!(body.len() < MAX_CONFIG_FILE_BYTES);
+        assert_eq!(
+            LocalRuntimeConfigV5::from_json(std::str::from_utf8(&body).unwrap()).unwrap(),
+            config
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_decode_rejects_invalid_utf8_and_json_without_mutation() {
+        let root = root("decode-invalid-input");
+        let layout = install(&root).unwrap();
+        fs::write(&layout.config, [0xff]).unwrap();
+        assert!(
+            matches!(load(&layout.config), Err(ConfigError::Io(error)) if error.kind() == io::ErrorKind::InvalidData)
+        );
+        assert_eq!(fs::read(&layout.config).unwrap(), [0xff]);
+        fs::write(&layout.config, b"{").unwrap();
+        assert!(matches!(load(&layout.config), Err(ConfigError::Json(_))));
+        assert_eq!(fs::read(&layout.config).unwrap(), b"{");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_decode_rejects_fifo_without_blocking() {
+        const PROBE: &str = "AGENTOBS_CONFIG_FIFO_PROBE";
+        if let Some(path) = std::env::var_os(PROBE) {
+            assert!(matches!(
+                load(Path::new(&path)),
+                Err(ConfigError::InvalidPath)
+            ));
+            return;
+        }
+        let root = root("decode-fifo");
+        let layout = install(&root).unwrap();
+        let fifo = root.join("config-fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let original = fs::read(&layout.config).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::file_decode_rejects_fifo_without_blocking",
+            ])
+            .env(PROBE, &fifo)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "config FIFO probe failed or exceeded hang guard"
+        );
+    }
 
     #[test]
     fn v4_migration_preserves_all_existing_values_and_selects_legacy() {
