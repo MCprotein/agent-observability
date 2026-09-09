@@ -202,7 +202,7 @@ try {
   const lifecycle = await mockCodexApi(lifecyclePage, {
     startConflicted: true,
     failConnect: true,
-    conflictDisconnect: true,
+    uncertainDisconnect: true,
   });
   let dashboardFailures = 1;
   let dashboardOpenCount = 0;
@@ -320,8 +320,13 @@ try {
   await lifecyclePage.locator("#toast").filter({ hasText: "모니터링 리포트를 열었습니다" }).waitFor();
   assert.equal(dashboardOpenCount, 2);
 
+  const disconnectAttemptIndex = lifecycle.methods.length;
   await lifecyclePage.locator("#toggle-integration").click();
-  await lifecyclePage.locator("#toast").filter({ hasText: "injected disconnect conflict" }).waitFor();
+  await lifecyclePage
+    .locator("#toast")
+    .filter({ hasText: "변경 또는 복원 결과를 확정할 수 없습니다. 현재 상태를 다시 확인해야 합니다. 현재 상태를 다시 확인했습니다." })
+    .waitFor();
+  assert.deepEqual(lifecycle.methods.slice(disconnectAttemptIndex), ["DELETE", "GET"]);
   assert.equal(lifecycle.status.config, "connected");
   assert.equal(lifecycle.launchAgentRunning, true);
   assert.equal(await lifecyclePage.locator("#toggle-integration").isEnabled(), true);
@@ -352,16 +357,27 @@ try {
       startConnected: lifecycleMethod === "DELETE",
       delayedMethod: lifecycleMethod,
     });
+    let finishShutdown: (() => void) | undefined;
+    const shutdownRelease = new Promise<void>((resolve) => {
+      finishShutdown = resolve;
+    });
     await delayedLifecyclePage.route(`${origin}/api/shutdown`, async (route) => {
+      await shutdownRelease;
       await route.fulfill({ status: 204 });
     });
     await delayedLifecyclePage.goto(url, { waitUntil: "networkidle" });
     await delayedLifecyclePage.locator("#toggle-integration").click();
     await delayedLifecycle.waitForStart();
     await delayedLifecyclePage.locator("#close-session").click();
-    await delayedLifecyclePage.locator("text=설정 세션이 종료되었습니다").waitFor();
     delayedLifecycle.complete();
     await delayedLifecycle.waitForCompletion();
+    assert.equal(
+      await delayedLifecyclePage.locator("button:not(#close-session):enabled").count(),
+      0,
+    );
+    if (!finishShutdown) throw new Error("shutdown release was not initialized");
+    finishShutdown();
+    await delayedLifecyclePage.locator("text=설정 세션이 종료되었습니다").waitFor();
     await delayedLifecyclePage.evaluate(() => new Promise<void>((resolve) => {
       requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
     }));
@@ -369,6 +385,127 @@ try {
     assert.equal(await delayedLifecyclePage.locator("#overview-title").count(), 0);
     assert.equal(await delayedLifecyclePage.evaluate(() => sessionStorage.length), 0);
     await delayedLifecyclePage.close();
+  }
+
+  for (const order of ["integration-first", "shutdown-first"] as const) {
+    const failedClosePage = await qaContext.newPage();
+    await failedClosePage.setViewportSize({ width: 1200, height: 800 });
+    const delayedIntegration = await mockCodexApi(failedClosePage, { delayedMethod: "POST" });
+    let releaseFailedShutdown: (() => void) | undefined;
+    const failedShutdownRelease = new Promise<void>((resolve) => {
+      releaseFailedShutdown = resolve;
+    });
+    await failedClosePage.route(`${origin}/api/shutdown`, async (route) => {
+      await failedShutdownRelease;
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "shutdown_failed", message: "injected shutdown failure" }),
+      });
+    });
+    await failedClosePage.goto(url, { waitUntil: "networkidle" });
+    await failedClosePage.locator("#toggle-integration").click();
+    await delayedIntegration.waitForStart();
+    await failedClosePage.locator("#close-session").click();
+
+    if (order === "integration-first") {
+      delayedIntegration.complete();
+      await delayedIntegration.waitForCompletion();
+      if (!releaseFailedShutdown) throw new Error("failed shutdown release was not initialized");
+      releaseFailedShutdown();
+    } else {
+      if (!releaseFailedShutdown) throw new Error("failed shutdown release was not initialized");
+      releaseFailedShutdown();
+    }
+
+    await failedClosePage.locator("#close-error").filter({ hasText: "다시 시도" }).waitFor();
+    assert.equal(await failedClosePage.locator("#close-dialog").getAttribute("open"), "");
+    assert.equal(await failedClosePage.locator("#confirm-close").isEnabled(), true);
+    assert.equal(await failedClosePage.locator("#save").isDisabled(), true);
+
+    if (order === "shutdown-first") {
+      delayedIntegration.complete();
+      await delayedIntegration.waitForCompletion();
+      await failedClosePage.locator("#close-error").filter({ hasText: "다시 시도" }).waitFor();
+      assert.equal(await failedClosePage.locator("#close-dialog").getAttribute("open"), "");
+      assert.equal(await failedClosePage.locator("#confirm-close").isEnabled(), true);
+      assert.equal(await failedClosePage.locator("#save").isDisabled(), true);
+    }
+    results.push({ name: `failed-close-${order}`, visibleRetry: true });
+    await failedClosePage.close();
+  }
+
+  for (const scenario of ["success", "error", "rebase"] as const) {
+    const saveRacePage = await qaContext.newPage();
+    await saveRacePage.setViewportSize({ width: 1200, height: 800 });
+    await mockCodexApi(saveRacePage);
+    await saveRacePage.route(`${origin}/api/shutdown`, async (route) => {
+      await route.fulfill({ status: 204 });
+    });
+    await saveRacePage.goto(url, { waitUntil: "networkidle" });
+    const envelope = await saveRacePage.evaluate(async () => {
+      const session = sessionStorage.getItem("agent-observability.settings.session.v1");
+      const response = await fetch("/api/config", {
+        headers: { "x-agent-observability-session": session ?? "" },
+      });
+      return response.json();
+    });
+    let markResponseStarted: (() => void) | undefined;
+    const responseStarted = new Promise<void>((resolve) => {
+      markResponseStarted = resolve;
+    });
+    let releaseResponse: (() => void) | undefined;
+    const responseRelease = new Promise<void>((resolve) => {
+      releaseResponse = resolve;
+    });
+    const configMethods: string[] = [];
+    await saveRacePage.route(`${origin}/api/config`, async (route) => {
+      const method = route.request().method();
+      configMethods.push(method);
+      if (method === "PUT" && scenario === "rebase") {
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({ code: "config_conflict", message: "injected conflict" }),
+        });
+        return;
+      }
+      markResponseStarted?.();
+      await responseRelease;
+      if (scenario === "error") {
+        await route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: JSON.stringify({ code: "save_failed", message: "injected late save failure" }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(envelope),
+      });
+    });
+    await saveRacePage.locator("#collection-max_batch_records").fill("124");
+    await saveRacePage.locator("#save").click();
+    await responseStarted;
+    await saveRacePage.locator("#close-session").click();
+    await saveRacePage.locator("#confirm-close").click();
+    await saveRacePage.locator("text=설정 세션이 종료되었습니다").waitFor();
+    if (!releaseResponse) throw new Error("save response release was not initialized");
+    releaseResponse();
+    await saveRacePage.evaluate(() => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    }));
+    assert.equal(await saveRacePage.locator("text=설정 세션이 종료되었습니다").count(), 1);
+    assert.equal(await saveRacePage.locator("#settings-form").count(), 0);
+    assert.equal(await saveRacePage.evaluate(() => sessionStorage.length), 0);
+    assert.deepEqual(
+      configMethods,
+      scenario === "rebase" ? ["PUT", "GET"] : ["PUT"],
+    );
+    results.push({ name: `close-during-save-${scenario}`, expiredUiRetained: true });
+    await saveRacePage.close();
   }
 
   const dashboardLauncherPage = await qaContext.newPage();
@@ -839,7 +976,7 @@ type MockCodexOptions = {
   startConflicted?: boolean;
   startConnected?: boolean;
   failConnect?: boolean;
-  conflictDisconnect?: boolean;
+  uncertainDisconnect?: boolean;
   delayedMethod?: "POST" | "DELETE";
   failStatus?: boolean;
   firstStatusUnavailable?: boolean;
@@ -873,7 +1010,7 @@ async function mockCodexApi(page: Page, options: MockCodexOptions = {}) {
     waitForCompletion: () => lifecycleCompletion,
   };
   let failConnect = options.failConnect ?? false;
-  let conflictDisconnect = options.conflictDisconnect ?? false;
+  let uncertainDisconnect = options.uncertainDisconnect ?? false;
   let firstStatusUnavailable = options.firstStatusUnavailable ?? false;
   let unavailableStatusCount = options.unavailableStatusCount ?? 0;
   await page.route("**/api/integrations/codex", async (route) => {
@@ -919,12 +1056,15 @@ async function mockCodexApi(page: Page, options: MockCodexOptions = {}) {
       });
       return;
     }
-    if (method === "DELETE" && conflictDisconnect) {
-      conflictDisconnect = false;
+    if (method === "DELETE" && uncertainDisconnect) {
+      uncertainDisconnect = false;
       await route.fulfill({
         status: 409,
         contentType: "application/json",
-        body: JSON.stringify({ code: "integration_conflict", message: "injected disconnect conflict" }),
+        body: JSON.stringify({
+          code: "integration_outcome_uncertain",
+          message: "변경 또는 복원 결과를 확정할 수 없습니다. 현재 상태를 다시 확인해야 합니다.",
+        }),
       });
       return;
     }

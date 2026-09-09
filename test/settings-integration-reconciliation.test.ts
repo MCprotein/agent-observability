@@ -15,7 +15,8 @@ test("failed integration mutation stays locked until status reconciles, or offer
       const status = new Promise((resolve) => { finishStatus = resolve; });
       const calls: string[] = [];
       const context = createContext({
-        busy: false, token: "session", integrationRequestGeneration: 0,
+        busy: false, closeInFlight: false, token: "session", sessionGeneration: 0,
+        integrationRequestGeneration: 0,
         integration: { config: method === "POST" ? "disconnected" : "connected" },
         integrationUnavailable: false, disabled: false,
         integrationApi: async (_path: string, init?: RequestInit) => {
@@ -26,6 +27,10 @@ test("failed integration mutation stays locked until status reconciles, or offer
           return { config: method === "POST" ? "connected" : "disconnected" };
         },
         messageOf: (error: Error) => error.message, showToast: () => {}, expireSession: () => {},
+        sessionIsCurrent: (session: { generation: number; token: string }) =>
+          session.generation === context.sessionGeneration &&
+          session.token === context.token &&
+          context.token !== "",
       });
       runInContext("function setBusy(value) { disabled = value; } function renderSettings() { disabled = busy; }", context);
       runInContext((await transform(functions, { loader: "ts", target: "es2022" })).code, context);

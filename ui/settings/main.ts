@@ -246,7 +246,12 @@ let revision = "";
 let integration: CodexIntegrationStatusV1 | null = null;
 let integrationUnavailable = false;
 let integrationRequestGeneration = 0;
+let sessionGeneration = 0;
 let busy = false;
+let closeInFlight = false;
+let closeFailureMessage = "";
+const buttonDisabledBeforeBusy = new WeakMap<HTMLButtonElement, boolean>();
+const inputDisabledBeforeClose = new WeakMap<HTMLInputElement, boolean>();
 let conflicted = false;
 let heartbeatTimer: number | undefined;
 let navigationObserver: IntersectionObserver | undefined;
@@ -276,23 +281,27 @@ async function bootstrap(): Promise<void> {
     renderExpired();
     return;
   }
+  const session = { generation: sessionGeneration, token };
   try {
     const envelope = await api<Envelope>("/api/config");
+    if (!sessionIsCurrent(session)) return;
     applyEnvelope(envelope);
     let shouldRenderSettings = false;
     try {
-      shouldRenderSettings = await loadInitialIntegrationStatus();
+      shouldRenderSettings = await loadInitialIntegrationStatus(session);
     } catch (error) {
+      if (!sessionIsCurrent(session)) return;
       const apiError = error as Error & { code?: string };
       if (apiError.code === "invalid_session") throw error;
       integration = null;
       integrationUnavailable = true;
       shouldRenderSettings = true;
     }
-    if (!token) return;
+    if (!sessionIsCurrent(session)) return;
     if (shouldRenderSettings) renderSettings();
     heartbeatTimer ??= window.setInterval(() => void heartbeat(), 20_000);
   } catch (error) {
+    if (!sessionIsCurrent(session)) return;
     const apiError = error as Error & { code?: string };
     if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
       expireSession();
@@ -302,20 +311,24 @@ async function bootstrap(): Promise<void> {
   }
 }
 
-async function loadInitialIntegrationStatus(): Promise<boolean> {
+async function loadInitialIntegrationStatus(
+  session: Readonly<{ generation: number; token: string }>,
+): Promise<boolean> {
   const generation = ++integrationRequestGeneration;
   try {
     const initial = await integrationApi("/api/integrations/codex");
-    const next = initial.config === "connected" && initial.collector === "unavailable"
-      ? await new Promise<void>((resolve) => window.setTimeout(resolve, INITIAL_INTEGRATION_RETRY_MS))
-        .then(() => integrationApi("/api/integrations/codex"))
-      : initial;
-    if (generation !== integrationRequestGeneration || !token) return false;
+    let next = initial;
+    if (initial.config === "connected" && initial.collector === "unavailable") {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, INITIAL_INTEGRATION_RETRY_MS));
+      if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return false;
+      next = await integrationApi("/api/integrations/codex");
+    }
+    if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return false;
     integration = next;
     integrationUnavailable = false;
     return true;
   } catch (error) {
-    if (generation !== integrationRequestGeneration) return false;
+    if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return false;
     throw error;
   }
 }
@@ -406,8 +419,10 @@ function renderSettings(focusTarget?: string): void {
   bindEvents();
   updateAllVisuals();
   updateDirtyState();
+  setBusy(busy);
   mountIcons();
-  if (focusTarget) {
+  const showingCloseFailure = renderCloseFailure();
+  if (focusTarget && !showingCloseFailure) {
     requestAnimationFrame(() => document.querySelector<HTMLElement>(`#${focusTarget}`)?.focus());
   }
 }
@@ -703,15 +718,15 @@ function bindEvents(): void {
 }
 
 async function toggleIntegration(): Promise<void> {
-  if (busy || !integration || integrationUnavailable) return;
-  const lifecycleToken = token;
+  if (busy || closeInFlight || !token || !integration || integrationUnavailable) return;
+  const session = { generation: sessionGeneration, token };
   const generation = ++integrationRequestGeneration;
   busy = true;
   setBusy(true);
   try {
     const method = integration.config === "connected" ? "DELETE" : "POST";
     const nextIntegration = await integrationApi("/api/integrations/codex", { method });
-    if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+    if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
     integration = nextIntegration;
     integrationUnavailable = false;
     busy = false;
@@ -721,17 +736,17 @@ async function toggleIntegration(): Promise<void> {
       "success",
     );
   } catch (error) {
-    if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+    if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
     integration = null;
     integrationUnavailable = true;
     // A failed response can follow a committed write. Keep mutations locked until GET settles.
     try {
       const next = await integrationApi("/api/integrations/codex");
-      if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+      if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
       integration = next;
       integrationUnavailable = false;
     } catch (statusError) {
-      if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+      if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
       if ((statusError as Error & { code?: string }).code === "invalid_session") {
         busy = false;
         expireSession();
@@ -747,20 +762,21 @@ async function toggleIntegration(): Promise<void> {
 }
 
 async function refreshIntegration(): Promise<void> {
-  if (busy) return;
+  if (busy || closeInFlight || !token) return;
+  const session = { generation: sessionGeneration, token };
   const generation = ++integrationRequestGeneration;
   busy = true;
   setBusy(true);
   try {
     const next = await integrationApi("/api/integrations/codex");
-    if (generation !== integrationRequestGeneration || !token) return;
+    if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return;
     integration = next;
     integrationUnavailable = false;
     busy = false;
     renderSettings("toggle-integration");
     showToast("Codex 자동 수집 상태를 확인했습니다.", "success");
   } catch (error) {
-    if (generation !== integrationRequestGeneration || !token) return;
+    if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return;
     busy = false;
     const apiError = error as Error & { code?: string };
     if (apiError.code === "invalid_session") {
@@ -775,20 +791,21 @@ async function refreshIntegration(): Promise<void> {
 }
 
 async function refreshIntegrationStatus(): Promise<void> {
-  if (busy || !persisted || !token) return;
+  if (busy || closeInFlight || !persisted || !token) return;
+  const session = { generation: sessionGeneration, token };
   const generation = ++integrationRequestGeneration;
   const previous = integration;
   const wasUnavailable = integrationUnavailable;
   try {
     const next = await integrationApi("/api/integrations/codex");
-    if (!token || generation !== integrationRequestGeneration) return;
+    if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
     integration = next;
     integrationUnavailable = false;
     if (wasUnavailable || !sameIntegrationStatus(previous, next)) {
       renderSettings();
     }
   } catch (error) {
-    if (generation !== integrationRequestGeneration) return;
+    if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return;
     const apiError = error as Error & { code?: string };
     if (apiError.code === "invalid_session") {
       expireSession();
@@ -816,11 +833,14 @@ function sameIntegrationStatus(
 }
 
 async function openDashboard(): Promise<void> {
-  if (busy) return;
+  if (busy || closeInFlight || !token) return;
+  const session = { generation: sessionGeneration, token };
   try {
     await api<void>("/api/dashboard/open", { method: "POST" });
+    if (!sessionIsCurrent(session)) return;
     showToast("모니터링 리포트를 열었습니다.", "success");
   } catch (error) {
+    if (!sessionIsCurrent(session)) return;
     showToast(messageOf(error), "error");
   }
 }
@@ -849,7 +869,7 @@ function trapDialogFocus(event: KeyboardEvent): void {
 
 function handleInput(event: Event): void {
   const input = event.target;
-  if (!(input instanceof HTMLInputElement) || !draft) return;
+  if (closeInFlight || !(input instanceof HTMLInputElement) || !draft) return;
   const path = input.dataset.path as FieldPath | undefined;
   if (!path) return;
   const value = Number(input.value);
@@ -861,7 +881,7 @@ function handleInput(event: Event): void {
 
 function handleEnabled(event: Event): void {
   const input = event.target;
-  if (!(input instanceof HTMLInputElement) || !draft) return;
+  if (closeInFlight || !(input instanceof HTMLInputElement) || !draft) return;
   draft.enabled = input.checked;
   setText(
     "enabled-copy",
@@ -872,7 +892,7 @@ function handleEnabled(event: Event): void {
 
 function handlePrivateDetails(event: Event): void {
   const input = event.target;
-  if (!(input instanceof HTMLInputElement) || !draft) return;
+  if (closeInFlight || !(input instanceof HTMLInputElement) || !draft) return;
   draft.capture_private_codex_turn_details = input.checked;
   setText(
     "private-details-copy",
@@ -885,7 +905,7 @@ function handlePrivateDetails(event: Event): void {
 
 function handleLifecycleEnabled(event: Event): void {
   const input = event.target;
-  if (!(input instanceof HTMLInputElement) || !draft) return;
+  if (closeInFlight || !(input instanceof HTMLInputElement) || !draft) return;
   draft.lifecycle.enabled = input.checked;
   setText(
     "lifecycle-enabled-copy",
@@ -957,16 +977,16 @@ function updateDirtyState(): void {
   document.querySelector<HTMLElement>("#save-band")?.classList.toggle("dirty", dirty);
   setText("save-title", conflicted ? "외부 변경 감지" : dirty ? `${changed.length + booleanChanges}개 변경` : "저장됨");
   setText("save-detail", conflicted ? "최신 설정을 다시 불러온 뒤 편집하세요." : dirty ? "저장 전까지 이 브라우저에만 유지됩니다." : "현재 설정과 같습니다.");
-  setDisabled("save", !dirty || busy || conflicted);
-  setDisabled("discard", !dirty || busy);
-  setDisabled("reset", busy);
+  setDisabled("save", !dirty || busy || closeInFlight || conflicted);
+  setDisabled("discard", !dirty || busy || closeInFlight);
+  setDisabled("reset", busy || closeInFlight);
   document.querySelectorAll<HTMLElement>("[data-field]").forEach((row) => {
     row.classList.toggle("changed", changed.includes(row.dataset.field as FieldPath));
   });
 }
 
 async function saveDraft(): Promise<void> {
-  if (!draft || busy || conflicted) return;
+  if (!draft || busy || closeInFlight || !token || conflicted) return;
   clearErrors();
   const form = document.querySelector<HTMLFormElement>("#settings-form");
   if (form && !form.checkValidity()) {
@@ -984,6 +1004,7 @@ async function saveDraft(): Promise<void> {
     showToast("허용 범위를 벗어난 값을 확인하세요.", "error");
     return;
   }
+  const session = { generation: sessionGeneration, token };
   busy = true;
   setBusy(true);
   try {
@@ -992,16 +1013,20 @@ async function saveDraft(): Promise<void> {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ config: draft, revision }),
     });
+    if (!sessionIsCurrent(session)) return;
     applyEnvelope(envelope);
     renderSettings("save-title");
     showToast("설정을 저장했습니다.", "success");
   } catch (error) {
+    if (!sessionIsCurrent(session)) return;
     const apiError = error as Error & { code?: string };
     if (apiError.code === "config_conflict") {
       try {
-        await rebaseDraftOnLatest();
+        await rebaseDraftOnLatest(session);
+        if (!sessionIsCurrent(session)) return;
         showToast("최신 설정을 불러와 내 변경만 다시 적용했습니다. 검토 후 저장하세요.", "error");
       } catch (rebaseError) {
+        if (!sessionIsCurrent(session)) return;
         const rebaseApiError = rebaseError as Error & { code?: string };
         if (
           rebaseApiError.code === "invalid_session" ||
@@ -1020,12 +1045,16 @@ async function saveDraft(): Promise<void> {
     }
   } finally {
     busy = false;
-    setBusy(false);
-    updateDirtyState();
+    if (sessionIsCurrent(session)) {
+      setBusy(false);
+      updateDirtyState();
+    }
   }
 }
 
-async function rebaseDraftOnLatest(): Promise<void> {
+async function rebaseDraftOnLatest(
+  session: Readonly<{ generation: number; token: string }>,
+): Promise<void> {
   if (!draft || !persisted) return;
   const localDraft = structuredClone(draft);
   const localBase = structuredClone(persisted);
@@ -1035,6 +1064,7 @@ async function rebaseDraftOnLatest(): Promise<void> {
     !== (localBase.capture_private_codex_turn_details ?? false);
   const lifecycleEnabledChanged = localDraft.lifecycle.enabled !== localBase.lifecycle.enabled;
   const latest = await api<Envelope>("/api/config");
+  if (!sessionIsCurrent(session)) return;
   applyEnvelope(latest);
   if (!draft) return;
   for (const path of changed) setValue(draft, path, getValue(localDraft, path));
@@ -1048,7 +1078,7 @@ async function rebaseDraftOnLatest(): Promise<void> {
 }
 
 function discardChanges(): void {
-  if (!persisted) return;
+  if (closeInFlight || !persisted) return;
   draft = structuredClone(persisted);
   conflicted = false;
   renderSettings("save-title");
@@ -1056,6 +1086,7 @@ function discardChanges(): void {
 }
 
 function openResetDialog(): void {
+  if (closeInFlight) return;
   document.querySelector<HTMLDialogElement>("#reset-dialog")?.showModal();
 }
 
@@ -1065,7 +1096,7 @@ function closeResetDialog(): void {
 }
 
 function resetDefaults(): void {
-  if (!defaults || !draft) return;
+  if (closeInFlight || !defaults || !draft) return;
   // P1 does not expose budget-mode controls: reset only the visible settings.
   draft = { ...structuredClone(defaults), storage_budget: structuredClone(draft.storage_budget) };
   closeResetDialog();
@@ -1074,16 +1105,20 @@ function resetDefaults(): void {
 }
 
 async function closeSession(): Promise<void> {
-  if (busy) return;
-  busy = true;
+  if (closeInFlight || !token) return;
+  const session = { generation: sessionGeneration, token };
+  closeInFlight = true;
+  closeFailureMessage = "";
   setBusy(true);
   setText("close-error", "");
   try {
     await api<void>("/api/shutdown", { method: "POST" });
+    if (!sessionIsCurrent(session)) return;
     if (persisted) draft = structuredClone(persisted);
     conflicted = false;
     expireSession();
   } catch (error) {
+    if (!sessionIsCurrent(session)) return;
     const apiError = error as Error & { code?: string };
     if (apiError.code === "invalid_session") {
       if (persisted) draft = structuredClone(persisted);
@@ -1091,18 +1126,28 @@ async function closeSession(): Promise<void> {
       expireSession();
       return;
     }
-    setText(
-      "close-error",
-      "세션을 닫지 못했습니다. 로컬 process 연결을 확인하고 다시 시도하세요.",
-    );
-    document.querySelector<HTMLButtonElement>("#confirm-close")?.focus();
+    closeFailureMessage =
+      "세션을 닫지 못했습니다. 로컬 process 연결을 확인하고 다시 시도하세요.";
   } finally {
-    busy = false;
-    if (token) {
-      setBusy(false);
+    closeInFlight = false;
+    if (sessionIsCurrent(session)) {
+      setBusy(busy);
       updateDirtyState();
+      renderCloseFailure();
     }
   }
+}
+
+function renderCloseFailure(): boolean {
+  if (!closeFailureMessage) return false;
+  const dialog = document.querySelector<HTMLDialogElement>("#close-dialog");
+  const retry = document.querySelector<HTMLButtonElement>("#confirm-close");
+  if (!dialog || !retry) return false;
+  setText("close-error", closeFailureMessage);
+  if (!dialog.open) dialog.showModal();
+  retry.disabled = false;
+  retry.focus();
+  return true;
 }
 
 function requestCloseSession(): void {
@@ -1114,25 +1159,37 @@ function requestCloseSession(): void {
 }
 
 function closeCloseDialog(): void {
+  closeFailureMessage = "";
   document.querySelector<HTMLDialogElement>("#close-dialog")?.close();
   document.querySelector<HTMLButtonElement>("#close-session")?.focus();
 }
 
 async function heartbeat(): Promise<void> {
-  if (Date.now() - lastUserActivity >= 60_000) return;
+  if (!token || closeInFlight || Date.now() - lastUserActivity >= 60_000) return;
+  const session = { generation: sessionGeneration, token };
   try {
     await api<void>("/api/heartbeat", { method: "POST" });
+    if (!sessionIsCurrent(session)) return;
     await refreshIntegrationStatus();
   } catch {
+    if (!sessionIsCurrent(session)) return;
     expireSession();
   }
 }
 
 function expireSession(): void {
   window.clearInterval(heartbeatTimer);
+  integrationRequestGeneration += 1;
+  sessionGeneration += 1;
   token = "";
   clearSessionToken();
   renderExpired();
+}
+
+function sessionIsCurrent(
+  session: Readonly<{ generation: number; token: string }>,
+): boolean {
+  return token !== "" && token === session.token && sessionGeneration === session.generation;
 }
 
 function readSessionToken(): string {
@@ -1228,10 +1285,38 @@ function applyEnvelope(envelope: Envelope): void {
 }
 
 function setBusy(value: boolean): void {
-  document.querySelector("#settings-form")?.setAttribute("aria-busy", String(value));
-  setText("save-title", value ? "저장 중" : "저장됨");
+  const blocked = value || closeInFlight;
+  document.querySelector("#settings-form")?.setAttribute("aria-busy", String(blocked));
+  if (blocked) setText("save-title", "저장 중");
   document.querySelectorAll<HTMLButtonElement>("button").forEach((button) => {
-    if (button.id !== "close-session") button.disabled = value;
+    if (button.id === "close-session") return;
+    if (button.id === "confirm-close" && !closeInFlight) {
+      if (buttonDisabledBeforeBusy.has(button)) {
+        button.disabled = buttonDisabledBeforeBusy.get(button)!;
+        buttonDisabledBeforeBusy.delete(button);
+      }
+      return;
+    }
+    if (blocked) {
+      if (!buttonDisabledBeforeBusy.has(button)) {
+        buttonDisabledBeforeBusy.set(button, button.disabled);
+      }
+      button.disabled = true;
+    } else if (buttonDisabledBeforeBusy.has(button)) {
+      button.disabled = buttonDisabledBeforeBusy.get(button)!;
+      buttonDisabledBeforeBusy.delete(button);
+    }
+  });
+  document.querySelectorAll<HTMLInputElement>("#settings-form input").forEach((input) => {
+    if (closeInFlight) {
+      if (!inputDisabledBeforeClose.has(input)) {
+        inputDisabledBeforeClose.set(input, input.disabled);
+      }
+      input.disabled = true;
+    } else if (inputDisabledBeforeClose.has(input)) {
+      input.disabled = inputDisabledBeforeClose.get(input)!;
+      inputDisabledBeforeClose.delete(input);
+    }
   });
 }
 

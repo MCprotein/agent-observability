@@ -1618,7 +1618,12 @@
   var integration = null;
   var integrationUnavailable = false;
   var integrationRequestGeneration = 0;
+  var sessionGeneration = 0;
   var busy = false;
+  var closeInFlight = false;
+  var closeFailureMessage = "";
+  var buttonDisabledBeforeBusy = /* @__PURE__ */ new WeakMap();
+  var inputDisabledBeforeClose = /* @__PURE__ */ new WeakMap();
   var conflicted = false;
   var heartbeatTimer;
   var navigationObserver;
@@ -1643,23 +1648,27 @@
       renderExpired();
       return;
     }
+    const session = { generation: sessionGeneration, token };
     try {
       const envelope = await api("/api/config");
+      if (!sessionIsCurrent(session)) return;
       applyEnvelope(envelope);
       let shouldRenderSettings = false;
       try {
-        shouldRenderSettings = await loadInitialIntegrationStatus();
+        shouldRenderSettings = await loadInitialIntegrationStatus(session);
       } catch (error) {
+        if (!sessionIsCurrent(session)) return;
         const apiError = error;
         if (apiError.code === "invalid_session") throw error;
         integration = null;
         integrationUnavailable = true;
         shouldRenderSettings = true;
       }
-      if (!token) return;
+      if (!sessionIsCurrent(session)) return;
       if (shouldRenderSettings) renderSettings();
       heartbeatTimer ??= window.setInterval(() => void heartbeat(), 2e4);
     } catch (error) {
+      if (!sessionIsCurrent(session)) return;
       const apiError = error;
       if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
         expireSession();
@@ -1668,17 +1677,22 @@
       }
     }
   }
-  async function loadInitialIntegrationStatus() {
+  async function loadInitialIntegrationStatus(session) {
     const generation = ++integrationRequestGeneration;
     try {
       const initial = await integrationApi("/api/integrations/codex");
-      const next = initial.config === "connected" && initial.collector === "unavailable" ? await new Promise((resolve) => window.setTimeout(resolve, INITIAL_INTEGRATION_RETRY_MS)).then(() => integrationApi("/api/integrations/codex")) : initial;
-      if (generation !== integrationRequestGeneration || !token) return false;
+      let next = initial;
+      if (initial.config === "connected" && initial.collector === "unavailable") {
+        await new Promise((resolve) => window.setTimeout(resolve, INITIAL_INTEGRATION_RETRY_MS));
+        if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return false;
+        next = await integrationApi("/api/integrations/codex");
+      }
+      if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return false;
       integration = next;
       integrationUnavailable = false;
       return true;
     } catch (error) {
-      if (generation !== integrationRequestGeneration) return false;
+      if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return false;
       throw error;
     }
   }
@@ -1765,8 +1779,10 @@
     bindEvents();
     updateAllVisuals();
     updateDirtyState();
+    setBusy(busy);
     mountIcons();
-    if (focusTarget) {
+    const showingCloseFailure = renderCloseFailure();
+    if (focusTarget && !showingCloseFailure) {
       requestAnimationFrame(() => document.querySelector(`#${focusTarget}`)?.focus());
     }
   }
@@ -2016,15 +2032,15 @@
     document.querySelectorAll(".settings-section").forEach((section) => navigationObserver?.observe(section));
   }
   async function toggleIntegration() {
-    if (busy || !integration || integrationUnavailable) return;
-    const lifecycleToken = token;
+    if (busy || closeInFlight || !token || !integration || integrationUnavailable) return;
+    const session = { generation: sessionGeneration, token };
     const generation = ++integrationRequestGeneration;
     busy = true;
     setBusy(true);
     try {
       const method = integration.config === "connected" ? "DELETE" : "POST";
       const nextIntegration = await integrationApi("/api/integrations/codex", { method });
-      if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+      if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
       integration = nextIntegration;
       integrationUnavailable = false;
       busy = false;
@@ -2034,16 +2050,16 @@
         "success"
       );
     } catch (error) {
-      if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+      if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
       integration = null;
       integrationUnavailable = true;
       try {
         const next = await integrationApi("/api/integrations/codex");
-        if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+        if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
         integration = next;
         integrationUnavailable = false;
       } catch (statusError) {
-        if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+        if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
         if (statusError.code === "invalid_session") {
           busy = false;
           expireSession();
@@ -2056,20 +2072,21 @@
     }
   }
   async function refreshIntegration() {
-    if (busy) return;
+    if (busy || closeInFlight || !token) return;
+    const session = { generation: sessionGeneration, token };
     const generation = ++integrationRequestGeneration;
     busy = true;
     setBusy(true);
     try {
       const next = await integrationApi("/api/integrations/codex");
-      if (generation !== integrationRequestGeneration || !token) return;
+      if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return;
       integration = next;
       integrationUnavailable = false;
       busy = false;
       renderSettings("toggle-integration");
       showToast("Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC\uB97C \uD655\uC778\uD588\uC2B5\uB2C8\uB2E4.", "success");
     } catch (error) {
-      if (generation !== integrationRequestGeneration || !token) return;
+      if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return;
       busy = false;
       const apiError = error;
       if (apiError.code === "invalid_session") {
@@ -2083,20 +2100,21 @@
     }
   }
   async function refreshIntegrationStatus() {
-    if (busy || !persisted || !token) return;
+    if (busy || closeInFlight || !persisted || !token) return;
+    const session = { generation: sessionGeneration, token };
     const generation = ++integrationRequestGeneration;
     const previous = integration;
     const wasUnavailable = integrationUnavailable;
     try {
       const next = await integrationApi("/api/integrations/codex");
-      if (!token || generation !== integrationRequestGeneration) return;
+      if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
       integration = next;
       integrationUnavailable = false;
       if (wasUnavailable || !sameIntegrationStatus(previous, next)) {
         renderSettings();
       }
     } catch (error) {
-      if (generation !== integrationRequestGeneration) return;
+      if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return;
       const apiError = error;
       if (apiError.code === "invalid_session") {
         expireSession();
@@ -2112,11 +2130,14 @@
     return left !== null && left.config === right.config && left.collector === right.collector && left.endpoint === right.endpoint && left.service === right.service && left.data_retained === right.data_retained && left.collector_degradation_reasons.length === right.collector_degradation_reasons.length && left.collector_degradation_reasons.every((reason) => rightReasons.includes(reason));
   }
   async function openDashboard() {
-    if (busy) return;
+    if (busy || closeInFlight || !token) return;
+    const session = { generation: sessionGeneration, token };
     try {
       await api("/api/dashboard/open", { method: "POST" });
+      if (!sessionIsCurrent(session)) return;
       showToast("\uBAA8\uB2C8\uD130\uB9C1 \uB9AC\uD3EC\uD2B8\uB97C \uC5F4\uC5C8\uC2B5\uB2C8\uB2E4.", "success");
     } catch (error) {
+      if (!sessionIsCurrent(session)) return;
       showToast(messageOf(error), "error");
     }
   }
@@ -2143,7 +2164,7 @@
   }
   function handleInput(event) {
     const input = event.target;
-    if (!(input instanceof HTMLInputElement) || !draft) return;
+    if (closeInFlight || !(input instanceof HTMLInputElement) || !draft) return;
     const path = input.dataset.path;
     if (!path) return;
     const value = Number(input.value);
@@ -2154,7 +2175,7 @@
   }
   function handleEnabled(event) {
     const input = event.target;
-    if (!(input instanceof HTMLInputElement) || !draft) return;
+    if (closeInFlight || !(input instanceof HTMLInputElement) || !draft) return;
     draft.enabled = input.checked;
     setText(
       "enabled-copy",
@@ -2164,7 +2185,7 @@
   }
   function handlePrivateDetails(event) {
     const input = event.target;
-    if (!(input instanceof HTMLInputElement) || !draft) return;
+    if (closeInFlight || !(input instanceof HTMLInputElement) || !draft) return;
     draft.capture_private_codex_turn_details = input.checked;
     setText(
       "private-details-copy",
@@ -2174,7 +2195,7 @@
   }
   function handleLifecycleEnabled(event) {
     const input = event.target;
-    if (!(input instanceof HTMLInputElement) || !draft) return;
+    if (closeInFlight || !(input instanceof HTMLInputElement) || !draft) return;
     draft.lifecycle.enabled = input.checked;
     setText(
       "lifecycle-enabled-copy",
@@ -2239,15 +2260,15 @@
     document.querySelector("#save-band")?.classList.toggle("dirty", dirty);
     setText("save-title", conflicted ? "\uC678\uBD80 \uBCC0\uACBD \uAC10\uC9C0" : dirty ? `${changed.length + booleanChanges}\uAC1C \uBCC0\uACBD` : "\uC800\uC7A5\uB428");
     setText("save-detail", conflicted ? "\uCD5C\uC2E0 \uC124\uC815\uC744 \uB2E4\uC2DC \uBD88\uB7EC\uC628 \uB4A4 \uD3B8\uC9D1\uD558\uC138\uC694." : dirty ? "\uC800\uC7A5 \uC804\uAE4C\uC9C0 \uC774 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uB9CC \uC720\uC9C0\uB429\uB2C8\uB2E4." : "\uD604\uC7AC \uC124\uC815\uACFC \uAC19\uC2B5\uB2C8\uB2E4.");
-    setDisabled("save", !dirty || busy || conflicted);
-    setDisabled("discard", !dirty || busy);
-    setDisabled("reset", busy);
+    setDisabled("save", !dirty || busy || closeInFlight || conflicted);
+    setDisabled("discard", !dirty || busy || closeInFlight);
+    setDisabled("reset", busy || closeInFlight);
     document.querySelectorAll("[data-field]").forEach((row) => {
       row.classList.toggle("changed", changed.includes(row.dataset.field));
     });
   }
   async function saveDraft() {
-    if (!draft || busy || conflicted) return;
+    if (!draft || busy || closeInFlight || !token || conflicted) return;
     clearErrors();
     const form = document.querySelector("#settings-form");
     if (form && !form.checkValidity()) {
@@ -2265,6 +2286,7 @@
       showToast("\uD5C8\uC6A9 \uBC94\uC704\uB97C \uBC97\uC5B4\uB09C \uAC12\uC744 \uD655\uC778\uD558\uC138\uC694.", "error");
       return;
     }
+    const session = { generation: sessionGeneration, token };
     busy = true;
     setBusy(true);
     try {
@@ -2273,16 +2295,20 @@
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ config: draft, revision })
       });
+      if (!sessionIsCurrent(session)) return;
       applyEnvelope(envelope);
       renderSettings("save-title");
       showToast("\uC124\uC815\uC744 \uC800\uC7A5\uD588\uC2B5\uB2C8\uB2E4.", "success");
     } catch (error) {
+      if (!sessionIsCurrent(session)) return;
       const apiError = error;
       if (apiError.code === "config_conflict") {
         try {
-          await rebaseDraftOnLatest();
+          await rebaseDraftOnLatest(session);
+          if (!sessionIsCurrent(session)) return;
           showToast("\uCD5C\uC2E0 \uC124\uC815\uC744 \uBD88\uB7EC\uC640 \uB0B4 \uBCC0\uACBD\uB9CC \uB2E4\uC2DC \uC801\uC6A9\uD588\uC2B5\uB2C8\uB2E4. \uAC80\uD1A0 \uD6C4 \uC800\uC7A5\uD558\uC138\uC694.", "error");
         } catch (rebaseError) {
+          if (!sessionIsCurrent(session)) return;
           const rebaseApiError = rebaseError;
           if (rebaseApiError.code === "invalid_session" || rebaseApiError.code === "network_failure") {
             expireSession();
@@ -2298,11 +2324,13 @@
       }
     } finally {
       busy = false;
-      setBusy(false);
-      updateDirtyState();
+      if (sessionIsCurrent(session)) {
+        setBusy(false);
+        updateDirtyState();
+      }
     }
   }
-  async function rebaseDraftOnLatest() {
+  async function rebaseDraftOnLatest(session) {
     if (!draft || !persisted) return;
     const localDraft = structuredClone(draft);
     const localBase = structuredClone(persisted);
@@ -2311,6 +2339,7 @@
     const privateDetailsChanged = (localDraft.capture_private_codex_turn_details ?? false) !== (localBase.capture_private_codex_turn_details ?? false);
     const lifecycleEnabledChanged = localDraft.lifecycle.enabled !== localBase.lifecycle.enabled;
     const latest = await api("/api/config");
+    if (!sessionIsCurrent(session)) return;
     applyEnvelope(latest);
     if (!draft) return;
     for (const path of changed) setValue(draft, path, getValue(localDraft, path));
@@ -2323,13 +2352,14 @@
     renderSettings("save-title");
   }
   function discardChanges() {
-    if (!persisted) return;
+    if (closeInFlight || !persisted) return;
     draft = structuredClone(persisted);
     conflicted = false;
     renderSettings("save-title");
     showToast("\uC800\uC7A5\uD558\uC9C0 \uC54A\uC740 \uBCC0\uACBD\uC744 \uCDE8\uC18C\uD588\uC2B5\uB2C8\uB2E4.", "neutral");
   }
   function openResetDialog() {
+    if (closeInFlight) return;
     document.querySelector("#reset-dialog")?.showModal();
   }
   function closeResetDialog() {
@@ -2337,23 +2367,27 @@
     document.querySelector("#reset")?.focus();
   }
   function resetDefaults() {
-    if (!defaults || !draft) return;
+    if (closeInFlight || !defaults || !draft) return;
     draft = { ...structuredClone(defaults), storage_budget: structuredClone(draft.storage_budget) };
     closeResetDialog();
     renderSettings("reset");
     showToast("\uAE30\uBCF8\uAC12\uC744 \uD3B8\uC9D1\uAC12\uC5D0 \uC801\uC6A9\uD588\uC2B5\uB2C8\uB2E4. \uC800\uC7A5\uD574\uC57C \uBC18\uC601\uB429\uB2C8\uB2E4.", "neutral");
   }
   async function closeSession() {
-    if (busy) return;
-    busy = true;
+    if (closeInFlight || !token) return;
+    const session = { generation: sessionGeneration, token };
+    closeInFlight = true;
+    closeFailureMessage = "";
     setBusy(true);
     setText("close-error", "");
     try {
       await api("/api/shutdown", { method: "POST" });
+      if (!sessionIsCurrent(session)) return;
       if (persisted) draft = structuredClone(persisted);
       conflicted = false;
       expireSession();
     } catch (error) {
+      if (!sessionIsCurrent(session)) return;
       const apiError = error;
       if (apiError.code === "invalid_session") {
         if (persisted) draft = structuredClone(persisted);
@@ -2361,18 +2395,26 @@
         expireSession();
         return;
       }
-      setText(
-        "close-error",
-        "\uC138\uC158\uC744 \uB2EB\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. \uB85C\uCEEC process \uC5F0\uACB0\uC744 \uD655\uC778\uD558\uACE0 \uB2E4\uC2DC \uC2DC\uB3C4\uD558\uC138\uC694."
-      );
-      document.querySelector("#confirm-close")?.focus();
+      closeFailureMessage = "\uC138\uC158\uC744 \uB2EB\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. \uB85C\uCEEC process \uC5F0\uACB0\uC744 \uD655\uC778\uD558\uACE0 \uB2E4\uC2DC \uC2DC\uB3C4\uD558\uC138\uC694.";
     } finally {
-      busy = false;
-      if (token) {
-        setBusy(false);
+      closeInFlight = false;
+      if (sessionIsCurrent(session)) {
+        setBusy(busy);
         updateDirtyState();
+        renderCloseFailure();
       }
     }
+  }
+  function renderCloseFailure() {
+    if (!closeFailureMessage) return false;
+    const dialog = document.querySelector("#close-dialog");
+    const retry = document.querySelector("#confirm-close");
+    if (!dialog || !retry) return false;
+    setText("close-error", closeFailureMessage);
+    if (!dialog.open) dialog.showModal();
+    retry.disabled = false;
+    retry.focus();
+    return true;
   }
   function requestCloseSession() {
     if (isDirty()) {
@@ -2382,23 +2424,32 @@
     }
   }
   function closeCloseDialog() {
+    closeFailureMessage = "";
     document.querySelector("#close-dialog")?.close();
     document.querySelector("#close-session")?.focus();
   }
   async function heartbeat() {
-    if (Date.now() - lastUserActivity >= 6e4) return;
+    if (!token || closeInFlight || Date.now() - lastUserActivity >= 6e4) return;
+    const session = { generation: sessionGeneration, token };
     try {
       await api("/api/heartbeat", { method: "POST" });
+      if (!sessionIsCurrent(session)) return;
       await refreshIntegrationStatus();
     } catch {
+      if (!sessionIsCurrent(session)) return;
       expireSession();
     }
   }
   function expireSession() {
     window.clearInterval(heartbeatTimer);
+    integrationRequestGeneration += 1;
+    sessionGeneration += 1;
     token = "";
     clearSessionToken();
     renderExpired();
+  }
+  function sessionIsCurrent(session) {
+    return token !== "" && token === session.token && sessionGeneration === session.generation;
   }
   function readSessionToken() {
     try {
@@ -2476,10 +2527,38 @@
     conflicted = false;
   }
   function setBusy(value) {
-    document.querySelector("#settings-form")?.setAttribute("aria-busy", String(value));
-    setText("save-title", value ? "\uC800\uC7A5 \uC911" : "\uC800\uC7A5\uB428");
+    const blocked = value || closeInFlight;
+    document.querySelector("#settings-form")?.setAttribute("aria-busy", String(blocked));
+    if (blocked) setText("save-title", "\uC800\uC7A5 \uC911");
     document.querySelectorAll("button").forEach((button) => {
-      if (button.id !== "close-session") button.disabled = value;
+      if (button.id === "close-session") return;
+      if (button.id === "confirm-close" && !closeInFlight) {
+        if (buttonDisabledBeforeBusy.has(button)) {
+          button.disabled = buttonDisabledBeforeBusy.get(button);
+          buttonDisabledBeforeBusy.delete(button);
+        }
+        return;
+      }
+      if (blocked) {
+        if (!buttonDisabledBeforeBusy.has(button)) {
+          buttonDisabledBeforeBusy.set(button, button.disabled);
+        }
+        button.disabled = true;
+      } else if (buttonDisabledBeforeBusy.has(button)) {
+        button.disabled = buttonDisabledBeforeBusy.get(button);
+        buttonDisabledBeforeBusy.delete(button);
+      }
+    });
+    document.querySelectorAll("#settings-form input").forEach((input) => {
+      if (closeInFlight) {
+        if (!inputDisabledBeforeClose.has(input)) {
+          inputDisabledBeforeClose.set(input, input.disabled);
+        }
+        input.disabled = true;
+      } else if (inputDisabledBeforeClose.has(input)) {
+        input.disabled = inputDisabledBeforeClose.get(input);
+        inputDisabledBeforeClose.delete(input);
+      }
     });
   }
   function showFieldError(path, message) {
