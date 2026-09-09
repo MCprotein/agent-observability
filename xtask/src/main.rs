@@ -1936,6 +1936,9 @@ enum AutomaticLifecycleStage {
     ConcurrentConnectWait,
     ConcurrentConnectOutput,
     ConcurrentConnectOutcome,
+    ConcurrentConnectConfigConflict,
+    ConcurrentConnectStoreBusy,
+    ConcurrentConnectBothBusy,
     ConcurrentConnectStorageBusy,
     ConcurrentConnectRuntimeBusy,
     ConcurrentConnectSuccessOutput,
@@ -1947,7 +1950,7 @@ enum AutomaticLifecycleStage {
 }
 
 impl AutomaticLifecycleStage {
-    const ALL: [Self; 33] = [
+    const ALL: [Self; 36] = [
         Self::Plist,
         Self::Status,
         Self::PreFailureOtlp,
@@ -1973,6 +1976,9 @@ impl AutomaticLifecycleStage {
         Self::ConcurrentConnectWait,
         Self::ConcurrentConnectOutput,
         Self::ConcurrentConnectOutcome,
+        Self::ConcurrentConnectConfigConflict,
+        Self::ConcurrentConnectStoreBusy,
+        Self::ConcurrentConnectBothBusy,
         Self::ConcurrentConnectStorageBusy,
         Self::ConcurrentConnectRuntimeBusy,
         Self::ConcurrentConnectSuccessOutput,
@@ -2024,6 +2030,15 @@ impl AutomaticLifecycleStage {
             Self::ConcurrentConnectOutcome => {
                 "automatic lifecycle stage concurrent connect outcome failed"
             }
+            Self::ConcurrentConnectConfigConflict => {
+                "automatic lifecycle stage concurrent connect config conflict"
+            }
+            Self::ConcurrentConnectStoreBusy => {
+                "automatic lifecycle stage concurrent connect store busy"
+            }
+            Self::ConcurrentConnectBothBusy => {
+                "automatic lifecycle stage concurrent connect both busy"
+            }
             Self::ConcurrentConnectStorageBusy => {
                 "automatic lifecycle stage concurrent connect storage busy"
             }
@@ -2072,6 +2087,11 @@ impl AutomaticLifecycleStage {
             Self::ConcurrentConnectWait => "code=lifecycle_concurrent_connect_wait_failed",
             Self::ConcurrentConnectOutput => "code=lifecycle_concurrent_connect_output_failed",
             Self::ConcurrentConnectOutcome => "code=lifecycle_concurrent_connect_outcome_failed",
+            Self::ConcurrentConnectConfigConflict => {
+                "code=lifecycle_concurrent_connect_config_conflict"
+            }
+            Self::ConcurrentConnectStoreBusy => "code=lifecycle_concurrent_connect_store_busy",
+            Self::ConcurrentConnectBothBusy => "code=lifecycle_concurrent_connect_both_busy",
             Self::ConcurrentConnectStorageBusy => "code=lifecycle_concurrent_connect_storage_busy",
             Self::ConcurrentConnectRuntimeBusy => "code=lifecycle_concurrent_connect_runtime_busy",
             Self::ConcurrentConnectSuccessOutput => {
@@ -2771,10 +2791,23 @@ fn validate_automatic_connect_outcomes(completed: &[AutomaticConnectOutput]) -> 
                 .iter()
                 .any(|outcome| !outcome.status.success() && outcome.stderr.trim() == message)
         };
-        let stage = if has_failure("storage accounting barrier is busy") {
+        let stage = if has_failure("storage accounting barrier is busy")
+            || has_failure("singleton coherence error: storage accounting barrier is busy")
+        {
             AutomaticLifecycleStage::ConcurrentConnectStorageBusy
         } else if has_failure("local runtime is already running") {
             AutomaticLifecycleStage::ConcurrentConnectRuntimeBusy
+        } else if has_failure("Codex configuration ownership conflict") {
+            AutomaticLifecycleStage::ConcurrentConnectConfigConflict
+        } else if has_failure("local store open is busy") {
+            AutomaticLifecycleStage::ConcurrentConnectStoreBusy
+        } else if successes == 0
+            && completed.iter().all(|outcome| {
+                outcome.stderr.trim()
+                    == "Codex integration lifecycle is busy: local runtime is already running"
+            })
+        {
+            AutomaticLifecycleStage::ConcurrentConnectBothBusy
         } else {
             AutomaticLifecycleStage::ConcurrentConnectOutcome
         };
@@ -6527,6 +6560,9 @@ fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
         "  - 'code=lifecycle_concurrent_connect_wait_failed'",
         "  - 'code=lifecycle_concurrent_connect_output_failed'",
         "  - 'code=lifecycle_concurrent_connect_outcome_failed'",
+        "  - 'code=lifecycle_concurrent_connect_config_conflict'",
+        "  - 'code=lifecycle_concurrent_connect_store_busy'",
+        "  - 'code=lifecycle_concurrent_connect_both_busy'",
         "  - 'code=lifecycle_concurrent_connect_storage_busy'",
         "  - 'code=lifecycle_concurrent_connect_runtime_busy'",
         "  - 'code=lifecycle_concurrent_connect_success_output_failed'",
@@ -8569,6 +8605,18 @@ mod tests {
         }
         for (stderr, expected) in [
             (
+                "Codex configuration ownership conflict",
+                "code=lifecycle_concurrent_connect_config_conflict",
+            ),
+            (
+                "local store open is busy",
+                "code=lifecycle_concurrent_connect_store_busy",
+            ),
+            (
+                "singleton coherence error: storage accounting barrier is busy",
+                "code=lifecycle_concurrent_connect_storage_busy",
+            ),
+            (
                 "storage accounting barrier is busy",
                 "code=lifecycle_concurrent_connect_storage_busy",
             ),
@@ -8597,12 +8645,14 @@ mod tests {
             assert!(!error.contains("RAW_SENTINEL"));
             validate_automatic_manifest_privacy(&format!("errors:\n  - '{expected}'\n")).unwrap();
         }
-        assert!(
-            validate_automatic_connect_outcomes(&[
-                outcome(false, "", lifecycle_busy),
-                outcome(false, "", lifecycle_busy)
-            ])
-            .is_err()
+        let both_busy = validate_automatic_connect_outcomes(&[
+            outcome(false, "", lifecycle_busy),
+            outcome(false, "", lifecycle_busy),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            automatic_evidence_error_code(&format!("lifecycle preflight: {both_busy}")),
+            "code=lifecycle_concurrent_connect_both_busy"
         );
         for invalid in [
             "integration=other\nconfig=connected\ncollector=ready",
