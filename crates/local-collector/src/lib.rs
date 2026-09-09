@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
+mod ingest_precommit;
 mod report_coherence;
 mod settings_coordination;
 pub mod storage_ownership;
+
+pub use ingest_precommit::{CollectorIngestPrecommitError, CollectorIngestPrecommitGuard};
 
 use report_coherence::{ReportMutationScope, ReportWritePermits, report_coherence_failure};
 
@@ -16,7 +19,9 @@ use agent_observability_adapter_codex::{
 #[cfg(test)]
 use agent_observability_application::project_report;
 use agent_observability_contracts::{CollectorDegradationReasonV1, LOCAL_COLLECTOR_HEALTH_VERSION};
-use agent_observability_local_runtime::storage_coherence::{StorageBarrier, StorageMutationWriter};
+use agent_observability_local_runtime::storage_coherence::{
+    OwnedStorageFreezeGuard, StorageBarrier, StorageMutationWriter,
+};
 use agent_observability_local_runtime::{
     Admission, ControlError, CoordinatedSingletonScope, InstalledLayout, LocalRuntimeConfigV3,
     MutationGuard, PressureSample, ProductionSingleton, REPORT_RESERVATION_METADATA_ALLOWANCE,
@@ -1484,6 +1489,7 @@ struct IngestCompletionTest {
 
 #[derive(Debug)]
 struct CollectorState {
+    ingest_precommit_guard: Option<Arc<dyn CollectorIngestPrecommitGuard>>,
     #[cfg(test)]
     ingest_completion_test: IngestCompletionTest,
     layout: InstalledLayout,
@@ -1582,7 +1588,25 @@ pub struct HealthDetails {
 }
 
 /// Runs the authenticated OTLP/HTTP receiver until the process is terminated.
+/// Uses existing admission only, without an optional ingest precommit guard.
 pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
+    serve_inner(options, None).await
+}
+
+/// Runs the receiver with an additional ingest check requiring initialized accounting.
+/// This explicit opt-in entrypoint is not used by the current CLI. It does not
+/// activate separated admission or replace any existing request or storage checks.
+pub async fn serve_with_ingest_precommit_guard(
+    options: CollectorOptions,
+    guard: Arc<dyn CollectorIngestPrecommitGuard>,
+) -> Result<(), CollectorError> {
+    serve_inner(options, Some(guard)).await
+}
+
+async fn serve_inner(
+    options: CollectorOptions,
+    ingest_precommit_guard: Option<Arc<dyn CollectorIngestPrecommitGuard>>,
+) -> Result<(), CollectorError> {
     validate_options(&options)?;
     let layout = install(&options.root).map_err(runtime_error)?;
     validate_owned_credentials(
@@ -1600,7 +1624,8 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     let singleton =
         ProductionSingleton::acquire(&layout.root, CoordinatedSingletonScope::Collector)
             .map_err(runtime_error)?;
-    let (collector, report_wakeup, report_generation) = prepare_collector_state(layout)?;
+    let (mut collector, report_wakeup, report_generation) = prepare_collector_state(layout)?;
+    collector.ingest_precommit_guard = ingest_precommit_guard;
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), options.port);
     let initial_bind = TcpListener::bind(address).await;
     let listener = bind_persisted_port(initial_bind)?;
@@ -1701,6 +1726,7 @@ fn prepare_collector_state(
             .unwrap_or_default();
         Ok((
             CollectorState {
+                ingest_precommit_guard: None,
                 #[cfg(test)]
                 ingest_completion_test: IngestCompletionTest::default(),
                 layout,
@@ -2361,7 +2387,7 @@ impl From<CollectorError> for IngestError {
 }
 
 fn ingest_locked(state: &mut CollectorState, body: &[u8]) -> Result<IngestOutcome, IngestError> {
-    with_ingest_storage_scope(state, |state| {
+    with_ingest_storage_scope(state, |state, freeze| {
         let Some(config) = admit_request(state, body.len())? else {
             return Ok((IngestOutcome::Disabled, ()));
         };
@@ -2390,6 +2416,7 @@ fn ingest_locked(state: &mut CollectorState, body: &[u8]) -> Result<IngestOutcom
         let persisted_correlation = request_correlation
             .to_persisted_json()
             .map_err(runtime_error)?;
+        check_ingest_precommit(state, freeze, &config)?;
         let outcome = commit_batch(
             state,
             &batch,
@@ -2414,7 +2441,7 @@ fn ingest_notify_locked_with_config(
     state: &mut CollectorState,
     body: &[u8],
 ) -> Result<(IngestOutcome, Option<LocalRuntimeConfigV3>), IngestError> {
-    with_ingest_storage_scope(state, |state| {
+    with_ingest_storage_scope(state, |state, freeze| {
         let Some(config) = admit_request(state, body.len())? else {
             return Ok((IngestOutcome::Disabled, None));
         };
@@ -2429,6 +2456,7 @@ fn ingest_notify_locked_with_config(
         )
         .map_err(runtime_error)?;
         enforce_batch_policy(&batch, &config)?;
+        check_ingest_precommit(state, freeze, &config)?;
         let outcome = commit_batch(state, &batch, Some(cursor.to_string()), now, None)?;
         Ok((outcome, Some(config)))
     })
@@ -2436,23 +2464,48 @@ fn ingest_notify_locked_with_config(
 
 fn with_ingest_storage_scope<T>(
     state: &mut CollectorState,
-    operation: impl FnOnce(&mut CollectorState) -> Result<(IngestOutcome, T), IngestError>,
+    operation: impl FnOnce(
+        &mut CollectorState,
+        Option<&OwnedStorageFreezeGuard<'_>>,
+    ) -> Result<(IngestOutcome, T), IngestError>,
 ) -> Result<(IngestOutcome, T), IngestError> {
+    enum Scope<'barrier> {
+        Initialized(OwnedStorageFreezeGuard<'barrier>),
+        Legacy(StorageMutationWriter<'barrier>),
+    }
     let barrier =
         agent_observability_local_runtime::storage_coherence::StorageBarrier::open_if_initialized(
             &state.layout.root,
         )
         .map_err(ingest_coherence_failure)?;
-    let scope = agent_observability_local_runtime::storage_coherence::StorageMutationWriter::acquire_exclusive(
-        &state.layout.root,
-        barrier.as_ref(),
-    ).map_err(ingest_coherence_failure)?;
-    let result = operation(state);
+    let scope = match &barrier {
+        Some(barrier) => Scope::Initialized(
+            barrier
+                .try_freeze_existing_root()
+                .map_err(ingest_coherence_failure)?,
+        ),
+        None if state.ingest_precommit_guard.is_some() => return Err(IngestError::Coherence),
+        None => Scope::Legacy(
+            StorageMutationWriter::acquire_exclusive(&state.layout.root, None)
+                .map_err(ingest_coherence_failure)?,
+        ),
+    };
+    let result = operation(
+        state,
+        match &scope {
+            Scope::Initialized(freeze) => Some(freeze),
+            Scope::Legacy(_) => None,
+        },
+    );
     #[cfg(test)]
     if let Some(after_operation) = state.ingest_completion_test.after_operation.take() {
         after_operation(&state.layout.runtime);
     }
-    let revalidation = scope.revalidate().map_err(ingest_coherence_failure);
+    let revalidation = match &scope {
+        Scope::Initialized(freeze) => freeze.revalidate(),
+        Scope::Legacy(writer) => writer.revalidate(),
+    }
+    .map_err(ingest_coherence_failure);
     match result {
         Ok((outcome @ (IngestOutcome::Committed | IngestOutcome::CommittedUnverified), value))
             if revalidation.is_err() =>
@@ -2474,6 +2527,28 @@ fn with_ingest_storage_scope<T>(
         }
         Err(error) => Err(error),
     }
+}
+
+fn check_ingest_precommit(
+    state: &CollectorState,
+    freeze: Option<&OwnedStorageFreezeGuard<'_>>,
+    config: &LocalRuntimeConfigV3,
+) -> Result<(), IngestError> {
+    let Some(guard) = &state.ingest_precommit_guard else {
+        return Ok(());
+    };
+    let freeze = freeze.ok_or(IngestError::Coherence)?;
+    guard
+        .check_precommit(
+            &state.layout,
+            freeze,
+            config,
+            u64::from(config.collection.max_batch_bytes),
+        )
+        .map_err(|error| match error {
+            CollectorIngestPrecommitError::Denied => IngestError::Storage,
+            CollectorIngestPrecommitError::Unavailable => IngestError::Coherence,
+        })
 }
 
 fn ingest_coherence_failure(
@@ -4942,6 +5017,7 @@ mod tests {
             })
             .unwrap_or_default();
         CollectorState {
+            ingest_precommit_guard: None,
             ingest_completion_test: IngestCompletionTest::default(),
             layout,
             store,
@@ -5123,6 +5199,271 @@ mod tests {
     }
 
     #[test]
+    fn ingest_precommit_denial_preserves_durable_and_in_memory_state() {
+        for notify in [false, true] {
+            let root = test_root(&format!("precommit-denial-{notify}"));
+            let mut state = collector_state(&root);
+            let mutation = MutationGuard::try_acquire(&state.layout.runtime).unwrap();
+            super::StorageBarrier::initialize(&state.layout.root, &mutation).unwrap();
+            drop(mutation);
+            let guard = Arc::new(TestIngestPrecommitGuard {
+                calls: AtomicU64::new(0),
+                deny: true,
+            });
+            state.ingest_precommit_guard = Some(guard.clone());
+            let status = state.store.report_status().unwrap();
+            let correlation = state.request_correlation.to_persisted_json().unwrap();
+            let persisted = state
+                .store
+                .codex_request_correlation_state(&state.source_generation)
+                .unwrap();
+            let body = if notify {
+                projected_notify("thread-1", "turn-1")
+            } else {
+                br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[
+                    {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+                    {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+                    {"key":"model","value":{"stringValue":"gpt-test"}},
+                    {"key":"auth.request_id","value":{"stringValue":"request-1"}}
+                ]}]}]}]}"#
+                    .to_vec()
+            };
+            let result = if notify {
+                ingest_notify_locked(&mut state, &body)
+            } else {
+                ingest_locked(&mut state, &body)
+            };
+            assert!(matches!(result, Err(IngestError::Storage)));
+            assert_eq!(guard.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(state.store.record_count().unwrap(), 0);
+            assert_eq!(state.last_cursor, None);
+            assert_eq!(
+                state
+                    .store
+                    .cursor("codex", &state.source_generation)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(state.store.report_status().unwrap(), status);
+            assert_eq!(
+                state.request_correlation.to_persisted_json().unwrap(),
+                correlation
+            );
+            assert_eq!(
+                state
+                    .store
+                    .codex_request_correlation_state(&state.source_generation)
+                    .unwrap(),
+                persisted
+            );
+            assert!(
+                !state
+                    .layout
+                    .runtime
+                    .join(super::REPORT_DIRTY_FILE_NAME)
+                    .exists()
+            );
+            // The same OTLP input really changes correlation when allowed to commit.
+            state.ingest_precommit_guard = None;
+            if notify {
+                ingest_notify_locked(&mut state, &body).unwrap();
+            } else {
+                ingest_locked(&mut state, &body).unwrap();
+                assert_eq!(state.request_correlation.pending_len(), 1);
+            }
+            assert_eq!(state.store.record_count().unwrap(), 1);
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestIngestPrecommitGuard {
+        calls: AtomicU64,
+        deny: bool,
+    }
+
+    impl super::CollectorIngestPrecommitGuard for TestIngestPrecommitGuard {
+        fn check_precommit(
+            &self,
+            layout: &agent_observability_local_runtime::InstalledLayout,
+            freeze: &agent_observability_local_runtime::storage_coherence::OwnedStorageFreezeGuard<
+                '_,
+            >,
+            config: &agent_observability_local_runtime::LocalRuntimeConfigV3,
+            max_batch_bytes: u64,
+        ) -> Result<(), super::CollectorIngestPrecommitError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(
+                max_batch_bytes,
+                u64::from(config.collection.max_batch_bytes)
+            );
+            freeze.revalidate().unwrap();
+            let barrier = super::StorageBarrier::open_existing(&layout.root).unwrap();
+            assert!(matches!(barrier.try_begin_write(), Err(agent_observability_local_runtime::storage_coherence::StorageCoherenceError::Busy)));
+            assert!(matches!(
+                MutationGuard::try_acquire(&layout.runtime),
+                Err(agent_observability_local_runtime::SingletonError::AlreadyRunning)
+            ));
+            if self.deny {
+                Err(super::CollectorIngestPrecommitError::Denied)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn ingest_precommit_requires_existing_barrier_and_skips_rejected_requests() {
+        for notify in [false, true] {
+            for case in [
+                "missing",
+                "disabled",
+                "malformed",
+                "oversize",
+                "batch-policy",
+            ] {
+                // A canonical notify contains one record; OTLP exercises batch rejection.
+                if case == "batch-policy" && notify {
+                    continue;
+                }
+                let root = test_root(&format!("precommit-skip-{notify}-{case}"));
+                let mut state = collector_state(&root);
+                let mut config = load(&state.layout.config).unwrap();
+                if case == "disabled" {
+                    config.enabled = false;
+                }
+                if case == "batch-policy" {
+                    config.collection.max_batch_records = 1;
+                }
+                let config_guard = ConfigMutationGuard::acquire(&state.layout).unwrap();
+                save(&config_guard, &config).unwrap();
+                drop(config_guard);
+                if case != "missing" {
+                    let mutation = MutationGuard::try_acquire(&state.layout.runtime).unwrap();
+                    super::StorageBarrier::initialize(&state.layout.root, &mutation).unwrap();
+                }
+                let guard = Arc::new(TestIngestPrecommitGuard {
+                    calls: AtomicU64::new(0),
+                    deny: false,
+                });
+                state.ingest_precommit_guard = Some(guard.clone());
+                let body = match case {
+                    "malformed" => b"{".to_vec(),
+                    "oversize" => {
+                        vec![b' '; usize::try_from(config.collection.max_batch_bytes).unwrap() + 1]
+                    }
+                    "batch-policy" if !notify => otlp_start_records(2),
+                    _ if notify => projected_notify("thread-1", "turn-1"),
+                    _ => otlp_start_records(1),
+                };
+                let result = if notify {
+                    ingest_notify_locked(&mut state, &body)
+                } else {
+                    ingest_locked(&mut state, &body)
+                };
+                if case == "disabled" {
+                    assert_eq!(result.unwrap(), IngestOutcome::Disabled);
+                } else {
+                    assert!(result.is_err());
+                }
+                assert_eq!(guard.calls.load(Ordering::Relaxed), 0);
+                assert_eq!(state.store.record_count().unwrap(), 0);
+                assert_eq!(state.last_cursor, None);
+                if case == "missing" {
+                    assert!(
+                        !state
+                            .layout
+                            .runtime
+                            .join("storage-accounting.lock")
+                            .exists()
+                    );
+                }
+                drop(state);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn ingest_precommit_absent_preserves_legacy_ingest_without_initializing_accounting() {
+        for notify in [false, true] {
+            let root = test_root(&format!("precommit-legacy-{notify}"));
+            let mut state = collector_state(&root);
+            assert!(state.ingest_precommit_guard.is_none());
+            let result = if notify {
+                ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1"))
+            } else {
+                ingest_locked(&mut state, &otlp_start_records(1))
+            };
+            assert_eq!(result.unwrap(), IngestOutcome::Committed);
+            assert_eq!(state.store.record_count().unwrap(), 1);
+            assert!(
+                !state
+                    .layout
+                    .runtime
+                    .join("storage-accounting.lock")
+                    .exists()
+            );
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn ingest_precommit_success_preserves_committed_unverified_postcheck() {
+        for notify in [false, true] {
+            for corrupt_after_commit in [false, true] {
+                let root = test_root(&format!(
+                    "precommit-success-{notify}-{corrupt_after_commit}"
+                ));
+                let mut state = collector_state(&root);
+                let mutation = MutationGuard::try_acquire(&state.layout.runtime).unwrap();
+                super::StorageBarrier::initialize(&state.layout.root, &mutation).unwrap();
+                drop(mutation);
+                let guard = Arc::new(TestIngestPrecommitGuard {
+                    calls: AtomicU64::new(0),
+                    deny: false,
+                });
+                state.ingest_precommit_guard = Some(guard.clone());
+                if corrupt_after_commit {
+                    state.ingest_completion_test.after_operation = Some(|runtime| {
+                        fs::write(runtime.join("storage-accounting.lock"), b"invalid").unwrap();
+                    });
+                }
+                let result = if notify {
+                    ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1"))
+                } else {
+                    ingest_locked(&mut state, &otlp_start_records(1))
+                };
+                assert_eq!(
+                    result.unwrap(),
+                    if corrupt_after_commit {
+                        IngestOutcome::CommittedUnverified
+                    } else {
+                        IngestOutcome::Committed
+                    }
+                );
+                assert_eq!(guard.calls.load(Ordering::Relaxed), 1);
+                assert_eq!(state.store.record_count().unwrap(), 1);
+                assert_eq!(
+                    state
+                        .store
+                        .cursor("codex", &state.source_generation)
+                        .unwrap(),
+                    state.last_cursor
+                );
+                assert!(state.last_cursor.is_some());
+                if corrupt_after_commit {
+                    assert!(state.report_dirty && state.report_degraded);
+                }
+                drop(state);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn automatic_ingest_never_recreates_an_initialized_mutation_lock() {
         use agent_observability_local_runtime::storage_coherence::StorageBarrier;
         for notify in [false, true] {
@@ -5286,7 +5627,7 @@ mod tests {
             let barrier = StorageBarrier::initialize(&state.layout.root, &mutation).unwrap();
             drop(mutation);
             let path = runtime.join("storage-accounting.lock");
-            let result = super::with_ingest_storage_scope(&mut state, |_| {
+            let result = super::with_ingest_storage_scope(&mut state, |_, _| {
                 assert!(matches!(
                     barrier.try_begin_write(),
                     Err(StorageCoherenceError::Busy)
@@ -8294,6 +8635,7 @@ mod tests {
         let config = load(&layout.config).unwrap();
         let store = open_store_for_test(&layout, &config);
         let mut state = CollectorState {
+            ingest_precommit_guard: None,
             ingest_completion_test: IngestCompletionTest::default(),
             layout: layout.clone(),
             store,
@@ -9933,6 +10275,7 @@ mod tests {
         let initial = load(&layout.config).unwrap();
         let store = open_store_for_test(&layout, &initial);
         let mut state = CollectorState {
+            ingest_precommit_guard: None,
             ingest_completion_test: IngestCompletionTest::default(),
             layout: layout.clone(),
             store,
