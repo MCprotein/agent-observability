@@ -1929,13 +1929,20 @@ enum AutomaticLifecycleStage {
     ReconnectCommand,
     ReconnectStatus,
     ConcurrentConnect,
+    ConcurrentConnectCapture,
+    ConcurrentConnectSpawn,
+    ConcurrentConnectWait,
+    ConcurrentConnectOutput,
+    ConcurrentConnectOutcome,
+    ConcurrentConnectStatus,
+    ConcurrentConnectOwnership,
     Disconnect,
     Restore,
     InheritedPlist,
 }
 
 impl AutomaticLifecycleStage {
-    const ALL: [Self; 21] = [
+    const ALL: [Self; 28] = [
         Self::Plist,
         Self::Status,
         Self::PreFailureOtlp,
@@ -1954,6 +1961,13 @@ impl AutomaticLifecycleStage {
         Self::ReconnectCommand,
         Self::ReconnectStatus,
         Self::ConcurrentConnect,
+        Self::ConcurrentConnectCapture,
+        Self::ConcurrentConnectSpawn,
+        Self::ConcurrentConnectWait,
+        Self::ConcurrentConnectOutput,
+        Self::ConcurrentConnectOutcome,
+        Self::ConcurrentConnectStatus,
+        Self::ConcurrentConnectOwnership,
         Self::Disconnect,
         Self::Restore,
         Self::InheritedPlist,
@@ -1979,6 +1993,27 @@ impl AutomaticLifecycleStage {
             Self::ReconnectCommand => "automatic lifecycle stage reconnect command failed",
             Self::ReconnectStatus => "automatic lifecycle stage reconnect status failed",
             Self::ConcurrentConnect => "automatic lifecycle stage concurrent connect failed",
+            Self::ConcurrentConnectCapture => {
+                "automatic lifecycle stage concurrent connect capture failed"
+            }
+            Self::ConcurrentConnectSpawn => {
+                "automatic lifecycle stage concurrent connect spawn failed"
+            }
+            Self::ConcurrentConnectWait => {
+                "automatic lifecycle stage concurrent connect wait failed"
+            }
+            Self::ConcurrentConnectOutput => {
+                "automatic lifecycle stage concurrent connect output failed"
+            }
+            Self::ConcurrentConnectOutcome => {
+                "automatic lifecycle stage concurrent connect outcome failed"
+            }
+            Self::ConcurrentConnectStatus => {
+                "automatic lifecycle stage concurrent connect status failed"
+            }
+            Self::ConcurrentConnectOwnership => {
+                "automatic lifecycle stage concurrent connect ownership failed"
+            }
             Self::Disconnect => "automatic lifecycle stage disconnect failed",
             Self::Restore => "automatic lifecycle stage restore failed",
             Self::InheritedPlist => "automatic lifecycle stage inherited plist failed",
@@ -2005,6 +2040,15 @@ impl AutomaticLifecycleStage {
             Self::ReconnectCommand => "code=lifecycle_reconnect_command_failed",
             Self::ReconnectStatus => "code=lifecycle_reconnect_status_failed",
             Self::ConcurrentConnect => "code=lifecycle_concurrent_connect_failed",
+            Self::ConcurrentConnectCapture => "code=lifecycle_concurrent_connect_capture_failed",
+            Self::ConcurrentConnectSpawn => "code=lifecycle_concurrent_connect_spawn_failed",
+            Self::ConcurrentConnectWait => "code=lifecycle_concurrent_connect_wait_failed",
+            Self::ConcurrentConnectOutput => "code=lifecycle_concurrent_connect_output_failed",
+            Self::ConcurrentConnectOutcome => "code=lifecycle_concurrent_connect_outcome_failed",
+            Self::ConcurrentConnectStatus => "code=lifecycle_concurrent_connect_status_failed",
+            Self::ConcurrentConnectOwnership => {
+                "code=lifecycle_concurrent_connect_ownership_failed"
+            }
             Self::Disconnect => "code=lifecycle_disconnect_stage_failed",
             Self::Restore => "code=lifecycle_restore_failed",
             Self::InheritedPlist => "code=lifecycle_inherited_plist_failed",
@@ -2245,10 +2289,7 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
             Ok(())
         })()?;
 
-        automatic_lifecycle_stage(
-            AutomaticLifecycleStage::ConcurrentConnect,
-            run_concurrent_automatic_connects(binary, &root, &cleanup),
-        )?;
+        run_concurrent_automatic_connects(binary, &root, &cleanup)?;
         automatic_lifecycle_stage(
             AutomaticLifecycleStage::Disconnect,
             (|| {
@@ -2612,8 +2653,14 @@ fn run_concurrent_automatic_connects(
     root: &Path,
     cleanup: &AutomaticLifecycleCleanup<'_>,
 ) -> Result<(), String> {
-    let ownership = AutomaticLifecycleOwnership::capture(root, cleanup)?;
-    let root_text = path_text(root)?;
+    let ownership = automatic_lifecycle_stage(
+        AutomaticLifecycleStage::ConcurrentConnectCapture,
+        AutomaticLifecycleOwnership::capture(root, cleanup),
+    )?;
+    let root_text = automatic_lifecycle_stage(
+        AutomaticLifecycleStage::ConcurrentConnectCapture,
+        path_text(root),
+    )?;
     let mut commands = Vec::with_capacity(2);
     for _ in 0..2 {
         let mut command = Command::new(binary);
@@ -2625,8 +2672,10 @@ fn run_concurrent_automatic_connects(
         for (name, value) in cleanup.environment() {
             command.env(name, value);
         }
-        commands.push(ChildGuard(command.spawn().map_err(|error| {
-            format!("spawn concurrent automatic lifecycle connect: {error}")
+        commands.push(ChildGuard(command.spawn().map_err(|_| {
+            AutomaticLifecycleStage::ConcurrentConnectSpawn
+                .failure()
+                .to_owned()
         })?));
     }
 
@@ -2654,27 +2703,40 @@ fn run_concurrent_automatic_connects(
         })
         .count();
     if !((successes == 1 && busy_failures == 1) || successes == 2) {
-        return Err(format!(
-            "automatic lifecycle concurrent connect outcomes violated the product contract: {}",
-            format_automatic_connect_outcomes(&completed)
-        ));
+        return Err(AutomaticLifecycleStage::ConcurrentConnectOutcome
+            .failure()
+            .to_owned());
     }
     for outcome in completed.iter().filter(|outcome| outcome.status.success()) {
-        require_output_line(&outcome.stdout, "integration", "codex")?;
-        require_output_line(&outcome.stdout, "config", "connected")?;
-        require_collector_ready_or_degraded(&outcome.stdout)?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::ConcurrentConnectOutcome,
+            (|| {
+                require_output_line(&outcome.stdout, "integration", "codex")?;
+                require_output_line(&outcome.stdout, "config", "connected")?;
+                require_collector_ready_or_degraded(&outcome.stdout)
+            })(),
+        )?;
     }
 
-    let status = run_bounded_product_command_with_env(
-        binary,
-        &["status", "codex", root_text],
-        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
-        &cleanup.environment(),
+    automatic_lifecycle_stage(
+        AutomaticLifecycleStage::ConcurrentConnectStatus,
+        (|| {
+            let status = run_bounded_product_command_with_env(
+                binary,
+                &["status", "codex", root_text],
+                AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+                &cleanup.environment(),
+            )?;
+            require_output_line(&status, "integration", "codex")?;
+            require_output_line(&status, "config", "connected")?;
+            require_collector_ready_or_degraded(&status)?;
+            Ok(())
+        })(),
     )?;
-    require_output_line(&status, "integration", "codex")?;
-    require_output_line(&status, "config", "connected")?;
-    require_collector_ready_or_degraded(&status)?;
-    ownership.verify(binary, root, cleanup)
+    automatic_lifecycle_stage(
+        AutomaticLifecycleStage::ConcurrentConnectOwnership,
+        ownership.verify(binary, root, cleanup),
+    )
 }
 
 #[derive(Debug)]
@@ -2762,34 +2824,39 @@ fn collect_automatic_connect_output(
     child: &mut ChildGuard,
     timeout: Duration,
 ) -> Result<AutomaticConnectOutput, String> {
-    let status = match wait_for_child(child, timeout) {
-        Ok(status) => status,
-        Err(error) => {
-            child.terminate()?;
-            return Err(format!(
-                "concurrent automatic lifecycle connect did not terminate boundedly: {error}"
-            ));
-        }
+    let Ok(status) = wait_for_child(child, timeout) else {
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::ConcurrentConnectWait,
+            child.terminate(),
+        )?;
+        return Err(AutomaticLifecycleStage::ConcurrentConnectWait
+            .failure()
+            .to_owned());
     };
-    let stdout = read_bounded_child_stream(
-        child
-            .stdout
-            .take()
-            .ok_or("concurrent automatic lifecycle connect stdout is unavailable")?,
-        "stdout",
-    )?;
-    let stderr = read_bounded_child_stream(
-        child
-            .stderr
-            .take()
-            .ok_or("concurrent automatic lifecycle connect stderr is unavailable")?,
-        "stderr",
-    )?;
-    Ok(AutomaticConnectOutput {
-        status,
-        stdout,
-        stderr,
-    })
+    automatic_lifecycle_stage(
+        AutomaticLifecycleStage::ConcurrentConnectOutput,
+        (|| {
+            let stdout = read_bounded_child_stream(
+                child
+                    .stdout
+                    .take()
+                    .ok_or("concurrent automatic lifecycle connect stdout is unavailable")?,
+                "stdout",
+            )?;
+            let stderr = read_bounded_child_stream(
+                child
+                    .stderr
+                    .take()
+                    .ok_or("concurrent automatic lifecycle connect stderr is unavailable")?,
+                "stderr",
+            )?;
+            Ok(AutomaticConnectOutput {
+                status,
+                stdout,
+                stderr,
+            })
+        })(),
+    )
 }
 
 fn read_bounded_child_stream(stream: impl Read, label: &str) -> Result<String, String> {
@@ -2805,23 +2872,6 @@ fn read_bounded_child_stream(stream: impl Read, label: &str) -> Result<String, S
     }
     String::from_utf8(bytes)
         .map_err(|_| format!("concurrent automatic lifecycle connect {label} is not UTF-8"))
-}
-
-fn format_automatic_connect_outcomes(outcomes: &[AutomaticConnectOutput]) -> String {
-    outcomes
-        .iter()
-        .enumerate()
-        .map(|(index, outcome)| {
-            format!(
-                "child {} status={} stdout={:?} stderr={:?}",
-                index + 1,
-                outcome.status,
-                outcome.stdout.trim(),
-                outcome.stderr.trim()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 fn file_mode(path: &Path, label: &str) -> Result<u32, String> {
@@ -6413,6 +6463,13 @@ fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
         "  - 'code=lifecycle_reconnect_command_failed'",
         "  - 'code=lifecycle_reconnect_status_failed'",
         "  - 'code=lifecycle_concurrent_connect_failed'",
+        "  - 'code=lifecycle_concurrent_connect_capture_failed'",
+        "  - 'code=lifecycle_concurrent_connect_spawn_failed'",
+        "  - 'code=lifecycle_concurrent_connect_wait_failed'",
+        "  - 'code=lifecycle_concurrent_connect_output_failed'",
+        "  - 'code=lifecycle_concurrent_connect_outcome_failed'",
+        "  - 'code=lifecycle_concurrent_connect_status_failed'",
+        "  - 'code=lifecycle_concurrent_connect_ownership_failed'",
         "  - 'code=lifecycle_disconnect_stage_failed'",
         "  - 'code=lifecycle_restore_failed'",
         "  - 'code=lifecycle_inherited_plist_failed'",
@@ -8424,6 +8481,78 @@ mod tests {
             assert!(!safe.contains("SENTINEL"));
             validate_automatic_manifest_privacy(&format!("errors:\n  - '{expected}'\n")).unwrap();
         }
+    }
+
+    #[test]
+    fn concurrent_connect_diagnostics_preserve_only_known_substages() {
+        for (stage, code) in [
+            ("capture", "capture"),
+            ("spawn", "spawn"),
+            ("wait", "wait"),
+            ("output", "output"),
+            ("outcome", "outcome"),
+            ("status", "status"),
+            ("ownership", "ownership"),
+        ] {
+            let failure = format!("automatic lifecycle stage concurrent connect {stage} failed");
+            let expected = format!("code=lifecycle_concurrent_connect_{code}_failed");
+            let stage = AutomaticLifecycleStage::from_failure(&failure).unwrap();
+            assert_eq!(
+                automatic_lifecycle_stage(
+                    stage,
+                    Err::<(), _>("/private/RAW_SENTINEL token=SECRET".to_owned())
+                ),
+                Err(failure.clone()),
+            );
+            assert_eq!(automatic_lifecycle_stage(stage, Ok::<_, String>(7)), Ok(7));
+            for suffix in ["", "; cleanup failed: /private/RAW_SENTINEL token=SECRET"] {
+                assert_eq!(
+                    automatic_evidence_error_code(&format!(
+                        "lifecycle preflight: {failure}{suffix}"
+                    )),
+                    expected,
+                );
+            }
+            validate_automatic_manifest_privacy(&format!("errors:\n  - '{expected}'\n")).unwrap();
+            assert_ne!(
+                automatic_evidence_error_code(&format!(
+                    "lifecycle preflight: {failure}: RAW_SENTINEL"
+                )),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_connect_wait_and_output_failures_keep_distinct_private_categories() {
+        let mut waiting = ChildGuard(
+            Command::new("/bin/sleep")
+                .arg("5")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(
+            collect_automatic_connect_output(&mut waiting, Duration::ZERO).unwrap_err(),
+            AutomaticLifecycleStage::ConcurrentConnectWait.failure()
+        );
+        assert!(waiting.try_wait().unwrap().is_some());
+
+        let mut no_output = ChildGuard(
+            Command::new("/bin/echo")
+                .arg("RAW_SENTINEL")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(
+            collect_automatic_connect_output(&mut no_output, LOCAL_COMMAND_TIMEOUT).unwrap_err(),
+            AutomaticLifecycleStage::ConcurrentConnectOutput.failure()
+        );
     }
 
     #[test]
