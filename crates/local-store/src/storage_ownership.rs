@@ -792,19 +792,30 @@ mod tests {
         let displaced = directory.with_extension("displaced");
         let _ = fs::remove_dir_all(&displaced);
 
+        let mut callback_called = false;
         let replacement =
             with_optional_report_reader_storage_ownership(&directory, |observation| {
                 assert!(observation.is_some());
+                callback_called = true;
                 fs::rename(&directory, &displaced).unwrap();
                 fs::create_dir(&directory).unwrap();
                 fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
             });
-        assert!(matches!(
-            replacement,
-            Err(StorageOwnershipPreflightError::Store(
-                StoreError::InvalidPath | StoreError::Io(_)
-            ))
-        ));
+        let category = match &replacement {
+            Ok(()) => "accepted".to_owned(),
+            Err(StorageOwnershipPreflightError::JournalPresent) => "journal_present".to_owned(),
+            Err(StorageOwnershipPreflightError::Store(error)) => error.to_string(),
+        };
+        assert!(
+            callback_called
+                && matches!(
+                    replacement,
+                    Err(StorageOwnershipPreflightError::Store(
+                        StoreError::InvalidPath | StoreError::Io(_)
+                    ))
+                ),
+            "callback_called={callback_called}; category={category}"
+        );
 
         fs::remove_dir(&directory).unwrap();
         std::os::unix::fs::symlink(&displaced, &directory).unwrap();
