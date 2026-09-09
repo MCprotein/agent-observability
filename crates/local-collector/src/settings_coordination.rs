@@ -1,5 +1,8 @@
 use crate::{CollectorError, InstalledLayout};
-use agent_observability_local_runtime::{install, storage_coherence::StorageMutationWriter};
+use agent_observability_local_runtime::{
+    install,
+    storage_coherence::{StorageBarrier, StorageCoherenceError, StorageMutationWriter},
+};
 use std::path::Path;
 
 #[cfg(test)]
@@ -128,6 +131,24 @@ pub(crate) fn with_settings_writer<T>(
     with_settings_writer_observing(root, operation, || {})
 }
 
+pub(super) fn with_settings_writer_waiting_for_root<T>(
+    root: &Path,
+    operation: impl FnOnce(&InstalledLayout) -> Result<T, CollectorError>,
+) -> Result<T, CollectorError> {
+    with_settings_writer_waiting_observing(root, operation, || {}, || {})
+}
+
+fn with_settings_writer_waiting_observing<T>(
+    root: &Path,
+    operation: impl FnOnce(&InstalledLayout) -> Result<T, CollectorError>,
+    before_postcheck: impl FnOnce(),
+    on_contention: impl FnOnce(),
+) -> Result<T, CollectorError> {
+    with_settings_writer_acquiring(root, operation, before_postcheck, |root, barrier| {
+        StorageMutationWriter::acquire_waiting_for_root(root, barrier, on_contention)
+    })
+}
+
 pub(super) fn published_finalization_error(error: CollectorError) -> CollectorError {
     if matches!(
         error,
@@ -152,14 +173,27 @@ fn with_settings_writer_observing<T>(
     operation: impl FnOnce(&InstalledLayout) -> Result<T, CollectorError>,
     before_postcheck: impl FnOnce(),
 ) -> Result<T, CollectorError> {
+    with_settings_writer_acquiring(root, operation, before_postcheck, |root, barrier| {
+        StorageMutationWriter::acquire(root, barrier)
+    })
+}
+
+fn with_settings_writer_acquiring<T>(
+    root: &Path,
+    operation: impl FnOnce(&InstalledLayout) -> Result<T, CollectorError>,
+    before_postcheck: impl FnOnce(),
+    acquire: impl for<'a> FnOnce(
+        &Path,
+        Option<&'a StorageBarrier>,
+    ) -> Result<StorageMutationWriter<'a>, StorageCoherenceError>,
+) -> Result<T, CollectorError> {
     let layout = install(root).map_err(crate::runtime_error)?;
     let barrier =
         agent_observability_local_runtime::storage_coherence::StorageBarrier::open_if_initialized(
             &layout.root,
         )
         .map_err(crate::runtime_error)?;
-    let scope = StorageMutationWriter::acquire(&layout.root, barrier.as_ref())
-        .map_err(crate::runtime_error)?;
+    let scope = acquire(&layout.root, barrier.as_ref()).map_err(crate::runtime_error)?;
     let result = operation(&layout);
     before_postcheck();
     let outcome = match (result, scope.revalidate()) {
@@ -252,6 +286,153 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn settings_waits_for_actual_root_contention_then_executes_once() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        for coordinated in [false, true] {
+            let root = root(&format!("settings-root-wait-{coordinated}"));
+            let settings = crate::install_settings(&root).unwrap();
+            let barrier = coordinated.then(|| initialized_barrier(&root));
+            let before = snapshot_tree(&root);
+            let mutation = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+            let (contended_tx, contended_rx) = mpsc::channel::<()>();
+            let (executed_tx, executed_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let worker_root = root.clone();
+            let worker = thread::spawn(move || {
+                let result = super::with_settings_writer_waiting_observing(
+                    &worker_root,
+                    |layout| {
+                        executed_tx.send(()).unwrap();
+                        crate::install_settings_locked(layout)
+                    },
+                    || {},
+                    || contended_tx.send(()).unwrap(),
+                );
+                result_tx.send(result).unwrap();
+            });
+            let contention = contended_rx.recv_timeout(Duration::from_secs(5));
+            let before_release = executed_rx.try_recv();
+            let default_result = crate::install_settings(&root);
+            drop(mutation);
+            let result = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            assert!(contention.is_ok(), "root contention must be observed");
+            assert!(matches!(before_release, Err(mpsc::TryRecvError::Empty)));
+            assert!(
+                matches!(default_result, Err(crate::CollectorError::Runtime(message))
+                if message == "storage accounting barrier is busy")
+            );
+            assert_eq!(result.unwrap(), settings);
+            assert_eq!(executed_rx.try_iter().count(), 1);
+            assert_eq!(
+                crate::install_settings_waiting_for_root(&root).unwrap(),
+                settings
+            );
+            assert!(snapshot_tree(&root) == before, "settings/TLS bytes changed");
+            assert_eq!(
+                root.join("runtime/storage-accounting.lock").exists(),
+                coordinated
+            );
+            drop(barrier);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn waiting_settings_writer_rejects_accounting_contention_without_running_operation() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let root = root("waiting-accounting-busy");
+        crate::install_settings(&root).unwrap();
+        let barrier = initialized_barrier(&root);
+        let before = snapshot_tree(&root);
+        let accounting = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("runtime/storage-accounting.lock"))
+            .unwrap();
+        accounting.try_lock().unwrap();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker_root = root.clone();
+        let worker = thread::spawn(move || {
+            let result = super::with_settings_writer_waiting_observing(
+                &worker_root,
+                |_| -> Result<(), crate::CollectorError> { panic!("operation must not run") },
+                || panic!("postcheck must not run before acquisition"),
+                || panic!("accounting contention must not notify root contention"),
+            );
+            result_tx.send(result).unwrap();
+        });
+        let result = result_rx.recv_timeout(Duration::from_secs(5));
+        // Completion must occur while accounting remains held, without retaining root.
+        let mutation = MutationGuard::try_acquire(&root.join("runtime"));
+        drop(accounting);
+        worker.join().unwrap();
+        assert!(
+            matches!(result.unwrap(), Err(crate::CollectorError::Runtime(message))
+            if message == "storage accounting barrier is busy")
+        );
+        drop(mutation.unwrap());
+        assert!(snapshot_tree(&root) == before, "settings/TLS bytes changed");
+        drop(barrier);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn waiting_settings_writer_preserves_postcheck_and_primary_errors() {
+        for coordinated in [false, true] {
+            for completed in [false, true] {
+                let root = root(&format!("waiting-postcheck-{coordinated}-{completed}"));
+                let layout = install(&root).unwrap();
+                let barrier = coordinated.then(|| initialized_barrier(&root));
+                let lock = layout.runtime.join("mutation.lock");
+                let retained = layout.runtime.join("retained-mutation.lock");
+                let error = super::with_settings_writer_waiting_observing(
+                    &root,
+                    |_| {
+                        if completed {
+                            Ok(())
+                        } else {
+                            Err(crate::CollectorError::Runtime(
+                                "primary operation error".into(),
+                            ))
+                        }
+                    },
+                    || {
+                        fs::rename(&lock, &retained).unwrap();
+                        fs::write(&lock, []).unwrap();
+                        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+                    },
+                    || panic!("uncontended root must not notify"),
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(&error, crate::CollectorError::StorageWriteUnverified {
+                    operation_completed, primary, ..
+                } if *operation_completed == completed && primary.is_none() == completed)
+                );
+                if !completed {
+                    assert!(
+                        matches!(&error, crate::CollectorError::StorageWriteUnverified {
+                        primary: Some(primary), ..
+                    } if matches!(primary.as_ref(), crate::CollectorError::Runtime(message)
+                        if message == "primary operation error"))
+                    );
+                }
+                assert!(retained.exists());
+                assert!(fs::read(&lock).unwrap().is_empty());
+                assert_eq!(
+                    layout.runtime.join("storage-accounting.lock").exists(),
+                    coordinated
+                );
+                drop(barrier);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 
     #[test]

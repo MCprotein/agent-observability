@@ -349,28 +349,39 @@ pub enum CollectorError {
 
 /// Creates or loads the private, idempotent local collector settings.
 pub fn install_settings(root: &Path) -> Result<CollectorSettings, CollectorError> {
-    settings_coordination::with_settings_writer(root, |layout| {
-        recover_settings_migration_before_install(layout)?;
-        let path = settings_path(layout);
-        match fs::symlink_metadata(&path) {
-            Ok(_) => {
-                let snapshot = read_private_snapshot(&path, MAX_SETTINGS_BYTES)?;
-                if let Ok(settings) = parse_owned_settings(&snapshot.bytes) {
-                    if settings.credentials.expires_at_unix_ms > current_unix_ms()? {
-                        validate_owned_credentials(layout, &settings)?;
-                        return Ok(settings);
-                    }
+    settings_coordination::with_settings_writer(root, install_settings_locked)
+}
+
+/// Creates or loads settings, waiting only for root mutation ownership.
+///
+/// Intended for foreground connection setup. Root waiting has no timeout; accounting
+/// is attempted once, and the settings operation is never retried. The default
+/// [`install_settings`] remains try-only. This does not initialize accounting.
+pub fn install_settings_waiting_for_root(root: &Path) -> Result<CollectorSettings, CollectorError> {
+    settings_coordination::with_settings_writer_waiting_for_root(root, install_settings_locked)
+}
+
+fn install_settings_locked(layout: &InstalledLayout) -> Result<CollectorSettings, CollectorError> {
+    recover_settings_migration_before_install(layout)?;
+    let path = settings_path(layout);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let snapshot = read_private_snapshot(&path, MAX_SETTINGS_BYTES)?;
+            if let Ok(settings) = parse_owned_settings(&snapshot.bytes) {
+                if settings.credentials.expires_at_unix_ms > current_unix_ms()? {
                     validate_owned_credentials(layout, &settings)?;
-                    return replace_settings(layout, Some(&snapshot));
+                    return Ok(settings);
                 }
-                let legacy_generation =
-                    validate_legacy_settings_for_migration(layout, &snapshot.bytes)?;
-                begin_settings_migration(layout, &snapshot, legacy_generation)
+                validate_owned_credentials(layout, &settings)?;
+                return replace_settings(layout, Some(&snapshot));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => rotate_settings(layout),
-            Err(error) => Err(error.into()),
+            let legacy_generation =
+                validate_legacy_settings_for_migration(layout, &snapshot.bytes)?;
+            begin_settings_migration(layout, &snapshot, legacy_generation)
         }
-    })
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => rotate_settings(layout),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn validate_legacy_settings_for_migration(

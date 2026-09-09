@@ -22,8 +22,8 @@ pub use agent_observability_contracts::{
 };
 use agent_observability_local_collector::{
     CollectorError, CollectorSettings, HealthOutcome, check_health, check_health_details,
-    commit_settings_migration, install_settings, load_settings, recover_occupied_persisted_port,
-    rollback_settings_migration, settings_migration_pending,
+    commit_settings_migration, install_settings_waiting_for_root, load_settings,
+    recover_occupied_persisted_port, rollback_settings_migration, settings_migration_pending,
 };
 use agent_observability_local_runtime::storage_coherence::{
     StorageBarrier, StorageCoherenceError, StorageMutationWriter,
@@ -216,7 +216,7 @@ pub fn connect(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus,
     let layout = install(root).map_err(runtime_error)?;
     with_lifecycle_lock(&layout, || {
         let result = (|| {
-            let settings = install_settings(&layout.root)?;
+            let settings = install_settings_waiting_for_root(&layout.root)?;
             let (_, restart) = recover_connect_settings(&layout.root, &settings)
                 .map_err(|error| rollback_migration_without_service(&layout.root, error))?;
             connect_with_reloaded_settings(
