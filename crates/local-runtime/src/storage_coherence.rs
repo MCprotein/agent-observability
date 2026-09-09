@@ -126,6 +126,23 @@ impl OwnedStorageFreezeGuard<'_> {
         revalidate_freeze(&self.held, &self.mutation)
     }
 
+    /// Observes currently available filesystem bytes at this freeze's validated root.
+    /// Other filesystem users can change this value; it is not reserved capacity
+    /// or an atomic storage snapshot, and it makes no admission decision.
+    pub fn available_space(&self) -> Result<u64, StorageCoherenceError> {
+        self.available_space_with(|root| fs2::available_space(root))
+    }
+
+    fn available_space_with(
+        &self,
+        probe: impl FnOnce(&Path) -> std::io::Result<u64>,
+    ) -> Result<u64, StorageCoherenceError> {
+        self.revalidate()?;
+        let available = probe(&self.held.barrier.root);
+        self.revalidate()?;
+        available.map_err(|error| StorageCoherenceError::Io(error.kind()))
+    }
+
     /// Recognizes only this freeze's exact stable accounting lock, not descendants.
     pub fn matches_accounting_lock(
         &self,
@@ -560,7 +577,7 @@ fn same_device(_: &File, _: &File) -> Result<(), StorageCoherenceError> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -596,6 +613,123 @@ mod tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mutation = crate::MutationGuard::try_acquire(&root.join("runtime")).unwrap();
         (root, mutation)
+    }
+
+    #[test]
+    fn owned_freeze_available_space_observes_without_releasing_locks() {
+        if run_isolated("owned_freeze_available_space_observes_without_releasing_locks") {
+            return;
+        }
+        let (root, mutation) = fixture();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let freeze = barrier.try_freeze_owned(mutation).unwrap();
+        let started = std::time::Instant::now();
+        let _available = freeze.available_space().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(
+            freeze.available_space_with(|path| {
+                assert_eq!(path, root);
+                Ok(0)
+            }),
+            Ok(0)
+        );
+        assert_eq!(
+            freeze.available_space_with(|_| Err(std::io::ErrorKind::PermissionDenied.into())),
+            Err(StorageCoherenceError::Io(
+                std::io::ErrorKind::PermissionDenied
+            ))
+        );
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::NotFound] {
+            assert_eq!(
+                freeze.available_space_with(|_| Err(kind.into())),
+                Err(StorageCoherenceError::Io(kind))
+            );
+        }
+        freeze.revalidate().unwrap();
+        assert!(matches!(
+            barrier.try_begin_write(),
+            Err(StorageCoherenceError::Busy)
+        ));
+        assert!(matches!(
+            MutationGuard::try_acquire(&root.join("runtime")),
+            Err(crate::SingletonError::AlreadyRunning)
+        ));
+        drop(freeze);
+        let mutation = MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        barrier.try_freeze(&mutation).unwrap().revalidate().unwrap();
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owned_freeze_available_space_rejects_invalid_identity_before_probe() {
+        let (root, mutation) = fixture();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let freeze = barrier.try_freeze_owned(mutation).unwrap();
+        fs::rename(
+            root.join("runtime/storage-accounting.lock"),
+            root.join("runtime/original.lock"),
+        )
+        .unwrap();
+        let mut calls = 0;
+        assert!(
+            freeze
+                .available_space_with(|_| {
+                    calls += 1;
+                    Ok(123)
+                })
+                .is_err()
+        );
+        assert_eq!(calls, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owned_freeze_available_space_rejects_and_preserves_probe_replacements() {
+        for replace_root in [false, true] {
+            let (root, mutation) = fixture();
+            let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+            let freeze = barrier.try_freeze_owned(mutation).unwrap();
+            let original = root.with_extension("original");
+            let target = if replace_root {
+                root.clone()
+            } else {
+                root.join("runtime/storage-accounting.lock")
+            };
+            let mut replacement_identity = None;
+            let result = freeze.available_space_with(|path| {
+                assert_eq!(path, root);
+                if replace_root {
+                    fs::rename(&root, &original)?;
+                    fs::create_dir(&root)?;
+                    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+                } else {
+                    fs::rename(&target, root.join("runtime/original.lock"))?;
+                    OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&target)?;
+                }
+                let metadata = fs::metadata(&target)?;
+                replacement_identity = Some((metadata.dev(), metadata.ino()));
+                Ok(123)
+            });
+            assert!(result.is_err());
+            assert!(target.exists());
+            let metadata = fs::metadata(&target).unwrap();
+            assert_eq!(Some((metadata.dev(), metadata.ino())), replacement_identity);
+            if replace_root {
+                assert!(target.is_dir());
+            } else {
+                assert_eq!(fs::metadata(&target).unwrap().len(), 0);
+            }
+            drop(freeze);
+            fs::remove_dir_all(root).unwrap();
+            if replace_root {
+                fs::remove_dir_all(original).unwrap();
+            }
+        }
     }
 
     #[test]
