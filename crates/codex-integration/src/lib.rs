@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
+pub mod storage_accounting;
 mod storage_ownership;
 
 pub use storage_ownership::{
