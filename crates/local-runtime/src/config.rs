@@ -385,6 +385,7 @@ pub struct ConfigAccountingEvidence<'guard> {
     guard: &'guard MutationGuard,
     layout: InstalledLayout,
     expected_revision: String,
+    storage_budget_policy: StorageBudgetPolicyV1,
     root: File,
     config: File,
     logs: File,
@@ -443,7 +444,8 @@ impl From<io::Error> for ConfigAccountingEvidenceError {
 }
 
 impl<'guard> ConfigAccountingEvidence<'guard> {
-    /// Capture the current validated config and exact installed layout without creating paths.
+    /// Capture schema-validated config evidence and the exact layout without creating paths.
+    /// This observation accepts separated policy but does not authorize its operation.
     pub fn capture(
         root: &Path,
         guard: &'guard MutationGuard,
@@ -453,6 +455,11 @@ impl<'guard> ConfigAccountingEvidence<'guard> {
 
     pub fn expected_revision(&self) -> &str {
         &self.expected_revision
+    }
+
+    /// The captured policy, not operational authorization or a live config read.
+    pub fn storage_budget_policy(&self) -> &StorageBudgetPolicyV1 {
+        &self.storage_budget_policy
     }
 
     /// Match only root, config.json, logs, queue, state, or runtime themselves.
@@ -496,7 +503,7 @@ impl<'guard> ConfigAccountingEvidence<'guard> {
         if !same_accounting_identity(&self.config, &current_file, false)? {
             return Err(ConfigAccountingEvidenceError::Replaced);
         }
-        let current = load_open_file(&mut current_file).map_err(map_accounting_error)?;
+        let current = decode_open_file(&mut current_file).map_err(map_accounting_error)?;
         let current_revision = revision(&current).map_err(map_accounting_error)?;
         if current_revision != self.expected_revision {
             return Err(ConfigAccountingEvidenceError::RevisionChanged);
@@ -568,12 +575,13 @@ fn capture_config_accounting_evidence<'guard>(
     let state = open_accounting_directory(&layout.state)?;
     let runtime = open_accounting_directory(&layout.runtime)?;
     let mut config = open_private_read(&layout.config).map_err(map_accounting_error)?;
-    let parsed = load_open_file(&mut config).map_err(map_accounting_error)?;
+    let parsed = decode_open_file(&mut config).map_err(map_accounting_error)?;
     let expected_revision = revision(&parsed).map_err(map_accounting_error)?;
     let evidence = ConfigAccountingEvidence {
         guard,
         layout,
         expected_revision,
+        storage_budget_policy: parsed.storage_budget,
         root: root_file,
         config,
         logs,
@@ -1000,11 +1008,15 @@ pub fn load(path: &Path) -> Result<LocalRuntimeConfigV3, ConfigError> {
 }
 
 fn load_open_file(file: &mut File) -> Result<LocalRuntimeConfigV3, ConfigError> {
-    let mut body = String::new();
-    file.read_to_string(&mut body)?;
-    let config = LocalRuntimeConfigV3::from_json(&body)?;
+    let config = decode_open_file(file)?;
     config.require_operational_storage_policy()?;
     Ok(config)
+}
+
+fn decode_open_file(file: &mut File) -> Result<LocalRuntimeConfigV3, ConfigError> {
+    let mut body = String::new();
+    file.read_to_string(&mut body)?;
+    LocalRuntimeConfigV3::from_json(&body)
 }
 
 pub fn save(guard: &ConfigMutationGuard, config: &LocalRuntimeConfigV3) -> Result<(), ConfigError> {
@@ -1466,12 +1478,19 @@ mod tests {
                 ConfigError::StoragePolicyUnavailable
             ))
         ));
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        assert!(matches!(
+            save(&guard, &candidate),
+            Err(ConfigError::StoragePolicyUnavailable)
+        ));
+        drop(guard);
         // Simulate a hand-edited config only inside this disposable private fixture.
         fs::write(&layout.config, serde_json::to_vec(&candidate).unwrap()).unwrap();
         assert!(matches!(
             load(&layout.config),
             Err(ConfigError::StoragePolicyUnavailable)
         ));
+        assert_eq!(service.read(), Err(ConfigServiceError::Unavailable));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2352,6 +2371,34 @@ mod tests {
                 .contains(".update.")
         }));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_observes_separated_policy_without_activation() {
+        let root = root("accounting-separated-policy");
+        let layout = install(&root).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.storage_budget.mode = StorageBudgetMode::Separated;
+        config.validate().unwrap();
+        // Hand-edit only this disposable private fixture; operational save stays gated.
+        fs::write(&layout.config, serde_json::to_vec(&config).unwrap()).unwrap();
+        let guard = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let evidence = ConfigAccountingEvidence::capture(&root, &guard).unwrap();
+        assert_eq!(evidence.expected_revision(), revision(&config).unwrap());
+        assert_eq!(evidence.storage_budget_policy(), &config.storage_budget);
+        evidence.revalidate().unwrap();
+
+        config.storage_budget.workspace_budget_bytes -= 1;
+        config.validate().unwrap();
+        fs::write(&layout.config, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(
+            evidence.revalidate(),
+            Err(ConfigAccountingEvidenceError::RevisionChanged)
+        );
+        drop(evidence);
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
