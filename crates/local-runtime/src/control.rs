@@ -201,10 +201,22 @@ impl RuntimeControl {
         guard: &MutationGuard,
         reservation: &WriteReservation,
     ) -> Result<u64, ControlError> {
+        let byte_ceiling = self.validated_report_reservation_bytes(root, guard, reservation)?;
+        Ok(Self::headroom(root, self.storage.writable_limit(), 0)?.min(byte_ceiling))
+    }
+
+    /// Returns only this exact owner's ceiling after validating its root, guard,
+    /// lifetime lock, and current metadata.
+    pub fn validated_report_reservation_bytes(
+        &self,
+        root: &Path,
+        guard: &MutationGuard,
+        reservation: &WriteReservation,
+    ) -> Result<u64, ControlError> {
         reservation
             .validate_owner(root, guard)
             .map_err(ControlError::Reservation)?;
-        Ok(Self::headroom(root, self.storage.writable_limit(), 0)?.min(reservation.byte_ceiling()))
+        Ok(reservation.byte_ceiling())
     }
 
     /// Claim stale metadata before cleaning interrupted staging. The returned
@@ -591,5 +603,103 @@ mod tests {
         let headroom = control.migration_headroom(&root).unwrap();
         assert!(headroom <= control.storage_budget().total);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validated_report_reservation_returns_exact_owner_ceiling_and_preserves_headroom() {
+        let root = std::env::temp_dir().join(format!(
+            "runtime-validated-reservation-{}",
+            std::process::id()
+        ));
+        let layout = crate::install(&root).unwrap();
+        let control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
+        let guard = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let ceiling = 8192;
+        let reservation = control
+            .reserve_report_build(&root, &guard, ceiling)
+            .unwrap();
+
+        assert_eq!(
+            control
+                .validated_report_reservation_bytes(&root, &guard, &reservation)
+                .unwrap(),
+            ceiling
+        );
+        let expected = RuntimeControl::headroom(&root, control.storage.writable_limit(), 0)
+            .unwrap()
+            .min(ceiling);
+        assert_eq!(
+            control
+                .reservation_finalization_headroom(&root, &guard, &reservation)
+                .unwrap(),
+            expected
+        );
+
+        reservation.release(&root, &guard).unwrap();
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validated_report_reservation_rejects_wrong_root_and_guard() {
+        let root = std::env::temp_dir().join(format!(
+            "runtime-validated-reservation-owner-{}",
+            std::process::id()
+        ));
+        let other = std::env::temp_dir().join(format!(
+            "runtime-validated-reservation-other-{}",
+            std::process::id()
+        ));
+        let layout = crate::install(&root).unwrap();
+        let other_layout = crate::install(&other).unwrap();
+        let control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
+        let guard = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let wrong_guard = MutationGuard::try_acquire(&other_layout.runtime).unwrap();
+        let reservation = control.reserve_report_build(&root, &guard, 8192).unwrap();
+
+        assert!(matches!(
+            control.validated_report_reservation_bytes(&root, &wrong_guard, &reservation),
+            Err(ControlError::Reservation(ReservationError::Lock(_)))
+        ));
+        assert!(matches!(
+            control.validated_report_reservation_bytes(&other, &guard, &reservation),
+            Err(ControlError::Reservation(ReservationError::Lock(_)))
+        ));
+
+        reservation.release(&root, &guard).unwrap();
+        drop((guard, wrong_guard));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(other).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validated_report_reservation_rejects_replaced_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "runtime-validated-reservation-replaced-{}",
+            std::process::id()
+        ));
+        let layout = crate::install(&root).unwrap();
+        let control = RuntimeControl::new(&LocalRuntimeConfigV3::default()).unwrap();
+        let guard = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let reservation = control.reserve_report_build(&root, &guard, 8192).unwrap();
+        let metadata = layout.runtime.join("report-reservation.meta");
+        let original = fs::read(&metadata).unwrap();
+        let replacement = layout.runtime.join("replacement-reservation.meta");
+        fs::write(&replacement, b"replaced").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&replacement, &metadata).unwrap();
+
+        assert!(matches!(
+            control.validated_report_reservation_bytes(&root, &guard, &reservation),
+            Err(ControlError::Reservation(ReservationError::Corrupt))
+        ));
+
+        fs::write(&metadata, original).unwrap();
+        reservation.release(&root, &guard).unwrap();
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
     }
 }
