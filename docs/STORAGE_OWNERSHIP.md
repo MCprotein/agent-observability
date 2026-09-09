@@ -378,9 +378,9 @@ admission 검사로 사용해서는 안 된다. 초기화된 경계의 owner 오
 legacy 결과로 대체하지 않는다. 정상 관측의 U는 진단에 남기되 아직 legacy admission을
 새 분리 정책으로 바꾸지는 않는다.
 
-### 다음 P3 증분: 수집 commit 직전 검사 경계
+### P3 증분: 수집 commit 직전 검사 경계
 
-collector가 integration이나 CLI를 의존하면 순환 의존성이 생긴다. 다음 증분은 collector가
+collector가 integration이나 CLI를 의존하면 순환 의존성이 생긴다. `1cb4e28`은 collector가
 소유하는 좁은 `CollectorIngestPrecommitGuard`와 명시적 실행 진입점으로 이 경계를 연결한다.
 기존 `serve`와 CLI 기본 실행은 추가 검사를 사용하지 않아 legacy 동작·비용을 유지한다.
 명시적 검사 경로만 이미 초기화된 accounting barrier를 요구하며 요청 중 생성하지 않는다.
@@ -389,10 +389,18 @@ collector가 integration이나 CLI를 의존하면 순환 의존성이 생긴다
 store를 port에 넘기지 않으며, callback 재시도·비동기 실행·관측 cache를 만들지 않는다.
 이 port는 추가 precommit 조건이지 기존 admission의 대체물이 아니다. 수집 외 writer,
 정확한 전체 예약·현재 filesystem 여유·작업량 산정 연결과 자원 검증 전에는 분리 모드를
-활성화하지 않는다. 현재는 독립 설계 WATCH를 받은 구현 예정 경계다.
+활성화하지 않는다. 이 비활성 연결 경계는 독립 코드 APPROVE / 아키텍처 CLEAR를 받았다.
+실제 검사 구현은 collector mutex와 freeze를 유지한 시간까지 자원 검증해야 하며,
+trait 자체가 구현체의 I/O·대기·변경을 컴파일 시점에 금지하는 것은 아니다.
 
-예약 수치 연결은 실제 확인된 전체 R을 그대로 받는 순수 계산 진입점을 추가한다.
+예약 수치 연결은 `1008153`에서 실제 확인된 전체 R을 그대로 받는 순수 계산 진입점을 추가했다.
 전체 R만 아는 관측에서 `active=R, stale=0` 같은 상태를 만들어내지 않는다. 기존 active/stale
 합산 API는 유지하고 한 개의 내부 계산을 공유한다. 기존 오류 우선순위와 합산 overflow를
-먼저 회귀 테스트로 고정하며, 새 함수도 소유권·동시성·쓰기 권한이나 예약 해제를 증명하지
-않는다. 이는 독립 설계 CLEAR를 받은 범위이며 운영 모드 활성화는 별도다.
+회귀 테스트로 고정했고, 새 함수도 소유권·동시성·쓰기 권한이나 예약 해제를 증명하지
+않는다. 독립 코드 APPROVE / 아키텍처 CLEAR 범위이며 운영 모드 활성화는 별도다.
+
+다음 filesystem 여유 D 연결은 기존 owned freeze가 소유한 정확한 root에서 기존 `fs2`
+조회만 수행한다. 조회 전후 guard identity를 확인하고 I/O 실패를 0이나 이전 값으로
+대체하지 않는다. 0은 실제 관측값으로 유지한다. 별도 잠금·cache·새 dependency를 만들지
+않으며, 다른 앱의 디스크 사용을 잠그거나 미래의 여유를 보장하는 API로 표시하지 않는다.
+원자적인 전체 기기 snapshot이나 쓰기 허가가 아닌 P3의 관측 경계로 구현·검증한다.
