@@ -415,3 +415,32 @@ headroom 순회는 그대로 유지하며, 없는 store의 비생성·checked ov
 실제 collector guard 배선보다 먼저 기존 추정값의 동일성을 회귀로 검증했고 독립 코드
 APPROVE / 아키텍처 CLEAR를 받았다. 집행 시 root mutation뿐 아니라 초기화된 exclusive
 all-writer freeze를 모든 snapshot 입력·판정·commit/rollback 동안 유지해야 한다.
+
+설정 관측 증분 `7e6c1d2`는 구조 검증과 운영 실행 허용을 구분했다. 기존
+`ConfigAccountingEvidence`는 파일 identity·revision·유효한 정책을 읽는 관측이므로
+schema가 유효한 분리 설정도 읽으며, 별도 공개 로더나 관측 생성자는 추가하지
+않았다. 기존 private decoder를 공유하되 public `load`·save·config service·
+`RuntimeControl`의 분리 모드 차단은 그대로 유지한다. 관측은 현재 정책만 노출하고 전체
+설정 객체나 쓰기 권한을 전달하지 않는다. 분리 설정 관측 성공과 운영 차단, 설정 변경 후
+revision 실패 및 기존 교체·권한·비생성 회귀를 함께 검증했고 독립 코드 APPROVE /
+아키텍처 CLEAR를 받았다. 실제 guard 배선은 후속이다.
+
+실제 수집 검사 연결의 선행 보강 `7cc52b5`는 설정 파일 읽기를 제한한다. 입력 상한은 64 KiB로,
+기존 settings HTTP 요청 상한과 같은 규모이며 저장 예산 T/W/F와 무관하다. 설정은 고정된
+필드와 유한한 숫자·enum으로 구성되며, 과도한 공백을 포함해 상한을 넘는 파일은 수정·절단
+없이 명시적으로 거부한다. decoder는 최대 상한+1 byte만 읽어 파일 증가에도 제한을 유지한다.
+열기는 기존 no-follow와 nonblocking flag를 함께 사용하고 열린 descriptor가 private
+regular file인지 확인한 뒤 읽는다. FIFO를 먼저 blocking open하거나 사전 stat만 믿지 않는다.
+정확한 byte 경계, 초과·읽는 중 증가, invalid UTF-8/JSON, FIFO의 유한 종료와 기존 권한·
+교체·비생성 및 운영 모드 차단을 회귀 검증했고 독립 코드 APPROVE / 아키텍처 CLEAR를 받았다.
+이는 설정 입력 한정의 자원 보강이며, 전체 소유권 관측이나 실제 guard의 지연 검증은 별도다.
+
+그 다음 실제 계산 조합은 CLI의 기존 `storage_accounting.rs` 안에 비활성 private
+`CliCollectorIngestPrecommitGuard`로 둔다. 전달받은 owned freeze를 다시 획득하지 않고
+동일 설정 revision·정책, A/X/U, 전체 R, 현재 D와 기존 E를 검증한 뒤 ingest 수치 판정을
+수행한다. 수치 거부는 `Denied`, 관측·identity·revision 실패는 `Unavailable`로 구분한다.
+callback의 허용 결과도 전체 관측의 마지막 재검증을 통과해야 반환한다. 명시적으로 전달된
+batch 상한과 설정의 불일치도 거부하며 원문·경로·secret을 오류에 포함하지 않는다.
+이 단계는 아직 `main.rs`나 `serve`에 연결하지 않는다. 자원 보강과 테스트를 먼저 통과하고
+다른 작업 경계 및 모드 전환 검증을 마치기 전까지 좁게 설명된 dead-code 허용으로
+비활성임을 드러낸다. 별도 로더·범용 service·새 dependency는 추가하지 않는다.

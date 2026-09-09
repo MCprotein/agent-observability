@@ -92,6 +92,15 @@ confused with the existing manual `retention-days` cutoff.
 않는다. `retention-days` 변경 후 실제 만료 대상은 `retention-plan`으로 확인하고
 `retention-apply`로 명시적으로 적용한다.
 
+### v1.11.0 개발 브랜치: 설정 파일 읽기 제한
+
+개발 브랜치는 `config.json`을 최대 **64 KiB (65,536 bytes)**까지 읽는다. JSON 공백도
+크기에 포함하며 초과하면 `local runtime configuration input is too large` 오류로
+거부한다. 파일을 자동으로 줄이거나 덮어쓰지 않는다. 이 제한은 작은 설정 파일의 읽기
+자원을 보호하는 것으로, 아래의 데이터 저장 예산과 별개다. 정상 CLI/웹이 생성하는 유효한
+설정은 이 범위 안에 들어간다. FIFO 같은 일반 파일이 아닌 경로는 데이터가 오기를
+기다리지 않고 거부하며, 기존 private 권한·symlink 검사도 유지한다.
+
 ### v1.11.0 개발 브랜치: 자동 보관 설정
 
 아래 옵션은 아직 게시되지 않은 개발 브랜치에 구현 중이다. `settings`의 **자동 보관** 영역에서
