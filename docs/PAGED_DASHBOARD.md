@@ -2,6 +2,12 @@
 
 Status: v1.11.0 development implementation; integration and release verification pending.
 
+September 9 merge scope: existing-real-data dashboard QA plus independent integrated
+review and exact-head required CI. Recovery of new ingestion in the capacity-blocked
+installed runtime is assigned to v1.12.0, not claimed by this dashboard change.
+QA of an isolated consistent copy does not certify live ingestion or installation
+migration. Exact-release performance evidence remains a separate publication gate.
+
 ## Why
 
 The original single-file UI bounds DOM rows but embeds every sanitized span in one HTML artifact. A private
