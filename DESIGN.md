@@ -110,13 +110,13 @@ private capability path remains separate from browser storage. A settings-trigge
 separate child process and repeated opens reuse the live process. Report generation and loopback delivery share
 one 32 MiB artifact limit.
 
-### Paged standalone dashboard — v1.11.0 accepted scope, implementation pending
+### Paged standalone dashboard — v1.11.0 implemented, release verification pending
 
 The user approved separating interactive dashboard delivery from the single-file export after a
 32,317-record local snapshot exceeded the 32 MiB artifact limit. This is not permission to delete
 observations, silently truncate results, raise the artifact bound, or add a mandatory remote service.
 
-- `agentobs dashboard` will serve a small TypeScript shell and private, bounded Rust query responses.
+- `agentobs dashboard` serves a small TypeScript shell and private, bounded Rust query responses.
   It must open even when the full HTML export would exceed its bound. Existing path-capability,
   exact loopback Host/Origin, no-store, independent lifetime and settings separation remain required.
 - The overview shows aggregate scope and generation time before trace/span pages. KPI totals describe
@@ -138,7 +138,10 @@ observations, silently truncate results, raise the artifact bound, or add a mand
   paged dashboard. Opening the interactive dashboard must not depend on export success.
 
 Backend query/index design, resource budgets and deletion fences are specified in
-[Paged Dashboard](docs/PAGED_DASHBOARD.md). This section is an accepted target, not release evidence.
+[Paged Dashboard](docs/PAGED_DASHBOARD.md). This section describes the implemented contract,
+not release approval. Existing-real-data browser QA and final review/CI are recorded separately
+in the [review checkpoint](docs/reviews/v1.11.0.md). Recovery of capacity-blocked new ingestion
+is deferred to v1.12.0 and is not claimed by this dashboard implementation.
 
 The settings process binds an operating-system-selected port on `127.0.0.1`, rejects non-loopback host and
 origin values, sends no CORS permission, makes no external request and expires after inactivity. Closing it
