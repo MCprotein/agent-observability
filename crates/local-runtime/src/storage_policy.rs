@@ -90,6 +90,54 @@ pub fn evaluate_storage_admission(
     filesystem_free_bytes: u64,
     operation: StorageOperation,
 ) -> Result<u64, StorageAdmissionRejection> {
+    let reserved_total = reservations
+        .active_bytes
+        .checked_add(reservations.stale_bytes)
+        .ok_or(StorageAdmissionRejection::ArithmeticOverflow(
+            StorageAdmissionArithmetic::Reservations,
+        ));
+    evaluate_storage_admission_inner(
+        policy,
+        allocation,
+        reserved_total,
+        estimated_allowance_bytes,
+        filesystem_free_bytes,
+        operation,
+    )
+}
+
+/// Evaluates admission using the caller-validated full outstanding reservation total.
+///
+/// This does not infer active/stale ownership or liveness, validate snapshot coherence,
+/// or grant write authority. Already allocated staging bytes are not deducted from
+/// the total. The same numeric conditions and error precedence apply as in
+/// [`evaluate_storage_admission`].
+pub fn evaluate_storage_admission_with_reserved_total(
+    policy: &StorageBudgetPolicyV1,
+    allocation: StorageAllocationSnapshotV1,
+    reserved_total: u64,
+    estimated_allowance_bytes: Option<u64>,
+    filesystem_free_bytes: u64,
+    operation: StorageOperation,
+) -> Result<u64, StorageAdmissionRejection> {
+    evaluate_storage_admission_inner(
+        policy,
+        allocation,
+        Ok(reserved_total),
+        estimated_allowance_bytes,
+        filesystem_free_bytes,
+        operation,
+    )
+}
+
+fn evaluate_storage_admission_inner(
+    policy: &StorageBudgetPolicyV1,
+    allocation: StorageAllocationSnapshotV1,
+    reserved_total: Result<u64, StorageAdmissionRejection>,
+    estimated_allowance_bytes: Option<u64>,
+    filesystem_free_bytes: u64,
+    operation: StorageOperation,
+) -> Result<u64, StorageAdmissionRejection> {
     policy
         .validate()
         .map_err(|_| StorageAdmissionRejection::InvalidPolicy)?;
@@ -106,12 +154,7 @@ pub fn evaluate_storage_admission(
         .ok_or(StorageAdmissionRejection::ArithmeticOverflow(
             StorageAdmissionArithmetic::TotalAllocated,
         ))?;
-    let reservation_bytes = reservations
-        .active_bytes
-        .checked_add(reservations.stale_bytes)
-        .ok_or(StorageAdmissionRejection::ArithmeticOverflow(
-            StorageAdmissionArithmetic::Reservations,
-        ))?;
+    let reservation_bytes = reserved_total?;
     let workspace_required_bytes = allocation
         .workspace_bytes
         .checked_add(reservation_bytes)
@@ -213,6 +256,76 @@ mod tests {
     }
 
     #[test]
+    fn full_reservation_total_matches_split_inputs_without_liveness_inference() {
+        let policies = [
+            policy(GIB, GIB, GIB),
+            policy(0, GIB, GIB),
+            StorageBudgetPolicyV1 {
+                mode: StorageBudgetMode::Legacy,
+                ..policy(GIB, GIB, GIB)
+            },
+        ];
+        let allocations = [
+            allocation(700, 64),
+            allocation(1024, 0),
+            allocation(0, 1025),
+            StorageAllocationSnapshotV1 {
+                unknown_entry_count: 1,
+                ..allocation(0, 0)
+            },
+            StorageAllocationSnapshotV1 {
+                unknown_bytes: 1,
+                ..allocation(0, 0)
+            },
+            StorageAllocationSnapshotV1 {
+                retained_bytes: u64::MAX,
+                workspace_bytes: 1,
+                ..allocation(0, 0)
+            },
+        ];
+        for policy in policies {
+            for allocation in allocations {
+                for total in [0, 128 * MIB, u64::MAX] {
+                    for split in [0, total / 2, total] {
+                        let reservations = StorageReservationSnapshotV1 {
+                            active_bytes: split,
+                            stale_bytes: total - split,
+                        };
+                        for estimate in [None, Some(0), Some(832 * MIB), Some(u64::MAX)] {
+                            for free in [0, 1984 * MIB, u64::MAX] {
+                                for operation in [
+                                    StorageOperation::Ingest,
+                                    StorageOperation::Import,
+                                    StorageOperation::PrivateCapture,
+                                    StorageOperation::Report,
+                                    StorageOperation::Cleanup,
+                                    StorageOperation::Recovery,
+                                    StorageOperation::Migration,
+                                ] {
+                                    assert_eq!(
+                                        evaluate_storage_admission_with_reserved_total(
+                                            &policy, allocation, total, estimate, free, operation
+                                        ),
+                                        evaluate_storage_admission(
+                                            &policy,
+                                            allocation,
+                                            reservations,
+                                            estimate,
+                                            free,
+                                            operation
+                                        ),
+                                        "policy={policy:?} allocation={allocation:?} reservations={reservations:?} estimate={estimate:?} free={free} operation={operation:?}",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn p0_vectors_preserve_separate_retained_workspace_and_free_floor_rules() {
         assert_eq!(
             evaluate(
@@ -282,6 +395,61 @@ mod tests {
                 StorageOperation::Cleanup,
             ),
             Ok(64 * MIB),
+        );
+    }
+
+    #[test]
+    fn split_reservation_overflow_keeps_existing_error_precedence() {
+        let overflowing = StorageReservationSnapshotV1 {
+            active_bytes: u64::MAX,
+            stale_bytes: 1,
+        };
+        let valid = policy(GIB, GIB, GIB);
+        let mut legacy = valid.clone();
+        legacy.mode = StorageBudgetMode::Legacy;
+        let invalid = policy(0, GIB, GIB);
+        for (candidate, estimate, expected) in [
+            (&invalid, None, StorageAdmissionRejection::InvalidPolicy),
+            (&legacy, None, StorageAdmissionRejection::LegacyMode),
+            (&valid, None, StorageAdmissionRejection::EstimateUnavailable),
+            (
+                &valid,
+                Some(0),
+                StorageAdmissionRejection::ArithmeticOverflow(
+                    StorageAdmissionArithmetic::Reservations,
+                ),
+            ),
+        ] {
+            assert_eq!(
+                evaluate_storage_admission(
+                    candidate,
+                    allocation(0, 0),
+                    overflowing,
+                    estimate,
+                    u64::MAX,
+                    StorageOperation::Report
+                ),
+                Err(expected),
+            );
+        }
+        let overflow_allocation = StorageAllocationSnapshotV1 {
+            retained_bytes: u64::MAX,
+            workspace_bytes: 1,
+            unknown_bytes: 0,
+            unknown_entry_count: 0,
+        };
+        assert_eq!(
+            evaluate_storage_admission(
+                &valid,
+                overflow_allocation,
+                overflowing,
+                Some(0),
+                u64::MAX,
+                StorageOperation::Report
+            ),
+            Err(StorageAdmissionRejection::ArithmeticOverflow(
+                StorageAdmissionArithmetic::TotalAllocated
+            )),
         );
     }
 
