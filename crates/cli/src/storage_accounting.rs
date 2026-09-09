@@ -632,7 +632,10 @@ mod tests {
             drop(LocalStore::open(self.layout.state.join("store")).unwrap());
         }
 
-        fn populate_private_artifact_capacity(&self) {
+        fn populate_private_artifact_capacity(
+            &self,
+            detail_fixture: fn(usize) -> (String, Vec<u8>),
+        ) -> usize {
             let detail_directory = self.layout.state.join(PRIVATE_DETAIL_DIRECTORY);
             let status_directory = self.layout.state.join(PRIVATE_STATUS_DIRECTORY);
             for directory in [&detail_directory, &status_directory] {
@@ -640,7 +643,7 @@ mod tests {
             }
 
             for index in 0..PRIVATE_ARTIFACT_CAPACITY {
-                let (turn_id, detail) = private_detail_at_byte_bound(index);
+                let (turn_id, detail) = detail_fixture(index);
                 let digest = turn_id.strip_prefix("id:sha256:").unwrap();
                 write_private_fixture_file(
                     &detail_directory.join(format!("{digest}.json")),
@@ -657,6 +660,7 @@ mod tests {
                     &status,
                 );
             }
+            tree_entry_count(&self.layout.root)
         }
 
         fn populate_to_inventory_entries(&self, target_entries: usize) {
@@ -692,6 +696,17 @@ mod tests {
             project_notify_with_private_detail(payload(&"x".repeat(padding)).as_bytes()).unwrap();
         let encoded = detail.to_json().unwrap();
         assert_eq!(encoded.len(), MAX_PRIVATE_TURN_DETAIL_BYTES);
+        (detail.turn_id().to_owned(), encoded)
+    }
+
+    fn small_private_detail(index: usize) -> (String, Vec<u8>) {
+        use agent_observability_adapter_codex::project_notify_with_private_detail;
+
+        let payload = format!(
+            "{{\"type\":\"agent-turn-complete\",\"thread-id\":\"synthetic-thread\",\"turn-id\":\"synthetic-turn-{index:04}\",\"cwd\":\"/synthetic-only\",\"input-messages\":[],\"last-assistant-message\":\"small\"}}"
+        );
+        let (_, detail) = project_notify_with_private_detail(payload.as_bytes()).unwrap();
+        let encoded = detail.to_json().unwrap();
         (detail.turn_id().to_owned(), encoded)
     }
 
@@ -1049,10 +1064,25 @@ mod tests {
         let capacity = Fixture::new("precommit-diagnostic-private-capacity");
         let capacity_config = capacity.separated_config();
         capacity.initialize_current_store();
-        capacity.populate_private_artifact_capacity();
+        let capacity_entries =
+            capacity.populate_private_artifact_capacity(private_detail_at_byte_bound);
         let capacity_freeze = capacity.freeze();
         let capacity_elapsed =
             sample_dormant_trait_guard(&capacity, &capacity_freeze, &capacity_config, Ok(()));
+
+        let small_capacity = Fixture::new("precommit-diagnostic-small-private-capacity");
+        let small_capacity_config = small_capacity.separated_config();
+        small_capacity.initialize_current_store();
+        let small_capacity_entries =
+            small_capacity.populate_private_artifact_capacity(small_private_detail);
+        assert_eq!(small_capacity_entries, capacity_entries);
+        let small_capacity_freeze = small_capacity.freeze();
+        let small_capacity_elapsed = sample_dormant_trait_guard(
+            &small_capacity,
+            &small_capacity_freeze,
+            &small_capacity_config,
+            Ok(()),
+        );
 
         let inventory_limit = Fixture::new("precommit-diagnostic-inventory-limit");
         let inventory_limit_config = inventory_limit.separated_config();
@@ -1076,13 +1106,16 @@ mod tests {
         );
 
         println!(
-            "baseline_ns={},{},{} capacity_ns={},{},{} inventory_limit_ns={},{},{} over_limit_ns={},{},{}",
+            "baseline_ns={},{},{} capacity_ns={},{},{} small_capacity_ns={},{},{} inventory_limit_ns={},{},{} over_limit_ns={},{},{}",
             baseline_elapsed[0],
             baseline_elapsed[1],
             baseline_elapsed[2],
             capacity_elapsed[0],
             capacity_elapsed[1],
             capacity_elapsed[2],
+            small_capacity_elapsed[0],
+            small_capacity_elapsed[1],
+            small_capacity_elapsed[2],
             inventory_limit_elapsed[0],
             inventory_limit_elapsed[1],
             inventory_limit_elapsed[2],
