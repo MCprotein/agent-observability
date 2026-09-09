@@ -270,6 +270,19 @@ pub struct ReportStatus {
 }
 
 #[derive(Debug)]
+struct StoreOpenGuard {
+    file: File,
+}
+
+impl Drop for StoreOpenGuard {
+    fn drop(&mut self) {
+        // End this acquisition even while a duplicate descriptor remains alive.
+        // Failed acquisitions never construct a guard and cannot unlock a peer.
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+#[derive(Debug)]
 pub struct ReportRenderGuard {
     file: File,
 }
@@ -704,7 +717,9 @@ impl LocalStore {
     ) -> Result<Self, StoreError> {
         private_dir(dir)?;
         let dir = fs::canonicalize(dir)?;
-        let _open_guard = acquire_private_lock(&dir, STORE_OPEN_LOCK_NAME)?;
+        let _open_guard = StoreOpenGuard {
+            file: acquire_private_lock(&dir, STORE_OPEN_LOCK_NAME)?,
+        };
         let db_path = dir.join(DB_NAME);
         match private_create_new(&db_path) {
             Ok(file) => file.sync_all()?,
@@ -2543,7 +2558,7 @@ fn acquire_existing_private_lock(
     parent: &Path,
     name: &str,
     nonblocking: bool,
-) -> Result<File, StoreError> {
+) -> Result<StoreOpenGuard, StoreError> {
     let path = parent.join(name);
     if let Ok(metadata) = fs::symlink_metadata(&path)
         && metadata.file_type().is_symlink()
@@ -2570,8 +2585,9 @@ fn acquire_existing_private_lock(
     } else {
         file.lock_exclusive()?;
     }
-    storage_ownership::validate_private_file_identity(&path, &file)?;
-    Ok(file)
+    let guard = StoreOpenGuard { file };
+    storage_ownership::validate_private_file_identity(&path, &guard.file)?;
+    Ok(guard)
 }
 
 fn try_acquire_private_lock(parent: &Path, name: &str) -> Result<Option<File>, StoreError> {
@@ -8648,6 +8664,48 @@ mod tests {
         drop(guard);
         assert!(peer.try_acquire_report_render_guard().unwrap().is_some());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_open_lock_release_is_independent_of_duplicate_descriptor_lifetime() {
+        let dir = temp_dir("store-open-duplicate-descriptor");
+        drop(LocalStore::open(&dir).unwrap());
+        for nonblocking in [None, Some(false), Some(true)] {
+            let guard = match nonblocking {
+                None => super::StoreOpenGuard {
+                    file: super::acquire_private_lock(&dir, super::STORE_OPEN_LOCK_NAME).unwrap(),
+                },
+                Some(nonblocking) => super::acquire_existing_private_lock(
+                    &dir,
+                    super::STORE_OPEN_LOCK_NAME,
+                    nonblocking,
+                )
+                .unwrap(),
+            };
+            let duplicate = guard.file.try_clone().unwrap();
+            assert!(matches!(
+                LocalStore::open_report_reader(&dir),
+                Err(StoreError::OpenLockBusy)
+            ));
+            drop(guard);
+            let reopened = LocalStore::open_report_reader(&dir);
+            assert!(
+                reopened.is_ok(),
+                "store-open ownership must end with its guard"
+            );
+            drop(reopened);
+            let next =
+                super::acquire_existing_private_lock(&dir, super::STORE_OPEN_LOCK_NAME, true)
+                    .unwrap();
+            drop(duplicate);
+            assert!(matches!(
+                LocalStore::open_report_reader(&dir),
+                Err(StoreError::OpenLockBusy)
+            ));
+            drop(next);
+            drop(LocalStore::open_report_reader(&dir).unwrap());
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
