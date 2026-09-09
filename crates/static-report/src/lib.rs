@@ -1,5 +1,7 @@
 //! Self-contained, private HTML artifact assembly for validated report DTOs.
 
+mod semantic_validation;
+
 use agent_observability_contracts::{ContractError, MAX_REPORT_ARTIFACT_BYTES, ReportDtoV2};
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -12,13 +14,17 @@ const PAGED_SHELL: &str = include_str!("../../../src/report/generated/paged-shel
 const TITLE_TOKEN: &str = "__AGENT_OBSERVABILITY_REPORT_TITLE__";
 const GENERATED_AT_TOKEN: &str = "__AGENT_OBSERVABILITY_REPORT_GENERATED_AT__";
 const DATA_TOKEN: &str = "__AGENT_OBSERVABILITY_REPORT_DATA__";
+const PENDING: &str = "<!doctype html><html lang=\"ko\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Agent Observability — 갱신 대기</title><main><h1>리포트 갱신 대기</h1><p>데이터 보관 정책을 적용하는 동안 이전 리포트를 숨겼습니다.</p><p>수집기가 실행 중이면 잠시 후 새로고침하세요. 수동 실행 환경에서는 agentobs report 명령으로 다시 만드세요.</p></main></html>";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub use semantic_validation::validate_semantic_artifact;
 
 #[derive(Debug)]
 pub enum ReportArtifactError {
     Contract(ContractError),
     Json(serde_json::Error),
     Io(io::Error),
+    InvalidArtifact,
     InvalidTemplate,
     InvalidPath,
     InsecurePermissions,
@@ -34,6 +40,7 @@ impl Display for ReportArtifactError {
             Self::Contract(_) => "report DTO does not satisfy its contract",
             Self::Json(_) => "report DTO serialization failed",
             Self::Io(_) => "report artifact I/O failed",
+            Self::InvalidArtifact => "static report artifact is not the canonical rendered output",
             Self::InvalidTemplate => "embedded report template is invalid",
             Self::InvalidPath => "report artifact path has the wrong file type",
             Self::InsecurePermissions => "report artifact path is not private",
@@ -118,7 +125,6 @@ pub fn write_private(path: &Path, report: &ReportDtoV2) -> Result<u64, ReportArt
 ///
 /// Returns [`ReportArtifactError`] without authorizing deletion if private publication fails.
 pub fn write_refresh_pending(path: &Path) -> Result<u64, ReportArtifactError> {
-    const PENDING: &str = "<!doctype html><html lang=\"ko\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Agent Observability — 갱신 대기</title><main><h1>리포트 갱신 대기</h1><p>데이터 보관 정책을 적용하는 동안 이전 리포트를 숨겼습니다.</p><p>수집기가 실행 중이면 잠시 후 새로고침하세요. 수동 실행 환경에서는 agentobs report 명령으로 다시 만드세요.</p></main></html>";
     write_private_content(path, |writer| {
         writer.write_all(PENDING.as_bytes())?;
         u64::try_from(PENDING.len()).map_err(|_| ReportArtifactError::TooLarge)
@@ -798,6 +804,116 @@ mod tests {
                 "report data containing {token} was interpreted as template syntax"
             );
         }
+    }
+
+    fn replace_embedded_report_data(html: &str, replacement: &str) -> Vec<u8> {
+        const OPEN: &str = r#"<script id="report-data" type="application/json">"#;
+        const CLOSE: &str = "</script>";
+
+        let data_start = html.find(OPEN).unwrap() + OPEN.len();
+        let data_end = data_start + html[data_start..].find(CLOSE).unwrap();
+        let mut artifact =
+            Vec::with_capacity(html.len() - (data_end - data_start) + replacement.len());
+        artifact.extend_from_slice(&html.as_bytes()[..data_start]);
+        artifact.extend_from_slice(replacement.as_bytes());
+        artifact.extend_from_slice(&html.as_bytes()[data_end..]);
+        artifact
+    }
+
+    #[test]
+    fn semantic_validation_accepts_empty_and_populated_current_reports() {
+        let empty = render(&report("Empty report")).unwrap();
+        assert!(validate_semantic_artifact(empty.as_bytes()).is_ok());
+
+        let populated: ReportDtoV2 = serde_json::from_slice(include_bytes!(
+            "../../../contracts/report-dto-v2.fixture.json"
+        ))
+        .unwrap();
+        assert!(!populated.spans.is_empty());
+        let populated = render(&populated).unwrap();
+        assert!(validate_semantic_artifact(populated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn semantic_validation_accepts_escaped_script_text_and_unicode() {
+        let html = render(&report("서울 </script> & 리포트 🚀")).unwrap();
+
+        assert!(validate_semantic_artifact(html.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn semantic_validation_accepts_only_the_exact_pending_placeholder() {
+        const EXPECTED_PENDING: &str = "<!doctype html><html lang=\"ko\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Agent Observability — 갱신 대기</title><main><h1>리포트 갱신 대기</h1><p>데이터 보관 정책을 적용하는 동안 이전 리포트를 숨겼습니다.</p><p>수집기가 실행 중이면 잠시 후 새로고침하세요. 수동 실행 환경에서는 agentobs report 명령으로 다시 만드세요.</p></main></html>";
+
+        assert!(validate_semantic_artifact(EXPECTED_PENDING.as_bytes()).is_ok());
+        assert!(validate_semantic_artifact(format!("{EXPECTED_PENDING}\n").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn semantic_validation_rejects_malformed_unknown_and_invalid_contract_json() {
+        let report = report("JSON contract");
+        let html = render(&report).unwrap();
+        assert!(validate_semantic_artifact(&replace_embedded_report_data(&html, "{")).is_err());
+
+        let mut unknown = serde_json::to_value(&report).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), serde_json::Value::Bool(true));
+        assert!(
+            validate_semantic_artifact(&replace_embedded_report_data(
+                &html,
+                &serde_json::to_string(&unknown).unwrap(),
+            ))
+            .is_err()
+        );
+
+        let mut invalid_contract = report;
+        invalid_contract.schema_version = "agent_observability.report.v999".into();
+        assert!(
+            validate_semantic_artifact(&replace_embedded_report_data(
+                &html,
+                &serde_json::to_string(&invalid_contract).unwrap(),
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn semantic_validation_rejects_shell_title_time_and_trailing_mutations() {
+        let html = render(&report("Canonical report")).unwrap();
+
+        let mutated_shell =
+            html.replacen("<main class=\"wrap\">", "<main class=\"wrap changed\">", 1);
+        assert!(validate_semantic_artifact(mutated_shell.as_bytes()).is_err());
+
+        let mismatched_title = html.replacen("Canonical report", "Different report", 1);
+        assert!(validate_semantic_artifact(mismatched_title.as_bytes()).is_err());
+
+        let mismatched_time =
+            html.replacen("2026-08-29T00:00:00.000Z", "2026-08-30T00:00:00.000Z", 1);
+        assert!(validate_semantic_artifact(mismatched_time.as_bytes()).is_err());
+
+        let mut trailing = html.as_bytes().to_vec();
+        trailing.extend_from_slice(b"\n");
+        assert!(validate_semantic_artifact(&trailing).is_err());
+    }
+
+    #[test]
+    fn semantic_validation_rejects_duplicate_report_data_tags_and_oversize_input() {
+        let html = render(&report("Duplicate data tag")).unwrap();
+        let duplicate = html.replacen(
+            "</body>",
+            r#"<script id="report-data" type="application/json">{}</script></body>"#,
+            1,
+        );
+        assert!(validate_semantic_artifact(duplicate.as_bytes()).is_err());
+
+        let oversize = vec![b'x'; usize::try_from(MAX_REPORT_ARTIFACT_BYTES).unwrap() + 1];
+        assert!(matches!(
+            validate_semantic_artifact(&oversize),
+            Err(ReportArtifactError::TooLarge)
+        ));
     }
 
     #[cfg(unix)]
