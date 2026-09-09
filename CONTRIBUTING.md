@@ -60,13 +60,22 @@ PR에 적용되는 명령은 버전 scope에 따라 달라질 수 있지만, 최
 
 ```bash
 cargo fmt --all -- --check
-cargo test --workspace --no-fail-fast
+cargo test --workspace --exclude agent-observability-cli --no-fail-fast
+bash scripts/test-rust-cli.sh
 cargo clippy --workspace --all-targets -- -D warnings
 npm test
 git fetch origin main
 git diff --check origin/main...HEAD
 git diff --check
 ```
+
+CLI 패키지는 파일 identity를 유지하는 테스트가 많아 별도 병렬 실행 프로필을 사용한다.
+위 스크립트는 Rust 1.97.0으로 CLI 패키지 전체를 32개 테스트 thread로 실행하며,
+자식 프로세스의 열린 파일 soft limit만 최소 1,024로 설정한다. hard limit이 부족하면
+테스트를 생략하거나 직렬화하지 않고 선행 조건 오류로 종료한다. 부모 셸·설치된 제품·
+사용자 설정은 바꾸지 않는다. 이는 현재 테스트 실행에 한정된 자원 계약이며 제품의
+최소 사양이나 저장공간 한도가 아니다. 파일 고갈 회귀는 별도 격리 자식에서 낮은 한도를
+사용해 안전한 거부와 자원 해제 후 복구를 검사한다.
 
 GitHub의 `CI` workflow는 pull request에서 Rust 검사와 `npm test`를 다시 실행한다.
 일반 PR CI 성공은 merge gate의 일부이며 장시간 release performance 검증을 대체하지 않는다.
