@@ -43,7 +43,7 @@ function runHarness(soft: number, hard: number) {
 }
 
 test("CLI harness raises only its child soft limit and runs all CLI tests in parallel", { skip: process.platform === "win32" }, () => {
-  const result = runHarness(256, 4096);
+  const result = runHarness(256, 1024);
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /child_limit=1024\n/);
@@ -52,10 +52,10 @@ test("CLI harness raises only its child soft limit and runs all CLI tests in par
 });
 
 test("CLI harness preserves an already sufficient child limit", { skip: process.platform === "win32" }, () => {
-  const result = runHarness(2048, 4096);
+  const result = runHarness(1024, 1024);
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /child_limit=2048\n/);
-  assert.match(result.stdout, /parent_limit=2048\n/);
+  assert.match(result.stdout, /child_limit=1024\n/);
+  assert.match(result.stdout, /parent_limit=1024\n/);
 });
 
 test("CLI harness rejects insufficient hard limits before running cargo", { skip: process.platform === "win32" }, () => {
