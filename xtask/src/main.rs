@@ -2142,10 +2142,8 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
             wait_for_automatic_lifecycle_recovery(binary, &cleanup),
         )?;
 
-        let recovered_records = automatic_lifecycle_stage(
-            AutomaticLifecycleStage::RecoverySnapshot,
-            automatic_report_record_count(binary, &root, &cleanup),
-        )?;
+        let recovered_records = automatic_report_record_count(binary, &root, &cleanup)
+            .map_err(|error| automatic_recovery_snapshot_error(&error))?;
         automatic_lifecycle_stage(
             AutomaticLifecycleStage::PostRecoveryOtlp,
             submit_automatic_synthetic_otlp(&root, 0, 1),
@@ -2326,6 +2324,41 @@ fn verify_automatic_ownership_rebase(
         &cleanup.environment(),
     )?;
     require_output_line(&status, "config", "connected")
+}
+
+fn automatic_recovery_snapshot_error(error: &str) -> String {
+    // Exact content-free errors only; classification grants no retry authority.
+    let reason = if let Some(stderr) =
+        error.strip_prefix("built product command failed: exit status: 1: ")
+    {
+        match stderr {
+            "storage accounting barrier is busy"
+            | "singleton coherence error: storage accounting barrier is busy"
+            | "local runtime is already running"
+            | "local store open is busy" => Some("busy"),
+            "local store database failure"
+            | "local store I/O failure"
+            | "local store schema or integrity mismatch" => Some("store_failed"),
+            _ => None,
+        }
+    } else if error
+        == format!(
+            "wait for built product command: worker exit timed out after {} ms",
+            AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT.as_millis()
+        )
+    {
+        Some("timeout")
+    } else if matches!(
+        error,
+        "automatic lifecycle report omitted records"
+            | "automatic lifecycle report returned invalid records"
+    ) {
+        Some("output_failed")
+    } else {
+        None
+    };
+    let stage = AutomaticLifecycleStage::RecoverySnapshot.failure();
+    reason.map_or_else(|| stage.to_owned(), |reason| format!("{stage}: {reason}"))
 }
 
 fn automatic_report_record_count(
@@ -5930,6 +5963,16 @@ fn render_automatic_manifest(
 
 fn automatic_evidence_error_code(error: &str) -> &'static str {
     if let Some(error) = error.strip_prefix("lifecycle preflight: ") {
+        let primary = error
+            .split_once("; cleanup failed: ")
+            .map_or(error, |(primary, _)| primary);
+        match primary.strip_prefix("automatic lifecycle stage recovery snapshot failed: ") {
+            Some("busy") => return "code=lifecycle_recovery_snapshot_busy",
+            Some("timeout") => return "code=lifecycle_recovery_snapshot_timeout",
+            Some("store_failed") => return "code=lifecycle_recovery_snapshot_store_failed",
+            Some("output_failed") => return "code=lifecycle_recovery_snapshot_output_failed",
+            _ => {}
+        }
         if let Some(stage) = AutomaticLifecycleStage::from_failure(error) {
             stage.code()
         } else if error.contains("requires codex") {
@@ -6320,6 +6363,10 @@ fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
         "  - 'code=lifecycle_kill_failed'",
         "  - 'code=lifecycle_recovery_wait_failed'",
         "  - 'code=lifecycle_recovery_snapshot_failed'",
+        "  - 'code=lifecycle_recovery_snapshot_busy'",
+        "  - 'code=lifecycle_recovery_snapshot_timeout'",
+        "  - 'code=lifecycle_recovery_snapshot_store_failed'",
+        "  - 'code=lifecycle_recovery_snapshot_output_failed'",
         "  - 'code=lifecycle_post_recovery_otlp_failed'",
         "  - 'code=lifecycle_post_recovery_notify_failed'",
         "  - 'code=lifecycle_post_recovery_privacy_failed'",
@@ -8278,6 +8325,63 @@ mod tests {
             assert!(manifest.contains(&format!("  - '{code}'")));
             validate_automatic_manifest_shape(&manifest).unwrap();
             validate_automatic_manifest_privacy(&manifest).unwrap();
+        }
+    }
+
+    #[test]
+    fn recovery_snapshot_diagnostics_preserve_only_closed_failure_categories() {
+        let cases = [
+            (
+                "built product command failed: exit status: 1: storage accounting barrier is busy",
+                "code=lifecycle_recovery_snapshot_busy",
+            ),
+            (
+                "built product command failed: exit status: 1: singleton coherence error: storage accounting barrier is busy",
+                "code=lifecycle_recovery_snapshot_busy",
+            ),
+            (
+                "built product command failed: exit status: 1: local runtime is already running",
+                "code=lifecycle_recovery_snapshot_busy",
+            ),
+            (
+                "built product command failed: exit status: 1: local store open is busy",
+                "code=lifecycle_recovery_snapshot_busy",
+            ),
+            (
+                "wait for built product command: worker exit timed out after 30000 ms",
+                "code=lifecycle_recovery_snapshot_timeout",
+            ),
+            (
+                "built product command failed: exit status: 1: local store database failure",
+                "code=lifecycle_recovery_snapshot_store_failed",
+            ),
+            (
+                "automatic lifecycle report omitted records",
+                "code=lifecycle_recovery_snapshot_output_failed",
+            ),
+            (
+                "automatic lifecycle report returned invalid records",
+                "code=lifecycle_recovery_snapshot_output_failed",
+            ),
+            (
+                "/private/tmp/AUTOMATIC_RAW_PROMPT_SENTINEL token private-key.pem",
+                "code=lifecycle_recovery_snapshot_failed",
+            ),
+            (
+                "private prefix: storage accounting barrier is busy",
+                "code=lifecycle_recovery_snapshot_failed",
+            ),
+        ];
+        for (private, expected) in cases {
+            let safe = automatic_recovery_snapshot_error(private);
+            for suffix in ["", "; cleanup failed: PRIVATE_CLEANUP_SENTINEL"] {
+                assert_eq!(
+                    automatic_evidence_error_code(&format!("lifecycle preflight: {safe}{suffix}")),
+                    expected
+                );
+            }
+            assert!(!safe.contains("SENTINEL"));
+            validate_automatic_manifest_privacy(&format!("errors:\n  - '{expected}'\n")).unwrap();
         }
     }
 
