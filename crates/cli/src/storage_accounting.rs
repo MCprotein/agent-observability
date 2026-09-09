@@ -483,16 +483,29 @@ mod tests {
     use agent_observability_codex_integration::storage_accounting::capture_codex_config_snapshot_ownership;
     use agent_observability_local_runtime::{
         LocalRuntimeConfigV3, MutationGuard, RuntimeControl, SingletonError, StorageBudgetMode,
-        install, load, storage_coherence::StorageBarrier,
+        install, load, storage::MAX_ACCOUNTING_ENTRIES, storage_coherence::StorageBarrier,
     };
     use agent_observability_local_store::LocalStore;
     use std::{
         fs,
-        os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
+        io::Write,
+        os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt},
         path::PathBuf,
         process::Command,
         sync::atomic::{AtomicU64, Ordering},
+        time::Instant,
     };
+
+    const DIAGNOSTIC_SAMPLES: usize = 3;
+    // Test-fixture mirrors of local-collector's private artifact contract. Source pointers:
+    // PRIVATE_TURN_DETAIL_{DIRECTORY,STATUS_DIRECTORY,STATUS_VERSION},
+    // MAX_PRIVATE_TURN_DETAIL_FILES, and validate_private_turn_detail_status in
+    // crates/local-collector/src/lib.rs. Production constants and types remain private.
+    const PRIVATE_DETAIL_DIRECTORY: &str = "private-codex-turn-details";
+    const PRIVATE_STATUS_DIRECTORY: &str = "private-codex-turn-detail-statuses";
+    const PRIVATE_STATUS_VERSION: &str = "private_codex_turn_detail_status.v1";
+    const PRIVATE_ARTIFACT_CAPACITY: usize = 1_024;
+    const PRIVATE_STATUS_BYTES: usize = 1_024;
 
     struct Fixture {
         base: PathBuf,
@@ -614,6 +627,113 @@ mod tests {
                 },
             )
         }
+
+        fn initialize_current_store(&self) {
+            drop(LocalStore::open(self.layout.state.join("store")).unwrap());
+        }
+
+        fn populate_private_artifact_capacity(&self) {
+            let detail_directory = self.layout.state.join(PRIVATE_DETAIL_DIRECTORY);
+            let status_directory = self.layout.state.join(PRIVATE_STATUS_DIRECTORY);
+            for directory in [&detail_directory, &status_directory] {
+                fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
+            }
+
+            for index in 0..PRIVATE_ARTIFACT_CAPACITY {
+                let (turn_id, detail) = private_detail_at_byte_bound(index);
+                let digest = turn_id.strip_prefix("id:sha256:").unwrap();
+                write_private_fixture_file(
+                    &detail_directory.join(format!("{digest}.json")),
+                    &detail,
+                );
+                let mut status = format!(
+                    "{{\"schema_version\":\"{PRIVATE_STATUS_VERSION}\",\"turn_id\":\"{turn_id}\",\"state\":\"available\",\"code\":\"ok\"}}"
+                )
+                .into_bytes();
+                assert!(status.len() < PRIVATE_STATUS_BYTES);
+                status.resize(PRIVATE_STATUS_BYTES, b' ');
+                write_private_fixture_file(
+                    &status_directory.join(format!("{digest}.json")),
+                    &status,
+                );
+            }
+        }
+
+        fn populate_to_inventory_entries(&self, target_entries: usize) {
+            let current_entries = tree_entry_count(&self.layout.root);
+            assert!(current_entries <= target_entries);
+            for index in current_entries..target_entries {
+                write_private_fixture_file(
+                    &self.layout.logs.join(format!("diagnostic-limit-{index}")),
+                    &[],
+                );
+            }
+            assert_eq!(tree_entry_count(&self.layout.root), target_entries);
+        }
+    }
+
+    fn private_detail_at_byte_bound(index: usize) -> (String, Vec<u8>) {
+        use agent_observability_adapter_codex::{
+            MAX_PRIVATE_TURN_DETAIL_BYTES, project_notify_with_private_detail,
+        };
+
+        let turn = format!("synthetic-turn-{index:04}");
+        let payload = |message: &str| {
+            format!(
+                "{{\"type\":\"agent-turn-complete\",\"thread-id\":\"synthetic-thread\",\"turn-id\":\"{turn}\",\"cwd\":\"/synthetic-only\",\"input-messages\":[],\"last-assistant-message\":\"{message}\"}}"
+            )
+        };
+        let (_, empty) = project_notify_with_private_detail(payload("").as_bytes()).unwrap();
+        let empty_bytes = empty.to_json().unwrap().len();
+        let padding = MAX_PRIVATE_TURN_DETAIL_BYTES
+            .checked_sub(empty_bytes)
+            .unwrap();
+        let (_, detail) =
+            project_notify_with_private_detail(payload(&"x".repeat(padding)).as_bytes()).unwrap();
+        let encoded = detail.to_json().unwrap();
+        assert_eq!(encoded.len(), MAX_PRIVATE_TURN_DETAIL_BYTES);
+        (detail.turn_id().to_owned(), encoded)
+    }
+
+    fn write_private_fixture_file(path: &Path, bytes: &[u8]) {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    fn tree_entry_count(path: &Path) -> usize {
+        let mut count = 1;
+        if path.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                count += tree_entry_count(&entry.unwrap().path());
+            }
+        }
+        count
+    }
+
+    fn sample_dormant_trait_guard(
+        fixture: &Fixture,
+        freeze: &OwnedStorageFreezeGuard<'_>,
+        config: &LocalRuntimeConfigV3,
+        expected: Result<(), CollectorIngestPrecommitError>,
+    ) -> [u128; DIAGNOSTIC_SAMPLES] {
+        std::array::from_fn(|_| {
+            let started = Instant::now();
+            let result = CollectorIngestPrecommitGuard::check_precommit(
+                &CliCollectorIngestPrecommitGuard,
+                &fixture.layout,
+                freeze,
+                config,
+                u64::from(config.collection.max_batch_bytes),
+            );
+            let elapsed_ns = started.elapsed().as_nanos();
+            assert_eq!(result, expected);
+            elapsed_ns
+        })
     }
 
     impl Drop for Fixture {
@@ -913,6 +1033,62 @@ mod tests {
                 u64::from(config.collection.max_batch_bytes),
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    #[ignore = "manual bounded resource diagnostic; does not establish an activation SLO"]
+    fn dormant_whole_guard_private_capacity_and_inventory_limit_diagnostic() {
+        let baseline = Fixture::new("precommit-diagnostic-baseline");
+        let baseline_config = baseline.separated_config();
+        baseline.initialize_current_store();
+        let baseline_freeze = baseline.freeze();
+        let baseline_elapsed =
+            sample_dormant_trait_guard(&baseline, &baseline_freeze, &baseline_config, Ok(()));
+
+        let capacity = Fixture::new("precommit-diagnostic-private-capacity");
+        let capacity_config = capacity.separated_config();
+        capacity.initialize_current_store();
+        capacity.populate_private_artifact_capacity();
+        let capacity_freeze = capacity.freeze();
+        let capacity_elapsed =
+            sample_dormant_trait_guard(&capacity, &capacity_freeze, &capacity_config, Ok(()));
+
+        let inventory_limit = Fixture::new("precommit-diagnostic-inventory-limit");
+        let inventory_limit_config = inventory_limit.separated_config();
+        inventory_limit.initialize_current_store();
+        inventory_limit.populate_to_inventory_entries(MAX_ACCOUNTING_ENTRIES);
+        let inventory_limit_freeze = inventory_limit.freeze();
+        let inventory_limit_elapsed = sample_dormant_trait_guard(
+            &inventory_limit,
+            &inventory_limit_freeze,
+            &inventory_limit_config,
+            Err(CollectorIngestPrecommitError::Denied),
+        );
+        drop(inventory_limit_freeze);
+        inventory_limit.populate_to_inventory_entries(MAX_ACCOUNTING_ENTRIES + 1);
+        let over_limit_freeze = inventory_limit.freeze();
+        let over_limit_elapsed = sample_dormant_trait_guard(
+            &inventory_limit,
+            &over_limit_freeze,
+            &inventory_limit_config,
+            Err(CollectorIngestPrecommitError::Unavailable),
+        );
+
+        println!(
+            "baseline_ns={},{},{} capacity_ns={},{},{} inventory_limit_ns={},{},{} over_limit_ns={},{},{}",
+            baseline_elapsed[0],
+            baseline_elapsed[1],
+            baseline_elapsed[2],
+            capacity_elapsed[0],
+            capacity_elapsed[1],
+            capacity_elapsed[2],
+            inventory_limit_elapsed[0],
+            inventory_limit_elapsed[1],
+            inventory_limit_elapsed[2],
+            over_limit_elapsed[0],
+            over_limit_elapsed[1],
+            over_limit_elapsed[2],
         );
     }
 
