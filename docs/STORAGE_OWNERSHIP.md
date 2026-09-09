@@ -404,3 +404,9 @@ trait 자체가 구현체의 I/O·대기·변경을 컴파일 시점에 금지�
 대체하지 않는다. 0은 실제 관측값으로 유지한다. 별도 잠금·cache·새 dependency를 만들지
 않으며, 다른 앱의 디스크 사용을 잠그거나 미래의 여유를 보장하는 API로 표시하지 않는다.
 원자적인 전체 기기 snapshot이나 쓰기 허가가 아닌 P3의 관측 경계로 구현·검증한다.
+
+다음 E 증분은 `control.rs`의 기존 `allocated_tree_bytes_strict(state/store) +
+max_batch_bytes` 산정만 공통 함수로 분리한다. 기존 legacy 진단도 같은 함수와 한 번의
+store scan을 사용하며, 없는 store의 비생성·checked overflow·경로 오류 계약을 유지한다.
+모드와 무관한 수치 산정 API이지 config 로딩의 분리 모드 차단을 우회하는 API가 아니다.
+실제 collector guard 배선보다 먼저 이 하한의 동일성을 회귀로 검증한다.
