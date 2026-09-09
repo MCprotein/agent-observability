@@ -1923,6 +1923,11 @@ enum AutomaticLifecycleStage {
     PostRecoveryNotify,
     PostRecoveryPrivacy,
     Reconnect,
+    ReconnectSettings,
+    ReconnectBootout,
+    ReconnectPortWait,
+    ReconnectCommand,
+    ReconnectStatus,
     ConcurrentConnect,
     Disconnect,
     Restore,
@@ -1930,7 +1935,7 @@ enum AutomaticLifecycleStage {
 }
 
 impl AutomaticLifecycleStage {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 21] = [
         Self::Plist,
         Self::Status,
         Self::PreFailureOtlp,
@@ -1943,6 +1948,11 @@ impl AutomaticLifecycleStage {
         Self::PostRecoveryNotify,
         Self::PostRecoveryPrivacy,
         Self::Reconnect,
+        Self::ReconnectSettings,
+        Self::ReconnectBootout,
+        Self::ReconnectPortWait,
+        Self::ReconnectCommand,
+        Self::ReconnectStatus,
         Self::ConcurrentConnect,
         Self::Disconnect,
         Self::Restore,
@@ -1963,6 +1973,11 @@ impl AutomaticLifecycleStage {
             Self::PostRecoveryNotify => "automatic lifecycle stage post-recovery notify failed",
             Self::PostRecoveryPrivacy => "automatic lifecycle stage post-recovery privacy failed",
             Self::Reconnect => "automatic lifecycle stage reconnect failed",
+            Self::ReconnectSettings => "automatic lifecycle stage reconnect settings failed",
+            Self::ReconnectBootout => "automatic lifecycle stage reconnect bootout failed",
+            Self::ReconnectPortWait => "automatic lifecycle stage reconnect port wait failed",
+            Self::ReconnectCommand => "automatic lifecycle stage reconnect command failed",
+            Self::ReconnectStatus => "automatic lifecycle stage reconnect status failed",
             Self::ConcurrentConnect => "automatic lifecycle stage concurrent connect failed",
             Self::Disconnect => "automatic lifecycle stage disconnect failed",
             Self::Restore => "automatic lifecycle stage restore failed",
@@ -1984,6 +1999,11 @@ impl AutomaticLifecycleStage {
             Self::PostRecoveryNotify => "code=lifecycle_post_recovery_notify_failed",
             Self::PostRecoveryPrivacy => "code=lifecycle_post_recovery_privacy_failed",
             Self::Reconnect => "code=lifecycle_reconnect_stage_failed",
+            Self::ReconnectSettings => "code=lifecycle_reconnect_settings_failed",
+            Self::ReconnectBootout => "code=lifecycle_reconnect_bootout_failed",
+            Self::ReconnectPortWait => "code=lifecycle_reconnect_port_wait_failed",
+            Self::ReconnectCommand => "code=lifecycle_reconnect_command_failed",
+            Self::ReconnectStatus => "code=lifecycle_reconnect_status_failed",
             Self::ConcurrentConnect => "code=lifecycle_concurrent_connect_failed",
             Self::Disconnect => "code=lifecycle_disconnect_stage_failed",
             Self::Restore => "code=lifecycle_restore_failed",
@@ -2177,37 +2197,53 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
             assert_automatic_notify_sentinels_absent(&root),
         )?;
 
-        automatic_lifecycle_stage(
-            AutomaticLifecycleStage::Reconnect,
-            (|| {
-                let occupied_port = load_settings(&root)
-                    .map_err(|error| error.to_string())?
-                    .port;
+        (|| {
+            let occupied_port = automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectSettings,
+                load_settings(&root).map_err(|error| error.to_string()),
+            )?
+            .port;
+            automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectBootout,
                 run_bounded_status_command(
                     "/bin/launchctl",
                     &["bootout", &target],
                     AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
                     &[0],
-                )?;
-                let occupied = occupy_automatic_lifecycle_port(occupied_port)?;
-                let reconnected = run_bounded_product_command_with_env(
+                ),
+            )?;
+            let occupied = automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectPortWait,
+                occupy_automatic_lifecycle_port(occupied_port),
+            )?;
+            let reconnected = automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectCommand,
+                run_bounded_product_command_with_env(
                     binary,
                     &["connect", "codex", path_text(&root)?],
                     AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
                     &cleanup.environment(),
-                )?;
-                require_output_line(&reconnected, "config", "connected")?;
-                require_collector_ready_or_degraded(&reconnected)?;
-                let recovered_port = load_settings(&root)
-                    .map_err(|error| error.to_string())?
-                    .port;
-                if recovered_port == occupied_port {
-                    return Err("automatic lifecycle occupied port was not recovered".into());
-                }
-                drop(occupied);
-                Ok(())
-            })(),
-        )?;
+                ),
+            )?;
+            automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectStatus,
+                require_output_line(&reconnected, "config", "connected"),
+            )?;
+            automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectStatus,
+                require_collector_ready_or_degraded(&reconnected),
+            )?;
+            let recovered_port = automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectSettings,
+                load_settings(&root).map_err(|error| error.to_string()),
+            )?
+            .port;
+            if recovered_port == occupied_port {
+                return Err(AutomaticLifecycleStage::Reconnect.failure().to_owned());
+            }
+            drop(occupied);
+            Ok(())
+        })()?;
 
         automatic_lifecycle_stage(
             AutomaticLifecycleStage::ConcurrentConnect,
@@ -6371,6 +6407,11 @@ fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
         "  - 'code=lifecycle_post_recovery_notify_failed'",
         "  - 'code=lifecycle_post_recovery_privacy_failed'",
         "  - 'code=lifecycle_reconnect_stage_failed'",
+        "  - 'code=lifecycle_reconnect_settings_failed'",
+        "  - 'code=lifecycle_reconnect_bootout_failed'",
+        "  - 'code=lifecycle_reconnect_port_wait_failed'",
+        "  - 'code=lifecycle_reconnect_command_failed'",
+        "  - 'code=lifecycle_reconnect_status_failed'",
         "  - 'code=lifecycle_concurrent_connect_failed'",
         "  - 'code=lifecycle_disconnect_stage_failed'",
         "  - 'code=lifecycle_restore_failed'",
