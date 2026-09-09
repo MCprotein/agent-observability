@@ -74,13 +74,32 @@ impl StorageBudget {
         Self::allocated_blocks(path).map(|blocks| blocks * BLOCK)
     }
     pub fn allocated_tree_bytes(path: &Path) -> Result<u64, StorageAccountingError> {
+        Self::allocated_tree_bytes_observing(path, true, |_| {})
+    }
+
+    /// Admission accounting must reject a disappearing descendant instead of
+    /// returning a partial allocation total. A missing root also remains an error.
+    pub fn allocated_tree_bytes_strict(path: &Path) -> Result<u64, StorageAccountingError> {
+        Self::allocated_tree_bytes_observing(path, false, |_| {})
+    }
+
+    fn allocated_tree_bytes_observing(
+        path: &Path,
+        allow_missing_descendants: bool,
+        mut before_metadata: impl FnMut(&Path),
+    ) -> Result<u64, StorageAccountingError> {
         let mut pending = vec![(path.to_path_buf(), true)];
         let mut entries = 1_usize;
         let mut bytes = 0_u64;
         while let Some((current, is_root)) = pending.pop() {
+            before_metadata(&current);
             let metadata = match fs::symlink_metadata(&current) {
                 Ok(metadata) => metadata,
-                Err(error) if !is_root && error.kind() == std::io::ErrorKind::NotFound => {
+                Err(error)
+                    if allow_missing_descendants
+                        && !is_root
+                        && error.kind() == std::io::ErrorKind::NotFound =>
+                {
                     continue;
                 }
                 Err(error) => return Err(StorageAccountingError::Io(error)),
@@ -94,7 +113,11 @@ impl StorageBudget {
             if metadata.is_dir() {
                 let directory = match fs::read_dir(&current) {
                     Ok(directory) => directory,
-                    Err(error) if !is_root && error.kind() == std::io::ErrorKind::NotFound => {
+                    Err(error)
+                        if allow_missing_descendants
+                            && !is_root
+                            && error.kind() == std::io::ErrorKind::NotFound =>
+                    {
                         continue;
                     }
                     Err(error) => return Err(StorageAccountingError::Io(error)),
@@ -106,7 +129,9 @@ impl StorageBudget {
                     }
                     match entry {
                         Ok(entry) => pending.push((entry.path(), false)),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error)
+                            if allow_missing_descendants
+                                && error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => return Err(StorageAccountingError::Io(error)),
                     }
                 }
@@ -238,6 +263,34 @@ mod tests {
         fs::write(root.join("state/data"), vec![0_u8; 5000]).unwrap();
         assert!(StorageBudget::allocated_tree_bytes(&root).unwrap() >= 8192);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn strict_admission_accounting_rejects_a_disappearing_descendant() {
+        let root = std::env::temp_dir().join(format!("runtime-strict-race-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let child = root.join("vanishing-file");
+        for allow_missing in [true, false] {
+            fs::write(&child, [0_u8; 4096]).unwrap();
+            let result =
+                StorageBudget::allocated_tree_bytes_observing(&root, allow_missing, |path| {
+                    if path == child {
+                        fs::remove_file(&child).unwrap();
+                    }
+                });
+            if allow_missing {
+                assert!(
+                    result.is_ok(),
+                    "legacy observation accounting remains tolerant"
+                );
+            } else {
+                assert!(matches!(result, Err(StorageAccountingError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound));
+            }
+        }
+        assert!(StorageBudget::allocated_tree_bytes_strict(&root).is_ok());
+        fs::remove_dir_all(&root).unwrap();
+        assert!(StorageBudget::allocated_tree_bytes_strict(&root).is_err());
     }
 
     #[test]

@@ -1,6 +1,9 @@
 use crate::{
     lock::{MutationGuard, SingletonError},
-    policy::{CollectionPolicyV1, PolicyError, RetentionPolicyV1},
+    policy::{
+        CollectionPolicyV1, PolicyError, RetentionPolicyV1, StorageBudgetMode,
+        StorageBudgetPolicyV1, StorageLifecyclePolicyV1,
+    },
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,9 +14,12 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub const LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v3";
+pub const LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v5";
 const LEGACY_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v1";
 const PRIOR_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v2";
+const PREVIOUS_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v3";
+const LIFECYCLE_LOCAL_RUNTIME_CONFIG_VERSION: &str = "local_runtime.v4";
+const MAX_CONFIG_FILE_BYTES: usize = 64 * 1024;
 static UPDATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,18 +31,50 @@ enum SaveStage {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct LocalRuntimeConfigV3 {
+pub struct LocalRuntimeConfigV5 {
     pub schema_version: String,
     pub enabled: bool,
     pub capture_private_codex_turn_details: bool,
     pub collection: CollectionPolicyV1,
     pub retention: RetentionPolicyV1,
+    pub lifecycle: StorageLifecyclePolicyV1,
+    pub storage_budget: StorageBudgetPolicyV1,
+}
+
+/// Compatibility alias for source callers; serialized output uses v5.
+pub type LocalRuntimeConfigV3 = LocalRuntimeConfigV5;
+/// Compatibility alias for source callers; serialized output uses v5.
+pub type LocalRuntimeConfigV4 = LocalRuntimeConfigV5;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictLocalRuntimeConfigV5 {
+    schema_version: String,
+    enabled: bool,
+    capture_private_codex_turn_details: bool,
+    collection: StrictCollectionPolicyV1,
+    retention: StrictRetentionPolicyV1,
+    lifecycle: StrictStorageLifecyclePolicyV1,
+    storage_budget: StorageBudgetPolicyV1,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictLocalRuntimeConfigV4 {
+    #[serde(rename = "schema_version")]
+    _schema_version: String,
+    enabled: bool,
+    capture_private_codex_turn_details: bool,
+    collection: StrictCollectionPolicyV1,
+    retention: StrictRetentionPolicyV1,
+    lifecycle: StrictStorageLifecyclePolicyV1,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictLocalRuntimeConfigV3 {
-    schema_version: String,
+    #[serde(rename = "schema_version")]
+    _schema_version: String,
     enabled: bool,
     capture_private_codex_turn_details: bool,
     collection: StrictCollectionPolicyV1,
@@ -64,12 +102,24 @@ struct StrictRetentionPolicyV1 {
     max_archive_bytes: u64,
 }
 
-impl<'de> Deserialize<'de> for LocalRuntimeConfigV3 {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictStorageLifecyclePolicyV1 {
+    enabled: bool,
+    hot_days: u16,
+    warm_days: u16,
+    delete_after_days: u16,
+    private_raw_days: u16,
+    maintenance_interval_seconds: u32,
+    max_traces_per_pass: u16,
+}
+
+impl<'de> Deserialize<'de> for LocalRuntimeConfigV5 {
     fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
     where
         Deserializer: serde::Deserializer<'de>,
     {
-        let strict = StrictLocalRuntimeConfigV3::deserialize(deserializer)?;
+        let strict = StrictLocalRuntimeConfigV5::deserialize(deserializer)?;
         Ok(Self {
             schema_version: strict.schema_version,
             enabled: strict.enabled,
@@ -88,11 +138,21 @@ impl<'de> Deserialize<'de> for LocalRuntimeConfigV3 {
                 max_archive_records: strict.retention.max_archive_records,
                 max_archive_bytes: strict.retention.max_archive_bytes,
             },
+            lifecycle: StorageLifecyclePolicyV1 {
+                enabled: strict.lifecycle.enabled,
+                hot_days: strict.lifecycle.hot_days,
+                warm_days: strict.lifecycle.warm_days,
+                delete_after_days: strict.lifecycle.delete_after_days,
+                private_raw_days: strict.lifecycle.private_raw_days,
+                maintenance_interval_seconds: strict.lifecycle.maintenance_interval_seconds,
+                max_traces_per_pass: strict.lifecycle.max_traces_per_pass,
+            },
+            storage_budget: strict.storage_budget,
         })
     }
 }
 
-impl Default for LocalRuntimeConfigV3 {
+impl Default for LocalRuntimeConfigV5 {
     fn default() -> Self {
         Self {
             schema_version: LOCAL_RUNTIME_CONFIG_VERSION.into(),
@@ -100,11 +160,13 @@ impl Default for LocalRuntimeConfigV3 {
             capture_private_codex_turn_details: false,
             collection: CollectionPolicyV1::default(),
             retention: RetentionPolicyV1::default(),
+            lifecycle: StorageLifecyclePolicyV1::default(),
+            storage_budget: StorageBudgetPolicyV1::default(),
         }
     }
 }
 
-impl LocalRuntimeConfigV3 {
+impl LocalRuntimeConfigV5 {
     pub fn from_json(input: &str) -> Result<Self, ConfigError> {
         let header: serde_json::Value = serde_json::from_str(input).map_err(ConfigError::Json)?;
         let version = header
@@ -120,6 +182,8 @@ impl LocalRuntimeConfigV3 {
                 capture_private_codex_turn_details: false,
                 collection: legacy.collection,
                 retention: RetentionPolicyV1::default(),
+                lifecycle: StorageLifecyclePolicyV1::default(),
+                storage_budget: StorageBudgetPolicyV1::default(),
             }
         } else if version == PRIOR_LOCAL_RUNTIME_CONFIG_VERSION {
             let prior: LegacyLocalRuntimeConfigV2 =
@@ -130,6 +194,32 @@ impl LocalRuntimeConfigV3 {
                 capture_private_codex_turn_details: false,
                 collection: prior.collection.into(),
                 retention: prior.retention.into(),
+                lifecycle: StorageLifecyclePolicyV1::default(),
+                storage_budget: StorageBudgetPolicyV1::default(),
+            }
+        } else if version == PREVIOUS_LOCAL_RUNTIME_CONFIG_VERSION {
+            let previous: StrictLocalRuntimeConfigV3 =
+                serde_json::from_str(input).map_err(ConfigError::Json)?;
+            Self {
+                schema_version: LOCAL_RUNTIME_CONFIG_VERSION.into(),
+                enabled: previous.enabled,
+                capture_private_codex_turn_details: previous.capture_private_codex_turn_details,
+                collection: previous.collection.into(),
+                retention: previous.retention.into(),
+                lifecycle: StorageLifecyclePolicyV1::default(),
+                storage_budget: StorageBudgetPolicyV1::default(),
+            }
+        } else if version == LIFECYCLE_LOCAL_RUNTIME_CONFIG_VERSION {
+            let previous: StrictLocalRuntimeConfigV4 =
+                serde_json::from_str(input).map_err(ConfigError::Json)?;
+            Self {
+                schema_version: LOCAL_RUNTIME_CONFIG_VERSION.into(),
+                enabled: previous.enabled,
+                capture_private_codex_turn_details: previous.capture_private_codex_turn_details,
+                collection: previous.collection.into(),
+                retention: previous.retention.into(),
+                lifecycle: previous.lifecycle.into(),
+                storage_budget: StorageBudgetPolicyV1::default(),
             }
         } else {
             serde_json::from_str(input).map_err(ConfigError::Json)?
@@ -143,7 +233,17 @@ impl LocalRuntimeConfigV3 {
             return Err(ConfigError::UnsupportedVersion);
         }
         self.collection.validate().map_err(ConfigError::Policy)?;
-        self.retention.validate().map_err(ConfigError::Policy)
+        self.retention.validate().map_err(ConfigError::Policy)?;
+        self.lifecycle.validate().map_err(ConfigError::Policy)?;
+        self.storage_budget.validate().map_err(ConfigError::Policy)
+    }
+
+    /// P1 accepts the new contract but must not activate unfinished admission logic.
+    pub fn require_operational_storage_policy(&self) -> Result<(), ConfigError> {
+        match self.storage_budget.mode {
+            StorageBudgetMode::Legacy => Ok(()),
+            StorageBudgetMode::Separated => Err(ConfigError::StoragePolicyUnavailable),
+        }
     }
 }
 
@@ -192,6 +292,20 @@ impl From<StrictRetentionPolicyV1> for RetentionPolicyV1 {
     }
 }
 
+impl From<StrictStorageLifecyclePolicyV1> for StorageLifecyclePolicyV1 {
+    fn from(strict: StrictStorageLifecyclePolicyV1) -> Self {
+        Self {
+            enabled: strict.enabled,
+            hot_days: strict.hot_days,
+            warm_days: strict.warm_days,
+            delete_after_days: strict.delete_after_days,
+            private_raw_days: strict.private_raw_days,
+            maintenance_interval_seconds: strict.maintenance_interval_seconds,
+            max_traces_per_pass: strict.max_traces_per_pass,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstalledLayout {
     pub root: PathBuf,
@@ -229,7 +343,10 @@ impl LocalConfigService {
     }
 
     pub fn read(&self) -> Result<VersionedLocalConfig, ConfigServiceError> {
-        let config = load(&self.layout.config).map_err(|_| ConfigServiceError::Unavailable)?;
+        let config = load(&self.layout.config).map_err(|error| match error {
+            ConfigError::InputTooLarge => ConfigServiceError::Invalid,
+            _ => ConfigServiceError::Unavailable,
+        })?;
         let revision = revision(&config).map_err(|_| ConfigServiceError::Unavailable)?;
         Ok(VersionedLocalConfig { config, revision })
     }
@@ -246,7 +363,13 @@ impl LocalConfigService {
         })?;
         save_if_revision(&mutation, expected_revision, config).map_err(|error| match error {
             ConfigError::Conflict => ConfigServiceError::Conflict,
-            ConfigError::Policy(_) | ConfigError::UnsupportedVersion => ConfigServiceError::Invalid,
+            ConfigError::StorageCoherence(
+                crate::storage_coherence::StorageCoherenceError::Busy,
+            ) => ConfigServiceError::Busy,
+            ConfigError::Policy(_)
+            | ConfigError::InputTooLarge
+            | ConfigError::UnsupportedVersion
+            | ConfigError::StoragePolicyUnavailable => ConfigServiceError::Invalid,
             _ => ConfigServiceError::Unavailable,
         })?;
         self.read()
@@ -255,15 +378,337 @@ impl LocalConfigService {
 
 #[derive(Debug)]
 pub struct ConfigMutationGuard {
-    _mutation: MutationGuard,
+    mutation: MutationGuard,
     config_path: PathBuf,
+}
+
+/// Read-only identity and revision evidence for the exact managed layout entries.
+///
+/// This does not classify any descendant, lock file, or temporary file, and it
+/// is not a write permit or a coherent snapshot across unrelated writers.
+pub struct ConfigAccountingEvidence<'guard> {
+    guard: &'guard MutationGuard,
+    layout: InstalledLayout,
+    expected_revision: String,
+    storage_budget_policy: StorageBudgetPolicyV1,
+    root: File,
+    config: File,
+    logs: File,
+    queue: File,
+    state: File,
+    runtime: File,
+}
+
+impl std::fmt::Debug for ConfigAccountingEvidence<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfigAccountingEvidence")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigAccountingEvidenceError {
+    Io(io::ErrorKind),
+    Coherence(crate::storage_coherence::StorageCoherenceError),
+    WrongMutationRoot,
+    InvalidConfig,
+    RevisionChanged,
+    Replaced,
+    InsecurePermissions,
+    Symlink,
+    Hardlink,
+    InvalidType,
+    UnsupportedPlatform,
+}
+
+impl std::fmt::Display for ConfigAccountingEvidenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Io(_) => "config accounting evidence I/O failure",
+            Self::Coherence(_) => "config accounting evidence coordination failed",
+            Self::WrongMutationRoot => "config accounting evidence mutation root mismatch",
+            Self::InvalidConfig => "config accounting evidence validation failed",
+            Self::RevisionChanged => "config accounting evidence revision changed",
+            Self::Replaced => "config accounting evidence identity changed",
+            Self::InsecurePermissions => "config accounting evidence path is not private",
+            Self::Symlink => "config accounting evidence refuses symbolic links",
+            Self::Hardlink => "config accounting evidence refuses hard-linked config",
+            Self::InvalidType => "config accounting evidence path has the wrong file type",
+            Self::UnsupportedPlatform => "config accounting evidence is unsupported",
+        })
+    }
+}
+
+impl std::error::Error for ConfigAccountingEvidenceError {}
+
+impl From<io::Error> for ConfigAccountingEvidenceError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error.kind())
+    }
+}
+
+impl<'guard> ConfigAccountingEvidence<'guard> {
+    /// Capture schema-validated config evidence and the exact layout without creating paths.
+    /// This observation accepts separated policy but does not authorize its operation.
+    pub fn capture(
+        root: &Path,
+        guard: &'guard MutationGuard,
+    ) -> Result<Self, ConfigAccountingEvidenceError> {
+        capture_config_accounting_evidence(root, guard)
+    }
+
+    pub fn expected_revision(&self) -> &str {
+        &self.expected_revision
+    }
+
+    /// The captured policy, not operational authorization or a live config read.
+    pub fn storage_budget_policy(&self) -> &StorageBudgetPolicyV1 {
+        &self.storage_budget_policy
+    }
+
+    /// Match only root, config.json, logs, queue, state, or runtime themselves.
+    pub fn matches_entry(
+        &self,
+        relative: &Path,
+        candidate: &File,
+    ) -> Result<bool, ConfigAccountingEvidenceError> {
+        let expected = if relative.as_os_str().is_empty() {
+            Some((&self.root, true))
+        } else if relative == Path::new("config.json") {
+            Some((&self.config, false))
+        } else if relative == Path::new("logs") {
+            Some((&self.logs, true))
+        } else if relative == Path::new("queue") {
+            Some((&self.queue, true))
+        } else if relative == Path::new("state") {
+            Some((&self.state, true))
+        } else if relative == Path::new("runtime") {
+            Some((&self.runtime, true))
+        } else {
+            None
+        };
+        let Some((expected, directory)) = expected else {
+            return Ok(false);
+        };
+        if !same_accounting_identity(expected, candidate, directory)? {
+            return Err(ConfigAccountingEvidenceError::Replaced);
+        }
+        Ok(true)
+    }
+
+    /// Revalidate the captured revision and every retained named identity.
+    pub fn revalidate(&self) -> Result<(), ConfigAccountingEvidenceError> {
+        self.guard
+            .require_root(&self.layout.root)
+            .map_err(map_accounting_guard_error)?;
+        self.revalidate_identities()?;
+        let mut current_file =
+            open_private_read(&self.layout.config).map_err(map_accounting_error)?;
+        if !same_accounting_identity(&self.config, &current_file, false)? {
+            return Err(ConfigAccountingEvidenceError::Replaced);
+        }
+        let current = decode_open_file(&mut current_file).map_err(map_accounting_error)?;
+        let current_revision = revision(&current).map_err(map_accounting_error)?;
+        if current_revision != self.expected_revision {
+            return Err(ConfigAccountingEvidenceError::RevisionChanged);
+        }
+        self.revalidate_identities()?;
+        self.guard
+            .require_root(&self.layout.root)
+            .map_err(map_accounting_guard_error)
+    }
+
+    fn revalidate_identities(&self) -> Result<(), ConfigAccountingEvidenceError> {
+        for (file, path) in [
+            (&self.root, &self.layout.root),
+            (&self.logs, &self.layout.logs),
+            (&self.queue, &self.layout.queue),
+            (&self.state, &self.layout.state),
+            (&self.runtime, &self.layout.runtime),
+        ] {
+            revalidate_accounting_identity(file, path, true)?;
+        }
+        revalidate_accounting_identity(&self.config, &self.layout.config, false)?;
+        Ok(())
+    }
+}
+
+fn map_accounting_guard_error(error: SingletonError) -> ConfigAccountingEvidenceError {
+    match error {
+        SingletonError::WrongMutationRoot => ConfigAccountingEvidenceError::WrongMutationRoot,
+        SingletonError::InsecurePermissions => ConfigAccountingEvidenceError::InsecurePermissions,
+        SingletonError::Symlink => ConfigAccountingEvidenceError::Symlink,
+        SingletonError::UnsupportedPlatform => ConfigAccountingEvidenceError::UnsupportedPlatform,
+        SingletonError::Io(error) => error.into(),
+        SingletonError::AlreadyRunning | SingletonError::CorruptMetadata => {
+            ConfigAccountingEvidenceError::WrongMutationRoot
+        }
+    }
+}
+
+fn map_accounting_error(error: ConfigError) -> ConfigAccountingEvidenceError {
+    match error {
+        ConfigError::Io(error) => error.into(),
+        ConfigError::StorageCoherence(error) => ConfigAccountingEvidenceError::Coherence(error),
+        ConfigError::InsecurePermissions => ConfigAccountingEvidenceError::InsecurePermissions,
+        ConfigError::InvalidPath => ConfigAccountingEvidenceError::InvalidType,
+        ConfigError::Symlink => ConfigAccountingEvidenceError::Symlink,
+        ConfigError::UnsupportedPlatform => ConfigAccountingEvidenceError::UnsupportedPlatform,
+        ConfigError::Json(_)
+        | ConfigError::InputTooLarge
+        | ConfigError::Policy(_)
+        | ConfigError::UnsupportedVersion
+        | ConfigError::StoragePolicyUnavailable
+        | ConfigError::Conflict
+        | ConfigError::WriteUnverified { .. } => ConfigAccountingEvidenceError::InvalidConfig,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn capture_config_accounting_evidence<'guard>(
+    root: &Path,
+    guard: &'guard MutationGuard,
+) -> Result<ConfigAccountingEvidence<'guard>, ConfigAccountingEvidenceError> {
+    guard
+        .require_root(root)
+        .map_err(map_accounting_guard_error)?;
+    let root_file = open_accounting_directory(root)?;
+    let canonical_root = fs::canonicalize(root)?;
+    let layout = InstalledLayout::at(&canonical_root);
+    let logs = open_accounting_directory(&layout.logs)?;
+    let queue = open_accounting_directory(&layout.queue)?;
+    let state = open_accounting_directory(&layout.state)?;
+    let runtime = open_accounting_directory(&layout.runtime)?;
+    let mut config = open_private_read(&layout.config).map_err(map_accounting_error)?;
+    let parsed = decode_open_file(&mut config).map_err(map_accounting_error)?;
+    let expected_revision = revision(&parsed).map_err(map_accounting_error)?;
+    let evidence = ConfigAccountingEvidence {
+        guard,
+        layout,
+        expected_revision,
+        storage_budget_policy: parsed.storage_budget,
+        root: root_file,
+        config,
+        logs,
+        queue,
+        state,
+        runtime,
+    };
+    evidence.revalidate()?;
+    Ok(evidence)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn capture_config_accounting_evidence(
+    _root: &Path,
+    _guard: &MutationGuard,
+) -> Result<ConfigAccountingEvidence<'_>, ConfigAccountingEvidenceError> {
+    Err(ConfigAccountingEvidenceError::UnsupportedPlatform)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn open_accounting_directory(path: &Path) -> Result<File, ConfigAccountingEvidenceError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    private_dir(path, false).map_err(map_accounting_error)?;
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(no_follow_flag());
+    let file = options.open(path)?;
+    let held = file.metadata()?;
+    validate_accounting_metadata(&held, true)?;
+    let named = fs::symlink_metadata(path)?;
+    validate_accounting_metadata(&named, true)?;
+    if !same_accounting_metadata_identity(&held, &named) {
+        return Err(ConfigAccountingEvidenceError::Replaced);
+    }
+    Ok(file)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn validate_accounting_metadata(
+    metadata: &fs::Metadata,
+    directory: bool,
+) -> Result<(), ConfigAccountingEvidenceError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if directory != metadata.is_dir() || (!directory && !metadata.is_file()) {
+        return Err(ConfigAccountingEvidenceError::InvalidType);
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(ConfigAccountingEvidenceError::InsecurePermissions);
+    }
+    if !directory && metadata.nlink() != 1 {
+        return Err(ConfigAccountingEvidenceError::Hardlink);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn same_accounting_identity(
+    expected: &File,
+    candidate: &File,
+    directory: bool,
+) -> Result<bool, ConfigAccountingEvidenceError> {
+    let expected = expected.metadata()?;
+    let candidate = candidate.metadata()?;
+    validate_accounting_metadata(&expected, directory)?;
+    validate_accounting_metadata(&candidate, directory)?;
+    Ok(same_accounting_metadata_identity(&expected, &candidate))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn same_accounting_metadata_identity(expected: &fs::Metadata, candidate: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    expected.dev() == candidate.dev() && expected.ino() == candidate.ino()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn same_accounting_identity(
+    _expected: &File,
+    _candidate: &File,
+    _directory: bool,
+) -> Result<bool, ConfigAccountingEvidenceError> {
+    Err(ConfigAccountingEvidenceError::UnsupportedPlatform)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn revalidate_accounting_identity(
+    expected: &File,
+    path: &Path,
+    directory: bool,
+) -> Result<(), ConfigAccountingEvidenceError> {
+    let current = if directory {
+        open_accounting_directory(path)?
+    } else {
+        open_private_read(path).map_err(map_accounting_error)?
+    };
+    if !same_accounting_identity(expected, &current, directory)? {
+        return Err(ConfigAccountingEvidenceError::Replaced);
+    }
+    Ok(())
 }
 
 impl ConfigMutationGuard {
     pub fn acquire(layout: &InstalledLayout) -> Result<Self, SingletonError> {
         let canonical = InstalledLayout::at(&layout.root);
-        MutationGuard::try_acquire(&canonical.runtime).map(|mutation| Self {
-            _mutation: mutation,
+        let barrier =
+            crate::storage_coherence::StorageBarrier::open_if_initialized(&canonical.root)
+                .map_err(|error| SingletonError::Io(io::Error::other(error)))?;
+        let mutation = if barrier.is_some() {
+            MutationGuard::try_acquire_existing(&canonical.runtime)?
+        } else {
+            MutationGuard::try_acquire(&canonical.runtime)?
+        };
+        mutation.require_root(&canonical.root)?;
+        if let Some(barrier) = barrier {
+            barrier
+                .revalidate()
+                .map_err(|error| SingletonError::Io(io::Error::other(error)))?;
+        }
+        Ok(Self {
+            mutation,
             config_path: canonical.config,
         })
     }
@@ -296,10 +741,18 @@ pub fn inspect(root: &Path) -> Result<InstalledLayout, ConfigError> {
 
 #[derive(Debug)]
 pub enum ConfigError {
+    InputTooLarge,
     Io(io::Error),
     Json(serde_json::Error),
     Policy(PolicyError),
     UnsupportedVersion,
+    StoragePolicyUnavailable,
+    StorageCoherence(crate::storage_coherence::StorageCoherenceError),
+    WriteUnverified {
+        primary: Option<Box<Self>>,
+        mutation: Option<Box<Self>>,
+        accounting: Option<crate::storage_coherence::StorageCoherenceError>,
+    },
     InsecurePermissions,
     InvalidPath,
     Symlink,
@@ -310,11 +763,26 @@ pub enum ConfigError {
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InputTooLarge => {
+                formatter.write_str("local runtime configuration input is too large")
+            }
             Self::Io(error) => write!(formatter, "local runtime configuration I/O error: {error}"),
             Self::Json(error) => write!(formatter, "invalid local runtime configuration: {error}"),
             Self::Policy(error) => error.fmt(formatter),
             Self::UnsupportedVersion => {
                 formatter.write_str("unsupported local runtime config version")
+            }
+            Self::StoragePolicyUnavailable => formatter.write_str(
+                "separated storage policy is not available in this development checkpoint",
+            ),
+            Self::StorageCoherence(error) => error.fmt(formatter),
+            Self::WriteUnverified { primary, .. } => {
+                if let Some(primary) = primary {
+                    write!(formatter, "{primary}; ")?;
+                }
+                formatter.write_str(
+                    "configuration write verification failed; publication may have completed",
+                )
             }
             Self::InsecurePermissions => formatter.write_str("local runtime path is not private"),
             Self::InvalidPath => formatter.write_str("local runtime path has the wrong file type"),
@@ -333,6 +801,20 @@ impl std::error::Error for ConfigError {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Policy(error) => Some(error),
+            Self::StorageCoherence(error) => Some(error),
+            Self::WriteUnverified {
+                primary,
+                mutation,
+                accounting,
+            } => primary
+                .as_deref()
+                .or(mutation.as_deref())
+                .map(|error| error as &(dyn std::error::Error + 'static))
+                .or_else(|| {
+                    accounting
+                        .as_ref()
+                        .map(|error| error as &(dyn std::error::Error + 'static))
+                }),
             _ => None,
         }
     }
@@ -345,16 +827,96 @@ impl From<io::Error> for ConfigError {
 }
 
 pub fn install(root: &Path) -> Result<InstalledLayout, ConfigError> {
+    // An intact layout needs no write authority. Presence discovery is noncreating:
+    // legacy owner-only read layouts keep their historical semantics, while an
+    // initialized layout must satisfy the barrier's stricter exact identities.
+    if let Ok(layout) = inspect(root) {
+        if accounting_barrier_exists(&layout.root)? {
+            crate::storage_coherence::StorageBarrier::open_existing(&layout.root)
+                .map_err(ConfigError::StorageCoherence)?;
+        }
+        return Ok(layout);
+    }
+
+    if accounting_barrier_exists(root)? {
+        install_initialized(root)
+    } else {
+        // Legacy bootstrap cannot claim coordination with writers that do not yet
+        // have a barrier. It preserves the original fresh/partial-install behavior.
+        install_legacy(root)
+    }
+}
+
+fn accounting_barrier_exists(root: &Path) -> Result<bool, ConfigError> {
+    match fs::symlink_metadata(root.join("runtime/storage-accounting.lock")) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn install_initialized(root: &Path) -> Result<InstalledLayout, ConfigError> {
+    let barrier = crate::storage_coherence::StorageBarrier::open_existing(root)
+        .map_err(ConfigError::StorageCoherence)?;
+    let root = fs::canonicalize(root)?;
+    let layout = InstalledLayout::at(&root);
+    let mutation =
+        MutationGuard::try_acquire_existing(&layout.runtime).map_err(map_install_mutation_error)?;
+    let freeze = barrier
+        .try_freeze(&mutation)
+        .map_err(ConfigError::StorageCoherence)?;
+
+    let result = complete_install(&layout, InstallCoordination::Initialized);
+    freeze.revalidate().map_err(ConfigError::StorageCoherence)?;
+    result?;
+    let installed = inspect(&layout.root)?;
+    freeze.revalidate().map_err(ConfigError::StorageCoherence)?;
+    Ok(installed)
+}
+
+fn map_install_mutation_error(error: SingletonError) -> ConfigError {
+    use crate::storage_coherence::StorageCoherenceError;
+
+    let error = match error {
+        SingletonError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+            StorageCoherenceError::Missing
+        }
+        SingletonError::Io(error) => StorageCoherenceError::Io(error.kind()),
+        SingletonError::AlreadyRunning => StorageCoherenceError::Busy,
+        SingletonError::CorruptMetadata | SingletonError::WrongMutationRoot => {
+            StorageCoherenceError::InvalidIdentity
+        }
+        SingletonError::InsecurePermissions => StorageCoherenceError::InsecurePermissions,
+        SingletonError::Symlink => StorageCoherenceError::Symlink,
+        SingletonError::UnsupportedPlatform => StorageCoherenceError::UnsupportedPlatform,
+    };
+    ConfigError::StorageCoherence(error)
+}
+
+fn install_legacy(root: &Path) -> Result<InstalledLayout, ConfigError> {
     private_dir(root, true)?;
     let root = fs::canonicalize(root)?;
     let layout = InstalledLayout::at(&root);
+    complete_install(&layout, InstallCoordination::Legacy)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallCoordination {
+    Legacy,
+    Initialized,
+}
+
+fn complete_install(
+    layout: &InstalledLayout,
+    coordination: InstallCoordination,
+) -> Result<InstalledLayout, ConfigError> {
     for directory in [&layout.logs, &layout.queue, &layout.state, &layout.runtime] {
         private_dir(directory, true)?;
     }
 
     if layout.config.exists() {
         let _ = load(&layout.config)?;
-        return Ok(layout);
+        return Ok(layout.clone());
     }
 
     reject_symlink(&layout.config)?;
@@ -363,7 +925,9 @@ pub fn install(root: &Path) -> Result<InstalledLayout, ConfigError> {
     let temporary = layout
         .root
         .join(format!(".config.json.tmp.{}", std::process::id()));
-    let _ = fs::remove_file(&temporary);
+    if coordination == InstallCoordination::Legacy {
+        let _ = fs::remove_file(&temporary);
+    }
     let mut file = private_create_new(&temporary)?;
     file.write_all(&body)?;
     file.write_all(b"\n")?;
@@ -372,29 +936,107 @@ pub fn install(root: &Path) -> Result<InstalledLayout, ConfigError> {
     match fs::hard_link(&temporary, &layout.config) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            fs::remove_file(&temporary)?;
+            cleanup_install_temporary(layout, &temporary, &file, coordination, None)?;
             let _ = load(&layout.config)?;
-            return Ok(layout);
+            return Ok(layout.clone());
         }
         Err(error) => {
-            let _ = fs::remove_file(&temporary);
+            if coordination == InstallCoordination::Legacy {
+                let _ = fs::remove_file(&temporary);
+            } else {
+                cleanup_install_temporary(layout, &temporary, &file, coordination, None)?;
+            }
             return Err(error.into());
         }
     }
-    fs::remove_file(&temporary)?;
+    cleanup_install_temporary(
+        layout,
+        &temporary,
+        &file,
+        coordination,
+        Some(&layout.config),
+    )?;
+    Ok(layout.clone())
+}
+
+fn cleanup_install_temporary(
+    layout: &InstalledLayout,
+    temporary: &Path,
+    file: &File,
+    coordination: InstallCoordination,
+    published: Option<&Path>,
+) -> Result<(), ConfigError> {
+    if coordination == InstallCoordination::Initialized {
+        validate_install_temporary_identity(file, temporary, published)?;
+    }
+    fs::remove_file(temporary)?;
     File::open(&layout.root)?.sync_all()?;
-    Ok(layout)
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn validate_install_temporary_identity(
+    file: &File,
+    temporary: &Path,
+    published: Option<&Path>,
+) -> Result<(), ConfigError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let held = file.metadata()?;
+    let named = fs::symlink_metadata(temporary)?;
+    let expected_links = if published.is_some() { 2 } else { 1 };
+    let valid = |metadata: &fs::Metadata| {
+        metadata.is_file()
+            && metadata.permissions().mode() & 0o7777 == 0o600
+            && metadata.nlink() == expected_links
+    };
+    if !valid(&held) || !valid(&named) || !same_accounting_metadata_identity(&held, &named) {
+        return Err(ConfigError::InvalidPath);
+    }
+    if let Some(published) = published {
+        let published = open_private_read(published)?;
+        let published = published.metadata()?;
+        if !valid(&published) || !same_accounting_metadata_identity(&held, &published) {
+            return Err(ConfigError::InvalidPath);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn validate_install_temporary_identity(
+    _file: &File,
+    _temporary: &Path,
+    _published: Option<&Path>,
+) -> Result<(), ConfigError> {
+    Err(ConfigError::UnsupportedPlatform)
 }
 
 pub fn load(path: &Path) -> Result<LocalRuntimeConfigV3, ConfigError> {
     let mut file = open_private_read(path)?;
-    let mut body = String::new();
-    file.read_to_string(&mut body)?;
-    LocalRuntimeConfigV3::from_json(&body)
+    load_open_file(&mut file)
+}
+
+fn load_open_file(file: &mut File) -> Result<LocalRuntimeConfigV3, ConfigError> {
+    let config = decode_open_file(file)?;
+    config.require_operational_storage_policy()?;
+    Ok(config)
+}
+
+fn decode_open_file(file: &mut File) -> Result<LocalRuntimeConfigV3, ConfigError> {
+    let mut body = Vec::new();
+    file.take(MAX_CONFIG_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut body)?;
+    if body.len() > MAX_CONFIG_FILE_BYTES {
+        return Err(ConfigError::InputTooLarge);
+    }
+    let body = std::str::from_utf8(&body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    LocalRuntimeConfigV3::from_json(body)
 }
 
 pub fn save(guard: &ConfigMutationGuard, config: &LocalRuntimeConfigV3) -> Result<(), ConfigError> {
-    save_with_hook(&guard.config_path, config, None, |_| Ok(()))
+    save_guarded(guard, config, None)
 }
 
 pub fn save_if_revision(
@@ -402,9 +1044,61 @@ pub fn save_if_revision(
     expected_revision: &str,
     config: &LocalRuntimeConfigV3,
 ) -> Result<(), ConfigError> {
-    save_with_hook(&guard.config_path, config, Some(expected_revision), |_| {
-        Ok(())
-    })
+    save_guarded(guard, config, Some(expected_revision))
+}
+
+fn save_guarded(
+    guard: &ConfigMutationGuard,
+    config: &LocalRuntimeConfigV3,
+    expected_revision: Option<&str>,
+) -> Result<(), ConfigError> {
+    save_guarded_observing(guard, config, expected_revision, || {})
+}
+
+fn save_guarded_observing(
+    guard: &ConfigMutationGuard,
+    config: &LocalRuntimeConfigV3,
+    expected_revision: Option<&str>,
+    before_postcheck: impl FnOnce(),
+) -> Result<(), ConfigError> {
+    let root = guard.config_path.parent().ok_or(ConfigError::InvalidPath)?;
+    guard
+        .mutation
+        .require_root(root)
+        .map_err(map_install_mutation_error)?;
+    let barrier = crate::storage_coherence::StorageBarrier::open_if_initialized(root)
+        .map_err(ConfigError::StorageCoherence)?;
+    let freeze = barrier
+        .as_ref()
+        .map(|barrier| barrier.try_freeze(&guard.mutation))
+        .transpose()
+        .map_err(ConfigError::StorageCoherence)?;
+    let result = save_with_hook(&guard.config_path, config, expected_revision, |_| Ok(()));
+    before_postcheck();
+    let mutation = guard
+        .mutation
+        .require_root(root)
+        .map_err(map_install_mutation_error);
+    // Validate the accounting identity independently even if the mutation identity
+    // is already lost; neither secondary failure may erase the primary result.
+    let barrier_check = barrier
+        .as_ref()
+        .map(crate::storage_coherence::StorageBarrier::revalidate)
+        .transpose();
+    let freeze_check = freeze
+        .as_ref()
+        .map(crate::storage_coherence::StorageFreezeGuard::revalidate)
+        .transpose();
+    let accounting = barrier_check.and(freeze_check);
+    if mutation.is_err() || accounting.is_err() {
+        return Err(ConfigError::WriteUnverified {
+            primary: result.err().map(Box::new),
+            mutation: mutation.err().map(Box::new),
+            accounting: accounting.err(),
+        });
+    }
+    drop(freeze);
+    result
 }
 
 pub fn revision(config: &LocalRuntimeConfigV3) -> Result<String, ConfigError> {
@@ -420,6 +1114,7 @@ fn save_with_hook(
     mut before: impl FnMut(SaveStage) -> io::Result<()>,
 ) -> Result<(), ConfigError> {
     config.validate()?;
+    config.require_operational_storage_policy()?;
     reject_symlink(path)?;
     let parent = path.parent().ok_or(ConfigError::InvalidPath)?;
     private_dir(parent, false)?;
@@ -569,7 +1264,9 @@ fn open_private_read(path: &Path) -> Result<File, ConfigError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let mut options = OpenOptions::new();
-    options.read(true).custom_flags(no_follow_flag());
+    options
+        .read(true)
+        .custom_flags(no_follow_flag() | crate::lock::nonblocking_flag());
     let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -600,6 +1297,424 @@ const fn no_follow_flag() -> i32 {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn file_decode_enforces_byte_limit_without_changing_private_config() {
+        use std::io::Seek;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root("decode-byte-limit");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let config = load(&layout.config).unwrap();
+        let mut body = serde_json::to_vec(&config).unwrap();
+        body.resize(65_536, b' ');
+        fs::write(&layout.config, &body).unwrap();
+        assert_eq!(load(&layout.config).unwrap(), config);
+        let guard = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let evidence = ConfigAccountingEvidence::capture(&root, &guard).unwrap();
+        let mut file = open_private_read(&layout.config).unwrap();
+        // Grow after opening: the read limit must not depend on an earlier file size.
+        body.extend_from_slice(&[b' '; 32]);
+        fs::write(&layout.config, &body).unwrap();
+        assert!(matches!(
+            decode_open_file(&mut file),
+            Err(ConfigError::InputTooLarge)
+        ));
+        assert_eq!(file.stream_position().unwrap(), 65_537);
+        assert_eq!(
+            evidence.revalidate(),
+            Err(ConfigAccountingEvidenceError::InvalidConfig)
+        );
+        drop(evidence);
+        drop(guard);
+        body.truncate(65_537);
+        fs::write(&layout.config, &body).unwrap();
+        assert!(matches!(
+            load(&layout.config),
+            Err(ConfigError::InputTooLarge)
+        ));
+        assert_eq!(
+            LocalConfigService::new(&layout).read(),
+            Err(ConfigServiceError::Invalid)
+        );
+        let guard = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        assert_eq!(
+            ConfigAccountingEvidence::capture(&root, &guard).unwrap_err(),
+            ConfigAccountingEvidenceError::InvalidConfig
+        );
+        drop(guard);
+        assert_eq!(fs::read(&layout.config).unwrap(), body);
+        assert_eq!(
+            fs::metadata(&layout.config).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Oversized input has precedence over both malformed JSON and invalid UTF-8.
+        for first in [b'!', 0xff] {
+            body[0] = first;
+            fs::write(&layout.config, &body).unwrap();
+            assert!(matches!(
+                load(&layout.config),
+                Err(ConfigError::InputTooLarge)
+            ));
+            assert_eq!(fs::read(&layout.config).unwrap(), body);
+        }
+        assert_eq!(
+            ConfigError::InputTooLarge.to_string(),
+            "local runtime configuration input is too large"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn maximum_valid_config_serialization_fits_file_decode_limit() {
+        let config = LocalRuntimeConfigV5 {
+            enabled: false,
+            capture_private_codex_turn_details: false,
+            collection: CollectionPolicyV1 {
+                file_reconcile_interval_ms: 60_000,
+                flush_interval_ms: 60_000,
+                max_batch_records: 500,
+                max_batch_bytes: 2_097_152,
+                active_heartbeat_interval_ms: 300_000,
+                idle_heartbeat_interval_ms: 900_000,
+                local_storage_budget_bytes: 21_474_836_480,
+            },
+            retention: RetentionPolicyV1 {
+                max_record_age_days: 3_650,
+                max_archive_records: 100_000,
+                max_archive_bytes: 268_435_456,
+            },
+            lifecycle: StorageLifecyclePolicyV1 {
+                enabled: false,
+                hot_days: 3_649,
+                warm_days: 3_649,
+                delete_after_days: 3_650,
+                private_raw_days: 3_650,
+                maintenance_interval_seconds: 86_400,
+                max_traces_per_pass: 128,
+            },
+            storage_budget: StorageBudgetPolicyV1 {
+                mode: StorageBudgetMode::Separated,
+                retained_target_bytes: 21_474_836_480,
+                workspace_budget_bytes: 21_474_836_480,
+                minimum_free_bytes: 21_474_836_480,
+            },
+            ..LocalRuntimeConfigV5::default()
+        };
+        config.validate().unwrap();
+        let mut body = serde_json::to_vec_pretty(&config).unwrap();
+        body.push(b'\n');
+        assert!(body.len() < MAX_CONFIG_FILE_BYTES);
+        assert_eq!(
+            LocalRuntimeConfigV5::from_json(std::str::from_utf8(&body).unwrap()).unwrap(),
+            config
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_decode_rejects_invalid_utf8_and_json_without_mutation() {
+        let root = root("decode-invalid-input");
+        let layout = install(&root).unwrap();
+        fs::write(&layout.config, [0xff]).unwrap();
+        assert!(
+            matches!(load(&layout.config), Err(ConfigError::Io(error)) if error.kind() == io::ErrorKind::InvalidData)
+        );
+        assert_eq!(fs::read(&layout.config).unwrap(), [0xff]);
+        fs::write(&layout.config, b"{").unwrap();
+        assert!(matches!(load(&layout.config), Err(ConfigError::Json(_))));
+        assert_eq!(fs::read(&layout.config).unwrap(), b"{");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_decode_rejects_fifo_without_blocking() {
+        const PROBE: &str = "AGENTOBS_CONFIG_FIFO_PROBE";
+        if let Some(path) = std::env::var_os(PROBE) {
+            assert!(matches!(
+                load(Path::new(&path)),
+                Err(ConfigError::InvalidPath)
+            ));
+            return;
+        }
+        let root = root("decode-fifo");
+        let layout = install(&root).unwrap();
+        let fifo = root.join("config-fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let original = fs::read(&layout.config).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::file_decode_rejects_fifo_without_blocking",
+            ])
+            .env(PROBE, &fifo)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "config FIFO probe failed or exceeded hang guard"
+        );
+    }
+
+    #[test]
+    fn v4_migration_preserves_all_existing_values_and_selects_legacy() {
+        let mut input: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/local-runtime-config-v4.fixture.json"
+        ))
+        .unwrap();
+        input["enabled"] = false.into();
+        input["capture_private_codex_turn_details"] = true.into();
+        input["collection"]["local_storage_budget_bytes"] = 536_870_912_u64.into();
+        input["lifecycle"]["enabled"] = true.into();
+        let config = LocalRuntimeConfigV3::from_json(&input.to_string()).unwrap();
+        let output = serde_json::to_value(&config).unwrap();
+        assert_eq!(output["schema_version"], "local_runtime.v5");
+        assert_eq!(output["storage_budget"]["mode"], "legacy");
+        for field in [
+            "enabled",
+            "capture_private_codex_turn_details",
+            "collection",
+            "retention",
+            "lifecycle",
+        ] {
+            assert_eq!(output[field], input[field], "{field}");
+        }
+        assert_eq!(
+            output["storage_budget"]["retained_target_bytes"],
+            1_073_741_824_u64
+        );
+    }
+
+    #[test]
+    fn historical_migrations_preserve_nondefault_collection_and_retention() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/local-runtime-config-v4.fixture.json"
+        ))
+        .unwrap();
+        for version in 1..=4 {
+            let mut input = fixture.clone();
+            input["schema_version"] = format!("local_runtime.v{version}").into();
+            input["enabled"] = false.into();
+            input["collection"]["local_storage_budget_bytes"] = 2_147_483_648_u64.into();
+            input["collection"]["flush_interval_ms"] = 12_000.into();
+            input["retention"]["max_record_age_days"] = 234.into();
+            if version < 4 {
+                input.as_object_mut().unwrap().remove("lifecycle");
+            }
+            if version < 3 {
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("capture_private_codex_turn_details");
+            }
+            if version < 2 {
+                input.as_object_mut().unwrap().remove("retention");
+            }
+            let migrated = LocalRuntimeConfigV5::from_json(&input.to_string()).unwrap();
+            let output = serde_json::to_value(&migrated).unwrap();
+            for (field, value) in input.as_object().unwrap() {
+                if field != "schema_version" {
+                    assert_eq!(&output[field], value, "v{version}/{field}");
+                }
+            }
+            assert_eq!(migrated.storage_budget, StorageBudgetPolicyV1::default());
+            input["storage_budget"] =
+                serde_json::to_value(StorageBudgetPolicyV1::default()).unwrap();
+            assert!(
+                LocalRuntimeConfigV5::from_json(&input.to_string()).is_err(),
+                "v{version} must reject new fields"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reading_v4_does_not_rewrite_config_or_change_revision_between_reads() {
+        let root = root("p1-read-migration");
+        let layout = install(&root).unwrap();
+        let fixture = include_str!("../../../contracts/local-runtime-config-v4.fixture.json");
+        fs::write(&layout.config, fixture).unwrap();
+        let service = LocalConfigService::new(&layout);
+        let first = service.read().unwrap();
+        assert_eq!(first, service.read().unwrap());
+        assert_eq!(fs::read_to_string(&layout.config).unwrap(), fixture);
+        let second = service.save(&first.revision, &first.config).unwrap();
+        assert_eq!(first, second);
+        assert!(
+            fs::read_to_string(&layout.config)
+                .unwrap()
+                .contains("local_runtime.v5")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v5_storage_fields_are_required_strict_and_bounded_even_when_inactive() {
+        let fixture = serde_json::to_value(LocalRuntimeConfigV5::default()).unwrap();
+        let mut missing = fixture.clone();
+        missing.as_object_mut().unwrap().remove("storage_budget");
+        assert!(LocalRuntimeConfigV5::from_json(&missing.to_string()).is_err());
+        for mode in ["legacy", "separated"] {
+            for field in [
+                "retained_target_bytes",
+                "workspace_budget_bytes",
+                "minimum_free_bytes",
+            ] {
+                for (bytes, accepted) in [
+                    (268_435_455_u64, false),
+                    (268_435_456, true),
+                    (21_474_836_480, true),
+                    (21_474_836_481, false),
+                    (u64::MAX, false),
+                ] {
+                    let mut input = fixture.clone();
+                    input["storage_budget"]["mode"] = mode.into();
+                    input["storage_budget"][field] = bytes.into();
+                    assert_eq!(
+                        LocalRuntimeConfigV5::from_json(&input.to_string()).is_ok(),
+                        accepted,
+                        "{mode}/{field}/{bytes}"
+                    );
+                }
+                let mut input = fixture.clone();
+                input["storage_budget"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+                assert!(LocalRuntimeConfigV5::from_json(&input.to_string()).is_err());
+                for value in [
+                    serde_json::json!(-1),
+                    serde_json::json!(268_435_456.5),
+                    serde_json::json!("1073741824"),
+                    serde_json::Value::Null,
+                ] {
+                    input["storage_budget"][field] = value;
+                    assert!(LocalRuntimeConfigV5::from_json(&input.to_string()).is_err());
+                }
+            }
+        }
+        for value in [
+            serde_json::json!("auto"),
+            serde_json::json!("LEGACY"),
+            serde_json::Value::Null,
+        ] {
+            let mut input = fixture.clone();
+            input["storage_budget"]["mode"] = value;
+            assert!(LocalRuntimeConfigV5::from_json(&input.to_string()).is_err());
+        }
+        let mut unknown = fixture.clone();
+        unknown["storage_budget"]["extra"] = true.into();
+        assert!(LocalRuntimeConfigV5::from_json(&unknown.to_string()).is_err());
+        let mut missing_mode = fixture;
+        missing_mode["storage_budget"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mode");
+        assert!(LocalRuntimeConfigV5::from_json(&missing_mode.to_string()).is_err());
+    }
+
+    #[test]
+    fn storage_mode_round_trip_preserves_inactive_values_and_changes_revision() {
+        let mut config = LocalRuntimeConfigV5::default();
+        config.collection.local_storage_budget_bytes = 536_870_912;
+        config.storage_budget.retained_target_bytes = 2_147_483_648;
+        config.storage_budget.workspace_budget_bytes = 805_306_368;
+        config.storage_budget.minimum_free_bytes = 1_610_612_736;
+        config.lifecycle.enabled = true;
+        let original = config.clone();
+        let original_revision = revision(&config).unwrap();
+        config.storage_budget.mode = StorageBudgetMode::Separated;
+        assert_ne!(revision(&config).unwrap(), original_revision);
+        let serialized = serde_json::to_string(&config).unwrap();
+        let mut reopened = LocalRuntimeConfigV5::from_json(&serialized).unwrap();
+        assert_eq!(reopened, config);
+        reopened.storage_budget.mode = StorageBudgetMode::Legacy;
+        assert_eq!(reopened, original);
+        assert_eq!(revision(&reopened).unwrap(), original_revision);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unfinished_separated_policy_cannot_save_load_or_create_runtime_control() {
+        let root = root("p1-activation-gate");
+        let layout = install(&root).unwrap();
+        let service = LocalConfigService::new(&layout);
+        let current = service.read().unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        let mut candidate = current.config.clone();
+        candidate.storage_budget.mode = StorageBudgetMode::Separated;
+        assert!(candidate.validate().is_ok());
+        assert_eq!(
+            service.save(&current.revision, &candidate),
+            Err(ConfigServiceError::Invalid)
+        );
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+        assert!(matches!(
+            crate::RuntimeControl::new(&candidate),
+            Err(crate::ControlError::Config(
+                ConfigError::StoragePolicyUnavailable
+            ))
+        ));
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        assert!(matches!(
+            save(&guard, &candidate),
+            Err(ConfigError::StoragePolicyUnavailable)
+        ));
+        drop(guard);
+        // Simulate a hand-edited config only inside this disposable private fixture.
+        fs::write(&layout.config, serde_json::to_vec(&candidate).unwrap()).unwrap();
+        assert!(matches!(
+            load(&layout.config),
+            Err(ConfigError::StoragePolicyUnavailable)
+        ));
+        assert_eq!(service.read(), Err(ConfigServiceError::Unavailable));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v5_inactive_budget_save_preserves_values_and_rejects_stale_revision() {
+        let root = root("p1-revision");
+        let layout = install(&root).unwrap();
+        let service = LocalConfigService::new(&layout);
+        let before = service.read().unwrap();
+        let mut candidate = before.config.clone();
+        candidate.storage_budget.workspace_budget_bytes = 805_306_368;
+        candidate.lifecycle.enabled = true;
+        let after = service.save(&before.revision, &candidate).unwrap();
+        assert_eq!(after.config, candidate);
+        assert_ne!(after.revision, before.revision);
+        assert_eq!(
+            service.save(&before.revision, &before.config),
+            Err(ConfigServiceError::Conflict)
+        );
+        assert_eq!(service.read().unwrap(), after);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "agent-observability-config-{name}-{}",
@@ -609,7 +1724,7 @@ mod tests {
 
     #[test]
     fn config_is_strict_and_versioned() {
-        let config = LocalRuntimeConfigV3::default();
+        let config = LocalRuntimeConfigV4::default();
         config.validate().unwrap();
         assert!(
             LocalRuntimeConfigV3::from_json(
@@ -618,7 +1733,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            LocalRuntimeConfigV3::from_json(r#"{"schema_version":"local_runtime.v4"}"#).is_err()
+            LocalRuntimeConfigV4::from_json(r#"{"schema_version":"local_runtime.v6"}"#).is_err()
         );
         let legacy = LocalRuntimeConfigV3::from_json(
             r#"{"schema_version":"local_runtime.v1","enabled":true,"collection":{}}"#,
@@ -627,15 +1742,46 @@ mod tests {
         assert_eq!(legacy.schema_version, LOCAL_RUNTIME_CONFIG_VERSION);
         assert!(!legacy.capture_private_codex_turn_details);
         assert_eq!(legacy.retention, RetentionPolicyV1::default());
+        assert_eq!(legacy.lifecycle, StorageLifecyclePolicyV1::default());
+        assert_eq!(legacy.storage_budget, StorageBudgetPolicyV1::default());
 
         let prior_v2 = LocalRuntimeConfigV3::from_json(
             r#"{"schema_version":"local_runtime.v2","enabled":true,"collection":{"file_reconcile_interval_ms":5000,"flush_interval_ms":5000,"max_batch_records":100,"max_batch_bytes":524288,"active_heartbeat_interval_ms":60000,"idle_heartbeat_interval_ms":300000,"local_storage_budget_bytes":1073741824},"retention":{"max_record_age_days":30,"max_archive_records":10000,"max_archive_bytes":16777216}}"#,
         )
         .unwrap();
         assert!(!prior_v2.capture_private_codex_turn_details);
+        assert_eq!(prior_v2.lifecycle, StorageLifecyclePolicyV1::default());
+        assert_eq!(prior_v2.storage_budget, StorageBudgetPolicyV1::default());
+
+        let mut previous_fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/local-runtime-config-v3.fixture.json"
+        ))
+        .unwrap();
+        previous_fixture["enabled"] = false.into();
+        previous_fixture["capture_private_codex_turn_details"] = true.into();
+        previous_fixture["collection"]["max_batch_records"] = 321.into();
+        previous_fixture["retention"]["max_record_age_days"] = 123.into();
+        let previous_v3 = LocalRuntimeConfigV4::from_json(&previous_fixture.to_string()).unwrap();
+        assert_eq!(previous_v3.schema_version, LOCAL_RUNTIME_CONFIG_VERSION);
+        assert!(!previous_v3.enabled);
+        assert!(previous_v3.capture_private_codex_turn_details);
+        assert_eq!(previous_v3.collection.max_batch_records, 321);
+        assert_eq!(previous_v3.retention.max_record_age_days, 123);
+        assert_eq!(previous_v3.lifecycle, StorageLifecyclePolicyV1::default());
+        assert_eq!(previous_v3.storage_budget, StorageBudgetPolicyV1::default());
+
+        let mut malformed_v3 = previous_fixture.clone();
+        malformed_v3["collection"]
+            .as_object_mut()
+            .unwrap()
+            .remove("flush_interval_ms");
+        assert!(LocalRuntimeConfigV4::from_json(&malformed_v3.to_string()).is_err());
+        let mut unknown_v3 = previous_fixture;
+        unknown_v3["unexpected"] = true.into();
+        assert!(LocalRuntimeConfigV4::from_json(&unknown_v3.to_string()).is_err());
 
         let mut opted_in: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../contracts/local-runtime-config-v3.fixture.json"
+            "../../../contracts/local-runtime-config-v4.fixture.json"
         ))
         .unwrap();
         opted_in["capture_private_codex_turn_details"] = serde_json::Value::Bool(true);
@@ -648,13 +1794,13 @@ mod tests {
 
     #[test]
     fn versioned_fixture_matches_the_rust_default_and_bounds() {
-        let fixture = include_str!("../../../contracts/local-runtime-config-v3.fixture.json");
+        let fixture = include_str!("../../../contracts/local-runtime-config-v4.fixture.json");
         assert_eq!(
             LocalRuntimeConfigV3::from_json(fixture).unwrap(),
-            LocalRuntimeConfigV3::default()
+            LocalRuntimeConfigV4::default()
         );
         let cases: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../contracts/local-runtime-config-v3.parity.json"
+            "../../../contracts/local-runtime-config-v4.parity.json"
         ))
         .unwrap();
         for case in cases.as_array().unwrap() {
@@ -663,6 +1809,29 @@ mod tests {
             let accepted = LocalRuntimeConfigV3::from_json(&document.to_string()).is_ok();
             assert_eq!(
                 accepted,
+                case["valid"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn v5_fixture_and_shared_parity_match_rust() {
+        let fixture = include_str!("../../../contracts/local-runtime-config-v5.fixture.json");
+        assert_eq!(
+            LocalRuntimeConfigV5::from_json(fixture).unwrap(),
+            LocalRuntimeConfigV5::default()
+        );
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/local-runtime-config-v5.parity.json"
+        ))
+        .unwrap();
+        for case in cases.as_array().unwrap() {
+            let mut document: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            apply_parity_case(&mut document, case);
+            assert_eq!(
+                LocalRuntimeConfigV5::from_json(&document.to_string()).is_ok(),
                 case["valid"].as_bool().unwrap(),
                 "{}",
                 case["name"]
@@ -717,6 +1886,244 @@ mod tests {
             LocalRuntimeConfigV3::default()
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intact_initialized_install_is_nonmutating_and_does_not_contend_with_writer() {
+        use crate::storage_coherence::StorageBarrier;
+
+        let root = root("install-initialized-intact");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let barrier = StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        let writer = barrier.try_begin_write().unwrap();
+        let original = fs::read(&layout.config).unwrap();
+
+        assert_eq!(install(&root).unwrap(), layout);
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+
+        drop(writer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_install_repairs_layout_without_rewriting_legacy_config() {
+        let root = root("install-legacy-config");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let legacy =
+            b"{\"schema_version\":\"local_runtime.v1\",\"enabled\":true,\"collection\":{}}\n";
+        fs::write(&layout.config, legacy).unwrap();
+        fs::remove_dir(&layout.queue).unwrap();
+
+        assert_eq!(install(&root).unwrap(), layout);
+        assert_eq!(fs::read(&layout.config).unwrap(), legacy);
+        assert!(layout.queue.is_dir());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intact_legacy_install_accepts_owner_read_only_runtime_without_barrier() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root("install-legacy-owner-read-only");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        fs::set_permissions(&layout.runtime, fs::Permissions::from_mode(0o500)).unwrap();
+
+        assert_eq!(install(&root).unwrap(), layout);
+        assert_eq!(
+            fs::metadata(&layout.runtime).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        assert!(!layout.runtime.join("storage-accounting.lock").exists());
+
+        fs::set_permissions(&layout.runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_install_does_not_repair_while_accounting_writer_is_busy() {
+        use crate::storage_coherence::{StorageBarrier, StorageCoherenceError};
+
+        let root = root("install-initialized-busy");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let barrier = StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        fs::remove_dir(&layout.queue).unwrap();
+        fs::remove_file(&layout.config).unwrap();
+        let writer = barrier.try_begin_write().unwrap();
+
+        assert!(matches!(
+            install(&root),
+            Err(ConfigError::StorageCoherence(StorageCoherenceError::Busy))
+        ));
+        assert!(!layout.queue.exists());
+        assert!(!layout.config.exists());
+
+        drop(writer);
+        assert_eq!(install(&root).unwrap(), layout);
+        assert!(layout.queue.is_dir());
+        assert_eq!(
+            load(&layout.config).unwrap(),
+            LocalRuntimeConfigV3::default()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_install_rejects_invalid_barrier_without_repair() {
+        use crate::storage_coherence::StorageBarrier;
+
+        let root = root("install-initialized-invalid");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        fs::remove_dir(&layout.queue).unwrap();
+        fs::remove_file(&layout.config).unwrap();
+        fs::write(layout.runtime.join("storage-accounting.lock"), b"invalid").unwrap();
+
+        assert!(matches!(
+            install(&root),
+            Err(ConfigError::StorageCoherence(_))
+        ));
+        assert!(!layout.queue.exists());
+        assert!(!layout.config.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intact_initialized_install_rejects_owner_read_only_runtime() {
+        use crate::storage_coherence::StorageBarrier;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root("install-initialized-owner-read-only");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        fs::set_permissions(&layout.runtime, fs::Permissions::from_mode(0o500)).unwrap();
+
+        assert!(matches!(
+            install(&root),
+            Err(ConfigError::StorageCoherence(_))
+        ));
+        assert_eq!(
+            fs::metadata(&layout.runtime).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+
+        fs::set_permissions(&layout.runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_install_does_not_recreate_missing_mutation_lock() {
+        use crate::storage_coherence::{StorageBarrier, StorageCoherenceError};
+
+        let root = root("install-initialized-missing-mutation-lock");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        let mutation_lock = layout.runtime.join("mutation.lock");
+        fs::remove_file(&mutation_lock).unwrap();
+        fs::remove_dir(&layout.queue).unwrap();
+
+        assert!(matches!(
+            install(&root),
+            Err(ConfigError::StorageCoherence(
+                StorageCoherenceError::Missing
+            ))
+        ));
+        assert!(!mutation_lock.exists());
+        assert!(!layout.queue.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_install_preserves_preexisting_config_temporary_collision() {
+        use crate::storage_coherence::StorageBarrier;
+
+        let root = root("install-initialized-temp-collision");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        fs::remove_file(&layout.config).unwrap();
+        let temporary = layout
+            .root
+            .join(format!(".config.json.tmp.{}", std::process::id()));
+        fs::write(&temporary, b"preexisting-user-file").unwrap();
+
+        assert!(matches!(
+            install(&root),
+            Err(ConfigError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(fs::read(&temporary).unwrap(), b"preexisting-user-file");
+        assert!(!layout.config.exists());
+
+        fs::remove_file(&temporary).unwrap();
+        assert_eq!(install(&root).unwrap(), layout);
+        assert!(!temporary.exists());
+        assert_eq!(
+            load(&layout.config).unwrap(),
+            LocalRuntimeConfigV3::default()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_cleanup_refuses_to_unlink_a_replaced_created_temporary() {
+        let root = root("install-initialized-replaced-temp");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let temporary = layout
+            .root
+            .join(format!(".config.json.tmp.{}", std::process::id()));
+        let displaced = layout.root.join("displaced-install-temp");
+        let mut created = private_create_new(&temporary).unwrap();
+        created.write_all(b"created-by-install").unwrap();
+        fs::rename(&temporary, &displaced).unwrap();
+        let mut replacement = private_create_new(&temporary).unwrap();
+        replacement.write_all(b"replacement").unwrap();
+
+        assert!(matches!(
+            cleanup_install_temporary(
+                &layout,
+                &temporary,
+                &created,
+                InstallCoordination::Initialized,
+                None,
+            ),
+            Err(ConfigError::InvalidPath)
+        ));
+        assert_eq!(fs::read(&temporary).unwrap(), b"replacement");
+        assert_eq!(fs::read(&displaced).unwrap(), b"created-by-install");
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -776,6 +2183,143 @@ mod tests {
                 .contains(".update.")
         }));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_accounting_barrier_blocks_config_save_without_modification() {
+        use crate::storage_coherence::{StorageBarrier, StorageCoherenceError};
+        let root = root("config-accounting-coordination");
+        assert!(!root.exists());
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.retention.max_record_age_days = 90;
+        let barrier = StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        let writer = barrier.try_begin_write().unwrap();
+        assert!(matches!(
+            save(&guard, &config),
+            Err(ConfigError::StorageCoherence(StorageCoherenceError::Busy))
+        ));
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+        drop(writer);
+        save_if_revision(
+            &guard,
+            &revision(&load(&layout.config).unwrap()).unwrap(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(load(&layout.config).unwrap(), config);
+        drop(guard);
+        let writer = barrier.try_begin_write().unwrap();
+        assert_eq!(
+            LocalConfigService::new(&layout).save(&revision(&config).unwrap(), &config),
+            Err(ConfigServiceError::Busy)
+        );
+        drop(writer);
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        fs::write(layout.runtime.join("storage-accounting.lock"), b"invalid").unwrap();
+        assert!(matches!(
+            save(&guard, &config),
+            Err(ConfigError::StorageCoherence(_))
+        ));
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_retains_primary_and_both_postcheck_failures() {
+        use crate::storage_coherence::StorageBarrier;
+        use std::os::unix::fs::PermissionsExt;
+        for fail_operation in [false, true] {
+            let root = root(if fail_operation {
+                "config-dual-failure"
+            } else {
+                "config-published-unverified"
+            });
+            assert!(!root.exists());
+            let layout = install(&root).unwrap();
+            let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+            let barrier = StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+            let mut config = load(&layout.config).unwrap();
+            config.retention.max_record_age_days = if fail_operation { 0 } else { 90 };
+            let result = super::save_guarded_observing(&guard, &config, None, || {
+                let path = layout.runtime.join("mutation.lock");
+                fs::rename(&path, layout.runtime.join("retained-mutation.lock")).unwrap();
+                fs::write(&path, []).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::write(layout.runtime.join("storage-accounting.lock"), b"invalid").unwrap();
+            });
+            let Err(ConfigError::WriteUnverified {
+                primary,
+                mutation,
+                accounting,
+            }) = result
+            else {
+                panic!("expected explicit write verification failure");
+            };
+            assert_eq!(primary.is_some(), fail_operation);
+            if let Some(primary) = primary {
+                assert!(matches!(*primary, ConfigError::Policy(_)));
+            }
+            assert!(mutation.is_some());
+            assert!(accounting.is_some());
+            let published = load(&layout.config).unwrap();
+            if fail_operation {
+                assert_eq!(published, LocalRuntimeConfigV3::default());
+            } else {
+                assert_eq!(published, config);
+            }
+            drop(barrier);
+            drop(guard);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_config_guard_never_recreates_missing_mutation_lock() {
+        use crate::storage_coherence::StorageBarrier;
+        let root = root("config-missing-stable-mutation");
+        assert!(!root.exists());
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let barrier = StorageBarrier::initialize(&layout.root, &guard.mutation).unwrap();
+        drop(guard);
+        let path = layout.runtime.join("mutation.lock");
+        fs::remove_file(&path).unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        assert!(ConfigMutationGuard::acquire(&layout).is_err());
+        assert!(!path.exists());
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+        drop(barrier);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_config_save_rejects_replaced_mutation_before_publication() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = root("config-replaced-legacy-mutation");
+        assert!(!root.exists());
+        let layout = install(&root).unwrap();
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let path = layout.runtime.join("mutation.lock");
+        fs::rename(&path, layout.runtime.join("retained-mutation.lock")).unwrap();
+        fs::write(&path, []).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let original = fs::read(&layout.config).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.retention.max_record_age_days = 90;
+        assert!(save(&guard, &config).is_err());
+        assert_eq!(fs::read(&layout.config).unwrap(), original);
+        assert!(!layout.runtime.join("storage-accounting.lock").exists());
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -1027,5 +2571,216 @@ mod tests {
                 .contains(".update.")
         }));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_observes_separated_policy_without_activation() {
+        let root = root("accounting-separated-policy");
+        let layout = install(&root).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.storage_budget.mode = StorageBudgetMode::Separated;
+        config.validate().unwrap();
+        // Hand-edit only this disposable private fixture; operational save stays gated.
+        fs::write(&layout.config, serde_json::to_vec(&config).unwrap()).unwrap();
+        let guard = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let evidence = ConfigAccountingEvidence::capture(&root, &guard).unwrap();
+        assert_eq!(evidence.expected_revision(), revision(&config).unwrap());
+        assert_eq!(evidence.storage_budget_policy(), &config.storage_budget);
+        evidence.revalidate().unwrap();
+
+        config.storage_budget.workspace_budget_bytes -= 1;
+        config.validate().unwrap();
+        fs::write(&layout.config, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(
+            evidence.revalidate(),
+            Err(ConfigAccountingEvidenceError::RevisionChanged)
+        );
+        drop(evidence);
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_rejects_equal_bytes_replacement_and_changed_revision() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let replaced_root = root("accounting-replaced-config");
+        let _ = fs::remove_dir_all(&replaced_root);
+        let replaced_layout = install(&replaced_root).unwrap();
+        let replaced_guard = MutationGuard::try_acquire(&replaced_layout.runtime).unwrap();
+        let replaced = ConfigAccountingEvidence::capture(&replaced_root, &replaced_guard).unwrap();
+        let original = fs::read(&replaced_layout.config).unwrap();
+        fs::rename(
+            &replaced_layout.config,
+            replaced_layout.root.join("saved-config"),
+        )
+        .unwrap();
+        let mut replacement = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&replaced_layout.config)
+            .unwrap();
+        replacement.write_all(&original).unwrap();
+        assert_eq!(
+            replaced.revalidate(),
+            Err(ConfigAccountingEvidenceError::Replaced)
+        );
+        drop(replaced);
+        drop(replaced_guard);
+        fs::remove_dir_all(&replaced_root).unwrap();
+
+        let changed_root = root("accounting-changed-revision");
+        let _ = fs::remove_dir_all(&changed_root);
+        let changed_layout = install(&changed_root).unwrap();
+        let changed_guard = MutationGuard::try_acquire(&changed_layout.runtime).unwrap();
+        let changed = ConfigAccountingEvidence::capture(&changed_root, &changed_guard).unwrap();
+        let mut config = load(&changed_layout.config).unwrap();
+        config.retention.max_record_age_days = 90;
+        let mut body = serde_json::to_vec_pretty(&config).unwrap();
+        body.push(b'\n');
+        fs::write(&changed_layout.config, body).unwrap();
+        assert_eq!(
+            changed.revalidate(),
+            Err(ConfigAccountingEvidenceError::RevisionChanged)
+        );
+        drop(changed);
+        drop(changed_guard);
+        fs::remove_dir_all(&changed_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_rejects_root_replacement_and_wrong_guard() {
+        let first_root = root("accounting-root-first");
+        let second_root = root("accounting-root-second");
+        let saved_root = root("accounting-root-saved");
+        for path in [&first_root, &second_root, &saved_root] {
+            let _ = fs::remove_dir_all(path);
+        }
+        let first_layout = install(&first_root).unwrap();
+        let second_layout = install(&second_root).unwrap();
+        let first_guard = MutationGuard::try_acquire(&first_layout.runtime).unwrap();
+        assert_eq!(
+            ConfigAccountingEvidence::capture(&second_root, &first_guard).unwrap_err(),
+            ConfigAccountingEvidenceError::WrongMutationRoot
+        );
+
+        let evidence = ConfigAccountingEvidence::capture(&first_root, &first_guard).unwrap();
+        fs::rename(&first_root, &saved_root).unwrap();
+        install(&first_root).unwrap();
+        assert_eq!(
+            evidence.revalidate(),
+            Err(ConfigAccountingEvidenceError::WrongMutationRoot)
+        );
+        drop(evidence);
+        drop(first_guard);
+        fs::remove_dir_all(&first_root).unwrap();
+        fs::remove_dir_all(&saved_root).unwrap();
+        fs::remove_dir_all(&second_root).unwrap();
+        drop(second_layout);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_matches_only_exact_layout_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root("accounting-exact-entry");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let child = layout.state.join("child");
+        fs::create_dir(&child).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let evidence = ConfigAccountingEvidence::capture(&root, &guard).unwrap();
+        let debug = format!("{evidence:?}");
+        assert_eq!(debug, "ConfigAccountingEvidence { .. }");
+        assert!(!debug.contains(root.to_string_lossy().as_ref()));
+        assert!(!debug.contains(evidence.expected_revision()));
+
+        for (relative, path) in [
+            (Path::new(""), &layout.root),
+            (Path::new("config.json"), &layout.config),
+            (Path::new("logs"), &layout.logs),
+            (Path::new("queue"), &layout.queue),
+            (Path::new("state"), &layout.state),
+            (Path::new("runtime"), &layout.runtime),
+        ] {
+            assert!(
+                evidence
+                    .matches_entry(relative, &File::open(path).unwrap())
+                    .unwrap()
+            );
+        }
+        assert!(
+            !evidence
+                .matches_entry(
+                    Path::new("state/child"),
+                    &File::open(layout.state.join("child")).unwrap(),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            evidence.matches_entry(
+                Path::new("state"),
+                &File::open(layout.state.join("child")).unwrap(),
+            ),
+            Err(ConfigAccountingEvidenceError::Replaced)
+        );
+        assert!(
+            !evidence
+                .matches_entry(
+                    Path::new("runtime/mutation.lock"),
+                    &File::open(layout.runtime.join("mutation.lock")).unwrap(),
+                )
+                .unwrap()
+        );
+
+        drop(evidence);
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accounting_evidence_is_noncreating_and_requires_private_layout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let missing_layout_root = root("accounting-noncreating");
+        let _ = fs::remove_dir_all(&missing_layout_root);
+        let layout = install(&missing_layout_root).unwrap();
+        fs::remove_dir(&layout.queue).unwrap();
+        let guard = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        assert!(ConfigAccountingEvidence::capture(&missing_layout_root, &guard).is_err());
+        assert!(!layout.queue.exists());
+        drop(guard);
+        fs::remove_dir_all(&missing_layout_root).unwrap();
+
+        let config_root = root("accounting-config-permission");
+        let _ = fs::remove_dir_all(&config_root);
+        let config_layout = install(&config_root).unwrap();
+        fs::set_permissions(&config_layout.config, fs::Permissions::from_mode(0o644)).unwrap();
+        let config_guard = MutationGuard::try_acquire(&config_layout.runtime).unwrap();
+        assert_eq!(
+            ConfigAccountingEvidence::capture(&config_root, &config_guard).unwrap_err(),
+            ConfigAccountingEvidenceError::InsecurePermissions
+        );
+        drop(config_guard);
+        fs::remove_dir_all(&config_root).unwrap();
+
+        let directory_root = root("accounting-directory-permission");
+        let _ = fs::remove_dir_all(&directory_root);
+        let directory_layout = install(&directory_root).unwrap();
+        fs::set_permissions(&directory_layout.logs, fs::Permissions::from_mode(0o755)).unwrap();
+        let directory_guard = MutationGuard::try_acquire(&directory_layout.runtime).unwrap();
+        assert_eq!(
+            ConfigAccountingEvidence::capture(&directory_root, &directory_guard).unwrap_err(),
+            ConfigAccountingEvidenceError::InsecurePermissions
+        );
+        drop(directory_guard);
+        fs::remove_dir_all(directory_root).unwrap();
     }
 }

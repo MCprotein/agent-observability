@@ -6,7 +6,7 @@
 
 ## Scope Boundary
 
-| Boundary | v1.10.0 candidate status |
+| Boundary | Published v1.10.0 status |
 | --- | --- |
 | Private canonical handoff parser | Implemented for Codex, Claude Code, Cursor |
 | One-shot local ingest CLI | Implemented |
@@ -267,6 +267,9 @@ Browser code는 raw SQLite, JSONL, agent payload나 rate policy를 직접 읽지
 filter하고 시각화할 뿐이며 가격을 다시 계산하지 않는다.
 
 ## Retention Flow
+
+Published v1.10.0 manual flow is shown below. The proposed automatic Hot/Warm/Cold flow is tracked
+in [Storage Lifecycle](STORAGE_LIFECYCLE.md) and is not yet a released collector behavior.
 
 ```mermaid
 flowchart TD

@@ -235,6 +235,12 @@ agentobs config set private-codex-details true
 별도 runtime을 사용한다면 `config set <root> <option> <value>` 형식으로 root를 지정한다.
 지원 option, 기본값, 허용 범위는 [Configuration](docs/CONFIGURATION.md)에 있다.
 
+저장 공간은 기본 **1 GiB**, 설정 범위는 **256 MiB~20 GiB**다. 메모리 한도가 아니라
+DB·인덱스·리포트·임시 파일을 합친 로컬 디스크 예산이다. 쓰기 도중 필요한 여유 공간도
+계산하므로, 저장된 파일이 1 GiB보다 작아도 새 수집이 거부될 수 있다.
+1 GiB는 실측으로 도출한 최적값이 아니라 초기 설계에서 정한 기본 예산이다.
+자세한 기준은 [저장 공간 예산](docs/CONFIGURATION.md#저장-공간-예산)을 참고한다.
+
 ## Agent 지원 범위
 
 `Verified version`은 capability manifest가 해당 버전의 canonical source 의미를 검증한다는 뜻이다.
@@ -306,6 +312,10 @@ flowchart TB
 [Collection Flow](docs/COLLECTION_FLOW.md)에 있다.
 
 ## Retention
+
+> 개발 중: 다음 버전의 Hot/Warm/Cold 전환과 자동 만료 정책은
+> [Storage Lifecycle](docs/STORAGE_LIFECYCLE.md)에 정리하고 있다. 아래는 공개 안정판 v1.10.0의
+> 수동 정리 동작이며, 개발 중인 자동 삭제 기능과 구분한다.
 
 보관 기간은 언제든 변경할 수 있지만 실제 정리는 자동 실행되지 않는다.
 

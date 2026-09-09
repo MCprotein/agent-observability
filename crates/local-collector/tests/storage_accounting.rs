@@ -1,0 +1,365 @@
+//! Synthetic cross-crate coordination proof, not installed-runtime acceptance.
+#![cfg(unix)]
+
+use agent_observability_adapter_codex::{AdapterItem, parse_handoff_jsonl};
+use agent_observability_local_collector::storage_ownership::{
+    CollectorPrivateStorageObservation, CollectorStorageOwnershipEvidence,
+    CollectorTlsOwnershipEvidence,
+};
+use agent_observability_local_runtime::{
+    InstalledLayout, MutationGuard, RuntimeControl, StorageAllocationClass, StorageInventoryError,
+    config::ConfigAccountingEvidence,
+    install, load,
+    lock::storage_ownership::SingletonStorageOwnershipEvidence,
+    reservation::ReportReservationEvidence,
+    storage_coherence::{StorageBarrier, StorageCoherenceError, StorageWriteGuard},
+};
+use agent_observability_local_store::{
+    LocalStore, MAX_REPORT_VIEW_BYTES, MISSING_RATE_FINGERPRINT, ReportViewBuildError,
+    ReportViewPermitFactory, ReportViewWritePhase, StoreBatchItem,
+    build_report_view_staging_bound_coordinated, publish_report_view,
+    storage_ownership::with_storage_ownership_observation, with_report_view_ownership_observation,
+};
+use std::fs;
+use std::os::unix::fs::OpenOptionsExt;
+
+struct RuntimePermits<'a> {
+    barrier: &'a StorageBarrier,
+    runtime: &'a std::path::Path,
+    phases: usize,
+}
+
+impl<'a> ReportViewPermitFactory for RuntimePermits<'a> {
+    type Permit = StorageWriteGuard<'a>;
+
+    fn acquire(&mut self, _: ReportViewWritePhase) -> Result<Self::Permit, ReportViewBuildError> {
+        // Every new write phase follows release of the previous permit. An
+        // actual exclusive cut is possible here, without releasing render ownership.
+        let mutation = MutationGuard::try_acquire(self.runtime).unwrap();
+        let freeze = self.barrier.try_freeze_owned(mutation).unwrap();
+        freeze.revalidate().unwrap();
+        drop(freeze);
+        self.phases += 1;
+        self.barrier.try_begin_write().map_err(|error| match error {
+            StorageCoherenceError::Busy => ReportViewBuildError::Busy,
+            _ => ReportViewBuildError::CoordinationDenied,
+        })
+    }
+
+    fn revalidate(&mut self, permit: &Self::Permit) -> Result<(), ReportViewBuildError> {
+        permit
+            .revalidate()
+            .map_err(|_| ReportViewBuildError::CoordinationDenied)
+    }
+}
+
+#[test]
+fn three_synthetic_generations_preserve_reservations_and_classify_under_real_freeze() {
+    let root = std::env::temp_dir().join(format!(
+        "agentobs-storage-composition-{}",
+        std::process::id()
+    ));
+    assert!(
+        !root.exists(),
+        "fixture must not overwrite an existing directory"
+    );
+    let layout = install(&root).unwrap();
+    agent_observability_local_collector::install_settings(&layout.root).unwrap();
+    let root = layout.root.clone();
+    let config = load(&layout.config).unwrap();
+    let control = RuntimeControl::new(&config).unwrap();
+    let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+    let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+    let setup_freeze = barrier.try_freeze(&mutation).unwrap();
+    let mut store = LocalStore::open(layout.state.join("store")).unwrap();
+    write_synthetic_accounting_artifacts(&layout);
+    drop(setup_freeze);
+    drop(mutation);
+    let singleton_owners = production_singletons(&root);
+    let mut previous_view = None;
+    for generation in 0..3 {
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let mut initial_freeze = Some(barrier.try_freeze_owned(mutation).unwrap());
+        ingest_generation(&mut store, generation);
+        let mut reservation = control
+            .reserve_report_build(
+                &root,
+                initial_freeze.as_ref().unwrap().mutation(),
+                MAX_REPORT_VIEW_BYTES,
+            )
+            .unwrap();
+        let mut permits = RuntimePermits {
+            barrier: &barrier,
+            runtime: &layout.runtime,
+            phases: 0,
+        };
+        let staging = build_report_view_staging_bound_coordinated(
+            &store,
+            MISSING_RATE_FINGERPRINT,
+            MAX_REPORT_VIEW_BYTES,
+            None,
+            |path, file| {
+                reservation
+                    .bind_staging(
+                        &root,
+                        initial_freeze.as_ref().unwrap().mutation(),
+                        path,
+                        file,
+                    )
+                    .unwrap();
+                drop(initial_freeze.take());
+                Ok(())
+            },
+            &mut permits,
+            |_| {
+                let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+                assert!(matches!(
+                    barrier.try_freeze(&mutation),
+                    Err(StorageCoherenceError::Busy)
+                ));
+            },
+        )
+        .unwrap();
+        assert!(permits.phases >= 3);
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+        assert_accounting(&layout, &mutation, &freeze, &store);
+        reservation
+            .validate_staging(&root, &mutation, staging.path(), staging.identity_file())
+            .unwrap();
+        let publication = publish_report_view(&store, staging).unwrap();
+        assert_eq!(
+            publication.retired().map(|view| view.view_id().to_owned()),
+            previous_view
+        );
+        previous_view = Some(publication.current().view_id().to_owned());
+        reservation.release(&root, &mutation).unwrap();
+        assert!(!root.join("runtime/report-reservation.meta").exists());
+        freeze.revalidate().unwrap();
+        drop(freeze);
+    }
+    drop((store, singleton_owners));
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn production_singletons(
+    root: &std::path::Path,
+) -> Vec<agent_observability_local_runtime::ProductionSingleton> {
+    use agent_observability_local_runtime::{CoordinatedSingletonScope, ProductionSingleton};
+    [
+        CoordinatedSingletonScope::Runtime,
+        CoordinatedSingletonScope::Collector,
+        CoordinatedSingletonScope::SettingsUi,
+        CoordinatedSingletonScope::DashboardUi,
+    ]
+    .into_iter()
+    .map(|scope| ProductionSingleton::acquire(root, scope).unwrap())
+    .collect()
+}
+
+fn write_synthetic_accounting_artifacts(layout: &InstalledLayout) {
+    // Synthetic unpaired private artifacts must be classified by their own semantics,
+    // not by the existence of a counterpart or a permissive directory prefix.
+    for (directory, digest, value) in [
+        (
+            "private-codex-turn-details",
+            "a".repeat(64),
+            serde_json::json!({
+                "schemaVersion": agent_observability_adapter_codex::PRIVATE_TURN_DETAIL_SCHEMA_VERSION,
+                "turnId":format!("id:sha256:{}", "a".repeat(64)), "cwd":"/synthetic-only",
+                "inputMessages":["synthetic-only"], "lastAssistantMessage":null
+            }),
+        ),
+        (
+            "private-codex-turn-detail-statuses",
+            "b".repeat(64),
+            serde_json::json!({
+                "schema_version":"private_codex_turn_detail_status.v1",
+                "turn_id":format!("id:sha256:{}", "b".repeat(64)),
+                "state":"failed", "code":"capture_disabled"
+            }),
+        ),
+    ] {
+        use std::{io::Write, os::unix::fs::DirBuilderExt};
+        let directory = layout.state.join(directory);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(format!("{digest}.json")))
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&value).unwrap())
+            .unwrap();
+        file.sync_all().unwrap();
+    }
+    // This exact semantic marker must be owned by the collector authority, not
+    // accepted merely because it is a private runtime file.
+    {
+        use std::io::Write;
+        let mut marker = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(layout.runtime.join("report-dirty"))
+            .unwrap();
+        marker.write_all(b"dirty\n").unwrap();
+        marker.sync_all().unwrap();
+    }
+    // Even a zero-allocation file needs semantic ownership; its name never suffices.
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(layout.logs.join("unowned.control"))
+        .unwrap();
+}
+
+fn ingest_generation(store: &mut LocalStore, generation: u32) {
+    let input = include_str!("../../../examples/codex-handoff.v1.jsonl")
+        .replace("example-v1.5.0", &format!("accounting-{generation}"))
+        .replace(
+            "example-conversation",
+            &format!("accounting-session-{generation}"),
+        );
+    let batch = parse_handoff_jsonl(&input).unwrap();
+    let items = batch
+        .items
+        .iter()
+        .map(|item| match item {
+            AdapterItem::Observation(observation) => StoreBatchItem::Observation(observation),
+            AdapterItem::Disposition(diagnostic) => StoreBatchItem::Disposition {
+                checkpoint: &diagnostic.checkpoint,
+                disposition: diagnostic.disposition,
+                code: diagnostic.code,
+                canonical_payload_hash: diagnostic.payload_hash.as_deref(),
+            },
+        })
+        .collect::<Vec<_>>();
+    store
+        .ingest_ordered_batch_deferred_projection(&items)
+        .unwrap();
+}
+
+fn assert_accounting(
+    layout: &InstalledLayout,
+    mutation: &MutationGuard,
+    freeze: &agent_observability_local_runtime::storage_coherence::StorageFreezeGuard<'_, '_>,
+    store: &LocalStore,
+) {
+    let root = layout.root.as_path();
+    let config_evidence = ConfigAccountingEvidence::capture(root, mutation).unwrap();
+    let collector_evidence = CollectorStorageOwnershipEvidence::capture(layout).unwrap();
+    let singleton_evidence = SingletonStorageOwnershipEvidence::capture(root, mutation).unwrap();
+    let mut private_observation = CollectorPrivateStorageObservation::capture(layout).unwrap();
+    let tls_evidence = CollectorTlsOwnershipEvidence::capture(layout)
+        .unwrap()
+        .unwrap();
+    let reservation_evidence = ReportReservationEvidence::capture(root, mutation).unwrap();
+    assert_eq!(
+        reservation_evidence.captured_reserved_bytes(),
+        MAX_REPORT_VIEW_BYTES
+    );
+    assert!(store.try_acquire_report_render_guard().unwrap().is_none());
+    assert_accounting_control_locks(root, mutation, freeze);
+    let mut unknown = std::collections::BTreeSet::new();
+    let allocation = with_storage_ownership_observation(store, |authority| {
+        with_report_view_ownership_observation(store, |published| {
+            freeze.classify(|relative, file| {
+                let path = root.join(relative);
+                if config_evidence
+                    .matches_entry(relative, file)
+                    .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                    || mutation
+                        .matches_accounting_lock(root, relative, file)
+                        .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                    || freeze
+                        .matches_accounting_lock(relative, file)
+                        .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                    || reservation_evidence
+                        .matches_control_entry(relative, file)
+                        .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                    || published
+                        .recognizes(&path, file)
+                        .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                    || authority
+                        .recognizes(&path, file)
+                        .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                    || collector_evidence
+                        .matches_entry(relative, file)
+                        .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                    || singleton_evidence
+                        .matches_entry(relative, file)
+                        .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                    || tls_evidence
+                        .matches_entry(relative, file)
+                        .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                    || private_observation
+                        .matches_entry(relative, file)
+                        .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                {
+                    return Ok(StorageAllocationClass::Retained);
+                }
+                if reservation_evidence
+                    .matches_staging(&path, file)
+                    .map_err(|_| StorageInventoryError::OwnershipMismatch)?
+                {
+                    return Ok(StorageAllocationClass::Workspace);
+                }
+                unknown.insert(relative.to_path_buf());
+                Ok(StorageAllocationClass::Unknown)
+            })
+        })
+    })
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert!(allocation.retained_bytes > 0);
+    assert!(allocation.workspace_bytes > 0);
+    let expected_unknown = ["logs/unowned.control"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(unknown, expected_unknown);
+    assert_eq!(allocation.unknown_entry_count, 1);
+    assert_eq!(allocation.unknown_bytes, 0);
+    config_evidence.revalidate().unwrap();
+    collector_evidence.revalidate().unwrap();
+    singleton_evidence.revalidate().unwrap();
+    tls_evidence.revalidate().unwrap();
+    private_observation.revalidate().unwrap();
+    reservation_evidence.revalidate().unwrap();
+    assert_eq!(
+        reservation_evidence.captured_reserved_bytes(),
+        MAX_REPORT_VIEW_BYTES
+    );
+}
+
+fn assert_accounting_control_locks(
+    root: &std::path::Path,
+    mutation: &MutationGuard,
+    freeze: &agent_observability_local_runtime::storage_coherence::StorageFreezeGuard<'_, '_>,
+) {
+    let mutation_path = std::path::Path::new("runtime/mutation.lock");
+    assert!(
+        mutation
+            .matches_accounting_lock(
+                root,
+                mutation_path,
+                &fs::File::open(root.join(mutation_path)).unwrap()
+            )
+            .unwrap()
+    );
+    let accounting_path = std::path::Path::new("runtime/storage-accounting.lock");
+    assert!(
+        freeze
+            .matches_accounting_lock(
+                accounting_path,
+                &fs::File::open(root.join(accounting_path)).unwrap()
+            )
+            .unwrap()
+    );
+}

@@ -1,5 +1,11 @@
 //! Transactional ownership of the user-level Codex observability settings.
 
+mod storage_ownership;
+
+pub use storage_ownership::{
+    CodexConfigSnapshotOwnershipError, CodexConfigSnapshotOwnershipEvidence,
+};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{

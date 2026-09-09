@@ -23,10 +23,14 @@ use agent_observability_local_collector::{
     load_settings, submit_otlp_json_outcome,
 };
 use agent_observability_local_runtime::{
-    Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressMessage, IngressOutcome, LocalRuntimeConfigV3,
-    PressureSample, RuntimeControl, StorageBudget,
+    Admission, ENQUEUE_DEADLINE_MS, Ingress, IngressMessage, IngressOutcome,
+    LOCAL_RUNTIME_CONFIG_VERSION, LocalRuntimeConfigV3, PressureSample, RuntimeControl,
+    StorageBudget,
 };
-use agent_observability_local_store::LocalStore;
+use agent_observability_local_store::{
+    LOCAL_STORE_SCHEMA_VERSION, LocalStore, ReportViewBuildError, ReportViewCatalogError,
+    StoreError, current_report_view, with_report_view_snapshot,
+};
 use serde::Deserialize;
 #[cfg(target_os = "macos")]
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -35,7 +39,9 @@ const USAGE: &str = "usage:\n  cargo run -p xtask -- perf <local|automatic> --pr
 const PROTOCOL: &str = include_str!("../../crates/contracts/performance/local-performance-v1.yaml");
 const AUTOMATIC_PROTOCOL: &str =
     include_str!("../../crates/contracts/performance/automatic-local-performance-v1.yaml");
-const AUTOMATIC_PROTOCOL_REVISION: &str = "v1.8.3-codex-0.152.1-private-ca-header-ownership-rebase-real-e2e-synthetic-diagnostics-rss-p95-v4";
+const AUTOMATIC_PROTOCOL_REVISION: &str = "v1.8.3-codex-0.152.1-private-ca-header-ownership-rebase-real-e2e-synthetic-diagnostics-rss-p95-v5-paged-snapshot-parity";
+const AUTOMATIC_PRESERVE_SMOKE_EVIDENCE_ENV: &str =
+    "AGENT_OBSERVABILITY_PRESERVE_AUTOMATIC_SMOKE_EVIDENCE";
 const AUTOMATIC_CODEX_VERSION: &str = "codex-cli 0.152.1";
 const AUTOMATIC_OWNERSHIP_REBASE_PROBE: &[u8] =
     b"\n[hooks.state.\"agentobs-release-evidence\"]\ntrusted_hash = \"content-free\"\n";
@@ -268,6 +274,7 @@ struct AutomaticProtocolWorkload {
     collector_boundary: String,
     payload: String,
     readiness: String,
+    convergence_failures: String,
     collector_shutdown: String,
 }
 
@@ -499,6 +506,19 @@ struct AutomaticRunResult {
 struct ReportConvergence {
     generation: u64,
     records: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AutomaticPublishedSnapshotEvidence {
+    source_generation: u64,
+    acknowledged_generation: u64,
+    source_visibility_epoch: u64,
+    authoritative_records: u64,
+    snapshot_generation: u64,
+    snapshot_visibility_epoch: u64,
+    snapshot_records: u64,
+    indexed_records: u64,
+    current_consistent: bool,
 }
 impl Config {
     fn for_profile(profile: Profile) -> Self {
@@ -1242,6 +1262,15 @@ fn command(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn automatic_smoke_preservation_requested(profile: Profile) -> bool {
+    profile == Profile::Smoke
+        && preserve_automatic_smoke_evidence(
+            env::var(AUTOMATIC_PRESERVE_SMOKE_EVIDENCE_ENV)
+                .ok()
+                .as_deref(),
+        )
+}
+
 fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Result<(), String> {
     validate_automatic_protocol_contract()?;
     validate_automatic_profile_host(config.profile, env::consts::OS)?;
@@ -1288,29 +1317,35 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
     validate_automatic_manifest_shape(&manifest)?;
     fs::write(&manifest_path, &manifest)
         .map_err(|error| format!("write automatic manifest: {error}"))?;
+    let preserve_smoke_evidence = automatic_smoke_preservation_requested(config.profile);
     let runtime_result = runtime_cleanup.cleanup();
     let smoke_result = smoke_cleanup.as_mut().map_or(Ok(()), |cleanup| {
-        if validation.is_err() {
+        if validation.is_err() || preserve_smoke_evidence {
             cleanup.preserve();
             Ok(())
         } else {
             cleanup.cleanup()
         }
     });
-    if let Err(cleanup_error) = combine_cleanup(runtime_result, smoke_result) {
+    let cleanup_result = combine_cleanup(runtime_result, smoke_result);
+    if let Err(cleanup_error) = &cleanup_result {
         errors.push(format!("cleanup: {cleanup_error}"));
-        if config.profile == Profile::Release {
-            let failed = render_automatic_manifest(
-                config,
-                &host,
-                &source_revision,
-                &results,
-                &errors,
-                "failed",
-            );
-            fs::write(&manifest_path, failed)
-                .map_err(|error| format!("finalize automatic cleanup failure: {error}"))?;
-        }
+    }
+    if config.profile == Profile::Release || preserve_smoke_evidence || validation.is_err() {
+        let completed = render_automatic_outcome(
+            config,
+            &host,
+            &source_revision,
+            &results,
+            &errors,
+            validation.is_ok(),
+            cleanup_result.is_ok(),
+        );
+        validate_automatic_manifest_shape(&completed)?;
+        fs::write(&manifest_path, completed)
+            .map_err(|error| format!("finalize automatic manifest: {error}"))?;
+    }
+    if let Err(cleanup_error) = cleanup_result {
         println!(
             "{}",
             automatic_manifest_metadata(&manifest_path, config.profile, "failed")?
@@ -1329,18 +1364,32 @@ fn run_automatic(config: AutomaticConfig, supplied_binary: Option<&Path>) -> Res
             manifest_path.display()
         ));
     }
-    if config.profile == Profile::Release {
-        let passed =
-            render_automatic_manifest(config, &host, &source_revision, &results, &errors, "pass");
-        validate_automatic_manifest_shape(&passed)?;
-        fs::write(&manifest_path, passed)
-            .map_err(|error| format!("finalize automatic manifest: {error}"))?;
-    }
     println!(
         "{}",
         automatic_manifest_metadata(&manifest_path, config.profile, "pass")?
     );
     Ok(())
+}
+
+fn preserve_automatic_smoke_evidence(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn render_automatic_outcome(
+    config: AutomaticConfig,
+    host: &HostEvidence,
+    source_revision: &str,
+    results: &[AutomaticRunResult],
+    errors: &[String],
+    validation_succeeded: bool,
+    cleanup_succeeded: bool,
+) -> String {
+    let status = if validation_succeeded && cleanup_succeeded {
+        "pass"
+    } else {
+        "failed"
+    };
+    render_automatic_manifest(config, host, source_revision, results, errors, status)
 }
 
 fn collect_automatic_run_results(
@@ -1426,7 +1475,8 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
             notify_boundary: "separately verified built agent-observability codex-notify supplement through private-CA HTTPS with the exact private random request header".into(),
             collector_boundary: "built agent-observability collector-serve subprocess".into(),
             payload: "bounded synthetic Codex-shaped WebSocket-request/completed OTLP log pairs with opaque identifiers; one bounded notify supplement per measured run whose raw sentinels must be absent from the durable tree".into(),
-            readiness: "successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, exactly two durable synthetic records per accepted OTLP request plus one notify record, acknowledged report generation, and HTML generatedSpans parity with authoritative SQLite must converge before collector shutdown".into(),
+            readiness: "successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, exactly two durable synthetic records per accepted OTLP request plus one notify record, and one current validated published paged snapshot whose generation, visibility epoch, metadata record count, and indexed row count match authoritative SQLite must converge before collector shutdown".into(),
+            convergence_failures: "Retry only explicit SQLite busy/locked, catalog Busy, not-ready or proven snapshot consistency races within the existing startup deadline; durable failures stop on the first poll with zero sleeps and map only published_snapshot_open_failed, published_snapshot_authority_failed, published_snapshot_catalog_failed or published_snapshot_validation_failed into manifest errors; public stderr remains automatic_check_failed".into(),
             collector_shutdown: "bounded child termination and wait".into(),
         },
         metrics: AutomaticProtocolMetrics {
@@ -1467,7 +1517,7 @@ fn expected_automatic_protocol() -> AutomaticProtocol {
             build_timeout_seconds: AUTOMATIC_BUILD_TIMEOUT.as_secs(),
             startup_timeout_seconds: AUTOMATIC_START_TIMEOUT.as_secs(),
             cleanup_timeout_seconds: AUTOMATIC_LIFECYCLE_CLEANUP_TIMEOUT.as_secs(),
-            fail_closed: "missing or invalid benchmark metrics, real Codex execution or native OTLP failure, rejected synthetic OTLP requests, Codex version or strict config-load incompatibility, missing notify or report convergence evidence, durable raw sentinels, non-loopback endpoints, timeout, or threshold breach produce non-zero exit".into(),
+            fail_closed: "missing or invalid benchmark metrics, real Codex execution or native OTLP failure, rejected synthetic OTLP requests, Codex version or strict config-load incompatibility, missing notify or published paged report convergence evidence, durable raw sentinels, non-loopback endpoints, timeout, or threshold breach produce non-zero exit".into(),
         },
         evidence: AutomaticProtocolEvidence {
             output: "docs/evidence/local/performance/automatic-<run>/manifest.yaml".into(),
@@ -1859,6 +1909,222 @@ fn local_codex_sse_response() -> String {
         })
 }
 
+#[derive(Clone, Copy)]
+enum AutomaticLifecycleStage {
+    Plist,
+    Status,
+    PreFailureOtlp,
+    PreFailureNotify,
+    PreFailurePrivacy,
+    Kill,
+    RecoveryWait,
+    RecoverySnapshot,
+    PostRecoveryOtlp,
+    PostRecoveryOtlpSubmit,
+    PostRecoveryOtlpGrowth,
+    PostRecoveryNotify,
+    PostRecoveryPrivacy,
+    Reconnect,
+    ReconnectSettings,
+    ReconnectBootout,
+    ReconnectPortWait,
+    ReconnectCommand,
+    ReconnectStatus,
+    ConcurrentConnect,
+    ConcurrentConnectCapture,
+    ConcurrentConnectSpawn,
+    ConcurrentConnectWait,
+    ConcurrentConnectOutput,
+    ConcurrentConnectOutcome,
+    ConcurrentConnectConfigConflict,
+    ConcurrentConnectStoreBusy,
+    ConcurrentConnectBothBusy,
+    ConcurrentConnectStorageBusy,
+    ConcurrentConnectRuntimeBusy,
+    ConcurrentConnectSuccessOutput,
+    ConcurrentConnectStatus,
+    ConcurrentConnectOwnership,
+    Disconnect,
+    Restore,
+    InheritedPlist,
+}
+
+impl AutomaticLifecycleStage {
+    const ALL: [Self; 36] = [
+        Self::Plist,
+        Self::Status,
+        Self::PreFailureOtlp,
+        Self::PreFailureNotify,
+        Self::PreFailurePrivacy,
+        Self::Kill,
+        Self::RecoveryWait,
+        Self::RecoverySnapshot,
+        Self::PostRecoveryOtlp,
+        Self::PostRecoveryOtlpSubmit,
+        Self::PostRecoveryOtlpGrowth,
+        Self::PostRecoveryNotify,
+        Self::PostRecoveryPrivacy,
+        Self::Reconnect,
+        Self::ReconnectSettings,
+        Self::ReconnectBootout,
+        Self::ReconnectPortWait,
+        Self::ReconnectCommand,
+        Self::ReconnectStatus,
+        Self::ConcurrentConnect,
+        Self::ConcurrentConnectCapture,
+        Self::ConcurrentConnectSpawn,
+        Self::ConcurrentConnectWait,
+        Self::ConcurrentConnectOutput,
+        Self::ConcurrentConnectOutcome,
+        Self::ConcurrentConnectConfigConflict,
+        Self::ConcurrentConnectStoreBusy,
+        Self::ConcurrentConnectBothBusy,
+        Self::ConcurrentConnectStorageBusy,
+        Self::ConcurrentConnectRuntimeBusy,
+        Self::ConcurrentConnectSuccessOutput,
+        Self::ConcurrentConnectStatus,
+        Self::ConcurrentConnectOwnership,
+        Self::Disconnect,
+        Self::Restore,
+        Self::InheritedPlist,
+    ];
+
+    const fn failure(self) -> &'static str {
+        match self {
+            Self::Plist => "automatic lifecycle stage plist failed",
+            Self::Status => "automatic lifecycle stage status failed",
+            Self::PreFailureOtlp => "automatic lifecycle stage pre-failure OTLP failed",
+            Self::PreFailureNotify => "automatic lifecycle stage pre-failure notify failed",
+            Self::PreFailurePrivacy => "automatic lifecycle stage pre-failure privacy failed",
+            Self::Kill => "automatic lifecycle stage kill failed",
+            Self::RecoveryWait => "automatic lifecycle stage recovery wait failed",
+            Self::RecoverySnapshot => "automatic lifecycle stage recovery snapshot failed",
+            Self::PostRecoveryOtlp => "automatic lifecycle stage post-recovery OTLP failed",
+            Self::PostRecoveryOtlpSubmit => {
+                "automatic lifecycle stage post-recovery OTLP submit failed"
+            }
+            Self::PostRecoveryOtlpGrowth => {
+                "automatic lifecycle stage post-recovery OTLP growth failed"
+            }
+            Self::PostRecoveryNotify => "automatic lifecycle stage post-recovery notify failed",
+            Self::PostRecoveryPrivacy => "automatic lifecycle stage post-recovery privacy failed",
+            Self::Reconnect => "automatic lifecycle stage reconnect failed",
+            Self::ReconnectSettings => "automatic lifecycle stage reconnect settings failed",
+            Self::ReconnectBootout => "automatic lifecycle stage reconnect bootout failed",
+            Self::ReconnectPortWait => "automatic lifecycle stage reconnect port wait failed",
+            Self::ReconnectCommand => "automatic lifecycle stage reconnect command failed",
+            Self::ReconnectStatus => "automatic lifecycle stage reconnect status failed",
+            Self::ConcurrentConnect => "automatic lifecycle stage concurrent connect failed",
+            Self::ConcurrentConnectCapture => {
+                "automatic lifecycle stage concurrent connect capture failed"
+            }
+            Self::ConcurrentConnectSpawn => {
+                "automatic lifecycle stage concurrent connect spawn failed"
+            }
+            Self::ConcurrentConnectWait => {
+                "automatic lifecycle stage concurrent connect wait failed"
+            }
+            Self::ConcurrentConnectOutput => {
+                "automatic lifecycle stage concurrent connect output failed"
+            }
+            Self::ConcurrentConnectOutcome => {
+                "automatic lifecycle stage concurrent connect outcome failed"
+            }
+            Self::ConcurrentConnectConfigConflict => {
+                "automatic lifecycle stage concurrent connect config conflict"
+            }
+            Self::ConcurrentConnectStoreBusy => {
+                "automatic lifecycle stage concurrent connect store busy"
+            }
+            Self::ConcurrentConnectBothBusy => {
+                "automatic lifecycle stage concurrent connect both busy"
+            }
+            Self::ConcurrentConnectStorageBusy => {
+                "automatic lifecycle stage concurrent connect storage busy"
+            }
+            Self::ConcurrentConnectRuntimeBusy => {
+                "automatic lifecycle stage concurrent connect runtime busy"
+            }
+            Self::ConcurrentConnectSuccessOutput => {
+                "automatic lifecycle stage concurrent connect success output failed"
+            }
+            Self::ConcurrentConnectStatus => {
+                "automatic lifecycle stage concurrent connect status failed"
+            }
+            Self::ConcurrentConnectOwnership => {
+                "automatic lifecycle stage concurrent connect ownership failed"
+            }
+            Self::Disconnect => "automatic lifecycle stage disconnect failed",
+            Self::Restore => "automatic lifecycle stage restore failed",
+            Self::InheritedPlist => "automatic lifecycle stage inherited plist failed",
+        }
+    }
+
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Plist => "code=lifecycle_plist_failed",
+            Self::Status => "code=lifecycle_status_failed",
+            Self::PreFailureOtlp => "code=lifecycle_pre_failure_otlp_failed",
+            Self::PreFailureNotify => "code=lifecycle_pre_failure_notify_failed",
+            Self::PreFailurePrivacy => "code=lifecycle_pre_failure_privacy_failed",
+            Self::Kill => "code=lifecycle_kill_failed",
+            Self::RecoveryWait => "code=lifecycle_recovery_wait_failed",
+            Self::RecoverySnapshot => "code=lifecycle_recovery_snapshot_failed",
+            Self::PostRecoveryOtlp => "code=lifecycle_post_recovery_otlp_failed",
+            Self::PostRecoveryOtlpSubmit => "code=lifecycle_post_recovery_otlp_submit_failed",
+            Self::PostRecoveryOtlpGrowth => "code=lifecycle_post_recovery_otlp_growth_failed",
+            Self::PostRecoveryNotify => "code=lifecycle_post_recovery_notify_failed",
+            Self::PostRecoveryPrivacy => "code=lifecycle_post_recovery_privacy_failed",
+            Self::Reconnect => "code=lifecycle_reconnect_stage_failed",
+            Self::ReconnectSettings => "code=lifecycle_reconnect_settings_failed",
+            Self::ReconnectBootout => "code=lifecycle_reconnect_bootout_failed",
+            Self::ReconnectPortWait => "code=lifecycle_reconnect_port_wait_failed",
+            Self::ReconnectCommand => "code=lifecycle_reconnect_command_failed",
+            Self::ReconnectStatus => "code=lifecycle_reconnect_status_failed",
+            Self::ConcurrentConnect => "code=lifecycle_concurrent_connect_failed",
+            Self::ConcurrentConnectCapture => "code=lifecycle_concurrent_connect_capture_failed",
+            Self::ConcurrentConnectSpawn => "code=lifecycle_concurrent_connect_spawn_failed",
+            Self::ConcurrentConnectWait => "code=lifecycle_concurrent_connect_wait_failed",
+            Self::ConcurrentConnectOutput => "code=lifecycle_concurrent_connect_output_failed",
+            Self::ConcurrentConnectOutcome => "code=lifecycle_concurrent_connect_outcome_failed",
+            Self::ConcurrentConnectConfigConflict => {
+                "code=lifecycle_concurrent_connect_config_conflict"
+            }
+            Self::ConcurrentConnectStoreBusy => "code=lifecycle_concurrent_connect_store_busy",
+            Self::ConcurrentConnectBothBusy => "code=lifecycle_concurrent_connect_both_busy",
+            Self::ConcurrentConnectStorageBusy => "code=lifecycle_concurrent_connect_storage_busy",
+            Self::ConcurrentConnectRuntimeBusy => "code=lifecycle_concurrent_connect_runtime_busy",
+            Self::ConcurrentConnectSuccessOutput => {
+                "code=lifecycle_concurrent_connect_success_output_failed"
+            }
+            Self::ConcurrentConnectStatus => "code=lifecycle_concurrent_connect_status_failed",
+            Self::ConcurrentConnectOwnership => {
+                "code=lifecycle_concurrent_connect_ownership_failed"
+            }
+            Self::Disconnect => "code=lifecycle_disconnect_stage_failed",
+            Self::Restore => "code=lifecycle_restore_failed",
+            Self::InheritedPlist => "code=lifecycle_inherited_plist_failed",
+        }
+    }
+
+    fn from_failure(error: &str) -> Option<Self> {
+        // combine_cleanup appends this exact delimiter; never inspect or emit its payload.
+        let primary = error
+            .split_once("; cleanup failed: ")
+            .map_or(error, |(primary, _)| primary);
+        Self::ALL
+            .into_iter()
+            .find(|stage| stage.failure() == primary)
+    }
+}
+
+fn automatic_lifecycle_stage<T>(
+    stage: AutomaticLifecycleStage,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    result.map_err(|_| stage.failure().to_owned())
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(), String> {
     if env::consts::OS != "macos" {
@@ -1898,19 +2164,12 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
         complete: false,
     };
     let smoke = (|| {
-        let setup = run_bounded_product_command_with_env(
+        let setup = require_automatic_setup_output(run_bounded_product_command_with_env(
             binary,
             &["setup", "--no-open"],
             AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
             &cleanup.environment(),
-        )
-        .map_err(|_| "automatic lifecycle setup stage failed")?;
-        require_output_line(&setup, "status", "ready")
-            .map_err(|_| "automatic lifecycle setup stage failed")?;
-        require_output_line(&setup, "config", "connected")
-            .map_err(|_| "automatic lifecycle setup stage failed")?;
-        require_collector_ready_or_degraded(&setup)
-            .map_err(|_| "automatic lifecycle setup stage failed")?;
+        ))?;
         verify_installed_codex_compatibility(&cleanup)?;
         verify_automatic_ownership_rebase(binary, &root, &mut cleanup)?;
         let service =
@@ -1926,118 +2185,208 @@ fn run_automatic_lifecycle_smoke(binary: &Path, runtime_root: &Path) -> Result<(
         let target = format!("gui/{}/{service}", uid.trim());
         cleanup.plist = Some(plist.clone());
         cleanup.target = Some(target.clone());
-        verify_automatic_launch_agent_plist(&plist, binary, &root)?;
-
-        let status = run_bounded_product_command_with_env(
-            binary,
-            &["status", "codex"],
-            AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
-            &cleanup.environment(),
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Plist,
+            verify_automatic_launch_agent_plist(&plist, binary, &root),
         )?;
-        require_output_line(&status, "config", "connected")?;
-        require_collector_ready_or_degraded(&status)?;
+
+        let status = automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Status,
+            run_bounded_product_command_with_env(
+                binary,
+                &["status", "codex"],
+                AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+                &cleanup.environment(),
+            ),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Status,
+            require_output_line(&status, "config", "connected"),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Status,
+            require_collector_ready_or_degraded(&status),
+        )?;
         let initial_records = automatic_report_record_count(binary, &root, &cleanup)
             .map_err(|_| "automatic lifecycle initial report stage failed")?;
         let live_codex_records = verify_real_codex_e2e(binary, &root, &cleanup, initial_records)
             .map_err(|_| "automatic lifecycle real Codex stage failed")?;
-        submit_automatic_synthetic_otlp(&root, 0, 0)?;
-        let pre_failure_otlp_records = require_automatic_record_growth(
-            binary,
-            &root,
-            &cleanup,
-            live_codex_records,
-            "pre-failure synthetic collector OTLP",
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PreFailureOtlp,
+            submit_automatic_synthetic_otlp(&root, 0, 0),
         )?;
-        submit_automatic_notify(binary, &root, &cleanup, 0)?;
-        require_automatic_record_growth(
-            binary,
-            &root,
-            &cleanup,
-            pre_failure_otlp_records,
-            "pre-failure notify",
+        let pre_failure_otlp_records = automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PreFailureOtlp,
+            require_automatic_record_growth(
+                binary,
+                &root,
+                &cleanup,
+                live_codex_records,
+                "pre-failure synthetic collector OTLP",
+            ),
         )?;
-        assert_automatic_notify_sentinels_absent(&root)?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PreFailureNotify,
+            submit_automatic_notify(binary, &root, &cleanup, 0),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PreFailureNotify,
+            require_automatic_record_growth(
+                binary,
+                &root,
+                &cleanup,
+                pre_failure_otlp_records,
+                "pre-failure notify",
+            ),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PreFailurePrivacy,
+            assert_automatic_notify_sentinels_absent(&root),
+        )?;
 
-        run_bounded_status_command(
-            "/bin/launchctl",
-            &["kill", "SIGKILL", &target],
-            AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
-            &[0],
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Kill,
+            run_bounded_status_command(
+                "/bin/launchctl",
+                &["kill", "SIGKILL", &target],
+                AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
+                &[0],
+            ),
         )?;
-        wait_for_automatic_lifecycle_recovery(binary, &cleanup)?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::RecoveryWait,
+            wait_for_automatic_lifecycle_recovery(binary, &cleanup),
+        )?;
 
-        let recovered_records = automatic_report_record_count(binary, &root, &cleanup)?;
-        submit_automatic_synthetic_otlp(&root, 0, 1)?;
-        let post_recovery_otlp_records = require_automatic_record_growth(
-            binary,
-            &root,
-            &cleanup,
-            recovered_records,
-            "post-recovery synthetic collector OTLP",
+        let recovered_records = automatic_report_record_count(binary, &root, &cleanup)
+            .map_err(|error| automatic_recovery_snapshot_error(&error))?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PostRecoveryOtlpSubmit,
+            submit_automatic_synthetic_otlp(&root, 0, 1),
         )?;
-        submit_automatic_notify(binary, &root, &cleanup, 1)?;
-        require_automatic_record_growth(
-            binary,
-            &root,
-            &cleanup,
-            post_recovery_otlp_records,
-            "post-recovery notify",
+        let post_recovery_otlp_records = automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PostRecoveryOtlpGrowth,
+            require_automatic_record_growth(
+                binary,
+                &root,
+                &cleanup,
+                recovered_records,
+                "post-recovery synthetic collector OTLP",
+            ),
         )?;
-        assert_automatic_notify_sentinels_absent(&root)?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PostRecoveryNotify,
+            submit_automatic_notify(binary, &root, &cleanup, 1),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PostRecoveryNotify,
+            require_automatic_record_growth(
+                binary,
+                &root,
+                &cleanup,
+                post_recovery_otlp_records,
+                "post-recovery notify",
+            ),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::PostRecoveryPrivacy,
+            assert_automatic_notify_sentinels_absent(&root),
+        )?;
 
-        let occupied_port = load_settings(&root)
-            .map_err(|error| error.to_string())?
+        (|| {
+            let occupied_port = automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectSettings,
+                load_settings(&root).map_err(|error| error.to_string()),
+            )?
             .port;
-        run_bounded_status_command(
-            "/bin/launchctl",
-            &["bootout", &target],
-            AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
-            &[0],
-        )?;
-        let occupied = occupy_automatic_lifecycle_port(occupied_port)?;
-        let reconnected = run_bounded_product_command_with_env(
-            binary,
-            &["connect", "codex", path_text(&root)?],
-            AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
-            &cleanup.environment(),
-        )?;
-        require_output_line(&reconnected, "config", "connected")?;
-        require_collector_ready_or_degraded(&reconnected)?;
-        let recovered_port = load_settings(&root)
-            .map_err(|error| error.to_string())?
+            automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectBootout,
+                run_bounded_status_command(
+                    "/bin/launchctl",
+                    &["bootout", &target],
+                    AUTOMATIC_LIFECYCLE_RESTART_TIMEOUT,
+                    &[0],
+                ),
+            )?;
+            let occupied = automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectPortWait,
+                occupy_automatic_lifecycle_port(occupied_port),
+            )?;
+            let reconnected = automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectCommand,
+                run_bounded_product_command_with_env(
+                    binary,
+                    &["connect", "codex", path_text(&root)?],
+                    AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+                    &cleanup.environment(),
+                ),
+            )?;
+            automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectStatus,
+                require_output_line(&reconnected, "config", "connected"),
+            )?;
+            automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectStatus,
+                require_collector_ready_or_degraded(&reconnected),
+            )?;
+            let recovered_port = automatic_lifecycle_stage(
+                AutomaticLifecycleStage::ReconnectSettings,
+                load_settings(&root).map_err(|error| error.to_string()),
+            )?
             .port;
-        if recovered_port == occupied_port {
-            return Err("automatic lifecycle occupied port was not recovered".into());
-        }
-        drop(occupied);
+            if recovered_port == occupied_port {
+                return Err(AutomaticLifecycleStage::Reconnect.failure().to_owned());
+            }
+            drop(occupied);
+            Ok(())
+        })()?;
 
         run_concurrent_automatic_connects(binary, &root, &cleanup)?;
-        fs::remove_file(root.join("runtime/collector.json"))
-            .map_err(|error| format!("remove automatic lifecycle settings: {error}"))?;
-
-        let disconnected = run_bounded_product_command_with_env(
-            binary,
-            &["disconnect", "codex", path_text(&root)?],
-            AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
-            &cleanup.environment(),
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Disconnect,
+            (|| {
+                fs::remove_file(root.join("runtime/collector.json"))
+                    .map_err(|error| format!("remove automatic lifecycle settings: {error}"))?;
+                let disconnected = run_bounded_product_command_with_env(
+                    binary,
+                    &["disconnect", "codex", path_text(&root)?],
+                    AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+                    &cleanup.environment(),
+                )?;
+                require_output_line(&disconnected, "config", "disconnected")?;
+                require_output_line(&disconnected, "collector", "stopped")
+            })(),
         )?;
-        require_output_line(&disconnected, "config", "disconnected")?;
-        require_output_line(&disconnected, "collector", "stopped")?;
         cleanup.connection_may_exist = false;
-        verify_exact_file(
-            &cleanup.config,
-            &cleanup.seed,
-            AUTOMATIC_LIFECYCLE_SEED_MODE,
-            "Codex config",
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Restore,
+            verify_exact_file(
+                &cleanup.config,
+                &cleanup.seed,
+                AUTOMATIC_LIFECYCLE_SEED_MODE,
+                "Codex config",
+            ),
         )?;
-        if plist.exists() {
-            return Err("automatic lifecycle disconnect left the LaunchAgent plist".into());
-        }
-        if launch_agent_is_loaded(&target)? {
-            return Err("automatic lifecycle disconnect left the LaunchAgent loaded".into());
-        }
-        verify_inherited_automatic_plist(binary, &root, &mut cleanup, &plist, &target, false)?;
-        verify_inherited_automatic_plist(binary, &root, &mut cleanup, &plist, &target, true)?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::Disconnect,
+            (|| {
+                if plist.exists() {
+                    return Err("automatic lifecycle disconnect left the LaunchAgent plist".into());
+                }
+                if launch_agent_is_loaded(&target)? {
+                    return Err("automatic lifecycle disconnect left the LaunchAgent loaded".into());
+                }
+                Ok(())
+            })(),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::InheritedPlist,
+            verify_inherited_automatic_plist(binary, &root, &mut cleanup, &plist, &target, false),
+        )?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::InheritedPlist,
+            verify_inherited_automatic_plist(binary, &root, &mut cleanup, &plist, &target, true),
+        )?;
         Ok(())
     })();
     drop(model_server);
@@ -2082,11 +2431,11 @@ fn verify_automatic_ownership_rebase(
         AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
         &cleanup.environment(),
     )
-    .map_err(|_| "automatic lifecycle ownership rebase setup failed")?;
+    .map_err(|error| automatic_ownership_rebase_command_error(&error))?;
     require_output_line(&setup, "config", "connected")
-        .map_err(|_| "automatic lifecycle ownership rebase setup failed")?;
+        .map_err(|_| "automatic lifecycle ownership rebase config assertion failed")?;
     require_collector_ready_or_degraded(&setup)
-        .map_err(|_| "automatic lifecycle ownership rebase setup failed")?;
+        .map_err(|_| "automatic lifecycle ownership rebase collector assertion failed")?;
     verify_exact_file(
         &cleanup.config,
         &edited,
@@ -2104,6 +2453,41 @@ fn verify_automatic_ownership_rebase(
         &cleanup.environment(),
     )?;
     require_output_line(&status, "config", "connected")
+}
+
+fn automatic_recovery_snapshot_error(error: &str) -> String {
+    // Exact content-free errors only; classification grants no retry authority.
+    let reason = if let Some(stderr) =
+        error.strip_prefix("built product command failed: exit status: 1: ")
+    {
+        match stderr {
+            "storage accounting barrier is busy"
+            | "singleton coherence error: storage accounting barrier is busy"
+            | "local runtime is already running"
+            | "local store open is busy" => Some("busy"),
+            "local store database failure"
+            | "local store I/O failure"
+            | "local store schema or integrity mismatch" => Some("store_failed"),
+            _ => None,
+        }
+    } else if error
+        == format!(
+            "wait for built product command: worker exit timed out after {} ms",
+            AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT.as_millis()
+        )
+    {
+        Some("timeout")
+    } else if matches!(
+        error,
+        "automatic lifecycle report omitted records"
+            | "automatic lifecycle report returned invalid records"
+    ) {
+        Some("output_failed")
+    } else {
+        None
+    };
+    let stage = AutomaticLifecycleStage::RecoverySnapshot.failure();
+    reason.map_or_else(|| stage.to_owned(), |reason| format!("{stage}: {reason}"))
 }
 
 fn automatic_report_record_count(
@@ -2321,8 +2705,14 @@ fn run_concurrent_automatic_connects(
     root: &Path,
     cleanup: &AutomaticLifecycleCleanup<'_>,
 ) -> Result<(), String> {
-    let ownership = AutomaticLifecycleOwnership::capture(root, cleanup)?;
-    let root_text = path_text(root)?;
+    let ownership = automatic_lifecycle_stage(
+        AutomaticLifecycleStage::ConcurrentConnectCapture,
+        AutomaticLifecycleOwnership::capture(root, cleanup),
+    )?;
+    let root_text = automatic_lifecycle_stage(
+        AutomaticLifecycleStage::ConcurrentConnectCapture,
+        path_text(root),
+    )?;
     let mut commands = Vec::with_capacity(2);
     for _ in 0..2 {
         let mut command = Command::new(binary);
@@ -2334,8 +2724,10 @@ fn run_concurrent_automatic_connects(
         for (name, value) in cleanup.environment() {
             command.env(name, value);
         }
-        commands.push(ChildGuard(command.spawn().map_err(|error| {
-            format!("spawn concurrent automatic lifecycle connect: {error}")
+        commands.push(ChildGuard(command.spawn().map_err(|_| {
+            AutomaticLifecycleStage::ConcurrentConnectSpawn
+                .failure()
+                .to_owned()
         })?));
     }
 
@@ -2348,6 +2740,35 @@ fn run_concurrent_automatic_connects(
     let mut completed = Vec::with_capacity(outcomes.len());
     for outcome in outcomes {
         completed.push(outcome?);
+    }
+    validate_automatic_connect_outcomes(&completed)?;
+
+    automatic_lifecycle_stage(
+        AutomaticLifecycleStage::ConcurrentConnectStatus,
+        (|| {
+            let status = run_bounded_product_command_with_env(
+                binary,
+                &["status", "codex", root_text],
+                AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
+                &cleanup.environment(),
+            )?;
+            require_output_line(&status, "integration", "codex")?;
+            require_output_line(&status, "config", "connected")?;
+            require_collector_ready_or_degraded(&status)?;
+            Ok(())
+        })(),
+    )?;
+    automatic_lifecycle_stage(
+        AutomaticLifecycleStage::ConcurrentConnectOwnership,
+        ownership.verify(binary, root, cleanup),
+    )
+}
+
+fn validate_automatic_connect_outcomes(completed: &[AutomaticConnectOutput]) -> Result<(), String> {
+    if completed.len() != 2 {
+        return Err(AutomaticLifecycleStage::ConcurrentConnectOutcome
+            .failure()
+            .to_owned());
     }
     let successes = completed
         .iter()
@@ -2363,27 +2784,47 @@ fn run_concurrent_automatic_connects(
         })
         .count();
     if !((successes == 1 && busy_failures == 1) || successes == 2) {
-        return Err(format!(
-            "automatic lifecycle concurrent connect outcomes violated the product contract: {}",
-            format_automatic_connect_outcomes(&completed)
-        ));
+        // Diagnose only exact, content-free failures. These categories do not
+        // count as accepted lifecycle contention or authorize a retry.
+        let has_failure = |message| {
+            completed
+                .iter()
+                .any(|outcome| !outcome.status.success() && outcome.stderr.trim() == message)
+        };
+        let stage = if has_failure("storage accounting barrier is busy")
+            || has_failure("singleton coherence error: storage accounting barrier is busy")
+        {
+            AutomaticLifecycleStage::ConcurrentConnectStorageBusy
+        } else if has_failure("local runtime is already running") {
+            AutomaticLifecycleStage::ConcurrentConnectRuntimeBusy
+        } else if has_failure("Codex configuration ownership conflict") {
+            AutomaticLifecycleStage::ConcurrentConnectConfigConflict
+        } else if has_failure("local store open is busy") {
+            AutomaticLifecycleStage::ConcurrentConnectStoreBusy
+        } else if successes == 0
+            && completed.iter().all(|outcome| {
+                outcome.stderr.trim()
+                    == "Codex integration lifecycle is busy: local runtime is already running"
+            })
+        {
+            AutomaticLifecycleStage::ConcurrentConnectBothBusy
+        } else {
+            AutomaticLifecycleStage::ConcurrentConnectOutcome
+        };
+        return Err(stage.failure().to_owned());
     }
     for outcome in completed.iter().filter(|outcome| outcome.status.success()) {
-        require_output_line(&outcome.stdout, "integration", "codex")?;
-        require_output_line(&outcome.stdout, "config", "connected")?;
-        require_collector_ready_or_degraded(&outcome.stdout)?;
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::ConcurrentConnectSuccessOutput,
+            (|| {
+                require_output_line(&outcome.stdout, "integration", "codex")?;
+                require_output_line(&outcome.stdout, "config", "connected")?;
+                require_collector_ready_or_degraded(&outcome.stdout)
+            })(),
+        )?;
     }
 
-    let status = run_bounded_product_command_with_env(
-        binary,
-        &["status", "codex", root_text],
-        AUTOMATIC_LIFECYCLE_COMMAND_TIMEOUT,
-        &cleanup.environment(),
-    )?;
-    require_output_line(&status, "integration", "codex")?;
-    require_output_line(&status, "config", "connected")?;
-    require_collector_ready_or_degraded(&status)?;
-    ownership.verify(binary, root, cleanup)
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2471,34 +2912,39 @@ fn collect_automatic_connect_output(
     child: &mut ChildGuard,
     timeout: Duration,
 ) -> Result<AutomaticConnectOutput, String> {
-    let status = match wait_for_child(child, timeout) {
-        Ok(status) => status,
-        Err(error) => {
-            child.terminate()?;
-            return Err(format!(
-                "concurrent automatic lifecycle connect did not terminate boundedly: {error}"
-            ));
-        }
+    let Ok(status) = wait_for_child(child, timeout) else {
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::ConcurrentConnectWait,
+            child.terminate(),
+        )?;
+        return Err(AutomaticLifecycleStage::ConcurrentConnectWait
+            .failure()
+            .to_owned());
     };
-    let stdout = read_bounded_child_stream(
-        child
-            .stdout
-            .take()
-            .ok_or("concurrent automatic lifecycle connect stdout is unavailable")?,
-        "stdout",
-    )?;
-    let stderr = read_bounded_child_stream(
-        child
-            .stderr
-            .take()
-            .ok_or("concurrent automatic lifecycle connect stderr is unavailable")?,
-        "stderr",
-    )?;
-    Ok(AutomaticConnectOutput {
-        status,
-        stdout,
-        stderr,
-    })
+    automatic_lifecycle_stage(
+        AutomaticLifecycleStage::ConcurrentConnectOutput,
+        (|| {
+            let stdout = read_bounded_child_stream(
+                child
+                    .stdout
+                    .take()
+                    .ok_or("concurrent automatic lifecycle connect stdout is unavailable")?,
+                "stdout",
+            )?;
+            let stderr = read_bounded_child_stream(
+                child
+                    .stderr
+                    .take()
+                    .ok_or("concurrent automatic lifecycle connect stderr is unavailable")?,
+                "stderr",
+            )?;
+            Ok(AutomaticConnectOutput {
+                status,
+                stdout,
+                stderr,
+            })
+        })(),
+    )
 }
 
 fn read_bounded_child_stream(stream: impl Read, label: &str) -> Result<String, String> {
@@ -2514,23 +2960,6 @@ fn read_bounded_child_stream(stream: impl Read, label: &str) -> Result<String, S
     }
     String::from_utf8(bytes)
         .map_err(|_| format!("concurrent automatic lifecycle connect {label} is not UTF-8"))
-}
-
-fn format_automatic_connect_outcomes(outcomes: &[AutomaticConnectOutput]) -> String {
-    outcomes
-        .iter()
-        .enumerate()
-        .map(|(index, outcome)| {
-            format!(
-                "child {} status={} stdout={:?} stderr={:?}",
-                index + 1,
-                outcome.status,
-                outcome.stdout.trim(),
-                outcome.stderr.trim()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 fn file_mode(path: &Path, label: &str) -> Result<u32, String> {
@@ -2806,6 +3235,31 @@ fn require_collector_ready_or_degraded(output: &str) -> Result<(), String> {
     } else {
         Err("automatic lifecycle collector was neither ready nor degraded".into())
     }
+}
+
+fn require_automatic_setup_output(result: Result<String, String>) -> Result<String, String> {
+    let output = result.map_err(|_| "automatic lifecycle setup command failed")?;
+    require_output_line(&output, "status", "ready")
+        .map_err(|_| "automatic lifecycle setup status assertion failed")?;
+    require_output_line(&output, "config", "connected")
+        .map_err(|_| "automatic lifecycle setup config assertion failed")?;
+    require_collector_ready_or_degraded(&output)
+        .map_err(|_| "automatic lifecycle setup collector assertion failed")?;
+    Ok(output)
+}
+
+fn automatic_ownership_rebase_command_error(error: &str) -> String {
+    let safe_stage = error.rsplit_once(": ").map(|(_, stage)| stage);
+    match safe_stage {
+        Some("dashboard snapshot preparation is busy; retry setup shortly") => {
+            "automatic lifecycle ownership rebase command preparation busy"
+        }
+        Some("dashboard snapshot recovery failed") => {
+            "automatic lifecycle ownership rebase command snapshot recovery failed"
+        }
+        _ => "automatic lifecycle ownership rebase command failed",
+    }
+    .into()
 }
 
 fn output_value(output: &str, key: &str) -> Option<String> {
@@ -3441,42 +3895,202 @@ fn wait_for_automatic_ready(root: &Path, collector: &mut ChildGuard) -> Result<(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublishedSnapshotStage {
+    Open,
+    Authority,
+    Catalog,
+    Validation,
+}
+
+impl PublishedSnapshotStage {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Open => "published_snapshot_open_failed",
+            Self::Authority => "published_snapshot_authority_failed",
+            Self::Catalog => "published_snapshot_catalog_failed",
+            Self::Validation => "published_snapshot_validation_failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutomaticConvergenceError {
+    Retry,
+    Fatal(PublishedSnapshotStage),
+    CollectorInspect,
+    CollectorExited,
+}
+
+fn automatic_store_read_error(
+    error: &StoreError,
+    stage: PublishedSnapshotStage,
+) -> AutomaticConvergenceError {
+    if error.is_contention() || matches!(error, StoreError::ReportSnapshotChanged) {
+        AutomaticConvergenceError::Retry
+    } else {
+        AutomaticConvergenceError::Fatal(stage)
+    }
+}
+
+fn automatic_catalog_read_error(
+    error: ReportViewCatalogError,
+    stage: PublishedSnapshotStage,
+) -> AutomaticConvergenceError {
+    match error {
+        ReportViewCatalogError::Busy
+        | ReportViewCatalogError::RefreshPending
+        | ReportViewCatalogError::SnapshotChanged => AutomaticConvergenceError::Retry,
+        // Validation only requests a view just read as current; expiration here proves a race.
+        ReportViewCatalogError::SnapshotExpired if stage == PublishedSnapshotStage::Validation => {
+            AutomaticConvergenceError::Retry
+        }
+        ReportViewCatalogError::Store(error)
+        | ReportViewCatalogError::Build(ReportViewBuildError::Store(error)) => {
+            automatic_store_read_error(&error, stage)
+        }
+        ReportViewCatalogError::Sqlite(error)
+        | ReportViewCatalogError::Build(ReportViewBuildError::Sqlite(error)) => {
+            automatic_store_read_error(&StoreError::Sqlite(error), stage)
+        }
+        _ => AutomaticConvergenceError::Fatal(stage),
+    }
+}
+
 fn wait_for_automatic_report_convergence(
     root: &Path,
     collector: &mut ChildGuard,
 ) -> Result<ReportConvergence, String> {
     let started = Instant::now();
+    wait_for_automatic_convergence(
+        || {
+            if collector
+                .try_wait()
+                .map_err(|_| AutomaticConvergenceError::CollectorInspect)?
+                .is_some()
+            {
+                return Err(AutomaticConvergenceError::CollectorExited);
+            }
+            let store = LocalStore::open_current(root.join("state/store")).map_err(|error| {
+                automatic_store_read_error(&error, PublishedSnapshotStage::Open)
+            })?;
+            let convergence = automatic_published_snapshot_convergence(&store)?;
+            // A degraded health status must not conceal a durable snapshot error.
+            Ok(convergence.filter(|_| check_health(root) == HealthOutcome::Ready))
+        },
+        || started.elapsed(),
+        sleep,
+    )
+}
+
+fn wait_for_automatic_convergence(
+    mut poll: impl FnMut() -> Result<Option<ReportConvergence>, AutomaticConvergenceError>,
+    mut elapsed: impl FnMut() -> Duration,
+    mut pause: impl FnMut(Duration),
+) -> Result<ReportConvergence, String> {
     loop {
-        if collector
-            .try_wait()
-            .map_err(|error| format!("inspect automatic collector convergence: {error}"))?
-            .is_some()
-        {
-            return Err("built automatic collector exited before report convergence".into());
+        match poll() {
+            Ok(Some(convergence)) => return Ok(convergence),
+            Ok(None) | Err(AutomaticConvergenceError::Retry) => {}
+            Err(AutomaticConvergenceError::Fatal(stage)) => return Err(stage.code().into()),
+            Err(AutomaticConvergenceError::CollectorInspect) => {
+                return Err("inspect automatic collector convergence failed".into());
+            }
+            Err(AutomaticConvergenceError::CollectorExited) => {
+                return Err("built automatic collector exited before report convergence".into());
+            }
         }
-        if check_health(root) == HealthOutcome::Ready
-            && let Ok(store) = LocalStore::open_current(root.join("state/store"))
-            && let Ok(status_before) = store.report_status()
-            && !status_before.pending()
-            && let Ok(record_count) = store.record_count()
-            && record_count > 0
-            && let Ok(report) =
-                fs::read_to_string(root.join("logs/agent-observability-report.html"))
-            && report.contains(&format!(r#""generatedSpans":{record_count}"#))
-            && let Ok(status_after) = store.report_status()
-            && status_after == status_before
-            && !status_after.pending()
-        {
-            return Ok(ReportConvergence {
-                generation: status_after.generation,
-                records: record_count,
-            });
+        if elapsed() >= AUTOMATIC_START_TIMEOUT {
+            return Err("automatic published paged snapshot convergence timed out".into());
         }
-        if started.elapsed() >= AUTOMATIC_START_TIMEOUT {
-            return Err("automatic durable report convergence timed out".into());
-        }
-        sleep(Duration::from_millis(20));
+        pause(Duration::from_millis(20));
     }
+}
+
+fn automatic_published_snapshot_convergence(
+    store: &LocalStore,
+) -> Result<Option<ReportConvergence>, AutomaticConvergenceError> {
+    let status_before = store
+        .report_status()
+        .map_err(|error| automatic_store_read_error(&error, PublishedSnapshotStage::Authority))?;
+    let visibility_before = store
+        .report_visibility_epoch()
+        .map_err(|error| automatic_store_read_error(&error, PublishedSnapshotStage::Authority))?;
+    let records_before = store
+        .record_count()
+        .map_err(|error| automatic_store_read_error(&error, PublishedSnapshotStage::Authority))?;
+    let Some(current_before) = current_report_view(store)
+        .map_err(|error| automatic_catalog_read_error(error, PublishedSnapshotStage::Catalog))?
+    else {
+        return Ok(None);
+    };
+    let (guarded_snapshot, indexed_records) =
+        with_report_view_snapshot(store, current_before.view_id(), |connection, snapshot| {
+            let indexed_records =
+                connection
+                    .query_row("SELECT COUNT(*) FROM spans", [], |row| row.get::<_, i64>(0))?;
+            Ok((snapshot.clone(), indexed_records))
+        })
+        .map_err(|error| automatic_catalog_read_error(error, PublishedSnapshotStage::Validation))?;
+    let status_after = store
+        .report_status()
+        .map_err(|error| automatic_store_read_error(&error, PublishedSnapshotStage::Authority))?;
+    let visibility_after = store
+        .report_visibility_epoch()
+        .map_err(|error| automatic_store_read_error(&error, PublishedSnapshotStage::Authority))?;
+    let records_after = store
+        .record_count()
+        .map_err(|error| automatic_store_read_error(&error, PublishedSnapshotStage::Authority))?;
+    let current_after = current_report_view(store)
+        .map_err(|error| automatic_catalog_read_error(error, PublishedSnapshotStage::Catalog))?;
+    let snapshot_records = u64::try_from(guarded_snapshot.records())
+        .map_err(|_| AutomaticConvergenceError::Fatal(PublishedSnapshotStage::Validation))?;
+    let indexed_records = u64::try_from(indexed_records)
+        .map_err(|_| AutomaticConvergenceError::Fatal(PublishedSnapshotStage::Validation))?;
+    let evidence = AutomaticPublishedSnapshotEvidence {
+        source_generation: status_after.generation,
+        acknowledged_generation: status_after.acknowledged_generation,
+        source_visibility_epoch: visibility_after,
+        authoritative_records: records_after,
+        snapshot_generation: guarded_snapshot.generation(),
+        snapshot_visibility_epoch: guarded_snapshot.visibility_epoch(),
+        snapshot_records,
+        indexed_records,
+        current_consistent: status_before == status_after
+            && visibility_before == visibility_after
+            && records_before == records_after
+            && current_before == guarded_snapshot
+            && current_after.as_ref() == Some(&guarded_snapshot),
+    };
+    if evidence.current_consistent
+        && evidence.authoritative_records != 0
+        && evidence.source_generation == evidence.acknowledged_generation
+        && validate_automatic_published_snapshot(evidence).is_none()
+    {
+        return Err(AutomaticConvergenceError::Fatal(
+            PublishedSnapshotStage::Validation,
+        ));
+    }
+    Ok(validate_automatic_published_snapshot(evidence))
+}
+
+fn validate_automatic_published_snapshot(
+    evidence: AutomaticPublishedSnapshotEvidence,
+) -> Option<ReportConvergence> {
+    if evidence.authoritative_records == 0
+        || evidence.source_generation != evidence.acknowledged_generation
+        || evidence.snapshot_generation != evidence.source_generation
+        || evidence.snapshot_visibility_epoch != evidence.source_visibility_epoch
+        || evidence.snapshot_records != evidence.authoritative_records
+        || evidence.indexed_records != evidence.authoritative_records
+        || !evidence.current_consistent
+    {
+        return None;
+    }
+    Some(ReportConvergence {
+        generation: evidence.source_generation,
+        records: evidence.authoritative_records,
+    })
 }
 
 fn automatic_notify_payload(run: usize, event: usize) -> String {
@@ -3943,6 +4557,10 @@ struct RssSampler {
     stop: Option<mpsc::Sender<()>>,
     result: mpsc::Receiver<Result<RssPeaks, String>>,
     handle: Option<thread::JoinHandle<()>>,
+    #[cfg(all(test, target_os = "macos"))]
+    sample_count: Arc<AtomicU64>,
+    #[cfg(all(test, target_os = "macos"))]
+    initial_rss_kib: f64,
 }
 
 struct ProcessRssReader {
@@ -4027,6 +4645,21 @@ impl RssSampler {
         }
         Ok(peaks)
     }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn wait_for_samples(&self, minimum: u64, timeout: Duration) -> Result<(), String> {
+        let started = Instant::now();
+        while self.sample_count.load(Ordering::Acquire) < minimum {
+            if started.elapsed() >= timeout {
+                return Err(format!(
+                    "RSS sampler did not complete {minimum} samples within {} ms",
+                    timeout.as_millis()
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
 }
 
 fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String> {
@@ -4037,6 +4670,10 @@ fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String>
     let initial = reader.sample_kib()?;
     let (stop_tx, stop_rx) = mpsc::channel();
     let (result_tx, result_rx) = mpsc::channel();
+    #[cfg(all(test, target_os = "macos"))]
+    let sample_count = Arc::new(AtomicU64::new(1));
+    #[cfg(all(test, target_os = "macos"))]
+    let sampler_sample_count = Arc::clone(&sample_count);
     let handle = thread::spawn(move || {
         let result = (|| {
             let mut rss_samples_kib = vec![initial];
@@ -4058,6 +4695,8 @@ fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String>
                 rss_samples_kib.push(rss_kib);
                 peaks.peak_rss_kib = peaks.peak_rss_kib.max(rss_kib);
                 peaks.samples = peaks.samples.saturating_add(1);
+                #[cfg(all(test, target_os = "macos"))]
+                sampler_sample_count.store(peaks.samples, Ordering::Release);
                 let sampled_at = Instant::now();
                 peaks.max_gap_ms = peaks
                     .max_gap_ms
@@ -4079,6 +4718,10 @@ fn start_rss_sampler(pid: u32, interval: Duration) -> Result<RssSampler, String>
         stop: Some(stop_tx),
         result: result_rx,
         handle: Some(handle),
+        #[cfg(all(test, target_os = "macos"))]
+        sample_count,
+        #[cfg(all(test, target_os = "macos"))]
+        initial_rss_kib: initial,
     })
 }
 
@@ -5278,7 +5921,7 @@ fn validate_automatic_results(
             return Err("automatic notify supplement evidence is missing".into());
         }
         if !result.report_converged {
-            return Err("automatic durable report convergence evidence is missing".into());
+            return Err("automatic published paged report convergence evidence is missing".into());
         }
         let expected_records = u64::try_from(config.events)
             .map_err(|_| "automatic expected record count overflow")?
@@ -5396,9 +6039,9 @@ fn render_automatic_manifest(
         .iter()
         .map(|result| result.rss_observed_max_gap_ms)
         .max();
-    let release_readiness = match status {
-        "pass" => "verified",
-        "pending-validation" => "pending",
+    let release_readiness = match (config.profile, status) {
+        (Profile::Release, "pass") => "verified",
+        (Profile::Release, "pending-validation") => "pending",
         _ => "not_verified",
     };
     let real_codex_e2e_status = if errors
@@ -5494,7 +6137,19 @@ fn render_automatic_manifest(
 
 fn automatic_evidence_error_code(error: &str) -> &'static str {
     if let Some(error) = error.strip_prefix("lifecycle preflight: ") {
-        if error.contains("requires codex") {
+        let primary = error
+            .split_once("; cleanup failed: ")
+            .map_or(error, |(primary, _)| primary);
+        match primary.strip_prefix("automatic lifecycle stage recovery snapshot failed: ") {
+            Some("busy") => return "code=lifecycle_recovery_snapshot_busy",
+            Some("timeout") => return "code=lifecycle_recovery_snapshot_timeout",
+            Some("store_failed") => return "code=lifecycle_recovery_snapshot_store_failed",
+            Some("output_failed") => return "code=lifecycle_recovery_snapshot_output_failed",
+            _ => {}
+        }
+        if let Some(stage) = AutomaticLifecycleStage::from_failure(error) {
+            stage.code()
+        } else if error.contains("requires codex") {
             "code=lifecycle_codex_version_failed"
         } else if error.contains("compatibility diagnostic")
             || error.contains("strict config")
@@ -5506,6 +6161,24 @@ fn automatic_evidence_error_code(error: &str) -> &'static str {
             "code=lifecycle_codex_e2e_failed"
         } else if error.contains("initial report") {
             "code=lifecycle_report_failed"
+        } else if error.contains("ownership rebase command preparation busy") {
+            "code=lifecycle_ownership_rebase_command_preparation_busy"
+        } else if error.contains("ownership rebase command snapshot recovery") {
+            "code=lifecycle_ownership_rebase_command_snapshot_recovery_failed"
+        } else if error.contains("ownership rebase command") {
+            "code=lifecycle_ownership_rebase_command_failed"
+        } else if error.contains("ownership rebase config assertion") {
+            "code=lifecycle_ownership_rebase_config_failed"
+        } else if error.contains("ownership rebase collector assertion") {
+            "code=lifecycle_ownership_rebase_collector_failed"
+        } else if error.contains("setup command") {
+            "code=lifecycle_setup_command_failed"
+        } else if error.contains("setup status assertion") {
+            "code=lifecycle_setup_status_failed"
+        } else if error.contains("setup config assertion") {
+            "code=lifecycle_setup_config_failed"
+        } else if error.contains("setup collector assertion") {
+            "code=lifecycle_setup_collector_failed"
         } else if error.contains("setup") {
             "code=lifecycle_setup_failed"
         } else if error.contains("recovery") || error.contains("SIGKILL") {
@@ -5517,8 +6190,19 @@ fn automatic_evidence_error_code(error: &str) -> &'static str {
         } else {
             "code=lifecycle_preflight_failed"
         }
-    } else if error.starts_with("run ") {
-        "code=benchmark_run_failed"
+    } else if let Some(run_error) = error.strip_prefix("run ") {
+        match run_error.split_once(": ") {
+            Some((run, stage)) if run.parse::<usize>().is_ok() => match stage {
+                "published_snapshot_open_failed" => "code=published_snapshot_open_failed",
+                "published_snapshot_authority_failed" => "code=published_snapshot_authority_failed",
+                "published_snapshot_catalog_failed" => "code=published_snapshot_catalog_failed",
+                "published_snapshot_validation_failed" => {
+                    "code=published_snapshot_validation_failed"
+                }
+                _ => "code=benchmark_run_failed",
+            },
+            _ => "code=benchmark_run_failed",
+        }
     } else if error.starts_with("validation: ") {
         "code=evidence_validation_failed"
     } else if error.starts_with("cleanup: ") {
@@ -5553,10 +6237,10 @@ fn validate_automatic_manifest_shape(manifest: &str) -> Result<AutomaticEvidence
     {
         return Err("automatic performance manifest shape is invalid".into());
     }
-    let expected_readiness = match evidence.status.as_str() {
-        "pass" => "verified",
-        "pending-validation" => "pending",
-        "failed" => "not_verified",
+    let expected_readiness = match (evidence.profile.as_str(), evidence.status.as_str()) {
+        ("release", "pass") => "verified",
+        ("release", "pending-validation") => "pending",
+        (_, "pass" | "pending-validation" | "failed") => "not_verified",
         _ => return Err("automatic performance manifest status is invalid".into()),
     };
     if evidence.release_readiness != expected_readiness {
@@ -5842,18 +6526,73 @@ fn validate_automatic_release_aggregates(
     Ok(())
 }
 
+// Keep the finite error allowlist and its rejection checks together.
+#[allow(clippy::too_many_lines)]
 fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
     let allowed_errors = [
         "  - 'code=lifecycle_preflight_failed'",
+        "  - 'code=lifecycle_plist_failed'",
+        "  - 'code=lifecycle_status_failed'",
+        "  - 'code=lifecycle_pre_failure_otlp_failed'",
+        "  - 'code=lifecycle_pre_failure_notify_failed'",
+        "  - 'code=lifecycle_pre_failure_privacy_failed'",
+        "  - 'code=lifecycle_kill_failed'",
+        "  - 'code=lifecycle_recovery_wait_failed'",
+        "  - 'code=lifecycle_recovery_snapshot_failed'",
+        "  - 'code=lifecycle_recovery_snapshot_busy'",
+        "  - 'code=lifecycle_recovery_snapshot_timeout'",
+        "  - 'code=lifecycle_recovery_snapshot_store_failed'",
+        "  - 'code=lifecycle_recovery_snapshot_output_failed'",
+        "  - 'code=lifecycle_post_recovery_otlp_failed'",
+        "  - 'code=lifecycle_post_recovery_otlp_submit_failed'",
+        "  - 'code=lifecycle_post_recovery_otlp_growth_failed'",
+        "  - 'code=lifecycle_post_recovery_notify_failed'",
+        "  - 'code=lifecycle_post_recovery_privacy_failed'",
+        "  - 'code=lifecycle_reconnect_stage_failed'",
+        "  - 'code=lifecycle_reconnect_settings_failed'",
+        "  - 'code=lifecycle_reconnect_bootout_failed'",
+        "  - 'code=lifecycle_reconnect_port_wait_failed'",
+        "  - 'code=lifecycle_reconnect_command_failed'",
+        "  - 'code=lifecycle_reconnect_status_failed'",
+        "  - 'code=lifecycle_concurrent_connect_failed'",
+        "  - 'code=lifecycle_concurrent_connect_capture_failed'",
+        "  - 'code=lifecycle_concurrent_connect_spawn_failed'",
+        "  - 'code=lifecycle_concurrent_connect_wait_failed'",
+        "  - 'code=lifecycle_concurrent_connect_output_failed'",
+        "  - 'code=lifecycle_concurrent_connect_outcome_failed'",
+        "  - 'code=lifecycle_concurrent_connect_config_conflict'",
+        "  - 'code=lifecycle_concurrent_connect_store_busy'",
+        "  - 'code=lifecycle_concurrent_connect_both_busy'",
+        "  - 'code=lifecycle_concurrent_connect_storage_busy'",
+        "  - 'code=lifecycle_concurrent_connect_runtime_busy'",
+        "  - 'code=lifecycle_concurrent_connect_success_output_failed'",
+        "  - 'code=lifecycle_concurrent_connect_status_failed'",
+        "  - 'code=lifecycle_concurrent_connect_ownership_failed'",
+        "  - 'code=lifecycle_disconnect_stage_failed'",
+        "  - 'code=lifecycle_restore_failed'",
+        "  - 'code=lifecycle_inherited_plist_failed'",
         "  - 'code=lifecycle_codex_version_failed'",
         "  - 'code=lifecycle_codex_config_failed'",
         "  - 'code=lifecycle_codex_e2e_failed'",
         "  - 'code=lifecycle_report_failed'",
+        "  - 'code=lifecycle_ownership_rebase_command_preparation_busy'",
+        "  - 'code=lifecycle_ownership_rebase_command_snapshot_recovery_failed'",
+        "  - 'code=lifecycle_ownership_rebase_command_failed'",
+        "  - 'code=lifecycle_ownership_rebase_config_failed'",
+        "  - 'code=lifecycle_ownership_rebase_collector_failed'",
         "  - 'code=lifecycle_setup_failed'",
+        "  - 'code=lifecycle_setup_command_failed'",
+        "  - 'code=lifecycle_setup_status_failed'",
+        "  - 'code=lifecycle_setup_config_failed'",
+        "  - 'code=lifecycle_setup_collector_failed'",
         "  - 'code=lifecycle_recovery_failed'",
         "  - 'code=lifecycle_reconnect_failed'",
         "  - 'code=lifecycle_cleanup_failed'",
         "  - 'code=benchmark_run_failed'",
+        "  - 'code=published_snapshot_open_failed'",
+        "  - 'code=published_snapshot_authority_failed'",
+        "  - 'code=published_snapshot_catalog_failed'",
+        "  - 'code=published_snapshot_validation_failed'",
         "  - 'code=evidence_validation_failed'",
         "  - 'code=cleanup_failed'",
         "  - 'code=automatic_check_failed'",
@@ -5915,7 +6654,7 @@ fn render_manifest(
         })
         .collect::<Vec<_>>();
     let mut out = format!(
-        "schema_version: local_performance.v1\nprotocol_revision: v1.2.0-supported-rate-saturation-continuous-network\nsource_revision: {}\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: {}\nos: {}\nfilesystem: {}\npower_mode: {}\ncold_warm_cache: warm-after-build-and-per-run-warmup\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: local_runtime.v3\n  durable_store: local_state.v4\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  supported_rate_events: {}\n  supported_inter_event_ms: {}\n  saturation_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  supported_rate_schedule: symmetric-driver-paced\n  supported_rate_durability_barrier: required-before-saturation\n  supported_rate_measurement_boundary: first-command-through-barrier-completion\n  saturation_schedule: enabled-unpaced\n  channel_capacity: 64\n  normalization_workers: 1\n  durable_batch_records: {DURABLE_BATCH_RECORDS}\n  durable_handoff_bytes_max: {DURABLE_HANDOFF_BYTES_MAX}\n  total_pipeline_payload_bytes_max: {TOTAL_PIPELINE_PAYLOAD_BYTES_MAX}\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: one-bounded-batch-local-store-drain-actor\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: run-relative/durable\n  durable_path_lifecycle: removed-after-measurement\nall_run_samples:\n",
+        "schema_version: local_performance.v1\nprotocol_revision: v1.2.0-supported-rate-saturation-continuous-network\nsource_revision: {}\nprofile: {}\nprotocol: crates/contracts/performance/local-performance-v1.yaml\nstatus: pending-validation\nmachine: {}\nos: {}\nfilesystem: {}\npower_mode: {}\ncold_warm_cache: warm-after-build-and-per-run-warmup\nlogical_cores: {}\nsource_versions:\n  product: {}\n  runtime_config: {runtime_config_version}\n  durable_store: {store_schema_version}\nbaseline:\n  runs: {}\nenabled:\n  runs: {}\nworkload:\n  warmup_seconds: {}\n  idle_seconds: {}\n  active_seconds: {}\n  supported_rate_events: {}\n  supported_inter_event_ms: {}\n  saturation_events: {}\n  sample_interval_seconds: {}\n  adapters: [codex, claude-code, cursor]\n  schedule: round-robin-codex-claude-code-cursor\n  supported_rate_schedule: symmetric-driver-paced\n  supported_rate_durability_barrier: required-before-saturation\n  supported_rate_measurement_boundary: first-command-through-barrier-completion\n  saturation_schedule: enabled-unpaced\n  channel_capacity: 64\n  normalization_workers: 1\n  durable_batch_records: {DURABLE_BATCH_RECORDS}\n  durable_handoff_bytes_max: {DURABLE_HANDOFF_BYTES_MAX}\n  total_pipeline_payload_bytes_max: {TOTAL_PIPELINE_PAYLOAD_BYTES_MAX}\n  enqueue_deadline_ms: 10\n  command_boundary: fixed-capacity-local-runtime-ingress\n  worker_boundary: one-bounded-batch-local-store-drain-actor\n  foreground_response: bounded-enqueue-acceptance\n  durable_path: run-relative/durable\n  durable_path_lifecycle: removed-after-measurement\nall_run_samples:\n",
         host.source_revision,
         profile_name(config.profile),
         host.machine,
@@ -5933,6 +6672,8 @@ fn render_manifest(
         SUPPORTED_INTER_EVENT_PERIOD.as_millis(),
         config.saturation_events,
         config.sample.as_secs_f64(),
+        runtime_config_version = LOCAL_RUNTIME_CONFIG_VERSION,
+        store_schema_version = LOCAL_STORE_SCHEMA_VERSION,
     );
     for result in results {
         let _ = writeln!(
@@ -6508,10 +7249,7 @@ mod tests {
         let binary = root.join("agent-observability");
         fs::write(
             &binary,
-            format!(
-                "#!/bin/sh\nsleep 2\nprintf '{}\\n'\n",
-                env!("CARGO_PKG_VERSION")
-            ),
+            format!("#!/bin/sh\nprintf '{}\\n'\n", env!("CARGO_PKG_VERSION")),
         )
         .unwrap();
         fs::set_permissions(&binary, Permissions::from_mode(0o700)).unwrap();
@@ -6618,6 +7356,10 @@ mod tests {
             stop: Some(stop_tx),
             result: result_rx,
             handle: Some(handle),
+            #[cfg(target_os = "macos")]
+            sample_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(target_os = "macos")]
+            initial_rss_kib: 0.0,
         };
         let started = Instant::now();
         let error = sampler
@@ -6632,23 +7374,49 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn rss_sampler_observes_a_bounded_subprocess_memory_spike() {
-        let mut child = Command::new("/usr/bin/perl")
-            .args([
-                "-e",
-                "select(undef,undef,undef,0.05); $x = 'x' x (64*1024*1024); select(undef,undef,undef,1.0);",
-            ])
-            .spawn()
-            .unwrap();
+    fn rss_sampler_observes_a_ready_subprocess_memory_spike_after_bounded_samples() {
+        let mut child = ChildGuard(
+            Command::new("/usr/bin/perl")
+                .args([
+                    "-e",
+                    "$| = 1; print \"ready\\n\"; <STDIN>; $x = 'x' x (64*1024*1024); print \"allocated\\n\"; <STDIN>;",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut output = WorkerOutput::new(child.stdout.take().unwrap());
+        assert_eq!(
+            output
+                .read(WORKER_EXIT_TIMEOUT, "RSS fixture readiness")
+                .unwrap(),
+            "ready"
+        );
         let mut sampler = start_rss_sampler(child.id(), Duration::from_millis(10)).unwrap();
-        thread::sleep(Duration::from_millis(600));
+        let baseline = sampler.initial_rss_kib;
+        let mut input = child.stdin.take().unwrap();
+        writeln!(input, "allocate").unwrap();
+        assert_eq!(
+            output
+                .read(WORKER_EXIT_TIMEOUT, "RSS fixture allocation")
+                .unwrap(),
+            "allocated"
+        );
+        let after_allocation = sampler.sample_count.load(Ordering::Acquire);
+        sampler
+            .wait_for_samples(after_allocation + 2, WORKER_EXIT_TIMEOUT)
+            .unwrap();
         let peaks = sampler.stop().unwrap();
-        let status = child.wait().unwrap();
+        writeln!(input, "stop").unwrap();
+        let status = wait_for_child(&mut child, WORKER_EXIT_TIMEOUT).unwrap();
+        output.join().unwrap();
 
         assert!(status.success());
         assert!(peaks.peak_rss_kib >= 32.0 * 1024.0);
+        assert!(peaks.peak_rss_kib - baseline >= 32.0 * 1024.0);
         assert!(peaks.samples >= 3);
-        assert!(peaks.max_gap_ms <= 100);
     }
 
     #[test]
@@ -6678,8 +7446,13 @@ mod tests {
                 .contains("exact durable report evidence")
         );
 
+        let max_gap_ms = u64::try_from(AUTOMATIC_RSS_MAX_OBSERVED_GAP.as_millis()).unwrap();
         let mut result = automatic_result(1, vec![1; automatic_config().events]);
-        result.rss_observed_max_gap_ms = 101;
+        result.rss_observed_max_gap_ms = max_gap_ms;
+        assert!(validate_single_automatic(result).is_ok());
+
+        let mut result = automatic_result(1, vec![1; automatic_config().events]);
+        result.rss_observed_max_gap_ms = max_gap_ms + 1;
         assert!(
             validate_single_automatic(result)
                 .unwrap_err()
@@ -6733,7 +7506,8 @@ mod tests {
         assert!(AUTOMATIC_PROTOCOL.contains("exact 10 input and 2 output token records"));
         assert!(AUTOMATIC_PROTOCOL.contains("sustained synthetic Codex-shaped OTLP/HTTP JSON"));
         assert!(AUTOMATIC_PROTOCOL.contains("after the real Codex gate passes"));
-        assert!(AUTOMATIC_PROTOCOL.contains("HTML generatedSpans parity"));
+        assert!(AUTOMATIC_PROTOCOL.contains("current validated published paged snapshot"));
+        assert!(!AUTOMATIC_PROTOCOL.contains("HTML generatedSpans parity"));
         assert!(AUTOMATIC_PROTOCOL.contains("not mTLS"));
         assert!(!AUTOMATIC_PROTOCOL.contains("launchd kickstart recovery"));
         assert!(
@@ -6953,6 +7727,341 @@ mod tests {
     }
 
     #[test]
+    fn automatic_snapshot_fatal_errors_stop_after_one_poll_without_sleep() {
+        for stage in [
+            PublishedSnapshotStage::Open,
+            PublishedSnapshotStage::Authority,
+            PublishedSnapshotStage::Catalog,
+            PublishedSnapshotStage::Validation,
+        ] {
+            for error in [
+                StoreError::SchemaMismatch,
+                StoreError::InsecurePermissions,
+                StoreError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "/tmp/AUTOMATIC_RAW_PROMPT_SENTINEL SELECT * FROM secrets database is locked",
+                )),
+            ] {
+                let classified = automatic_store_read_error(&error, stage);
+                assert_eq!(classified, AutomaticConvergenceError::Fatal(stage));
+                let mut polls = 0;
+                let mut sleeps = 0;
+                let result = wait_for_automatic_convergence(
+                    || {
+                        polls += 1;
+                        Err(classified)
+                    },
+                    || Duration::ZERO,
+                    |_| sleeps += 1,
+                );
+                assert_eq!(result.unwrap_err(), stage.code());
+                assert_eq!((polls, sleeps), (1, 0));
+            }
+        }
+        for error in [
+            ReportViewCatalogError::InvalidCatalog,
+            ReportViewCatalogError::SourceMismatch,
+            ReportViewCatalogError::CatalogCapacityExceeded,
+            ReportViewCatalogError::SnapshotExpired,
+            ReportViewCatalogError::Io(io::Error::other("/tmp/private SELECT raw")),
+        ] {
+            let classified = automatic_catalog_read_error(error, PublishedSnapshotStage::Catalog);
+            assert_eq!(
+                classified,
+                AutomaticConvergenceError::Fatal(PublishedSnapshotStage::Catalog)
+            );
+            let mut polls = 0;
+            let mut sleeps = 0;
+            let result = wait_for_automatic_convergence(
+                || {
+                    polls += 1;
+                    Err(classified)
+                },
+                || Duration::ZERO,
+                |_| sleeps += 1,
+            );
+            assert_eq!(result.unwrap_err(), PublishedSnapshotStage::Catalog.code());
+            assert_eq!((polls, sleeps), (1, 0));
+        }
+    }
+
+    #[test]
+    fn automatic_snapshot_transients_retry_and_keep_the_existing_deadline() {
+        let expected = ReportConvergence {
+            generation: 7,
+            records: 51,
+        };
+        let mut outcomes = [
+            Ok(None),
+            Err(automatic_store_read_error(
+                &StoreError::ReportSnapshotChanged,
+                PublishedSnapshotStage::Authority,
+            )),
+            Err(automatic_catalog_read_error(
+                ReportViewCatalogError::Busy,
+                PublishedSnapshotStage::Catalog,
+            )),
+            Err(automatic_catalog_read_error(
+                ReportViewCatalogError::RefreshPending,
+                PublishedSnapshotStage::Catalog,
+            )),
+            Err(automatic_catalog_read_error(
+                ReportViewCatalogError::SnapshotChanged,
+                PublishedSnapshotStage::Catalog,
+            )),
+            Err(automatic_catalog_read_error(
+                ReportViewCatalogError::SnapshotExpired,
+                PublishedSnapshotStage::Validation,
+            )),
+            Ok(Some(expected)),
+        ]
+        .into_iter();
+        let mut polls = 0;
+        let mut sleeps = 0;
+        assert_eq!(
+            wait_for_automatic_convergence(
+                || {
+                    polls += 1;
+                    outcomes.next().unwrap()
+                },
+                || Duration::ZERO,
+                |duration| {
+                    assert_eq!(duration, Duration::from_millis(20));
+                    sleeps += 1;
+                },
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!((polls, sleeps), (7, 6));
+
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let mut polls = 0;
+        let mut sleeps = 0;
+        assert!(
+            wait_for_automatic_convergence(
+                || {
+                    polls += 1;
+                    Ok(None)
+                },
+                || elapsed.get(),
+                |_| {
+                    sleeps += 1;
+                    elapsed.set(AUTOMATIC_START_TIMEOUT);
+                },
+            )
+            .unwrap_err()
+            .contains("timed out")
+        );
+        assert_eq!((polls, sleeps), (2, 1));
+
+        for error in [
+            AutomaticConvergenceError::CollectorExited,
+            AutomaticConvergenceError::CollectorInspect,
+        ] {
+            let mut polls = 0;
+            let mut sleeps = 0;
+            assert!(
+                wait_for_automatic_convergence(
+                    || {
+                        polls += 1;
+                        Err(error)
+                    },
+                    || Duration::ZERO,
+                    |_| sleeps += 1,
+                )
+                .is_err()
+            );
+            assert_eq!((polls, sleeps), (1, 0));
+        }
+    }
+
+    #[test]
+    fn automatic_snapshot_fatal_after_transients_never_sleeps_again() {
+        let mut outcomes = [
+            Err(AutomaticConvergenceError::Retry),
+            Err(AutomaticConvergenceError::Retry),
+            Err(AutomaticConvergenceError::Fatal(
+                PublishedSnapshotStage::Validation,
+            )),
+        ]
+        .into_iter();
+        let mut polls = 0;
+        let mut sleeps = 0;
+        assert_eq!(
+            wait_for_automatic_convergence(
+                || {
+                    polls += 1;
+                    outcomes.next().expect("must stop on fatal")
+                },
+                || Duration::ZERO,
+                |_| sleeps += 1,
+            )
+            .unwrap_err(),
+            "published_snapshot_validation_failed"
+        );
+        assert_eq!((polls, sleeps), (3, 2));
+    }
+
+    #[test]
+    fn automatic_snapshot_real_store_parity_contention_and_corruption() {
+        use agent_observability_local_store::{
+            MISSING_RATE_FINGERPRINT, build_report_view_staging, publish_report_view,
+        };
+        let root = env::temp_dir().join(format!(
+            "xtask-snapshot-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _cleanup = DirectoryCleanup::new(root.clone(), "snapshot test fixture");
+        let mut store = LocalStore::open(&root).unwrap();
+        store
+            .ingest(&observation("codex|0", &BTreeMap::new()).unwrap())
+            .unwrap();
+        assert_eq!(
+            automatic_published_snapshot_convergence(&store).unwrap(),
+            None
+        );
+        let staging =
+            build_report_view_staging(&store, MISSING_RATE_FINGERPRINT, 16 * 1024 * 1024, None)
+                .unwrap();
+        let publication = publish_report_view(&store, staging).unwrap();
+        store
+            .acknowledge_report_generation(publication.current().generation())
+            .unwrap();
+        let mut guard = Some(store.acquire_report_render_guard().unwrap());
+        assert_eq!(
+            automatic_published_snapshot_convergence(&store),
+            Err(AutomaticConvergenceError::Retry)
+        );
+        // Publication is queried through the same bounded retry contract as production.
+        // Force one real contention result, then release the guard on the first retry.
+        // An unreleased guard still fails at the existing deadline; fatal errors never retry.
+        let started = Instant::now();
+        let mut retries = 0;
+        let convergence = wait_for_automatic_convergence(
+            || automatic_published_snapshot_convergence(&store),
+            || started.elapsed(),
+            |duration| {
+                retries += 1;
+                drop(guard.take());
+                sleep(duration);
+            },
+        );
+        assert_eq!(
+            convergence.unwrap(),
+            ReportConvergence {
+                generation: publication.current().generation(),
+                records: 1,
+            },
+        );
+        assert!(retries >= 1);
+        assert!(guard.is_none());
+
+        // A real SQLite query error retains its type until the static validation boundary.
+        let sql_error =
+            with_report_view_snapshot(&store, publication.current().view_id(), |connection, _| {
+                connection.execute_batch("SELECT * FROM AUTOMATIC_RAW_PROMPT_SENTINEL")?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(
+            automatic_catalog_read_error(sql_error, PublishedSnapshotStage::Validation),
+            AutomaticConvergenceError::Fatal(PublishedSnapshotStage::Validation)
+        );
+
+        let views = root.join("report-views.v1");
+        let snapshot = fs::read_dir(&views)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "sqlite3")
+            })
+            .unwrap();
+        fs::write(&snapshot, b"AUTOMATIC_RAW_PROMPT_SENTINEL not a database").unwrap();
+        let started = Instant::now();
+        let mut polls = 0;
+        let mut sleeps = 0;
+        assert_eq!(
+            wait_for_automatic_convergence(
+                || {
+                    polls += 1;
+                    automatic_published_snapshot_convergence(&store)
+                },
+                || started.elapsed(),
+                |duration| {
+                    sleeps += 1;
+                    sleep(duration);
+                },
+            )
+            .unwrap_err(),
+            "published_snapshot_validation_failed"
+        );
+        // Real filesystem locks may transiently retry before validation is reached.
+        // The injected test above separately proves immediate termination on fatal.
+        assert!(polls > 0);
+        assert_eq!(polls, sleeps + 1);
+    }
+
+    #[test]
+    fn automatic_snapshot_real_catalog_corruption_reaches_fatal() {
+        use agent_observability_local_store::{
+            MISSING_RATE_FINGERPRINT, build_report_view_staging, publish_report_view,
+        };
+        let root = env::temp_dir().join(format!(
+            "xtask-catalog-corruption-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _cleanup = DirectoryCleanup::new(root.clone(), "catalog corruption test fixture");
+        let mut store = LocalStore::open(&root).unwrap();
+        store
+            .ingest(&observation("codex|0", &BTreeMap::new()).unwrap())
+            .unwrap();
+        let staging =
+            build_report_view_staging(&store, MISSING_RATE_FINGERPRINT, 16 * 1024 * 1024, None)
+                .unwrap();
+        let publication = publish_report_view(&store, staging).unwrap();
+        store
+            .acknowledge_report_generation(publication.current().generation())
+            .unwrap();
+        drop(publication);
+
+        fs::write(
+            root.join("report-views.v1/catalog.json"),
+            b"/tmp/AUTOMATIC_RAW_PROMPT_SENTINEL SELECT * FROM secrets",
+        )
+        .unwrap();
+        let started = Instant::now();
+        let mut polls = 0;
+        let mut sleeps = 0;
+        assert_eq!(
+            wait_for_automatic_convergence(
+                || {
+                    polls += 1;
+                    automatic_published_snapshot_convergence(&store)
+                },
+                || started.elapsed(),
+                |duration| {
+                    sleeps += 1;
+                    sleep(duration);
+                },
+            )
+            .unwrap_err(),
+            PublishedSnapshotStage::Catalog.code()
+        );
+        assert!(polls > 0);
+        assert_eq!(polls, sleeps + 1);
+    }
+
+    #[test]
     fn automatic_report_convergence_is_fail_closed() {
         let mut result = automatic_result(1, vec![1; 100]);
         result.report_converged = false;
@@ -6960,6 +8069,57 @@ mod tests {
             validate_single_automatic(result)
                 .unwrap_err()
                 .contains("report convergence")
+        );
+    }
+
+    #[test]
+    fn automatic_published_snapshot_convergence_requires_current_exact_parity() {
+        let valid = AutomaticPublishedSnapshotEvidence {
+            source_generation: 7,
+            acknowledged_generation: 7,
+            source_visibility_epoch: 3,
+            authoritative_records: 51,
+            snapshot_generation: 7,
+            snapshot_visibility_epoch: 3,
+            snapshot_records: 51,
+            indexed_records: 51,
+            current_consistent: true,
+        };
+
+        for invalid in [
+            AutomaticPublishedSnapshotEvidence {
+                acknowledged_generation: 6,
+                ..valid
+            },
+            AutomaticPublishedSnapshotEvidence {
+                snapshot_generation: 6,
+                ..valid
+            },
+            AutomaticPublishedSnapshotEvidence {
+                snapshot_visibility_epoch: 2,
+                ..valid
+            },
+            AutomaticPublishedSnapshotEvidence {
+                snapshot_records: 50,
+                ..valid
+            },
+            AutomaticPublishedSnapshotEvidence {
+                indexed_records: 50,
+                ..valid
+            },
+            AutomaticPublishedSnapshotEvidence {
+                current_consistent: false,
+                ..valid
+            },
+        ] {
+            assert_eq!(validate_automatic_published_snapshot(invalid), None);
+        }
+        assert_eq!(
+            validate_automatic_published_snapshot(valid),
+            Some(ReportConvergence {
+                generation: 7,
+                records: 51,
+            })
         );
     }
 
@@ -6972,6 +8132,46 @@ mod tests {
                 .unwrap_err()
                 .contains("non-finite or negative")
         );
+    }
+
+    #[test]
+    fn preserved_smoke_evidence_never_claims_release_readiness() {
+        let mut config = automatic_config();
+        config.profile = Profile::Smoke;
+        config.runs = 1;
+        let results = vec![automatic_result(1, vec![1; 100])];
+        for status in ["pass", "pending-validation", "failed"] {
+            let manifest = render_automatic_manifest(
+                config,
+                &host(),
+                "0123456789abcdef0123456789abcdef01234567",
+                &results,
+                &[],
+                status,
+            );
+            assert!(manifest.contains("release_readiness: not_verified"));
+            validate_automatic_manifest_shape(&manifest).unwrap();
+            assert!(
+                validate_automatic_manifest_shape(&manifest.replace(
+                    "release_readiness: not_verified",
+                    "release_readiness: verified"
+                ))
+                .is_err()
+            );
+        }
+        let failed = render_automatic_outcome(
+            config,
+            &host(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &results,
+            &["cleanup: injected failure".into()],
+            true,
+            false,
+        );
+        assert!(failed.contains("status: failed\n"));
+        assert!(failed.contains("release_readiness: not_verified"));
+        assert!(failed.contains("code=cleanup_failed"));
+        validate_automatic_manifest_shape(&failed).unwrap();
     }
 
     #[test]
@@ -7222,6 +8422,37 @@ mod tests {
     }
 
     #[test]
+    fn automatic_snapshot_failures_use_exact_content_free_stage_codes() {
+        for stage in [
+            "published_snapshot_open_failed",
+            "published_snapshot_authority_failed",
+            "published_snapshot_catalog_failed",
+            "published_snapshot_validation_failed",
+        ] {
+            let error = format!("run 1: {stage}");
+            let expected = format!("code={stage}");
+            assert_eq!(automatic_evidence_error_code(&error), expected);
+            let manifest = render_automatic_manifest(
+                automatic_config(),
+                &host(),
+                &"a".repeat(40),
+                &[],
+                &[error],
+                "failed",
+            );
+            assert!(manifest.contains(&format!("  - '{expected}'")));
+            validate_automatic_manifest_shape(&manifest).unwrap();
+            validate_automatic_manifest_privacy(&manifest).unwrap();
+            let private =
+                format!("run 1: {stage}: /tmp/AUTOMATIC_RAW_PROMPT_SENTINEL SELECT * FROM secrets");
+            assert_eq!(
+                automatic_evidence_error_code(&private),
+                "code=benchmark_run_failed"
+            );
+        }
+    }
+
+    #[test]
     fn automatic_lifecycle_failures_use_content_free_stage_codes() {
         for (error, code) in [
             (
@@ -7240,10 +8471,473 @@ mod tests {
                 "lifecycle preflight: automatic lifecycle setup stage failed",
                 "code=lifecycle_setup_failed",
             ),
+            (
+                "lifecycle preflight: automatic lifecycle setup command failed",
+                "code=lifecycle_setup_command_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle setup status assertion failed",
+                "code=lifecycle_setup_status_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle setup config assertion failed",
+                "code=lifecycle_setup_config_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle setup collector assertion failed",
+                "code=lifecycle_setup_collector_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle ownership rebase command failed",
+                "code=lifecycle_ownership_rebase_command_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle ownership rebase command preparation busy",
+                "code=lifecycle_ownership_rebase_command_preparation_busy",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle ownership rebase command snapshot recovery failed",
+                "code=lifecycle_ownership_rebase_command_snapshot_recovery_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle ownership rebase config assertion failed",
+                "code=lifecycle_ownership_rebase_config_failed",
+            ),
+            (
+                "lifecycle preflight: automatic lifecycle ownership rebase collector assertion failed",
+                "code=lifecycle_ownership_rebase_collector_failed",
+            ),
         ] {
             assert_eq!(automatic_evidence_error_code(error), code);
             assert!(!code.contains("private"));
+            let manifest = render_automatic_manifest(
+                automatic_config(),
+                &host(),
+                &"a".repeat(40),
+                &[],
+                &[error.into()],
+                "failed",
+            );
+            assert!(manifest.contains(&format!("  - '{code}'")));
+            validate_automatic_manifest_shape(&manifest).unwrap();
+            validate_automatic_manifest_privacy(&manifest).unwrap();
         }
+    }
+
+    #[test]
+    fn recovery_snapshot_diagnostics_preserve_only_closed_failure_categories() {
+        let cases = [
+            (
+                "built product command failed: exit status: 1: storage accounting barrier is busy",
+                "code=lifecycle_recovery_snapshot_busy",
+            ),
+            (
+                "built product command failed: exit status: 1: singleton coherence error: storage accounting barrier is busy",
+                "code=lifecycle_recovery_snapshot_busy",
+            ),
+            (
+                "built product command failed: exit status: 1: local runtime is already running",
+                "code=lifecycle_recovery_snapshot_busy",
+            ),
+            (
+                "built product command failed: exit status: 1: local store open is busy",
+                "code=lifecycle_recovery_snapshot_busy",
+            ),
+            (
+                "wait for built product command: worker exit timed out after 30000 ms",
+                "code=lifecycle_recovery_snapshot_timeout",
+            ),
+            (
+                "built product command failed: exit status: 1: local store database failure",
+                "code=lifecycle_recovery_snapshot_store_failed",
+            ),
+            (
+                "automatic lifecycle report omitted records",
+                "code=lifecycle_recovery_snapshot_output_failed",
+            ),
+            (
+                "automatic lifecycle report returned invalid records",
+                "code=lifecycle_recovery_snapshot_output_failed",
+            ),
+            (
+                "/private/tmp/AUTOMATIC_RAW_PROMPT_SENTINEL token private-key.pem",
+                "code=lifecycle_recovery_snapshot_failed",
+            ),
+            (
+                "private prefix: storage accounting barrier is busy",
+                "code=lifecycle_recovery_snapshot_failed",
+            ),
+        ];
+        for (private, expected) in cases {
+            let safe = automatic_recovery_snapshot_error(private);
+            for suffix in ["", "; cleanup failed: PRIVATE_CLEANUP_SENTINEL"] {
+                assert_eq!(
+                    automatic_evidence_error_code(&format!("lifecycle preflight: {safe}{suffix}")),
+                    expected
+                );
+            }
+            assert!(!safe.contains("SENTINEL"));
+            validate_automatic_manifest_privacy(&format!("errors:\n  - '{expected}'\n")).unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_connect_outcomes_keep_contract_and_identify_exact_busy_failures() {
+        use std::os::unix::process::ExitStatusExt;
+        let outcome = |success, stdout: &str, stderr: &str| AutomaticConnectOutput {
+            status: ExitStatus::from_raw(if success { 0 } else { 256 }),
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+        };
+        let ready = "integration=codex\nconfig=connected\ncollector=ready";
+        let degraded = "integration=codex\nconfig=connected\ncollector=degraded";
+        let lifecycle_busy =
+            "Codex integration lifecycle is busy: local runtime is already running";
+        for pair in [
+            [outcome(true, ready, ""), outcome(true, degraded, "")],
+            [outcome(true, ready, ""), outcome(false, "", lifecycle_busy)],
+            [
+                outcome(false, "", lifecycle_busy),
+                outcome(true, degraded, ""),
+            ],
+        ] {
+            assert!(validate_automatic_connect_outcomes(&pair).is_ok());
+        }
+        for (stderr, expected) in [
+            (
+                "Codex configuration ownership conflict",
+                "code=lifecycle_concurrent_connect_config_conflict",
+            ),
+            (
+                "local store open is busy",
+                "code=lifecycle_concurrent_connect_store_busy",
+            ),
+            (
+                "singleton coherence error: storage accounting barrier is busy",
+                "code=lifecycle_concurrent_connect_storage_busy",
+            ),
+            (
+                "storage accounting barrier is busy",
+                "code=lifecycle_concurrent_connect_storage_busy",
+            ),
+            (
+                "local runtime is already running",
+                "code=lifecycle_concurrent_connect_runtime_busy",
+            ),
+            (
+                "/private/RAW_SENTINEL token=SECRET",
+                "code=lifecycle_concurrent_connect_outcome_failed",
+            ),
+            (
+                "storage accounting barrier is busy RAW_SENTINEL",
+                "code=lifecycle_concurrent_connect_outcome_failed",
+            ),
+        ] {
+            let error = validate_automatic_connect_outcomes(&[
+                outcome(true, ready, ""),
+                outcome(false, "", stderr),
+            ])
+            .unwrap_err();
+            assert_eq!(
+                automatic_evidence_error_code(&format!("lifecycle preflight: {error}")),
+                expected
+            );
+            assert!(!error.contains("RAW_SENTINEL"));
+            validate_automatic_manifest_privacy(&format!("errors:\n  - '{expected}'\n")).unwrap();
+        }
+        let both_busy = validate_automatic_connect_outcomes(&[
+            outcome(false, "", lifecycle_busy),
+            outcome(false, "", lifecycle_busy),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            automatic_evidence_error_code(&format!("lifecycle preflight: {both_busy}")),
+            "code=lifecycle_concurrent_connect_both_busy"
+        );
+        for invalid in [
+            "integration=other\nconfig=connected\ncollector=ready",
+            "integration=codex\nconfig=conflict\ncollector=ready",
+            "integration=codex\nconfig=connected\ncollector=unavailable",
+        ] {
+            let error = validate_automatic_connect_outcomes(&[
+                outcome(true, ready, ""),
+                outcome(true, invalid, "RAW_SENTINEL"),
+            ])
+            .unwrap_err();
+            assert_eq!(
+                automatic_evidence_error_code(&format!("lifecycle preflight: {error}")),
+                "code=lifecycle_concurrent_connect_success_output_failed"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_connect_diagnostics_preserve_only_known_substages() {
+        for (stage, code) in [
+            ("capture", "capture"),
+            ("spawn", "spawn"),
+            ("wait", "wait"),
+            ("output", "output"),
+            ("outcome", "outcome"),
+            ("status", "status"),
+            ("ownership", "ownership"),
+        ] {
+            let failure = format!("automatic lifecycle stage concurrent connect {stage} failed");
+            let expected = format!("code=lifecycle_concurrent_connect_{code}_failed");
+            let stage = AutomaticLifecycleStage::from_failure(&failure).unwrap();
+            assert_eq!(
+                automatic_lifecycle_stage(
+                    stage,
+                    Err::<(), _>("/private/RAW_SENTINEL token=SECRET".to_owned())
+                ),
+                Err(failure.clone()),
+            );
+            assert_eq!(automatic_lifecycle_stage(stage, Ok::<_, String>(7)), Ok(7));
+            for suffix in ["", "; cleanup failed: /private/RAW_SENTINEL token=SECRET"] {
+                assert_eq!(
+                    automatic_evidence_error_code(&format!(
+                        "lifecycle preflight: {failure}{suffix}"
+                    )),
+                    expected,
+                );
+            }
+            validate_automatic_manifest_privacy(&format!("errors:\n  - '{expected}'\n")).unwrap();
+            assert_ne!(
+                automatic_evidence_error_code(&format!(
+                    "lifecycle preflight: {failure}: RAW_SENTINEL"
+                )),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_connect_wait_and_output_failures_keep_distinct_private_categories() {
+        let mut waiting = ChildGuard(
+            Command::new("/bin/sleep")
+                .arg("5")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(
+            collect_automatic_connect_output(&mut waiting, Duration::ZERO).unwrap_err(),
+            AutomaticLifecycleStage::ConcurrentConnectWait.failure()
+        );
+        assert!(waiting.try_wait().unwrap().is_some());
+
+        let mut no_output = ChildGuard(
+            Command::new("/bin/echo")
+                .arg("RAW_SENTINEL")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(
+            collect_automatic_connect_output(&mut no_output, LOCAL_COMMAND_TIMEOUT).unwrap_err(),
+            AutomaticLifecycleStage::ConcurrentConnectOutput.failure()
+        );
+    }
+
+    #[test]
+    fn automatic_lifecycle_stage_diagnostics_are_specific_private_and_not_verified() {
+        assert_eq!(
+            automatic_lifecycle_stage(AutomaticLifecycleStage::Status, Ok::<_, String>(7)),
+            Ok(7)
+        );
+        let private = Err::<(), _>(
+            "/private/tmp/AUTOMATIC_RAW_PROMPT_SENTINEL token private-key.pem".to_owned(),
+        );
+        for (stage, code) in [
+            (
+                AutomaticLifecycleStage::Plist,
+                "code=lifecycle_plist_failed",
+            ),
+            (
+                AutomaticLifecycleStage::Status,
+                "code=lifecycle_status_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PreFailureOtlp,
+                "code=lifecycle_pre_failure_otlp_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PreFailureNotify,
+                "code=lifecycle_pre_failure_notify_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PreFailurePrivacy,
+                "code=lifecycle_pre_failure_privacy_failed",
+            ),
+            (AutomaticLifecycleStage::Kill, "code=lifecycle_kill_failed"),
+            (
+                AutomaticLifecycleStage::RecoveryWait,
+                "code=lifecycle_recovery_wait_failed",
+            ),
+            (
+                AutomaticLifecycleStage::RecoverySnapshot,
+                "code=lifecycle_recovery_snapshot_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PostRecoveryOtlp,
+                "code=lifecycle_post_recovery_otlp_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PostRecoveryOtlpSubmit,
+                "code=lifecycle_post_recovery_otlp_submit_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PostRecoveryOtlpGrowth,
+                "code=lifecycle_post_recovery_otlp_growth_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PostRecoveryNotify,
+                "code=lifecycle_post_recovery_notify_failed",
+            ),
+            (
+                AutomaticLifecycleStage::PostRecoveryPrivacy,
+                "code=lifecycle_post_recovery_privacy_failed",
+            ),
+            (
+                AutomaticLifecycleStage::Reconnect,
+                "code=lifecycle_reconnect_stage_failed",
+            ),
+            (
+                AutomaticLifecycleStage::ConcurrentConnect,
+                "code=lifecycle_concurrent_connect_failed",
+            ),
+            (
+                AutomaticLifecycleStage::Disconnect,
+                "code=lifecycle_disconnect_stage_failed",
+            ),
+            (
+                AutomaticLifecycleStage::Restore,
+                "code=lifecycle_restore_failed",
+            ),
+            (
+                AutomaticLifecycleStage::InheritedPlist,
+                "code=lifecycle_inherited_plist_failed",
+            ),
+        ] {
+            let error = automatic_lifecycle_stage(stage, private.clone()).unwrap_err();
+            assert_eq!(
+                automatic_evidence_error_code(&format!("lifecycle preflight: {error}")),
+                code
+            );
+            let manifest = render_automatic_manifest(
+                automatic_config(),
+                &host(),
+                &"a".repeat(40),
+                &[],
+                &[format!("lifecycle preflight: {error}")],
+                "failed",
+            );
+            assert!(manifest.contains("status: failed"));
+            assert!(manifest.contains("release_readiness: not_verified"));
+            assert!(manifest.contains(&format!("  - '{code}'")));
+            assert!(!manifest.contains("/private/tmp"));
+            assert!(!manifest.contains("AUTOMATIC_RAW_PROMPT_SENTINEL"));
+            assert!(!manifest.contains("private-key.pem"));
+            validate_automatic_manifest_shape(&manifest).unwrap();
+            validate_automatic_manifest_privacy(&manifest).unwrap();
+        }
+    }
+
+    #[test]
+    fn lifecycle_stage_survives_private_cleanup_failure_without_prefix_guessing() {
+        for stage in AutomaticLifecycleStage::ALL {
+            let error = combine_cleanup(
+                Err(stage.failure().into()),
+                Err("/private/AUTOMATIC_RAW_PROMPT_SENTINEL credential".into()),
+            )
+            .unwrap_err();
+            let evidence_error = format!("lifecycle preflight: {error}");
+            assert_eq!(automatic_evidence_error_code(&evidence_error), stage.code());
+            let manifest = render_automatic_manifest(
+                automatic_config(),
+                &host(),
+                &"a".repeat(40),
+                &[],
+                &[evidence_error],
+                "failed",
+            );
+            assert!(manifest.contains("status: failed"));
+            assert!(manifest.contains("release_readiness: not_verified"));
+            assert!(!manifest.contains("AUTOMATIC_RAW_PROMPT_SENTINEL"));
+            assert!(!manifest.contains("/private"));
+            validate_automatic_manifest_shape(&manifest).unwrap();
+            validate_automatic_manifest_privacy(&manifest).unwrap();
+            for suffix in [" extra", "; cleanup", "; cleanup failed", "-other"] {
+                assert!(
+                    AutomaticLifecycleStage::from_failure(&format!("{}{suffix}", stage.failure()))
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_setup_diagnostics_are_specific_and_content_free() {
+        let private = "/Users/private token AUTOMATIC_RAW_PROMPT_SENTINEL";
+        let cases = [
+            (
+                Err(private.into()),
+                "automatic lifecycle setup command failed",
+            ),
+            (
+                Ok("config=connected\ncollector=ready\n".into()),
+                "automatic lifecycle setup status assertion failed",
+            ),
+            (
+                Ok("status=ready\nconfig=conflict\ncollector=ready\n".into()),
+                "automatic lifecycle setup config assertion failed",
+            ),
+            (
+                Ok("status=ready\nconfig=connected\ncollector=unavailable\n".into()),
+                "automatic lifecycle setup collector assertion failed",
+            ),
+        ];
+
+        for (result, expected) in cases {
+            let error = require_automatic_setup_output(result).unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!error.contains("private"));
+            assert!(!error.contains("token"));
+            assert!(!error.contains("AUTOMATIC_RAW_PROMPT_SENTINEL"));
+        }
+        assert_eq!(
+            require_automatic_setup_output(Ok(
+                "status=ready\nconfig=connected\ncollector=degraded\n".into()
+            ))
+            .unwrap(),
+            "status=ready\nconfig=connected\ncollector=degraded\n"
+        );
+    }
+
+    #[test]
+    fn automatic_ownership_rebase_command_diagnostics_allow_only_exact_safe_stages() {
+        for (raw, expected) in [
+            (
+                "built product command failed: exit status: 1: dashboard snapshot preparation is busy; retry setup shortly",
+                "automatic lifecycle ownership rebase command preparation busy",
+            ),
+            (
+                "built product command failed: exit status: 1: dashboard snapshot recovery failed",
+                "automatic lifecycle ownership rebase command snapshot recovery failed",
+            ),
+        ] {
+            assert_eq!(automatic_ownership_rebase_command_error(raw), expected);
+        }
+
+        let private = "built product command failed: exit status: 1: dashboard snapshot recovery failed\n/private/tmp/AUTOMATIC_RAW_PROMPT_SENTINEL";
+        let error = automatic_ownership_rebase_command_error(private);
+        assert_eq!(error, "automatic lifecycle ownership rebase command failed");
+        assert!(!error.contains("/private/tmp"));
+        assert!(!error.contains("AUTOMATIC_RAW_PROMPT_SENTINEL"));
     }
 
     #[test]
@@ -7294,6 +8988,14 @@ mod tests {
 
         assert!(root.is_dir());
         fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn automatic_smoke_evidence_preservation_requires_explicit_one() {
+        assert!(preserve_automatic_smoke_evidence(Some("1")));
+        assert!(!preserve_automatic_smoke_evidence(None));
+        assert!(!preserve_automatic_smoke_evidence(Some("0")));
+        assert!(!preserve_automatic_smoke_evidence(Some("true")));
     }
 
     #[test]
@@ -7353,6 +9055,10 @@ mod tests {
             "automatic lifecycle Codex config stage failed",
             "automatic lifecycle real Codex stage failed",
             "automatic lifecycle setup stage failed",
+            "automatic lifecycle setup command failed",
+            "automatic lifecycle setup status assertion failed",
+            "automatic lifecycle setup config assertion failed",
+            "automatic lifecycle setup collector assertion failed",
         ] {
             let manifest = render_automatic_manifest(
                 automatic_config(),
@@ -7656,6 +9362,8 @@ mod tests {
                 .contains("protocol_revision: v1.2.0-supported-rate-saturation-continuous-network")
         );
         assert!(manifest.contains("source_revision: 0123456789abcdef0123456789abcdef01234567"));
+        assert!(manifest.contains(&format!("  runtime_config: {LOCAL_RUNTIME_CONFIG_VERSION}")));
+        assert!(manifest.contains(&format!("  durable_store: {LOCAL_STORE_SCHEMA_VERSION}")));
         assert!(manifest.contains("supported_inter_event_ms: 3"));
         assert!(manifest.contains(
             "supported_rate_measurement_boundary: first-command-through-barrier-completion"

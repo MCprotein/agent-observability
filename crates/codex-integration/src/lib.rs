@@ -1,19 +1,36 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
+pub mod storage_accounting;
+#[cfg(target_os = "macos")]
+mod storage_ownership;
+
+#[cfg(target_os = "macos")]
+pub use storage_ownership::{
+    LaunchAgentStorageOwnershipError, LaunchAgentStorageOwnershipEvidence,
+};
+
 use agent_observability_codex_config::{
     CodexConfigManager, ConfigError, ConnectionStatus as ConfigConnectionStatus, ExporterSecurity,
     NotifyOwnership,
 };
+use agent_observability_contracts::CODEX_INTEGRATION_STATUS_VERSION;
+pub use agent_observability_contracts::{
+    CodexConnectionStatusV1 as ConnectionStatus,
+    CodexIntegrationStatusV1 as CodexIntegrationStatus, CodexNotifyStatusV1 as NotifyStatus,
+    CollectorStatusV1 as CollectorStatus,
+};
 use agent_observability_local_collector::{
-    CollectorError, CollectorSettings, HealthOutcome, check_health, commit_settings_migration,
-    install_settings, load_settings, recover_occupied_persisted_port, rollback_settings_migration,
-    settings_migration_pending,
+    CollectorError, CollectorSettings, HealthOutcome, check_health, check_health_details,
+    commit_settings_migration, install_settings_waiting_for_root, load_settings,
+    recover_occupied_persisted_port, rollback_settings_migration, settings_migration_pending,
+};
+use agent_observability_local_runtime::storage_coherence::{
+    StorageBarrier, StorageCoherenceError, StorageMutationWriter,
 };
 use agent_observability_local_runtime::{InstalledLayout, MutationGuard, install};
 #[cfg(target_os = "macos")]
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     env, fmt, fs,
@@ -40,29 +57,6 @@ const MAX_LAUNCH_AGENT_OWNERSHIP_BYTES: u64 = MAX_LAUNCH_AGENT_PLIST_BYTES * 12 
 const MACOS_O_NOFOLLOW: i32 = 0x0000_0100;
 #[cfg(target_os = "macos")]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum ConnectionStatus {
-    Connected,
-    Disconnected,
-    Conflict,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum CollectorStatus {
-    Ready,
-    Degraded,
-    Unavailable,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum NotifyStatus {
-    AgentobsOwned,
-    ExternalPreserved,
-}
 
 /// Reports whether a local Codex installation is available for automatic setup.
 ///
@@ -96,22 +90,37 @@ enum LaunchAgentOwnershipStatus {
     Conflict,
 }
 
-#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
-pub struct CodexIntegrationStatus {
-    pub config: ConnectionStatus,
-    pub notify: Option<NotifyStatus>,
-    pub collector: CollectorStatus,
-    pub endpoint: Option<String>,
-    pub service: Option<String>,
-    pub data_retained: bool,
-}
-
 #[derive(Debug)]
 pub enum IntegrationError {
     Collector(CollectorError),
     Config(ConfigError),
     Io(std::io::Error),
     Runtime(String),
+    Storage(StorageCoherenceError),
+    // Completion refers to this file-writing scope, not the entire integration lifecycle.
+    StorageWriteUnverified {
+        operation_completed: bool,
+        primary: Option<Box<IntegrationError>>,
+        verification: StorageCoherenceError,
+    },
+    RecoveryFailed {
+        primary: Box<IntegrationError>,
+        recovery: Box<IntegrationError>,
+    },
+    ConnectCommittedSettingsFinalizationUnverified {
+        finalization: CollectorError,
+    },
+    DisconnectCommittedSettingsFinalizationUnverified {
+        finalization: CollectorError,
+    },
+    SettingsRollbackFailed {
+        primary: Box<IntegrationError>,
+        rollback: CollectorError,
+    },
+    SettingsRollbackUnverified {
+        primary: Box<IntegrationError>,
+        rollback: CollectorError,
+    },
 }
 
 impl fmt::Display for IntegrationError {
@@ -121,6 +130,39 @@ impl fmt::Display for IntegrationError {
             Self::Config(error) => error.fmt(formatter),
             Self::Io(error) => error.fmt(formatter),
             Self::Runtime(message) => formatter.write_str(message),
+            Self::Storage(error) => error.fmt(formatter),
+            Self::StorageWriteUnverified {
+                operation_completed,
+                ..
+            } => write!(
+                formatter,
+                "integration storage write unverified (operation completed: {operation_completed}); fresh guarded recovery required"
+            ),
+            Self::RecoveryFailed { primary, recovery } => {
+                if is_storage_write_unverified(recovery) {
+                    write!(
+                        formatter,
+                        "{primary}; recovery final state unverified: {recovery}"
+                    )
+                } else {
+                    write!(formatter, "{primary}; rollback failed: {recovery}")
+                }
+            }
+            Self::ConnectCommittedSettingsFinalizationUnverified { finalization } => write!(
+                formatter,
+                "Codex integration connect committed; settings finalization unverified: {finalization}"
+            ),
+            Self::DisconnectCommittedSettingsFinalizationUnverified { finalization } => write!(
+                formatter,
+                "Codex integration disconnect committed; settings finalization unverified: {finalization}"
+            ),
+            Self::SettingsRollbackFailed { primary, rollback } => {
+                write!(formatter, "{primary}; settings rollback failed: {rollback}")
+            }
+            Self::SettingsRollbackUnverified { primary, rollback } => write!(
+                formatter,
+                "{primary}; settings rollback final state unverified: {rollback}"
+            ),
         }
     }
 }
@@ -132,6 +174,22 @@ impl std::error::Error for IntegrationError {
             Self::Config(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::Runtime(_) => None,
+            Self::Storage(error) => Some(error),
+            Self::StorageWriteUnverified {
+                primary,
+                verification,
+                ..
+            } => primary
+                .as_deref()
+                .map(|error| error as &(dyn std::error::Error + 'static))
+                .or(Some(verification)),
+            Self::RecoveryFailed { primary, .. } => Some(primary.as_ref()),
+            Self::ConnectCommittedSettingsFinalizationUnverified { finalization }
+            | Self::DisconnectCommittedSettingsFinalizationUnverified { finalization } => {
+                Some(finalization)
+            }
+            Self::SettingsRollbackFailed { rollback, .. }
+            | Self::SettingsRollbackUnverified { rollback, .. } => Some(rollback),
         }
     }
 }
@@ -158,7 +216,7 @@ pub fn connect(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus,
     let layout = install(root).map_err(runtime_error)?;
     with_lifecycle_lock(&layout, || {
         let result = (|| {
-            let settings = install_settings(&layout.root)?;
+            let settings = install_settings_waiting_for_root(&layout.root)?;
             let (_, restart) = recover_connect_settings(&layout.root, &settings)
                 .map_err(|error| rollback_migration_without_service(&layout.root, error))?;
             connect_with_reloaded_settings(
@@ -178,9 +236,19 @@ fn finish_settings_migration(
     root: &Path,
     result: Result<CodexIntegrationStatus, IntegrationError>,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
+    finish_settings_migration_with(root, result, commit_settings_migration)
+}
+
+fn finish_settings_migration_with(
+    root: &Path,
+    result: Result<CodexIntegrationStatus, IntegrationError>,
+    finalize: impl FnOnce(&Path) -> Result<(), CollectorError>,
+) -> Result<CodexIntegrationStatus, IntegrationError> {
     match result {
         Ok(status) => {
-            commit_settings_migration(root)?;
+            finalize(root).map_err(|finalization| {
+                IntegrationError::ConnectCommittedSettingsFinalizationUnverified { finalization }
+            })?;
             Ok(status)
         }
         Err(error) => Err(error),
@@ -244,7 +312,7 @@ fn connect_with_reloaded_settings<C: ConfigLifecycle>(
     let manager = config_from_settings(&settings)
         .map_err(|error| rollback_migration_install(root, lifecycle, &service, error))?;
     let (config, notify) = match manager.connect() {
-        Ok((config, notify)) => (config.into(), notify.map(Into::into)),
+        Ok((config, notify)) => (connection_status(config), notify.map(notify_status)),
         Err(error) => {
             return Err(recover_failed_config_connect(
                 root, &manager, lifecycle, &service, error,
@@ -253,6 +321,8 @@ fn connect_with_reloaded_settings<C: ConfigLifecycle>(
     };
     lifecycle.commit_install(&service)?;
     Ok(CodexIntegrationStatus {
+        schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+        collector_degradation_reasons: Vec::new(),
         config,
         notify,
         collector,
@@ -275,11 +345,13 @@ fn connect_prepared(
         .wait_until_ready(root)
         .map_err(|error| rollback_install(lifecycle, &service, error))?;
     let (config_status, notify) = match config.connect() {
-        Ok((status, notify)) => (status.into(), notify.map(Into::into)),
+        Ok((status, notify)) => (connection_status(status), notify.map(notify_status)),
         Err(error) => return Err(rollback_install(lifecycle, &service, error)),
     };
     lifecycle.commit_install(&service)?;
     Ok(CodexIntegrationStatus {
+        schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+        collector_degradation_reasons: Vec::new(),
         config: config_status,
         notify,
         collector,
@@ -315,9 +387,19 @@ fn finish_disconnect_settings_migration(
     root: &Path,
     result: Result<CodexIntegrationStatus, IntegrationError>,
 ) -> Result<CodexIntegrationStatus, IntegrationError> {
+    finish_disconnect_settings_migration_with(root, result, rollback_settings_migration)
+}
+
+fn finish_disconnect_settings_migration_with(
+    root: &Path,
+    result: Result<CodexIntegrationStatus, IntegrationError>,
+    finalize: impl FnOnce(&Path) -> Result<(), CollectorError>,
+) -> Result<CodexIntegrationStatus, IntegrationError> {
     match result {
         Ok(status) => {
-            rollback_settings_migration(root)?;
+            finalize(root).map_err(|finalization| {
+                IntegrationError::DisconnectCommittedSettingsFinalizationUnverified { finalization }
+            })?;
             Ok(status)
         }
         Err(error) => Err(error),
@@ -386,6 +468,7 @@ fn disconnect_owned_prepared(
             lifecycle.commit_uninstall(&service)?;
             status
         }
+        Err(error) if is_storage_write_unverified(&error) => return Err(error),
         Err(error) => match config.status() {
             Ok(ConfigConnectionStatus::Connected) => {
                 let reinstall = lifecycle
@@ -393,20 +476,22 @@ fn disconnect_owned_prepared(
                     .and_then(|()| lifecycle.wait_until_ready(root).map(|_| ()));
                 return match reinstall {
                     Ok(()) => Err(error),
-                    Err(reinstall) => Err(rollback_error(&error, &reinstall)),
+                    Err(reinstall) => Err(rollback_error(error, reinstall)),
                 };
             }
             Ok(ConfigConnectionStatus::Disconnected | ConfigConnectionStatus::Conflict) => {
-                lifecycle
-                    .commit_uninstall(&service)
-                    .map_err(|commit| rollback_error(&error, &commit))?;
+                if let Err(commit) = lifecycle.commit_uninstall(&service) {
+                    return Err(rollback_error(error, commit));
+                }
                 return Err(error);
             }
-            Err(status_error) => return Err(rollback_error(&error, &status_error)),
+            Err(status_error) => return Err(rollback_error(error, status_error)),
         },
     };
     Ok(CodexIntegrationStatus {
-        config: status.into(),
+        schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+        collector_degradation_reasons: Vec::new(),
+        config: connection_status(status),
         notify: None,
         collector: CollectorStatus::Unavailable,
         endpoint: endpoint.map(str::to_owned),
@@ -423,6 +508,7 @@ trait ConfigLifecycle {
     fn disconnect(&self) -> Result<ConfigConnectionStatus, IntegrationError>;
 }
 
+#[cfg(test)]
 impl ConfigLifecycle for CodexConfigManager {
     fn status(&self) -> Result<ConfigConnectionStatus, IntegrationError> {
         self.status().map_err(Into::into)
@@ -441,12 +527,50 @@ impl ConfigLifecycle for CodexConfigManager {
     }
 }
 
-impl From<NotifyOwnership> for NotifyStatus {
-    fn from(ownership: NotifyOwnership) -> Self {
-        match ownership {
-            NotifyOwnership::AgentobsOwned => Self::AgentobsOwned,
-            NotifyOwnership::ExternalPreserved => Self::ExternalPreserved,
-        }
+// The root is supplied by the composition boundary, never recovered from a filename.
+struct StorageConfigManager {
+    root: PathBuf,
+    manager: CodexConfigManager,
+}
+
+impl StorageConfigManager {
+    fn ownership_status(&self) -> Result<Option<ConfigConnectionStatus>, IntegrationError> {
+        with_storage_writer(&self.root, || {
+            self.manager.ownership_status().map_err(Into::into)
+        })
+    }
+
+    fn notify_ownership(&self) -> Result<Option<NotifyOwnership>, IntegrationError> {
+        with_storage_writer(&self.root, || {
+            self.manager.notify_ownership().map_err(Into::into)
+        })
+    }
+}
+
+impl ConfigLifecycle for StorageConfigManager {
+    fn status(&self) -> Result<ConfigConnectionStatus, IntegrationError> {
+        with_storage_writer(&self.root, || self.manager.status().map_err(Into::into))
+    }
+
+    fn connect(
+        &self,
+    ) -> Result<(ConfigConnectionStatus, Option<NotifyOwnership>), IntegrationError> {
+        with_storage_writer(&self.root, || {
+            let status = self.manager.connect()?;
+            let notify = self.manager.notify_ownership()?;
+            Ok((status, notify))
+        })
+    }
+
+    fn disconnect(&self) -> Result<ConfigConnectionStatus, IntegrationError> {
+        with_storage_writer(&self.root, || self.manager.disconnect().map_err(Into::into))
+    }
+}
+
+fn notify_status(ownership: NotifyOwnership) -> NotifyStatus {
+    match ownership {
+        NotifyOwnership::AgentobsOwned => NotifyStatus::AgentobsOwned,
+        NotifyOwnership::ExternalPreserved => NotifyStatus::ExternalPreserved,
     }
 }
 
@@ -541,9 +665,12 @@ fn rollback_install(
     service: &CollectorService,
     error: IntegrationError,
 ) -> IntegrationError {
+    if is_storage_write_unverified(&error) {
+        return error;
+    }
     match lifecycle.rollback_install(service) {
         Ok(()) => error,
-        Err(rollback) => rollback_error(&error, &rollback),
+        Err(rollback) => rollback_error(error, rollback),
     }
 }
 
@@ -553,8 +680,11 @@ fn rollback_migration_install(
     service: &CollectorService,
     error: IntegrationError,
 ) -> IntegrationError {
+    if is_storage_write_unverified(&error) {
+        return error;
+    }
     if let Err(rollback) = lifecycle.rollback_install(service) {
-        return rollback_error(&error, &rollback);
+        return rollback_error(error, rollback);
     }
     rollback_migration_without_service(root, error)
 }
@@ -566,24 +696,61 @@ fn recover_failed_config_connect(
     service: &CollectorService,
     error: IntegrationError,
 ) -> IntegrationError {
+    if is_storage_write_unverified(&error) {
+        return error;
+    }
     match config.status() {
         Ok(ConfigConnectionStatus::Disconnected) => {
             rollback_migration_install(root, lifecycle, service, error)
         }
         Ok(ConfigConnectionStatus::Connected | ConfigConnectionStatus::Conflict) => error,
-        Err(status) => rollback_error(&error, &status),
+        Err(status) => rollback_error(error, status),
     }
 }
 
 fn rollback_migration_without_service(root: &Path, error: IntegrationError) -> IntegrationError {
-    match rollback_settings_migration(root) {
+    if is_storage_write_unverified(&error) {
+        return error;
+    }
+    rollback_migration_without_service_with(root, error, rollback_settings_migration)
+}
+
+fn rollback_migration_without_service_with(
+    root: &Path,
+    error: IntegrationError,
+    rollback_settings: impl FnOnce(&Path) -> Result<(), CollectorError>,
+) -> IntegrationError {
+    match rollback_settings(root) {
         Ok(()) => error,
-        Err(rollback) => rollback_error(&error, &rollback.into()),
+        Err(rollback @ CollectorError::StorageWriteUnverified { .. }) => {
+            IntegrationError::SettingsRollbackUnverified {
+                primary: Box::new(error),
+                rollback,
+            }
+        }
+        Err(rollback) => IntegrationError::SettingsRollbackFailed {
+            primary: Box::new(error),
+            rollback,
+        },
     }
 }
 
-fn rollback_error(error: &IntegrationError, rollback: &IntegrationError) -> IntegrationError {
-    IntegrationError::Runtime(format!("{error}; rollback failed: {rollback}"))
+fn is_storage_write_unverified(error: &IntegrationError) -> bool {
+    match error {
+        IntegrationError::Collector(CollectorError::StorageWriteUnverified { .. })
+        | IntegrationError::StorageWriteUnverified { .. } => true,
+        IntegrationError::RecoveryFailed { primary, recovery } => {
+            is_storage_write_unverified(primary) || is_storage_write_unverified(recovery)
+        }
+        _ => false,
+    }
+}
+
+fn rollback_error(error: IntegrationError, rollback: IntegrationError) -> IntegrationError {
+    IntegrationError::RecoveryFailed {
+        primary: Box::new(error),
+        recovery: Box::new(rollback),
+    }
 }
 
 pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, IntegrationError> {
@@ -602,7 +769,7 @@ pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, 
         let manager = codex_config_manager(&layout, executable, &settings)?;
         let config = manager.status()?;
         let notify = if config == ConfigConnectionStatus::Connected {
-            manager.notify_ownership()?.map(Into::into)
+            manager.notify_ownership()?.map(notify_status)
         } else {
             None
         };
@@ -610,10 +777,13 @@ pub fn status(root: &Path, executable: &Path) -> Result<CodexIntegrationStatus, 
         if settle_settings_migration_for_status(&layout.root, config)? {
             return status_without_settings(&layout);
         }
+        let health = check_health_details(&layout.root);
         Ok(CodexIntegrationStatus {
-            config: config.into(),
+            schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: health.degradation_reasons,
+            config: connection_status(config),
             notify,
-            collector: collector_status(check_health(&layout.root)),
+            collector: collector_status(health.outcome),
             endpoint: Some(settings.endpoint()),
             service: Some(service_label(&layout.root)),
             data_retained: true,
@@ -667,7 +837,7 @@ fn status_without_settings(
     let manager = codex_config_ownership_manager(layout)?;
     let config = manager.ownership_status()?;
     let notify = if config == Some(ConfigConnectionStatus::Connected) {
-        manager.notify_ownership()?.map(Into::into)
+        manager.notify_ownership()?.map(notify_status)
     } else {
         None
     };
@@ -694,9 +864,11 @@ fn missing_settings_status(
     {
         ConnectionStatus::Conflict
     } else {
-        config.unwrap_or(ConfigConnectionStatus::Conflict).into()
+        connection_status(config.unwrap_or(ConfigConnectionStatus::Conflict))
     };
     CodexIntegrationStatus {
+        schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+        collector_degradation_reasons: Vec::new(),
         config,
         notify,
         collector: CollectorStatus::Unavailable,
@@ -708,6 +880,8 @@ fn missing_settings_status(
 
 fn disconnected_status() -> CodexIntegrationStatus {
     CodexIntegrationStatus {
+        schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+        collector_degradation_reasons: Vec::new(),
         config: ConnectionStatus::Disconnected,
         notify: None,
         collector: CollectorStatus::Unavailable,
@@ -717,13 +891,11 @@ fn disconnected_status() -> CodexIntegrationStatus {
     }
 }
 
-impl From<ConfigConnectionStatus> for ConnectionStatus {
-    fn from(status: ConfigConnectionStatus) -> Self {
-        match status {
-            ConfigConnectionStatus::Connected => Self::Connected,
-            ConfigConnectionStatus::Disconnected => Self::Disconnected,
-            ConfigConnectionStatus::Conflict => Self::Conflict,
-        }
+fn connection_status(status: ConfigConnectionStatus) -> ConnectionStatus {
+    match status {
+        ConfigConnectionStatus::Connected => ConnectionStatus::Connected,
+        ConfigConnectionStatus::Disconnected => ConnectionStatus::Disconnected,
+        ConfigConnectionStatus::Conflict => ConnectionStatus::Conflict,
     }
 }
 
@@ -739,16 +911,57 @@ fn runtime_error(error: impl fmt::Display) -> IntegrationError {
     IntegrationError::Runtime(error.to_string())
 }
 
-fn acquire_lifecycle_lock(layout: &InstalledLayout) -> Result<MutationGuard, IntegrationError> {
-    let lock_dir = layout.runtime.join("integrations/codex/lifecycle");
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+fn with_storage_writer<T>(
+    root: &Path,
+    operation: impl FnOnce() -> Result<T, IntegrationError>,
+) -> Result<T, IntegrationError> {
+    with_storage_writer_observing(root, operation, || {})
+}
+
+fn with_storage_writer_observing<T>(
+    root: &Path,
+    operation: impl FnOnce() -> Result<T, IntegrationError>,
+    on_contention: impl FnOnce(),
+) -> Result<T, IntegrationError> {
+    let barrier = StorageBarrier::open_if_initialized(root).map_err(IntegrationError::Storage)?;
+    // Integration is a foreground/manual workflow. Wait for the validated root
+    // mutation lock, then try accounting exclusion once. Never retry operation.
+    let writer = StorageMutationWriter::acquire_exclusive_waiting_for_root(
+        root,
+        barrier.as_ref(),
+        on_contention,
+    )
+    .map_err(IntegrationError::Storage)?;
+    let result = operation();
+    let verification = writer.revalidate();
+    match verification {
+        Ok(()) => result,
+        Err(verification) => Err(IntegrationError::StorageWriteUnverified {
+            operation_completed: result.is_ok()
+                || matches!(
+                    &result,
+                    Err(IntegrationError::StorageWriteUnverified {
+                        operation_completed: true,
+                        ..
+                    })
+                ),
+            primary: result.err().map(Box::new),
+            verification,
+        }),
     }
-    builder.create(&lock_dir)?;
+}
+
+fn acquire_lifecycle_lock(layout: &InstalledLayout) -> Result<MutationGuard, IntegrationError> {
+    with_storage_writer(&layout.root, || acquire_lifecycle_lock_unchecked(layout))
+}
+
+fn acquire_lifecycle_lock_unchecked(
+    layout: &InstalledLayout,
+) -> Result<MutationGuard, IntegrationError> {
+    ensure_private_runtime_directory(&layout.runtime.join("integrations"))?;
+    ensure_private_runtime_directory(&layout.runtime.join("integrations/codex"))?;
+    let lock_dir = layout.runtime.join("integrations/codex/lifecycle");
+    ensure_private_runtime_directory(&lock_dir)?;
     MutationGuard::try_acquire(&lock_dir).map_err(|error| {
         IntegrationError::Runtime(format!("Codex integration lifecycle is busy: {error}"))
     })
@@ -766,22 +979,25 @@ fn codex_config_manager(
     layout: &InstalledLayout,
     executable: &Path,
     settings: &CollectorSettings,
-) -> Result<CodexConfigManager, IntegrationError> {
+) -> Result<StorageConfigManager, IntegrationError> {
     let config_path = codex_config_path()?;
     let codex_home = config_path
         .parent()
         .ok_or_else(|| IntegrationError::Runtime("Codex config path has no parent".into()))?;
-    ensure_codex_home(codex_home)?;
+    with_storage_writer(&layout.root, || ensure_codex_home(codex_home))?;
     let security = exporter_security(layout, settings)?;
-    CodexConfigManager::new(
+    let manager = CodexConfigManager::new(
         config_path,
         layout.runtime.join("integrations/codex"),
         executable,
         &layout.root,
         settings.port,
         security,
-    )
-    .map_err(Into::into)
+    )?;
+    Ok(StorageConfigManager {
+        root: layout.root.clone(),
+        manager,
+    })
 }
 
 fn exporter_security(
@@ -810,11 +1026,14 @@ fn exporter_security(
 
 fn codex_config_ownership_manager(
     layout: &InstalledLayout,
-) -> Result<CodexConfigManager, IntegrationError> {
-    Ok(CodexConfigManager::from_ownership_snapshot(
-        codex_config_path()?,
-        layout.runtime.join("integrations/codex"),
-    ))
+) -> Result<StorageConfigManager, IntegrationError> {
+    Ok(StorageConfigManager {
+        root: layout.root.clone(),
+        manager: CodexConfigManager::from_ownership_snapshot(
+            codex_config_path()?,
+            layout.runtime.join("integrations/codex"),
+        ),
+    })
 }
 
 fn codex_config_path() -> Result<PathBuf, IntegrationError> {
@@ -897,6 +1116,8 @@ fn ensure_codex_home(path: &Path) -> Result<(), IntegrationError> {
 
 #[derive(Clone, Debug)]
 struct CollectorService {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    root: PathBuf,
     label: String,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     plist: PathBuf,
@@ -921,6 +1142,11 @@ fn service_label(root: &Path) -> String {
     format!("io.agent-observability.collector.{suffix}")
 }
 
+fn expected_launch_agent_plist_path(root: &Path, home: &Path) -> PathBuf {
+    home.join("Library/LaunchAgents")
+        .join(format!("{}.plist", service_label(root)))
+}
+
 fn collector_service(root: &Path) -> Result<CollectorService, IntegrationError> {
     let home = env::var_os("HOME")
         .filter(|value| !value.is_empty())
@@ -929,9 +1155,8 @@ fn collector_service(root: &Path) -> Result<CollectorService, IntegrationError> 
     let label = service_label(root);
     let uid = current_uid()?;
     Ok(CollectorService {
-        plist: home
-            .join("Library/LaunchAgents")
-            .join(format!("{label}.plist")),
+        root: root.to_path_buf(),
+        plist: expected_launch_agent_plist_path(root, &home),
         target: format!("gui/{uid}/{label}"),
         ownership: root.join("runtime/integrations/codex/launch-agent-ownership-v1.json"),
         label,
@@ -1055,6 +1280,11 @@ fn install_collector_service_with(
     launchctl: &impl Launchctl,
     force_reconnect: bool,
 ) -> Result<CollectorService, IntegrationError> {
+    if service.root != root {
+        return Err(IntegrationError::Storage(
+            StorageCoherenceError::WrongMutationRoot,
+        ));
+    }
     let owned =
         recover_launch_agent_transaction(&service, launchctl, LaunchAgentRecovery::Connect)?;
     let desired = LaunchAgentFileState {
@@ -1452,9 +1682,12 @@ fn rollback_launch_agent_operation(
     launchctl: &impl Launchctl,
     error: IntegrationError,
 ) -> IntegrationError {
+    if is_storage_write_unverified(&error) {
+        return error;
+    }
     match recover_launch_agent_transaction(service, launchctl, LaunchAgentRecovery::Connect) {
         Ok(_) => error,
-        Err(rollback) => rollback_error(&error, &rollback),
+        Err(rollback) => rollback_error(error, rollback),
     }
 }
 
@@ -1550,7 +1783,7 @@ fn stop_launch_agent_with(
             Err(status_error) => {
                 return match bootout {
                     Ok(_) => Err(status_error),
-                    Err(error) => Err(rollback_error(&error, &status_error)),
+                    Err(error) => Err(rollback_error(error, status_error)),
                 };
             }
         }
@@ -1696,6 +1929,7 @@ fn launch_agent_conflict() -> IntegrationError {
 fn load_launch_agent_transaction(
     service: &CollectorService,
 ) -> Result<Option<LaunchAgentTransaction>, IntegrationError> {
+    validate_service_storage_path(service)?;
     let Some((mut file, _)) = open_bounded_regular_file(
         &service.ownership,
         MAX_LAUNCH_AGENT_OWNERSHIP_BYTES,
@@ -1714,18 +1948,29 @@ fn load_launch_agent_transaction(
             "LaunchAgent ownership state exceeds size bound".into(),
         ));
     }
-    let transaction: LaunchAgentTransaction = serde_json::from_slice(&bytes).map_err(|error| {
+    Ok(Some(decode_launch_agent_transaction(
+        &bytes,
+        &service.plist,
+    )?))
+}
+
+#[cfg(target_os = "macos")]
+fn decode_launch_agent_transaction(
+    bytes: &[u8],
+    expected_plist: &Path,
+) -> Result<LaunchAgentTransaction, IntegrationError> {
+    let transaction: LaunchAgentTransaction = serde_json::from_slice(bytes).map_err(|error| {
         IntegrationError::Runtime(format!("invalid LaunchAgent ownership state: {error}"))
     })?;
     validate_launch_agent_transaction_file_states(&transaction)?;
     if transaction.schema_version != LAUNCH_AGENT_OWNERSHIP_VERSION
-        || transaction.plist_path != service.plist
+        || transaction.plist_path != expected_plist
     {
         return Err(IntegrationError::Runtime(
             "LaunchAgent ownership state does not match this service".into(),
         ));
     }
-    Ok(Some(transaction))
+    Ok(transaction)
 }
 
 #[cfg(target_os = "macos")]
@@ -1733,24 +1978,21 @@ fn save_launch_agent_transaction(
     service: &CollectorService,
     transaction: &LaunchAgentTransaction,
 ) -> Result<(), IntegrationError> {
+    with_storage_writer(&service.root, || {
+        save_launch_agent_transaction_guarded(service, transaction)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn save_launch_agent_transaction_guarded(
+    service: &CollectorService,
+    transaction: &LaunchAgentTransaction,
+) -> Result<(), IntegrationError> {
     validate_launch_agent_transaction_file_states(transaction)?;
-    let parent = service
-        .ownership
-        .parent()
-        .ok_or_else(|| IntegrationError::Runtime("LaunchAgent state path has no parent".into()))?;
-    let integrations = parent.parent().ok_or_else(|| {
-        IntegrationError::Runtime("LaunchAgent state parent has no runtime directory".into())
-    })?;
-    let runtime = integrations.parent().ok_or_else(|| {
-        IntegrationError::Runtime("LaunchAgent state path has no runtime root".into())
-    })?;
-    let root = runtime.parent().ok_or_else(|| {
-        IntegrationError::Runtime("LaunchAgent state path has no installed root".into())
-    })?;
-    ensure_private_runtime_directory(root)?;
-    ensure_private_runtime_directory(runtime)?;
-    ensure_private_runtime_directory(integrations)?;
-    ensure_private_runtime_directory(parent)?;
+    validate_service_storage_path(service)?;
+    let integrations = service.root.join("runtime/integrations");
+    ensure_private_runtime_directory(&integrations)?;
+    ensure_private_runtime_directory(&integrations.join("codex"))?;
     let mut bytes = serde_json::to_vec(transaction).map_err(|error| {
         IntegrationError::Runtime(format!("LaunchAgent state encode failed: {error}"))
     })?;
@@ -1793,29 +2035,34 @@ fn validate_launch_agent_transaction_file_states(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn ensure_private_runtime_directory(path: &Path) -> Result<(), IntegrationError> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-
     let mut builder = fs::DirBuilder::new();
-    builder.mode(0o700);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
     match builder.create(path) {
         Ok(()) => {
             let parent = path.parent().ok_or_else(|| {
                 IntegrationError::Runtime("private runtime directory has no parent".into())
             })?;
-            File::open(parent)?.sync_all()?;
+            fs::File::open(parent)?.sync_all()?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
     }
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.permissions().mode() & 0o077 != 0
-    {
+    #[cfg(unix)]
+    let private = {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode().trailing_zeros() >= 6
+    };
+    #[cfg(not(unix))]
+    let private = true;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || !private {
         return Err(IntegrationError::Runtime(
-            "LaunchAgent state directory must be private and real".into(),
+            "integration state directory must be private and real".into(),
         ));
     }
     Ok(())
@@ -1823,11 +2070,28 @@ fn ensure_private_runtime_directory(path: &Path) -> Result<(), IntegrationError>
 
 #[cfg(target_os = "macos")]
 fn remove_launch_agent_transaction(service: &CollectorService) -> Result<(), IntegrationError> {
-    match fs::remove_file(&service.ownership) {
-        Ok(()) => sync_launch_agent_parent(&service.ownership, "state removal"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+    with_storage_writer(&service.root, || {
+        validate_service_storage_path(service)?;
+        match fs::remove_file(&service.ownership) {
+            Ok(()) => sync_launch_agent_parent(&service.ownership, "state removal"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn validate_service_storage_path(service: &CollectorService) -> Result<(), IntegrationError> {
+    if service.ownership
+        != service
+            .root
+            .join("runtime/integrations/codex/launch-agent-ownership-v1.json")
+    {
+        return Err(IntegrationError::Storage(
+            StorageCoherenceError::WrongMutationRoot,
+        ));
     }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -2062,15 +2326,17 @@ fn xml_escape(input: &str) -> String {
 mod tests {
     use super::{
         CodexIntegrationStatus, CollectorLifecycle, CollectorService, CollectorStatus,
-        ConfigConnectionStatus, ConfigLifecycle, ConnectionStatus, IntegrationError,
+        ConfigConnectionStatus, ConfigError, ConfigLifecycle, ConnectionStatus, IntegrationError,
         LaunchAgentOwnershipStatus, NotifyOwnership, NotifyStatus, codex_detected_at,
         collector_status, connect_prepared, connect_with_reloaded_settings,
-        disconnect_owned_prepared, disconnect_prepared, ensure_codex_home, exporter_security,
-        finish_disconnect_settings_migration, finish_settings_migration, launch_agent_body,
-        missing_settings_status, recover_connect_settings, recover_connect_settings_with,
-        service_label, settle_pending_migration_before_disconnect,
-        settle_pending_migration_before_status, settle_settings_migration_for_status, status,
-        with_lifecycle_lock,
+        disconnect_owned_prepared, disconnect_prepared, disconnected_status, ensure_codex_home,
+        exporter_security, finish_disconnect_settings_migration,
+        finish_disconnect_settings_migration_with, finish_settings_migration,
+        finish_settings_migration_with, launch_agent_body, missing_settings_status,
+        recover_connect_settings, recover_connect_settings_with,
+        rollback_migration_without_service_with, service_label,
+        settle_pending_migration_before_disconnect, settle_pending_migration_before_status,
+        settle_settings_migration_for_status, status, with_lifecycle_lock,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -2112,6 +2378,358 @@ mod tests {
 
     fn test_exporter_security(root: &Path) -> ExporterSecurity {
         ExporterSecurity::new(root.join("ca-certificate.pem"), "private-token").unwrap()
+    }
+
+    #[test]
+    fn foreground_storage_writer_waits_for_root_without_repeating_operation() {
+        use agent_observability_local_runtime::MutationGuard;
+        use std::sync::mpsc;
+        for coordinated in [false, true] {
+            let root = temporary_root("foreground-root-wait");
+            let layout = install(&root).unwrap();
+            if coordinated {
+                initialize_accounting(&root);
+            }
+            let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+            let (contended_tx, contended_rx) = mpsc::channel();
+            let (executed_tx, executed_rx) = mpsc::channel();
+            let thread_root = root.clone();
+            let child = thread::spawn(move || {
+                super::with_storage_writer_observing(
+                    &thread_root,
+                    || {
+                        executed_tx.send(()).unwrap();
+                        Ok(7)
+                    },
+                    || {
+                        contended_tx.send(()).unwrap();
+                    },
+                )
+            });
+            let contention = contended_rx.recv_timeout(Duration::from_secs(5));
+            let before_release = executed_rx.try_recv();
+            drop(mutation);
+            let result = child.join().unwrap();
+            fs::remove_dir_all(root).unwrap();
+            assert!(
+                contention.is_ok(),
+                "root contention must be observed before proceeding"
+            );
+            assert!(matches!(before_release, Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(result.unwrap(), 7);
+            assert_eq!(executed_rx.try_iter().count(), 1);
+        }
+    }
+
+    #[test]
+    fn settings_install_after_lifecycle_entry_rejects_legacy_root_contention() {
+        assert_settings_install_after_lifecycle_entry_rejects_root_contention(false);
+    }
+
+    #[test]
+    fn settings_install_after_lifecycle_entry_rejects_initialized_root_contention() {
+        assert_settings_install_after_lifecycle_entry_rejects_root_contention(true);
+    }
+
+    fn assert_settings_install_after_lifecycle_entry_rejects_root_contention(coordinated: bool) {
+        use agent_observability_local_collector::CollectorError;
+        use agent_observability_local_runtime::MutationGuard;
+
+        const CHANNEL_TIMEOUT: Duration = Duration::from_secs(5);
+        let root = temporary_root(if coordinated {
+            "settings-after-lifecycle-initialized-root-contention"
+        } else {
+            "settings-after-lifecycle-legacy-root-contention"
+        });
+        let layout = install(&root).unwrap();
+        let settings = install_settings(&root).unwrap();
+        let barrier_path = layout.runtime.join("storage-accounting.lock");
+        assert!(!barrier_path.exists());
+        if coordinated {
+            initialize_accounting(&root);
+        }
+        assert_eq!(barrier_path.exists(), coordinated);
+        let snapshots = [
+            layout.runtime.join("collector.json"),
+            layout.runtime.join(&settings.credentials.ca_certificate),
+            layout
+                .runtime
+                .join(&settings.credentials.server_certificate),
+            layout
+                .runtime
+                .join(&settings.credentials.server_private_key),
+        ]
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        });
+        let entered = Cell::new(false);
+        let result = with_lifecycle_lock(&layout, || {
+            entered.set(true);
+            let (held_tx, held_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let runtime = layout.runtime.clone();
+            let worker = thread::spawn(move || {
+                let mutation = MutationGuard::try_acquire(&runtime).unwrap();
+                held_tx.send(()).unwrap();
+                let released = release_rx.recv_timeout(CHANNEL_TIMEOUT);
+                drop(mutation);
+                released
+            });
+            let held = held_rx.recv_timeout(CHANNEL_TIMEOUT);
+            let attempted = held.as_ref().ok().map(|()| install_settings(&root));
+            let released = release_tx.send(());
+            let worker_result = worker.join().unwrap();
+            assert!(
+                held.is_ok(),
+                "helper must hold root mutation before settings install"
+            );
+            assert!(released.is_ok());
+            assert!(worker_result.is_ok());
+            attempted.unwrap().map_err(IntegrationError::Collector)
+        });
+        assert!(
+            entered.get(),
+            "contention must occur after lifecycle closure entry"
+        );
+        assert!(matches!(
+            result,
+            Err(IntegrationError::Collector(CollectorError::Runtime(ref message)))
+                if message == "storage accounting barrier is busy"
+        ));
+        for (path, bytes) in snapshots {
+            assert!(
+                fs::read(path).unwrap() == bytes,
+                "settings/TLS bytes changed"
+            );
+        }
+        assert_eq!(barrier_path.exists(), coordinated);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_creation_respects_held_accounting_permit() {
+        use agent_observability_local_runtime::{MutationGuard, storage_coherence::StorageBarrier};
+        let root = temporary_root("lifecycle-accounting");
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let permit = barrier.try_begin_write().unwrap();
+        let result = super::acquire_lifecycle_lock(&layout);
+        let created = layout.runtime.join("integrations/codex/lifecycle").exists();
+        assert!(
+            result.is_err(),
+            "accounting must exclude lifecycle creation"
+        );
+        assert!(!created);
+        drop(permit);
+        super::acquire_lifecycle_lock(&layout).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_creation_does_not_recreate_missing_root() {
+        let root = temporary_root("lifecycle-missing-root");
+        let layout = install(&root).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        let result = super::acquire_lifecycle_lock(&layout);
+        assert!(result.is_err());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn storage_writer_postchecks_success_and_primary_failure() {
+        for coordinated in [false, true] {
+            for completed in [false, true] {
+                let root = temporary_root("integration-postcheck");
+                let layout = install(&root).unwrap();
+                if coordinated {
+                    initialize_accounting(&root);
+                }
+                let result = super::with_storage_writer(&root, || {
+                    fs::write(root.join("runtime/published-fixture"), b"retained").unwrap();
+                    fs::remove_file(layout.runtime.join("mutation.lock")).unwrap();
+                    if completed {
+                        Ok(())
+                    } else {
+                        Err(IntegrationError::Config(ConfigError::Conflict))
+                    }
+                });
+                let error = result.unwrap_err();
+                assert!(matches!(&error, IntegrationError::StorageWriteUnverified {
+                    operation_completed, primary, ..
+                } if *operation_completed == completed && primary.is_none() == completed));
+                if !completed {
+                    assert!(matches!(&error, IntegrationError::StorageWriteUnverified {
+                        primary: Some(primary), ..
+                    } if matches!(primary.as_ref(), IntegrationError::Config(ConfigError::Conflict))));
+                }
+                assert_eq!(
+                    fs::read(root.join("runtime/published-fixture")).unwrap(),
+                    b"retained"
+                );
+                let retained = super::rollback_migration_without_service(&root, error);
+                assert!(matches!(
+                    retained,
+                    IntegrationError::StorageWriteUnverified { .. }
+                ));
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    fn initialize_accounting(root: &Path) -> super::StorageBarrier {
+        let mutation = super::MutationGuard::try_acquire(&root.join("runtime")).unwrap();
+        super::StorageBarrier::initialize(root, &mutation).unwrap()
+    }
+
+    #[test]
+    fn integration_uncertainty_skips_status_probe_and_service_compensation() {
+        let config = FakeConfig::disconnected();
+        let lifecycle = FakeLifecycle::ready();
+        for completed in [false, true] {
+            let error = IntegrationError::StorageWriteUnverified {
+                operation_completed: completed,
+                primary: (!completed)
+                    .then(|| Box::new(IntegrationError::Config(ConfigError::Conflict))),
+                verification: super::StorageCoherenceError::InvalidIdentity,
+            };
+            let error = super::recover_failed_config_connect(
+                Path::new("/unused"),
+                &config,
+                &lifecycle,
+                &FakeLifecycle::service(),
+                error,
+            );
+            let error = super::rollback_migration_install(
+                Path::new("/unused"),
+                &lifecycle,
+                &FakeLifecycle::service(),
+                error,
+            );
+            assert!(matches!(
+                error,
+                IntegrationError::StorageWriteUnverified { .. }
+            ));
+        }
+        assert!(config.events.borrow().is_empty());
+        assert!(lifecycle.events.borrow().is_empty());
+    }
+
+    #[test]
+    fn connect_releases_storage_before_fake_start_and_health() {
+        let root = temporary_root("connect-storage-release");
+        let layout = install(&root).unwrap();
+        initialize_accounting(&root);
+        let settings = install_settings(&root).unwrap();
+        let lifecycle = FakeLifecycle {
+            storage_probe_root: Some(root.clone()),
+            ..FakeLifecycle::ready()
+        };
+        with_lifecycle_lock(&layout, || {
+            connect_with_reloaded_settings(
+                &root,
+                Path::new("/bin/agentobs"),
+                &lifecycle,
+                false,
+                || Ok(settings.clone()),
+                |_| {
+                    Ok(super::StorageConfigManager {
+                        root: root.clone(),
+                        manager: CodexConfigManager::new(
+                            root.join("config.toml"),
+                            layout.runtime.join("integrations/codex"),
+                            Path::new("/bin/agentobs"),
+                            &root,
+                            settings.port,
+                            test_exporter_security(&root),
+                        )?,
+                    })
+                },
+            )
+        })
+        .unwrap();
+        assert_eq!(*lifecycle.events.borrow(), ["install", "health", "commit"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_writers_and_recovery_respect_accounting_and_legacy() {
+        for coordinated in [false, true] {
+            let root = temporary_root("config-writer-accounting");
+            let layout = install(&root).unwrap();
+            let manager = super::StorageConfigManager {
+                root: root.clone(),
+                manager: CodexConfigManager::new(
+                    root.join("config.toml"),
+                    layout.runtime.join("integrations/codex"),
+                    Path::new("/bin/agentobs"),
+                    &root,
+                    4318,
+                    test_exporter_security(&root),
+                )
+                .unwrap(),
+            };
+            let barrier = coordinated.then(|| initialize_accounting(&root));
+            if let Some(barrier) = &barrier {
+                let permit = barrier.try_begin_write().unwrap();
+                assert!(manager.notify_ownership().is_err());
+                assert!(!layout.runtime.join("integrations/codex").exists());
+                drop(permit);
+            }
+            manager.connect().unwrap();
+            let snapshot_path = layout
+                .runtime
+                .join("integrations/codex/codex-config-ownership-v1.json");
+            let mut pending: serde_json::Value =
+                serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+            pending["phase"] = "prepared".into();
+            fs::write(&snapshot_path, serde_json::to_vec(&pending).unwrap()).unwrap();
+            let snapshot = fs::read(&snapshot_path).unwrap();
+            let config = fs::read(root.join("config.toml")).unwrap();
+            if let Some(barrier) = &barrier {
+                let permit = barrier.try_begin_write().unwrap();
+                assert!(matches!(
+                    manager.connect(),
+                    Err(IntegrationError::Storage(
+                        super::StorageCoherenceError::Busy
+                    ))
+                ));
+                assert!(manager.disconnect().is_err());
+                assert!(manager.status().is_err());
+                assert!(manager.ownership_status().is_err());
+                assert!(manager.notify_ownership().is_err());
+                assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+                assert_eq!(fs::read(root.join("config.toml")).unwrap(), config);
+                drop(permit);
+            }
+            assert_eq!(manager.status().unwrap(), ConfigConnectionStatus::Connected);
+            let recovered: serde_json::Value =
+                serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+            assert_eq!(recovered["phase"], "connected");
+            assert!(manager.notify_ownership().unwrap().is_some());
+            manager.disconnect().unwrap();
+            assert!(!snapshot_path.exists());
+            assert_eq!(
+                layout.runtime.join("storage-accounting.lock").exists(),
+                coordinated
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    fn connected_status() -> CodexIntegrationStatus {
+        CodexIntegrationStatus {
+            schema_version: super::CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: Vec::new(),
+            config: ConnectionStatus::Connected,
+            notify: Some(NotifyStatus::AgentobsOwned),
+            collector: CollectorStatus::Ready,
+            endpoint: Some("https://127.0.0.1:4318/v1/logs".into()),
+            service: Some("io.agent-observability.collector.test".into()),
+            data_retained: true,
+        }
     }
 
     #[test]
@@ -2264,6 +2882,7 @@ mod tests {
     }
 
     struct FakeLifecycle {
+        storage_probe_root: Option<PathBuf>,
         wait_error: bool,
         uninstall_error: bool,
         commit_error: bool,
@@ -2275,6 +2894,7 @@ mod tests {
     impl FakeLifecycle {
         fn ready() -> Self {
             Self {
+                storage_probe_root: None,
                 wait_error: false,
                 uninstall_error: false,
                 commit_error: false,
@@ -2286,10 +2906,18 @@ mod tests {
 
         fn service() -> CollectorService {
             CollectorService {
+                root: PathBuf::from("/runtime"),
                 label: "test-service".into(),
                 plist: PathBuf::from("/tmp/test-service.plist"),
                 target: "gui/1/test-service".into(),
                 ownership: PathBuf::from("/tmp/launch-agent-ownership-v1.json"),
+            }
+        }
+
+        fn check_storage_released(&self) {
+            if let Some(root) = &self.storage_probe_root {
+                super::with_storage_writer(root, || Ok(()))
+                    .expect("storage guard held across process start or health");
             }
         }
     }
@@ -2301,6 +2929,7 @@ mod tests {
             _executable: &Path,
         ) -> Result<CollectorService, IntegrationError> {
             self.events.borrow_mut().push("install");
+            self.check_storage_released();
             if self.install_error.get() {
                 return Err(IntegrationError::Runtime("install failed".into()));
             }
@@ -2318,6 +2947,7 @@ mod tests {
             _executable: &Path,
         ) -> Result<CollectorService, IntegrationError> {
             self.events.borrow_mut().push("restart");
+            self.check_storage_released();
             if self.install_error.get() {
                 return Err(IntegrationError::Runtime("install failed".into()));
             }
@@ -2326,6 +2956,7 @@ mod tests {
 
         fn wait_until_ready(&self, _root: &Path) -> Result<CollectorStatus, IntegrationError> {
             self.events.borrow_mut().push("health");
+            self.check_storage_released();
             if self.wait_error {
                 Err(IntegrationError::Runtime("health failed".into()))
             } else {
@@ -2355,6 +2986,8 @@ mod tests {
     #[test]
     fn status_is_serializable_with_stable_values() {
         let status = CodexIntegrationStatus {
+            schema_version: super::CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: Vec::new(),
             config: ConnectionStatus::Conflict,
             notify: None,
             collector: CollectorStatus::Unavailable,
@@ -2375,6 +3008,8 @@ mod tests {
 
         let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
         let status = CodexIntegrationStatus {
+            schema_version: super::CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: Vec::new(),
             config: ConnectionStatus::Connected,
             notify: Some(NotifyStatus::AgentobsOwned),
             collector: CollectorStatus::Ready,
@@ -2436,6 +3071,139 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn committed_connect_reports_unverified_settings_finalization_without_mutating_fixture() {
+        use agent_observability_local_collector::CollectorError;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("connect-finalization-unverified");
+        let layout = install(&root).unwrap();
+        let settings_path = layout.runtime.join("collector.json");
+        let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
+        fs::write(&settings_path, legacy).unwrap();
+        fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = install_settings(&root).unwrap();
+        let journal_path = layout.runtime.join("collector-settings-migration.json");
+        let settings_bytes = fs::read(&settings_path).unwrap();
+        let journal_bytes = fs::read(&journal_path).unwrap();
+
+        let error = finish_settings_migration_with(&root, Ok(connected_status()), |_| {
+            Err(CollectorError::StorageWriteUnverified {
+                operation_completed: true,
+                primary: None,
+                verification: Box::new(CollectorError::Runtime(
+                    "settings finalization postcheck failed".into(),
+                )),
+            })
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IntegrationError::ConnectCommittedSettingsFinalizationUnverified {
+                finalization: CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(fs::read(settings_path).unwrap(), settings_bytes);
+        assert_eq!(fs::read(journal_path).unwrap(), journal_bytes);
+        assert!(
+            layout
+                .runtime
+                .join("integrations/codex/tls")
+                .join(replacement.generation)
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_disconnect_reports_unverified_settings_finalization_without_mutating_fixture() {
+        use agent_observability_local_collector::CollectorError;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("disconnect-finalization-unverified");
+        let layout = install(&root).unwrap();
+        let settings_path = layout.runtime.join("collector.json");
+        let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
+        fs::write(&settings_path, legacy).unwrap();
+        fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = install_settings(&root).unwrap();
+        let journal_path = layout.runtime.join("collector-settings-migration.json");
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        journal["phase"] = serde_json::Value::String("integration_committed".into());
+        fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let settings_bytes = fs::read(&settings_path).unwrap();
+        let journal_bytes = fs::read(&journal_path).unwrap();
+
+        let error =
+            finish_disconnect_settings_migration_with(&root, Ok(disconnected_status()), |_| {
+                Err(CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    primary: None,
+                    verification: Box::new(CollectorError::Runtime(
+                        "settings finalization postcheck failed".into(),
+                    )),
+                })
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IntegrationError::DisconnectCommittedSettingsFinalizationUnverified {
+                finalization: CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(fs::read(settings_path).unwrap(), settings_bytes);
+        assert_eq!(fs::read(journal_path).unwrap(), journal_bytes);
+        assert!(
+            layout
+                .runtime
+                .join("integrations/codex/tls")
+                .join(replacement.generation)
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn settings_rollback_uncertainty_preserves_typed_primary_and_verification() {
+        use agent_observability_local_collector::CollectorError;
+
+        let error = rollback_migration_without_service_with(
+            Path::new("/runtime"),
+            IntegrationError::Config(ConfigError::Conflict),
+            |_| {
+                Err(CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    primary: None,
+                    verification: Box::new(CollectorError::Runtime(
+                        "settings rollback postcheck failed".into(),
+                    )),
+                })
+            },
+        );
+
+        assert!(matches!(
+            error,
+            IntegrationError::SettingsRollbackUnverified {
+                primary,
+                rollback: CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    ..
+                }
+            } if matches!(*primary, IntegrationError::Config(ConfigError::Conflict))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn status_settles_pending_settings_from_observed_config_state() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2493,6 +3261,8 @@ mod tests {
         let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
         let status = CodexIntegrationStatus {
             config: ConnectionStatus::Disconnected,
+            schema_version: super::CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: Vec::new(),
             notify: None,
             collector: CollectorStatus::Unavailable,
             endpoint: None,
@@ -2542,6 +3312,10 @@ mod tests {
     #[test]
     fn degraded_status_serializes_without_becoming_ready() {
         let status = CodexIntegrationStatus {
+            schema_version: super::CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: vec![
+                agent_observability_contracts::CollectorDegradationReasonV1::StoragePressure,
+            ],
             config: ConnectionStatus::Connected,
             notify: Some(NotifyStatus::ExternalPreserved),
             collector: CollectorStatus::Degraded,
@@ -2553,6 +3327,10 @@ mod tests {
         let value = serde_json::to_value(status).unwrap();
 
         assert_eq!(value["collector"], "degraded");
+        assert_eq!(
+            value["collector_degradation_reasons"][0],
+            "storage_pressure"
+        );
     }
 
     #[test]
@@ -2869,6 +3647,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unverified_settings_failure_does_not_trigger_blind_migration_rollback() {
+        use agent_observability_local_collector::CollectorError;
+        use std::os::unix::fs::PermissionsExt;
+
+        for operation_completed in [false, true] {
+            let root = temporary_root("settings-unverified-no-rollback");
+            let layout = install(&root).unwrap();
+            let settings_path = layout.runtime.join("collector.json");
+            let legacy = br#"{"schema_version":"local_collector.v1","port":4318,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_generation":"codex-otel-v1"}"#;
+            fs::write(&settings_path, legacy).unwrap();
+            fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let replacement = install_settings(&root).unwrap();
+            let journal = layout.runtime.join("collector-settings-migration.json");
+            let journal_bytes = fs::read(&journal).unwrap();
+            let error = IntegrationError::Collector(CollectorError::StorageWriteUnverified {
+                operation_completed,
+                primary: (!operation_completed)
+                    .then(|| Box::new(CollectorError::Runtime("primary".into()))),
+                verification: Box::new(CollectorError::Runtime("storage identity changed".into())),
+            });
+            let result = super::rollback_migration_without_service(&root, error);
+            assert!(matches!(
+                result,
+                IntegrationError::Collector(CollectorError::StorageWriteUnverified { .. })
+            ));
+            assert_eq!(load_settings(&root).unwrap(), replacement);
+            assert_eq!(fs::read(journal).unwrap(), journal_bytes);
+            assert!(
+                layout
+                    .runtime
+                    .join("integrations/codex/tls")
+                    .join(replacement.generation)
+                    .exists()
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn production_connect_commit_failure_retains_recoverable_v3_state() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3051,6 +3869,148 @@ mod tests {
         );
         assert_eq!(status.config, ConnectionStatus::Connected);
         assert_eq!(*lifecycle.events.borrow(), ["install", "health", "commit"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_setup_connect_rebases_only_unowned_config_edits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("automatic-setup-unowned-rebase");
+        let layout = install(&root).unwrap();
+        let settings = install_settings(&root).unwrap();
+        let config_path = root.join("codex-config.toml");
+        let original = b"notify = ['/external/notify']\nmodel = 'before'\n";
+        fs::write(&config_path, original).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        CodexConfigManager::new(
+            &config_path,
+            layout.runtime.join("integrations/codex"),
+            Path::new("/bin/agentobs"),
+            &root,
+            settings.port,
+            exporter_security(&layout, &settings).unwrap(),
+        )
+        .unwrap()
+        .connect()
+        .unwrap();
+
+        let mut edited = fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("model = 'before'", "model = 'after'")
+            .into_bytes();
+        edited.extend_from_slice(b"\n[features]\nnew_unowned_flag = true\n");
+        fs::write(&config_path, &edited).unwrap();
+
+        let lifecycle = FakeLifecycle::ready();
+        let status = connect_with_reloaded_settings(
+            &root,
+            Path::new("/bin/agentobs"),
+            &lifecycle,
+            false,
+            || load_settings(&root).map_err(Into::into),
+            |settings| {
+                CodexConfigManager::new(
+                    &config_path,
+                    layout.runtime.join("integrations/codex"),
+                    Path::new("/bin/agentobs"),
+                    &root,
+                    settings.port,
+                    exporter_security(&layout, settings)?,
+                )
+                .map_err(Into::into)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(status.config, ConnectionStatus::Connected);
+        assert_eq!(status.notify, Some(NotifyStatus::ExternalPreserved));
+        assert_eq!(fs::read(&config_path).unwrap(), edited);
+        assert_eq!(*lifecycle.events.borrow(), ["install", "health", "commit"]);
+
+        let manager = CodexConfigManager::new(
+            &config_path,
+            layout.runtime.join("integrations/codex"),
+            Path::new("/bin/agentobs"),
+            &root,
+            settings.port,
+            exporter_security(&layout, &settings).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manager.status().unwrap(), ConfigConnectionStatus::Connected);
+        assert_eq!(
+            manager.disconnect().unwrap(),
+            ConfigConnectionStatus::Disconnected
+        );
+        let disconnected = fs::read_to_string(&config_path).unwrap();
+        assert!(disconnected.contains("notify = ['/external/notify']"));
+        assert!(disconnected.contains("model = 'after'"));
+        assert!(disconnected.contains("[features]\nnew_unowned_flag = true"));
+        assert!(!disconnected.contains("[otel]"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_setup_connect_rejects_owned_otel_edits_without_rewriting_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("automatic-setup-owned-conflict");
+        let layout = install(&root).unwrap();
+        let settings = install_settings(&root).unwrap();
+        let config_path = root.join("codex-config.toml");
+        fs::write(&config_path, b"model = 'before'\n").unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        CodexConfigManager::new(
+            &config_path,
+            layout.runtime.join("integrations/codex"),
+            Path::new("/bin/agentobs"),
+            &root,
+            settings.port,
+            exporter_security(&layout, &settings).unwrap(),
+        )
+        .unwrap()
+        .connect()
+        .unwrap();
+
+        let edited = fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("environment = \"local\"", "environment = \"changed\"")
+            .into_bytes();
+        fs::write(&config_path, &edited).unwrap();
+
+        let lifecycle = FakeLifecycle::ready();
+        let error = connect_with_reloaded_settings(
+            &root,
+            Path::new("/bin/agentobs"),
+            &lifecycle,
+            false,
+            || load_settings(&root).map_err(Into::into),
+            |settings| {
+                CodexConfigManager::new(
+                    &config_path,
+                    layout.runtime.join("integrations/codex"),
+                    Path::new("/bin/agentobs"),
+                    &root,
+                    settings.port,
+                    exporter_security(&layout, settings)?,
+                )
+                .map_err(Into::into)
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IntegrationError::Config(ConfigError::Conflict)
+        ));
+        assert_eq!(fs::read(&config_path).unwrap(), edited);
+        assert_eq!(*lifecycle.events.borrow(), ["install", "health"]);
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3546,6 +4506,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     struct FakeLaunchctl {
+        storage_probe_root: Option<PathBuf>,
         loaded: Cell<bool>,
         pending_unload_checks: Cell<Option<usize>>,
         bootout_unload_delay_checks: Cell<usize>,
@@ -3560,6 +4521,7 @@ mod tests {
     impl FakeLaunchctl {
         fn new(loaded: bool) -> Self {
             Self {
+                storage_probe_root: None,
                 loaded: Cell::new(loaded),
                 pending_unload_checks: Cell::new(None),
                 bootout_unload_delay_checks: Cell::new(0),
@@ -3570,11 +4532,19 @@ mod tests {
                 events: RefCell::new(Vec::new()),
             }
         }
+
+        fn check_storage_released(&self) {
+            if let Some(root) = &self.storage_probe_root {
+                super::with_storage_writer(root, || Ok(()))
+                    .expect("storage guard held across launchctl");
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
     impl Launchctl for FakeLaunchctl {
         fn bootout(&self, _target: &str) -> Result<bool, IntegrationError> {
+            self.check_storage_released();
             self.events.borrow_mut().push("bootout");
             let result = self
                 .bootout_results
@@ -3593,6 +4563,7 @@ mod tests {
         }
 
         fn is_loaded(&self, _target: &str) -> Result<bool, IntegrationError> {
+            self.check_storage_released();
             self.events.borrow_mut().push("is-loaded");
             if let Some(remaining) = self.pending_unload_checks.get() {
                 if remaining == 0 {
@@ -3606,6 +4577,7 @@ mod tests {
         }
 
         fn bootstrap(&self, _domain: &str, _plist: &Path) -> Result<(), IntegrationError> {
+            self.check_storage_released();
             self.events.borrow_mut().push("bootstrap");
             let result = self
                 .bootstrap_results
@@ -3619,6 +4591,7 @@ mod tests {
         }
 
         fn kickstart(&self, _target: &str) -> Result<(), IntegrationError> {
+            self.check_storage_released();
             self.events.borrow_mut().push("kickstart");
             let result = self
                 .kickstart_results
@@ -3677,12 +4650,91 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn test_service(root: &Path) -> CollectorService {
+        install(root).unwrap();
         CollectorService {
+            root: root.to_path_buf(),
             label: "test-service".into(),
             plist: root.join("LaunchAgents/test-service.plist"),
             target: "gui/1/test-service".into(),
             ownership: root.join("runtime/integrations/codex/launch-agent-ownership-v1.json"),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_agent_writers_exclude_accounting_and_release_before_process_calls() {
+        let root = temporary_root("launch-agent-storage");
+        let service = test_service(&root);
+        let layout = install(&root).unwrap();
+        let barrier = initialize_accounting(&root);
+        let launchctl = FakeLaunchctl {
+            storage_probe_root: Some(root.clone()),
+            ..FakeLaunchctl::new(false)
+        };
+        with_lifecycle_lock(&layout, || {
+            install_collector_service_with(
+                service.clone(),
+                &root,
+                Path::new("/bin/agentobs"),
+                &launchctl,
+                false,
+            )?;
+            let transaction = load_launch_agent_transaction(&service)?.unwrap();
+            let before = fs::read(&service.ownership)?;
+            let permit = barrier.try_begin_write().unwrap();
+            assert!(save_launch_agent_transaction(&service, &transaction).is_err());
+            assert!(super::remove_launch_agent_transaction(&service).is_err());
+            assert_eq!(fs::read(&service.ownership)?, before);
+            drop(permit);
+            commit_collector_service_install(&service)?;
+            uninstall_collector_service_with(&service, &launchctl)?;
+            commit_collector_service_uninstall(&service)?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!service.ownership.exists());
+        assert!(launchctl.events.borrow().contains(&"bootstrap"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_agent_postcheck_failure_retains_transaction_without_process_rollback() {
+        let root = temporary_root("launch-agent-postcheck");
+        let service = test_service(&root);
+        initialize_accounting(&root);
+        let launchctl = FakeLaunchctl::new(false);
+        install_collector_service_with(
+            service.clone(),
+            &root,
+            Path::new("/bin/agentobs"),
+            &launchctl,
+            false,
+        )
+        .unwrap();
+        let transaction = load_launch_agent_transaction(&service).unwrap().unwrap();
+        let events = launchctl.events.borrow().clone();
+        let error = super::with_storage_writer(&root, || {
+            super::save_launch_agent_transaction_guarded(&service, &transaction)?;
+            fs::remove_file(root.join("runtime/storage-accounting.lock"))?;
+            Ok(())
+        })
+        .unwrap_err();
+        let bytes = fs::read(&service.ownership).unwrap();
+        let error = super::rollback_launch_agent_operation(&service, &launchctl, error);
+        assert!(matches!(
+            error,
+            IntegrationError::StorageWriteUnverified {
+                operation_completed: true,
+                ..
+            }
+        ));
+        assert_eq!(fs::read(&service.ownership).unwrap(), bytes);
+        assert_eq!(*launchctl.events.borrow(), events);
+        fs::remove_dir_all(&root).unwrap();
+        assert!(save_launch_agent_transaction(&service, &transaction).is_err());
+        assert!(super::remove_launch_agent_transaction(&service).is_err());
+        assert!(!root.exists());
     }
 
     #[cfg(target_os = "macos")]

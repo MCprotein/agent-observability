@@ -183,10 +183,21 @@ a durable SQLite report generation. A renderer reads a generation-consistent sna
 exact generation written to `logs/agent-observability-report.html`; a private marker is only a best-effort wakeup.
 Startup reconciles every unacknowledged generation. Refresh uses bounded exponential retries and reports a
 degraded health state after exhaustion. CLI and UI preserve that state instead of presenting the report as
-current. Burst refresh is quiet-period coalesced; continuous ingest does not repeatedly rebuild a growing full
-report. The latest generation is rendered once input becomes quiet, while explicit report commands and startup
+current. In v1.11 development, a snapshot superseded by a concurrent commit is distinguished internally from
+JSON/schema/storage failures. It keeps the report pending/degraded without incrementing the genuine-failure
+counter. The next quiet window is the larger of twice the previous window and four times the last attempt's
+elapsed time, capped at 30 seconds. This learned window survives task handoffs for the collector lifetime;
+new ingest wakeups cannot reset it into rapid full-scan retries. The initial window remains 200 ms. The public
+v1 health stage remains `snapshot`; no database message or record content is exposed. A prior genuine failure
+is retained until successful publication. The latest generation is rendered once input becomes quiet, while explicit report commands and startup
 recovery retain their convergence paths. HTML/projection fsync therefore does not occupy the foreground notify
 path indefinitely. A failure never turns raw input into a fallback log or file.
+
+The v1.11 development report builder binds its freshly created empty staging descriptor to the
+runtime reservation before SQLite initialization. Mutation remains held through durable binding,
+then is released during projection; publication revalidates the binding under mutation. The full
+active/stale reservation remains charged. This is not activation of separated storage admission
+or proof of a coherent filesystem inventory; see [Storage Ownership](STORAGE_OWNERSHIP.md).
 
 ## Manual imports
 
@@ -195,11 +206,12 @@ handoff file, normalize it with the agent adapter, commit it under the runtime s
 They do not require a LaunchAgent, local HTTP receiver, login or network access. Disconnecting Codex automatic
 collection does not disable or remove this path.
 
-The installed configuration is intentionally small:
+The v1.11.0 development branch writes the following configuration. Published v1.10.0 uses v3
+without `lifecycle` or `storage_budget`; these development additions are not released yet.
 
 ~~~json
 {
-  "schema_version": "local_runtime.v3",
+  "schema_version": "local_runtime.v5",
   "enabled": true,
   "capture_private_codex_turn_details": false,
   "collection": {
@@ -215,13 +227,33 @@ The installed configuration is intentionally small:
     "max_record_age_days": 30,
     "max_archive_records": 10000,
     "max_archive_bytes": 16777216
+  },
+  "lifecycle": {
+    "enabled": false,
+    "hot_days": 7,
+    "warm_days": 30,
+    "delete_after_days": 90,
+    "private_raw_days": 7,
+    "maintenance_interval_seconds": 300,
+    "max_traces_per_pass": 32
+  },
+  "storage_budget": {
+    "mode": "legacy",
+    "retained_target_bytes": 1073741824,
+    "workspace_budget_bytes": 1073741824,
+    "minimum_free_bytes": 1073741824
   }
 }
 ~~~
 
-The runtime reads strict `local_runtime.v1` and `local_runtime.v2` documents through explicit
-migrations. Both migrate to v3 with private Codex turn-detail capture disabled; v2 remains a frozen
-compatibility schema and current writes always emit v3.
+The development runtime reads v1–v4 documents through their existing version-specific validation
+and explicit migrations. Existing values are preserved; v1–v3 automatic lifecycle stays off, existing
+v4 lifecycle choices are preserved, and v1/v2 private capture stays disabled. New and migrated
+configurations select legacy budget mode. Reading does not rewrite the config file; supported saves
+emit v5. The three new byte values are inactive in legacy mode and are preserved during unrelated edits.
+At P1, separated mode is accepted only by pure contract validation: operational load/save and runtime
+control refuse it until P2/P3 admission integration is verified. Older binaries reject v5; changing
+budget mode is not a binary/schema downgrade. See [P0 decisions](STORAGE_BUDGET_P0.md).
 
 `config set [root] <option> <value>` acquires the runtime singleton, validates the complete updated
 configuration, writes a private temporary file, syncs it, and atomically replaces `config.json`.
@@ -291,7 +323,25 @@ Storage admission remains fail-closed at the configured disk budget. Retention i
 operator command rather than an ingest-side implicit delete: pressure never silently overwrites
 accepted observations.
 
+## v1.11 development: ownership diagnostics
+
+When the storage-accounting barrier is already initialized, `runtime-check <root>`
+adds a separate post-store-open observation: retained/workspace/unknown allocated bytes,
+unknown entry count, full report reservations, and config revision. A zero-byte unknown
+file still counts as an unknown entry. `accounting_stage=post_store_open` explicitly means
+the existing store creation/migration step has already run; the whole command is not a
+read-only preflight. Ownership errors fail the command without success output.
+
+Uninitialized layouts retain the existing command behavior and output; diagnostics do
+not initialize the accounting barrier. The new observations do not replace legacy
+`storage_admission`, activate separated mode, or authorize writes. See
+[Storage Ownership](STORAGE_OWNERSHIP.md#전체-소유권-조합의-연결-순서).
+
 ## Retention and private archive
+
+This section describes published v1.10.0 manual retention. The next version's opt-in automatic
+Hot/Warm/Cold lifecycle is in progress; see [Storage Lifecycle](STORAGE_LIFECYCLE.md) for its
+separate managed-data policy, safety limits and acceptance gates.
 
 `retention-plan` computes a cutoff from the current clock and `max_record_age_days`, then reports a
 deterministic bounded selection without writing an archive or changing retention authority. The CLI
@@ -368,7 +418,12 @@ a privacy-safe aggregate contribution journal and versioned checkpoints ahead of
 
 ## Durable state
 
-SQLite local_state.v4 is authoritative. Projection-affecting transactions set
+SQLite local_state.v4 is authoritative in published v1.10.0; the v1.11 development branch uses
+local_state.v7, retaining v5 tier storage and private lifecycle control tables, the v6 report
+visibility epoch, and a fixed-width acknowledgement table. Admitted older stores migrate without
+discarding observations. The v6→v7 migration and its disk/rollback/downgrade contract are described
+in [Acknowledgement Storage](ACKNOWLEDGEMENT_STORAGE.md); this is not an installed migration claim.
+Projection-affecting transactions set
 projection_dirty=1; a successful atomic JSONL replacement clears it. A clean reopen does not
 rebuild the full projection. Explicit repairing store opens restore missing or dirty JSONL and bound
 stale projection-temp cleanup. Automatic collector startup and HTML refresh defer JSONL repair so a
@@ -395,6 +450,13 @@ gate with synthetic collector performance evidence while remaining separate from
 smoke is non-normative and deletes successful temporary output; a failed smoke retains only its sanitized
 manifest so the printed diagnostic path remains usable. release writes sanitized evidence under
 docs/evidence/local/performance/ and exits nonzero when required evidence is missing or a budget is breached.
+The macOS PR check uploads a failed automatic smoke's `manifest.yaml` as
+`automatic-smoke-diagnostics-<commit>` for seven days. It never uploads the runtime tree or raw
+logs. A failure before manifest creation leaves the original check failed and reports a missing
+artifact warning; diagnostic retention does not turn smoke into release evidence.
+Linux CI also repeats the report-refresh regression group five times. Convergence tests check
+failure/retry/publication state using bounded hang guards that accommodate adaptive quiet windows;
+the performance protocols below, not those test guards, define latency and resource budgets.
 For `perf local`, enabled runs permit at most 1% explicit fail-open rejection and must reconcile every enqueued
 event with one durable observation after graceful fixture shutdown; foreground enqueue does not itself imply
 durability. For `perf automatic`, every foreground notify must be accepted and each run independently enforces
@@ -416,7 +478,13 @@ smoke remains available while the diagnostic commit is being prepared.
 
 ## Static report
 
-`report` holds the singleton lock, reads a typed ordered snapshot from SQLite authority, applies the
+The v1.11 development branch implements the [paged dashboard extension](PAGED_DASHBOARD.md)
+separately from this export path. It is not yet release-approved; exact-revision performance,
+private-copy and browser acceptance gates remain. The behavior below describes the existing
+self-contained export. Its 32 MiB capacity error must not require deleting observations.
+
+`report` prepares the store under the singleton lock, releases it, then holds the report publication lock
+while reading a typed ordered snapshot from SQLite authority. It applies the
 Rust privacy/cost projector, and writes `logs/agent-observability-report.html` atomically with mode
 0600. The optional rate table must satisfy `agent_observability.rate_table.v1`, be at most 1 MiB,
 and be a private regular file opened without following symlinks. The generated report is

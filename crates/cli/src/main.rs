@@ -1,3 +1,5 @@
+mod storage_accounting;
+
 use agent_observability_adapter_claude_code::{
     AdapterItem as ClaudeAdapterItem, read_handoff_file as read_claude_handoff_file,
 };
@@ -23,9 +25,10 @@ use agent_observability_local_collector::{
     NotifyOutcome, load_settings, maintain_private_turn_details, serve, submit_notify,
 };
 use agent_observability_local_runtime::{
-    Admission, ConfigMutationGuard, InstalledLayout, LOCAL_RUNTIME_CONFIG_VERSION,
-    LocalRuntimeConfigV3, MutationGuard, PressureSample, RuntimeControl, Singleton, StorageBudget,
-    install, load, save,
+    Admission, ConfigMutationGuard, CoordinatedSingletonScope, InstalledLayout,
+    LOCAL_RUNTIME_CONFIG_VERSION, LocalRuntimeConfigV3, MutationGuard, PressureSample,
+    ProductionSingleton, RuntimeControl, StorageBudget, install, load, save,
+    storage_coherence::{StorageBarrier, StorageCoherenceError, StorageMutationWriter},
 };
 use agent_observability_local_store::{
     IngestStatus, LOCAL_STORE_SCHEMA_VERSION, LocalStore, RetentionPlan,
@@ -67,6 +70,8 @@ Import and report:
 
 Maintenance:
   agentobs retention-plan <root>
+  agentobs lifecycle-run [root]
+  agentobs cold-read <root> [after-archive-seq]
   agentobs retention-apply <root> <plan-id> <private-archive-jsonl>
   agentobs init|runtime-check|storage-check <root>
   agentobs config-check <config-json>
@@ -96,7 +101,7 @@ enum IngestBlock {
     Storage,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct IngestResult {
     source: String,
     observations: u64,
@@ -104,6 +109,7 @@ struct IngestResult {
     duplicates: u64,
     suppressed: u64,
     blocked: Option<IngestBlock>,
+    storage_coherence_verified: bool,
 }
 
 impl IngestResult {
@@ -115,12 +121,13 @@ impl IngestResult {
             duplicates: 0,
             suppressed: 0,
             blocked: Some(blocked),
+            storage_coherence_verified: true,
         }
     }
 
     fn output(&self) -> String {
         format!(
-            "source={}\nobservations={}\ndiagnostics={}\nduplicates={}\nsuppressed={}\ncollection_disabled={}\npolicy_blocked={}\npressure_blocked={}\nstorage_blocked={}\nteam_ingest=disabled",
+            "source={}\nobservations={}\ndiagnostics={}\nduplicates={}\nsuppressed={}\ncollection_disabled={}\npolicy_blocked={}\npressure_blocked={}\nstorage_blocked={}\nstorage_coherence={}\nteam_ingest=disabled",
             self.source,
             self.observations,
             self.diagnostics,
@@ -130,6 +137,11 @@ impl IngestResult {
             u8::from(self.blocked == Some(IngestBlock::Policy)),
             u8::from(self.blocked == Some(IngestBlock::Pressure)),
             u8::from(self.blocked == Some(IngestBlock::Storage)),
+            if self.storage_coherence_verified {
+                "verified"
+            } else {
+                "unverified"
+            },
         )
     }
 }
@@ -271,20 +283,39 @@ fn setup_ui(root: &Path, automatic: bool) -> Result<(), String> {
 }
 
 fn dashboard_ui(root: &Path, open: bool) -> Result<(), String> {
-    let _ = prepare_dashboard(root, false)?;
     serve_existing_dashboard(root, open, None)
+}
+
+fn classify_initial_dashboard_refresh(
+    result: Result<bool, agent_observability_local_collector::CollectorError>,
+) -> Result<Option<agent_observability_contracts::dashboard::DashboardStatusReasonV1>, String> {
+    match result {
+        Ok(_) => Ok(None),
+        Err(agent_observability_local_collector::CollectorError::DashboardStorageCapacity) => Ok(
+            Some(agent_observability_contracts::dashboard::DashboardStatusReasonV1::Capacity),
+        ),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn serve_existing_dashboard(root: &Path, open: bool, context: Option<&str>) -> Result<(), String> {
     let layout = install(root).map_err(|error| error.to_string())?;
+    // Initialization/migration is a CLI mutation step, never performed by query endpoints.
+    prepare_dashboard_store(&layout)?;
+    let initial_snapshot_failure = classify_initial_dashboard_refresh(
+        agent_observability_local_collector::refresh_dashboard_snapshot(&layout.root),
+    )?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| format!("dashboard runtime failed: {error}"))?;
     runtime.block_on(async {
-        let ui = agent_observability_local_ui::prepare_dashboard(&layout)
-            .await
-            .map_err(|error| error.to_string())?;
+        let ui = agent_observability_local_ui::prepare_dashboard_with_status(
+            &layout,
+            initial_snapshot_failure,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         announce_dashboard(&ui, open, context)?;
         ui.serve().await.map_err(|error| error.to_string())
     })
@@ -325,7 +356,6 @@ fn announce_dashboard(
 }
 
 fn settings_ui(root: &Path, open: bool) -> Result<(), String> {
-    let _ = prepare_dashboard(root, false)?;
     let layout = install(root).map_err(|error| error.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -403,6 +433,9 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
         [command] if command == "contracts" => contracts(),
         [command, root] if command == "storage-check" => storage_check(Path::new(root)),
         [command, root] if command == "retention-plan" => retention(Path::new(root), None),
+        [command, args @ ..] if matches!(command.as_str(), "cold-read" | "lifecycle-run") => {
+            storage_lifecycle_command(command, args)
+        }
         [command, root, plan_id, archive] if command == "retention-apply" => retention(
             Path::new(root),
             Some((plan_id.as_str(), Path::new(archive))),
@@ -469,7 +502,6 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<String, String> {
             Ok(env!("CARGO_PKG_VERSION").into())
         }
         [] => Ok(USAGE.into()),
-        [command] if matches!(command.as_str(), "help" | "--help" | "-h") => Ok(USAGE.into()),
         [command] => Err(format!("unknown command {command}")),
         _ => Err(USAGE.into()),
     }
@@ -481,9 +513,30 @@ fn help_requested(arguments: &[String]) -> bool {
         .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
 }
 
+fn storage_lifecycle_command(command: &str, arguments: &[String]) -> Result<String, String> {
+    match (command, arguments) {
+        ("cold-read", [root]) => cold_read(Path::new(root), 0),
+        ("cold-read", [root, after]) => cold_read(
+            Path::new(root),
+            after
+                .parse::<u64>()
+                .map_err(|_| "invalid archive cursor".to_string())?,
+        ),
+        ("lifecycle-run", [] | [_]) => {
+            let root = arguments
+                .first()
+                .map_or_else(default_root, |root| Ok(PathBuf::from(root)))?;
+            agent_observability_local_collector::maintain_storage_lifecycle(&root)
+                .map_err(|error| error.to_string())
+        }
+        _ => Err(USAGE.into()),
+    }
+}
+
 fn run_onboarding(arguments: &[String]) -> Option<Result<String, String>> {
     let result = match arguments {
         _ if help_requested(arguments) => Ok(USAGE.into()),
+        [command] if command == "help" => Ok(USAGE.into()),
         [command] if command == "demo" => default_demo_root().and_then(|root| demo(&root, true)),
         [command, flag] if command == "demo" && flag == "--no-open" => {
             default_demo_root().and_then(|root| demo(&root, false))
@@ -601,7 +654,7 @@ fn setup(root: &Path, open: bool, automatic: bool) -> Result<String, String> {
         open,
         automatic,
         detected,
-        prepare_dashboard,
+        prepare_setup_runtime,
         connect_codex,
     )
 }
@@ -615,7 +668,7 @@ fn setup_with(
     connect: impl FnOnce(&Path) -> Result<String, String>,
 ) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let dashboard = prepare(&layout.root, open)?;
+    let _prepared = prepare(&layout.root, open)?;
     let connection = (automatic && codex_is_detected)
         .then(|| connect(&layout.root))
         .transpose()?;
@@ -626,12 +679,63 @@ fn setup_with(
     };
     let detection = (automatic && !codex_is_detected).then_some("\ncodex=not_detected");
     Ok(format!(
-        "status=ready\nroot={}\ndashboard={}\ncollection={collection}\nopened={open}{}{}",
+        "status=ready\nroot={}\ndashboard_command=agentobs dashboard\ncollection={collection}\nopened={open}{}{}",
         layout.root.display(),
-        dashboard.display(),
         detection.unwrap_or_default(),
         connection.map_or_else(String::new, |output| format!("\n{output}"))
     ))
+}
+
+fn prepare_setup_runtime(root: &Path, _open: bool) -> Result<PathBuf, String> {
+    // Interactive setup_ui owns the subsequent server/open step; --no-open needs no export.
+    let layout = install(root).map_err(|error| error.to_string())?;
+    prepare_dashboard_store(&layout)?;
+    Ok(layout.root)
+}
+
+fn prepare_dashboard_store(layout: &InstalledLayout) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if try_prepare_dashboard_store(layout)? {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("dashboard snapshot preparation is busy; retry setup shortly".into());
+        }
+        // Publication acquires mutation after render. Never wait for render while
+        // retaining mutation: retry the entire attempt after releasing both resources.
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn try_prepare_dashboard_store(layout: &InstalledLayout) -> Result<bool, String> {
+    let barrier =
+        StorageBarrier::open_if_initialized(&layout.root).map_err(|error| error.to_string())?;
+    let scope = match StorageMutationWriter::acquire_exclusive(&layout.root, barrier.as_ref()) {
+        Ok(scope) => scope,
+        Err(StorageCoherenceError::Busy) => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let headroom = RuntimeControl::new(&config)
+        .map_err(|error| error.to_string())?
+        .migration_headroom(&layout.root)
+        .map_err(|error| error.to_string())?;
+    let store = LocalStore::open_with_migration_headroom_deferred_projection(
+        layout.state.join("store"),
+        headroom,
+    )
+    .map_err(|error| error.to_string())?;
+    let result = match agent_observability_local_store::recover_report_view_catalog(&store) {
+        Ok(()) => Ok(true),
+        Err(agent_observability_local_store::ReportViewCatalogError::Busy) => Ok(false),
+        Err(_) => Err("dashboard snapshot recovery failed".into()),
+    };
+    let revalidation = scope.revalidate().map_err(|error| error.to_string());
+    match result {
+        Err(error) => Err(error),
+        Ok(value) => revalidation.map(|()| value),
+    }
 }
 
 fn connect_codex(root: &Path) -> Result<String, String> {
@@ -726,14 +830,22 @@ fn prepare_dashboard_with(
 
 fn current_record_count(root: &Path) -> Result<usize, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let _singleton = acquire_runtime_singleton(&layout)?;
+    let barrier =
+        StorageBarrier::open_if_initialized(&layout.root).map_err(|error| error.to_string())?;
+    let scope = StorageMutationWriter::acquire_exclusive(&layout.root, barrier.as_ref())
+        .map_err(|error| error.to_string())?;
     let config = load(&layout.config).map_err(|error| error.to_string())?;
-    let store = open_store(&mutation, &layout, &config)?;
-    store
+    let store = open_store(scope.mutation(), &layout, &config)?;
+    let result = store
         .current_records()
         .map(|records| records.len())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    let revalidation = scope.revalidate().map_err(|error| error.to_string());
+    match result {
+        Err(error) => Err(error),
+        Ok(value) => revalidation.map(|()| value),
+    }
 }
 
 fn open_dashboard(path: &Path) -> Result<(), String> {
@@ -745,6 +857,28 @@ fn open_dashboard_with(
     opener: impl FnOnce(&Path) -> Result<(), PlatformOpenError>,
 ) -> Result<(), String> {
     opener(path).map_err(|error| format!("dashboard {error}"))
+}
+
+fn acquire_runtime_singleton(layout: &InstalledLayout) -> Result<ProductionSingleton, String> {
+    ProductionSingleton::acquire(&layout.root, CoordinatedSingletonScope::Runtime)
+        .map_err(|error| error.to_string())
+}
+
+fn revalidate_writer(
+    singleton: &ProductionSingleton,
+    writer: &StorageMutationWriter<'_>,
+) -> Result<(), String> {
+    writer.revalidate().map_err(|error| error.to_string())?;
+    singleton.revalidate().map_err(|error| error.to_string())
+}
+
+fn mutation_phase_error(primary: &str, outcome: &str, revalidation: &Result<(), String>) -> String {
+    match revalidation {
+        Ok(()) => format!("{primary}\n{outcome}\nstorage_coherence=verified"),
+        Err(secondary) => format!(
+            "{primary}\n{outcome}\nstorage_coherence=unverified\nstorage_coherence_error={secondary}"
+        ),
+    }
 }
 
 fn show_config(root: &Path) -> Result<String, String> {
@@ -787,10 +921,26 @@ fn set_config_value(
         "batch-bytes" => config.collection.max_batch_bytes = parse!(u32),
         "active-heartbeat-ms" => config.collection.active_heartbeat_interval_ms = parse!(u32),
         "idle-heartbeat-ms" => config.collection.idle_heartbeat_interval_ms = parse!(u32),
-        "storage-bytes" => config.collection.local_storage_budget_bytes = parse!(u64),
+        "storage-bytes" => {
+            if config.storage_budget.mode
+                != agent_observability_local_runtime::StorageBudgetMode::Legacy
+            {
+                return Err("storage-bytes requires legacy storage budget mode".into());
+            }
+            config.collection.local_storage_budget_bytes = parse!(u64);
+        }
         "retention-days" => config.retention.max_record_age_days = parse!(u16),
         "archive-records" => config.retention.max_archive_records = parse!(u32),
         "archive-bytes" => config.retention.max_archive_bytes = parse!(u64),
+        "lifecycle-enabled" => config.lifecycle.enabled = parse!(bool),
+        "hot-days" => config.lifecycle.hot_days = parse!(u16),
+        "warm-days" => config.lifecycle.warm_days = parse!(u16),
+        "delete-after-days" => config.lifecycle.delete_after_days = parse!(u16),
+        "private-raw-days" => config.lifecycle.private_raw_days = parse!(u16),
+        "maintenance-interval-seconds" => {
+            config.lifecycle.maintenance_interval_seconds = parse!(u32);
+        }
+        "max-traces-per-pass" => config.lifecycle.max_traces_per_pass = parse!(u16),
         _ => return Err(format!("unknown config option {key}")),
     }
     config.validate().map_err(|error| error.to_string())
@@ -798,7 +948,7 @@ fn set_config_value(
 
 fn config_output(layout: &InstalledLayout, config: &LocalRuntimeConfigV3) -> String {
     format!(
-        "root={}\nconfig={}\nenabled={}\nprivate-codex-details={}\nfile-reconcile-ms={}\nflush-ms={}\nbatch-records={}\nbatch-bytes={}\nactive-heartbeat-ms={}\nidle-heartbeat-ms={}\nstorage-bytes={}\nretention-days={}\narchive-records={}\narchive-bytes={}",
+        "root={}\nconfig={}\nenabled={}\nprivate-codex-details={}\nfile-reconcile-ms={}\nflush-ms={}\nbatch-records={}\nbatch-bytes={}\nactive-heartbeat-ms={}\nidle-heartbeat-ms={}\nstorage-bytes={}\nretention-days={}\narchive-records={}\narchive-bytes={}\nlifecycle-enabled={}\nhot-days={}\nwarm-days={}\ndelete-after-days={}\nprivate-raw-days={}\nmaintenance-interval-seconds={}\nmax-traces-per-pass={}",
         layout.root.display(),
         layout.config.display(),
         config.enabled,
@@ -812,20 +962,35 @@ fn config_output(layout: &InstalledLayout, config: &LocalRuntimeConfigV3) -> Str
         config.collection.local_storage_budget_bytes,
         config.retention.max_record_age_days,
         config.retention.max_archive_records,
-        config.retention.max_archive_bytes
+        config.retention.max_archive_bytes,
+        config.lifecycle.enabled,
+        config.lifecycle.hot_days,
+        config.lifecycle.warm_days,
+        config.lifecycle.delete_after_days,
+        config.lifecycle.private_raw_days,
+        config.lifecycle.maintenance_interval_seconds,
+        config.lifecycle.max_traces_per_pass
     )
 }
 
 fn storage_check(root: &Path) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let _singleton = acquire_runtime_singleton(&layout)?;
+    let barrier =
+        StorageBarrier::open_if_initialized(&layout.root).map_err(|error| error.to_string())?;
+    let scope = StorageMutationWriter::acquire_exclusive(&layout.root, barrier.as_ref())
+        .map_err(|error| error.to_string())?;
     let config = load(&layout.config).map_err(|error| error.to_string())?;
-    let store = open_store(&mutation, &layout, &config)?;
+    let store = open_store(scope.mutation(), &layout, &config)?;
     let (observations, records, outcomes) = store.counts().map_err(|error| error.to_string())?;
-    Ok(format!(
-        "store_schema={LOCAL_STORE_SCHEMA_VERSION}\nobservations={observations}\nrecords={records}\ndelivery_outcomes={outcomes}\nteam_ingest=disabled"
-    ))
+    let expired = store
+        .expired_trace_disposition_count()
+        .map_err(|error| error.to_string())?;
+    let output = format!(
+        "store_schema={LOCAL_STORE_SCHEMA_VERSION}\nobservations={observations}\nrecords={records}\ndelivery_outcomes={outcomes}\nexpired_trace_dispositions={expired}\nteam_ingest=disabled"
+    );
+    scope.revalidate().map_err(|error| error.to_string())?;
+    Ok(output)
 }
 
 fn open_store(
@@ -841,15 +1006,68 @@ fn open_store(
         .map_err(|error| error.to_string())
 }
 
+fn cold_read(root: &Path, after_archive_seq: u64) -> Result<String, String> {
+    let layout =
+        agent_observability_local_runtime::inspect(root).map_err(|error| error.to_string())?;
+    let config = load(&layout.config).map_err(|error| error.to_string())?;
+    let store =
+        LocalStore::open_current(layout.state.join("store")).map_err(|error| error.to_string())?;
+    let page = store
+        .query_cold_archives(agent_observability_local_store::ColdArchiveQuery {
+            after_archive_seq,
+            max_traces: config.lifecycle.max_traces_per_pass,
+            max_records: config.retention.max_archive_records,
+            max_bytes: config.retention.max_archive_bytes,
+        })
+        .map_err(|error| error.to_string())?;
+    let mut output = format!(
+        "cold_traces={}\nrecords={}\nnext_after_archive_seq={}\nhas_more={}\nblocked={:?}\n",
+        page.traces.len(),
+        page.records,
+        page.next_after_archive_seq,
+        page.has_more,
+        page.blocked,
+    );
+    for trace in page.traces {
+        output.push_str(&trace.records_jsonl().map_err(|error| error.to_string())?);
+    }
+    Ok(output)
+}
+
 fn retention(root: &Path, apply: Option<(&str, &Path)>) -> Result<String, String> {
+    retention_observing(root, apply, |_| {})
+}
+
+fn retention_observing(
+    root: &Path,
+    apply: Option<(&str, &Path)>,
+    after_apply: impl FnOnce(&Path),
+) -> Result<String, String> {
+    retention_applying(root, apply, after_apply, |_| {})
+}
+
+fn retention_applying(
+    root: &Path,
+    apply: Option<(&str, &Path)>,
+    after_apply: impl FnOnce(&Path),
+    before_apply: impl FnOnce(&LocalStore),
+) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
     let apply = apply
         .map(|(plan_id, path)| normalize_archive_path(&layout.root, plan_id, path))
         .transpose()?;
-    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let singleton = acquire_runtime_singleton(&layout)?;
+    let barrier =
+        StorageBarrier::open_if_initialized(&layout.root).map_err(|error| error.to_string())?;
+    let scope = StorageMutationWriter::acquire_exclusive(&layout.root, barrier.as_ref())
+        .map_err(|error| error.to_string())?;
     let config = load(&layout.config).map_err(|error| error.to_string())?;
-    let store = open_store(&mutation, &layout, &config)?;
+    let store_result = open_store(scope.mutation(), &layout, &config);
+    let revalidation = scope.revalidate().map_err(|error| error.to_string());
+    let store = store_result
+        .map_err(|error| mutation_phase_error(&error, "store_open=unconfirmed", &revalidation))?;
+    revalidation?;
+    drop(scope);
     let now_unix_ms = current_unix_ms()?;
     let retention_ms = u64::from(config.retention.max_record_age_days)
         .checked_mul(86_400_000)
@@ -858,29 +1076,76 @@ fn retention(root: &Path, apply: Option<(&str, &Path)>) -> Result<String, String
         .saturating_mul(86_400_000)
         .saturating_sub(retention_ms);
     if let Some((expected_plan_id, archive_path)) = apply.as_ref() {
-        let result = store
-            .apply_retention(
-                cutoff_unix_ms,
-                config.retention.max_archive_records,
-                config.retention.max_archive_bytes,
-                expected_plan_id,
-                archive_path,
+        let render_guard = store
+            .try_acquire_report_render_guard()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "report publication is busy; retry retention".to_string())?;
+        let writer = StorageMutationWriter::acquire(&layout.root, barrier.as_ref())
+            .map_err(|error| error.to_string())?;
+        let mut apply_attempted = false;
+        let result = (|| {
+            store
+                .invalidate_report()
+                .map_err(|error| error.to_string())?;
+            agent_observability_static_report::write_refresh_pending(
+                &layout.logs.join(REPORT_FILE_NAME),
             )
             .map_err(|error| error.to_string())?;
-        let output = retention_output(&result.plan, result.archive_path.as_deref(), true);
+            before_apply(&store);
+            apply_attempted = true;
+            store
+                .apply_retention_guarded(
+                    cutoff_unix_ms,
+                    config.retention.max_archive_records,
+                    config.retention.max_archive_bytes,
+                    expected_plan_id,
+                    archive_path,
+                    render_guard,
+                )
+                .map_err(|error| error.to_string())
+        })();
+        if result.is_ok() {
+            after_apply(&layout.runtime);
+        }
+        let revalidation = revalidate_writer(&singleton, &writer);
+        let outcome = if apply_attempted {
+            "retention_completion=uncertain"
+        } else {
+            "retention_completion=not_attempted"
+        };
+        let result =
+            result.map_err(|error| mutation_phase_error(&error, outcome, &revalidation))?;
+        let coherence_verified = revalidation.is_ok();
+        drop(writer);
         drop(store);
-        drop(mutation);
-        maintain_private_turn_details(root).map_err(|error| error.to_string())?;
-        return Ok(output);
+        let cleanup = if maintain_private_turn_details(root).is_ok() {
+            "complete"
+        } else {
+            "failed"
+        };
+        return Ok(retention_output(
+            &result.plan,
+            result.archive_path.as_deref(),
+            true,
+            coherence_verified,
+            cleanup,
+        ));
     }
-    let plan = store
+    let writer = StorageMutationWriter::acquire(&layout.root, barrier.as_ref())
+        .map_err(|error| error.to_string())?;
+    let plan_result = store
         .retention_plan(
             cutoff_unix_ms,
             config.retention.max_archive_records,
             config.retention.max_archive_bytes,
         )
-        .map_err(|error| error.to_string())?;
-    Ok(retention_output(&plan, None, false))
+        .map_err(|error| error.to_string());
+    let revalidation = revalidate_writer(&singleton, &writer);
+    let plan = plan_result.map_err(|error| {
+        mutation_phase_error(&error, "retention_plan=unconfirmed", &revalidation)
+    })?;
+    revalidation?;
+    Ok(retention_output(&plan, None, false, true, "not_applicable"))
 }
 
 fn normalize_archive_path(
@@ -903,9 +1168,15 @@ fn normalize_archive_path(
     Ok((plan_id.into(), normalized))
 }
 
-fn retention_output(plan: &RetentionPlan, archive: Option<&Path>, applied: bool) -> String {
+fn retention_output(
+    plan: &RetentionPlan,
+    archive: Option<&Path>,
+    applied: bool,
+    storage_coherence_verified: bool,
+    private_cleanup: &str,
+) -> String {
     format!(
-        "plan_id={}\ncutoff_unix_ms={}\ntraces={}\nobservations={}\nrecords={}\narchive_bytes={}\ntruncated={}\napplied={}\narchive={}\nteam_ingest=disabled",
+        "plan_id={}\ncutoff_unix_ms={}\ntraces={}\nobservations={}\nrecords={}\narchive_bytes={}\ntruncated={}\napplied={}\narchive={}\nstorage_coherence={}\nprivate_cleanup={}\nteam_ingest=disabled",
         plan.plan_id,
         plan.cutoff_unix_ms,
         plan.traces,
@@ -914,7 +1185,13 @@ fn retention_output(plan: &RetentionPlan, archive: Option<&Path>, applied: bool)
         plan.archive_bytes,
         plan.truncated,
         u8::from(applied && plan.traces > 0),
-        archive.map_or_else(|| "none".into(), |path| path.display().to_string())
+        archive.map_or_else(|| "none".into(), |path| path.display().to_string()),
+        if storage_coherence_verified {
+            "verified"
+        } else {
+            "unverified"
+        },
+        private_cleanup,
     )
 }
 
@@ -935,9 +1212,37 @@ fn report_command(arguments: &[String]) -> Result<String, String> {
 }
 
 fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String> {
+    report_observing(root, rate_table_path, |_| {})
+}
+
+fn report_observing(
+    root: &Path,
+    rate_table_path: Option<&Path>,
+    after_acknowledgement: impl FnMut(&Path),
+) -> Result<String, String> {
+    report_acknowledging(
+        root,
+        rate_table_path,
+        after_acknowledgement,
+        |store, generation| {
+            store
+                .acknowledge_report_generation(generation)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn report_acknowledging(
+    root: &Path,
+    rate_table_path: Option<&Path>,
+    mut after_acknowledgement: impl FnMut(&Path),
+    mut acknowledge: impl FnMut(&LocalStore, u64) -> Result<bool, String>,
+) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let singleton = acquire_runtime_singleton(&layout)?;
     let store = open_report_store(&layout)?;
+    let barrier =
+        StorageBarrier::open_if_initialized(&layout.root).map_err(|error| error.to_string())?;
     let rate_table = rate_table_path
         .map(read_private_rate_table)
         .transpose()?
@@ -970,29 +1275,80 @@ fn report(root: &Path, rate_table_path: Option<&Path>) -> Result<String, String>
         let report = projector
             .finish(current_timestamp()?, "Agent Observability Report")
             .map_err(|error| error.to_string())?;
-        let bytes = write_private(&output_path, &report).map_err(|error| error.to_string())?;
-        if store
-            .acknowledge_report_generation(visit.generation)
-            .map_err(|error| error.to_string())?
-        {
-            rendered = Some((visit.records, report.cost.status, bytes));
+        let writer =
+            StorageMutationWriter::acquire_waiting_for_root(&layout.root, barrier.as_ref(), || {
+                eprintln!("waiting=runtime_mutation");
+            })
+            .map_err(|error| error.to_string())?;
+        let mut published_bytes = None;
+        let publication = (|| {
+            let bytes = write_private(&output_path, &report).map_err(|error| error.to_string())?;
+            published_bytes = Some(bytes);
+            let acknowledged = acknowledge(&store, visit.generation)?;
+            Ok::<_, String>((bytes, acknowledged))
+        })();
+        if matches!(publication, Ok((_, true))) {
+            after_acknowledgement(&layout.runtime);
+        }
+        let revalidation = revalidate_writer(&singleton, &writer);
+        let (bytes, acknowledged) = publication.map_err(|error| {
+            mutation_phase_error(
+                &error,
+                &published_bytes.map_or_else(
+                    || "html_published=unconfirmed\nacknowledgement=not_attempted".into(),
+                    |bytes| format!("html_published=1\nbytes={bytes}\nacknowledgement=unconfirmed"),
+                ),
+                &revalidation,
+            )
+        })?;
+        if acknowledged {
+            rendered = Some((
+                visit.records,
+                report.cost.status,
+                bytes,
+                revalidation.is_ok(),
+            ));
             break;
         }
+        revalidation.map_err(|error| {
+            mutation_phase_error(
+                "report acknowledgement not confirmed",
+                &format!("html_published=1\nbytes={bytes}\nacknowledgement=unconfirmed"),
+                &Err(error),
+            )
+        })?;
     }
-    let (record_count, cost_status, bytes) = rendered
+    let (record_count, cost_status, bytes, storage_coherence_verified) = rendered
         .ok_or_else(|| "report authority changed during every render attempt".to_string())?;
     Ok(format!(
-        "report_schema={REPORT_DTO_VERSION}\nrecords={}\ncost_status={}\nreport={}\nbytes={bytes}\nteam_ingest=disabled",
+        "report_schema={REPORT_DTO_VERSION}\nrecords={}\ncost_status={}\nreport={}\nbytes={bytes}\nhtml_published=1\nacknowledgement=confirmed\nstorage_coherence={}\nteam_ingest=disabled",
         record_count,
         cost_status,
-        output_path.display()
+        output_path.display(),
+        if storage_coherence_verified {
+            "verified"
+        } else {
+            "unverified"
+        },
     ))
 }
 
 fn open_report_store(layout: &InstalledLayout) -> Result<LocalStore, String> {
-    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let barrier =
+        StorageBarrier::open_if_initialized(&layout.root).map_err(|error| error.to_string())?;
+    let scope = StorageMutationWriter::acquire_exclusive_waiting_for_root(
+        &layout.root,
+        barrier.as_ref(),
+        || eprintln!("waiting=runtime_mutation"),
+    )
+    .map_err(|error| error.to_string())?;
     let config = load(&layout.config).map_err(|error| error.to_string())?;
-    open_store(&mutation, layout, &config)
+    let result = open_store(scope.mutation(), layout, &config);
+    let revalidation = scope.revalidate().map_err(|error| error.to_string());
+    match result {
+        Err(error) => Err(error),
+        Ok(store) => revalidation.map(|()| store),
+    }
 }
 
 fn read_private_rate_table(path: &Path) -> Result<String, String> {
@@ -1090,18 +1446,69 @@ fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 
 fn runtime_check(root: &Path) -> Result<String, String> {
     let layout = install(root).map_err(|error| error.to_string())?;
-    let _singleton = Singleton::acquire(&layout.runtime).map_err(|error| error.to_string())?;
-    let mutation = MutationGuard::acquire(&layout.runtime).map_err(|error| error.to_string())?;
+    let _singleton = acquire_runtime_singleton(&layout)?;
+    let barrier =
+        StorageBarrier::open_if_initialized(&layout.root).map_err(|error| error.to_string())?;
+    if let Some(barrier) = &barrier {
+        let freeze = barrier
+            .try_freeze_existing_root()
+            .map_err(|error| error.to_string())?;
+        let result = runtime_check_locked(&layout, freeze.mutation(), || {
+            use agent_observability_codex_integration::storage_accounting::capture_current_codex_config_snapshot_ownership;
+            let codex = capture_current_codex_config_snapshot_ownership(&layout.root)
+                .map_err(|error| error.to_string())?;
+            #[cfg(target_os = "macos")]
+            let launch = agent_observability_codex_integration::storage_accounting::capture_current_launch_agent_storage_ownership(&layout.root)
+                .map_err(|error| error.to_string())?;
+            storage_accounting::with_all_owner_storage_observation(
+                &layout,
+                &freeze,
+                &codex,
+                #[cfg(target_os = "macos")]
+                Some(&launch),
+                #[cfg(not(target_os = "macos"))]
+                None,
+                |observation| {
+                    Ok(format!(
+                        "\nstorage_accounting=observed\naccounting_stage=post_store_open\naccounting_retained_bytes={}\naccounting_workspace_bytes={}\naccounting_unknown_bytes={}\naccounting_unknown_entries={}\naccounting_report_reserved_bytes={}\naccounting_config_revision={}\nseparated_admission=disabled",
+                        observation.allocation.retained_bytes,
+                        observation.allocation.workspace_bytes,
+                        observation.allocation.unknown_bytes,
+                        observation.allocation.unknown_entry_count,
+                        observation.report_reserved_bytes,
+                        observation.config_revision,
+                    ))
+                },
+            )
+        });
+        let revalidation = freeze.revalidate().map_err(|error| error.to_string());
+        return result.and_then(|output| revalidation.map(|()| output));
+    }
+    let scope = StorageMutationWriter::acquire_exclusive(&layout.root, barrier.as_ref())
+        .map_err(|error| error.to_string())?;
+    let output = runtime_check_locked(&layout, scope.mutation(), || Ok(String::new()))?;
+    scope.revalidate().map_err(|error| error.to_string())?;
+    Ok(output)
+}
+
+// Store preparation retains its existing migration/repair behavior. The optional
+// observation runs afterward and is not a pre-write admission or recovery gate.
+fn runtime_check_locked(
+    layout: &InstalledLayout,
+    mutation: &MutationGuard,
+    observe_after_store: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
     let config = load(&layout.config).map_err(|error| error.to_string())?;
-    let store = open_store(&mutation, &layout, &config)?;
+    let store = open_store(mutation, layout, &config)?;
     drop(store);
+    let ownership = observe_after_store()?;
     let allocated =
         StorageBudget::allocated_tree_bytes(&layout.root).map_err(|error| error.to_string())?;
     let mut control = RuntimeControl::new(&config).map_err(|error| error.to_string())?;
-    let admission = match control
-        .storage_budget()
-        .admit(allocated, u64::from(config.collection.max_batch_bytes))
-    {
+    let diagnostic = control
+        .collector_admission_diagnostic(&layout.root, u64::from(config.collection.max_batch_bytes))
+        .map_err(|error| error.to_string())?;
+    let admission = match diagnostic.admission {
         Admission::Allowed { .. } => "allowed",
         Admission::Denied => "denied",
     };
@@ -1113,10 +1520,15 @@ fn runtime_check(root: &Path) -> Result<String, String> {
             queue_percent: 0,
         },
     );
-    Ok(format!(
-        "config_schema={LOCAL_RUNTIME_CONFIG_VERSION}\nstore_schema={LOCAL_STORE_SCHEMA_VERSION}\nallocated_bytes={allocated}\nstorage_admission={admission}\nruntime_state={:?}\nsingleton=held\nteam_ingest=disabled",
+    let output = format!(
+        "config_schema={LOCAL_RUNTIME_CONFIG_VERSION}\nstore_schema={LOCAL_STORE_SCHEMA_VERSION}\nallocated_bytes={allocated}\nstorage_admission={admission}\ningest_reservation_bytes={}\nreport_reserved_bytes={}\nwritable_headroom_bytes={}\nstorage_deficit_bytes={}\nruntime_state={:?}\nsingleton=held\nteam_ingest=disabled",
+        diagnostic.collector_reservation_bytes,
+        diagnostic.current_report_reserved_bytes,
+        diagnostic.writable_headroom_bytes,
+        diagnostic.deficit_bytes,
         schedule.state
-    ))
+    );
+    Ok(output + &ownership)
 }
 
 fn ingest_items<'a>(
@@ -1124,9 +1536,65 @@ fn ingest_items<'a>(
     source: &str,
     items: impl Iterator<Item = IngestItem<'a>>,
 ) -> Result<IngestResult, String> {
+    ingest_items_observing(directory, source, items, |_| {})
+}
+
+fn ingest_items_observing<'a>(
+    directory: &str,
+    source: &str,
+    items: impl Iterator<Item = IngestItem<'a>>,
+    after_operation: impl FnOnce(&Path),
+) -> Result<IngestResult, String> {
     let paths = ingest_paths(Path::new(directory))?;
-    let _mutation =
-        MutationGuard::acquire(&paths.runtime_directory).map_err(|error| error.to_string())?;
+    let barrier = StorageBarrier::open_if_initialized(&paths.accounting_root)
+        .map_err(|error| error.to_string())?;
+    let scope = StorageMutationWriter::acquire_exclusive_waiting_for_root(
+        &paths.accounting_root,
+        barrier.as_ref(),
+        || eprintln!("waiting=runtime_mutation"),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut progress = IngestResult {
+        source: source.into(),
+        observations: 0,
+        diagnostics: 0,
+        duplicates: 0,
+        suppressed: 0,
+        blocked: None,
+        storage_coherence_verified: true,
+    };
+    let result = ingest_items_locked(&paths, source, items, &mut progress);
+    after_operation(&paths.runtime_directory);
+    let revalidation = scope.revalidate().map_err(|error| error.to_string());
+    match result {
+        Err(error) => Err(mutation_phase_error(
+            &error,
+            &format!(
+                "ingest_completion=uncertain\nobservations={}\ndiagnostics={}\nduplicates={}\nsuppressed={}",
+                progress.observations,
+                progress.diagnostics,
+                progress.duplicates,
+                progress.suppressed,
+            ),
+            &revalidation,
+        )),
+        Ok(mut result) if revalidation.is_err() && result.blocked.is_none() => {
+            result.storage_coherence_verified = false;
+            Ok(result)
+        }
+        Ok(result) => {
+            revalidation?;
+            Ok(result)
+        }
+    }
+}
+
+fn ingest_items_locked<'a>(
+    paths: &IngestPaths,
+    source: &str,
+    items: impl Iterator<Item = IngestItem<'a>>,
+    progress: &mut IngestResult,
+) -> Result<IngestResult, String> {
     let config = load(&paths.config_path).map_err(|error| error.to_string())?;
     let mut control = RuntimeControl::new(&config).map_err(|error| error.to_string())?;
     let items = items.collect::<Vec<_>>();
@@ -1153,14 +1621,12 @@ fn ingest_items<'a>(
         return Ok(IngestResult::blocked(source, IngestBlock::Pressure));
     }
     if control
-        .admit(
+        .collector_admission_diagnostic(
             &paths.accounting_root,
-            ingest_reservation_bytes(
-                &paths.store_directory,
-                u64::from(config.collection.max_batch_bytes),
-            )?,
+            u64::from(config.collection.max_batch_bytes),
         )
         .map_err(|error| error.to_string())?
+        .admission
         == Admission::Denied
     {
         return Ok(IngestResult::blocked(source, IngestBlock::Storage));
@@ -1171,10 +1637,6 @@ fn ingest_items<'a>(
     let mut store =
         LocalStore::open_with_migration_headroom(&paths.store_directory, migration_headroom)
             .map_err(|error| error.to_string())?;
-    let mut observations = 0_u64;
-    let mut diagnostics = 0_u64;
-    let mut duplicates = 0_u64;
-    let mut suppressed = 0_u64;
     for item in items {
         match item {
             IngestItem::Observation(observation) => {
@@ -1182,9 +1644,9 @@ fn ingest_items<'a>(
                     .ingest_deferred_projection(observation)
                     .map_err(|error| error.to_string())?;
                 match status {
-                    IngestStatus::Committed => observations += 1,
-                    IngestStatus::Duplicate => duplicates += 1,
-                    IngestStatus::Suppressed => suppressed += 1,
+                    IngestStatus::Committed => progress.observations += 1,
+                    IngestStatus::Duplicate => progress.duplicates += 1,
+                    IngestStatus::Suppressed => progress.suppressed += 1,
                 }
             }
             IngestItem::Disposition {
@@ -1198,11 +1660,11 @@ fn ingest_items<'a>(
                     .map_err(|error| error.to_string())?;
                 match status {
                     IngestStatus::Committed => match disposition {
-                        AdapterDispositionKind::Diagnostic => diagnostics += 1,
-                        AdapterDispositionKind::Suppressed => suppressed += 1,
+                        AdapterDispositionKind::Diagnostic => progress.diagnostics += 1,
+                        AdapterDispositionKind::Suppressed => progress.suppressed += 1,
                     },
-                    IngestStatus::Duplicate => duplicates += 1,
-                    IngestStatus::Suppressed => suppressed += 1,
+                    IngestStatus::Duplicate => progress.duplicates += 1,
+                    IngestStatus::Suppressed => progress.suppressed += 1,
                 }
             }
         }
@@ -1210,25 +1672,7 @@ fn ingest_items<'a>(
     store
         .rebuild_projection()
         .map_err(|error| error.to_string())?;
-    Ok(IngestResult {
-        source: source.into(),
-        observations,
-        diagnostics,
-        duplicates,
-        suppressed,
-        blocked: None,
-    })
-}
-
-fn ingest_reservation_bytes(store_directory: &Path, batch_bytes: u64) -> Result<u64, String> {
-    if !store_directory.exists() {
-        return Ok(batch_bytes);
-    }
-    let existing =
-        StorageBudget::allocated_tree_bytes(store_directory).map_err(|error| error.to_string())?;
-    batch_bytes
-        .checked_add(existing)
-        .ok_or_else(|| "ingest storage reservation overflow".to_string())
+    Ok(progress.clone())
 }
 
 struct IngestPaths {
@@ -1250,10 +1694,29 @@ fn ingest_paths(path: &Path) -> Result<IngestPaths, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lifecycle_cli_is_opt_in_and_cold_reads_are_bounded() {
+        let root =
+            std::env::temp_dir().join(format!("agentobs-lifecycle-cli-{}", std::process::id()));
+        let layout = agent_observability_local_runtime::install(&root).unwrap();
+        let root_arg = layout.root.to_string_lossy().into_owned();
+        assert_eq!(
+            super::run(["lifecycle-run".into(), root_arg.clone()].into_iter()).unwrap(),
+            "lifecycle=disabled"
+        );
+        super::run(["storage-check".into(), root_arg.clone()].into_iter()).unwrap();
+        let empty = super::run(["cold-read".into(), root_arg.clone()].into_iter()).unwrap();
+        assert!(empty.contains("cold_traces=0\n"));
+        assert!(empty.contains("has_more=false\n"));
+        assert!(super::run(["cold-read".into(), root_arg, "-1".into()].into_iter()).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::{
         IngestBlock, IngestResult, LOCAL_STORE_SCHEMA_VERSION, REPORT_FILE_NAME, USAGE,
-        format_codex_status, open_dashboard_with, open_settings_url_with, prepare_dashboard_with,
-        require_demo_ingest, run, run_ui_command, setup_with, timestamp_from_duration,
+        classify_initial_dashboard_refresh, format_codex_status, open_dashboard_with,
+        open_settings_url_with, prepare_dashboard_with, require_demo_ingest, run, run_ui_command,
+        setup_with, timestamp_from_duration,
     };
     use agent_observability_codex_integration::{
         CodexIntegrationStatus, CollectorStatus, ConnectionStatus,
@@ -1299,8 +1762,26 @@ mod tests {
     }
 
     #[test]
+    fn retryable_dashboard_refresh_keeps_native_building_semantics() {
+        assert_eq!(classify_initial_dashboard_refresh(Ok(false)), Ok(None));
+    }
+
+    #[test]
+    fn durable_dashboard_refresh_failure_is_not_downgraded_to_pending() {
+        let message = "dashboard snapshot refresh failed at publish";
+        let error = classify_initial_dashboard_refresh(Err(
+            agent_observability_local_collector::CollectorError::Runtime(message.into()),
+        ))
+        .unwrap_err();
+
+        assert_eq!(error, message);
+    }
+
+    #[test]
     fn codex_status_preserves_conflict_and_degraded_without_an_endpoint() {
         let output = format_codex_status(&CodexIntegrationStatus {
+            schema_version: agent_observability_contracts::CODEX_INTEGRATION_STATUS_VERSION.into(),
+            collector_degradation_reasons: Vec::new(),
             config: ConnectionStatus::Conflict,
             notify: None,
             collector: CollectorStatus::Degraded,
@@ -1324,7 +1805,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         let init = run(["init".into(), root.to_string_lossy().into_owned()].into_iter()).unwrap();
-        assert!(init.contains("config_schema=local_runtime.v3"));
+        assert!(init.contains("config_schema=local_runtime.v5"));
         let config = root.join("config.json");
         let check = run(["config-check".into(), config.to_string_lossy().into_owned()].into_iter())
             .unwrap();
@@ -1335,7 +1816,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn setup_creates_a_ready_private_dashboard_in_one_command() {
+    fn setup_prepares_private_store_without_requiring_html_export() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
@@ -1354,13 +1835,101 @@ mod tests {
         assert!(output.contains("status=ready"));
         assert!(output.contains("collection=manual_import"));
         assert!(output.contains("opened=false"));
-        let dashboard = root.join("logs").join(REPORT_FILE_NAME);
-        assert!(dashboard.is_file());
+        assert!(output.contains("dashboard_command=agentobs dashboard"));
+        assert!(!root.join("logs").join(REPORT_FILE_NAME).exists());
+        let store = root.join("state/store/local-store.sqlite3");
+        assert!(store.is_file());
         assert_eq!(
-            fs::metadata(dashboard).unwrap().permissions().mode() & 0o777,
+            fs::metadata(store).unwrap().permissions().mode() & 0o777,
             0o600
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn setup_retries_publication_contention_without_holding_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-setup-publication-contention-{}",
+            std::process::id()
+        ));
+        let layout = install(&root).unwrap();
+        let store = super::LocalStore::open(layout.state.join("store")).unwrap();
+        let render = store.acquire_report_render_guard().unwrap();
+        let runtime = layout.runtime.clone();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            // A publisher needs mutation before releasing its render guard. Setup must
+            // release mutation between attempts instead of waiting with the inverse order.
+            let mutation = MutationGuard::acquire(&runtime).unwrap();
+            drop(render);
+            drop(mutation);
+        });
+        let result = super::prepare_dashboard_store(&layout);
+        release.join().unwrap();
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn setup_persistent_publication_contention_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-setup-persistent-contention-{}",
+            std::process::id()
+        ));
+        let layout = install(&root).unwrap();
+        let store = super::LocalStore::open(layout.state.join("store")).unwrap();
+        let render = store.acquire_report_render_guard().unwrap();
+        let error = super::prepare_dashboard_store(&layout).unwrap_err();
+        assert_eq!(
+            error,
+            "dashboard snapshot preparation is busy; retry setup shortly"
+        );
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        drop(mutation);
+        drop(render);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setup_mutation_contention_is_retryable_without_store_creation() {
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-setup-mutation-contention-{}",
+            std::process::id()
+        ));
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+        assert!(!super::try_prepare_dashboard_store(&layout).unwrap());
+        assert!(!layout.state.join("store").exists());
+        drop(mutation);
+        assert!(super::try_prepare_dashboard_store(&layout).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_does_not_retry_or_repair_invalid_catalog() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-setup-invalid-catalog-{}",
+            std::process::id()
+        ));
+        let layout = install(&root).unwrap();
+        let store = super::LocalStore::open(layout.state.join("store")).unwrap();
+        let directory = layout.state.join("store/report-views.v1");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let catalog = directory.join("catalog.json");
+        fs::write(&catalog, b"invalid catalog").unwrap();
+        fs::set_permissions(&catalog, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            super::try_prepare_dashboard_store(&layout).unwrap_err(),
+            "dashboard snapshot recovery failed"
+        );
+        assert_eq!(fs::read(catalog).unwrap(), b"invalid catalog");
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1490,6 +2059,7 @@ mod tests {
             duplicates: 0,
             suppressed: 0,
             blocked: None,
+            storage_coherence_verified: true,
         };
         require_demo_ingest(&result).unwrap();
     }
@@ -1566,6 +2136,17 @@ mod tests {
         assert!(!dashboard.contains("AUTOMATIC_PRIVATE_TARGET_SENTINEL"));
     }
 
+    #[test]
+    fn storage_bytes_never_reinterprets_separated_target() {
+        let mut config = super::LocalRuntimeConfigV3::default();
+        config.storage_budget.mode =
+            agent_observability_local_runtime::StorageBudgetMode::Separated;
+        let original = config.clone();
+        let error = super::set_config_value(&mut config, "storage-bytes", "536870912").unwrap_err();
+        assert_eq!(error, "storage-bytes requires legacy storage budget mode");
+        assert_eq!(config, original);
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn cli_open_wrappers_report_unsupported_platform_without_target_content() {
@@ -1609,6 +2190,13 @@ mod tests {
             ("retention-days", "90"),
             ("archive-records", "5000"),
             ("archive-bytes", "8388608"),
+            ("lifecycle-enabled", "true"),
+            ("hot-days", "10"),
+            ("warm-days", "45"),
+            ("delete-after-days", "120"),
+            ("private-raw-days", "14"),
+            ("maintenance-interval-seconds", "600"),
+            ("max-traces-per-pass", "64"),
         ];
         for (key, value) in options {
             let output = run([
@@ -1668,6 +2256,650 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_singleton_acquisition_joins_initialized_accounting_barrier() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-runtime-singleton-coordination-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+
+        assert_eq!(
+            super::acquire_runtime_singleton(&layout).unwrap_err(),
+            "singleton coherence error: storage accounting barrier is busy"
+        );
+        assert!(!layout.runtime.join("runtime.meta").exists());
+
+        drop(freeze);
+        let owner = super::acquire_runtime_singleton(&layout).unwrap();
+        assert!(layout.runtime.join("runtime.meta").is_file());
+        drop(owner);
+        assert!(!layout.runtime.join("runtime.meta").exists());
+
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_html_success_ack_failure_retains_postcheck() {
+        let root =
+            std::env::temp_dir().join(format!("agentobs-cli-ack-failure-{}", std::process::id()));
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        super::StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let store = super::open_report_store(&layout).unwrap();
+        store.invalidate_report().unwrap();
+        drop(store);
+        let error = super::report_acknowledging(
+            &root,
+            None,
+            |_| {},
+            |_, _| {
+                fs::rename(
+                    layout.runtime.join("storage-accounting.lock"),
+                    layout.runtime.join("retained-accounting.lock"),
+                )
+                .unwrap();
+                Err("injected acknowledgement failure".into())
+            },
+        )
+        .unwrap_err();
+        assert!(layout.logs.join(super::REPORT_FILE_NAME).is_file());
+        let store = super::LocalStore::open_current(layout.state.join("store")).unwrap();
+        assert!(store.report_status().unwrap().pending());
+        assert!(
+            error.contains("injected acknowledgement failure"),
+            "{error}"
+        );
+        assert!(error.contains("html_published=1"), "{error}");
+        assert!(error.contains("acknowledgement=unconfirmed"), "{error}");
+        assert!(error.contains("storage_coherence=unverified"), "{error}");
+        assert!(error.contains("storage_coherence_error="), "{error}");
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_ingest_later_failure_retains_committed_counts_and_postcheck() {
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-cli-later-ingest-failure-{}",
+            std::process::id()
+        ));
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        super::StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let batch = super::parse_codex_handoff_jsonl(super::CODEX_DEMO_HANDOFF).unwrap();
+        let mut observations = batch
+            .items
+            .into_iter()
+            .filter_map(|item| match item {
+                super::CodexAdapterItem::Observation(observation) => Some(*observation),
+                super::CodexAdapterItem::Disposition(_) => None,
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        let missing_cursor = observations[0].previous_source_cursor.take().unwrap();
+        observations.push(observations[0].clone());
+        observations[1].source_cursor = missing_cursor.clone();
+        observations[1].previous_source_cursor = Some(missing_cursor);
+        let error = super::ingest_items_observing(
+            root.to_str().unwrap(),
+            "codex",
+            observations.iter().map(super::IngestItem::Observation),
+            |runtime| {
+                fs::rename(
+                    runtime.join("storage-accounting.lock"),
+                    runtime.join("retained-accounting.lock"),
+                )
+                .unwrap();
+            },
+        )
+        .unwrap_err();
+        let store = super::LocalStore::open_current(layout.state.join("store")).unwrap();
+        assert_eq!(store.counts().unwrap().0, 1);
+        assert!(error.contains("source cursor conflict"), "{error}");
+        assert!(error.contains("observations=1"), "{error}");
+        assert!(error.contains("ingest_completion=uncertain"), "{error}");
+        assert!(error.contains("storage_coherence=unverified"), "{error}");
+        assert!(error.contains("storage_coherence_error="), "{error}");
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_error_after_deletion_reports_uncertainty() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-cli-retention-uncertain-{}",
+            std::process::id()
+        ));
+        let layout = install(&root).unwrap();
+        super::update_config(&root, "retention-days", "1").unwrap();
+        let old_handoff = include_str!("../../adapter-cursor/tests/fixtures/cursor-handoff.jsonl")
+            .replace("178787520", "100000000");
+        let batch = agent_observability_adapter_cursor::parse_handoff_jsonl(&old_handoff).unwrap();
+        super::ingest_items(
+            root.to_str().unwrap(),
+            "cursor",
+            batch.items.iter().map(|item| match item {
+                super::CursorAdapterItem::Observation(observation) => {
+                    super::IngestItem::Observation(observation)
+                }
+                super::CursorAdapterItem::Disposition(item) => super::IngestItem::Disposition {
+                    checkpoint: &item.checkpoint,
+                    disposition: item.disposition,
+                    code: item.code,
+                    payload_hash: item.payload_hash.as_deref(),
+                },
+            }),
+        )
+        .unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        super::StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let plan = super::retention(&root, None).unwrap();
+        assert!(!plan.contains("traces=0"));
+        let store = super::LocalStore::open_current(layout.state.join("store")).unwrap();
+        let before = store.counts().unwrap().0;
+        drop(store);
+        let planned: u64 = plan
+            .lines()
+            .find_map(|line| line.strip_prefix("observations="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let plan_id = plan
+            .lines()
+            .find_map(|line| line.strip_prefix("plan_id="))
+            .unwrap();
+        let archive_dir = root.with_extension("archives");
+        fs::create_dir(&archive_dir).unwrap();
+        fs::set_permissions(&archive_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let archive = archive_dir.join("expired.jsonl");
+        let projection = layout.state.join("store/observations.jsonl");
+        let retained_projection = layout.state.join("store/retained-observations.jsonl");
+        let error = super::retention_applying(
+            &root,
+            Some((plan_id, &archive)),
+            |_| {},
+            |_| {
+                fs::rename(&projection, &retained_projection).unwrap();
+                fs::create_dir(&projection).unwrap();
+                fs::rename(
+                    layout.runtime.join("storage-accounting.lock"),
+                    layout.runtime.join("retained-accounting.lock"),
+                )
+                .unwrap();
+            },
+        )
+        .unwrap_err();
+        fs::remove_dir(&projection).unwrap();
+        fs::rename(&retained_projection, &projection).unwrap();
+        let store = super::LocalStore::open_current(layout.state.join("store")).unwrap();
+        assert!(planned > 0);
+        assert_eq!(store.counts().unwrap().0, before - planned, "{error}");
+        assert!(archive.is_file());
+        assert!(
+            error.contains("local store path has the wrong filesystem type"),
+            "{error}"
+        );
+        assert!(error.contains("retention_completion=uncertain"), "{error}");
+        assert!(!error.contains("applied=0"), "{error}");
+        assert!(error.contains("storage_coherence=unverified"), "{error}");
+        assert!(error.contains("storage_coherence_error="), "{error}");
+        drop(store);
+        fs::remove_dir_all(archive_dir).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_ingest_keeps_legacy_runtime_uninitialized() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-manual-ingest-legacy-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        super::ingest_items(
+            root.to_str().unwrap(),
+            "codex",
+            std::iter::empty::<super::IngestItem<'_>>(),
+        )
+        .unwrap();
+
+        assert!(root.join("state/store/local-store.sqlite3").is_file());
+        assert!(!root.join("runtime/storage-accounting.lock").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_ingest_rejects_invalid_initialized_barrier_without_fallback() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-manual-ingest-invalid-accounting-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        fs::write(layout.runtime.join("storage-accounting.lock"), b"invalid").unwrap();
+
+        assert_eq!(
+            super::ingest_items(
+                root.to_str().unwrap(),
+                "codex",
+                std::iter::empty::<super::IngestItem<'_>>(),
+            )
+            .unwrap_err(),
+            "storage accounting private identity changed"
+        );
+        assert!(!layout.state.join("store/local-store.sqlite3").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_ingest_does_not_recreate_initialized_mutation_lock() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-manual-ingest-missing-mutation-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let mutation_path = layout.runtime.join("mutation.lock");
+        fs::remove_file(&mutation_path).unwrap();
+
+        assert!(
+            super::ingest_items(
+                root.to_str().unwrap(),
+                "codex",
+                std::iter::empty::<super::IngestItem<'_>>(),
+            )
+            .is_err()
+        );
+        assert!(!mutation_path.exists());
+        assert!(!layout.state.join("store/local-store.sqlite3").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_accounting_contention_is_bounded_and_preserves_html() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-report-accounting-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let report = layout.logs.join(super::REPORT_FILE_NAME);
+        fs::write(&report, b"sentinel").unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let writer = barrier.try_begin_write().unwrap();
+        let started = std::time::Instant::now();
+
+        assert_eq!(
+            super::report(&root, None).unwrap_err(),
+            "storage accounting barrier is busy"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(fs::read(&report).unwrap(), b"sentinel");
+        assert!(!layout.state.join("store/local-store.sqlite3").exists());
+
+        drop(writer);
+        drop(barrier);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_root_mutation_store_openers_join_initialized_accounting() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+
+        fn assert_blocked(label: &str, operation: impl FnOnce(&Path) -> Result<(), String>) {
+            let root = std::env::temp_dir().join(format!(
+                "agent-observability-cli-{label}-accounting-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            let layout = install(&root).unwrap();
+            let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+            let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+            drop(mutation);
+            let writer = barrier.try_begin_write().unwrap();
+
+            assert_eq!(
+                operation(&root).unwrap_err(),
+                "storage accounting barrier is busy",
+                "{label} bypassed the initialized accounting writer"
+            );
+            assert!(!layout.state.join("store/local-store.sqlite3").exists());
+
+            drop(writer);
+            drop(barrier);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        assert_blocked("current-record-count", |root| {
+            super::current_record_count(root).map(|_| ())
+        });
+        assert_blocked("storage-check", |root| {
+            super::storage_check(root).map(|_| ())
+        });
+        assert_blocked("runtime-check", |root| {
+            super::runtime_check(root).map(|_| ())
+        });
+        assert_blocked("open-report-store", |root| {
+            let layout = install(root).map_err(|error| error.to_string())?;
+            super::open_report_store(&layout).map(|_| ())
+        });
+        assert_blocked("retention", |root| super::retention(root, None).map(|_| ()));
+        assert_blocked("manual-ingest", |root| {
+            super::ingest_items(
+                root.to_str().unwrap(),
+                "codex",
+                std::iter::empty::<super::IngestItem<'_>>(),
+            )
+            .map(|_| ())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_store_preparation_defers_to_initialized_shared_writer() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-dashboard-store-accounting-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let writer = barrier.try_begin_write().unwrap();
+
+        assert!(!super::try_prepare_dashboard_store(&layout).unwrap());
+        assert!(!layout.state.join("store/local-store.sqlite3").exists());
+
+        drop(writer);
+        drop(barrier);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_ingest_reports_committed_store_when_postcheck_fails() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-manual-ingest-postcheck-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+
+        let result = super::ingest_items_observing(
+            root.to_str().unwrap(),
+            "codex",
+            std::iter::empty::<super::IngestItem<'_>>(),
+            |runtime| {
+                fs::rename(
+                    runtime.join("storage-accounting.lock"),
+                    runtime.join("retained-storage-accounting.lock"),
+                )
+                .unwrap();
+            },
+        )
+        .unwrap();
+
+        assert!(result.output().contains("storage_coherence=unverified"));
+        assert!(layout.state.join("store/local-store.sqlite3").is_file());
+        assert!(!layout.runtime.join("storage-accounting.lock").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_holds_shared_writer_through_html_and_acknowledgement() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        use std::cell::Cell;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-report-shared-writer-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let blocked = Cell::new(false);
+
+        let output = super::report_observing(&root, None, |runtime| {
+            blocked.set(matches!(
+                MutationGuard::try_acquire(runtime),
+                Err(agent_observability_local_runtime::SingletonError::AlreadyRunning)
+            ));
+        })
+        .unwrap();
+
+        assert!(blocked.get());
+        assert!(output.contains("storage_coherence=verified"));
+        let store = super::LocalStore::open_current(layout.state.join("store")).unwrap();
+        assert!(!store.report_status().unwrap().pending());
+        assert!(layout.logs.join(super::REPORT_FILE_NAME).is_file());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_preserves_committed_acknowledgement_when_postcheck_fails() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-report-postcheck-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+
+        let output = super::report_observing(&root, None, |runtime| {
+            let mutation = runtime.join("mutation.lock");
+            fs::rename(&mutation, runtime.join("retained-mutation.lock")).unwrap();
+            fs::write(&mutation, []).unwrap();
+            fs::set_permissions(&mutation, fs::Permissions::from_mode(0o600)).unwrap();
+        })
+        .unwrap();
+
+        assert!(output.contains("storage_coherence=unverified"));
+        assert!(layout.logs.join(super::REPORT_FILE_NAME).is_file());
+        let store = super::LocalStore::open_current(layout.state.join("store")).unwrap();
+        assert!(!store.report_status().unwrap().pending());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_preserves_applied_output_when_postcheck_fails() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-retention-postcheck-{}",
+            std::process::id()
+        ));
+        let archive = std::env::temp_dir().join(format!(
+            "agent-observability-cli-retention-postcheck-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&archive);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let plan = super::retention(&root, None).unwrap();
+        let plan_id = plan
+            .lines()
+            .find_map(|line| line.strip_prefix("plan_id="))
+            .unwrap();
+
+        let output = super::retention_observing(&root, Some((plan_id, &archive)), |runtime| {
+            let mutation = runtime.join("mutation.lock");
+            fs::rename(&mutation, runtime.join("retained-mutation.lock")).unwrap();
+            fs::write(&mutation, []).unwrap();
+            fs::set_permissions(&mutation, fs::Permissions::from_mode(0o600)).unwrap();
+        })
+        .unwrap();
+
+        assert!(output.contains("applied=0"));
+        assert!(output.contains("storage_coherence=unverified"));
+        assert!(layout.logs.join(super::REPORT_FILE_NAME).is_file());
+        let store = super::LocalStore::open_current(layout.state.join("store")).unwrap();
+        assert!(store.report_status().unwrap().pending());
+        drop(store);
+        let _ = fs::remove_file(archive);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_check_counts_active_and_stale_report_reservations() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-cli-reservation-{}",
+            std::process::id()
+        ));
+        super::runtime_check(&root).unwrap();
+        let layout = agent_observability_local_runtime::install(&root).unwrap();
+        let config = agent_observability_local_runtime::load(&layout.config).unwrap();
+        let control = agent_observability_local_runtime::RuntimeControl::new(&config).unwrap();
+        let mutation =
+            agent_observability_local_runtime::MutationGuard::acquire(&layout.runtime).unwrap();
+        let ceiling = control.writable_headroom(&root).unwrap()
+            - u64::from(config.collection.max_batch_bytes) / 2;
+        let reservation = control
+            .reserve_report_build(&root, &mutation, ceiling)
+            .unwrap();
+        drop(mutation);
+        assert!(
+            super::runtime_check(&root)
+                .unwrap()
+                .contains("storage_admission=denied")
+        );
+        drop(reservation);
+        assert!(
+            super::runtime_check(&root)
+                .unwrap()
+                .contains("storage_admission=denied")
+        );
+        let mutation =
+            agent_observability_local_runtime::MutationGuard::acquire(&layout.runtime).unwrap();
+        // This fixture created no staging file; guarded cleanup is already complete.
+        control
+            .claim_stale_report_reservation(&root, &mutation)
+            .unwrap()
+            .unwrap()
+            .release(&root, &mutation)
+            .unwrap();
+        drop(mutation);
+        assert!(
+            super::runtime_check(&root)
+                .unwrap()
+                .contains("storage_admission=allowed")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_check_reports_the_collectors_full_write_admission() {
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-runtime-ingest-admission-{}",
+            std::process::id()
+        ));
+        super::runtime_check(&root).unwrap();
+        let layout = install(&root).unwrap();
+        let config = super::load(&layout.config).unwrap();
+        let control = super::RuntimeControl::new(&config).unwrap();
+        let batch = u64::from(config.collection.max_batch_bytes);
+        let store_bytes =
+            super::StorageBudget::allocated_tree_bytes(&layout.state.join("store")).unwrap();
+        let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+        let ceiling = control.writable_headroom(&root).unwrap() - batch - store_bytes / 2;
+        let reservation = control
+            .reserve_report_build(&root, &mutation, ceiling)
+            .unwrap();
+        drop(mutation);
+        // The former status check reported allowed here, despite the actual writer's refusal.
+        assert!(matches!(
+            control.admit(&root, batch).unwrap(),
+            super::Admission::Allowed { .. }
+        ));
+        let output = super::runtime_check(&root).unwrap();
+        let diagnostic = control
+            .collector_admission_diagnostic(&root, batch)
+            .unwrap();
+        assert_eq!(diagnostic.admission, super::Admission::Denied);
+        assert!(diagnostic.deficit_bytes > 0);
+        assert!(output.contains("storage_admission=denied\n"));
+        let number = |key: &str| -> u64 {
+            output
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once('=')?;
+                    (name == key).then(|| value.parse().unwrap())
+                })
+                .unwrap()
+        };
+        // Each assessment is coherent under mutation; lock metadata may change
+        // allocation after runtime-check returns, so compare its own numeric snapshot.
+        assert_eq!(
+            number("storage_deficit_bytes"),
+            number("ingest_reservation_bytes").saturating_sub(number("writable_headroom_bytes"))
+        );
+        assert!(number("storage_deficit_bytes") > 0);
+        assert!(!output.contains(&root.to_string_lossy().into_owned()));
+        let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+        reservation.release(&root, &mutation).unwrap();
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn storage_check_opens_private_local_authority() {
         let directory = std::env::temp_dir().join(format!(
@@ -1683,6 +2915,7 @@ mod tests {
         .expect("storage check succeeds");
         assert!(output.contains(&format!("store_schema={LOCAL_STORE_SCHEMA_VERSION}")));
         assert!(output.contains("observations=0"));
+        assert!(output.contains("expired_trace_dispositions=0"));
         assert!(output.contains("team_ingest=disabled"));
         let _ = fs::remove_dir_all(directory);
     }

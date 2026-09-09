@@ -6,7 +6,7 @@
 
 ## Current and target stack
 
-현재 안정판은 `v1.10.0`이고, 이 문서는 해당 버전의 경계를 정의한다. macOS standalone은 Codex, Claude Code와 Cursor의 private
+현재 안정판은 `v1.10.0`이다. 이 문서는 공통 경계와 별도로 표시한 v1.11 개발 변경을 정의한다. macOS standalone은 Codex, Claude Code와 Cursor의 private
 handoff 수동 import를 daemon과 network 없이 계속 제공한다. 선택적 Codex automatic path는 private-CA
 HTTPS와 exact private random request header로 인증하는 `127.0.0.1` OTLP/HTTP JSON receiver,
 pre-transport projected notify supplement와 LaunchAgent를 추가한다. 이 transport는 mTLS가 아니다. Rust 경로는
@@ -36,13 +36,20 @@ collection의 Rust collector는 같은 executable의 private `collector-serve` m
 배포 형식은 transport일 뿐 domain/application/runtime 책임을 소유하지 않는다.
 
 TypeScript UI는 브라우저에서 직접 원본 event log를 읽지 않고 Rust가 만든 sanitized report 또는
-versioned config DTO만 사용한다. report는 self-contained static HTML이며 상시 web server를
-요구하지 않는다. `dashboard`는 별도 read-only path capability로 report를 runtime-root에서 결정되는
+versioned config DTO만 사용한다. 수동 report export는 self-contained static HTML이며 상시 web server를
+요구하지 않는다. `dashboard`는 별도 read-only path capability로 대시보드를 runtime-root에서 결정되는
 고정 IPv4 loopback port에 제공한다. 이 stable origin은 sanitized saved view의 browser-local persistence를
 프로세스 재시작 사이에도 보존한다. report-only router, capability, process lifetime은 settings surface와
 분리되며 설정·integration API를 등록하지 않는다. 설정에서 연 dashboard도 별도 자식 프로세스가 소유하고,
-반복 open은 살아 있는 동일 process를 재사용한다. 생성기와 transport는 같은 32 MiB artifact 상한을
-공유하며, foreground process는 10분 idle 또는 1시간 hard deadline에 종료된다.
+반복 open은 살아 있는 동일 process를 재사용한다. 안정판 v1.10의 단일 HTML transport와 수동
+export는 32 MiB artifact 상한을 공유한다. foreground process는 10분 idle 또는 1시간 hard deadline에 종료된다.
+
+v1.11 개발 브랜치에는 [Paged Dashboard](PAGED_DASHBOARD.md)의 data-free shell과 bounded
+query transport가 구현돼 있다. interactive dashboard는 페이지 단위로 조회하고, 수동
+self-contained HTML export는 기존 32 MiB 상한을 유지한다. 전체 데이터 삭제/축약이나 cap
+상향은 해결책으로 사용하지 않는다. 이 개발 구현을 배포 승인과 혼동하지 않으며,
+query/index의 generation, privacy, 삭제 fence, 실제 규모와 resource budget에 대한
+exact-revision 통합 검증을 배포 전에 완료해야 한다.
 설정 UI는 CLI가 명시적으로 시작한 동안에만 `127.0.0.1:0`에 bind하는 ephemeral
 inbound adapter를 사용한다. settings token, exact Host/Origin, body bound, no-store와 optimistic revision을
 검증한다. HTTP/1 header read는 5초, 동시 연결은 64개, 종료 drain은 1초로 제한해 불완전한
@@ -56,6 +63,30 @@ runtime을 설치하고 `InstalledLayout`을 local-ui에 주입한다. local-ui�
 `config.json` 직접 편집은 지원 경계 밖이다.
 
 ## Deployment profiles
+
+2026-09-08 후속 설계 방향은 [Storage Budget Policy](STORAGE_BUDGET_POLICY.md)다.
+보관 목표·작업 예산·디스크 최소 여유를 구분한다. P1은 legacy를 기본으로 보존하는 v5 설정
+계약만 추가하며, 분리 모드의 실제 실행은 P2/P3까지 거부한다. 아직 새 admission 동작이
+아니다. 아래 Isolated Ingest는 과거 후보로 보존하며 현재 구현 우선안이 아니다.
+unsafe/FFI 정책 예외나 자체 VFS를 도입하지 않는다.
+
+P2 staging 연결은 local-store가 소유하는 생성 직후 descriptor와 local-runtime의 예약을
+collector composition에서 결합한다. 연결의 내구화까지 mutation guard를 유지하고 이후
+projection 동안 해제하며, publication guard는 계속 유지한다. Runtime은 SQLite schema나
+catalog를 해석하지 않는다. 기존 예약 전액·복구 경계를 유지하며, 이 연결을 전체 파일 분류나
+동시 측정의 증명으로 취급하지 않는다. 구체적인 계약은 [Storage Ownership](STORAGE_OWNERSHIP.md)에 있다.
+
+v1.11 추가 개발 설계인 [Isolated Ingest](ISOLATED_INGEST.md)는 같은 Rust executable의
+수집 전용 자식 프로세스와 쓰기 제한 VFS 후보를 검토한다. 의존성 평가와 private IPC 설계
+범위는 승인됐지만 아직 구현되거나 활성화되지 않았다. 기존 transaction authority,
+privacy, 전역 예약과 `unsafe_code = "forbid"`를 유지하며, process 분리를 quota나 hard RSS
+보장으로 취급하지 않는다. OS quota·Docker·외부 서버를 standalone의 필수 조건으로 추가하지 않는다.
+
+The approved v1.11 local-state extension uses a fixed-width report acknowledgement separate from
+variable-size metadata. [Acknowledgement Storage](ACKNOWLEDGEMENT_STORAGE.md) owns its v6→v7
+migration, equality fence and disk-allocation contract. This changes only Rust local infrastructure;
+domain semantics, TypeScript report DTOs and team transport are unchanged. The development schema
+must not be confused with an installed or released upgrade.
 
 제품은 하나의 core를 두 개의 독립된 composition root로 조립한다.
 
@@ -281,8 +312,11 @@ anti-corruption layer다.
 
 ### Local Runtime
 
-- standalone 설정은 `local_runtime.v3` strict JSON이다. 기존 v1/v2는 명시적 migration으로
-  private Codex detail capture를 끈 v3로 로드한다. 팀 identity, 이메일, endpoint와 transport
+- 게시된 v1.10 standalone 설정은 `local_runtime.v3` strict JSON이다. v1.11 개발 브랜치는
+  `local_runtime.v5`에 opt-in storage lifecycle과 필수 `storage_budget` 계약을 포함한다.
+  v1–v4 migration은 기존 값을 보존하고 legacy 예산 모드를 선택한다. v1–v3에는 자동 정리를
+  끈 초기값을 추가하고 v4의 기존 lifecycle 선택은 보존한다. 분리 모드 실행은 P2/P3 전까지
+  차단한다. v1/v2의 private Codex detail capture도 기존처럼 기본 off다. 팀 identity, 이메일, endpoint와 transport
   설정은 포함하지 않는다.
 - Codex automatic integration은 별도 private `runtime/collector.json`,
   `runtime/integrations/codex/tls` credential tree와
@@ -428,8 +462,10 @@ Web UI는 TypeScript `strict` mode를 사용한다.
   완성된 중간 문자열 없이 private temporary file로 streaming한 뒤 고정된 logs 경로에 원자 기록한다.
   Node.js는 build/test에서만 사용된다.
 - Automatic collector의 report refresh는 ingest quiet period 뒤 최신 generation을 한 번 렌더한다.
-  연속 ingest 중 성장하는 전체 report를 주기적으로 다시 만들지 않으며, 새 commit이 render와
-  겹치면 stale generation을 acknowledge하지 않고 quiet-period 수렴을 다시 예약한다.
+  새 commit이 render와 겹치면 stale generation을 acknowledge하지 않는다. v1.11 개발 경로는
+  이 충돌을 데이터 오류와 구분하고, 직전 시도 시간에 비례하는 quiet period(최대 30초)를
+  같은 작업과 후속 작업에 유지해 빠른 전체 재스캔 반복을 억제한다. 입력이 계속되면 report는
+  pending/degraded 상태로 남을 수 있으며, 입력이 잠잠해진 뒤 최신 generation으로 수렴한다.
 - team profile의 hosted UI도 같은 `ReportDtoVx` schema와 UI component를 사용한다. transport와
   authentication/authorization만 profile별 composition root에서 달라진다. hosted query는
   server-resolved tenant/workspace scope 밖의 DTO를 생성할 수 없다.
@@ -538,6 +574,16 @@ policy로 표현한다. 수집된 billable dimension에 대응하는 규칙이 �
 identity, unknown model, alias, snapshot, cache breakdown, pricing modifier를 검증해야 한다.
 
 ## Maintainability and extensibility gates
+
+### v1.11.0 storage lifecycle work in progress
+
+[Storage Lifecycle](STORAGE_LIFECYCLE.md) defines the next standalone retention extension.
+Rust local-store owns atomic tier transitions and replay protection; local-runtime owns versioned
+policy and migration; the collector owns a quiet-period, bounded blocking maintenance task; CLI
+provides the same one-shot operation; TypeScript settings display the validated policy and deletion
+consequences. No Elasticsearch service, external archive sink or team transport is added.
+The current-release manual retention contract above remains the v1.10.0 reference until the new
+implementation and its migration, privacy, crash and performance gates pass.
 
 - canonical schema 변경에는 migration note와 이전 schema fixture가 필요하다.
 - adapter 추가에는 공통 parity suite와 unsupported-event fixture가 필요하다.

@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
 import { access, chmod, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { chromium, type Page, type Request } from "playwright-core";
+import type { CodexIntegrationStatusV1 } from "../ui/settings/generated/codex-integration-status-v1.js";
 
 const execute = promisify(execFile);
 
@@ -23,6 +23,12 @@ const child = spawn(binary, ["settings", runtimeRoot, "--no-open"], {
 });
 type SettingsProcess = typeof child;
 const browser = await chromium.launch({ executablePath, headless: true });
+const qaContext = await browser.newContext();
+let blockedPlatformOpenRequests = 0;
+await qaContext.route((url) => url.pathname === "/api/dashboard/open", async (route) => {
+  blockedPlatformOpenRequests += 1;
+  await route.abort("blockedbyclient");
+});
 let stderr = "";
 child.stderr.setEncoding("utf8");
 child.stderr.on("data", (chunk) => {
@@ -35,7 +41,8 @@ try {
   const results: Array<Record<string, string | number | boolean>> = [];
   const screenshotDirectory = process.env.SETTINGS_SCREENSHOT_DIR ?? directory;
 
-  const bootstrapFailurePage = await browser.newPage({ viewport: { width: 800, height: 600 } });
+  const bootstrapFailurePage = await qaContext.newPage();
+  await bootstrapFailurePage.setViewportSize({ width: 800, height: 600 });
   await mockCodexApi(bootstrapFailurePage);
   const bootstrapFailures: Request[] = [];
   const bootstrapPageErrors: string[] = [];
@@ -53,7 +60,8 @@ try {
   assert.deepEqual(bootstrapPageErrors, []);
   await bootstrapFailurePage.close();
 
-  const optionalIntegrationFailurePage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const optionalIntegrationFailurePage = await qaContext.newPage();
+  await optionalIntegrationFailurePage.setViewportSize({ width: 900, height: 700 });
   await mockCodexApi(optionalIntegrationFailurePage, { failStatus: true });
   await optionalIntegrationFailurePage.goto(url, { waitUntil: "networkidle" });
   await optionalIntegrationFailurePage.locator("#settings-form").waitFor();
@@ -67,7 +75,8 @@ try {
   assert.equal(await optionalIntegrationFailurePage.evaluate(() => sessionStorage.length), 1);
   await optionalIntegrationFailurePage.close();
 
-  const recoveringIntegrationPage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const recoveringIntegrationPage = await qaContext.newPage();
+  await recoveringIntegrationPage.setViewportSize({ width: 900, height: 700 });
   const recoveringIntegration = await mockCodexApi(recoveringIntegrationPage, {
     startConnected: true,
     firstStatusUnavailable: true,
@@ -81,7 +90,8 @@ try {
   );
   await recoveringIntegrationPage.close();
 
-  const persistentlyUnavailablePage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const persistentlyUnavailablePage = await qaContext.newPage();
+  await persistentlyUnavailablePage.setViewportSize({ width: 900, height: 700 });
   await persistentlyUnavailablePage.addInitScript(() => {
     const nativeAddEventListener = window.addEventListener.bind(window);
     window.addEventListener = ((type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions) => {
@@ -100,7 +110,8 @@ try {
   assert.equal(persistentlyUnavailable.methods.filter((method) => method === "GET").length, 2);
   await persistentlyUnavailablePage.close();
 
-  const outOfOrderPage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const outOfOrderPage = await qaContext.newPage();
+  await outOfOrderPage.setViewportSize({ width: 900, height: 700 });
   let integrationGetCount = 0;
   let releaseInitialStatus: (() => void) | undefined;
   const initialStatusRelease = new Promise<void>((resolve) => {
@@ -126,7 +137,8 @@ try {
   assert.equal(await outOfOrderPage.locator(".integration-panel").getAttribute("data-state"), "ready");
   await outOfOrderPage.close();
 
-  const expiredRacePage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const expiredRacePage = await qaContext.newPage();
+  await expiredRacePage.setViewportSize({ width: 900, height: 700 });
   await expiredRacePage.addInitScript(() => {
     const nativeSetInterval = window.setInterval.bind(window);
     (window as typeof window & { __agentobsIntervalCount?: number }).__agentobsIntervalCount = 0;
@@ -171,7 +183,8 @@ try {
   );
   await expiredRacePage.close();
 
-  const mutationFailurePage = await browser.newPage({ viewport: { width: 800, height: 600 } });
+  const mutationFailurePage = await qaContext.newPage();
+  await mutationFailurePage.setViewportSize({ width: 800, height: 600 });
   await mockCodexApi(mutationFailurePage);
   await mutationFailurePage.route(`${origin}/api/config`, (route) => {
     if (route.request().method() === "PUT") return route.abort("connectionfailed");
@@ -184,11 +197,12 @@ try {
   assert.equal(await mutationFailurePage.evaluate(() => sessionStorage.length), 0);
   await mutationFailurePage.close();
 
-  const lifecyclePage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+  const lifecyclePage = await qaContext.newPage();
+  await lifecyclePage.setViewportSize({ width: 1200, height: 800 });
   const lifecycle = await mockCodexApi(lifecyclePage, {
     startConflicted: true,
     failConnect: true,
-    conflictDisconnect: true,
+    uncertainDisconnect: true,
   });
   let dashboardFailures = 1;
   let dashboardOpenCount = 0;
@@ -225,7 +239,7 @@ try {
   assert.equal(lifecycle.launchAgentRunning, true);
   assert.equal(await lifecyclePage.locator("#toggle-integration").innerText(), "연결 해제");
 
-  lifecycle.status = degradedStatus();
+  lifecycle.status = degradedStatus(["lifecycle_failure"]);
   const documentIdentity = await lifecyclePage.evaluate(() => performance.timeOrigin);
   const navigationCount = await lifecyclePage.evaluate(
     () => performance.getEntriesByType("navigation").length,
@@ -234,9 +248,13 @@ try {
   await lifecyclePage.locator(".integration-panel[data-state='degraded']").waitFor();
   assert.match(
     await lifecyclePage.locator(".integration-identity strong").innerText(),
-    /리포트 반영 지연/,
+    /데이터 보관 정리 미완료/,
   );
-  assert.match(await lifecyclePage.locator(".integration-meta").innerText(), /리포트 지연/);
+  assert.match(
+    await lifecyclePage.locator(".integration-identity").innerText(),
+    /일부 데이터 또는 오류로 데이터 보관 정리 작업을 완료하지 못했습니다/,
+  );
+  assert.match(await lifecyclePage.locator(".integration-meta").innerText(), /상태 저하/);
   assert.doesNotMatch(await lifecyclePage.locator(".integration-meta").innerText(), /정상/);
   assert.equal(await lifecyclePage.locator("#toggle-integration").innerText(), "연결 해제");
   assert.equal(await lifecyclePage.evaluate(() => performance.timeOrigin), documentIdentity);
@@ -244,8 +262,23 @@ try {
     await lifecyclePage.evaluate(() => performance.getEntriesByType("navigation").length),
     navigationCount,
   );
+  lifecycle.status = degradedStatus(["storage_pressure"]);
+  await lifecyclePage.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await lifecyclePage.locator(".integration-identity strong").filter({ hasText: "정리용 임시 저장 공간 부족" }).waitFor();
+  assert.match(
+    await lifecyclePage.locator(".integration-identity").innerText(),
+    /정리 작업에 필요한 임시 저장 공간이 부족해 데이터 보관 정리가 지연됩니다/,
+  );
+  lifecycle.status = degradedStatus(["expired_trace"]);
+  await lifecyclePage.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await lifecyclePage.locator(".integration-identity strong").filter({ hasText: "만료된 세션 데이터 제외" }).waitFor();
+  assert.match(
+    await lifecyclePage.locator(".integration-identity").innerText(),
+    /에이전트에서 새 세션을 시작해야 합니다/,
+  );
 
-  const heartbeatPage = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const heartbeatPage = await qaContext.newPage();
+  await heartbeatPage.setViewportSize({ width: 900, height: 700 });
   await heartbeatPage.addInitScript(() => {
     const nativeSetInterval = window.setInterval.bind(window);
     window.setInterval = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
@@ -287,8 +320,13 @@ try {
   await lifecyclePage.locator("#toast").filter({ hasText: "모니터링 리포트를 열었습니다" }).waitFor();
   assert.equal(dashboardOpenCount, 2);
 
+  const disconnectAttemptIndex = lifecycle.methods.length;
   await lifecyclePage.locator("#toggle-integration").click();
-  await lifecyclePage.locator("#toast").filter({ hasText: "injected disconnect conflict" }).waitFor();
+  await lifecyclePage
+    .locator("#toast")
+    .filter({ hasText: "변경 또는 복원 결과를 확정할 수 없습니다. 현재 상태를 다시 확인해야 합니다. 현재 상태를 다시 확인했습니다." })
+    .waitFor();
+  assert.deepEqual(lifecycle.methods.slice(disconnectAttemptIndex), ["DELETE", "GET"]);
   assert.equal(lifecycle.status.config, "connected");
   assert.equal(lifecycle.launchAgentRunning, true);
   assert.equal(await lifecyclePage.locator("#toggle-integration").isEnabled(), true);
@@ -313,21 +351,33 @@ try {
   await lifecyclePage.close();
 
   for (const lifecycleMethod of ["POST", "DELETE"] as const) {
-    const delayedLifecyclePage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+    const delayedLifecyclePage = await qaContext.newPage();
+    await delayedLifecyclePage.setViewportSize({ width: 1200, height: 800 });
     const delayedLifecycle = await mockCodexApi(delayedLifecyclePage, {
       startConnected: lifecycleMethod === "DELETE",
       delayedMethod: lifecycleMethod,
     });
+    let finishShutdown: (() => void) | undefined;
+    const shutdownRelease = new Promise<void>((resolve) => {
+      finishShutdown = resolve;
+    });
     await delayedLifecyclePage.route(`${origin}/api/shutdown`, async (route) => {
+      await shutdownRelease;
       await route.fulfill({ status: 204 });
     });
     await delayedLifecyclePage.goto(url, { waitUntil: "networkidle" });
     await delayedLifecyclePage.locator("#toggle-integration").click();
     await delayedLifecycle.waitForStart();
     await delayedLifecyclePage.locator("#close-session").click();
-    await delayedLifecyclePage.locator("text=설정 세션이 종료되었습니다").waitFor();
     delayedLifecycle.complete();
     await delayedLifecycle.waitForCompletion();
+    assert.equal(
+      await delayedLifecyclePage.locator("button:not(#close-session):enabled").count(),
+      0,
+    );
+    if (!finishShutdown) throw new Error("shutdown release was not initialized");
+    finishShutdown();
+    await delayedLifecyclePage.locator("text=설정 세션이 종료되었습니다").waitFor();
     await delayedLifecyclePage.evaluate(() => new Promise<void>((resolve) => {
       requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
     }));
@@ -337,35 +387,193 @@ try {
     await delayedLifecyclePage.close();
   }
 
-  const dashboardLauncherPage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+  for (const order of ["integration-first", "shutdown-first"] as const) {
+    const failedClosePage = await qaContext.newPage();
+    await failedClosePage.setViewportSize({ width: 1200, height: 800 });
+    const delayedIntegration = await mockCodexApi(failedClosePage, { delayedMethod: "POST" });
+    let releaseFailedShutdown: (() => void) | undefined;
+    const failedShutdownRelease = new Promise<void>((resolve) => {
+      releaseFailedShutdown = resolve;
+    });
+    await failedClosePage.route(`${origin}/api/shutdown`, async (route) => {
+      await failedShutdownRelease;
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "shutdown_failed", message: "injected shutdown failure" }),
+      });
+    });
+    await failedClosePage.goto(url, { waitUntil: "networkidle" });
+    await failedClosePage.locator("#toggle-integration").click();
+    await delayedIntegration.waitForStart();
+    await failedClosePage.locator("#close-session").click();
+
+    if (order === "integration-first") {
+      delayedIntegration.complete();
+      await delayedIntegration.waitForCompletion();
+      if (!releaseFailedShutdown) throw new Error("failed shutdown release was not initialized");
+      releaseFailedShutdown();
+    } else {
+      if (!releaseFailedShutdown) throw new Error("failed shutdown release was not initialized");
+      releaseFailedShutdown();
+    }
+
+    await failedClosePage.locator("#close-error").filter({ hasText: "다시 시도" }).waitFor();
+    assert.equal(await failedClosePage.locator("#close-dialog").getAttribute("open"), "");
+    assert.equal(await failedClosePage.locator("#confirm-close").isEnabled(), true);
+    assert.equal(await failedClosePage.locator("#save").isDisabled(), true);
+
+    if (order === "shutdown-first") {
+      delayedIntegration.complete();
+      await delayedIntegration.waitForCompletion();
+      await failedClosePage.locator("#close-error").filter({ hasText: "다시 시도" }).waitFor();
+      assert.equal(await failedClosePage.locator("#close-dialog").getAttribute("open"), "");
+      assert.equal(await failedClosePage.locator("#confirm-close").isEnabled(), true);
+      assert.equal(await failedClosePage.locator("#save").isDisabled(), true);
+    }
+    results.push({ name: `failed-close-${order}`, visibleRetry: true });
+    await failedClosePage.close();
+  }
+
+  for (const scenario of ["success", "error", "rebase"] as const) {
+    const saveRacePage = await qaContext.newPage();
+    await saveRacePage.setViewportSize({ width: 1200, height: 800 });
+    await mockCodexApi(saveRacePage);
+    await saveRacePage.route(`${origin}/api/shutdown`, async (route) => {
+      await route.fulfill({ status: 204 });
+    });
+    await saveRacePage.goto(url, { waitUntil: "networkidle" });
+    const envelope = await saveRacePage.evaluate(async () => {
+      const session = sessionStorage.getItem("agent-observability.settings.session.v1");
+      const response = await fetch("/api/config", {
+        headers: { "x-agent-observability-session": session ?? "" },
+      });
+      return response.json();
+    });
+    let markResponseStarted: (() => void) | undefined;
+    const responseStarted = new Promise<void>((resolve) => {
+      markResponseStarted = resolve;
+    });
+    let releaseResponse: (() => void) | undefined;
+    const responseRelease = new Promise<void>((resolve) => {
+      releaseResponse = resolve;
+    });
+    const configMethods: string[] = [];
+    await saveRacePage.route(`${origin}/api/config`, async (route) => {
+      const method = route.request().method();
+      configMethods.push(method);
+      if (method === "PUT" && scenario === "rebase") {
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({ code: "config_conflict", message: "injected conflict" }),
+        });
+        return;
+      }
+      markResponseStarted?.();
+      await responseRelease;
+      if (scenario === "error") {
+        await route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: JSON.stringify({ code: "save_failed", message: "injected late save failure" }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(envelope),
+      });
+    });
+    await saveRacePage.locator("#collection-max_batch_records").fill("124");
+    await saveRacePage.locator("#save").click();
+    await responseStarted;
+    await saveRacePage.locator("#close-session").click();
+    await saveRacePage.locator("#confirm-close").click();
+    await saveRacePage.locator("text=설정 세션이 종료되었습니다").waitFor();
+    if (!releaseResponse) throw new Error("save response release was not initialized");
+    releaseResponse();
+    await saveRacePage.evaluate(() => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    }));
+    assert.equal(await saveRacePage.locator("text=설정 세션이 종료되었습니다").count(), 1);
+    assert.equal(await saveRacePage.locator("#settings-form").count(), 0);
+    assert.equal(await saveRacePage.evaluate(() => sessionStorage.length), 0);
+    assert.deepEqual(
+      configMethods,
+      scenario === "rebase" ? ["PUT", "GET"] : ["PUT"],
+    );
+    results.push({ name: `close-during-save-${scenario}`, expiredUiRetained: true });
+    await saveRacePage.close();
+  }
+
+  const dashboardLauncherPage = await qaContext.newPage();
+  await dashboardLauncherPage.setViewportSize({ width: 1200, height: 800 });
+  let platformOpenApiRequests = 0;
+  dashboardLauncherPage.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/dashboard/open") platformOpenApiRequests += 1;
+  });
   await dashboardLauncherPage.goto(url, { waitUntil: "networkidle" });
-  const expectedDashboardOpenStatus = process.platform === "darwin" ? 204 : 409;
-  const firstOpenResponse = dashboardLauncherPage.waitForResponse(
-    (response) => response.url() === `${origin}/api/dashboard/open`
-      && response.request().method() === "POST",
-  );
-  await dashboardLauncherPage.locator("#open-dashboard").click();
-  assert.equal((await firstOpenResponse).status(), expectedDashboardOpenStatus);
-  const dashboardUrl = await waitForDashboardUrl(runtimeRoot);
+  const dashboardUrl = await launchDashboardWithoutOpener(dashboardLauncherPage);
   const dashboardPid = await readDashboardPid(runtimeRoot);
-  const secondOpenResponse = dashboardLauncherPage.waitForResponse(
-    (response) => response.url() === `${origin}/api/dashboard/open`
-      && response.request().method() === "POST",
+  const reusedDashboardUrl = await launchDashboardWithoutOpener(dashboardLauncherPage);
+  assert.equal(
+    reusedDashboardUrl === dashboardUrl,
+    true,
+    "repeated launch requests must reuse one private dashboard URL",
   );
-  await dashboardLauncherPage.locator("#open-dashboard").click();
-  assert.equal((await secondOpenResponse).status(), expectedDashboardOpenStatus);
   assert.equal(await readDashboardPid(runtimeRoot), dashboardPid, "repeated opens must reuse one server");
-  const independentDashboardPage = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+  assert.equal(platformOpenApiRequests, 0, "headless QA must not request the platform-opening API");
+  const independentDashboardPage = await qaContext.newPage();
+  await independentDashboardPage.setViewportSize({ width: 1200, height: 800 });
   await independentDashboardPage.goto(dashboardUrl, { waitUntil: "load" });
-  assert.equal(await independentDashboardPage.locator("h1").textContent(), "Agent Observability Report");
+  assert.equal(await independentDashboardPage.locator("h1").textContent(), "Agent Observability");
   await dashboardLauncherPage.close();
+
+  const preservedStorageBudget = {
+    mode: "legacy",
+    retained_target_bytes: 2_147_483_648,
+    workspace_budget_bytes: 805_306_368,
+    minimum_free_bytes: 1_610_612_736,
+  };
+  const budgetSeedPage = await qaContext.newPage();
+  await mockCodexApi(budgetSeedPage);
+  await budgetSeedPage.goto(url, { waitUntil: "networkidle" });
+  await budgetSeedPage.locator("#settings-form").waitFor();
+  await budgetSeedPage.evaluate(async (storageBudget) => {
+    const token = sessionStorage.getItem("agent-observability.settings.session.v1");
+    if (!token) throw new Error("settings session token is unavailable");
+    const headers = { "x-agent-observability-session": token, "content-type": "application/json" };
+    const response = await fetch("/api/config", { headers });
+    if (!response.ok) throw new Error(`config seed read failed (${response.status})`);
+    const body = await response.json();
+    body.config.storage_budget = storageBudget;
+    body.config.collection.max_batch_records = 124;
+    const saved = await fetch("/api/config", {
+      method: "PUT", headers, body: JSON.stringify({ config: body.config, revision: body.revision }),
+    });
+    if (!saved.ok) throw new Error(`config seed save failed (${saved.status})`);
+  }, preservedStorageBudget);
+  await budgetSeedPage.reload({ waitUntil: "networkidle" });
+  await budgetSeedPage.locator("#settings-form").waitFor();
+  await budgetSeedPage.locator("#reset").click();
+  await budgetSeedPage.locator("#confirm-reset").click();
+  await budgetSeedPage.locator("#save").click();
+  await budgetSeedPage.waitForFunction(() => (document.querySelector("#save") as HTMLButtonElement).disabled
+    && document.querySelector("#save-title")?.textContent === "저장됨");
+  const resetConfig = JSON.parse(await readFile(join(runtimeRoot, "config.json"), "utf8"));
+  assert.equal(resetConfig.collection.max_batch_records, 100);
+  assert.deepEqual(resetConfig.storage_budget, preservedStorageBudget);
+  await budgetSeedPage.close();
 
   for (const testCase of [
     { name: "desktop", viewport: { width: 1440, height: 900 } },
     { name: "mobile", viewport: { width: 390, height: 844 } },
     { name: "compact", viewport: { width: 320, height: 800 } },
   ]) {
-    const page = await browser.newPage({ viewport: testCase.viewport });
+    const page = await qaContext.newPage();
+    await page.setViewportSize(testCase.viewport);
     await mockCodexApi(page);
     const consoleErrors: string[] = [];
     const expectedApiErrors: string[] = [];
@@ -399,8 +607,8 @@ try {
     assert.equal(await page.evaluate(() => location.hash), "");
     assert.equal(await page.locator("main").count(), 1);
     assert.equal(await page.locator("nav[aria-label='설정 영역']").count(), 1);
-    assert.equal(await page.locator("#settings-form input[type=number]").count(), 10);
-    assert.equal(await page.locator("#settings-form input[type=checkbox]").count(), 2);
+    assert.equal(await page.locator("#settings-form input[type=number]").count(), 16);
+    assert.equal(await page.locator("#settings-form input[type=checkbox]").count(), 3);
     assert.equal(
       await page.evaluate(
         () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
@@ -438,8 +646,37 @@ try {
       await page.waitForFunction(() => document.activeElement?.id === "save-title");
       const configPath = join(runtimeRoot, "config.json");
       const config = JSON.parse(await readFile(configPath, "utf8"));
+      assert.equal(config.schema_version, "local_runtime.v5");
+      assert.deepEqual(config.storage_budget, preservedStorageBudget);
       assert.equal(config.collection.max_batch_records, 125);
       assert.equal(config.capture_private_codex_turn_details, true);
+      assert.equal(config.lifecycle.enabled, false);
+      assert.match(await page.locator(".lifecycle-warning").innerText(), /삭제는 되돌릴 수 없습니다/);
+      assert.match(await page.locator(".lifecycle-warning").innerText(), /에이전트에서 새 세션을 시작해야 합니다/);
+      await page.locator('[data-boolean-field="lifecycle.enabled"]').click();
+      await page.locator("#lifecycle-hot_days").fill("10");
+      await page.locator("#lifecycle-warm_days").fill("9");
+      await page.locator("#save").click();
+      assert.equal(await page.locator("#lifecycle-warm_days").getAttribute("aria-invalid"), "true");
+      assert.equal(JSON.parse(await readFile(configPath, "utf8")).lifecycle.enabled, false);
+      await page.locator("#lifecycle-warm_days").fill("30");
+      await page.locator("#lifecycle-private_raw_days").fill("3");
+      await page.locator("#save").click();
+      await page.waitForFunction(() => (document.querySelector("#save") as HTMLButtonElement).disabled
+        && document.querySelector("#save-title")?.textContent === "저장됨");
+      const lifecycleConfig = JSON.parse(await readFile(configPath, "utf8"));
+      assert.deepEqual(lifecycleConfig.storage_budget, preservedStorageBudget);
+      assert.equal(lifecycleConfig.lifecycle.enabled, true);
+      assert.equal(lifecycleConfig.lifecycle.hot_days, 10);
+      assert.equal(lifecycleConfig.lifecycle.private_raw_days, 3);
+      await page.reload({ waitUntil: "networkidle" });
+      assert.equal(await page.locator("#lifecycle-enabled").isChecked(), true);
+      assert.equal(await page.locator("#lifecycle-hot_days").inputValue(), "10");
+      await page.locator('[data-boolean-field="lifecycle.enabled"]').click();
+      await page.locator("#save").click();
+      await page.waitForFunction(() => (document.querySelector("#save") as HTMLButtonElement).disabled
+        && document.querySelector("#save-title")?.textContent === "저장됨");
+      assert.equal(JSON.parse(await readFile(configPath, "utf8")).lifecycle.enabled, false);
       await page.locator("#collection-max_batch_records").fill("");
       await page.locator("#collection-flush_interval_ms").fill("6000");
       await page.locator("#save").click();
@@ -627,33 +864,37 @@ try {
   const exitCode = await waitForExit(child);
   assert.equal(exitCode, 0, stderr);
   await independentDashboardPage.reload({ waitUntil: "load" });
-  assert.equal(await independentDashboardPage.locator("h1").textContent(), "Agent Observability Report");
+  assert.equal(await independentDashboardPage.locator("h1").textContent(), "Agent Observability");
   results.push({ name: "independent-dashboard", reloadAfterSettingsExit: true });
   await independentDashboardPage.close();
+  assert.equal(blockedPlatformOpenRequests, 0, "QA attempted an unmocked platform-opening API request");
   await stopDashboardProcess(runtimeRoot);
   console.log(JSON.stringify({ executablePath, results }));
 } finally {
   if (child.exitCode === null) child.kill("SIGTERM");
+  await qaContext.close();
   await browser.close();
   if (!process.env.SETTINGS_SCREENSHOT_DIR) {
     await rm(directory, { recursive: true, force: true });
   }
 }
 
-async function waitForDashboardUrl(root: string): Promise<string> {
-  const canonicalRoot = await realpath(root);
-  const digest = createHash("sha256").update(canonicalRoot).digest();
-  const port = 49_152 + (digest.readUInt16BE(0) % 12_000);
-  const capabilityPath = join(canonicalRoot, "runtime", "dashboard-ui", "capability");
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    const token = await readFile(capabilityPath, "utf8").then((value) => value.trim()).catch(() => "");
-    if (/^[0-9a-f]{64}$/.test(token)) {
-      return `http://127.0.0.1:${port}/report/${token}`;
+async function launchDashboardWithoutOpener(page: Page): Promise<string> {
+  return page.evaluate(async () => {
+    const token = sessionStorage.getItem("agent-observability.settings.session.v1");
+    if (!token) throw new Error("settings session token is unavailable");
+    const response = await fetch("/api/dashboard/launch", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "x-agent-observability-session": token },
+    });
+    if (!response.ok) throw new Error(`dashboard launch failed (${response.status})`);
+    const body = await response.json() as { url?: unknown };
+    if (typeof body.url !== "string" || !body.url.startsWith("http://127.0.0.1:")) {
+      throw new Error("dashboard launch returned an invalid URL");
     }
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  throw new Error("settings-launched dashboard capability was not created");
+    return body.url;
+  });
 }
 
 async function stopDashboardProcess(root: string): Promise<void> {
@@ -729,19 +970,13 @@ function rectanglesOverlap(first: DOMRect, second: DOMRect): boolean {
   );
 }
 
-type IntegrationStatus = {
-  config: "connected" | "disconnected" | "conflict";
-  collector: "ready" | "degraded" | "unavailable";
-  endpoint?: string;
-  service?: string;
-  data_retained: boolean;
-};
+type IntegrationStatus = CodexIntegrationStatusV1;
 
 type MockCodexOptions = {
   startConflicted?: boolean;
   startConnected?: boolean;
   failConnect?: boolean;
-  conflictDisconnect?: boolean;
+  uncertainDisconnect?: boolean;
   delayedMethod?: "POST" | "DELETE";
   failStatus?: boolean;
   firstStatusUnavailable?: boolean;
@@ -775,7 +1010,7 @@ async function mockCodexApi(page: Page, options: MockCodexOptions = {}) {
     waitForCompletion: () => lifecycleCompletion,
   };
   let failConnect = options.failConnect ?? false;
-  let conflictDisconnect = options.conflictDisconnect ?? false;
+  let uncertainDisconnect = options.uncertainDisconnect ?? false;
   let firstStatusUnavailable = options.firstStatusUnavailable ?? false;
   let unavailableStatusCount = options.unavailableStatusCount ?? 0;
   await page.route("**/api/integrations/codex", async (route) => {
@@ -821,12 +1056,15 @@ async function mockCodexApi(page: Page, options: MockCodexOptions = {}) {
       });
       return;
     }
-    if (method === "DELETE" && conflictDisconnect) {
-      conflictDisconnect = false;
+    if (method === "DELETE" && uncertainDisconnect) {
+      uncertainDisconnect = false;
       await route.fulfill({
         status: 409,
         contentType: "application/json",
-        body: JSON.stringify({ code: "integration_conflict", message: "injected disconnect conflict" }),
+        body: JSON.stringify({
+          code: "integration_outcome_uncertain",
+          message: "변경 또는 복원 결과를 확정할 수 없습니다. 현재 상태를 다시 확인해야 합니다.",
+        }),
       });
       return;
     }
@@ -849,36 +1087,54 @@ async function mockCodexApi(page: Page, options: MockCodexOptions = {}) {
 
 function connectedStatus(): IntegrationStatus {
   return {
+    schema_version: "codex_integration_status.v1",
     config: "connected",
+    notify: "agentobs_owned",
     collector: "ready",
     endpoint: "https://127.0.0.1:4318/v1/logs",
     service: "dev.agent-observability.collector",
     data_retained: true,
+    collector_degradation_reasons: [],
   };
 }
 
-function degradedStatus(): IntegrationStatus {
+function degradedStatus(
+  reasons: IntegrationStatus["collector_degradation_reasons"] = [],
+): IntegrationStatus {
   return {
+    schema_version: "codex_integration_status.v1",
     config: "connected",
+    notify: "agentobs_owned",
     collector: "degraded",
     endpoint: "https://127.0.0.1:4318/v1/logs",
     service: "dev.agent-observability.collector",
     data_retained: true,
+    collector_degradation_reasons: reasons,
   };
 }
 
 function disconnectedStatus(): IntegrationStatus {
   return {
+    schema_version: "codex_integration_status.v1",
     config: "disconnected",
+    notify: null,
     collector: "unavailable",
+    endpoint: null,
+    service: null,
     data_retained: true,
+    collector_degradation_reasons: [],
   };
 }
 
 function conflictStatus(): IntegrationStatus {
   return {
+    schema_version: "codex_integration_status.v1",
     config: "conflict",
+    notify: "external_preserved",
     collector: "unavailable",
+    endpoint: null,
+    service: null,
     data_retained: true,
+    collector_degradation_reasons: [],
   };
 }

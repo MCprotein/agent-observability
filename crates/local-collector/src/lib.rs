@@ -1,20 +1,40 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
+mod ingest_precommit;
+mod report_coherence;
+mod report_precommit;
+mod settings_coordination;
+pub mod storage_ownership;
+
+pub use ingest_precommit::{CollectorIngestPrecommitError, CollectorIngestPrecommitGuard};
+pub use report_precommit::{CollectorReportPrecommitError, CollectorReportPrecommitGuard};
+
+use report_coherence::{ReportMutationScope, ReportWritePermits, report_coherence_failure};
+
 use agent_observability_adapter_codex::{
     AdapterBatch, AdapterItem, MAX_HANDOFF_BYTES, MAX_PRIVATE_TURN_DETAIL_BYTES,
     OtlpRequestCorrelationState, PrivateCodexTurnDetailV1, ProjectedNotifyV2,
     parse_otlp_http_json_with_state, parse_projected_notify_json, project_notify_json,
     project_notify_with_private_detail,
 };
-use agent_observability_application::ReportProjector;
 #[cfg(test)]
 use agent_observability_application::project_report;
-use agent_observability_local_runtime::{
-    Admission, InstalledLayout, LocalRuntimeConfigV3, MutationGuard, PressureSample,
-    RuntimeControl, Singleton, SingletonError, StorageBudget, inspect, install, load,
+use agent_observability_contracts::{CollectorDegradationReasonV1, LOCAL_COLLECTOR_HEALTH_VERSION};
+use agent_observability_local_runtime::storage_coherence::{
+    OwnedStorageFreezeGuard, StorageBarrier, StorageMutationWriter,
 };
-use agent_observability_local_store::{LocalStore, StoreBatchItem};
+use agent_observability_local_runtime::{
+    Admission, ControlError, CoordinatedSingletonScope, InstalledLayout, LocalRuntimeConfigV3,
+    MutationGuard, PressureSample, ProductionSingleton, REPORT_RESERVATION_METADATA_ALLOWANCE,
+    ReservationError, RuntimeControl, SingletonError, StorageBudget, inspect, install, load,
+};
+use agent_observability_local_store::{
+    LocalStore, MISSING_RATE_FINGERPRINT, ReportViewBuildError, ReportViewCatalogError,
+    StoreBatchItem, current_report_view, current_report_view_needs_kernel_upgrade,
+    publish_report_view, recover_report_view_catalog, recover_report_view_catalog_before_migration,
+};
+#[cfg(test)]
 use agent_observability_static_report::write_private;
 use axum::{
     Router,
@@ -78,6 +98,11 @@ const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
 const MAX_CREDENTIAL_PATH_BYTES: usize = 256;
 static SETTINGS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const REPORT_DIRTY_FILE_NAME: &str = "report-dirty";
+const MAX_AUTOMATIC_REPORT_VIEW_BYTES: u64 = agent_observability_local_store::MAX_REPORT_VIEW_BYTES;
+// The bounded catalog replacement and authority ACK journal are separate from the
+// staging builder's own database/journal allowance. Include both in shared admission.
+const REPORT_VIEW_PUBLICATION_RESERVE_BYTES: u64 =
+    64 * 1024 + agent_observability_local_store::MAX_REPORT_ACKNOWLEDGEMENT_BYTES;
 const PRIVATE_TURN_DETAIL_DIRECTORY: &str = "private-codex-turn-details";
 const PRIVATE_TURN_DETAIL_STATUS_DIRECTORY: &str = "private-codex-turn-detail-statuses";
 const PRIVATE_TURN_DETAIL_STATUS_VERSION: &str = "private_codex_turn_detail_status.v1";
@@ -93,7 +118,10 @@ const PRIVATE_NOTIFY_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 const REPORT_RETRY_LIMIT: u32 = 4;
 const REPORT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
 const REPORT_DEBOUNCE_DELAY: Duration = Duration::from_millis(200);
+const REPORT_CONTENTION_QUIET_LIMIT: Duration = Duration::from_secs(30);
 const REPORT_AUTHORITY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const LIFECYCLE_POLICY_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const LIFECYCLE_QUIET_PERIOD_MS: u64 = 30_000;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_LIFETIME: Duration = Duration::from_secs(30);
 const MAX_CONNECTIONS: usize = 64;
@@ -304,6 +332,15 @@ impl PrivateTurnDetailReceiptV1 {
 
 #[derive(Debug)]
 pub enum CollectorError {
+    StorageWriteUnverified {
+        /// Publication was crossed or the operation returned successfully.
+        /// False means completion is unknown, not that nothing was written.
+        operation_completed: bool,
+        primary: Option<Box<CollectorError>>,
+        verification: Box<CollectorError>,
+    },
+    LifecycleStoragePressure,
+    DashboardStorageCapacity,
     Io(std::io::Error),
     RequestIo {
         stage: &'static str,
@@ -314,25 +351,37 @@ pub enum CollectorError {
 
 /// Creates or loads the private, idempotent local collector settings.
 pub fn install_settings(root: &Path) -> Result<CollectorSettings, CollectorError> {
-    let layout = install(root).map_err(runtime_error)?;
-    recover_settings_migration_before_install(&layout)?;
-    let path = settings_path(&layout);
+    settings_coordination::with_settings_writer(root, install_settings_locked)
+}
+
+/// Creates or loads settings, waiting only for root mutation ownership.
+///
+/// Intended for foreground connection setup. Root waiting has no timeout; accounting
+/// is attempted once, and the settings operation is never retried. The default
+/// [`install_settings`] remains try-only. This does not initialize accounting.
+pub fn install_settings_waiting_for_root(root: &Path) -> Result<CollectorSettings, CollectorError> {
+    settings_coordination::with_settings_writer_waiting_for_root(root, install_settings_locked)
+}
+
+fn install_settings_locked(layout: &InstalledLayout) -> Result<CollectorSettings, CollectorError> {
+    recover_settings_migration_before_install(layout)?;
+    let path = settings_path(layout);
     match fs::symlink_metadata(&path) {
         Ok(_) => {
             let snapshot = read_private_snapshot(&path, MAX_SETTINGS_BYTES)?;
             if let Ok(settings) = parse_owned_settings(&snapshot.bytes) {
                 if settings.credentials.expires_at_unix_ms > current_unix_ms()? {
-                    validate_owned_credentials(&layout, &settings)?;
+                    validate_owned_credentials(layout, &settings)?;
                     return Ok(settings);
                 }
-                validate_owned_credentials(&layout, &settings)?;
-                return replace_settings(&layout, Some(&snapshot));
+                validate_owned_credentials(layout, &settings)?;
+                return replace_settings(layout, Some(&snapshot));
             }
             let legacy_generation =
-                validate_legacy_settings_for_migration(&layout, &snapshot.bytes)?;
-            begin_settings_migration(&layout, &snapshot, legacy_generation)
+                validate_legacy_settings_for_migration(layout, &snapshot.bytes)?;
+            begin_settings_migration(layout, &snapshot, legacy_generation)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => rotate_settings(&layout),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => rotate_settings(layout),
         Err(error) => Err(error.into()),
     }
 }
@@ -342,11 +391,7 @@ fn validate_legacy_settings_for_migration(
     bytes: &[u8],
 ) -> Result<Option<String>, CollectorError> {
     if let Ok(legacy) = serde_json::from_slice::<LegacyCollectorSettingsV1>(bytes)
-        && legacy.schema_version == "local_collector.v1"
-        && legacy.port != 0
-        && legacy.token.len() == 64
-        && legacy.token.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && legacy.source_generation == SOURCE_GENERATION
+        && valid_legacy_v1_metadata(&legacy)
     {
         return Ok(None);
     }
@@ -356,8 +401,15 @@ fn validate_legacy_settings_for_migration(
     Ok(Some(legacy.generation))
 }
 
-fn validate_legacy_v2_mtls(
-    layout: &InstalledLayout,
+fn valid_legacy_v1_metadata(settings: &LegacyCollectorSettingsV1) -> bool {
+    settings.schema_version == "local_collector.v1"
+        && settings.port != 0
+        && settings.token.len() == 64
+        && settings.token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && settings.source_generation == SOURCE_GENERATION
+}
+
+fn validate_legacy_v2_metadata(
     settings: &LegacyCollectorSettingsV2Mtls,
 ) -> Result<(), CollectorError> {
     if settings.schema_version != "local_collector.v2"
@@ -399,6 +451,22 @@ fn validate_legacy_v2_mtls(
                 "invalid legacy collector credential path".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_legacy_v2_mtls(
+    layout: &InstalledLayout,
+    settings: &LegacyCollectorSettingsV2Mtls,
+) -> Result<(), CollectorError> {
+    validate_legacy_v2_metadata(settings)?;
+    for path in [
+        &settings.credentials.ca_certificate,
+        &settings.credentials.server_certificate,
+        &settings.credentials.server_private_key,
+        &settings.credentials.client_certificate,
+        &settings.credentials.client_private_key,
+    ] {
         read_private_bounded(&credential_path(layout, path)?, MAX_CREDENTIAL_BYTES)?;
     }
     let generation_dir = layout
@@ -465,6 +533,9 @@ fn begin_settings_migration(
         previous,
         MAX_SETTINGS_BYTES,
     ) {
+        if matches!(error, CollectorError::StorageWriteUnverified { .. }) {
+            return Err(error);
+        }
         let cleanup = cleanup_credential_generation(layout, &settings.generation)
             .and_then(|()| remove_private_file(&migration_path));
         return Err(match cleanup {
@@ -492,6 +563,9 @@ fn replace_settings(
         None => write_private_json(&settings_path(layout), &settings),
     };
     if let Err(error) = write_result {
+        if matches!(error, CollectorError::StorageWriteUnverified { .. }) {
+            return Err(error);
+        }
         return Err(
             match cleanup_credential_generation(layout, &settings.generation) {
                 Ok(()) => error,
@@ -554,12 +628,19 @@ fn cleanup_credential_generation(
     generation: &str,
 ) -> Result<(), CollectorError> {
     let tls_root = layout.runtime.join(TLS_DIRECTORY);
+    let directory = match settings_coordination::SettingsDirectory::open(&tls_root) {
+        Ok(directory) => directory,
+        Err(CollectorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     match fs::remove_dir_all(tls_root.join(generation)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     }
-    File::open(tls_root)?.sync_all()?;
+    directory.sync()?;
     Ok(())
 }
 
@@ -589,64 +670,67 @@ fn load_settings_from_layout(
 
 /// Commits a pending legacy settings migration after collector service and Codex config commit.
 pub fn commit_settings_migration(root: &Path) -> Result<(), CollectorError> {
-    let layout = install(root).map_err(runtime_error)?;
-    let Some(mut migration) = load_settings_migration(&layout)? else {
-        return Ok(());
-    };
-    let current = read_private_snapshot(&settings_path(&layout), MAX_SETTINGS_BYTES)?;
-    let settings = parse_owned_settings(&current.bytes)?;
-    if settings.generation != migration.replacement_generation {
-        return Err(CollectorError::Runtime(
-            "collector settings changed before migration commit".into(),
-        ));
-    }
-    if migration.phase == SettingsMigrationPhase::Pending {
-        let path = settings_migration_path(&layout);
-        let snapshot = read_private_snapshot(&path, MAX_SETTINGS_MIGRATION_BYTES)?;
-        migration.phase = SettingsMigrationPhase::IntegrationCommitted;
-        write_private_json_if_unchanged(
-            &path,
-            &migration,
-            &snapshot,
-            MAX_SETTINGS_MIGRATION_BYTES,
-        )?;
-    }
-    finalize_committed_settings_migration(&layout, &migration)
+    settings_coordination::with_settings_writer(root, |layout| {
+        let Some(mut migration) = load_settings_migration(layout)? else {
+            return Ok(());
+        };
+        let current = read_private_snapshot(&settings_path(layout), MAX_SETTINGS_BYTES)?;
+        let settings = parse_owned_settings(&current.bytes)?;
+        if settings.generation != migration.replacement_generation {
+            return Err(CollectorError::Runtime(
+                "collector settings changed before migration commit".into(),
+            ));
+        }
+        if migration.phase == SettingsMigrationPhase::Pending {
+            let path = settings_migration_path(layout);
+            let snapshot = read_private_snapshot(&path, MAX_SETTINGS_MIGRATION_BYTES)?;
+            migration.phase = SettingsMigrationPhase::IntegrationCommitted;
+            write_private_json_if_unchanged(
+                &path,
+                &migration,
+                &snapshot,
+                MAX_SETTINGS_MIGRATION_BYTES,
+            )?;
+        }
+        finalize_committed_settings_migration(layout, &migration)
+    })
 }
 
 /// Restores exact legacy settings when a collector/config integration transaction fails.
 pub fn rollback_settings_migration(root: &Path) -> Result<(), CollectorError> {
-    let layout = install(root).map_err(runtime_error)?;
-    let Some(migration) = load_settings_migration(&layout)? else {
-        return Ok(());
-    };
-    if migration.phase == SettingsMigrationPhase::IntegrationCommitted {
-        return finalize_committed_settings_migration(&layout, &migration);
-    }
-    let path = settings_path(&layout);
-    let current = read_private_snapshot(&path, MAX_SETTINGS_BYTES)?;
-    let previous = PrivateFileSnapshot {
-        bytes: migration.previous_settings.clone(),
-        mode: migration.previous_mode,
-    };
-    if current != previous {
-        let settings = parse_owned_settings(&current.bytes)?;
-        if settings.generation != migration.replacement_generation {
-            return Err(CollectorError::Runtime(
-                "collector settings changed before migration rollback".into(),
-            ));
+    settings_coordination::with_settings_writer(root, |layout| {
+        let Some(migration) = load_settings_migration(layout)? else {
+            return Ok(());
+        };
+        if migration.phase == SettingsMigrationPhase::IntegrationCommitted {
+            return finalize_committed_settings_migration(layout, &migration);
         }
-        let validated_generation =
-            validate_legacy_settings_for_migration(&layout, &previous.bytes)?;
-        if validated_generation != migration.previous_generation {
-            return Err(CollectorError::Runtime(
-                "collector migration rollback generation mismatch".into(),
-            ));
+        let path = settings_path(layout);
+        let current = read_private_snapshot(&path, MAX_SETTINGS_BYTES)?;
+        let previous = PrivateFileSnapshot {
+            bytes: migration.previous_settings.clone(),
+            mode: migration.previous_mode,
+        };
+        if current != previous {
+            let settings = parse_owned_settings(&current.bytes)?;
+            if settings.generation != migration.replacement_generation {
+                return Err(CollectorError::Runtime(
+                    "collector settings changed before migration rollback".into(),
+                ));
+            }
+            let validated_generation =
+                validate_legacy_settings_for_migration(layout, &previous.bytes)?;
+            if validated_generation != migration.previous_generation {
+                return Err(CollectorError::Runtime(
+                    "collector migration rollback generation mismatch".into(),
+                ));
+            }
+            write_private_bytes_if_unchanged(&path, &previous, &current)?;
         }
-        write_private_bytes_if_unchanged(&path, &previous, &current)?;
-    }
-    cleanup_credential_generation(&layout, &migration.replacement_generation)?;
-    remove_private_file(&settings_migration_path(&layout))
+        cleanup_credential_generation(layout, &migration.replacement_generation)
+            .and_then(|()| remove_private_file(&settings_migration_path(layout)))
+            .map_err(settings_coordination::published_finalization_error)
+    })
 }
 
 /// Reports whether an exact settings migration journal still requires settlement.
@@ -710,17 +794,20 @@ fn finalize_committed_settings_migration(
     layout: &InstalledLayout,
     migration: &SettingsMigrationV1,
 ) -> Result<(), CollectorError> {
-    let current = read_private_snapshot(&settings_path(layout), MAX_SETTINGS_BYTES)?;
-    let settings = parse_owned_settings(&current.bytes)?;
-    if settings.generation != migration.replacement_generation {
-        return Err(CollectorError::Runtime(
-            "committed collector settings migration cannot be finalized".into(),
-        ));
-    }
-    if let Some(previous_generation) = &migration.previous_generation {
-        cleanup_credential_generation(layout, previous_generation)?;
-    }
-    remove_private_file(&settings_migration_path(layout))
+    (|| {
+        let current = read_private_snapshot(&settings_path(layout), MAX_SETTINGS_BYTES)?;
+        let settings = parse_owned_settings(&current.bytes)?;
+        if settings.generation != migration.replacement_generation {
+            return Err(CollectorError::Runtime(
+                "committed collector settings migration cannot be finalized".into(),
+            ));
+        }
+        if let Some(previous_generation) = &migration.previous_generation {
+            cleanup_credential_generation(layout, previous_generation)?;
+        }
+        remove_private_file(&settings_migration_path(layout))
+    })()
+    .map_err(settings_coordination::published_finalization_error)
 }
 
 fn valid_generation(generation: &str) -> bool {
@@ -753,29 +840,30 @@ pub fn recover_occupied_persisted_port(
     root: &Path,
     expected: &CollectorSettings,
 ) -> Result<CollectorSettings, CollectorError> {
-    let layout = install(root).map_err(runtime_error)?;
-    let current = load_settings(root)?;
-    if current != *expected {
-        return Err(CollectorError::Runtime(
-            "collector settings changed during port recovery".into(),
-        ));
-    }
-
-    match StdTcpListener::bind((Ipv4Addr::LOCALHOST, current.port)) {
-        Ok(listener) => {
-            drop(listener);
-            return Ok(current);
+    settings_coordination::with_settings_writer(root, |layout| {
+        let current = load_settings_from_layout(layout)?;
+        if current != *expected {
+            return Err(CollectorError::Runtime(
+                "collector settings changed during port recovery".into(),
+            ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
-        Err(error) => return Err(error.into()),
-    }
 
-    let reservation = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-    let mut recovered = current;
-    recovered.port = reservation.local_addr()?.port();
-    write_private_json(&settings_path(&layout), &recovered)?;
-    drop(reservation);
-    Ok(recovered)
+        match StdTcpListener::bind((Ipv4Addr::LOCALHOST, current.port)) {
+            Ok(listener) => {
+                drop(listener);
+                return Ok(current);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let reservation = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let mut recovered = current;
+        recovered.port = reservation.local_addr()?.port();
+        write_private_json(&settings_path(layout), &recovered)?;
+        drop(reservation);
+        Ok(recovered)
+    })
 }
 
 fn settings_path(layout: &InstalledLayout) -> PathBuf {
@@ -854,8 +942,10 @@ fn generate_credentials(
 ) -> Result<CredentialMetadata, CollectorError> {
     let tls_root = layout.runtime.join(TLS_DIRECTORY);
     ensure_private_directory_tree(&layout.runtime, &tls_root)?;
+    let tls_directory = settings_coordination::SettingsDirectory::open(&tls_root)?;
     let generation_dir = tls_root.join(generation);
     create_private_directory(&generation_dir)?;
+    let directory = settings_coordination::SettingsDirectory::open(&generation_dir)?;
 
     let now = OffsetDateTime::now_utc();
     let not_after = now
@@ -896,8 +986,8 @@ fn generate_credentials(
     ] {
         write_private_file(&generation_dir.join(name), &bytes)?;
     }
-    File::open(&generation_dir)?.sync_all()?;
-    File::open(&tls_root)?.sync_all()?;
+    directory.sync()?;
+    tls_directory.sync()?;
 
     let prefix = format!("{TLS_DIRECTORY}/{generation}");
     Ok(CredentialMetadata {
@@ -994,10 +1084,7 @@ fn settings_temporary_path(parent: &Path) -> PathBuf {
     ))
 }
 
-fn write_private_json_temporary<T: Serialize>(
-    path: &Path,
-    value: &T,
-) -> Result<File, CollectorError> {
+fn create_settings_temporary(path: &Path) -> Result<File, CollectorError> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -1005,29 +1092,89 @@ fn write_private_json_temporary<T: Serialize>(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(path)?;
-    serde_json::to_writer_pretty(&mut file, value)
-        .map_err(|_| CollectorError::Runtime("collector settings serialization failed".into()))?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    Ok(file)
+    options.open(path).map_err(Into::into)
+}
+
+fn finish_settings_temporary(
+    directory: &settings_coordination::SettingsDirectory,
+    path: &Path,
+    file: &File,
+    result: Result<(), CollectorError>,
+) -> Result<(), CollectorError> {
+    let cleanup = (|| {
+        directory.revalidate().map_err(|_| ())?;
+        let named = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(()),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = file.metadata().map_err(|_| ())?;
+            if !named.is_file() || (named.dev(), named.ino()) != (held.dev(), held.ino()) {
+                return Err(());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (named, file);
+            return Err(());
+        }
+        match fs::remove_file(path) {
+            Ok(()) => directory.sync().map_err(|_| ()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(()),
+        }
+    })();
+    match (result, cleanup) {
+        (result, Ok(())) => result,
+        (Err(error @ CollectorError::StorageWriteUnverified { .. }), Err(())) => {
+            let operation_completed = matches!(
+                &error,
+                CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    ..
+                }
+            );
+            Err(CollectorError::StorageWriteUnverified {
+                operation_completed,
+                primary: Some(Box::new(error)),
+                verification: Box::new(CollectorError::Runtime(
+                    "collector temporary cleanup failed".into(),
+                )),
+            })
+        }
+        (Ok(()), Err(())) => Err(CollectorError::StorageWriteUnverified {
+            operation_completed: true,
+            primary: None,
+            verification: Box::new(CollectorError::Runtime(
+                "collector temporary cleanup failed".into(),
+            )),
+        }),
+        (Err(error), Err(())) => Err(CollectorError::Runtime(format!(
+            "{error}; collector temporary cleanup failed"
+        ))),
+    }
 }
 
 fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CollectorError> {
     let parent = path
         .parent()
         .ok_or_else(|| CollectorError::Runtime("collector settings have no parent".into()))?;
-    validate_private_directory(parent)?;
+    let directory = settings_coordination::SettingsDirectory::open(parent)?;
     let temporary = settings_temporary_path(parent);
+    let mut file = create_settings_temporary(&temporary)?;
     let result = (|| {
-        let file = write_private_json_temporary(&temporary, value)?;
-        drop(file);
-        fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
+        serde_json::to_writer_pretty(&mut file, value).map_err(|_| {
+            CollectorError::Runtime("collector settings serialization failed".into())
+        })?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        directory.publish(&temporary, &file, path)?;
         Ok(())
     })();
-    let _ = fs::remove_file(&temporary);
-    result
+    finish_settings_temporary(&directory, &temporary, &file, result)
 }
 
 fn write_private_json_if_unchanged<T: Serialize>(
@@ -1039,23 +1186,25 @@ fn write_private_json_if_unchanged<T: Serialize>(
     let parent = path
         .parent()
         .ok_or_else(|| CollectorError::Runtime("collector settings have no parent".into()))?;
-    validate_private_directory(parent)?;
+    let directory = settings_coordination::SettingsDirectory::open(parent)?;
     let temporary = settings_temporary_path(parent);
+    let mut file = create_settings_temporary(&temporary)?;
     let result = (|| {
-        let file = write_private_json_temporary(&temporary, value)?;
-        drop(file);
+        serde_json::to_writer_pretty(&mut file, value).map_err(|_| {
+            CollectorError::Runtime("collector settings serialization failed".into())
+        })?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
         let current = read_private_snapshot(path, max_bytes)?;
         if current != *expected {
             return Err(CollectorError::Runtime(
                 "collector settings changed during credential replacement".into(),
             ));
         }
-        fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
+        directory.publish(&temporary, &file, path)?;
         Ok(())
     })();
-    let _ = fs::remove_file(&temporary);
-    result
+    finish_settings_temporary(&directory, &temporary, &file, result)
 }
 
 fn write_private_bytes_if_unchanged(
@@ -1066,42 +1215,40 @@ fn write_private_bytes_if_unchanged(
     let parent = path
         .parent()
         .ok_or_else(|| CollectorError::Runtime("collector settings have no parent".into()))?;
-    validate_private_directory(parent)?;
+    let directory = settings_coordination::SettingsDirectory::open(parent)?;
     let temporary = settings_temporary_path(parent);
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(replacement.mode & 0o777)
+            .custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&temporary)?;
     let result = (|| {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(replacement.mode & 0o777)
-                .custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = options.open(&temporary)?;
         file.write_all(&replacement.bytes)?;
         file.sync_all()?;
-        drop(file);
         let current = read_private_snapshot(path, MAX_SETTINGS_BYTES)?;
         if current != *expected {
             return Err(CollectorError::Runtime(
                 "collector settings changed during migration rollback".into(),
             ));
         }
-        fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
+        directory.publish(&temporary, &file, path)?;
         Ok(())
     })();
-    let _ = fs::remove_file(&temporary);
-    result
+    finish_settings_temporary(&directory, &temporary, &file, result)
 }
 
 fn remove_private_file(path: &Path) -> Result<(), CollectorError> {
     let parent = path
         .parent()
         .ok_or_else(|| CollectorError::Runtime("collector file has no parent".into()))?;
+    let directory = settings_coordination::SettingsDirectory::open(parent)?;
     match fs::remove_file(path) {
-        Ok(()) => File::open(parent)?.sync_all().map_err(Into::into),
+        Ok(()) => directory.sync(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -1116,7 +1263,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), CollectorError> {
     let parent = path
         .parent()
         .ok_or_else(|| CollectorError::Runtime("collector credential has no parent".into()))?;
-    validate_private_directory(parent)?;
+    let directory = settings_coordination::SettingsDirectory::open(parent)?;
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -1127,6 +1274,8 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), CollectorError> {
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    settings_coordination::require_named_identity(path, &file)?;
+    directory.sync()?;
     Ok(())
 }
 
@@ -1214,6 +1363,14 @@ fn credential_path(layout: &InstalledLayout, relative: &str) -> Result<PathBuf, 
 impl std::fmt::Display for CollectorError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::StorageWriteUnverified { .. } => formatter
+                .write_str("collector settings write unverified; secondary verification failed"),
+            Self::LifecycleStoragePressure => {
+                formatter.write_str("lifecycle temporary storage headroom unavailable")
+            }
+            Self::DashboardStorageCapacity => {
+                formatter.write_str("dashboard snapshot storage headroom unavailable")
+            }
             Self::Io(error) => write!(formatter, "local collector I/O error: {error}"),
             Self::RequestIo { stage, source } => {
                 write!(formatter, "local collector {stage} I/O error: {source}")
@@ -1226,8 +1383,15 @@ impl std::fmt::Display for CollectorError {
 impl std::error::Error for CollectorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::StorageWriteUnverified {
+                primary,
+                verification,
+                ..
+            } => Some(primary.as_deref().unwrap_or(verification.as_ref())),
             Self::Io(error) | Self::RequestIo { source: error, .. } => Some(error),
-            Self::Runtime(_) => None,
+            Self::Runtime(_) | Self::LifecycleStoragePressure | Self::DashboardStorageCapacity => {
+                None
+            }
         }
     }
 }
@@ -1329,8 +1493,18 @@ fn build_legacy_client_config(
     Ok(Arc::new(config))
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct IngestCompletionTest {
+    after_operation: Option<fn(&Path)>,
+    fail_report_status: bool,
+}
+
 #[derive(Debug)]
 struct CollectorState {
+    ingest_precommit_guard: Option<Arc<dyn CollectorIngestPrecommitGuard>>,
+    #[cfg(test)]
+    ingest_completion_test: IngestCompletionTest,
     layout: InstalledLayout,
     store: LocalStore,
     source_generation: String,
@@ -1352,11 +1526,16 @@ enum ReportFailure {
     Task,
     Install,
     OpenStore,
-    Clock,
     RenderGuard,
     Snapshot,
+    // Preserve the v1 public stage code; distinguish transient contention internally without
+    // leaking database diagnostics or treating it as a persistent snapshot corruption failure.
+    #[serde(rename = "snapshot")]
+    SnapshotChanged,
     Projection,
     Publish,
+    #[serde(rename = "publish")]
+    Capacity,
     Acknowledge,
     Status,
 }
@@ -1366,14 +1545,30 @@ struct AppState {
     collector: Arc<Mutex<CollectorState>>,
     auth_token: Arc<str>,
     private_detail_failures: Arc<AtomicU64>,
+    lifecycle_failures: Arc<AtomicU64>,
+    lifecycle_storage_pressure: Arc<AtomicBool>,
     report_refresh_scheduled: Arc<AtomicBool>,
     report_refresh_requested: Arc<AtomicU64>,
+    report_contention_quiet_ms: Arc<AtomicU64>,
     #[cfg(test)]
     report_refresh_attempts: Arc<AtomicU64>,
+    #[cfg(test)]
+    report_snapshot_test: Arc<ReportSnapshotTest>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ReportSnapshotTest {
+    delay_ms: AtomicU64,
+    started: AtomicBool,
+    fail_after_reservation: AtomicBool,
+    cleanup_attempts: AtomicU64,
 }
 
 #[derive(Debug, Serialize)]
 struct Health {
+    schema_version: &'static str,
+    degradation_reasons: Vec<CollectorDegradationReasonV1>,
     status: &'static str,
     accepted_requests: u64,
     rejected_requests: u64,
@@ -1383,6 +1578,8 @@ struct Health {
     report_refresh_failures: u32,
     report_failure: Option<ReportFailure>,
     private_detail_failures: u64,
+    lifecycle_failures: u64,
+    expired_trace_dispositions: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1391,8 +1588,38 @@ struct HealthProbe {
     report_dirty: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct HealthReasonProjection {
+    schema_version: String,
+    degradation_reasons: Vec<CollectorDegradationReasonV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthDetails {
+    pub outcome: HealthOutcome,
+    pub degradation_reasons: Vec<CollectorDegradationReasonV1>,
+}
+
 /// Runs the authenticated OTLP/HTTP receiver until the process is terminated.
+/// Uses existing admission only, without an optional ingest precommit guard.
 pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
+    serve_inner(options, None).await
+}
+
+/// Runs the receiver with an additional ingest check requiring initialized accounting.
+/// This explicit opt-in entrypoint is not used by the current CLI. It does not
+/// activate separated admission or replace any existing request or storage checks.
+pub async fn serve_with_ingest_precommit_guard(
+    options: CollectorOptions,
+    guard: Arc<dyn CollectorIngestPrecommitGuard>,
+) -> Result<(), CollectorError> {
+    serve_inner(options, Some(guard)).await
+}
+
+async fn serve_inner(
+    options: CollectorOptions,
+    ingest_precommit_guard: Option<Arc<dyn CollectorIngestPrecommitGuard>>,
+) -> Result<(), CollectorError> {
     validate_options(&options)?;
     let layout = install(&options.root).map_err(runtime_error)?;
     validate_owned_credentials(
@@ -1407,55 +1634,29 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
         },
     )?;
     let tls_config = build_server_config(&layout, &options.credentials)?;
-    let singleton = Singleton::acquire(&layout.runtime.join("collector")).map_err(runtime_error)?;
-    let mutation = try_collector_mutation(&layout.runtime)?;
-    let config = load(&layout.config).map_err(runtime_error)?;
-    maintain_private_turn_details_locked(&layout, &config, SystemTime::now())?;
-    let store = open_store(&mutation, &layout, &config)?;
-    let report_status = store.report_status().map_err(runtime_error)?;
-    let report_missing = !layout.logs.join(REPORT_FILE_NAME).is_file();
-    let report_wakeup = reconcile_report_state(&layout, report_status.pending() || report_missing);
-    let report_dirty = report_status.pending() || report_missing;
-    let source_generation = SOURCE_GENERATION.to_owned();
-    let last_cursor = store
-        .cursor("codex", &source_generation)
-        .map_err(runtime_error)?;
-    let now = current_unix_ms()?;
-    let request_correlation = store
-        .codex_request_correlation_state(&source_generation)
-        .map_err(runtime_error)?
-        .map(|snapshot| OtlpRequestCorrelationState::from_persisted_json(&snapshot, now))
-        .transpose()
-        .map_err(runtime_error)?
-        .unwrap_or_default();
-    drop(mutation);
+    let singleton =
+        ProductionSingleton::acquire(&layout.root, CoordinatedSingletonScope::Collector)
+            .map_err(runtime_error)?;
+    let (mut collector, report_wakeup, report_generation) = prepare_collector_state(layout)?;
+    collector.ingest_precommit_guard = ingest_precommit_guard;
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), options.port);
     let initial_bind = TcpListener::bind(address).await;
     let listener = bind_persisted_port(initial_bind)?;
     let private_detail_failures = Arc::new(AtomicU64::new(0));
-    let collector = Arc::new(Mutex::new(CollectorState {
-        layout,
-        store,
-        source_generation,
-        last_cursor,
-        request_correlation,
-        accepted_requests: 0,
-        rejected_requests: 0,
-        suppressed_requests: 0,
-        last_ingest_unix_ms: None,
-        report_dirty,
-        report_degraded: report_dirty,
-        report_refresh_failures: 0,
-        report_failure: None,
-    }));
+    let collector = Arc::new(Mutex::new(collector));
     let state = AppState {
         collector,
         auth_token: Arc::from(options.auth_token),
         private_detail_failures,
+        lifecycle_failures: Arc::new(AtomicU64::new(0)),
+        lifecycle_storage_pressure: Arc::new(AtomicBool::new(false)),
         report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
         report_refresh_requested: Arc::new(AtomicU64::new(0)),
+        report_contention_quiet_ms: Arc::new(AtomicU64::new(0)),
         #[cfg(test)]
         report_refresh_attempts: Arc::new(AtomicU64::new(0)),
+        #[cfg(test)]
+        report_snapshot_test: Arc::default(),
     };
     let app = router(state.clone());
     if report_wakeup {
@@ -1463,9 +1664,10 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     }
     let report_watcher = tokio::spawn(watch_report_authority(
         state.clone(),
-        report_status.generation,
+        report_generation,
         REPORT_AUTHORITY_POLL_INTERVAL,
     ));
+    let lifecycle_watcher = tokio::spawn(watch_storage_lifecycle(state.clone()));
     let result = serve_transport(
         listener,
         tls_config,
@@ -1477,8 +1679,88 @@ pub async fn serve(options: CollectorOptions) -> Result<(), CollectorError> {
     .await;
     report_watcher.abort();
     let _ = report_watcher.await;
+    lifecycle_watcher.abort();
+    let _ = lifecycle_watcher.await;
     drop(singleton);
     result
+}
+
+fn verify_collector_write_result<T>(
+    result: Result<T, CollectorError>,
+    verification: Result<
+        (),
+        agent_observability_local_runtime::storage_coherence::StorageCoherenceError,
+    >,
+) -> Result<T, CollectorError> {
+    match verification {
+        Ok(()) => result,
+        Err(verification) => Err(CollectorError::StorageWriteUnverified {
+            operation_completed: result.is_ok()
+                || matches!(
+                    &result,
+                    Err(CollectorError::StorageWriteUnverified {
+                        operation_completed: true,
+                        ..
+                    })
+                ),
+            primary: result.err().map(Box::new),
+            verification: Box::new(runtime_error(verification)),
+        }),
+    }
+}
+
+fn prepare_collector_state(
+    layout: InstalledLayout,
+) -> Result<(CollectorState, bool, u64), CollectorError> {
+    let barrier = StorageBarrier::open_if_initialized(&layout.root).map_err(runtime_error)?;
+    let scope = StorageMutationWriter::acquire_exclusive(&layout.root, barrier.as_ref())
+        .map_err(runtime_error)?;
+    let result = (|| {
+        let config = load(&layout.config).map_err(runtime_error)?;
+        recover_report_reservation_for_startup(&layout, &config, scope.mutation())?;
+        maintain_private_turn_details_locked(&layout, &config, SystemTime::now())?;
+        let store = open_store(scope.mutation(), &layout, &config)?;
+        recover_report_view_catalog_for_startup(&store)?;
+        let report_status = store.report_status().map_err(runtime_error)?;
+        let report_missing = automatic_report_view_missing(&store)?;
+        let report_dirty = report_status.pending() || report_missing;
+        let report_wakeup = reconcile_report_state(&layout, report_dirty);
+        let source_generation = SOURCE_GENERATION.to_owned();
+        let last_cursor = store
+            .cursor("codex", &source_generation)
+            .map_err(runtime_error)?;
+        let now = current_unix_ms()?;
+        let request_correlation = store
+            .codex_request_correlation_state(&source_generation)
+            .map_err(runtime_error)?
+            .map(|snapshot| OtlpRequestCorrelationState::from_persisted_json(&snapshot, now))
+            .transpose()
+            .map_err(runtime_error)?
+            .unwrap_or_default();
+        Ok((
+            CollectorState {
+                ingest_precommit_guard: None,
+                #[cfg(test)]
+                ingest_completion_test: IngestCompletionTest::default(),
+                layout,
+                store,
+                source_generation,
+                last_cursor,
+                request_correlation,
+                accepted_requests: 0,
+                rejected_requests: 0,
+                suppressed_requests: 0,
+                last_ingest_unix_ms: None,
+                report_dirty,
+                report_degraded: report_dirty,
+                report_refresh_failures: 0,
+                report_failure: None,
+            },
+            report_wakeup,
+            report_status.generation,
+        ))
+    })();
+    verify_collector_write_result(result, scope.revalidate())
 }
 
 fn bind_persisted_port(
@@ -1759,7 +2041,7 @@ async fn ingest_preflight(
 async fn ingest_notify(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
     let mut collector = state.collector.lock().await;
     let (outcome, committed) = match ingest_notify_locked(&mut collector, &body) {
-        Ok(IngestOutcome::Committed) => {
+        Ok(IngestOutcome::Committed | IngestOutcome::CommittedUnverified) => {
             collector.accepted_requests = collector.accepted_requests.saturating_add(1);
             (StatusCode::OK.into_response(), true)
         }
@@ -1790,6 +2072,19 @@ async fn ingest_notify_with_private_detail(State(state): State<AppState>, body: 
 
     let mut collector = state.collector.lock().await;
     match ingest_notify_locked_with_config(&mut collector, &projected) {
+        Ok((IngestOutcome::CommittedUnverified, Some(_))) => {
+            // The projected observation is committed, but do not start another
+            // private-file write after its completion fence failed.
+            collector.accepted_requests = collector.accepted_requests.saturating_add(1);
+            drop(collector);
+            schedule_report_refresh(&state);
+            state.private_detail_failures.fetch_add(1, Ordering::AcqRel);
+            private_turn_detail_receipt_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                PrivateTurnDetailReceiptState::Failed,
+                "storage_coherence",
+            )
+        }
         Ok((IngestOutcome::Committed, Some(config))) => {
             collector.accepted_requests = collector.accepted_requests.saturating_add(1);
             let layout = collector.layout.clone();
@@ -1851,6 +2146,7 @@ async fn ingest_notify_with_private_detail(State(state): State<AppState>, body: 
                     IngestError::Pressure => "pressure",
                     IngestError::Storage => "storage_budget",
                     IngestError::Policy => "policy",
+                    IngestError::Coherence => "storage_coherence",
                     IngestError::Invalid(_) => "invalid_request",
                 },
             )
@@ -1864,7 +2160,14 @@ fn persist_private_turn_detail_request(
     config: &LocalRuntimeConfigV3,
     private_detail: &PrivateCodexTurnDetailV1,
 ) -> Response {
-    let mutation = match acquire_private_turn_detail_mutation(&layout.runtime) {
+    #[cfg(test)]
+    let lock_started = StdInstant::now();
+    let barrier = StorageBarrier::open_if_initialized(&layout.root);
+    let acquisition = match &barrier {
+        Ok(barrier) => acquire_private_turn_detail_mutation(layout, barrier.as_ref()),
+        Err(error) => Err(runtime_error(error)),
+    };
+    let mutation = match acquisition {
         Ok(Some(mutation)) => mutation,
         Ok(None) => {
             state.private_detail_failures.fetch_add(1, Ordering::AcqRel);
@@ -1883,7 +2186,13 @@ fn persist_private_turn_detail_request(
             );
         }
     };
+    #[cfg(test)]
+    eprintln!(
+        "private_capture_stage=lock elapsed={:?}",
+        lock_started.elapsed()
+    );
     let result = capture_private_turn_detail_locked(layout, private_detail, config);
+    let result = verify_collector_write_result(result, mutation.revalidate());
     drop(mutation);
     match result {
         Ok((PrivateTurnDetailReceiptState::Available, code)) => {
@@ -1947,9 +2256,34 @@ fn private_turn_detail_receipt_response(
         .into_response()
 }
 
+fn lifecycle_degradation_reasons(
+    failures: u64,
+    storage_pressure: bool,
+    expired_dispositions: Option<u64>,
+) -> Vec<CollectorDegradationReasonV1> {
+    let mut reasons = Vec::with_capacity(2);
+    if storage_pressure {
+        reasons.push(CollectorDegradationReasonV1::StoragePressure);
+    } else if failures > 0 {
+        reasons.push(CollectorDegradationReasonV1::LifecycleFailure);
+    }
+    if expired_dispositions.is_some_and(|count| count > 0) {
+        reasons.push(CollectorDegradationReasonV1::ExpiredTrace);
+    }
+    reasons
+}
+
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let mut collector = state.collector.lock().await;
     let private_detail_failures = state.private_detail_failures.load(Ordering::Acquire);
+    let lifecycle_failures = state.lifecycle_failures.load(Ordering::Acquire);
+    let expired_trace_dispositions = collector.store.expired_trace_disposition_count().ok();
+    let degradation_reasons = lifecycle_degradation_reasons(
+        lifecycle_failures,
+        state.lifecycle_storage_pressure.load(Ordering::Acquire),
+        expired_trace_dispositions,
+    );
+    let lifecycle_degraded = !degradation_reasons.is_empty();
     let report_pending = if let Ok(status) = collector.store.report_status() {
         status.pending()
     } else {
@@ -1958,7 +2292,14 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     };
     collector.report_dirty = report_pending;
     axum::Json(Health {
-        status: if collector.report_degraded || report_pending {
+        schema_version: LOCAL_COLLECTOR_HEALTH_VERSION,
+        degradation_reasons,
+        status: if collector.report_degraded
+            || report_pending
+            || lifecycle_failures > 0
+            || lifecycle_degraded
+            || expired_trace_dispositions.is_none_or(|count| count > 0)
+        {
             "degraded"
         } else {
             "ready"
@@ -1971,6 +2312,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         report_refresh_failures: collector.report_refresh_failures,
         report_failure: collector.report_failure,
         private_detail_failures,
+        lifecycle_failures,
+        expired_trace_dispositions,
     })
     .into_response()
 }
@@ -1978,7 +2321,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 async fn ingest_logs(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
     let mut collector = state.collector.lock().await;
     let (outcome, committed) = match ingest_locked(&mut collector, &body) {
-        Ok(IngestOutcome::Committed) => {
+        Ok(IngestOutcome::Committed | IngestOutcome::CommittedUnverified) => {
             collector.accepted_requests = collector.accepted_requests.saturating_add(1);
             (StatusCode::OK.into_response(), true)
         }
@@ -2009,12 +2352,14 @@ fn is_json(headers: &HeaderMap) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IngestOutcome {
     Committed,
+    CommittedUnverified,
     Disabled,
 }
 
 #[derive(Debug)]
 enum IngestError {
     Invalid(CollectorError),
+    Coherence,
     Busy,
     Policy,
     Pressure,
@@ -2024,13 +2369,19 @@ enum IngestError {
 impl IngestError {
     const fn status(&self) -> StatusCode {
         match self {
-            Self::Invalid(CollectorError::Io(_) | CollectorError::RequestIo { .. }) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::Coherence
+            | Self::Invalid(
+                CollectorError::StorageWriteUnverified { .. }
+                | CollectorError::Io(_)
+                | CollectorError::RequestIo { .. },
+            ) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Invalid(CollectorError::Runtime(_)) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Busy | Self::Pressure => StatusCode::SERVICE_UNAVAILABLE,
             Self::Policy => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::Storage => StatusCode::INSUFFICIENT_STORAGE,
+            Self::Storage
+            | Self::Invalid(
+                CollectorError::LifecycleStoragePressure | CollectorError::DashboardStorageCapacity,
+            ) => StatusCode::INSUFFICIENT_STORAGE,
         }
     }
 
@@ -2049,44 +2400,47 @@ impl From<CollectorError> for IngestError {
 }
 
 fn ingest_locked(state: &mut CollectorState, body: &[u8]) -> Result<IngestOutcome, IngestError> {
-    let _mutation = try_ingest_mutation(&state.layout.runtime)?;
-    let Some(config) = admit_request(state, body.len())? else {
-        return Ok(IngestOutcome::Disabled);
-    };
-    let now = current_unix_ms()?;
-    let next_cursor = state
-        .last_cursor
-        .as_deref()
-        .map_or(Ok(1), |cursor| {
-            cursor
-                .parse::<u64>()
-                .map_err(|_| CollectorError::Runtime("invalid durable Codex cursor".into()))
-        })?
-        .checked_add(u64::from(state.last_cursor.is_some()))
-        .ok_or_else(|| CollectorError::Runtime("Codex cursor overflow".into()))?;
-    let mut request_correlation = state.request_correlation.clone();
-    let (batch, last_cursor) = parse_otlp_http_json_with_state(
-        body,
-        &state.source_generation,
-        state.last_cursor.as_deref(),
-        next_cursor,
-        now,
-        &mut request_correlation,
-    )
-    .map_err(runtime_error)?;
-    enforce_batch_policy(&batch, &config)?;
-    let persisted_correlation = request_correlation
-        .to_persisted_json()
+    with_ingest_storage_scope(state, |state, freeze| {
+        let Some(config) = admit_request(state, body.len())? else {
+            return Ok((IngestOutcome::Disabled, ()));
+        };
+        let now = current_unix_ms()?;
+        let next_cursor = state
+            .last_cursor
+            .as_deref()
+            .map_or(Ok(1), |cursor| {
+                cursor
+                    .parse::<u64>()
+                    .map_err(|_| CollectorError::Runtime("invalid durable Codex cursor".into()))
+            })?
+            .checked_add(u64::from(state.last_cursor.is_some()))
+            .ok_or_else(|| CollectorError::Runtime("Codex cursor overflow".into()))?;
+        let mut request_correlation = state.request_correlation.clone();
+        let (batch, last_cursor) = parse_otlp_http_json_with_state(
+            body,
+            &state.source_generation,
+            state.last_cursor.as_deref(),
+            next_cursor,
+            now,
+            &mut request_correlation,
+        )
         .map_err(runtime_error)?;
-    commit_batch(
-        state,
-        &batch,
-        last_cursor,
-        now,
-        Some(&persisted_correlation),
-    )?;
-    state.request_correlation = request_correlation;
-    Ok(IngestOutcome::Committed)
+        enforce_batch_policy(&batch, &config)?;
+        let persisted_correlation = request_correlation
+            .to_persisted_json()
+            .map_err(runtime_error)?;
+        check_ingest_precommit(state, freeze, &config)?;
+        let outcome = commit_batch(
+            state,
+            &batch,
+            last_cursor,
+            now,
+            Some(&persisted_correlation),
+        )?;
+        state.request_correlation = request_correlation;
+        Ok((outcome, ()))
+    })
+    .map(|(outcome, ())| outcome)
 }
 
 fn ingest_notify_locked(
@@ -2100,37 +2454,125 @@ fn ingest_notify_locked_with_config(
     state: &mut CollectorState,
     body: &[u8],
 ) -> Result<(IngestOutcome, Option<LocalRuntimeConfigV3>), IngestError> {
-    let _mutation = try_ingest_mutation(&state.layout.runtime)?;
-    let Some(config) = admit_request(state, body.len())? else {
-        return Ok((IngestOutcome::Disabled, None));
+    with_ingest_storage_scope(state, |state, freeze| {
+        let Some(config) = admit_request(state, body.len())? else {
+            return Ok((IngestOutcome::Disabled, None));
+        };
+        let now = current_unix_ms()?;
+        let cursor = next_cursor(state)?;
+        let batch = parse_projected_notify_json(
+            body,
+            &state.source_generation,
+            state.last_cursor.as_deref(),
+            cursor,
+            now,
+        )
+        .map_err(runtime_error)?;
+        enforce_batch_policy(&batch, &config)?;
+        check_ingest_precommit(state, freeze, &config)?;
+        let outcome = commit_batch(state, &batch, Some(cursor.to_string()), now, None)?;
+        Ok((outcome, Some(config)))
+    })
+}
+
+fn with_ingest_storage_scope<T>(
+    state: &mut CollectorState,
+    operation: impl FnOnce(
+        &mut CollectorState,
+        Option<&OwnedStorageFreezeGuard<'_>>,
+    ) -> Result<(IngestOutcome, T), IngestError>,
+) -> Result<(IngestOutcome, T), IngestError> {
+    enum Scope<'barrier> {
+        Initialized(OwnedStorageFreezeGuard<'barrier>),
+        Legacy(StorageMutationWriter<'barrier>),
+    }
+    let barrier =
+        agent_observability_local_runtime::storage_coherence::StorageBarrier::open_if_initialized(
+            &state.layout.root,
+        )
+        .map_err(ingest_coherence_failure)?;
+    let scope = match &barrier {
+        Some(barrier) => Scope::Initialized(
+            barrier
+                .try_freeze_existing_root()
+                .map_err(ingest_coherence_failure)?,
+        ),
+        None if state.ingest_precommit_guard.is_some() => return Err(IngestError::Coherence),
+        None => Scope::Legacy(
+            StorageMutationWriter::acquire_exclusive(&state.layout.root, None)
+                .map_err(ingest_coherence_failure)?,
+        ),
     };
-    let now = current_unix_ms()?;
-    let cursor = next_cursor(state)?;
-    let batch = parse_projected_notify_json(
-        body,
-        &state.source_generation,
-        state.last_cursor.as_deref(),
-        cursor,
-        now,
-    )
-    .map_err(runtime_error)?;
-    enforce_batch_policy(&batch, &config)?;
-    commit_batch(state, &batch, Some(cursor.to_string()), now, None)?;
-    Ok((IngestOutcome::Committed, Some(config)))
+    let result = operation(
+        state,
+        match &scope {
+            Scope::Initialized(freeze) => Some(freeze),
+            Scope::Legacy(_) => None,
+        },
+    );
+    #[cfg(test)]
+    if let Some(after_operation) = state.ingest_completion_test.after_operation.take() {
+        after_operation(&state.layout.runtime);
+    }
+    let revalidation = match &scope {
+        Scope::Initialized(freeze) => freeze.revalidate(),
+        Scope::Legacy(writer) => writer.revalidate(),
+    }
+    .map_err(ingest_coherence_failure);
+    match result {
+        Ok((outcome @ (IngestOutcome::Committed | IngestOutcome::CommittedUnverified), value))
+            if revalidation.is_err() =>
+        {
+            // Durable commit/cursor state remains authoritative. ACK the committed
+            // observation without inviting a retry as though nothing was saved.
+            // Keep refresh scheduled and health degraded; future work must acquire
+            // and validate its own barrier, never reuse this failed assessment.
+            state.report_dirty = true;
+            state.report_degraded = true;
+            if outcome == IngestOutcome::Committed {
+                state.report_failure = Some(ReportFailure::Publish);
+            }
+            Ok((IngestOutcome::CommittedUnverified, value))
+        }
+        Ok(value) => {
+            revalidation?;
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
 }
 
-fn try_ingest_mutation(runtime: &Path) -> Result<MutationGuard, IngestError> {
-    MutationGuard::try_acquire(runtime).map_err(|error| match error {
-        SingletonError::AlreadyRunning => IngestError::Busy,
-        error => IngestError::Invalid(runtime_error(error)),
-    })
+fn check_ingest_precommit(
+    state: &CollectorState,
+    freeze: Option<&OwnedStorageFreezeGuard<'_>>,
+    config: &LocalRuntimeConfigV3,
+) -> Result<(), IngestError> {
+    let Some(guard) = &state.ingest_precommit_guard else {
+        return Ok(());
+    };
+    let freeze = freeze.ok_or(IngestError::Coherence)?;
+    guard
+        .check_precommit(
+            &state.layout,
+            freeze,
+            config,
+            u64::from(config.collection.max_batch_bytes),
+        )
+        .map_err(|error| match error {
+            CollectorIngestPrecommitError::Denied => IngestError::Storage,
+            CollectorIngestPrecommitError::Unavailable => IngestError::Coherence,
+        })
 }
 
-fn try_collector_mutation(runtime: &Path) -> Result<MutationGuard, CollectorError> {
-    MutationGuard::try_acquire(runtime).map_err(|error| match error {
-        SingletonError::AlreadyRunning => CollectorError::Runtime("runtime mutation busy".into()),
-        error => runtime_error(error),
-    })
+fn ingest_coherence_failure(
+    error: agent_observability_local_runtime::storage_coherence::StorageCoherenceError,
+) -> IngestError {
+    match error {
+        agent_observability_local_runtime::storage_coherence::StorageCoherenceError::Busy => {
+            IngestError::Busy
+        }
+        _ => IngestError::Coherence,
+    }
 }
 
 fn admit_request(
@@ -2158,20 +2600,16 @@ fn admit_request(
     if schedule.flush_paused {
         return Err(IngestError::Pressure);
     }
-    let store_directory = state.layout.state.join("store");
-    let existing_store = if store_directory.exists() {
-        StorageBudget::allocated_tree_bytes(&store_directory).map_err(runtime_error)?
-    } else {
-        0
-    };
-    let reservation = existing_store
-        .checked_add(u64::from(config.collection.max_batch_bytes))
-        .ok_or(IngestError::Storage)?;
-    if control
-        .admit(&state.layout.root, reservation)
-        .map_err(runtime_error)?
-        == Admission::Denied
-    {
+    let diagnostic = control
+        .collector_admission_diagnostic(
+            &state.layout.root,
+            u64::from(config.collection.max_batch_bytes),
+        )
+        .map_err(|error| match error {
+            ControlError::CollectorAdmissionOverflow => IngestError::Storage,
+            error => IngestError::Invalid(runtime_error(error)),
+        })?;
+    if diagnostic.admission == Admission::Denied {
         return Err(IngestError::Storage);
     }
     Ok(Some(config))
@@ -2203,7 +2641,7 @@ fn commit_batch(
     last_cursor: Option<String>,
     now: u64,
     persisted_correlation: Option<&str>,
-) -> Result<(), CollectorError> {
+) -> Result<IngestOutcome, CollectorError> {
     let items = batch
         .items
         .iter()
@@ -2233,28 +2671,46 @@ fn commit_batch(
     match result {
         Ok(_) => {}
         Err(error) => {
-            state.report_dirty = state
-                .store
-                .report_status()
-                .map_err(runtime_error)?
-                .pending();
-            if !state.report_dirty {
-                let _ = clear_report_dirty(&state.layout);
-            }
+            reconcile_ingest_report_state(state);
             return Err(runtime_error(error));
         }
     }
     state.last_cursor = last_cursor;
     state.last_ingest_unix_ms = Some(now);
-    state.report_dirty = state
+    Ok(if reconcile_ingest_report_state(state) {
+        IngestOutcome::Committed
+    } else {
+        IngestOutcome::CommittedUnverified
+    })
+}
+
+fn reconcile_ingest_report_state(state: &mut CollectorState) -> bool {
+    if let Ok(pending) = ingest_report_pending(state) {
+        state.report_dirty = pending;
+        if !pending {
+            let _ = clear_report_dirty(&state.layout);
+        }
+        true
+    } else {
+        state.report_dirty = true;
+        state.report_degraded = true;
+        state.report_failure = Some(ReportFailure::Status);
+        false
+    }
+}
+
+fn ingest_report_pending(state: &CollectorState) -> Result<bool, CollectorError> {
+    #[cfg(test)]
+    if state.ingest_completion_test.fail_report_status {
+        return Err(CollectorError::Runtime(
+            "injected report status failure".into(),
+        ));
+    }
+    state
         .store
         .report_status()
-        .map_err(runtime_error)?
-        .pending();
-    if !state.report_dirty {
-        let _ = clear_report_dirty(&state.layout);
-    }
-    Ok(())
+        .map(agent_observability_local_store::ReportStatus::pending)
+        .map_err(runtime_error)
 }
 
 fn schedule_report_refresh(state: &AppState) {
@@ -2267,6 +2723,150 @@ fn schedule_report_refresh(state: &AppState) {
     );
 }
 
+/// Executes one bounded, opt-in lifecycle pass without starting a collector.
+/// A busy writer is not waited on; the next scheduled pass can retry.
+pub fn maintain_storage_lifecycle(root: &Path) -> Result<String, CollectorError> {
+    let layout = inspect(root).map_err(runtime_error)?;
+    let barrier = StorageBarrier::open_if_initialized(&layout.root).map_err(runtime_error)?;
+    let scope = match StorageMutationWriter::acquire_exclusive(&layout.root, barrier.as_ref()) {
+        Ok(guard) => guard,
+        Err(agent_observability_local_runtime::storage_coherence::StorageCoherenceError::Busy) => {
+            return Ok("lifecycle=busy".into());
+        }
+        Err(error) => return Err(runtime_error(error)),
+    };
+    let result = maintain_storage_lifecycle_locked(&layout);
+    verify_collector_write_result(result, scope.revalidate())
+}
+
+fn maintain_storage_lifecycle_locked(layout: &InstalledLayout) -> Result<String, CollectorError> {
+    let config = load(&layout.config).map_err(runtime_error)?;
+    if !config.lifecycle.enabled {
+        return Ok("lifecycle=disabled".into());
+    }
+    // Raw expiry needs no database copy and must still run when tier migration lacks disk space.
+    maintain_private_turn_details_locked(layout, &config, SystemTime::now())?;
+    let store = LocalStore::open_current(layout.state.join("store")).map_err(runtime_error)?;
+    let policy = &config.lifecycle;
+    let request = agent_observability_local_store::LifecycleRequest {
+        now_unix_ms: current_unix_ms()?,
+        hot_days: policy.hot_days,
+        warm_days: policy.warm_days,
+        delete_after_days: policy.delete_after_days,
+        max_traces_per_pass: policy.max_traces_per_pass,
+        max_archive_records: config.retention.max_archive_records,
+        max_archive_bytes: config.retention.max_archive_bytes,
+    };
+    let preflight = store.lifecycle_preflight(request).map_err(runtime_error)?;
+    if !preflight.has_candidates && !preflight.has_backfill_pending {
+        return Ok("lifecycle=idle".into());
+    }
+    let headroom = RuntimeControl::new(&config)
+        .map_err(runtime_error)?
+        .migration_headroom(&layout.root)
+        .map_err(runtime_error)?;
+    if headroom < preflight.required_temporary_bytes {
+        return Err(CollectorError::LifecycleStoragePressure);
+    }
+    let Some(render_guard) = store
+        .try_acquire_report_render_guard()
+        .map_err(runtime_error)?
+    else {
+        return Ok("lifecycle=busy".into());
+    };
+    store.invalidate_report().map_err(runtime_error)?;
+    agent_observability_static_report::write_refresh_pending(&layout.logs.join(REPORT_FILE_NAME))
+        .map_err(runtime_error)?;
+    mark_report_dirty(layout)?;
+    let result = store
+        .maintain_lifecycle_guarded(request, render_guard)
+        .map_err(runtime_error)?;
+    let status = if result.blocked > 0 {
+        "blocked"
+    } else {
+        "completed"
+    };
+    Ok(format!(
+        "lifecycle={status}\nreport_refresh=pending\n{result:?}"
+    ))
+}
+
+fn lifecycle_idle(last_ingest: Option<u64>, now: u64) -> bool {
+    last_ingest.is_none_or(|last| now.saturating_sub(last) >= LIFECYCLE_QUIET_PERIOD_MS)
+}
+
+fn record_lifecycle_pass(state: &AppState, output: &str) {
+    if output == "lifecycle=busy" {
+        return;
+    }
+    state
+        .lifecycle_storage_pressure
+        .store(false, Ordering::Release);
+    state.lifecycle_failures.store(
+        u64::from(output.starts_with("lifecycle=blocked\n")),
+        Ordering::Release,
+    );
+    if output.contains("report_refresh=pending") {
+        schedule_report_refresh(state);
+    }
+}
+
+async fn watch_storage_lifecycle(state: AppState) {
+    let mut ticker = tokio::time::interval(LIFECYCLE_POLICY_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_pass: Option<StdInstant> = None;
+    loop {
+        ticker.tick().await;
+        let Ok(collector) = state.collector.try_lock() else {
+            continue;
+        };
+        let Ok(now) = current_unix_ms() else {
+            continue;
+        };
+        if !lifecycle_idle(collector.last_ingest_unix_ms, now) {
+            continue;
+        }
+        let root = collector.layout.root.clone();
+        drop(collector);
+        // Config I/O and maintenance never occupy a Tokio network executor thread.
+        let elapsed = last_pass.map(|last| last.elapsed());
+        let outcome = tokio::task::spawn_blocking(move || {
+            let layout = inspect(&root).map_err(runtime_error)?;
+            let config = load(&layout.config).map_err(runtime_error)?;
+            if !config.lifecycle.enabled {
+                return Ok(Some("lifecycle=disabled".to_owned()));
+            }
+            let cadence =
+                Duration::from_secs(u64::from(config.lifecycle.maintenance_interval_seconds));
+            if elapsed.is_some_and(|elapsed| elapsed < cadence) {
+                return Ok(None);
+            }
+            maintain_storage_lifecycle(&root).map(Some)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(Some(output))) => {
+                if output != "lifecycle=busy" {
+                    last_pass = Some(StdInstant::now());
+                }
+                record_lifecycle_pass(&state, &output);
+            }
+            Ok(Ok(None)) => {}
+            outcome => {
+                state.lifecycle_storage_pressure.store(
+                    matches!(outcome, Ok(Err(CollectorError::LifecycleStoragePressure))),
+                    Ordering::Release,
+                );
+                last_pass = Some(StdInstant::now());
+                state.lifecycle_failures.fetch_add(1, Ordering::AcqRel);
+                // A failed pass may already have hidden the previous HTML safely.
+                // Rebuild from committed storage rather than leaving that placeholder stale.
+                schedule_report_refresh(&state);
+            }
+        }
+    }
+}
+
 async fn watch_report_authority(state: AppState, mut observed_generation: u64, interval: Duration) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2274,29 +2874,55 @@ async fn watch_report_authority(state: AppState, mut observed_generation: u64, i
     loop {
         ticker.tick().await;
         let mut collector = state.collector.lock().await;
-        let Ok(status) = collector.store.report_status() else {
+        let Ok(wakeup) = poll_report_authority(&mut collector, &mut observed_generation) else {
             collector.report_dirty = true;
             collector.report_degraded = true;
             collector.report_failure = Some(ReportFailure::Status);
             continue;
         };
-        collector.report_dirty = status.pending();
-        let changed = status.generation != observed_generation;
-        observed_generation = status.generation;
-        if !status.pending() {
-            collector.report_degraded = false;
-            collector.report_refresh_failures = 0;
-            collector.report_failure = None;
-            let _ = clear_report_dirty(&collector.layout);
-            continue;
-        }
-        if !changed {
-            continue;
-        }
-        let _ = mark_report_dirty(&collector.layout);
         drop(collector);
-        schedule_report_refresh(&state);
+        if wakeup {
+            schedule_report_refresh(&state);
+        }
     }
+}
+
+fn poll_report_authority(
+    collector: &mut CollectorState,
+    observed_generation: &mut u64,
+) -> Result<bool, CollectorError> {
+    poll_report_authority_observing(collector, observed_generation, |_| {})
+}
+
+fn poll_report_authority_observing(
+    collector: &mut CollectorState,
+    observed_generation: &mut u64,
+    before_postcheck: impl FnOnce(&MutationGuard),
+) -> Result<bool, CollectorError> {
+    let barrier =
+        StorageBarrier::open_if_initialized(&collector.layout.root).map_err(runtime_error)?;
+    let scope = StorageMutationWriter::acquire(&collector.layout.root, barrier.as_ref())
+        .map_err(runtime_error)?;
+    let result = (|| {
+        let status = collector.store.report_status().map_err(runtime_error)?;
+        let changed = status.generation != *observed_generation;
+        if !status.pending() {
+            clear_report_dirty(&collector.layout)?;
+        } else if changed {
+            mark_report_dirty(&collector.layout)?;
+        }
+        Ok((status, changed))
+    })();
+    before_postcheck(scope.mutation());
+    let (status, changed) = verify_collector_write_result(result, scope.revalidate())?;
+    collector.report_dirty = status.pending();
+    *observed_generation = status.generation;
+    if !status.pending() {
+        collector.report_degraded = false;
+        collector.report_refresh_failures = 0;
+        collector.report_failure = None;
+    }
+    Ok(status.pending() && changed)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2320,27 +2946,17 @@ fn schedule_report_refresh_with_timing(state: &AppState, timing: ReportRefreshTi
     tokio::spawn(async move {
         let mut failure_attempts = 0;
         let mut retry_delay = timing.retry_initial;
+        let mut quiet_period = timing.debounce.max(Duration::from_millis(
+            state.report_contention_quiet_ms.load(Ordering::Acquire),
+        ));
         loop {
             if failure_attempts == 0 {
-                await_report_debounce(&state, timing).await;
+                await_report_debounce(&state, quiet_period).await;
             } else {
                 tokio::time::sleep(retry_delay).await;
             }
             let attempt_epoch = state.report_refresh_requested.load(Ordering::Acquire);
-            let root = {
-                let collector = state.collector.lock().await;
-                collector.layout.root.clone()
-            };
-            #[cfg(test)]
-            state
-                .report_refresh_attempts
-                .fetch_add(1, Ordering::Release);
-            let (refresh, mut failure) =
-                match tokio::task::spawn_blocking(move || refresh_report_from_root(&root)).await {
-                    Ok(Ok(refreshed)) => (Some(refreshed), None),
-                    Ok(Err(report_failure)) => (None, Some(report_failure)),
-                    Err(_) => (None, Some(ReportFailure::Task)),
-                };
+            let (refresh, mut failure, attempt_duration) = run_report_refresh_attempt(&state).await;
             let mut collector = state.collector.lock().await;
             let pending = if let Ok(status) = collector.store.report_status() {
                 status.pending()
@@ -2373,42 +2989,111 @@ fn schedule_report_refresh_with_timing(state: &AppState, timing: ReportRefreshTi
                 }
                 return;
             }
-            if refresh.is_some() {
-                collector.report_refresh_failures = 0;
-                collector.report_failure = failure;
+            if failure == Some(ReportFailure::SnapshotChanged)
+                || (refresh.is_some() && failure.is_none())
+            {
+                // A concurrent commit invalidated this read/publication. Preserve the same
+                // scheduled task and its learned quiet period across new wakeups: restarting
+                // the ordinary short retry cycle would repeatedly scan a growing store.
+                quiet_period = contention_quiet_period(quiet_period, attempt_duration);
+                state.report_contention_quiet_ms.store(
+                    u64::try_from(quiet_period.as_millis()).unwrap_or(u64::MAX),
+                    Ordering::Release,
+                );
                 failure_attempts = 0;
                 retry_delay = timing.retry_initial;
-            } else {
-                collector.report_refresh_failures =
-                    collector.report_refresh_failures.saturating_add(1);
-                collector.report_failure = failure;
-                failure_attempts += 1;
+                collector.report_degraded = true;
+                if collector.report_failure.is_none() {
+                    collector.report_failure = Some(ReportFailure::SnapshotChanged);
+                }
+                drop(collector);
+                continue;
             }
+            collector.report_refresh_failures = collector.report_refresh_failures.saturating_add(1);
+            collector.report_failure = failure;
+            failure_attempts += 1;
             if failure_attempts == REPORT_RETRY_LIMIT {
                 collector.report_degraded = true;
+                let layout = collector.layout.clone();
+                drop(collector);
+                // Retain scheduler ownership across bounded cleanup-only retries. A busy
+                // mutation lock must not silently discard recovery after the last build.
+                if let Err(failure) =
+                    cleanup_report_reservation_with_retry(&state, &layout, timing).await
+                {
+                    state.collector.lock().await.report_failure = Some(failure);
+                }
                 state
                     .report_refresh_scheduled
                     .store(false, Ordering::Release);
                 let retry_latest =
                     state.report_refresh_requested.load(Ordering::Acquire) != attempt_epoch;
-                drop(collector);
                 if retry_latest {
                     schedule_report_refresh_with_timing(&state, timing);
                 }
                 return;
             }
             drop(collector);
-            if refresh.is_none() {
-                retry_delay = retry_delay.saturating_mul(2);
-            }
+            retry_delay = retry_delay.saturating_mul(2);
         }
     });
 }
 
-async fn await_report_debounce(state: &AppState, timing: ReportRefreshTiming) {
+async fn run_report_refresh_attempt(
+    state: &AppState,
+) -> (Option<bool>, Option<ReportFailure>, Duration) {
+    let root = state.collector.lock().await.layout.root.clone();
+    #[cfg(test)]
+    state
+        .report_refresh_attempts
+        .fetch_add(1, Ordering::Release);
+    #[cfg(test)]
+    let snapshot_test = Arc::clone(&state.report_snapshot_test);
+    let result = tokio::task::spawn_blocking(move || {
+        let started = StdInstant::now();
+        #[cfg(not(test))]
+        {
+            (refresh_report_from_root(&root), started.elapsed())
+        }
+        #[cfg(test)]
+        {
+            (
+                refresh_report_from_root_observing(&root, |index| {
+                    if index == 0 {
+                        snapshot_test.started.store(true, Ordering::Release);
+                        assert!(
+                            !snapshot_test.fail_after_reservation.load(Ordering::Acquire),
+                            "injected post-reservation projection failure"
+                        );
+                        std::thread::sleep(Duration::from_millis(
+                            snapshot_test.delay_ms.load(Ordering::Acquire),
+                        ));
+                    }
+                }),
+                started.elapsed(),
+            )
+        }
+    })
+    .await;
+    let (published, failure, attempt_duration) = match result {
+        Ok((Ok(published), attempt_duration)) => (Some(published), None, attempt_duration),
+        Ok((Err(failure), attempt_duration)) => (None, Some(failure), attempt_duration),
+        Err(_) => (None, Some(ReportFailure::Task), Duration::ZERO),
+    };
+    (published, failure, attempt_duration)
+}
+
+fn contention_quiet_period(previous: Duration, attempt: Duration) -> Duration {
+    previous
+        .saturating_mul(2)
+        .max(attempt.saturating_mul(4))
+        .min(REPORT_CONTENTION_QUIET_LIMIT)
+}
+
+async fn await_report_debounce(state: &AppState, quiet_period: Duration) {
     let mut observed = state.report_refresh_requested.load(Ordering::Acquire);
     loop {
-        tokio::time::sleep(timing.debounce).await;
+        tokio::time::sleep(quiet_period).await;
         let latest = state.report_refresh_requested.load(Ordering::Acquire);
         if latest == observed {
             return;
@@ -2477,11 +3162,62 @@ fn clear_report_dirty(layout: &InstalledLayout) -> Result<(), CollectorError> {
 }
 
 fn refresh_report_from_root(root: &Path) -> Result<bool, ReportFailure> {
+    refresh_report_from_root_observing(root, |_| {})
+}
+
+/// Builds and publishes the bounded immutable dashboard snapshot for a prepared local store.
+///
+/// The caller remains responsible for initializing or migrating the store under the CLI/runtime
+/// mutation guard. Concurrent publication and source-generation drift are retryable and return
+/// `Ok(false)`; storage-capacity rejection and other durable failures remain explicit errors.
+pub fn refresh_dashboard_snapshot(root: &Path) -> Result<bool, CollectorError> {
+    match refresh_report_from_root(root) {
+        Ok(published) => Ok(published),
+        Err(ReportFailure::RenderGuard | ReportFailure::SnapshotChanged) => Ok(false),
+        Err(ReportFailure::Capacity) => Err(CollectorError::DashboardStorageCapacity),
+        Err(error) => Err(CollectorError::Runtime(format!(
+            "dashboard snapshot refresh failed at {}",
+            report_failure_stage(error)
+        ))),
+    }
+}
+
+const fn report_failure_stage(error: ReportFailure) -> &'static str {
+    match error {
+        ReportFailure::Task => "task",
+        ReportFailure::Install => "install",
+        ReportFailure::OpenStore => "open_store",
+        ReportFailure::RenderGuard => "render_guard",
+        ReportFailure::Snapshot | ReportFailure::SnapshotChanged => "snapshot",
+        ReportFailure::Projection => "projection",
+        ReportFailure::Publish | ReportFailure::Capacity => "publish",
+        ReportFailure::Acknowledge => "acknowledge",
+        ReportFailure::Status => "status",
+    }
+}
+
+fn refresh_report_from_root_observing(
+    root: &Path,
+    on_record: impl FnMut(usize),
+) -> Result<bool, ReportFailure> {
     let layout = install(root).map_err(|_| ReportFailure::Install)?;
+    let barrier =
+        agent_observability_local_runtime::storage_coherence::StorageBarrier::open_if_initialized(
+            &layout.root,
+        )
+        .map_err(report_coherence_failure)?;
+    let permit = barrier
+        .as_ref()
+        .map(agent_observability_local_runtime::storage_coherence::StorageBarrier::try_begin_write)
+        .transpose()
+        .map_err(report_coherence_failure)?;
     let store = LocalStore::open_current(layout.state.join("store"))
         .map_err(|_| ReportFailure::OpenStore)?;
-    let now_unix_ms = current_unix_ms().map_err(|_| ReportFailure::Clock)?;
-    refresh_report(&layout, &store, now_unix_ms)
+    if let Some(permit) = permit.as_ref() {
+        permit.revalidate().map_err(report_coherence_failure)?;
+    }
+    drop(permit);
+    refresh_report_observing(&layout, &store, on_record)
 }
 
 /// Projects and sends a raw notify argument with bounded foreground deadlines.
@@ -2489,6 +3225,12 @@ fn refresh_report_from_root(root: &Path) -> Result<bool, ReportFailure> {
 #[must_use]
 pub fn submit_notify(root: &Path, payload: &[u8]) -> NotifyOutcome {
     let deadline = StdInstant::now() + PRIVATE_NOTIFY_FOREGROUND_DEADLINE;
+    submit_notify_until(root, payload, deadline)
+}
+
+// Keep the production deadline fixed at entry while allowing functional transport
+// tests to exercise this same path independently of host scheduling latency.
+fn submit_notify_until(root: &Path, payload: &[u8], deadline: StdInstant) -> NotifyOutcome {
     let Ok(projected) = project_notify_json(payload) else {
         return NotifyOutcome::Rejected;
     };
@@ -2545,13 +3287,16 @@ fn capture_private_turn_detail_if_enabled(
         .map_err(runtime_error)
 }
 
-fn acquire_private_turn_detail_mutation(
-    runtime: &Path,
-) -> Result<Option<MutationGuard>, CollectorError> {
+fn acquire_private_turn_detail_mutation<'barrier>(
+    layout: &InstalledLayout,
+    barrier: Option<&'barrier StorageBarrier>,
+) -> Result<Option<StorageMutationWriter<'barrier>>, CollectorError> {
     for attempt in 0..PRIVATE_TURN_DETAIL_LOCK_RETRIES {
-        match MutationGuard::try_acquire(runtime) {
+        match StorageMutationWriter::acquire_exclusive(&layout.root, barrier) {
             Ok(mutation) => return Ok(Some(mutation)),
-            Err(SingletonError::AlreadyRunning) => {
+            Err(
+                agent_observability_local_runtime::storage_coherence::StorageCoherenceError::Busy,
+            ) => {
                 if attempt + 1 < PRIVATE_TURN_DETAIL_LOCK_RETRIES {
                     thread::sleep(PRIVATE_TURN_DETAIL_LOCK_RETRY_DELAY);
                 }
@@ -2709,11 +3454,22 @@ fn persist_private_turn_detail_locked(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    // Test-only, content-free timings keep a failed latency gate attributable
+    // without changing admission, durability, retention, or the time limit.
+    #[cfg(test)]
+    let prune_started = StdInstant::now();
     prune_private_turn_details(&directory, Some(&path), config, SystemTime::now())?;
+    #[cfg(test)]
+    eprintln!(
+        "private_capture_stage=detail_prune elapsed={:?}",
+        prune_started.elapsed()
+    );
     let reservation = u64::try_from(MAX_PRIVATE_TURN_DETAIL_BYTES)
         .map_err(|_| CollectorError::Runtime("private detail size bound overflow".into()))?
         .checked_add(additional_reservation)
         .ok_or_else(|| CollectorError::Runtime("private detail size bound overflow".into()))?;
+    #[cfg(test)]
+    let admission_started = StdInstant::now();
     let control = RuntimeControl::new(config).map_err(runtime_error)?;
     if control
         .admit(&layout.root, reservation)
@@ -2724,6 +3480,13 @@ fn persist_private_turn_detail_locked(
             "private turn detail exceeds local storage budget".into(),
         ));
     }
+    #[cfg(test)]
+    eprintln!(
+        "private_capture_stage=admission elapsed={:?}",
+        admission_started.elapsed()
+    );
+    #[cfg(test)]
+    let publication_started = StdInstant::now();
     let temporary = settings_temporary_path(&directory);
     let result = (|| {
         let mut options = OpenOptions::new();
@@ -2742,6 +3505,11 @@ fn persist_private_turn_detail_locked(
         Ok(())
     })();
     let _ = fs::remove_file(&temporary);
+    #[cfg(test)]
+    eprintln!(
+        "private_capture_stage=detail_publication elapsed={:?}",
+        publication_started.elapsed()
+    );
     result
 }
 
@@ -2793,9 +3561,13 @@ fn prune_private_turn_files_with_limit(
         ));
     }
     let max_age = Duration::from_secs(
-        u64::from(config.retention.max_record_age_days)
-            .checked_mul(24 * 60 * 60)
-            .ok_or_else(|| CollectorError::Runtime("private detail retention overflow".into()))?,
+        u64::from(if config.lifecycle.enabled {
+            config.lifecycle.private_raw_days
+        } else {
+            config.retention.max_record_age_days
+        })
+        .checked_mul(24 * 60 * 60)
+        .ok_or_else(|| CollectorError::Runtime("private detail retention overflow".into()))?,
     );
     let mut retained = Vec::new();
     let mut expired = Vec::new();
@@ -2874,9 +3646,12 @@ fn prune_private_turn_files_with_limit(
 /// on a subsequent private capture.
 pub fn maintain_private_turn_details(root: &Path) -> Result<(), CollectorError> {
     let layout = install(root).map_err(runtime_error)?;
+    let barrier = StorageBarrier::open_if_initialized(&layout.root).map_err(runtime_error)?;
+    let scope = StorageMutationWriter::acquire_exclusive(&layout.root, barrier.as_ref())
+        .map_err(runtime_error)?;
     let config = load(&layout.config).map_err(runtime_error)?;
-    let _mutation = MutationGuard::acquire(&layout.runtime).map_err(runtime_error)?;
-    maintain_private_turn_details_locked(&layout, &config, SystemTime::now())
+    let result = maintain_private_turn_details_locked(&layout, &config, SystemTime::now());
+    verify_collector_write_result(result, scope.revalidate())
 }
 
 fn maintain_private_turn_details_locked(
@@ -2973,6 +3748,10 @@ fn maintain_private_turn_directory_locked(
 
 fn private_turn_detail_error_code(error: &CollectorError) -> &'static str {
     match error {
+        CollectorError::StorageWriteUnverified { .. } => "settings_write_unverified",
+        CollectorError::LifecycleStoragePressure | CollectorError::DashboardStorageCapacity => {
+            "storage_budget"
+        }
         CollectorError::Runtime(message) if message.contains("conflict") => "conflict",
         CollectorError::Runtime(message) if message.contains("storage budget") => "storage_budget",
         CollectorError::Runtime(message) if message.contains("already running") => "busy",
@@ -3010,6 +3789,8 @@ fn write_private_turn_detail_status_locked(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    #[cfg(test)]
+    let prune_started = StdInstant::now();
     prune_private_turn_files_with_limit(
         &directory,
         Some(&path),
@@ -3018,13 +3799,26 @@ fn write_private_turn_detail_status_locked(
         MAX_PRIVATE_TURN_DETAIL_FILES,
         MAX_PRIVATE_TURN_DETAIL_STATUS_BYTES,
     )?;
+    #[cfg(test)]
+    eprintln!(
+        "private_capture_stage=status_prune elapsed={:?}",
+        prune_started.elapsed()
+    );
     let status = PrivateTurnDetailCaptureStatusV1 {
         schema_version: PRIVATE_TURN_DETAIL_STATUS_VERSION.into(),
         turn_id: turn_id.into(),
         state: state.into(),
         code: code.into(),
     };
-    write_private_json(&path, &status)
+    #[cfg(test)]
+    let publication_started = StdInstant::now();
+    let result = write_private_json(&path, &status);
+    #[cfg(test)]
+    eprintln!(
+        "private_capture_stage=status_publication elapsed={:?}",
+        publication_started.elapsed()
+    );
+    result
 }
 
 fn read_private_turn_detail_status(
@@ -3048,8 +3842,15 @@ fn read_private_turn_detail_status(
         }
         Err(_) => return Err("status_storage_unavailable"),
     };
+    validate_private_turn_detail_status(&bytes, turn_id).map(Some)
+}
+
+fn validate_private_turn_detail_status(
+    bytes: &[u8],
+    turn_id: &str,
+) -> Result<&'static str, &'static str> {
     let status: PrivateTurnDetailCaptureStatusV1 =
-        serde_json::from_slice(&bytes).map_err(|_| "status_artifact_invalid")?;
+        serde_json::from_slice(bytes).map_err(|_| "status_artifact_invalid")?;
     if status.schema_version != PRIVATE_TURN_DETAIL_STATUS_VERSION
         || status.turn_id != turn_id
         || status.state
@@ -3073,7 +3874,7 @@ fn read_private_turn_detail_status(
         "conflict" => "conflict",
         _ => return Err("status_artifact_invalid"),
     };
-    Ok(Some(code))
+    Ok(code)
 }
 
 fn private_turn_detail_path(directory: &Path, turn_id: &str) -> Result<PathBuf, CollectorError> {
@@ -3097,6 +3898,12 @@ fn private_turn_detail_path(directory: &Path, turn_id: &str) -> Result<PathBuf, 
 /// Performs a bounded authenticated health probe against the local collector.
 #[must_use]
 pub fn check_health(root: &Path) -> HealthOutcome {
+    check_health_details(root).outcome
+}
+
+/// Preserves allowlisted degradation reasons from a versioned collector health response.
+#[must_use]
+pub fn check_health_details(root: &Path) -> HealthDetails {
     match authenticated_request(
         root,
         "GET",
@@ -3105,19 +3912,38 @@ pub fn check_health(root: &Path) -> HealthOutcome {
         Duration::from_millis(50),
         Duration::from_millis(100),
     ) {
-        Ok(response) if response.status == 200 => {
-            match serde_json::from_slice::<HealthProbe>(&response.body) {
-                Ok(HealthProbe {
-                    status,
-                    report_dirty: false,
-                }) if status == "ready" => HealthOutcome::Ready,
-                Ok(HealthProbe {
-                    status,
-                    report_dirty: true,
-                }) if status == "degraded" => HealthOutcome::Degraded,
-                _ => HealthOutcome::Unavailable,
-            }
-        }
+        Ok(response) if response.status == 200 => classify_health_details(&response.body),
+        _ => HealthDetails {
+            outcome: HealthOutcome::Unavailable,
+            degradation_reasons: Vec::new(),
+        },
+    }
+}
+
+fn classify_health_details(body: &[u8]) -> HealthDetails {
+    let outcome = classify_health_probe(body);
+    let degradation_reasons = if outcome == HealthOutcome::Degraded {
+        serde_json::from_slice::<HealthReasonProjection>(body)
+            .ok()
+            .filter(|projection| projection.schema_version == LOCAL_COLLECTOR_HEALTH_VERSION)
+            .filter(|projection| projection.degradation_reasons.len() <= 3)
+            .map_or_else(Vec::new, |projection| projection.degradation_reasons)
+    } else {
+        Vec::new()
+    };
+    HealthDetails {
+        outcome,
+        degradation_reasons,
+    }
+}
+
+fn classify_health_probe(body: &[u8]) -> HealthOutcome {
+    match serde_json::from_slice::<HealthProbe>(body) {
+        Ok(HealthProbe {
+            status,
+            report_dirty: false,
+        }) if status == "ready" => HealthOutcome::Ready,
+        Ok(HealthProbe { status, .. }) if status == "degraded" => HealthOutcome::Degraded,
         _ => HealthOutcome::Unavailable,
     }
 }
@@ -3368,39 +4194,390 @@ fn parse_complete_http_response(
     }))
 }
 
-fn refresh_report(
+fn refresh_report_observing(
     layout: &InstalledLayout,
     store: &LocalStore,
-    now_unix_ms: u64,
+    on_record: impl FnMut(usize),
 ) -> Result<bool, ReportFailure> {
-    let _render_guard = store
-        .acquire_report_render_guard()
-        .map_err(|_| ReportFailure::RenderGuard)?;
-    let capacity = usize::try_from(store.record_count().map_err(|_| ReportFailure::Snapshot)?)
-        .map_err(|_| ReportFailure::Snapshot)?;
-    let mut projector = ReportProjector::new(capacity, None);
-    let mut projection_failure = false;
-    let visit = store
-        .visit_report_snapshot(|index, record| {
-            if !projection_failure && projector.push_owned(index, record).is_err() {
-                projection_failure = true;
-            }
-        })
-        .map_err(|_| ReportFailure::Snapshot)?;
-    if projection_failure {
-        return Err(ReportFailure::Projection);
-    }
-    let report = projector
-        .finish(
-            timestamp_from_unix_ms(now_unix_ms).map_err(|_| ReportFailure::Projection)?,
-            "Agent Observability Report",
+    refresh_report_with_precommit_observing(layout, store, None, on_record)
+}
+
+fn refresh_report_with_precommit_observing(
+    layout: &InstalledLayout,
+    store: &LocalStore,
+    precommit: Option<&dyn CollectorReportPrecommitGuard>,
+    on_record: impl FnMut(usize),
+) -> Result<bool, ReportFailure> {
+    let mutation = try_report_mutation(layout)?;
+    let barrier =
+        agent_observability_local_runtime::storage_coherence::StorageBarrier::open_if_initialized(
+            &layout.root,
         )
-        .map_err(|_| ReportFailure::Projection)?;
-    write_private(&layout.logs.join(REPORT_FILE_NAME), &report)
+        .map_err(report_coherence_failure)?;
+    let scope = ReportMutationScope::acquire(mutation, barrier.as_ref())?;
+    let config = load(&layout.config).map_err(|_| ReportFailure::Publish)?;
+    let control = RuntimeControl::new(&config).map_err(report_control_failure)?;
+    let admitted_bytes = if let Some(precommit) = precommit {
+        Some(check_report_start(layout, &scope, &config, precommit)?)
+    } else {
+        None
+    };
+    if let Some(stale) = control
+        .claim_stale_report_reservation(&layout.root, scope.mutation())
+        .map_err(report_control_failure)?
+    {
+        // Keep both locks until cleanup succeeds. Failed cleanup preserves the stale promise.
+        recover_report_view_catalog(store).map_err(report_catalog_failure)?;
+        stale
+            .release(&layout.root, scope.mutation())
+            .map_err(|_| ReportFailure::Publish)?;
+    }
+    let admitted_bytes = match admitted_bytes {
+        Some(bytes) => bytes,
+        None => automatic_report_view_admitted_bytes(layout, &config)?,
+    };
+    let mut reservation = control
+        .reserve_report_build(
+            &layout.root,
+            scope.mutation(),
+            admitted_bytes + REPORT_VIEW_PUBLICATION_RESERVE_BYTES,
+        )
+        .map_err(report_control_failure)?;
+    let staging = build_automatic_report_view_staging(
+        store,
+        admitted_bytes,
+        barrier.as_ref(),
+        |path, file| {
+            reservation
+                .bind_staging(&layout.root, scope.mutation(), path, file)
+                .map_err(|_| ReportViewBuildError::InvalidStagingState)?;
+            // Release only after the created descriptor is durably bound; projection must
+            // not occupy the ingest mutation lock. The publication guard remains held.
+            scope
+                .revalidate()
+                .map_err(|_| ReportViewBuildError::InvalidStagingState)?;
+            drop(scope);
+            Ok(())
+        },
+        on_record,
+    )?;
+    // Never wait while holding the publication guard. Other writers can own mutation and
+    // attempt publication in the opposite order; contention is retryable, not a deadlock.
+    let mutation = try_report_mutation(layout)?;
+    let scope = ReportMutationScope::acquire(mutation, barrier.as_ref())?;
+    // Settings may change during projection. Publication must obey the latest budget, not
+    // the admission-time copy, even though the original reservation remains conservative.
+    let config = load(&layout.config).map_err(|_| ReportFailure::Publish)?;
+    let control = RuntimeControl::new(&config).map_err(report_control_failure)?;
+    let remaining = control
+        .reservation_finalization_headroom(&layout.root, scope.mutation(), &reservation)
+        .map_err(report_control_failure)?;
+    if remaining < REPORT_VIEW_PUBLICATION_RESERVE_BYTES {
+        return Err(ReportFailure::Capacity);
+    }
+    reservation
+        .validate_staging(
+            &layout.root,
+            scope.mutation(),
+            staging.path(),
+            staging.identity_file(),
+        )
         .map_err(|_| ReportFailure::Publish)?;
-    store
-        .acknowledge_report_generation(visit.generation)
-        .map_err(|_| ReportFailure::Acknowledge)
+    if let Some(precommit) = precommit {
+        let freeze = scope.required_freeze()?;
+        let self_reservation = control
+            .validated_report_reservation_bytes(&layout.root, scope.mutation(), &reservation)
+            .map_err(report_control_failure)?;
+        precommit
+            .check_publication(
+                layout,
+                freeze,
+                &config,
+                REPORT_VIEW_PUBLICATION_RESERVE_BYTES,
+                self_reservation,
+            )
+            .map_err(report_precommit_failure)?;
+        scope.revalidate()?;
+    }
+    let publication = publish_report_view(store, staging).map_err(report_catalog_failure)?;
+    if publication.cleanup_pending() {
+        return Err(ReportFailure::Publish);
+    }
+    let acknowledged = acknowledge_report_reservation(
+        layout,
+        store,
+        publication.current().generation(),
+        scope.mutation(),
+        reservation,
+    )?;
+    scope.revalidate()?;
+    Ok(acknowledged)
+}
+
+fn check_report_start(
+    layout: &InstalledLayout,
+    scope: &ReportMutationScope<'_>,
+    config: &LocalRuntimeConfigV3,
+    precommit: &dyn CollectorReportPrecommitGuard,
+) -> Result<u64, ReportFailure> {
+    let freeze = scope.required_freeze()?;
+    let evidence =
+        agent_observability_local_runtime::reservation::ReportReservationEvidence::capture(
+            &layout.root,
+            scope.mutation(),
+        )
+        .map_err(|error| report_control_failure(ControlError::Reservation(error)))?;
+    // Admission cannot authorize recovery. Defer both active and stale promises.
+    if evidence.captured_reserved_bytes() != 0 {
+        return Err(ReportFailure::RenderGuard);
+    }
+    let admitted_bytes = automatic_report_view_admitted_bytes(layout, config)?;
+    let estimated_allowance = admitted_bytes
+        .checked_add(REPORT_VIEW_PUBLICATION_RESERVE_BYTES)
+        .and_then(|bytes| bytes.checked_add(REPORT_RESERVATION_METADATA_ALLOWANCE))
+        .ok_or(ReportFailure::Capacity)?;
+    precommit
+        .check_start(layout, freeze, config, estimated_allowance)
+        .map_err(report_precommit_failure)?;
+    evidence
+        .revalidate()
+        .map_err(|error| report_control_failure(ControlError::Reservation(error)))?;
+    scope.revalidate()?;
+    Ok(admitted_bytes)
+}
+
+fn acknowledge_report_reservation(
+    layout: &InstalledLayout,
+    store: &LocalStore,
+    generation: u64,
+    mutation: &MutationGuard,
+    reservation: agent_observability_local_runtime::WriteReservation,
+) -> Result<bool, ReportFailure> {
+    let acknowledged = store
+        .acknowledge_report_generation(generation)
+        .map_err(|_| ReportFailure::Acknowledge)?;
+    if !acknowledged {
+        // Do not discharge an incomplete finalization. Guarded recovery will reconcile the
+        // published catalog before a later attempt clears this now-stale reservation.
+        return Err(ReportFailure::SnapshotChanged);
+    }
+    reservation
+        .release(&layout.root, mutation)
+        .map_err(|_| ReportFailure::Publish)?;
+    Ok(acknowledged)
+}
+
+fn try_report_mutation(layout: &InstalledLayout) -> Result<MutationGuard, ReportFailure> {
+    MutationGuard::try_acquire(&layout.runtime).map_err(|error| match error {
+        SingletonError::AlreadyRunning => ReportFailure::RenderGuard,
+        _ => ReportFailure::Publish,
+    })
+}
+
+const fn report_precommit_failure(error: CollectorReportPrecommitError) -> ReportFailure {
+    match error {
+        CollectorReportPrecommitError::Denied => ReportFailure::Capacity,
+        CollectorReportPrecommitError::Unavailable => ReportFailure::Publish,
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // Direct Result::map_err adapter consumes the source error.
+fn report_control_failure(error: ControlError) -> ReportFailure {
+    match error {
+        ControlError::Reservation(ReservationError::Busy) => ReportFailure::RenderGuard,
+        ControlError::Reservation(ReservationError::Capacity) => ReportFailure::Capacity,
+        _ => ReportFailure::Publish,
+    }
+}
+
+fn recover_report_reservation_for_startup(
+    layout: &InstalledLayout,
+    config: &LocalRuntimeConfigV3,
+    mutation: &MutationGuard,
+) -> Result<(), CollectorError> {
+    let control = RuntimeControl::new(config).map_err(runtime_error)?;
+    if let Some(stale) = control
+        .claim_stale_report_reservation(&layout.root, mutation)
+        .map_err(runtime_error)?
+    {
+        // A reservation is created only for an already current store. Recovery must not
+        // require migration headroom that is still conservatively reserved by the stale owner.
+        recover_report_view_catalog_before_migration(layout.state.join("store"))
+            .map_err(runtime_error)?;
+        stale
+            .release(&layout.root, mutation)
+            .map_err(runtime_error)?;
+    }
+    Ok(())
+}
+
+async fn cleanup_report_reservation_with_retry(
+    state: &AppState,
+    layout: &InstalledLayout,
+    timing: ReportRefreshTiming,
+) -> Result<(), ReportFailure> {
+    let mut delay = timing.retry_initial;
+    for attempt in 0..REPORT_RETRY_LIMIT {
+        #[cfg(test)]
+        state
+            .report_snapshot_test
+            .cleanup_attempts
+            .fetch_add(1, Ordering::Release);
+        #[cfg(not(test))]
+        let _ = state;
+        let layout = layout.clone();
+        let result = tokio::task::spawn_blocking(move || cleanup_report_reservation(&layout))
+            .await
+            .map_err(|_| ReportFailure::Task)?;
+        match result {
+            Err(ReportFailure::RenderGuard) if attempt + 1 < REPORT_RETRY_LIMIT => {
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+            result => return result,
+        }
+    }
+    unreachable!("cleanup retry limit is nonzero")
+}
+
+fn cleanup_report_reservation(layout: &InstalledLayout) -> Result<(), ReportFailure> {
+    let mutation = try_report_mutation(layout)?;
+    let barrier =
+        agent_observability_local_runtime::storage_coherence::StorageBarrier::open_if_initialized(
+            &layout.root,
+        )
+        .map_err(report_coherence_failure)?;
+    let scope = ReportMutationScope::acquire(mutation, barrier.as_ref())?;
+    let config = load(&layout.config).map_err(|_| ReportFailure::Publish)?;
+    let control = RuntimeControl::new(&config).map_err(|_| ReportFailure::Publish)?;
+    if let Some(stale) = control
+        .claim_stale_report_reservation(&layout.root, scope.mutation())
+        .map_err(report_control_failure)?
+    {
+        recover_report_view_catalog_before_migration(layout.state.join("store"))
+            .map_err(report_catalog_failure)?;
+        stale
+            .release(&layout.root, scope.mutation())
+            .map_err(|error| report_control_failure(ControlError::Reservation(error)))?;
+    }
+    scope.revalidate()
+}
+
+fn automatic_report_view_missing(store: &LocalStore) -> Result<bool, CollectorError> {
+    match current_report_view(store) {
+        Ok(view) => match current_report_view_needs_kernel_upgrade(store) {
+            Ok(needs_upgrade) => Ok(view.is_none() || needs_upgrade),
+            Err(ReportViewCatalogError::Busy) => Ok(true),
+            Err(error) => Err(runtime_error(error)),
+        },
+        // A staging build or destructive pass already owns publication. Start normally and let
+        // the existing adaptive refresh scheduler converge after that bounded operation ends.
+        Err(ReportViewCatalogError::Busy) => Ok(true),
+        Err(error) => Err(runtime_error(error)),
+    }
+}
+
+fn recover_report_view_catalog_for_startup(store: &LocalStore) -> Result<(), CollectorError> {
+    recover_report_view_catalog(store).map_err(runtime_error)
+}
+
+fn automatic_report_view_admitted_bytes(
+    layout: &InstalledLayout,
+    config: &LocalRuntimeConfigV3,
+) -> Result<u64, ReportFailure> {
+    // Runtime accounting covers the entire managed tree, including current/retired/staging
+    // sidecars. The builder keeps its SQLite journal reserve inside this per-generation amount.
+    RuntimeControl::new(config)
+        .map_err(|_| ReportFailure::Publish)?
+        .writable_headroom(&layout.root)
+        .map_err(|_| ReportFailure::Publish)
+        .map(automatic_report_view_bytes_from_headroom)
+}
+
+fn automatic_report_view_bytes_from_headroom(headroom: u64) -> u64 {
+    headroom
+        .saturating_sub(REPORT_VIEW_PUBLICATION_RESERVE_BYTES)
+        .saturating_sub(REPORT_RESERVATION_METADATA_ALLOWANCE)
+        .min(MAX_AUTOMATIC_REPORT_VIEW_BYTES)
+}
+
+fn build_automatic_report_view_staging(
+    store: &LocalStore,
+    admitted_bytes: u64,
+    barrier: Option<&agent_observability_local_runtime::storage_coherence::StorageBarrier>,
+    before_write: impl FnOnce(&Path, &File) -> Result<(), ReportViewBuildError>,
+    on_record: impl FnMut(usize),
+) -> Result<agent_observability_local_store::ReportViewStaging, ReportFailure> {
+    #[cfg(not(test))]
+    let on_record = {
+        let _ = on_record;
+        |_| {}
+    };
+    if let Some(barrier) = barrier {
+        let mut permits = ReportWritePermits { barrier };
+        return agent_observability_local_store::build_report_view_staging_bound_coordinated(
+            store,
+            MISSING_RATE_FINGERPRINT,
+            admitted_bytes,
+            None,
+            before_write,
+            &mut permits,
+            on_record,
+        )
+        .map_err(|error| report_view_build_failure(&error));
+    }
+    agent_observability_local_store::build_report_view_staging_bound(
+        store,
+        MISSING_RATE_FINGERPRINT,
+        admitted_bytes,
+        None,
+        before_write,
+        on_record,
+    )
+    .map_err(|error| report_view_build_failure(&error))
+}
+
+fn report_view_build_failure(error: &ReportViewBuildError) -> ReportFailure {
+    match error {
+        ReportViewBuildError::Busy => ReportFailure::RenderGuard,
+        ReportViewBuildError::SnapshotChanged
+        | ReportViewBuildError::Store(
+            agent_observability_local_store::StoreError::ReportSnapshotChanged,
+        ) => ReportFailure::SnapshotChanged,
+        ReportViewBuildError::Store(
+            agent_observability_local_store::StoreError::ReportSnapshotRecordTooLarge { .. },
+        ) => ReportFailure::Capacity,
+        ReportViewBuildError::Store(_) => ReportFailure::Snapshot,
+        ReportViewBuildError::Projection(_) | ReportViewBuildError::Json(_) => {
+            ReportFailure::Projection
+        }
+        ReportViewBuildError::Sqlite(_)
+        | ReportViewBuildError::Io(_)
+        | ReportViewBuildError::InvalidRateFingerprint
+        | ReportViewBuildError::CoordinationDenied
+        | ReportViewBuildError::InvalidStagingState => ReportFailure::Publish,
+        ReportViewBuildError::InvalidByteBudget | ReportViewBuildError::CapacityExceeded => {
+            ReportFailure::Capacity
+        }
+    }
+}
+
+fn report_catalog_failure(error: ReportViewCatalogError) -> ReportFailure {
+    match error {
+        ReportViewCatalogError::Busy => ReportFailure::RenderGuard,
+        ReportViewCatalogError::SnapshotChanged => ReportFailure::SnapshotChanged,
+        ReportViewCatalogError::Store(_) => ReportFailure::Snapshot,
+        ReportViewCatalogError::Build(error) => report_view_build_failure(&error),
+        ReportViewCatalogError::Sqlite(_)
+        | ReportViewCatalogError::Json(_)
+        | ReportViewCatalogError::Io(_)
+        | ReportViewCatalogError::SourceMismatch
+        | ReportViewCatalogError::SnapshotExpired
+        | ReportViewCatalogError::RefreshPending
+        | ReportViewCatalogError::InvalidCatalog
+        | ReportViewCatalogError::CatalogCapacityExceeded
+        | ReportViewCatalogError::InvalidVisibilityAdvance => ReportFailure::Publish,
+    }
 }
 
 fn open_store(
@@ -3449,6 +4626,7 @@ fn current_unix_ms() -> Result<u64, CollectorError> {
         .map_err(|_| CollectorError::Runtime("system clock is out of range".into()))
 }
 
+#[cfg(test)]
 fn timestamp_from_unix_ms(unix_ms: u64) -> Result<String, CollectorError> {
     let seconds = i64::try_from(unix_ms / 1_000)
         .map_err(|_| CollectorError::Runtime("system clock is out of range".into()))?;
@@ -3464,6 +4642,7 @@ fn timestamp_from_unix_ms(unix_ms: u64) -> Result<String, CollectorError> {
     ))
 }
 
+#[cfg(test)]
 fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     let days = days_since_epoch + 719_468;
     let era = days / 146_097;
@@ -3485,14 +4664,291 @@ fn runtime_error(error: impl std::fmt::Display) -> CollectorError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lifecycle_health_degradation_does_not_require_a_dirty_report() {
+        assert_eq!(
+            super::classify_health_probe(
+                br#"{"status":"degraded","report_dirty":false,"lifecycle_failures":1}"#
+            ),
+            super::HealthOutcome::Degraded
+        );
+        assert_eq!(
+            super::classify_health_probe(br#"{"status":"ready","report_dirty":true}"#),
+            super::HealthOutcome::Unavailable
+        );
+        assert_eq!(
+            super::classify_health_probe(br#"{"status":"unknown","report_dirty":false}"#),
+            super::HealthOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn lifecycle_quiet_period_protects_recent_and_future_ingest() {
+        assert!(super::lifecycle_idle(None, 0));
+        assert!(!super::lifecycle_idle(Some(1_000), 30_999));
+        assert!(super::lifecycle_idle(Some(1_000), 31_000));
+        assert!(!super::lifecycle_idle(Some(32_000), 31_000));
+    }
+
+    #[test]
+    fn lifecycle_disabled_does_not_require_or_create_store() {
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-lifecycle-disabled-{}-{}",
+            std::process::id(),
+            super::current_unix_ms().unwrap()
+        ));
+        let layout = agent_observability_local_runtime::install(&root).unwrap();
+        assert_eq!(
+            super::maintain_storage_lifecycle(&root).unwrap(),
+            "lifecycle=disabled"
+        );
+        assert!(!layout.state.join("store").exists());
+        let mutation_guard =
+            agent_observability_local_runtime::MutationGuard::acquire(&layout.runtime).unwrap();
+        assert_eq!(
+            super::maintain_storage_lifecycle(&root).unwrap(),
+            "lifecycle=busy"
+        );
+        drop(mutation_guard);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_idle_preserves_existing_report() {
+        let root = test_root("lifecycle-idle-report");
+        let state = collector_state(&root);
+        let layout = state.layout.clone();
+        drop(state);
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.lifecycle.enabled = true;
+        save(&guard, &config).unwrap();
+        drop(guard);
+        let report_path = layout.logs.join(REPORT_FILE_NAME);
+        let report = project_report(
+            &[],
+            "2026-09-07T00:00:00.000Z",
+            "Agent Observability Report",
+            None,
+        )
+        .unwrap();
+        write_private(&report_path, &report).unwrap();
+        let before = fs::read(&report_path).unwrap();
+        assert_eq!(
+            super::maintain_storage_lifecycle(&root).unwrap(),
+            "lifecycle=idle"
+        );
+        assert_eq!(fs::read(&report_path).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn versioned_health_reasons_are_preserved_without_guessing_legacy_causes() {
+        use agent_observability_contracts::CollectorDegradationReasonV1 as Reason;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schema_version": super::LOCAL_COLLECTOR_HEALTH_VERSION,
+            "status": "degraded", "report_dirty": false,
+            "degradation_reasons": ["storage_pressure", "expired_trace"]
+        }))
+        .unwrap();
+        let details = super::classify_health_details(&body);
+        assert_eq!(details.outcome, super::HealthOutcome::Degraded);
+        assert_eq!(
+            details.degradation_reasons,
+            vec![Reason::StoragePressure, Reason::ExpiredTrace]
+        );
+        for body in [
+            br#"{"status":"degraded","report_dirty":false,"lifecycle_failures":1}"#.as_slice(),
+            br#"{"schema_version":"local_collector_health.v1","status":"degraded","report_dirty":false,"degradation_reasons":["future_reason"]}"#,
+            br#"{"schema_version":"future.v2","status":"degraded","report_dirty":false,"degradation_reasons":["storage_pressure"]}"#,
+        ] {
+            let details = super::classify_health_details(body);
+            assert_eq!(details.outcome, super::HealthOutcome::Degraded);
+            assert!(details.degradation_reasons.is_empty());
+        }
+        assert_eq!(
+            super::lifecycle_degradation_reasons(1, false, Some(0)),
+            vec![Reason::LifecycleFailure]
+        );
+        assert_eq!(
+            super::lifecycle_degradation_reasons(1, true, Some(1)),
+            vec![Reason::StoragePressure, Reason::ExpiredTrace]
+        );
+        assert!(super::lifecycle_degradation_reasons(0, false, Some(0)).is_empty());
+    }
+
+    #[test]
+    fn lifecycle_pass_health_tracks_last_pass_and_preserves_busy_state() {
+        let root = test_root("lifecycle-pass-health");
+        let state = app_state(&root);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                super::record_lifecycle_pass(&state, "lifecycle=blocked\nreport_refresh=pending");
+                assert_eq!(state.lifecycle_failures.load(Ordering::Acquire), 1);
+                assert!(state.report_refresh_scheduled.load(Ordering::Acquire));
+                super::record_lifecycle_pass(&state, "lifecycle=busy");
+                assert_eq!(state.lifecycle_failures.load(Ordering::Acquire), 1);
+                state
+                    .lifecycle_storage_pressure
+                    .store(true, Ordering::Release);
+                super::record_lifecycle_pass(&state, "lifecycle=busy");
+                assert!(state.lifecycle_storage_pressure.load(Ordering::Acquire));
+                for output in [
+                    "lifecycle=completed",
+                    "lifecycle=idle",
+                    "lifecycle=disabled",
+                ] {
+                    state.lifecycle_failures.store(1, Ordering::Release);
+                    super::record_lifecycle_pass(&state, output);
+                    assert_eq!(state.lifecycle_failures.load(Ordering::Acquire), 0);
+                    assert!(!state.lifecycle_storage_pressure.load(Ordering::Acquire));
+                }
+            });
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_oversized_trace_reports_blocked_without_deleting_it() {
+        let root = test_root("lifecycle-blocked");
+        let mut state = collector_state(&root);
+        let layout = state.layout.clone();
+        let body = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
+          {"timeUnixNano":"1000000000000000000","attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},
+            {"key":"conversation.id","value":{"stringValue":"blocked-trace"}}]},
+          {"timeUnixNano":"1000000000000000000","attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+            {"key":"conversation.id","value":{"stringValue":"blocked-trace"}},
+            {"key":"auth.request_id","value":{"stringValue":"blocked-request"}}]}
+        ]}]}]}"#;
+        ingest_locked(&mut state, body).unwrap();
+        let count = state.store.record_count().unwrap();
+        assert!(count > 1);
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.lifecycle.enabled = true;
+        config.retention.max_archive_records = 1;
+        config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+        config.retention.max_archive_bytes = 256 * 1024 * 1024;
+        save(&guard, &config).unwrap();
+        drop(guard);
+        assert!(matches!(
+            super::maintain_storage_lifecycle(&root),
+            Err(super::CollectorError::LifecycleStoragePressure)
+        ));
+        assert_eq!(state.store.record_count().unwrap(), count);
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        config.retention.max_archive_bytes = 65_536;
+        save(&guard, &config).unwrap();
+        drop(guard);
+        let output = super::maintain_storage_lifecycle(&root).unwrap();
+        assert!(output.starts_with("lifecycle=blocked\n"), "{output}");
+        assert_eq!(state.store.record_count().unwrap(), count);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_publication_lock_protects_report_and_expiry() {
+        let root = test_root("lifecycle-publication-lock");
+        let mut state = collector_state(&root);
+        let layout = state.layout.clone();
+        let body = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"1000000000000000000","attributes":[{"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},{"key":"conversation.id","value":{"stringValue":"old-lifecycle-trace"}}]}]}]}]}"#;
+        ingest_locked(&mut state, body).unwrap();
+        assert_eq!(state.store.record_count().unwrap(), 1);
+        refresh_report_from_root(&root).unwrap();
+        let snapshot = state.store.report_snapshot().unwrap();
+        let report = project_report(
+            &snapshot.records,
+            "2026-09-07T00:00:00.000Z",
+            "Agent Observability Report",
+            None,
+        )
+        .unwrap();
+        write_private(&layout.logs.join(REPORT_FILE_NAME), &report).unwrap();
+        let config_guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.lifecycle.enabled = true;
+        save(&config_guard, &config).unwrap();
+        drop(config_guard);
+        let render_guard = state.store.acquire_report_render_guard().unwrap();
+        let path = layout.logs.join(REPORT_FILE_NAME);
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            super::maintain_storage_lifecycle(&root).unwrap(),
+            "lifecycle=busy"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(state.store.record_count().unwrap(), 1);
+        drop(render_guard);
+        let result = super::maintain_storage_lifecycle(&root).unwrap();
+        assert!(result.contains("lifecycle=completed"));
+        assert_eq!(state.store.record_count().unwrap(), 0);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("리포트 갱신 대기")
+        );
+        assert!(state.store.report_status().unwrap().pending());
+        refresh_report_from_root(&root).unwrap();
+        assert!(!state.store.report_status().unwrap().pending());
+        assert_published_report_view(&root, 0);
+        ingest_notify_locked(
+            &mut state,
+            &projected_notify("old-lifecycle-trace", "new-after-expiry"),
+        )
+        .unwrap();
+        assert_eq!(state.store.expired_trace_disposition_count().unwrap(), 1);
+        let health_state = app_state(&root);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let response = super::health(State(health_state)).await.into_response();
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(health["expired_trace_dispositions"], 1);
+                assert_eq!(health["status"], "degraded");
+                assert_eq!(
+                    health["schema_version"],
+                    super::LOCAL_COLLECTOR_HEALTH_VERSION
+                );
+                assert_eq!(
+                    health["degradation_reasons"],
+                    serde_json::json!(["expired_trace"])
+                );
+                let schema: serde_json::Value = serde_json::from_str(
+                    agent_observability_contracts::LOCAL_COLLECTOR_HEALTH_SCHEMA,
+                )
+                .unwrap();
+                assert_eq!(
+                    health.as_object().unwrap().keys().collect::<Vec<_>>(),
+                    schema["properties"]
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .collect::<Vec<_>>(),
+                );
+            });
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     use super::{
-        AUTH_HEADER_NAME, AppState, CollectorState, IngestError, IngestOutcome, NotifyOutcome,
-        OtlpRejectionCategory, OtlpRequestCorrelationState, OtlpSubmissionOutcome,
-        PrivateTurnDetailLookup, REPORT_FILE_NAME, ReportFailure, admit_request,
-        authenticated_request, build_client_config, build_server_config,
-        capture_private_turn_detail, capture_private_turn_detail_if_enabled,
-        capture_private_turn_detail_locked, classify_otlp_rejection, enforce_batch_policy,
-        ensure_private_directory_tree, ingest_locked, ingest_notify_locked,
+        AUTH_HEADER_NAME, AppState, CollectorState, IngestCompletionTest, IngestError,
+        IngestOutcome, LocalStore, MISSING_RATE_FINGERPRINT, NotifyOutcome, OtlpRejectionCategory,
+        OtlpRequestCorrelationState, OtlpSubmissionOutcome, PrivateTurnDetailLookup,
+        REPORT_FILE_NAME, ReportFailure, admit_request, authenticated_request, build_client_config,
+        build_server_config, capture_private_turn_detail, capture_private_turn_detail_if_enabled,
+        capture_private_turn_detail_locked, classify_otlp_rejection, current_report_view,
+        enforce_batch_policy, ensure_private_directory_tree, ingest_locked, ingest_notify_locked,
         ingest_notify_with_private_detail, install_settings, is_json, load_settings,
         lookup_private_turn_detail, maintain_private_turn_details_locked, open_store,
         parse_complete_http_response, persist_private_turn_detail,
@@ -3501,6 +4957,7 @@ mod tests {
         private_turn_detail_status_directory, private_turn_detail_status_path, project_report,
         prune_private_turn_details_with_limit, read_private_snapshot, read_private_turn_detail,
         read_private_turn_detail_status, reconcile_report_state, recover_occupied_persisted_port,
+        recover_report_view_catalog_for_startup, refresh_dashboard_snapshot,
         refresh_report_from_root, report_dirty_path, router, schedule_report_refresh,
         settings_path, submit_notify, submit_otlp_json_outcome, timestamp_from_unix_ms,
         token_matches, watch_report_authority, write_private, write_private_json,
@@ -3510,7 +4967,8 @@ mod tests {
         MAX_HANDOFF_BYTES, parse_otlp_http_json, project_notify_with_private_detail,
     };
     use agent_observability_local_runtime::{
-        ConfigMutationGuard, MutationGuard, StorageBudget, install, load, save,
+        Admission, ConfigMutationGuard, MutationGuard, RuntimeControl, StorageBudget, install,
+        load, save,
     };
     use axum::{
         extract::State,
@@ -3537,11 +4995,12 @@ mod tests {
             (ReportFailure::Task, "\"task\""),
             (ReportFailure::Install, "\"install\""),
             (ReportFailure::OpenStore, "\"open_store\""),
-            (ReportFailure::Clock, "\"clock\""),
             (ReportFailure::RenderGuard, "\"render_guard\""),
             (ReportFailure::Snapshot, "\"snapshot\""),
+            (ReportFailure::SnapshotChanged, "\"snapshot\""),
             (ReportFailure::Projection, "\"projection\""),
             (ReportFailure::Publish, "\"publish\""),
+            (ReportFailure::Capacity, "\"publish\""),
             (ReportFailure::Acknowledge, "\"acknowledge\""),
             (ReportFailure::Status, "\"status\""),
         ] {
@@ -3549,11 +5008,28 @@ mod tests {
         }
     }
 
+    include!("rotation_diagnostic.rs");
+
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "agent-observability-collector-{name}-{}",
             std::process::id()
         ))
+    }
+
+    pub(crate) fn occupy_loopback_port(port: u16) -> TcpListener {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap()
+    }
+
+    fn assert_published_report_view(root: &Path, expected_records: usize) {
+        let store = LocalStore::open_current(root.join("state/store")).unwrap();
+        let snapshot = current_report_view(&store).unwrap().unwrap();
+        assert_eq!(snapshot.records(), expected_records);
+        assert_eq!(snapshot.rate_fingerprint(), MISSING_RATE_FINGERPRINT);
+        assert_eq!(
+            snapshot.generation(),
+            store.report_status().unwrap().acknowledged_generation
+        );
     }
 
     #[test]
@@ -3628,6 +5104,8 @@ mod tests {
             })
             .unwrap_or_default();
         CollectorState {
+            ingest_precommit_guard: None,
+            ingest_completion_test: IngestCompletionTest::default(),
             layout,
             store,
             source_generation,
@@ -3659,9 +5137,13 @@ mod tests {
             collector: Arc::new(Mutex::new(collector_state(root))),
             auth_token: Arc::from(auth_token),
             private_detail_failures,
+            lifecycle_failures: Arc::new(AtomicU64::new(0)),
+            lifecycle_storage_pressure: Arc::new(AtomicBool::new(false)),
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
             report_refresh_requested: Arc::new(AtomicU64::new(0)),
+            report_contention_quiet_ms: Arc::new(AtomicU64::new(0)),
             report_refresh_attempts: Arc::new(AtomicU64::new(0)),
+            report_snapshot_test: Arc::default(),
         }
     }
 
@@ -3710,6 +5192,637 @@ mod tests {
     }
 
     #[test]
+    fn report_authority_marker_holds_accounting_and_rejects_failed_postcheck() {
+        use agent_observability_local_runtime::storage_coherence::{
+            StorageBarrier, StorageCoherenceError,
+        };
+        for invalidate in [false, true] {
+            let root = test_root(&format!("report-marker-accounting-{invalidate}"));
+            let mut collector = collector_state(&root);
+            ingest_notify_locked(&mut collector, &projected_notify("thread", "turn")).unwrap();
+            let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+            let barrier = StorageBarrier::initialize(&collector.layout.root, &mutation).unwrap();
+            drop(mutation);
+            let mut observed = 0;
+            let result =
+                super::poll_report_authority_observing(&mut collector, &mut observed, |mutation| {
+                    assert!(matches!(
+                        barrier.try_freeze(mutation),
+                        Err(StorageCoherenceError::Busy)
+                    ));
+                    if invalidate {
+                        fs::write(root.join("runtime/storage-accounting.lock"), b"invalid")
+                            .unwrap();
+                    }
+                });
+            if invalidate {
+                assert!(matches!(
+                    result,
+                    Err(super::CollectorError::StorageWriteUnverified { .. })
+                ));
+                assert_eq!(observed, 0);
+            } else {
+                assert!(result.unwrap());
+                assert_eq!(
+                    observed,
+                    collector.store.report_status().unwrap().generation
+                );
+                let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+                barrier.try_freeze(&mutation).unwrap().revalidate().unwrap();
+            }
+            drop(barrier);
+            drop(collector);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn collector_startup_maintenance_and_private_capture_respect_accounting_writers() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        let root = test_root("collector-all-accounting-writers");
+        let state = app_state(&root);
+        set_private_turn_details(&root, true);
+        let layout = state.collector.blocking_lock().layout.clone();
+        let config = load(&layout.config).unwrap();
+        let (_, detail) =
+            project_notify_with_private_detail(&raw_notify("thread", "turn")).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&layout.root, &mutation).unwrap();
+        drop(mutation);
+        let writer = barrier.try_begin_write().unwrap();
+        assert!(super::prepare_collector_state(layout.clone()).is_err());
+        assert_eq!(
+            super::maintain_storage_lifecycle(&root).unwrap(),
+            "lifecycle=busy"
+        );
+        assert!(super::maintain_private_turn_details(&root).is_err());
+        let response = persist_private_turn_detail_request(&state, &layout, &config, &detail);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            state
+                .collector
+                .blocking_lock()
+                .store
+                .record_count()
+                .unwrap(),
+            0
+        );
+        assert!(
+            !layout
+                .state
+                .join(super::PRIVATE_TURN_DETAIL_DIRECTORY)
+                .exists()
+        );
+        drop(writer);
+        let response = persist_private_turn_detail_request(&state, &layout, &config, &detail);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(
+            lookup_private_turn_detail(&root, detail.turn_id()),
+            PrivateTurnDetailLookup::Available(_)
+        ));
+        drop(barrier);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ingest_precommit_denial_preserves_durable_and_in_memory_state() {
+        for notify in [false, true] {
+            let root = test_root(&format!("precommit-denial-{notify}"));
+            let mut state = collector_state(&root);
+            let mutation = MutationGuard::try_acquire(&state.layout.runtime).unwrap();
+            super::StorageBarrier::initialize(&state.layout.root, &mutation).unwrap();
+            drop(mutation);
+            let guard = Arc::new(TestIngestPrecommitGuard {
+                calls: AtomicU64::new(0),
+                deny: true,
+            });
+            state.ingest_precommit_guard = Some(guard.clone());
+            let status = state.store.report_status().unwrap();
+            let correlation = state.request_correlation.to_persisted_json().unwrap();
+            let persisted = state
+                .store
+                .codex_request_correlation_state(&state.source_generation)
+                .unwrap();
+            let body = if notify {
+                projected_notify("thread-1", "turn-1")
+            } else {
+                br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[
+                    {"key":"event.name","value":{"stringValue":"codex.api_request"}},
+                    {"key":"conversation.id","value":{"stringValue":"conversation-1"}},
+                    {"key":"model","value":{"stringValue":"gpt-test"}},
+                    {"key":"auth.request_id","value":{"stringValue":"request-1"}}
+                ]}]}]}]}"#
+                    .to_vec()
+            };
+            let result = if notify {
+                ingest_notify_locked(&mut state, &body)
+            } else {
+                ingest_locked(&mut state, &body)
+            };
+            assert!(matches!(result, Err(IngestError::Storage)));
+            assert_eq!(guard.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(state.store.record_count().unwrap(), 0);
+            assert_eq!(state.last_cursor, None);
+            assert_eq!(
+                state
+                    .store
+                    .cursor("codex", &state.source_generation)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(state.store.report_status().unwrap(), status);
+            assert_eq!(
+                state.request_correlation.to_persisted_json().unwrap(),
+                correlation
+            );
+            assert_eq!(
+                state
+                    .store
+                    .codex_request_correlation_state(&state.source_generation)
+                    .unwrap(),
+                persisted
+            );
+            assert!(
+                !state
+                    .layout
+                    .runtime
+                    .join(super::REPORT_DIRTY_FILE_NAME)
+                    .exists()
+            );
+            // The same OTLP input really changes correlation when allowed to commit.
+            state.ingest_precommit_guard = None;
+            if notify {
+                ingest_notify_locked(&mut state, &body).unwrap();
+            } else {
+                ingest_locked(&mut state, &body).unwrap();
+                assert_eq!(state.request_correlation.pending_len(), 1);
+            }
+            assert_eq!(state.store.record_count().unwrap(), 1);
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestIngestPrecommitGuard {
+        calls: AtomicU64,
+        deny: bool,
+    }
+
+    impl super::CollectorIngestPrecommitGuard for TestIngestPrecommitGuard {
+        fn check_precommit(
+            &self,
+            layout: &agent_observability_local_runtime::InstalledLayout,
+            freeze: &agent_observability_local_runtime::storage_coherence::OwnedStorageFreezeGuard<
+                '_,
+            >,
+            config: &agent_observability_local_runtime::LocalRuntimeConfigV3,
+            max_batch_bytes: u64,
+        ) -> Result<(), super::CollectorIngestPrecommitError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(
+                max_batch_bytes,
+                u64::from(config.collection.max_batch_bytes)
+            );
+            freeze.revalidate().unwrap();
+            let barrier = super::StorageBarrier::open_existing(&layout.root).unwrap();
+            assert!(matches!(barrier.try_begin_write(), Err(agent_observability_local_runtime::storage_coherence::StorageCoherenceError::Busy)));
+            assert!(matches!(
+                MutationGuard::try_acquire(&layout.runtime),
+                Err(agent_observability_local_runtime::SingletonError::AlreadyRunning)
+            ));
+            if self.deny {
+                Err(super::CollectorIngestPrecommitError::Denied)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn ingest_precommit_requires_existing_barrier_and_skips_rejected_requests() {
+        for notify in [false, true] {
+            for case in [
+                "missing",
+                "disabled",
+                "malformed",
+                "oversize",
+                "batch-policy",
+            ] {
+                // A canonical notify contains one record; OTLP exercises batch rejection.
+                if case == "batch-policy" && notify {
+                    continue;
+                }
+                let root = test_root(&format!("precommit-skip-{notify}-{case}"));
+                let mut state = collector_state(&root);
+                let mut config = load(&state.layout.config).unwrap();
+                if case == "disabled" {
+                    config.enabled = false;
+                }
+                if case == "batch-policy" {
+                    config.collection.max_batch_records = 1;
+                }
+                let config_guard = ConfigMutationGuard::acquire(&state.layout).unwrap();
+                save(&config_guard, &config).unwrap();
+                drop(config_guard);
+                if case != "missing" {
+                    let mutation = MutationGuard::try_acquire(&state.layout.runtime).unwrap();
+                    super::StorageBarrier::initialize(&state.layout.root, &mutation).unwrap();
+                }
+                let guard = Arc::new(TestIngestPrecommitGuard {
+                    calls: AtomicU64::new(0),
+                    deny: false,
+                });
+                state.ingest_precommit_guard = Some(guard.clone());
+                let body = match case {
+                    "malformed" => b"{".to_vec(),
+                    "oversize" => {
+                        vec![b' '; usize::try_from(config.collection.max_batch_bytes).unwrap() + 1]
+                    }
+                    "batch-policy" if !notify => otlp_start_records(2),
+                    _ if notify => projected_notify("thread-1", "turn-1"),
+                    _ => otlp_start_records(1),
+                };
+                let result = if notify {
+                    ingest_notify_locked(&mut state, &body)
+                } else {
+                    ingest_locked(&mut state, &body)
+                };
+                if case == "disabled" {
+                    assert_eq!(result.unwrap(), IngestOutcome::Disabled);
+                } else {
+                    assert!(result.is_err());
+                }
+                assert_eq!(guard.calls.load(Ordering::Relaxed), 0);
+                assert_eq!(state.store.record_count().unwrap(), 0);
+                assert_eq!(state.last_cursor, None);
+                if case == "missing" {
+                    assert!(
+                        !state
+                            .layout
+                            .runtime
+                            .join("storage-accounting.lock")
+                            .exists()
+                    );
+                }
+                drop(state);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn ingest_precommit_absent_preserves_legacy_ingest_without_initializing_accounting() {
+        for notify in [false, true] {
+            let root = test_root(&format!("precommit-legacy-{notify}"));
+            let mut state = collector_state(&root);
+            assert!(state.ingest_precommit_guard.is_none());
+            let result = if notify {
+                ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1"))
+            } else {
+                ingest_locked(&mut state, &otlp_start_records(1))
+            };
+            assert_eq!(result.unwrap(), IngestOutcome::Committed);
+            assert_eq!(state.store.record_count().unwrap(), 1);
+            assert!(
+                !state
+                    .layout
+                    .runtime
+                    .join("storage-accounting.lock")
+                    .exists()
+            );
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn ingest_precommit_success_preserves_committed_unverified_postcheck() {
+        for notify in [false, true] {
+            for corrupt_after_commit in [false, true] {
+                let root = test_root(&format!(
+                    "precommit-success-{notify}-{corrupt_after_commit}"
+                ));
+                let mut state = collector_state(&root);
+                let mutation = MutationGuard::try_acquire(&state.layout.runtime).unwrap();
+                super::StorageBarrier::initialize(&state.layout.root, &mutation).unwrap();
+                drop(mutation);
+                let guard = Arc::new(TestIngestPrecommitGuard {
+                    calls: AtomicU64::new(0),
+                    deny: false,
+                });
+                state.ingest_precommit_guard = Some(guard.clone());
+                if corrupt_after_commit {
+                    state.ingest_completion_test.after_operation = Some(|runtime| {
+                        fs::write(runtime.join("storage-accounting.lock"), b"invalid").unwrap();
+                    });
+                }
+                let result = if notify {
+                    ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1"))
+                } else {
+                    ingest_locked(&mut state, &otlp_start_records(1))
+                };
+                assert_eq!(
+                    result.unwrap(),
+                    if corrupt_after_commit {
+                        IngestOutcome::CommittedUnverified
+                    } else {
+                        IngestOutcome::Committed
+                    }
+                );
+                assert_eq!(guard.calls.load(Ordering::Relaxed), 1);
+                assert_eq!(state.store.record_count().unwrap(), 1);
+                assert_eq!(
+                    state
+                        .store
+                        .cursor("codex", &state.source_generation)
+                        .unwrap(),
+                    state.last_cursor
+                );
+                assert!(state.last_cursor.is_some());
+                if corrupt_after_commit {
+                    assert!(state.report_dirty && state.report_degraded);
+                }
+                drop(state);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_ingest_never_recreates_an_initialized_mutation_lock() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        for notify in [false, true] {
+            let root = test_root(&format!("ingest-missing-stable-mutation-{notify}"));
+            let mut state = collector_state(&root);
+            let mutation = MutationGuard::try_acquire(&state.layout.runtime).unwrap();
+            let barrier = StorageBarrier::initialize(&state.layout.root, &mutation).unwrap();
+            drop(mutation);
+            let lock = state.layout.runtime.join("mutation.lock");
+            fs::remove_file(&lock).unwrap();
+            let status = state.store.report_status().unwrap();
+            let result = if notify {
+                ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1"))
+            } else {
+                ingest_locked(&mut state, &otlp_start_records(1))
+            };
+            assert!(matches!(result, Err(IngestError::Coherence)));
+            assert!(!lock.exists());
+            assert_eq!(state.last_cursor, None);
+            assert_eq!(state.store.record_count().unwrap(), 0);
+            assert_eq!(state.store.report_status().unwrap(), status);
+            drop(barrier);
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn automatic_ingest_defers_before_cursor_or_records_change_when_accounting_is_busy() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        for notify in [false, true] {
+            let root = test_root(&format!("ingest-accounting-contention-{notify}"));
+            let mut state = collector_state(&root);
+            let mutation = MutationGuard::try_acquire(&state.layout.runtime).unwrap();
+            let barrier = StorageBarrier::initialize(&state.layout.root, &mutation).unwrap();
+            drop(mutation);
+            let writer = barrier.try_begin_write().unwrap();
+            let body = if notify {
+                projected_notify("thread-1", "turn-1")
+            } else {
+                otlp_start_records(1)
+            };
+            let before = state.store.report_status().unwrap();
+            let result = if notify {
+                ingest_notify_locked(&mut state, &body)
+            } else {
+                ingest_locked(&mut state, &body)
+            };
+            assert!(matches!(result, Err(IngestError::Busy)));
+            assert_eq!(state.last_cursor, None);
+            assert_eq!(state.store.record_count().unwrap(), 0);
+            assert_eq!(state.store.report_status().unwrap(), before);
+            drop(writer);
+            let result = if notify {
+                ingest_notify_locked(&mut state, &body)
+            } else {
+                ingest_locked(&mut state, &body)
+            };
+            assert_eq!(result.unwrap(), IngestOutcome::Committed);
+            assert_eq!(state.store.record_count().unwrap(), 1);
+            let mutation = MutationGuard::try_acquire(&state.layout.runtime).unwrap();
+            barrier.try_freeze(&mutation).unwrap().revalidate().unwrap();
+            drop(mutation);
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_ingest_keeps_ack_cursor_and_refresh_when_completion_check_fails() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        use axum::{body::Bytes, extract::State, response::IntoResponse};
+
+        for (notify, status_failure) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let root = test_root(&format!(
+                "ingest-committed-coherence-{notify}-{status_failure}"
+            ));
+            let state = app_state(&root);
+            // Check scheduling without launching a renderer in this regression.
+            state
+                .report_refresh_scheduled
+                .store(true, Ordering::Release);
+            let runtime = {
+                let mut collector = state.collector.lock().await;
+                let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+                StorageBarrier::initialize(&collector.layout.root, &mutation).unwrap();
+                collector.ingest_completion_test.after_operation = Some(|runtime| {
+                    fs::write(runtime.join("storage-accounting.lock"), b"invalid").unwrap();
+                });
+                if status_failure {
+                    collector.ingest_completion_test.after_operation = None;
+                    collector.ingest_completion_test.fail_report_status = true;
+                }
+                collector.layout.runtime.clone()
+            };
+            let body = if notify {
+                projected_notify("thread-1", "turn-1")
+            } else {
+                otlp_start_records(1)
+            };
+            for attempt in 1..=2 {
+                let response = if notify {
+                    super::ingest_notify(State(state.clone()), Bytes::from(body.clone()))
+                        .await
+                        .into_response()
+                } else {
+                    super::ingest_logs(State(state.clone()), Bytes::from(body.clone()))
+                        .await
+                        .into_response()
+                };
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "a durable commit is not a rejected payload"
+                );
+                {
+                    let collector = state.collector.lock().await;
+                    assert_eq!(collector.accepted_requests, attempt);
+                    assert_eq!(collector.rejected_requests, 0);
+                    assert_eq!(collector.store.record_count().unwrap(), 1);
+                    assert_eq!(
+                        collector
+                            .store
+                            .cursor("codex", &collector.source_generation)
+                            .unwrap(),
+                        collector.last_cursor
+                    );
+                    assert!(collector.last_cursor.is_some());
+                    assert!(collector.report_degraded);
+                    assert!(collector.report_dirty);
+                }
+                assert_eq!(
+                    state.report_refresh_requested.load(Ordering::Acquire),
+                    attempt
+                );
+                // Restore only this test's lock, then replay the identical source observation.
+                fs::write(runtime.join("storage-accounting.lock"), b"").unwrap();
+                state
+                    .collector
+                    .lock()
+                    .await
+                    .ingest_completion_test
+                    .fail_report_status = false;
+            }
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn ingest_scope_checks_completion_and_preserves_primary_failure() {
+        use agent_observability_local_runtime::storage_coherence::{
+            StorageBarrier, StorageCoherenceError,
+        };
+        for primary_failure in [false, true] {
+            let root = test_root(&format!("ingest-accounting-completion-{primary_failure}"));
+            let mut state = collector_state(&root);
+            let runtime = state.layout.runtime.clone();
+            let mutation = MutationGuard::try_acquire(&runtime).unwrap();
+            let barrier = StorageBarrier::initialize(&state.layout.root, &mutation).unwrap();
+            drop(mutation);
+            let path = runtime.join("storage-accounting.lock");
+            let result = super::with_ingest_storage_scope(&mut state, |_, _| {
+                assert!(matches!(
+                    barrier.try_begin_write(),
+                    Err(StorageCoherenceError::Busy)
+                ));
+                assert!(matches!(
+                    MutationGuard::try_acquire(&runtime),
+                    Err(agent_observability_local_runtime::SingletonError::AlreadyRunning)
+                ));
+                fs::write(&path, b"invalid").unwrap();
+                if primary_failure {
+                    Err(IngestError::Policy)
+                } else {
+                    Ok((IngestOutcome::Disabled, ()))
+                }
+            });
+            if primary_failure {
+                assert!(matches!(result, Err(IngestError::Policy)));
+            } else {
+                assert!(matches!(result, Err(IngestError::Coherence)));
+            }
+            // Corrupt coordination never falls back to uncoordinated ingest.
+            assert!(matches!(
+                ingest_notify_locked(&mut state, &projected_notify("thread-1", "turn-1")),
+                Err(IngestError::Coherence)
+            ));
+            assert_eq!(state.last_cursor, None);
+            assert_eq!(state.store.record_count().unwrap(), 0);
+            let mutation = MutationGuard::try_acquire(&runtime).unwrap();
+            fs::write(&path, b"").unwrap();
+            barrier.try_freeze(&mutation).unwrap().revalidate().unwrap();
+            drop(mutation);
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_private_notify_reports_capture_failure_without_rejecting_projection() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+
+        let root = test_root("private-commit-coherence");
+        set_private_turn_details(&root, true);
+        let state = app_state(&root);
+        state
+            .report_refresh_scheduled
+            .store(true, Ordering::Release);
+        let layout = {
+            let mut collector = state.collector.lock().await;
+            let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+            StorageBarrier::initialize(&collector.layout.root, &mutation).unwrap();
+            collector.ingest_completion_test.after_operation = Some(|runtime| {
+                fs::write(runtime.join("storage-accounting.lock"), b"invalid").unwrap();
+            });
+            collector.layout.clone()
+        };
+        let body = capture_private_turn_detail_if_enabled(&root, &raw_notify("thread-1", "turn-1"))
+            .unwrap()
+            .unwrap();
+        let response = ingest_notify_with_private_detail(State(state.clone()), body.into()).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(receipt["state"], "failed");
+        assert_eq!(receipt["code"], "storage_coherence");
+        {
+            let collector = state.collector.lock().await;
+            assert_eq!(collector.accepted_requests, 1);
+            assert_eq!(collector.rejected_requests, 0);
+            assert_eq!(collector.store.record_count().unwrap(), 1);
+            assert!(collector.last_cursor.is_some());
+            assert!(collector.report_degraded);
+        }
+        assert_eq!(state.report_refresh_requested.load(Ordering::Acquire), 1);
+        assert_eq!(state.private_detail_failures.load(Ordering::Acquire), 1);
+        assert!(
+            !layout
+                .state
+                .join(super::PRIVATE_TURN_DETAIL_DIRECTORY)
+                .exists()
+        );
+        assert!(!private_turn_detail_status_directory(&layout).exists());
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_ingest_preserves_primary_error_when_report_status_also_fails() {
+        let root = test_root("ingest-primary-status-error");
+        let mut state = collector_state(&root);
+        let (batch, cursor) =
+            parse_otlp_http_json(&otlp_start_records(1), "codex-test", None, 1, 0).unwrap();
+        let expected = super::commit_batch(&mut state, &batch, cursor.clone(), 1, Some("invalid"))
+            .unwrap_err();
+        state.ingest_completion_test.fail_report_status = true;
+        let actual =
+            super::commit_batch(&mut state, &batch, cursor, 1, Some("invalid")).unwrap_err();
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        assert_eq!(state.store.record_count().unwrap(), 0);
+        assert_eq!(state.last_cursor, None);
+        assert!(state.report_degraded);
+        assert_eq!(state.report_failure, Some(ReportFailure::Status));
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn collector_ingest_returns_busy_without_waiting_for_the_shared_runtime_mutation_guard() {
         let root = test_root("shared-mutation-guard");
         let _ = fs::remove_dir_all(&root);
@@ -3737,7 +5850,7 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_report_refresh_is_independent_of_config_mutation() {
+    fn report_refresh_retries_after_config_mutation_without_waiting() {
         let root = test_root("open-rebuild-mutation");
         let _ = fs::remove_dir_all(&root);
         let state = collector_state(&root);
@@ -3745,9 +5858,187 @@ mod tests {
         drop(state);
         let guard = ConfigMutationGuard::acquire(&layout).unwrap();
 
+        assert!(!refresh_dashboard_snapshot(&root).unwrap());
+        drop(guard);
         assert!(refresh_report_from_root(&root).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_admission_scalar_preserves_reserve_boundaries_and_ceiling() {
+        let publication = super::REPORT_VIEW_PUBLICATION_RESERVE_BYTES;
+        let metadata = super::REPORT_RESERVATION_METADATA_ALLOWANCE;
+        let overhead = publication + metadata;
+        let maximum = super::MAX_AUTOMATIC_REPORT_VIEW_BYTES;
+        for (headroom, expected) in [
+            (0, 0),
+            (publication - 1, 0),
+            (publication, 0),
+            (publication + 1, 0),
+            (overhead - 1, 0),
+            (overhead, 0),
+            (overhead + 1, 1),
+            (maximum, maximum - overhead),
+            (overhead + maximum - 1, maximum - 1),
+            (overhead + maximum, maximum),
+            (overhead + maximum + 1, maximum),
+            (u64::MAX, maximum),
+        ] {
+            assert_eq!(
+                super::automatic_report_view_bytes_from_headroom(headroom),
+                expected,
+                "headroom={headroom}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_admission_preserves_writable_headroom_and_publication_reserve() {
+        let root = test_root("snapshot-writable-admission");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        let mut config = load(&state.layout.config).unwrap();
+        assert_eq!(
+            config.collection.local_storage_budget_bytes,
+            1024 * 1024 * 1024
+        );
+        assert_eq!(super::MAX_AUTOMATIC_REPORT_VIEW_BYTES, 256 * 1024 * 1024);
+        config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+        let budget =
+            StorageBudget::calculate(config.collection.local_storage_budget_bytes, false).unwrap();
+        let allocated = StorageBudget::allocated_tree_bytes(&root).unwrap();
+        let admitted = super::automatic_report_view_admitted_bytes(&state.layout, &config).unwrap();
+        assert!(admitted < super::MAX_AUTOMATIC_REPORT_VIEW_BYTES);
+        assert!(allocated + admitted + 64 * 1024 <= budget.writable_limit());
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn automatic_report_refresh_publishes_a_readable_empty_index() {
+        let root = test_root("empty-index-publication");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        let config = load(&state.layout.config).unwrap();
+        let admitted = super::automatic_report_view_admitted_bytes(&state.layout, &config).unwrap();
+        assert!(admitted > 0);
+        assert!(admitted <= super::MAX_AUTOMATIC_REPORT_VIEW_BYTES);
+        drop(state);
+
+        assert!(super::refresh_dashboard_snapshot(&root).unwrap());
+        assert_published_report_view(&root, 0);
+        assert!(!root.join("logs").join(REPORT_FILE_NAME).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collector_startup_recovers_interrupted_report_view_files_before_catalog_read() {
+        let root = test_root("startup-report-view-recovery");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        let published = current_report_view(&state.store).unwrap().unwrap();
+        let orphan = root
+            .join("state/store/report-views.v1")
+            .join(".report-view.sqlite3.staging.interrupted");
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut interrupted = options.open(&orphan).unwrap();
+        interrupted.write_all(b"interrupted").unwrap();
+        interrupted.sync_all().unwrap();
+        drop(interrupted);
+
+        recover_report_view_catalog_for_startup(&state.store).unwrap();
+
+        assert!(!orphan.exists());
+        assert_eq!(current_report_view(&state.store).unwrap(), Some(published));
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn standalone_dashboard_refresh_reports_busy_as_retryable() {
+        let root = test_root("standalone-dashboard-busy");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        let guard = state.store.acquire_report_render_guard().unwrap();
+
+        assert!(!super::refresh_dashboard_snapshot(&root).unwrap());
+        assert!(current_report_view(&state.store).is_err());
 
         drop(guard);
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn standalone_dashboard_capacity_mapping_remains_typed() {
+        assert_eq!(
+            super::report_view_build_failure(
+                &agent_observability_local_store::ReportViewBuildError::InvalidByteBudget
+            ),
+            ReportFailure::Capacity
+        );
+        assert_eq!(
+            super::CollectorError::DashboardStorageCapacity.to_string(),
+            "dashboard snapshot storage headroom unavailable"
+        );
+    }
+
+    #[test]
+    fn standalone_dashboard_refresh_maps_oversized_authority_record_to_capacity() {
+        let root = test_root("standalone-dashboard-oversized-authority-record");
+        let _ = fs::remove_dir_all(&root);
+        let mut state = collector_state(&root);
+        let body = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{
+          "timeUnixNano":"1787875200000000000",
+          "attributes":[
+            {"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},
+            {"key":"conversation.id","value":{"stringValue":"conversation-capacity"}},
+            {"key":"model","value":{"stringValue":"gpt-5.6-sol"}}
+          ]
+        }]}]}]}"#;
+        let (batch, _) = parse_otlp_http_json(body, "codex-test", None, 1, 0).unwrap();
+        let mut observation = match batch.items.into_iter().next().unwrap() {
+            agent_observability_adapter_codex::AdapterItem::Observation(observation) => observation,
+            agent_observability_adapter_codex::AdapterItem::Disposition(_) => {
+                panic!("conversation start must produce an authority observation")
+            }
+        };
+        observation.event = agent_observability_contracts::ObservationEvent::Session {
+            model: Some(format!("gpt-5.6-sol-{}", "x".repeat(2 * 1024 * 1024))),
+            project: Some("agent-observability".to_owned()),
+        };
+        state.store.ingest(&observation).unwrap();
+        let record = state.store.current_records().unwrap().pop().unwrap();
+        assert!(serde_json::to_vec(&record).unwrap().len() > 2 * 1024 * 1024);
+        drop(state);
+
+        assert!(matches!(
+            refresh_dashboard_snapshot(&root),
+            Err(super::CollectorError::DashboardStorageCapacity)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn standalone_dashboard_refresh_keeps_ordinary_failures_as_errors() {
+        let root = test_root("standalone-dashboard-ordinary-error");
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        assert!(!layout.state.join("store").exists());
+
+        assert!(matches!(
+            refresh_dashboard_snapshot(&root),
+            Err(super::CollectorError::Runtime(message))
+                if message == "dashboard snapshot refresh failed at open_store"
+        ));
+        assert!(!layout.state.join("store").exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3792,6 +6083,55 @@ mod tests {
         assert!(matches!(retry, Err(IngestError::Storage)));
         assert_eq!(state.store.record_count().unwrap(), 0);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collector_admission_denies_full_store_reservation_when_batch_alone_fits() {
+        let root = test_root("collector-full-store-admission");
+        let _ = fs::remove_dir_all(&root);
+        let state = collector_state(&root);
+        fs::write(
+            state.layout.state.join("store/admission-fixture"),
+            vec![0_u8; 2 * 1024 * 1024],
+        )
+        .unwrap();
+        inflate_allocated_accounting(&root);
+        let guard = ConfigMutationGuard::acquire(&state.layout).unwrap();
+        let mut config = load(&state.layout.config).unwrap();
+        config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+        save(&guard, &config).unwrap();
+        drop(guard);
+        let control = RuntimeControl::new(&config).unwrap();
+        let max_batch_bytes = u64::from(config.collection.max_batch_bytes);
+        for index in (0..300).rev() {
+            if matches!(
+                control.admit(&root, max_batch_bytes).unwrap(),
+                Admission::Allowed { .. }
+            ) {
+                break;
+            }
+            let link = root.join(format!("allocated-budget-link-{index}"));
+            if link.exists() {
+                fs::remove_file(link).unwrap();
+            }
+        }
+
+        assert!(matches!(
+            control.admit(&root, max_batch_bytes).unwrap(),
+            Admission::Allowed { .. }
+        ));
+        let diagnostic = control
+            .collector_admission_diagnostic(&root, max_batch_bytes)
+            .unwrap();
+        assert!(diagnostic.existing_store_allocated_bytes > max_batch_bytes);
+        assert_eq!(diagnostic.admission, Admission::Denied);
+        assert!(diagnostic.deficit_bytes > 0);
+        assert!(matches!(
+            admit_request(&state, usize::try_from(max_batch_bytes).unwrap()),
+            Err(IngestError::Storage)
+        ));
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn projected_notify(thread: &str, turn: &str) -> Vec<u8> {
@@ -3960,6 +6300,80 @@ mod tests {
             debounce: Duration::from_millis(20),
             retry_initial: Duration::from_millis(10),
         }
+    }
+
+    fn report_refresh_diagnostics(state: &AppState) -> String {
+        format!(
+            "attempts={} scheduled={} requested={} quiet_ms={} state={:?}",
+            state.report_refresh_attempts.load(Ordering::Acquire),
+            state.report_refresh_scheduled.load(Ordering::Acquire),
+            state.report_refresh_requested.load(Ordering::Acquire),
+            state.report_contention_quiet_ms.load(Ordering::Acquire),
+            state.collector.try_lock().ok().map(|collector| (
+                collector.report_dirty,
+                collector.report_degraded,
+                collector.report_refresh_failures,
+                collector.report_failure,
+                collector
+                    .store
+                    .report_status()
+                    .ok()
+                    .map(agent_observability_local_store::ReportStatus::pending),
+            )),
+        )
+    }
+
+    async fn wait_for_report_refresh_completion(state: &AppState) {
+        // After the last wakeup, debounce can finish its current quiet interval and
+        // repeat it once. This is a finite hang guard, not a publication latency SLO.
+        let guard = super::REPORT_CONTENTION_QUIET_LIMIT * 2 + Duration::from_secs(5);
+        wait_for_report_refresh_completion_within(state, guard).await;
+    }
+
+    async fn wait_for_report_refresh_completion_within(state: &AppState, guard: Duration) {
+        let completed = tokio::time::timeout(guard, async {
+            loop {
+                let collector = state.collector.lock().await;
+                let published = collector.store.report_status().unwrap();
+                if state.report_refresh_attempts.load(Ordering::Acquire) > 0
+                    && !state.report_refresh_scheduled.load(Ordering::Acquire)
+                    && !published.pending()
+                {
+                    break;
+                }
+                drop(collector);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            completed.is_ok(),
+            "refresh did not converge: {}",
+            report_refresh_diagnostics(state)
+        );
+    }
+
+    #[test]
+    fn report_refresh_contention_quiet_obeys_duration_and_ceiling_without_wall_clock() {
+        for (previous, attempt, expected) in [
+            (20, 120, 480),
+            (480, 1, 960),
+            (20, 900, 3600),
+            (20, 8000, 30_000),
+            (30_000, 1, 30_000),
+        ] {
+            assert_eq!(
+                super::contention_quiet_period(
+                    Duration::from_millis(previous),
+                    Duration::from_millis(attempt)
+                ),
+                Duration::from_millis(expected),
+            );
+        }
+        assert_eq!(
+            super::contention_quiet_period(Duration::MAX, Duration::MAX),
+            super::REPORT_CONTENTION_QUIET_LIMIT,
+        );
     }
 
     fn configure_port(root: &Path, port: u16) {
@@ -4736,7 +7150,13 @@ mod tests {
             tokio::task::yield_now().await;
             let root = accepted.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                submit_notify(&root, &raw_notify("thread-ok", "turn-ok"))
+                // This is an authenticated functional-success check, not a claim
+                // that a loaded debug CI host completes durable ingest in 250ms.
+                super::submit_notify_until(
+                    &root,
+                    &raw_notify("thread-ok", "turn-ok"),
+                    super::StdInstant::now() + Duration::from_secs(5),
+                )
             })
             .await
             .unwrap();
@@ -4747,6 +7167,32 @@ mod tests {
         for root in [refused, rogue, accepted] {
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn notify_expired_deadline_never_connects_or_changes_the_foreground_budget() {
+        assert_eq!(
+            super::PRIVATE_NOTIFY_FOREGROUND_DEADLINE,
+            Duration::from_millis(250)
+        );
+        let root = test_root("notify-expired-deadline");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        configure_port(&root, listener.local_addr().unwrap().port());
+        let expired = super::StdInstant::now();
+        assert_eq!(
+            super::submit_notify_until(&root, &raw_notify("expired", "expired"), expired),
+            NotifyOutcome::Unavailable
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            super::submit_notify_until(&root, b"{}", expired),
+            NotifyOutcome::Rejected
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -4974,27 +7420,17 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let (server_config, _) = test_tls_configs(&root);
-            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            configure_port(&root, listener.local_addr().unwrap().port());
-            let transport =
-                super::TransportListener::new(listener, server_config, Duration::from_secs(1), 2);
-            let app = router(app_state(&root));
-            let server = tokio::spawn(async move { axum::serve(transport, app).await });
-            tokio::task::yield_now().await;
-
-            let notify_root = root.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                submit_notify(
-                    &notify_root,
-                    &raw_notify("thread-private-only", "turn-private-only"),
-                )
-            })
-            .await
+            // Privacy is independent of host scheduling inside the foreground 250ms budget.
+            // Dedicated transport/deadline tests retain that production timing contract.
+            let envelope = capture_private_turn_detail_if_enabled(
+                &root,
+                &raw_notify("thread-private-only", "turn-private-only"),
+            )
+            .unwrap()
             .unwrap();
-            assert_eq!(outcome, NotifyOutcome::Accepted);
+            let response =
+                ingest_notify_with_private_detail(State(app_state(&root)), envelope.into()).await;
+            assert_eq!(response.status(), StatusCode::OK);
             let (_, detail) = project_notify_with_private_detail(&raw_notify(
                 "thread-private-only",
                 "turn-private-only",
@@ -5025,9 +7461,8 @@ mod tests {
                     .windows(b"RAW_OUTPUT_SECRET".len())
                     .any(|part| part == b"RAW_OUTPUT_SECRET")
             );
-            server.abort();
-            let _ = server.await;
         });
+        drop(runtime);
         refresh_report_from_root(&root).unwrap();
         fs::remove_dir_all(layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY)).unwrap();
         fs::remove_dir_all(private_turn_detail_status_directory(&layout)).unwrap();
@@ -5137,6 +7572,74 @@ mod tests {
             "startup/retention maintenance expires detail without another capture"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_raw_retention_is_independent_and_opt_in() {
+        let root = test_root("lifecycle-raw-retention");
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let mut config = load(&layout.config).unwrap();
+        config.lifecycle.private_raw_days = 1;
+        let (_, detail) = project_notify_with_private_detail(&raw_notify(
+            "thread-lifecycle-raw",
+            "turn-lifecycle-raw",
+        ))
+        .unwrap();
+        capture_private_turn_detail(&layout, &detail, &config).unwrap();
+        let path = private_turn_detail_path(
+            &layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY),
+            detail.turn_id(),
+        )
+        .unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let now = modified + Duration::from_hours(25);
+        maintain_private_turn_details_locked(&layout, &config, now).unwrap();
+        assert!(
+            path.is_file(),
+            "disabled lifecycle preserves legacy raw retention"
+        );
+        config.lifecycle.enabled = true;
+        maintain_private_turn_details_locked(&layout, &config, now).unwrap();
+        assert!(
+            !path.exists(),
+            "enabled lifecycle uses the independent raw age"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_raw_expiry_runs_even_when_store_is_unavailable() {
+        let root = test_root("lifecycle-raw-without-store");
+        let layout = install(&root).unwrap();
+        set_private_turn_details(&root, true);
+        let guard = ConfigMutationGuard::acquire(&layout).unwrap();
+        let mut config = load(&layout.config).unwrap();
+        config.lifecycle.enabled = true;
+        config.lifecycle.private_raw_days = 1;
+        save(&guard, &config).unwrap();
+        drop(guard);
+        let (_, detail) =
+            project_notify_with_private_detail(&raw_notify("raw-no-db", "turn-no-db")).unwrap();
+        capture_private_turn_detail(&layout, &detail, &config).unwrap();
+        let path = private_turn_detail_path(
+            &layout.state.join(super::PRIVATE_TURN_DETAIL_DIRECTORY),
+            detail.turn_id(),
+        )
+        .unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_hours(25);
+        fs::File::open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        assert!(super::maintain_storage_lifecycle(&root).is_err());
+        assert!(
+            !path.exists(),
+            "raw expiry does not depend on a usable canonical store"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -5310,8 +7813,15 @@ mod tests {
                 .open(path)
                 .unwrap();
             file.write_all(b"{}").unwrap();
+            file.sync_all().unwrap();
         }
 
+        // Production status files are durable before the next foreground capture.
+        // Complete fixture setup before measuring the unchanged 250ms contract.
+        fs::File::open(&status_directory)
+            .unwrap()
+            .sync_all()
+            .unwrap();
         let state = app_state(&root);
         let (_, detail) =
             project_notify_with_private_detail(&raw_notify("thread-capacity", "turn-capacity"))
@@ -6240,6 +8750,8 @@ mod tests {
         let config = load(&layout.config).unwrap();
         let store = open_store_for_test(&layout, &config);
         let mut state = CollectorState {
+            ingest_precommit_guard: None,
+            ingest_completion_test: IngestCompletionTest::default(),
             layout: layout.clone(),
             store,
             source_generation: "codex-test".into(),
@@ -6277,14 +8789,8 @@ mod tests {
 
         assert_eq!(state.last_cursor.as_deref(), Some("3"));
         assert_eq!(state.store.counts().unwrap().0, 2);
-        let report = layout.logs.join(REPORT_FILE_NAME);
-        assert!(report.is_file());
-        let html = fs::read_to_string(report).unwrap();
-        assert!(html.contains("Agent Observability Report"));
-        assert!(!html.contains("conversation-1"));
-        assert!(!html.contains("SECRET_PROMPT"));
-        assert!(!html.contains("SECRET_OUTPUT"));
-        assert!(!html.contains("SECRET_PATH"));
+        assert_published_report_view(&root, 2);
+        assert!(!layout.logs.join(REPORT_FILE_NAME).exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6514,6 +9020,11 @@ mod tests {
         let root = test_root("report-refresh-coalescing");
         let _ = fs::remove_dir_all(&root);
         let state = app_state(&root);
+        // Coalescing requires one settled publication, not a one-second render SLO.
+        state
+            .report_snapshot_test
+            .delay_ms
+            .store(1_200, Ordering::Release);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6528,13 +9039,7 @@ mod tests {
             for _ in 0..20 {
                 super::schedule_report_refresh_with_timing(&state, fast_report_timing());
             }
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while state.report_refresh_scheduled.load(Ordering::Acquire) {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            wait_for_report_refresh_completion(&state).await;
 
             assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 1);
             assert!(
@@ -6575,17 +9080,87 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 0);
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while state.report_refresh_scheduled.load(Ordering::Acquire) {
-                    tokio::task::yield_now().await;
+            wait_for_report_refresh_completion(&state).await;
+            assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 1);
+        });
+        assert_published_report_view(&root, 10);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_refresh_contention_waits_for_render_sized_quiet_period() {
+        let root = test_root("report-refresh-slow-snapshot-contention");
+        let state = app_state(&root);
+        state
+            .report_snapshot_test
+            .delay_ms
+            .store(120, Ordering::Release);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            {
+                let mut collector = state.collector.lock().await;
+                ingest_notify_locked(&mut collector, &projected_notify("initial", "turn-1"))
+                    .unwrap();
+            }
+            super::schedule_report_refresh_with_timing(&state, fast_report_timing());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !state.report_snapshot_test.started.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             })
             .await
             .unwrap();
+            // Commits are farther apart than debounce but closer than a slow snapshot.
+            // The first conflict must not start repeated full scans during the stream.
+            for event in 0..8 {
+                {
+                    let mut collector = state.collector.lock().await;
+                    ingest_notify_locked(
+                        &mut collector,
+                        &projected_notify(&format!("slow-{event}"), "turn-1"),
+                    )
+                    .unwrap();
+                }
+                super::schedule_report_refresh_with_timing(&state, fast_report_timing());
+                tokio::time::sleep(Duration::from_millis(45)).await;
+            }
             assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 1);
+            assert!(
+                state
+                    .collector
+                    .lock()
+                    .await
+                    .store
+                    .report_status()
+                    .unwrap()
+                    .pending()
+            );
+            assert!(state.collector.lock().await.report_degraded);
+            assert_eq!(state.collector.lock().await.report_refresh_failures, 0);
+            assert!(state.report_contention_quiet_ms.load(Ordering::Acquire) >= 480);
+            state
+                .report_snapshot_test
+                .delay_ms
+                .store(0, Ordering::Release);
+            wait_for_report_refresh_completion(&state).await;
+            let collector = state.collector.lock().await;
+            assert!(!collector.store.report_status().unwrap().pending());
+            assert_eq!(collector.report_refresh_failures, 0);
+            assert!(!collector.report_degraded);
+            drop(collector);
+            // A successful cycle and a new wakeup must not discard the learned quiet window.
+            let attempts = state.report_refresh_attempts.load(Ordering::Acquire);
+            super::schedule_report_refresh_with_timing(&state, fast_report_timing());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                state.report_refresh_attempts.load(Ordering::Acquire),
+                attempts
+            );
         });
-        let html = fs::read_to_string(root.join("logs").join(REPORT_FILE_NAME)).unwrap();
-        assert!(html.contains(r#""generatedSpans":10"#));
+        assert_published_report_view(&root, 9);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6643,20 +9218,13 @@ mod tests {
             super::schedule_report_refresh_with_timing(&state, fast_report_timing());
             drop(render_guard);
 
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while state.report_refresh_scheduled.load(Ordering::Acquire) {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            wait_for_report_refresh_completion(&state).await;
             let collector = state.collector.lock().await;
             assert!(!collector.store.report_status().unwrap().pending());
             assert_eq!(collector.store.record_count().unwrap(), 2);
         });
 
-        let html = fs::read_to_string(root.join("logs").join(REPORT_FILE_NAME)).unwrap();
-        assert!(html.contains(r#""generatedSpans":2"#));
+        assert_published_report_view(&root, 2);
         assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 2);
         let _ = fs::remove_dir_all(root);
     }
@@ -6666,8 +9234,8 @@ mod tests {
         let root = test_root("report-retry");
         let _ = fs::remove_dir_all(&root);
         let state = app_state(&root);
-        let report = root.join("logs").join(REPORT_FILE_NAME);
-        fs::create_dir(&report).unwrap();
+        let report_views = root.join("state/store/report-views.v1");
+        fs::write(&report_views, b"occupied").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6680,8 +9248,29 @@ mod tests {
                     .unwrap();
             }
             schedule_report_refresh(&state);
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            // Keep the obstruction until the scheduler has recorded a real failure.
+            // A sleep shorter than debounce could otherwise test only a successful first try.
+            let failed = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let collector = state.collector.lock().await;
+                    if collector.report_refresh_failures > 0
+                        && collector.report_failure == Some(super::ReportFailure::Snapshot)
+                    {
+                        break;
+                    }
+                    drop(collector);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(
+                failed.is_ok(),
+                "injected failure was not observed: {}",
+                report_refresh_diagnostics(&state)
+            );
             assert!(state.report_refresh_scheduled.load(Ordering::Acquire));
+            let failed_attempts = state.report_refresh_attempts.load(Ordering::Acquire);
+            assert!(failed_attempts > 0);
 
             {
                 let mut collector = state.collector.lock().await;
@@ -6689,29 +9278,38 @@ mod tests {
                     .unwrap();
             }
             schedule_report_refresh(&state);
-            fs::remove_dir(&report).unwrap();
+            fs::remove_file(&report_views).unwrap();
 
-            for _ in 0..100 {
-                if report.is_file() && !state.report_refresh_scheduled.load(Ordering::Acquire) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            assert!(report.is_file());
-            assert!(!state.report_refresh_scheduled.load(Ordering::Acquire));
+            wait_for_report_refresh_completion(&state).await;
+            assert!(state.report_refresh_attempts.load(Ordering::Acquire) > failed_attempts);
+            let collector = state.collector.lock().await;
+            assert_eq!(collector.report_refresh_failures, 0);
+            assert!(!collector.report_degraded);
+            assert!(collector.report_failure.is_none());
         });
 
-        let html = fs::read_to_string(&report).unwrap();
-        assert!(html.contains(r#""generatedSpans":2"#));
+        assert_published_report_view(&root, 2);
         assert!(!report_dirty_path(&state.collector.blocking_lock().layout).exists());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn report_authority_watcher_converges_an_external_store_commit() {
-        let root = test_root("report-external-store-commit");
+        assert_external_commit_converges(0);
+    }
+
+    #[test]
+    fn report_authority_watcher_respects_a_learned_quiet_window() {
+        assert_external_commit_converges(2_500);
+    }
+
+    fn assert_external_commit_converges(quiet_ms: u64) {
+        let root = test_root(&format!("report-external-store-commit-{quiet_ms}"));
         let _ = fs::remove_dir_all(&root);
         let state = app_state(&root);
+        state
+            .report_contention_quiet_ms
+            .store(quiet_ms, Ordering::Release);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6738,21 +9336,45 @@ mod tests {
             )
             .unwrap();
 
-            tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    if state.report_refresh_attempts.load(Ordering::Acquire) > 0
-                        && !state.report_refresh_scheduled.load(Ordering::Acquire)
-                        && root.join("logs").join(REPORT_FILE_NAME).is_file()
-                    {
-                        break;
+            // This is a convergence test, not a two-second publication SLO. A learned
+            // quiet window can legally outlast that old harness deadline. Keep a
+            // finite guard beyond the production quiet ceiling; performance has its
+            // own measured protocol rather than this shared-runner wall clock.
+            let convergence = tokio::time::timeout(
+                super::REPORT_CONTENTION_QUIET_LIMIT + Duration::from_secs(5),
+                async {
+                    loop {
+                        let published = {
+                            let collector = state.collector.lock().await;
+                            current_report_view(&collector.store)
+                                .is_ok_and(|view| view.is_some_and(|view| view.records() == 1))
+                        };
+                        if state.report_refresh_attempts.load(Ordering::Acquire) > 0
+                            && !state.report_refresh_scheduled.load(Ordering::Acquire)
+                            && published
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
+                },
+            )
+            .await;
             watcher.abort();
             let _ = watcher.await;
+            assert!(
+                convergence.is_ok(),
+                "external commit convergence timed out: attempts={} scheduled={} quiet_ms={} state={:?}",
+                state.report_refresh_attempts.load(Ordering::Acquire),
+                state.report_refresh_scheduled.load(Ordering::Acquire),
+                state.report_contention_quiet_ms.load(Ordering::Acquire),
+                state.collector.try_lock().ok().map(|collector| (
+                    collector.report_dirty,
+                    collector.report_degraded,
+                    collector.report_refresh_failures,
+                    collector.report_failure,
+                )),
+            );
             assert!(
                 !state
                     .collector
@@ -6764,8 +9386,7 @@ mod tests {
                     .pending()
             );
         });
-        let html = fs::read_to_string(root.join("logs").join(REPORT_FILE_NAME)).unwrap();
-        assert!(html.contains(r#""generatedSpans":1"#));
+        assert_published_report_view(&root, 1);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6817,16 +9438,17 @@ mod tests {
 
         assert!(refresh_report_from_root(&root).unwrap());
         assert!(!collector.store.report_status().unwrap().pending());
+        assert_published_report_view(&root, 2);
         assert!(
             fs::read_to_string(&report_path)
                 .unwrap()
-                .contains(r#""generatedSpans":2"#)
+                .contains(r#""generatedSpans":1"#)
         );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn report_refresh_does_not_require_the_runtime_mutation_guard() {
+    fn report_refresh_does_not_wait_for_busy_runtime_mutation_guard() {
         let root = test_root("report-render-mutation-lock-boundary");
         let _ = fs::remove_dir_all(&root);
         let mut collector = collector_state(&root);
@@ -6839,22 +9461,766 @@ mod tests {
         let projection = collector.layout.state.join("store/observations.jsonl");
         assert!(!projection.exists());
         let refresh_root = root.clone();
-        let refresh = thread::spawn(move || refresh_report_from_root(&refresh_root));
+        let refresh = thread::spawn(move || refresh_dashboard_snapshot(&refresh_root));
 
-        thread::sleep(Duration::from_millis(50));
+        assert!(!refresh.join().unwrap().unwrap());
         assert!(!projection.exists());
         drop(render_guard);
-        assert!(refresh.join().unwrap().unwrap());
+        assert!(!refresh_dashboard_snapshot(&root).unwrap());
         drop(mutation);
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
         assert!(!projection.exists());
         assert_eq!(collector.store.record_count().unwrap(), 1);
         assert!(!collector.store.report_status().unwrap().pending());
-        assert!(
-            fs::read_to_string(collector.layout.logs.join(REPORT_FILE_NAME))
-                .unwrap()
-                .contains(r#""generatedSpans":1"#)
-        );
+        assert_published_report_view(&root, 1);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_refresh_does_not_hold_runtime_mutation_guard_during_projection() {
+        let root = test_root("report-reservation-short-mutation-lock");
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        let mut observed = false;
+        assert!(
+            super::refresh_report_from_root_observing(&root, |_| {
+                let guard = MutationGuard::try_acquire(&collector.layout.runtime)
+                    .expect("projection must not hold the ingest mutation lock");
+                let metadata: serde_json::Value = serde_json::from_slice(
+                    &fs::read(collector.layout.runtime.join("report-reservation.meta")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    metadata["version"], 2,
+                    "staging must already be durably bound"
+                );
+                let config = load(&collector.layout.config).unwrap();
+                let control = RuntimeControl::new(&config).unwrap();
+                let allocated = StorageBudget::allocated_tree_bytes(&root).unwrap();
+                let unreserved = control.storage_budget().writable_limit() - allocated;
+                assert_eq!(control.admit(&root, unreserved).unwrap(), Admission::Denied);
+                assert!(matches!(
+                    control.admit(&root, 1).unwrap(),
+                    Admission::Allowed { .. }
+                ));
+                observed = true;
+                drop(guard);
+            })
+            .unwrap()
+        );
+        assert!(observed);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_refresh_honors_initialized_accounting_between_bounded_writes() {
+        use agent_observability_local_runtime::storage_coherence::{
+            StorageBarrier, StorageCoherenceError,
+        };
+        let root = test_root("report-accounting-permit-boundary");
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&collector.layout.root, &mutation).unwrap();
+        drop(mutation);
+        let blocked_writer = barrier.try_begin_write().unwrap();
+        assert!(!refresh_dashboard_snapshot(&root).unwrap());
+        assert!(
+            !collector
+                .layout
+                .runtime
+                .join("report-reservation.meta")
+                .exists()
+        );
+        drop(blocked_writer);
+        let mut observed = false;
+        assert!(
+            super::refresh_report_from_root_observing(&root, |_| {
+                let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+                assert!(matches!(
+                    barrier.try_freeze(&mutation),
+                    Err(StorageCoherenceError::Busy)
+                ));
+                observed = true;
+            })
+            .unwrap()
+        );
+        assert!(observed);
+        assert_published_report_view(&root, 1);
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        barrier.try_freeze(&mutation).unwrap().revalidate().unwrap();
+        assert!(
+            !collector
+                .layout
+                .runtime
+                .join("report-reservation.meta")
+                .exists()
+        );
+        drop(mutation);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_barrier_replacement_stops_projection_and_preserves_recovery_promise() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = test_root("report-accounting-replacement");
+        let mut collector = collector_state(&root);
+        for index in 0..129 {
+            ingest_notify_locked(
+                &mut collector,
+                &projected_notify(&format!("thread-{index}"), "turn-1"),
+            )
+            .unwrap();
+        }
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&collector.layout.root, &mutation).unwrap();
+        drop(mutation);
+        let path = collector.layout.runtime.join("storage-accounting.lock");
+        let original = collector.layout.runtime.join("original-accounting.lock");
+        let metadata = collector.layout.runtime.join("report-reservation.meta");
+        let mut observed = 0;
+        let mut promise = None;
+        let result = super::refresh_report_from_root_observing(&root, |_| {
+            observed += 1;
+            if promise.is_none() {
+                promise = Some(fs::read(&metadata).unwrap());
+                fs::rename(&path, &original).unwrap();
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .unwrap();
+            }
+        });
+        assert_eq!(result.unwrap_err(), super::ReportFailure::Publish);
+        assert_eq!(observed, 128);
+        assert_eq!(fs::read(&metadata).unwrap(), promise.unwrap());
+        assert!(current_report_view(&collector.store).unwrap().is_none());
+        assert!(collector.store.report_status().unwrap().pending());
+        assert!(barrier.revalidate().is_err());
+        // Restore only this test's explicitly retained lock, then exercise guarded recovery.
+        fs::remove_file(&path).unwrap();
+        fs::rename(&original, &path).unwrap();
+        barrier.revalidate().unwrap();
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        assert_published_report_view(&root, 129);
+        assert!(!metadata.exists());
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut snapshot = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                snapshot.extend(snapshot_tree(&path));
+            } else {
+                snapshot.insert(path.clone(), fs::read(path).unwrap());
+            }
+        }
+        snapshot
+    }
+
+    #[derive(Debug, Default)]
+    struct ReportPrecommitTestGuard {
+        deny_start: bool,
+        deny_publication: bool,
+        starts: std::sync::atomic::AtomicUsize,
+        publications: std::sync::atomic::AtomicUsize,
+        start_allowance: std::sync::atomic::AtomicU64,
+        budgets: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl super::CollectorReportPrecommitGuard for ReportPrecommitTestGuard {
+        fn check_start(
+            &self,
+            layout: &agent_observability_local_runtime::InstalledLayout,
+            freeze: &agent_observability_local_runtime::storage_coherence::OwnedStorageFreezeGuard<
+                '_,
+            >,
+            config: &agent_observability_local_runtime::LocalRuntimeConfigV3,
+            estimated_allowance: u64,
+        ) -> Result<(), super::CollectorReportPrecommitError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            self.start_allowance
+                .store(estimated_allowance, Ordering::SeqCst);
+            assert_eq!(
+                estimated_allowance,
+                super::automatic_report_view_admitted_bytes(layout, config).unwrap()
+                    + super::REPORT_VIEW_PUBLICATION_RESERVE_BYTES
+                    + super::REPORT_RESERVATION_METADATA_ALLOWANCE
+            );
+            self.observe(layout, freeze, config);
+            if self.deny_start {
+                Err(super::CollectorReportPrecommitError::Denied)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn check_publication(
+            &self,
+            layout: &agent_observability_local_runtime::InstalledLayout,
+            freeze: &agent_observability_local_runtime::storage_coherence::OwnedStorageFreezeGuard<
+                '_,
+            >,
+            config: &agent_observability_local_runtime::LocalRuntimeConfigV3,
+            publication_allowance: u64,
+            validated_self_reservation_bytes: u64,
+        ) -> Result<(), super::CollectorReportPrecommitError> {
+            self.publications.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                publication_allowance,
+                super::REPORT_VIEW_PUBLICATION_RESERVE_BYTES
+            );
+            let evidence =
+                agent_observability_local_runtime::reservation::ReportReservationEvidence::capture(
+                    &layout.root,
+                    freeze.mutation(),
+                )
+                .unwrap();
+            assert_eq!(
+                validated_self_reservation_bytes,
+                evidence.captured_reserved_bytes()
+            );
+            assert!(validated_self_reservation_bytes > 0);
+            assert_eq!(
+                validated_self_reservation_bytes + super::REPORT_RESERVATION_METADATA_ALLOWANCE,
+                self.start_allowance.load(Ordering::SeqCst)
+            );
+            self.observe(layout, freeze, config);
+            if self.deny_publication {
+                Err(super::CollectorReportPrecommitError::Denied)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ReportPrecommitTestGuard {
+        fn observe(
+            &self,
+            layout: &agent_observability_local_runtime::InstalledLayout,
+            freeze: &agent_observability_local_runtime::storage_coherence::OwnedStorageFreezeGuard<
+                '_,
+            >,
+            config: &agent_observability_local_runtime::LocalRuntimeConfigV3,
+        ) {
+            freeze.revalidate().unwrap();
+            assert!(MutationGuard::try_acquire(&layout.runtime).is_err());
+            let barrier = super::StorageBarrier::open_if_initialized(&layout.root)
+                .unwrap()
+                .unwrap();
+            assert!(barrier.try_begin_write().is_err());
+            self.budgets
+                .lock()
+                .unwrap()
+                .push(config.collection.local_storage_budget_bytes);
+        }
+    }
+
+    #[test]
+    fn report_precommit_start_denial_and_legacy_scope_do_not_mutate() {
+        for coordinated in [false, true] {
+            let root = test_root(&format!("report-port-start-{coordinated}"));
+            let mut collector = collector_state(&root);
+            ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+            if coordinated {
+                let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+                super::StorageBarrier::initialize(&root, &mutation).unwrap();
+            }
+            let before = snapshot_tree(&root);
+            let guard = ReportPrecommitTestGuard {
+                deny_start: true,
+                ..Default::default()
+            };
+            let result = super::refresh_report_with_precommit_observing(
+                &collector.layout,
+                &collector.store,
+                Some(&guard),
+                |_| panic!("projection before admission"),
+            );
+            assert_eq!(
+                result,
+                Err(if coordinated {
+                    super::ReportFailure::Capacity
+                } else {
+                    super::ReportFailure::Publish
+                })
+            );
+            assert_eq!(
+                guard.starts.load(Ordering::SeqCst),
+                usize::from(coordinated)
+            );
+            assert_eq!(guard.publications.load(Ordering::SeqCst), 0);
+            assert_eq!(snapshot_tree(&root), before);
+            assert_eq!(
+                super::StorageBarrier::open_if_initialized(&root)
+                    .unwrap()
+                    .is_some(),
+                coordinated
+            );
+            drop(collector);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn report_precommit_existing_reservation_is_not_recovered() {
+        let root = test_root("report-port-existing");
+        let collector = collector_state(&root);
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        super::StorageBarrier::initialize(&root, &mutation).unwrap();
+        let config = load(&collector.layout.config).unwrap();
+        let reservation = RuntimeControl::new(&config)
+            .unwrap()
+            .reserve_report_build(&root, &mutation, 1024 * 1024)
+            .unwrap();
+        drop(reservation);
+        drop(mutation);
+        let before = snapshot_tree(&root);
+        let guard = ReportPrecommitTestGuard::default();
+        assert_eq!(
+            super::refresh_report_with_precommit_observing(
+                &collector.layout,
+                &collector.store,
+                Some(&guard),
+                |_| panic!("unexpected projection"),
+            ),
+            Err(super::ReportFailure::RenderGuard)
+        );
+        assert_eq!(guard.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(snapshot_tree(&root), before);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_precommit_publication_denial_preserves_recovery_and_latest_config() {
+        let root = test_root("report-port-publication");
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        collector.store.invalidate_report().unwrap();
+        let current = current_report_view(&collector.store).unwrap();
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        super::StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let original_budget = load(&collector.layout.config)
+            .unwrap()
+            .collection
+            .local_storage_budget_bytes;
+        let guard = ReportPrecommitTestGuard {
+            deny_publication: true,
+            ..Default::default()
+        };
+        let mut before_publication = None;
+        let result = super::refresh_report_with_precommit_observing(
+            &collector.layout,
+            &collector.store,
+            Some(&guard),
+            |_| {
+                let mut config = load(&collector.layout.config).unwrap();
+                config.collection.local_storage_budget_bytes = original_budget + 1024 * 1024;
+                // Simulate an external edit in this synthetic fixture. A cooperative config
+                // writer correctly cannot enter while a projection write permit is held.
+                fs::write(
+                    &collector.layout.config,
+                    serde_json::to_vec(&config).unwrap(),
+                )
+                .unwrap();
+                before_publication = Some(
+                    fs::read(collector.layout.runtime.join("report-reservation.meta")).unwrap(),
+                );
+            },
+        );
+        assert_eq!(result, Err(super::ReportFailure::Capacity));
+        assert_eq!(guard.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(guard.publications.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *guard.budgets.lock().unwrap(),
+            vec![original_budget, original_budget + 1024 * 1024]
+        );
+        assert_eq!(current_report_view(&collector.store).unwrap(), current);
+        assert!(collector.store.report_status().unwrap().pending());
+        assert_eq!(
+            fs::read(collector.layout.runtime.join("report-reservation.meta")).unwrap(),
+            before_publication.unwrap()
+        );
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        let evidence =
+            agent_observability_local_runtime::reservation::ReportReservationEvidence::capture(
+                &root, &mutation,
+            )
+            .unwrap();
+        let staging = report_precommit_staging_path(&root);
+        assert!(
+            evidence
+                .matches_staging(&staging, &fs::File::open(&staging).unwrap())
+                .unwrap()
+        );
+        drop(evidence);
+        drop(mutation);
+        // The unchanged default path may perform guarded recovery and finish publication.
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn report_precommit_staging_path(root: &Path) -> std::path::PathBuf {
+        fs::read_dir(root.join("state/store/report-views.v1"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".report-view.sqlite3.staging.")
+                    && !path.to_string_lossy().ends_with("-journal")
+            })
+            .expect("retained bound staging")
+    }
+
+    #[test]
+    fn report_precommit_wrong_root_or_missing_accounting_lock_fails_without_creation() {
+        for wrong_root in [false, true] {
+            let root = test_root(&format!("report-port-invalid-root-{wrong_root}"));
+            let collector = collector_state(&root);
+            let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+            super::StorageBarrier::initialize(&root, &mutation).unwrap();
+            drop(mutation);
+            let mut layout = collector.layout.clone();
+            if wrong_root {
+                let other = install(&root.join("other")).unwrap();
+                let mutation = MutationGuard::try_acquire(&other.runtime).unwrap();
+                super::StorageBarrier::initialize(&other.root, &mutation).unwrap();
+                layout.root = other.root;
+            } else {
+                fs::remove_file(layout.runtime.join("storage-accounting.lock")).unwrap();
+            }
+            let before = snapshot_tree(&root);
+            let guard = ReportPrecommitTestGuard::default();
+            assert_eq!(
+                super::refresh_report_with_precommit_observing(
+                    &layout,
+                    &collector.store,
+                    Some(&guard),
+                    |_| panic!("invalid ownership"),
+                ),
+                Err(super::ReportFailure::Publish)
+            );
+            assert_eq!(guard.starts.load(Ordering::SeqCst), 0);
+            assert_eq!(guard.publications.load(Ordering::SeqCst), 0);
+            assert_eq!(snapshot_tree(&root), before);
+            drop(collector);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn report_precommit_success_checks_once_and_releases_scopes() {
+        let root = test_root("report-port-success");
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        let config_guard = ConfigMutationGuard::acquire(&collector.layout).unwrap();
+        let mut config = load(&collector.layout.config).unwrap();
+        config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+        save(&config_guard, &config).unwrap();
+        drop(config_guard);
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        let barrier = super::StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let guard = ReportPrecommitTestGuard::default();
+        assert_eq!(
+            super::refresh_report_with_precommit_observing(
+                &collector.layout,
+                &collector.store,
+                Some(&guard),
+                |_| {},
+            ),
+            Ok(true)
+        );
+        assert_eq!(guard.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(guard.publications.load(Ordering::SeqCst), 1);
+        assert!(
+            guard.start_allowance.load(Ordering::SeqCst)
+                < super::MAX_AUTOMATIC_REPORT_VIEW_BYTES
+                    + super::REPORT_VIEW_PUBLICATION_RESERVE_BYTES
+                    + super::REPORT_RESERVATION_METADATA_ALLOWANCE
+        );
+        assert_published_report_view(&root, 1);
+        assert!(
+            !collector
+                .layout
+                .runtime
+                .join("report-reservation.meta")
+                .exists()
+        );
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        barrier.try_freeze(&mutation).unwrap().revalidate().unwrap();
+        drop(mutation);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_precommit_replaced_metadata_or_staging_never_reaches_publication_check() {
+        use std::os::unix::fs::OpenOptionsExt;
+        for replace_staging in [false, true] {
+            let root = test_root(&format!("report-port-replacement-{replace_staging}"));
+            let mut collector = collector_state(&root);
+            ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+            let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+            super::StorageBarrier::initialize(&root, &mutation).unwrap();
+            drop(mutation);
+            let guard = ReportPrecommitTestGuard::default();
+            let mut replaced = None;
+            let result = super::refresh_report_with_precommit_observing(
+                &collector.layout,
+                &collector.store,
+                Some(&guard),
+                |_| {
+                    if replaced.is_some() {
+                        return;
+                    }
+                    let path = if replace_staging {
+                        report_precommit_staging_path(&root)
+                    } else {
+                        collector.layout.runtime.join("report-reservation.meta")
+                    };
+                    let retained = root.join("retained-original");
+                    fs::rename(&path, &retained).unwrap();
+                    OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&path)
+                        .unwrap();
+                    replaced = Some((path, retained));
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(guard.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(guard.publications.load(Ordering::SeqCst), 0);
+            let (path, retained) = replaced.unwrap();
+            assert_eq!(fs::read(path).unwrap(), b"");
+            assert!(retained.exists());
+            assert!(
+                collector
+                    .layout
+                    .runtime
+                    .join("report-reservation.meta")
+                    .exists()
+            );
+            assert!(current_report_view(&collector.store).unwrap().is_none());
+            assert!(collector.store.report_status().unwrap().pending());
+            drop(collector);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn report_cleanup_defers_while_accounting_writer_is_active() {
+        use agent_observability_local_runtime::storage_coherence::StorageBarrier;
+        let root = test_root("report-cleanup-accounting-contention");
+        let collector = collector_state(&root);
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&collector.layout.root, &mutation).unwrap();
+        drop(mutation);
+        let writer = barrier.try_begin_write().unwrap();
+        assert_eq!(
+            super::cleanup_report_reservation(&collector.layout),
+            Err(super::ReportFailure::RenderGuard)
+        );
+        drop(writer);
+        assert_eq!(super::cleanup_report_reservation(&collector.layout), Ok(()));
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        barrier.try_freeze(&mutation).unwrap().revalidate().unwrap();
+        drop(mutation);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_finalization_contention_preserves_reservation_until_guarded_recovery() {
+        for coordinated in [false, true] {
+            assert_report_finalization_recovers(coordinated);
+        }
+    }
+
+    fn assert_report_finalization_recovers(coordinated: bool) {
+        let root = test_root(&format!(
+            "report-reservation-finalization-contention-{coordinated}"
+        ));
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        if coordinated {
+            let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+            agent_observability_local_runtime::storage_coherence::StorageBarrier::initialize(
+                &collector.layout.root,
+                &mutation,
+            )
+            .unwrap();
+        }
+        let mut blocker = None;
+        let result = super::refresh_report_from_root_observing(&root, |_| {
+            blocker = Some(MutationGuard::try_acquire(&collector.layout.runtime).unwrap());
+        });
+        assert_eq!(result.unwrap_err(), super::ReportFailure::RenderGuard);
+        let control = RuntimeControl::new(&load(&collector.layout.config).unwrap()).unwrap();
+        assert!(
+            control
+                .claim_stale_report_reservation(&root, blocker.as_ref().unwrap())
+                .unwrap()
+                .is_some()
+        );
+        assert!(collector.store.report_status().unwrap().pending());
+        assert!(current_report_view(&collector.store).unwrap().is_none());
+        drop(blocker);
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        let mutation = MutationGuard::acquire(&collector.layout.runtime).unwrap();
+        assert!(
+            control
+                .claim_stale_report_reservation(&root, &mutation)
+                .unwrap()
+                .is_none()
+        );
+        drop(mutation);
+        assert_published_report_view(&root, 1);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_refresh_rejects_replaced_bound_staging_without_deleting_the_replacement() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = test_root("report-bound-staging-replaced");
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        let previous = current_report_view(&collector.store).unwrap();
+        collector.store.invalidate_report().unwrap();
+        let directory = collector.layout.state.join("store/report-views.v1");
+        let mut replacement = None;
+        let result = super::refresh_report_from_root_observing(&root, |_| {
+            if replacement.is_some() {
+                return;
+            }
+            let path = fs::read_dir(&directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .starts_with(".report-view.sqlite3.staging.")
+                        && !path.to_string_lossy().ends_with("-journal")
+                })
+                .unwrap();
+            fs::remove_file(&path).unwrap();
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"replacement-must-survive").unwrap();
+            file.sync_all().unwrap();
+            replacement = Some(path);
+        });
+        assert!(result.is_err());
+        assert_eq!(current_report_view(&collector.store).unwrap(), previous);
+        assert!(collector.store.report_status().unwrap().pending());
+        assert_eq!(
+            fs::read(replacement.as_ref().unwrap()).unwrap(),
+            b"replacement-must-survive"
+        );
+        let metadata_before =
+            fs::read(collector.layout.runtime.join("report-reservation.meta")).unwrap();
+        assert!(refresh_dashboard_snapshot(&root).is_err());
+        assert_eq!(
+            fs::read(collector.layout.runtime.join("report-reservation.meta")).unwrap(),
+            metadata_before
+        );
+        assert_eq!(
+            fs::read(replacement.unwrap()).unwrap(),
+            b"replacement-must-survive"
+        );
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_acknowledgement_mismatch_keeps_reservation_for_recovery() {
+        let root = test_root("report-reservation-ack-mismatch");
+        let collector = collector_state(&root);
+        let config = load(&collector.layout.config).unwrap();
+        let control = RuntimeControl::new(&config).unwrap();
+        let mutation = MutationGuard::acquire(&collector.layout.runtime).unwrap();
+        let reservation = control
+            .reserve_report_build(&root, &mutation, 1024 * 1024)
+            .unwrap();
+        let wrong_generation = collector.store.report_status().unwrap().generation + 1;
+        assert_eq!(
+            super::acknowledge_report_reservation(
+                &collector.layout,
+                &collector.store,
+                wrong_generation,
+                &mutation,
+                reservation,
+            )
+            .unwrap_err(),
+            super::ReportFailure::SnapshotChanged
+        );
+        assert!(
+            control
+                .claim_stale_report_reservation(&root, &mutation)
+                .unwrap()
+                .is_some()
+        );
+        drop(mutation);
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        let mutation = MutationGuard::acquire(&collector.layout.runtime).unwrap();
+        assert!(
+            control
+                .claim_stale_report_reservation(&root, &mutation)
+                .unwrap()
+                .is_none()
+        );
+        drop(mutation);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_publication_rechecks_budget_changed_during_projection() {
+        let root = test_root("report-reservation-budget-change");
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        let current = current_report_view(&collector.store).unwrap();
+        collector.store.invalidate_report().unwrap();
+        let result = super::refresh_report_from_root_observing(&root, |_| {
+            let guard = ConfigMutationGuard::acquire(&collector.layout).unwrap();
+            let mut config = load(&collector.layout.config).unwrap();
+            config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+            save(&guard, &config).unwrap();
+            inflate_allocated_accounting(&root);
+        });
+        assert_eq!(result.unwrap_err(), super::ReportFailure::Capacity);
+        assert_eq!(current_report_view(&collector.store).unwrap(), current);
+        assert!(collector.store.report_status().unwrap().pending());
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6873,11 +10239,7 @@ mod tests {
 
             assert!(refresh_report_from_root(&root).unwrap());
             assert!(!collector.store.report_status().unwrap().pending());
-            let html = fs::read_to_string(collector.layout.logs.join(REPORT_FILE_NAME)).unwrap();
-            assert!(
-                html.contains(&format!(r#""generatedSpans":{count}"#)),
-                "report did not preserve the {count}-record boundary"
-            );
+            assert_published_report_view(&root, count);
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -6901,9 +10263,13 @@ mod tests {
             collector: Arc::new(Mutex::new(restarted)),
             auth_token: Arc::from("a".repeat(64)),
             private_detail_failures,
+            lifecycle_failures: Arc::new(AtomicU64::new(0)),
+            lifecycle_storage_pressure: Arc::new(AtomicBool::new(false)),
             report_refresh_scheduled: Arc::new(AtomicBool::new(false)),
             report_refresh_requested: Arc::new(AtomicU64::new(0)),
+            report_contention_quiet_ms: Arc::new(AtomicU64::new(0)),
             report_refresh_attempts: Arc::new(AtomicU64::new(0)),
+            report_snapshot_test: Arc::default(),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6921,9 +10287,328 @@ mod tests {
             assert!(!collector.report_dirty);
             assert!(!collector.report_degraded);
         });
-        assert!(root.join("logs").join(REPORT_FILE_NAME).is_file());
+        assert_published_report_view(&root, 1);
+        assert!(!root.join("logs").join(REPORT_FILE_NAME).exists());
         assert!(!report_dirty_path(&install(&root).unwrap()).exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lifecycle_invalidation_recovers_before_any_destructive_commit() {
+        for replace_html in [false, true] {
+            let root = test_root(if replace_html {
+                "lifecycle-after-placeholder"
+            } else {
+                "lifecycle-before-placeholder"
+            });
+            let state = collector_state(&root);
+            let layout = state.layout.clone();
+            assert!(refresh_report_from_root(&root).unwrap());
+            let guard = state.store.acquire_report_render_guard().unwrap();
+            state.store.invalidate_report().unwrap();
+            if replace_html {
+                agent_observability_static_report::write_refresh_pending(
+                    &layout.logs.join(REPORT_FILE_NAME),
+                )
+                .unwrap();
+            }
+            drop(guard);
+            drop(state);
+            // Simulate process loss at either publication boundary: no sidecar wakeup exists.
+            assert!(!report_dirty_path(&layout).exists());
+            let reopened = collector_state(&root);
+            assert!(reopened.store.report_status().unwrap().pending());
+            assert!(reconcile_report_state(
+                &layout,
+                reopened.store.report_status().unwrap().pending()
+            ));
+            drop(reopened);
+            assert!(refresh_report_from_root(&root).unwrap());
+            assert_published_report_view(&root, 0);
+            if replace_html {
+                assert!(
+                    fs::read_to_string(layout.logs.join(REPORT_FILE_NAME))
+                        .unwrap()
+                        .contains("리포트 갱신 대기")
+                );
+            }
+            let reopened = collector_state(&root);
+            assert!(!reopened.store.report_status().unwrap().pending());
+            drop(reopened);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_v6_reservation_recovers_catalog_before_authority_migration() {
+        for invalid_staging in [false, true] {
+            let root = test_root(&format!("v6-reservation-catalog-{invalid_staging}"));
+            let mut collector = collector_state(&root);
+            ingest_notify_locked(&mut collector, &projected_notify("v6-thread", "v6-turn"))
+                .unwrap();
+            assert!(refresh_dashboard_snapshot(&root).unwrap());
+            let layout = collector.layout.clone();
+            assert!(current_report_view(&collector.store).unwrap().is_some());
+            let view_dir = layout.state.join("store/report-views.v1");
+            let published_files: Vec<_> = fs::read_dir(&view_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|value| value == "sqlite3"))
+                .collect();
+            assert_eq!(published_files.len(), 1);
+            let published_file = &published_files[0];
+            assert!(published_file.exists());
+            drop(collector);
+            let database = layout.state.join("store/local-store.sqlite3");
+            // The historical fixture has epoch7; this epoch0 catalog must be retired.
+            write_private_test_file(
+                &database,
+                include_bytes!("../../local-store/tests/fixtures/local_state_v6.sqlite3"),
+            );
+            let before = fs::read(&database).unwrap();
+            let config = load(&layout.config).unwrap();
+            let control = RuntimeControl::new(&config).unwrap();
+            let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+            drop(
+                control
+                    .reserve_report_build(&root, &mutation, 1024 * 1024)
+                    .unwrap(),
+            );
+            let staging = view_dir.join(".report-view.sqlite3.staging.v6-interrupted");
+            if invalid_staging {
+                fs::create_dir(&staging).unwrap();
+            } else {
+                write_private_test_file(&staging, b"content-free interrupted staging");
+            }
+            let unrelated = layout.logs.join("operator-note");
+            write_private_test_file(&unrelated, b"preserve");
+            if invalid_staging {
+                assert!(
+                    super::recover_report_reservation_for_startup(&layout, &config, &mutation)
+                        .is_err()
+                );
+                assert!(
+                    control
+                        .claim_stale_report_reservation(&root, &mutation)
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    fs::read(&database).unwrap() == before,
+                    "failed recovery changed authority"
+                );
+                fs::remove_dir(&staging).unwrap();
+                write_private_test_file(&staging, b"content-free interrupted staging");
+            }
+            super::recover_report_reservation_for_startup(&layout, &config, &mutation).unwrap();
+            assert!(!staging.exists());
+            assert!(!published_file.exists());
+            assert!(!view_dir.join("catalog.json").exists());
+            assert_eq!(fs::read(&unrelated).unwrap(), b"preserve");
+            assert!(
+                fs::read(&database).unwrap() == before,
+                "cleanup migrated or changed authority"
+            );
+            assert!(
+                control
+                    .claim_stale_report_reservation(&root, &mutation)
+                    .unwrap()
+                    .is_none()
+            );
+            let store = super::open_store(&mutation, &layout, &config).unwrap();
+            assert_eq!(store.report_status().unwrap().generation, 2);
+            assert_eq!(store.report_status().unwrap().acknowledged_generation, 1);
+            assert_eq!(store.report_visibility_epoch().unwrap(), 7);
+            assert_eq!(store.record_count().unwrap(), 2);
+            drop(store);
+            drop(mutation);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn terminal_cleanup_retries_contention_without_rebuilding() {
+        for lock_kind in ["mutation", "catalog", "reservation"] {
+            let root = test_root(&format!("report-terminal-cleanup-{lock_kind}"));
+            let state = app_state(&root);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let layout = state.collector.lock().await.layout.clone();
+                let config = load(&layout.config).unwrap();
+                let control = RuntimeControl::new(&config).unwrap();
+                let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+                let reservation = control
+                    .reserve_report_build(&root, &mutation, 65536)
+                    .unwrap();
+                let reservation = if lock_kind == "reservation" {
+                    Some(reservation)
+                } else {
+                    drop(reservation);
+                    None
+                };
+                let blocker = LocalStore::open_current(layout.state.join("store")).unwrap();
+                let catalog = if lock_kind == "catalog" {
+                    Some(blocker.acquire_report_render_guard().unwrap())
+                } else {
+                    None
+                };
+                let mutation = if lock_kind == "mutation" {
+                    Some(mutation)
+                } else {
+                    drop(mutation);
+                    None
+                };
+                let cleanup_state = state.clone();
+                let cleanup_layout = layout.clone();
+                let cleanup = tokio::spawn(async move {
+                    super::cleanup_report_reservation_with_retry(
+                        &cleanup_state,
+                        &cleanup_layout,
+                        super::ReportRefreshTiming {
+                            debounce: Duration::ZERO,
+                            retry_initial: Duration::from_millis(50),
+                        },
+                    )
+                    .await
+                });
+                // Wait until at least one busy attempt has completed; the held lock cannot
+                // be acquired by the second attempt either until explicitly released here.
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while state
+                        .report_snapshot_test
+                        .cleanup_attempts
+                        .load(Ordering::Acquire)
+                        < 2
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(!cleanup.is_finished());
+                drop(mutation);
+                drop(catalog);
+                drop(reservation);
+                assert_eq!(cleanup.await.unwrap(), Ok(()));
+                assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 0);
+                let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+                assert!(
+                    control
+                        .claim_stale_report_reservation(&root, &mutation)
+                        .unwrap()
+                        .is_none()
+                );
+            });
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn terminal_cleanup_exhaustion_is_bounded_and_preserves_recovery() {
+        let root = test_root("report-terminal-cleanup-exhaustion");
+        let state = app_state(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let layout = state.collector.lock().await.layout.clone();
+            let config = load(&layout.config).unwrap();
+            let control = RuntimeControl::new(&config).unwrap();
+            let mutation = MutationGuard::acquire(&layout.runtime).unwrap();
+            drop(
+                control
+                    .reserve_report_build(&root, &mutation, 65536)
+                    .unwrap(),
+            );
+            let result = super::cleanup_report_reservation_with_retry(
+                &state,
+                &layout,
+                super::ReportRefreshTiming {
+                    debounce: Duration::ZERO,
+                    retry_initial: Duration::from_millis(1),
+                },
+            )
+            .await;
+            assert_eq!(result, Err(ReportFailure::RenderGuard));
+            assert_eq!(
+                state
+                    .report_snapshot_test
+                    .cleanup_attempts
+                    .load(Ordering::Acquire),
+                u64::from(super::REPORT_RETRY_LIMIT)
+            );
+            assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 0);
+            assert!(
+                control
+                    .claim_stale_report_reservation(&root, &mutation)
+                    .unwrap()
+                    .is_some()
+            );
+            drop(mutation);
+            assert_eq!(super::cleanup_report_reservation(&layout), Ok(()));
+        });
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_refresh_failure_cleans_stale_reservation_without_rebuilding() {
+        let root = test_root("report-terminal-reservation-cleanup");
+        let state = app_state(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let current = {
+                let mut collector = state.collector.lock().await;
+                ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1"))
+                    .unwrap();
+                assert!(refresh_dashboard_snapshot(&root).unwrap());
+                let current = current_report_view(&collector.store).unwrap();
+                collector.store.invalidate_report().unwrap();
+                current
+            };
+            state
+                .report_snapshot_test
+                .fail_after_reservation
+                .store(true, Ordering::Release);
+            schedule_report_refresh(&state);
+            for _ in 0..200 {
+                if !state.report_refresh_scheduled.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!state.report_refresh_scheduled.load(Ordering::Acquire));
+            let collector = state.collector.lock().await;
+            assert_eq!(collector.report_refresh_failures, super::REPORT_RETRY_LIMIT);
+            assert_eq!(current_report_view(&collector.store).unwrap(), current);
+            assert!(collector.store.report_status().unwrap().pending());
+            let config = load(&collector.layout.config).unwrap();
+            let control = RuntimeControl::new(&config).unwrap();
+            let mutation = MutationGuard::acquire(&collector.layout.runtime).unwrap();
+            assert!(
+                control
+                    .claim_stale_report_reservation(&root, &mutation)
+                    .unwrap()
+                    .is_none()
+            );
+            let allocated = StorageBudget::allocated_tree_bytes(&root).unwrap();
+            let request = control.storage_budget().writable_limit() - allocated - 8192;
+            assert!(matches!(
+                control.admit(&root, request).unwrap(),
+                Admission::Allowed { .. }
+            ));
+        });
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6931,8 +10616,8 @@ mod tests {
         let root = test_root("report-persistent-failure");
         let _ = fs::remove_dir_all(&root);
         let state = app_state(&root);
-        let report = root.join("logs").join(REPORT_FILE_NAME);
-        fs::create_dir(&report).unwrap();
+        let report_views = root.join("state/store/report-views.v1");
+        fs::write(&report_views, b"occupied").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6979,7 +10664,7 @@ mod tests {
                 generation,
                 Duration::from_millis(10),
             ));
-            fs::remove_dir(&report).unwrap();
+            fs::remove_file(&report_views).unwrap();
             assert!(refresh_report_from_root(&root).unwrap());
             tokio::time::timeout(Duration::from_secs(1), async {
                 loop {
@@ -7005,6 +10690,7 @@ mod tests {
             assert_eq!(health["report_dirty"], false);
             assert_eq!(health["report_refresh_failures"], 0);
         });
+        assert_published_report_view(&root, 1);
         assert!(!report_dirty_path(&install(&root).unwrap()).exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -7037,8 +10723,12 @@ mod tests {
                 .await
                 .unwrap();
             configure_port(&root, listener.local_addr().unwrap().port());
-            let transport =
-                super::TransportListener::new(listener, server_config, Duration::from_secs(1), 2);
+            let transport = super::TransportListener::new(
+                listener,
+                server_config,
+                Duration::from_secs(1),
+                super::MAX_CONNECTIONS,
+            );
             let app = router(app_state(&root));
             let server = tokio::spawn(async move { axum::serve(transport, app).await });
             let health_root = root.clone();
@@ -7061,19 +10751,34 @@ mod tests {
             .await
             .unwrap();
             let notify_root = root.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                submit_notify(
+            // Privacy acceptance is not the callback's 250ms fail-open latency test.
+            // Use the same projector and authenticated transport with a bounded test deadline.
+            let response = tokio::task::spawn_blocking(move || {
+                let projected =
+                    super::project_notify_json(&raw_notify("RAW_THREAD_SECRET", "RAW_TURN_SECRET"))
+                        .unwrap();
+                let body = serde_json::to_vec(&projected).unwrap();
+                super::authenticated_request(
                     &notify_root,
-                    &raw_notify("RAW_THREAD_SECRET", "RAW_TURN_SECRET"),
+                    "POST",
+                    "/v1/notify",
+                    Some(&body),
+                    Duration::from_secs(1),
+                    Duration::from_secs(5),
                 )
             })
             .await
             .unwrap();
-            assert_eq!(outcome, NotifyOutcome::Accepted);
+            assert_eq!(response.unwrap().status, 200);
             server.abort();
             let _ = server.await;
         });
+        let store = LocalStore::open_current(root.join("state/store")).unwrap();
+        assert_eq!(store.observation_count().unwrap(), 2);
+        assert_eq!(store.record_count().unwrap(), 2);
+        drop(store);
         refresh_report_from_root(&root).unwrap();
+        assert_published_report_view(&root, 2);
 
         assert_tree_excludes(
             &root,
@@ -7102,6 +10807,8 @@ mod tests {
         let initial = load(&layout.config).unwrap();
         let store = open_store_for_test(&layout, &initial);
         let mut state = CollectorState {
+            ingest_precommit_guard: None,
+            ingest_completion_test: IngestCompletionTest::default(),
             layout: layout.clone(),
             store,
             source_generation: "codex-test".into(),

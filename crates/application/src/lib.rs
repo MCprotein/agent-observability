@@ -1,5 +1,7 @@
 //! Pure application use cases for local pricing and cost aggregation.
 
+pub mod dashboard_summary;
+
 use agent_observability_contracts::{
     AttributesV1, AvailabilityStateV2, CostComponentV1, CostDetailV1, CostEstimateV1,
     DurableRecordV1, FieldAvailabilityV2, MetricsV1, REPORT_DTO_VERSION, RateTableRefV1,
@@ -209,9 +211,8 @@ impl<'a> ReportProjector<'a> {
         index: usize,
         record: &DurableRecordV1,
     ) -> Result<(), ReportProjectionError> {
-        let record = sanitize_durable_record(record)
-            .map_err(|source| ReportProjectionError::InvalidRecord { index, source })?;
-        self.spans.push(report_span(&record, self.table));
+        self.spans
+            .push(project_report_span(index, record, self.table)?);
         Ok(())
     }
 
@@ -225,13 +226,15 @@ impl<'a> ReportProjector<'a> {
         index: usize,
         record: DurableRecordV1,
     ) -> Result<(), ReportProjectionError> {
-        let record = sanitize_owned_durable_record(record)
-            .map_err(|source| ReportProjectionError::InvalidRecord { index, source })?;
-        self.spans.push(report_span(&record, self.table));
+        self.spans
+            .push(project_owned_report_span(index, record, self.table)?);
         Ok(())
     }
 
     /// Finalizes aggregate, filter, trace, and ordering projections.
+    ///
+    /// This is where a repository verified on one span is propagated to otherwise unknown spans
+    /// in the same trace. Single-record projection cannot infer that trace context.
     ///
     /// # Errors
     ///
@@ -265,6 +268,50 @@ impl<'a> ReportProjector<'a> {
             .map_err(ReportProjectionError::InvalidReport)?;
         Ok(report)
     }
+}
+
+/// Validates, sanitizes, and projects one borrowed durable record into a report span.
+///
+/// Repository availability is derived only from this record. Use [`ReportProjector::finish`] when
+/// sibling spans should supply verified trace-level repository context.
+///
+/// # Errors
+///
+/// Returns [`ReportProjectionError::InvalidRecord`] with `index` when the durable record violates
+/// the closed contract.
+pub fn project_report_span(
+    index: usize,
+    record: &DurableRecordV1,
+    table: Option<&RateTable>,
+) -> Result<ReportSpanV2, ReportProjectionError> {
+    let record = sanitize_durable_record(record)
+        .map_err(|source| ReportProjectionError::InvalidRecord { index, source })?;
+    let span = report_span(&record, table);
+    span.validate()
+        .map_err(ReportProjectionError::InvalidReport)?;
+    Ok(span)
+}
+
+/// Validates, sanitizes, and projects one owned durable record into a report span.
+///
+/// This variant reuses the durable record allocation during sanitization. Repository availability
+/// is derived only from this record; trace-level propagation remains a projector finalization step.
+///
+/// # Errors
+///
+/// Returns [`ReportProjectionError::InvalidRecord`] with `index` when the durable record violates
+/// the closed contract.
+pub fn project_owned_report_span(
+    index: usize,
+    record: DurableRecordV1,
+    table: Option<&RateTable>,
+) -> Result<ReportSpanV2, ReportProjectionError> {
+    let record = sanitize_owned_durable_record(record)
+        .map_err(|source| ReportProjectionError::InvalidRecord { index, source })?;
+    let span = report_span(&record, table);
+    span.validate()
+        .map_err(ReportProjectionError::InvalidReport)?;
+    Ok(span)
 }
 
 /// Projects validated durable spans into the privacy-safe report DTO.
@@ -510,26 +557,38 @@ fn propagate_trace_repositories(spans: &mut [ReportSpanV2]) {
             .insert(span.repo.clone());
     }
     for span in spans {
-        if span.repo != "unknown" {
-            continue;
-        }
-        match known.get(&span.trace_id) {
-            Some(repos) if repos.len() == 1 => {
-                span.repo
-                    .clone_from(repos.first().expect("single repository"));
-                span.availability.repository = field_availability(
-                    AvailabilityStateV2::Available,
-                    "derived_from_trace_context",
-                );
-            }
-            Some(_) => {
-                span.availability.repository = field_availability(
-                    AvailabilityStateV2::SourceUnavailable,
-                    "ambiguous_trace_repository",
-                );
-            }
-            None => {}
-        }
+        let repositories = known.get(&span.trace_id);
+        resolve_report_repository(span, repositories.into_iter().flatten().map(String::as_str));
+    }
+}
+
+/// Resolves an unknown repository using already privacy-projected trace context.
+///
+/// An indexed consumer may supply at most two distinct known repositories: that is sufficient
+/// to distinguish missing, unique, and ambiguous context without materializing a whole trace.
+/// Known span repositories remain authoritative. Source/durable strings must be projected first.
+pub fn resolve_report_repository<'a>(
+    span: &mut ReportSpanV2,
+    known_repositories: impl IntoIterator<Item = &'a str>,
+) {
+    if span.repo != "unknown" {
+        return;
+    }
+    let mut repositories = known_repositories
+        .into_iter()
+        .filter(|repository| *repository != "unknown");
+    let Some(first) = repositories.next() else {
+        return;
+    };
+    if repositories.any(|repository| repository != first) {
+        span.availability.repository = field_availability(
+            AvailabilityStateV2::SourceUnavailable,
+            "ambiguous_trace_repository",
+        );
+    } else {
+        first.clone_into(&mut span.repo);
+        span.availability.repository =
+            field_availability(AvailabilityStateV2::Available, "derived_from_trace_context");
     }
 }
 

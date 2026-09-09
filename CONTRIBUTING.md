@@ -46,12 +46,22 @@ agent-observability는 버전 단위의 작은 pull request로 변경을 검토�
 
 ## Required Checks
 
+### Documentation impact check
+
+Every feature PR records the affected documentation and verifies each changed claim against code
+and fresh tests. Update ROADMAP scope/status, configuration examples, architecture/process flows
+and DESIGN when their contracts change; update README only where user-facing behavior changes.
+Do not rewrite historical release evidence or describe unimplemented plans as available features.
+Run `anamnesis context diagnose`, then review semantic freshness: a valid path alone does not prove
+the behavior described by a document. Record known warnings and remaining verification gaps in the PR.
+
 PR에 적용되는 명령은 버전 scope에 따라 달라질 수 있지만, 최소한 다음 저장소 검증을
 실행한다.
 
 ```bash
 cargo fmt --all -- --check
-cargo test --workspace --no-fail-fast
+cargo test --workspace --exclude agent-observability-cli --no-fail-fast
+bash scripts/test-rust-cli.sh
 cargo clippy --workspace --all-targets -- -D warnings
 npm test
 git fetch origin main
@@ -59,9 +69,23 @@ git diff --check origin/main...HEAD
 git diff --check
 ```
 
+CLI 패키지는 파일 identity를 유지하는 테스트가 많아 별도 병렬 실행 프로필을 사용한다.
+위 스크립트는 Rust 1.97.0으로 CLI 패키지 전체를 32개 테스트 thread로 실행하며,
+자식 프로세스의 열린 파일 soft limit만 최소 1,024로 설정한다. hard limit이 부족하면
+테스트를 생략하거나 직렬화하지 않고 선행 조건 오류로 종료한다. 부모 셸·설치된 제품·
+사용자 설정은 바꾸지 않는다. 이는 현재 테스트 실행에 한정된 자원 계약이며 제품의
+최소 사양이나 저장공간 한도가 아니다. 파일 고갈 회귀는 별도 격리 자식에서 낮은 한도를
+사용해 안전한 거부와 자원 해제 후 복구를 검사한다.
+
 GitHub의 `CI` workflow는 pull request에서 Rust 검사와 `npm test`를 다시 실행한다.
-CI 성공은 merge gate의 일부이며, 로컬에서만 실행할 수 있는 장시간 release performance
-검증을 대체하지 않는다.
+일반 PR CI 성공은 merge gate의 일부이며 장시간 release performance 검증을 대체하지 않는다.
+정확한 revision의 장시간 검사는 GitHub Actions `CI`를 수동 실행하여 별도로 수행한다.
+
+브라우저 QA는 임시 runtime과 headless Chromium을 사용한다. Headless 실행 자체는 서버의
+macOS 브라우저 열기 호출을 차단하지 않는다. 설정 smoke는 인증된
+`POST /api/dashboard/launch`로 서버 시작·재사용만 검증하고, 실제 브라우저를 여는
+`POST /api/dashboard/open`은 mock하거나 차단한다. 사용자 Chrome 탭을 열거나 포커스를
+옮기는 테스트를 자동 검증에 포함하지 않는다. `--no-open`은 초기 화면 자동 열기만 막는다.
 
 사용자 동작이나 성능 계약이 바뀌면 ROADMAP에 선언된 fixture, smoke, browser, performance
 검증도 추가한다. 생성된 evidence는 실제 실행 결과와 호환되는 protocol/manifest만

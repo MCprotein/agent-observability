@@ -1,4 +1,4 @@
-/* Generated from contracts/local-runtime-config-v3.schema.json. Do not edit. */
+/* Generated from contracts/local-runtime-config-v5.schema.json. Do not edit. */
 "use strict";
 (() => {
   // node_modules/lucide/dist/esm/defaultAttributes.mjs
@@ -307,8 +307,9 @@
     }
   };
 
-  // ui/settings/generated/validate-local-runtime-config-v3.js
-  var validate_local_runtime_config_v3_default = validate20;
+  // ui/settings/generated/validate-local-runtime-config-v5.js
+  var validate_local_runtime_config_v5_default = validate20;
+  var schema33 = { "type": "object", "additionalProperties": false, "required": ["mode", "retained_target_bytes", "workspace_budget_bytes", "minimum_free_bytes"], "properties": { "mode": { "type": "string", "enum": ["legacy", "separated"] }, "retained_target_bytes": { "type": "integer", "minimum": 268435456, "maximum": 21474836480 }, "workspace_budget_bytes": { "type": "integer", "minimum": 268435456, "maximum": 21474836480 }, "minimum_free_bytes": { "type": "integer", "minimum": 268435456, "maximum": 21474836480 } } };
   function validate20(data, { instancePath = "", parentData, parentDataProperty, rootData = data, dynamicAnchors = {} } = {}) {
     let vErrors = null;
     let errors = 0;
@@ -322,13 +323,13 @@
     if (errors === 0) {
       if (data && typeof data == "object" && !Array.isArray(data)) {
         let missing0;
-        if (data.schema_version === void 0 && (missing0 = "schema_version") || data.enabled === void 0 && (missing0 = "enabled") || data.capture_private_codex_turn_details === void 0 && (missing0 = "capture_private_codex_turn_details") || data.collection === void 0 && (missing0 = "collection") || data.retention === void 0 && (missing0 = "retention")) {
+        if (data.schema_version === void 0 && (missing0 = "schema_version") || data.enabled === void 0 && (missing0 = "enabled") || data.capture_private_codex_turn_details === void 0 && (missing0 = "capture_private_codex_turn_details") || data.collection === void 0 && (missing0 = "collection") || data.storage_budget === void 0 && (missing0 = "storage_budget") || data.retention === void 0 && (missing0 = "retention") || data.lifecycle === void 0 && (missing0 = "lifecycle")) {
           validate20.errors = [{ instancePath, schemaPath: "#/required", keyword: "required", params: { missingProperty: missing0 }, message: "must have required property '" + missing0 + "'" }];
           return false;
         } else {
           const _errs1 = errors;
           for (const key0 in data) {
-            if (!(key0 === "schema_version" || key0 === "enabled" || key0 === "capture_private_codex_turn_details" || key0 === "collection" || key0 === "retention")) {
+            if (!(key0 === "schema_version" || key0 === "enabled" || key0 === "capture_private_codex_turn_details" || key0 === "collection" || key0 === "storage_budget" || key0 === "retention" || key0 === "lifecycle")) {
               validate20.errors = [{ instancePath, schemaPath: "#/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key0 }, message: "must NOT have additional properties" }];
               return false;
               break;
@@ -337,8 +338,8 @@
           if (_errs1 === errors) {
             if (data.schema_version !== void 0) {
               const _errs2 = errors;
-              if ("local_runtime.v3" !== data.schema_version) {
-                validate20.errors = [{ instancePath: instancePath + "/schema_version", schemaPath: "#/properties/schema_version/const", keyword: "const", params: { allowedValue: "local_runtime.v3" }, message: "must be equal to constant" }];
+              if ("local_runtime.v5" !== data.schema_version) {
+                validate20.errors = [{ instancePath: instancePath + "/schema_version", schemaPath: "#/properties/schema_version/const", keyword: "const", params: { allowedValue: "local_runtime.v5" }, message: "must be equal to constant" }];
                 return false;
               }
               var valid0 = _errs2 === errors;
@@ -580,66 +581,57 @@
                     var valid0 = true;
                   }
                   if (valid0) {
-                    if (data.retention !== void 0) {
-                      let data11 = data.retention;
+                    if (data.storage_budget !== void 0) {
+                      let data11 = data.storage_budget;
                       const _errs25 = errors;
                       const _errs26 = errors;
                       if (errors === _errs26) {
                         if (data11 && typeof data11 == "object" && !Array.isArray(data11)) {
                           let missing2;
-                          if (data11.max_record_age_days === void 0 && (missing2 = "max_record_age_days") || data11.max_archive_records === void 0 && (missing2 = "max_archive_records") || data11.max_archive_bytes === void 0 && (missing2 = "max_archive_bytes")) {
-                            validate20.errors = [{ instancePath: instancePath + "/retention", schemaPath: "#/$defs/retention/required", keyword: "required", params: { missingProperty: missing2 }, message: "must have required property '" + missing2 + "'" }];
+                          if (data11.mode === void 0 && (missing2 = "mode") || data11.retained_target_bytes === void 0 && (missing2 = "retained_target_bytes") || data11.workspace_budget_bytes === void 0 && (missing2 = "workspace_budget_bytes") || data11.minimum_free_bytes === void 0 && (missing2 = "minimum_free_bytes")) {
+                            validate20.errors = [{ instancePath: instancePath + "/storage_budget", schemaPath: "#/$defs/storage_budget/required", keyword: "required", params: { missingProperty: missing2 }, message: "must have required property '" + missing2 + "'" }];
                             return false;
                           } else {
                             const _errs28 = errors;
                             for (const key2 in data11) {
-                              if (!(key2 === "max_record_age_days" || key2 === "max_archive_records" || key2 === "max_archive_bytes")) {
-                                validate20.errors = [{ instancePath: instancePath + "/retention", schemaPath: "#/$defs/retention/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key2 }, message: "must NOT have additional properties" }];
+                              if (!(key2 === "mode" || key2 === "retained_target_bytes" || key2 === "workspace_budget_bytes" || key2 === "minimum_free_bytes")) {
+                                validate20.errors = [{ instancePath: instancePath + "/storage_budget", schemaPath: "#/$defs/storage_budget/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key2 }, message: "must NOT have additional properties" }];
                                 return false;
                                 break;
                               }
                             }
                             if (_errs28 === errors) {
-                              if (data11.max_record_age_days !== void 0) {
-                                let data12 = data11.max_record_age_days;
+                              if (data11.mode !== void 0) {
+                                let data12 = data11.mode;
                                 const _errs29 = errors;
-                                if (!(typeof data12 == "number" && (!(data12 % 1) && !isNaN(data12)) && isFinite(data12))) {
-                                  validate20.errors = [{ instancePath: instancePath + "/retention/max_record_age_days", schemaPath: "#/$defs/retention/properties/max_record_age_days/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                if (typeof data12 !== "string") {
+                                  validate20.errors = [{ instancePath: instancePath + "/storage_budget/mode", schemaPath: "#/$defs/storage_budget/properties/mode/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
                                   return false;
                                 }
-                                if (errors === _errs29) {
-                                  if (typeof data12 == "number" && isFinite(data12)) {
-                                    if (data12 > 3650 || isNaN(data12)) {
-                                      validate20.errors = [{ instancePath: instancePath + "/retention/max_record_age_days", schemaPath: "#/$defs/retention/properties/max_record_age_days/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3650 }, message: "must be <= 3650" }];
-                                      return false;
-                                    } else {
-                                      if (data12 < 1 || isNaN(data12)) {
-                                        validate20.errors = [{ instancePath: instancePath + "/retention/max_record_age_days", schemaPath: "#/$defs/retention/properties/max_record_age_days/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
-                                        return false;
-                                      }
-                                    }
-                                  }
+                                if (!(data12 === "legacy" || data12 === "separated")) {
+                                  validate20.errors = [{ instancePath: instancePath + "/storage_budget/mode", schemaPath: "#/$defs/storage_budget/properties/mode/enum", keyword: "enum", params: { allowedValues: schema33.properties.mode.enum }, message: "must be equal to one of the allowed values" }];
+                                  return false;
                                 }
                                 var valid4 = _errs29 === errors;
                               } else {
                                 var valid4 = true;
                               }
                               if (valid4) {
-                                if (data11.max_archive_records !== void 0) {
-                                  let data13 = data11.max_archive_records;
+                                if (data11.retained_target_bytes !== void 0) {
+                                  let data13 = data11.retained_target_bytes;
                                   const _errs31 = errors;
                                   if (!(typeof data13 == "number" && (!(data13 % 1) && !isNaN(data13)) && isFinite(data13))) {
-                                    validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_records", schemaPath: "#/$defs/retention/properties/max_archive_records/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                    validate20.errors = [{ instancePath: instancePath + "/storage_budget/retained_target_bytes", schemaPath: "#/$defs/storage_budget/properties/retained_target_bytes/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
                                     return false;
                                   }
                                   if (errors === _errs31) {
                                     if (typeof data13 == "number" && isFinite(data13)) {
-                                      if (data13 > 1e5 || isNaN(data13)) {
-                                        validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_records", schemaPath: "#/$defs/retention/properties/max_archive_records/maximum", keyword: "maximum", params: { comparison: "<=", limit: 1e5 }, message: "must be <= 100000" }];
+                                      if (data13 > 21474836480 || isNaN(data13)) {
+                                        validate20.errors = [{ instancePath: instancePath + "/storage_budget/retained_target_bytes", schemaPath: "#/$defs/storage_budget/properties/retained_target_bytes/maximum", keyword: "maximum", params: { comparison: "<=", limit: 21474836480 }, message: "must be <= 21474836480" }];
                                         return false;
                                       } else {
-                                        if (data13 < 1 || isNaN(data13)) {
-                                          validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_records", schemaPath: "#/$defs/retention/properties/max_archive_records/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                        if (data13 < 268435456 || isNaN(data13)) {
+                                          validate20.errors = [{ instancePath: instancePath + "/storage_budget/retained_target_bytes", schemaPath: "#/$defs/storage_budget/properties/retained_target_bytes/minimum", keyword: "minimum", params: { comparison: ">=", limit: 268435456 }, message: "must be >= 268435456" }];
                                           return false;
                                         }
                                       }
@@ -650,21 +642,21 @@
                                   var valid4 = true;
                                 }
                                 if (valid4) {
-                                  if (data11.max_archive_bytes !== void 0) {
-                                    let data14 = data11.max_archive_bytes;
+                                  if (data11.workspace_budget_bytes !== void 0) {
+                                    let data14 = data11.workspace_budget_bytes;
                                     const _errs33 = errors;
                                     if (!(typeof data14 == "number" && (!(data14 % 1) && !isNaN(data14)) && isFinite(data14))) {
-                                      validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_bytes", schemaPath: "#/$defs/retention/properties/max_archive_bytes/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                      validate20.errors = [{ instancePath: instancePath + "/storage_budget/workspace_budget_bytes", schemaPath: "#/$defs/storage_budget/properties/workspace_budget_bytes/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
                                       return false;
                                     }
                                     if (errors === _errs33) {
                                       if (typeof data14 == "number" && isFinite(data14)) {
-                                        if (data14 > 268435456 || isNaN(data14)) {
-                                          validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_bytes", schemaPath: "#/$defs/retention/properties/max_archive_bytes/maximum", keyword: "maximum", params: { comparison: "<=", limit: 268435456 }, message: "must be <= 268435456" }];
+                                        if (data14 > 21474836480 || isNaN(data14)) {
+                                          validate20.errors = [{ instancePath: instancePath + "/storage_budget/workspace_budget_bytes", schemaPath: "#/$defs/storage_budget/properties/workspace_budget_bytes/maximum", keyword: "maximum", params: { comparison: "<=", limit: 21474836480 }, message: "must be <= 21474836480" }];
                                           return false;
                                         } else {
-                                          if (data14 < 65536 || isNaN(data14)) {
-                                            validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_bytes", schemaPath: "#/$defs/retention/properties/max_archive_bytes/minimum", keyword: "minimum", params: { comparison: ">=", limit: 65536 }, message: "must be >= 65536" }];
+                                          if (data14 < 268435456 || isNaN(data14)) {
+                                            validate20.errors = [{ instancePath: instancePath + "/storage_budget/workspace_budget_bytes", schemaPath: "#/$defs/storage_budget/properties/workspace_budget_bytes/minimum", keyword: "minimum", params: { comparison: ">=", limit: 268435456 }, message: "must be >= 268435456" }];
                                             return false;
                                           }
                                         }
@@ -674,18 +666,352 @@
                                   } else {
                                     var valid4 = true;
                                   }
+                                  if (valid4) {
+                                    if (data11.minimum_free_bytes !== void 0) {
+                                      let data15 = data11.minimum_free_bytes;
+                                      const _errs35 = errors;
+                                      if (!(typeof data15 == "number" && (!(data15 % 1) && !isNaN(data15)) && isFinite(data15))) {
+                                        validate20.errors = [{ instancePath: instancePath + "/storage_budget/minimum_free_bytes", schemaPath: "#/$defs/storage_budget/properties/minimum_free_bytes/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                        return false;
+                                      }
+                                      if (errors === _errs35) {
+                                        if (typeof data15 == "number" && isFinite(data15)) {
+                                          if (data15 > 21474836480 || isNaN(data15)) {
+                                            validate20.errors = [{ instancePath: instancePath + "/storage_budget/minimum_free_bytes", schemaPath: "#/$defs/storage_budget/properties/minimum_free_bytes/maximum", keyword: "maximum", params: { comparison: "<=", limit: 21474836480 }, message: "must be <= 21474836480" }];
+                                            return false;
+                                          } else {
+                                            if (data15 < 268435456 || isNaN(data15)) {
+                                              validate20.errors = [{ instancePath: instancePath + "/storage_budget/minimum_free_bytes", schemaPath: "#/$defs/storage_budget/properties/minimum_free_bytes/minimum", keyword: "minimum", params: { comparison: ">=", limit: 268435456 }, message: "must be >= 268435456" }];
+                                              return false;
+                                            }
+                                          }
+                                        }
+                                      }
+                                      var valid4 = _errs35 === errors;
+                                    } else {
+                                      var valid4 = true;
+                                    }
+                                  }
                                 }
                               }
                             }
                           }
                         } else {
-                          validate20.errors = [{ instancePath: instancePath + "/retention", schemaPath: "#/$defs/retention/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                          validate20.errors = [{ instancePath: instancePath + "/storage_budget", schemaPath: "#/$defs/storage_budget/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
                           return false;
                         }
                       }
                       var valid0 = _errs25 === errors;
                     } else {
                       var valid0 = true;
+                    }
+                    if (valid0) {
+                      if (data.retention !== void 0) {
+                        let data16 = data.retention;
+                        const _errs37 = errors;
+                        const _errs38 = errors;
+                        if (errors === _errs38) {
+                          if (data16 && typeof data16 == "object" && !Array.isArray(data16)) {
+                            let missing3;
+                            if (data16.max_record_age_days === void 0 && (missing3 = "max_record_age_days") || data16.max_archive_records === void 0 && (missing3 = "max_archive_records") || data16.max_archive_bytes === void 0 && (missing3 = "max_archive_bytes")) {
+                              validate20.errors = [{ instancePath: instancePath + "/retention", schemaPath: "#/$defs/retention/required", keyword: "required", params: { missingProperty: missing3 }, message: "must have required property '" + missing3 + "'" }];
+                              return false;
+                            } else {
+                              const _errs40 = errors;
+                              for (const key3 in data16) {
+                                if (!(key3 === "max_record_age_days" || key3 === "max_archive_records" || key3 === "max_archive_bytes")) {
+                                  validate20.errors = [{ instancePath: instancePath + "/retention", schemaPath: "#/$defs/retention/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key3 }, message: "must NOT have additional properties" }];
+                                  return false;
+                                  break;
+                                }
+                              }
+                              if (_errs40 === errors) {
+                                if (data16.max_record_age_days !== void 0) {
+                                  let data17 = data16.max_record_age_days;
+                                  const _errs41 = errors;
+                                  if (!(typeof data17 == "number" && (!(data17 % 1) && !isNaN(data17)) && isFinite(data17))) {
+                                    validate20.errors = [{ instancePath: instancePath + "/retention/max_record_age_days", schemaPath: "#/$defs/retention/properties/max_record_age_days/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                    return false;
+                                  }
+                                  if (errors === _errs41) {
+                                    if (typeof data17 == "number" && isFinite(data17)) {
+                                      if (data17 > 3650 || isNaN(data17)) {
+                                        validate20.errors = [{ instancePath: instancePath + "/retention/max_record_age_days", schemaPath: "#/$defs/retention/properties/max_record_age_days/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3650 }, message: "must be <= 3650" }];
+                                        return false;
+                                      } else {
+                                        if (data17 < 1 || isNaN(data17)) {
+                                          validate20.errors = [{ instancePath: instancePath + "/retention/max_record_age_days", schemaPath: "#/$defs/retention/properties/max_record_age_days/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                          return false;
+                                        }
+                                      }
+                                    }
+                                  }
+                                  var valid6 = _errs41 === errors;
+                                } else {
+                                  var valid6 = true;
+                                }
+                                if (valid6) {
+                                  if (data16.max_archive_records !== void 0) {
+                                    let data18 = data16.max_archive_records;
+                                    const _errs43 = errors;
+                                    if (!(typeof data18 == "number" && (!(data18 % 1) && !isNaN(data18)) && isFinite(data18))) {
+                                      validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_records", schemaPath: "#/$defs/retention/properties/max_archive_records/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                      return false;
+                                    }
+                                    if (errors === _errs43) {
+                                      if (typeof data18 == "number" && isFinite(data18)) {
+                                        if (data18 > 1e5 || isNaN(data18)) {
+                                          validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_records", schemaPath: "#/$defs/retention/properties/max_archive_records/maximum", keyword: "maximum", params: { comparison: "<=", limit: 1e5 }, message: "must be <= 100000" }];
+                                          return false;
+                                        } else {
+                                          if (data18 < 1 || isNaN(data18)) {
+                                            validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_records", schemaPath: "#/$defs/retention/properties/max_archive_records/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                            return false;
+                                          }
+                                        }
+                                      }
+                                    }
+                                    var valid6 = _errs43 === errors;
+                                  } else {
+                                    var valid6 = true;
+                                  }
+                                  if (valid6) {
+                                    if (data16.max_archive_bytes !== void 0) {
+                                      let data19 = data16.max_archive_bytes;
+                                      const _errs45 = errors;
+                                      if (!(typeof data19 == "number" && (!(data19 % 1) && !isNaN(data19)) && isFinite(data19))) {
+                                        validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_bytes", schemaPath: "#/$defs/retention/properties/max_archive_bytes/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                        return false;
+                                      }
+                                      if (errors === _errs45) {
+                                        if (typeof data19 == "number" && isFinite(data19)) {
+                                          if (data19 > 268435456 || isNaN(data19)) {
+                                            validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_bytes", schemaPath: "#/$defs/retention/properties/max_archive_bytes/maximum", keyword: "maximum", params: { comparison: "<=", limit: 268435456 }, message: "must be <= 268435456" }];
+                                            return false;
+                                          } else {
+                                            if (data19 < 65536 || isNaN(data19)) {
+                                              validate20.errors = [{ instancePath: instancePath + "/retention/max_archive_bytes", schemaPath: "#/$defs/retention/properties/max_archive_bytes/minimum", keyword: "minimum", params: { comparison: ">=", limit: 65536 }, message: "must be >= 65536" }];
+                                              return false;
+                                            }
+                                          }
+                                        }
+                                      }
+                                      var valid6 = _errs45 === errors;
+                                    } else {
+                                      var valid6 = true;
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          } else {
+                            validate20.errors = [{ instancePath: instancePath + "/retention", schemaPath: "#/$defs/retention/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                            return false;
+                          }
+                        }
+                        var valid0 = _errs37 === errors;
+                      } else {
+                        var valid0 = true;
+                      }
+                      if (valid0) {
+                        if (data.lifecycle !== void 0) {
+                          let data20 = data.lifecycle;
+                          const _errs47 = errors;
+                          const _errs48 = errors;
+                          if (errors === _errs48) {
+                            if (data20 && typeof data20 == "object" && !Array.isArray(data20)) {
+                              let missing4;
+                              if (data20.enabled === void 0 && (missing4 = "enabled") || data20.hot_days === void 0 && (missing4 = "hot_days") || data20.warm_days === void 0 && (missing4 = "warm_days") || data20.delete_after_days === void 0 && (missing4 = "delete_after_days") || data20.private_raw_days === void 0 && (missing4 = "private_raw_days") || data20.maintenance_interval_seconds === void 0 && (missing4 = "maintenance_interval_seconds") || data20.max_traces_per_pass === void 0 && (missing4 = "max_traces_per_pass")) {
+                                validate20.errors = [{ instancePath: instancePath + "/lifecycle", schemaPath: "#/$defs/lifecycle/required", keyword: "required", params: { missingProperty: missing4 }, message: "must have required property '" + missing4 + "'" }];
+                                return false;
+                              } else {
+                                const _errs50 = errors;
+                                for (const key4 in data20) {
+                                  if (!(key4 === "enabled" || key4 === "hot_days" || key4 === "warm_days" || key4 === "delete_after_days" || key4 === "private_raw_days" || key4 === "maintenance_interval_seconds" || key4 === "max_traces_per_pass")) {
+                                    validate20.errors = [{ instancePath: instancePath + "/lifecycle", schemaPath: "#/$defs/lifecycle/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key4 }, message: "must NOT have additional properties" }];
+                                    return false;
+                                    break;
+                                  }
+                                }
+                                if (_errs50 === errors) {
+                                  if (data20.enabled !== void 0) {
+                                    const _errs51 = errors;
+                                    if (typeof data20.enabled !== "boolean") {
+                                      validate20.errors = [{ instancePath: instancePath + "/lifecycle/enabled", schemaPath: "#/$defs/lifecycle/properties/enabled/type", keyword: "type", params: { type: "boolean" }, message: "must be boolean" }];
+                                      return false;
+                                    }
+                                    var valid8 = _errs51 === errors;
+                                  } else {
+                                    var valid8 = true;
+                                  }
+                                  if (valid8) {
+                                    if (data20.hot_days !== void 0) {
+                                      let data22 = data20.hot_days;
+                                      const _errs53 = errors;
+                                      if (!(typeof data22 == "number" && (!(data22 % 1) && !isNaN(data22)) && isFinite(data22))) {
+                                        validate20.errors = [{ instancePath: instancePath + "/lifecycle/hot_days", schemaPath: "#/$defs/lifecycle/properties/hot_days/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                        return false;
+                                      }
+                                      if (errors === _errs53) {
+                                        if (typeof data22 == "number" && isFinite(data22)) {
+                                          if (data22 > 3650 || isNaN(data22)) {
+                                            validate20.errors = [{ instancePath: instancePath + "/lifecycle/hot_days", schemaPath: "#/$defs/lifecycle/properties/hot_days/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3650 }, message: "must be <= 3650" }];
+                                            return false;
+                                          } else {
+                                            if (data22 < 1 || isNaN(data22)) {
+                                              validate20.errors = [{ instancePath: instancePath + "/lifecycle/hot_days", schemaPath: "#/$defs/lifecycle/properties/hot_days/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                              return false;
+                                            }
+                                          }
+                                        }
+                                      }
+                                      var valid8 = _errs53 === errors;
+                                    } else {
+                                      var valid8 = true;
+                                    }
+                                    if (valid8) {
+                                      if (data20.warm_days !== void 0) {
+                                        let data23 = data20.warm_days;
+                                        const _errs55 = errors;
+                                        if (!(typeof data23 == "number" && (!(data23 % 1) && !isNaN(data23)) && isFinite(data23))) {
+                                          validate20.errors = [{ instancePath: instancePath + "/lifecycle/warm_days", schemaPath: "#/$defs/lifecycle/properties/warm_days/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                          return false;
+                                        }
+                                        if (errors === _errs55) {
+                                          if (typeof data23 == "number" && isFinite(data23)) {
+                                            if (data23 > 3650 || isNaN(data23)) {
+                                              validate20.errors = [{ instancePath: instancePath + "/lifecycle/warm_days", schemaPath: "#/$defs/lifecycle/properties/warm_days/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3650 }, message: "must be <= 3650" }];
+                                              return false;
+                                            } else {
+                                              if (data23 < 1 || isNaN(data23)) {
+                                                validate20.errors = [{ instancePath: instancePath + "/lifecycle/warm_days", schemaPath: "#/$defs/lifecycle/properties/warm_days/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                                return false;
+                                              }
+                                            }
+                                          }
+                                        }
+                                        var valid8 = _errs55 === errors;
+                                      } else {
+                                        var valid8 = true;
+                                      }
+                                      if (valid8) {
+                                        if (data20.delete_after_days !== void 0) {
+                                          let data24 = data20.delete_after_days;
+                                          const _errs57 = errors;
+                                          if (!(typeof data24 == "number" && (!(data24 % 1) && !isNaN(data24)) && isFinite(data24))) {
+                                            validate20.errors = [{ instancePath: instancePath + "/lifecycle/delete_after_days", schemaPath: "#/$defs/lifecycle/properties/delete_after_days/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                            return false;
+                                          }
+                                          if (errors === _errs57) {
+                                            if (typeof data24 == "number" && isFinite(data24)) {
+                                              if (data24 > 3650 || isNaN(data24)) {
+                                                validate20.errors = [{ instancePath: instancePath + "/lifecycle/delete_after_days", schemaPath: "#/$defs/lifecycle/properties/delete_after_days/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3650 }, message: "must be <= 3650" }];
+                                                return false;
+                                              } else {
+                                                if (data24 < 1 || isNaN(data24)) {
+                                                  validate20.errors = [{ instancePath: instancePath + "/lifecycle/delete_after_days", schemaPath: "#/$defs/lifecycle/properties/delete_after_days/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                                  return false;
+                                                }
+                                              }
+                                            }
+                                          }
+                                          var valid8 = _errs57 === errors;
+                                        } else {
+                                          var valid8 = true;
+                                        }
+                                        if (valid8) {
+                                          if (data20.private_raw_days !== void 0) {
+                                            let data25 = data20.private_raw_days;
+                                            const _errs59 = errors;
+                                            if (!(typeof data25 == "number" && (!(data25 % 1) && !isNaN(data25)) && isFinite(data25))) {
+                                              validate20.errors = [{ instancePath: instancePath + "/lifecycle/private_raw_days", schemaPath: "#/$defs/lifecycle/properties/private_raw_days/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                              return false;
+                                            }
+                                            if (errors === _errs59) {
+                                              if (typeof data25 == "number" && isFinite(data25)) {
+                                                if (data25 > 3650 || isNaN(data25)) {
+                                                  validate20.errors = [{ instancePath: instancePath + "/lifecycle/private_raw_days", schemaPath: "#/$defs/lifecycle/properties/private_raw_days/maximum", keyword: "maximum", params: { comparison: "<=", limit: 3650 }, message: "must be <= 3650" }];
+                                                  return false;
+                                                } else {
+                                                  if (data25 < 1 || isNaN(data25)) {
+                                                    validate20.errors = [{ instancePath: instancePath + "/lifecycle/private_raw_days", schemaPath: "#/$defs/lifecycle/properties/private_raw_days/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                                    return false;
+                                                  }
+                                                }
+                                              }
+                                            }
+                                            var valid8 = _errs59 === errors;
+                                          } else {
+                                            var valid8 = true;
+                                          }
+                                          if (valid8) {
+                                            if (data20.maintenance_interval_seconds !== void 0) {
+                                              let data26 = data20.maintenance_interval_seconds;
+                                              const _errs61 = errors;
+                                              if (!(typeof data26 == "number" && (!(data26 % 1) && !isNaN(data26)) && isFinite(data26))) {
+                                                validate20.errors = [{ instancePath: instancePath + "/lifecycle/maintenance_interval_seconds", schemaPath: "#/$defs/lifecycle/properties/maintenance_interval_seconds/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                                return false;
+                                              }
+                                              if (errors === _errs61) {
+                                                if (typeof data26 == "number" && isFinite(data26)) {
+                                                  if (data26 > 86400 || isNaN(data26)) {
+                                                    validate20.errors = [{ instancePath: instancePath + "/lifecycle/maintenance_interval_seconds", schemaPath: "#/$defs/lifecycle/properties/maintenance_interval_seconds/maximum", keyword: "maximum", params: { comparison: "<=", limit: 86400 }, message: "must be <= 86400" }];
+                                                    return false;
+                                                  } else {
+                                                    if (data26 < 60 || isNaN(data26)) {
+                                                      validate20.errors = [{ instancePath: instancePath + "/lifecycle/maintenance_interval_seconds", schemaPath: "#/$defs/lifecycle/properties/maintenance_interval_seconds/minimum", keyword: "minimum", params: { comparison: ">=", limit: 60 }, message: "must be >= 60" }];
+                                                      return false;
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                              var valid8 = _errs61 === errors;
+                                            } else {
+                                              var valid8 = true;
+                                            }
+                                            if (valid8) {
+                                              if (data20.max_traces_per_pass !== void 0) {
+                                                let data27 = data20.max_traces_per_pass;
+                                                const _errs63 = errors;
+                                                if (!(typeof data27 == "number" && (!(data27 % 1) && !isNaN(data27)) && isFinite(data27))) {
+                                                  validate20.errors = [{ instancePath: instancePath + "/lifecycle/max_traces_per_pass", schemaPath: "#/$defs/lifecycle/properties/max_traces_per_pass/type", keyword: "type", params: { type: "integer" }, message: "must be integer" }];
+                                                  return false;
+                                                }
+                                                if (errors === _errs63) {
+                                                  if (typeof data27 == "number" && isFinite(data27)) {
+                                                    if (data27 > 128 || isNaN(data27)) {
+                                                      validate20.errors = [{ instancePath: instancePath + "/lifecycle/max_traces_per_pass", schemaPath: "#/$defs/lifecycle/properties/max_traces_per_pass/maximum", keyword: "maximum", params: { comparison: "<=", limit: 128 }, message: "must be <= 128" }];
+                                                      return false;
+                                                    } else {
+                                                      if (data27 < 1 || isNaN(data27)) {
+                                                        validate20.errors = [{ instancePath: instancePath + "/lifecycle/max_traces_per_pass", schemaPath: "#/$defs/lifecycle/properties/max_traces_per_pass/minimum", keyword: "minimum", params: { comparison: ">=", limit: 1 }, message: "must be >= 1" }];
+                                                        return false;
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                                var valid8 = _errs63 === errors;
+                                              } else {
+                                                var valid8 = true;
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            } else {
+                              validate20.errors = [{ instancePath: instancePath + "/lifecycle", schemaPath: "#/$defs/lifecycle/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+                              return false;
+                            }
+                          }
+                          var valid0 = _errs47 === errors;
+                        } else {
+                          var valid0 = true;
+                        }
+                      }
                     }
                   }
                 }
@@ -702,6 +1028,416 @@
     return errors === 0;
   }
   validate20.evaluated = { "props": true, "dynamicProps": false, "dynamicItems": false };
+
+  // ui/settings/config-validation.ts
+  function validateLocalRuntimeConfig(value) {
+    if (!validate_local_runtime_config_v5_default(value)) {
+      return {
+        valid: false,
+        errors: (validate_local_runtime_config_v5_default.errors ?? []).map((error) => ({
+          path: error.instancePath?.replace(/^\//, "").replaceAll("/", ".") ?? "",
+          message: error.message ?? "\uD5C8\uC6A9 \uBC94\uC704\uB97C \uD655\uC778\uD558\uC138\uC694."
+        }))
+      };
+    }
+    const config = value;
+    const { hot_days: hot, warm_days: warm, delete_after_days: expiry } = config.lifecycle;
+    if (hot > warm) {
+      return {
+        valid: false,
+        errors: [{ path: "lifecycle.warm_days", message: "Hot \uAE30\uC900\uC77C \uC774\uC0C1\uC774\uC5B4\uC57C \uD569\uB2C8\uB2E4." }]
+      };
+    }
+    if (warm >= expiry) {
+      return {
+        valid: false,
+        errors: [{ path: "lifecycle.delete_after_days", message: "Warm \uAE30\uC900\uC77C\uBCF4\uB2E4 \uCEE4\uC57C \uD569\uB2C8\uB2E4." }]
+      };
+    }
+    return { valid: true, errors: [] };
+  }
+
+  // ui/settings/generated/validate-codex-integration-status-v1.js
+  var validate_codex_integration_status_v1_default = validate21;
+  var schema36 = { "title": "CodexIntegrationStatusV1", "type": "object", "additionalProperties": false, "required": ["schema_version", "config", "notify", "collector", "endpoint", "service", "data_retained", "collector_degradation_reasons"], "properties": { "schema_version": { "const": "codex_integration_status.v1" }, "config": { "$ref": "#/$defs/codex_connection_status" }, "notify": { "anyOf": [{ "$ref": "#/$defs/codex_notify_status" }, { "type": "null" }] }, "collector": { "$ref": "#/$defs/collector_status" }, "endpoint": { "type": ["string", "null"] }, "service": { "type": ["string", "null"] }, "data_retained": { "type": "boolean" }, "collector_degradation_reasons": { "type": "array", "maxItems": 3, "items": { "$ref": "#/$defs/collector_degradation_reason" } } }, "allOf": [{ "if": { "properties": { "collector": { "const": "degraded" } }, "required": ["collector"] }, "else": { "properties": { "collector_degradation_reasons": { "type": "array", "maxItems": 0 } } } }], "$defs": { "codex_connection_status": { "title": "CodexConnectionStatusV1", "type": "string", "enum": ["connected", "disconnected", "conflict"] }, "codex_notify_status": { "title": "CodexNotifyStatusV1", "type": "string", "enum": ["agentobs_owned", "external_preserved"] }, "collector_status": { "title": "CollectorStatusV1", "type": "string", "enum": ["ready", "degraded", "unavailable"] }, "collector_degradation_reason": { "title": "CollectorDegradationReasonV1", "type": "string", "enum": ["lifecycle_failure", "storage_pressure", "expired_trace"] } } };
+  var schema37 = { "title": "CodexConnectionStatusV1", "type": "string", "enum": ["connected", "disconnected", "conflict"] };
+  var schema38 = { "title": "CodexNotifyStatusV1", "type": "string", "enum": ["agentobs_owned", "external_preserved"] };
+  var schema39 = { "title": "CollectorStatusV1", "type": "string", "enum": ["ready", "degraded", "unavailable"] };
+  var schema40 = { "title": "CollectorDegradationReasonV1", "type": "string", "enum": ["lifecycle_failure", "storage_pressure", "expired_trace"] };
+  function validate21(data, { instancePath = "", parentData, parentDataProperty, rootData = data, dynamicAnchors = {} } = {}) {
+    let vErrors = null;
+    let errors = 0;
+    const evaluated0 = validate21.evaluated;
+    if (evaluated0.dynamicProps) {
+      evaluated0.props = void 0;
+    }
+    if (evaluated0.dynamicItems) {
+      evaluated0.items = void 0;
+    }
+    const _errs2 = errors;
+    let valid1 = true;
+    const _errs3 = errors;
+    if (data && typeof data == "object" && !Array.isArray(data)) {
+      let missing0;
+      if (data.collector === void 0 && (missing0 = "collector")) {
+        const err0 = {};
+        if (vErrors === null) {
+          vErrors = [err0];
+        } else {
+          vErrors.push(err0);
+        }
+        errors++;
+      } else {
+        if (data.collector !== void 0) {
+          if ("degraded" !== data.collector) {
+            const err1 = {};
+            if (vErrors === null) {
+              vErrors = [err1];
+            } else {
+              vErrors.push(err1);
+            }
+            errors++;
+          }
+        }
+      }
+    }
+    var _valid0 = _errs3 === errors;
+    errors = _errs2;
+    if (vErrors !== null) {
+      if (_errs2) {
+        vErrors.length = _errs2;
+      } else {
+        vErrors = null;
+      }
+    }
+    if (!_valid0) {
+      const _errs5 = errors;
+      if (data && typeof data == "object" && !Array.isArray(data)) {
+        if (data.collector_degradation_reasons !== void 0) {
+          let data1 = data.collector_degradation_reasons;
+          const _errs6 = errors;
+          if (errors === _errs6) {
+            if (Array.isArray(data1)) {
+              if (data1.length > 0) {
+                validate21.errors = [{ instancePath: instancePath + "/collector_degradation_reasons", schemaPath: "#/allOf/0/else/properties/collector_degradation_reasons/maxItems", keyword: "maxItems", params: { limit: 0 }, message: "must NOT have more than 0 items" }];
+                return false;
+              }
+            } else {
+              validate21.errors = [{ instancePath: instancePath + "/collector_degradation_reasons", schemaPath: "#/allOf/0/else/properties/collector_degradation_reasons/type", keyword: "type", params: { type: "array" }, message: "must be array" }];
+              return false;
+            }
+          }
+        }
+      }
+      var _valid0 = _errs5 === errors;
+      valid1 = _valid0;
+      if (valid1) {
+        var props0 = {};
+        props0.collector_degradation_reasons = true;
+        props0.collector = true;
+      }
+    }
+    if (!valid1) {
+      const err2 = { instancePath, schemaPath: "#/allOf/0/if", keyword: "if", params: { failingKeyword: "else" }, message: 'must match "else" schema' };
+      if (vErrors === null) {
+        vErrors = [err2];
+      } else {
+        vErrors.push(err2);
+      }
+      errors++;
+      validate21.errors = vErrors;
+      return false;
+    }
+    if (errors === 0) {
+      if (data && typeof data == "object" && !Array.isArray(data)) {
+        let missing1;
+        if (data.schema_version === void 0 && (missing1 = "schema_version") || data.config === void 0 && (missing1 = "config") || data.notify === void 0 && (missing1 = "notify") || data.collector === void 0 && (missing1 = "collector") || data.endpoint === void 0 && (missing1 = "endpoint") || data.service === void 0 && (missing1 = "service") || data.data_retained === void 0 && (missing1 = "data_retained") || data.collector_degradation_reasons === void 0 && (missing1 = "collector_degradation_reasons")) {
+          validate21.errors = [{ instancePath, schemaPath: "#/required", keyword: "required", params: { missingProperty: missing1 }, message: "must have required property '" + missing1 + "'" }];
+          return false;
+        } else {
+          const _errs8 = errors;
+          for (const key0 in data) {
+            if (!(key0 === "schema_version" || key0 === "config" || key0 === "notify" || key0 === "collector" || key0 === "endpoint" || key0 === "service" || key0 === "data_retained" || key0 === "collector_degradation_reasons")) {
+              validate21.errors = [{ instancePath, schemaPath: "#/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key0 }, message: "must NOT have additional properties" }];
+              return false;
+              break;
+            }
+          }
+          if (_errs8 === errors) {
+            if (data.schema_version !== void 0) {
+              const _errs9 = errors;
+              if ("codex_integration_status.v1" !== data.schema_version) {
+                validate21.errors = [{ instancePath: instancePath + "/schema_version", schemaPath: "#/properties/schema_version/const", keyword: "const", params: { allowedValue: "codex_integration_status.v1" }, message: "must be equal to constant" }];
+                return false;
+              }
+              var valid4 = _errs9 === errors;
+            } else {
+              var valid4 = true;
+            }
+            if (valid4) {
+              if (data.config !== void 0) {
+                let data3 = data.config;
+                const _errs10 = errors;
+                if (typeof data3 !== "string") {
+                  validate21.errors = [{ instancePath: instancePath + "/config", schemaPath: "#/$defs/codex_connection_status/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                  return false;
+                }
+                if (!(data3 === "connected" || data3 === "disconnected" || data3 === "conflict")) {
+                  validate21.errors = [{ instancePath: instancePath + "/config", schemaPath: "#/$defs/codex_connection_status/enum", keyword: "enum", params: { allowedValues: schema37.enum }, message: "must be equal to one of the allowed values" }];
+                  return false;
+                }
+                var valid4 = _errs10 === errors;
+              } else {
+                var valid4 = true;
+              }
+              if (valid4) {
+                if (data.notify !== void 0) {
+                  let data4 = data.notify;
+                  const _errs13 = errors;
+                  const _errs14 = errors;
+                  let valid6 = false;
+                  const _errs15 = errors;
+                  if (typeof data4 !== "string") {
+                    const err3 = { instancePath: instancePath + "/notify", schemaPath: "#/$defs/codex_notify_status/type", keyword: "type", params: { type: "string" }, message: "must be string" };
+                    if (vErrors === null) {
+                      vErrors = [err3];
+                    } else {
+                      vErrors.push(err3);
+                    }
+                    errors++;
+                  }
+                  if (!(data4 === "agentobs_owned" || data4 === "external_preserved")) {
+                    const err4 = { instancePath: instancePath + "/notify", schemaPath: "#/$defs/codex_notify_status/enum", keyword: "enum", params: { allowedValues: schema38.enum }, message: "must be equal to one of the allowed values" };
+                    if (vErrors === null) {
+                      vErrors = [err4];
+                    } else {
+                      vErrors.push(err4);
+                    }
+                    errors++;
+                  }
+                  var _valid1 = _errs15 === errors;
+                  valid6 = valid6 || _valid1;
+                  const _errs18 = errors;
+                  if (data4 !== null) {
+                    const err5 = { instancePath: instancePath + "/notify", schemaPath: "#/properties/notify/anyOf/1/type", keyword: "type", params: { type: "null" }, message: "must be null" };
+                    if (vErrors === null) {
+                      vErrors = [err5];
+                    } else {
+                      vErrors.push(err5);
+                    }
+                    errors++;
+                  }
+                  var _valid1 = _errs18 === errors;
+                  valid6 = valid6 || _valid1;
+                  if (!valid6) {
+                    const err6 = { instancePath: instancePath + "/notify", schemaPath: "#/properties/notify/anyOf", keyword: "anyOf", params: {}, message: "must match a schema in anyOf" };
+                    if (vErrors === null) {
+                      vErrors = [err6];
+                    } else {
+                      vErrors.push(err6);
+                    }
+                    errors++;
+                    validate21.errors = vErrors;
+                    return false;
+                  } else {
+                    errors = _errs14;
+                    if (vErrors !== null) {
+                      if (_errs14) {
+                        vErrors.length = _errs14;
+                      } else {
+                        vErrors = null;
+                      }
+                    }
+                  }
+                  var valid4 = _errs13 === errors;
+                } else {
+                  var valid4 = true;
+                }
+                if (valid4) {
+                  if (data.collector !== void 0) {
+                    let data5 = data.collector;
+                    const _errs20 = errors;
+                    if (typeof data5 !== "string") {
+                      validate21.errors = [{ instancePath: instancePath + "/collector", schemaPath: "#/$defs/collector_status/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                      return false;
+                    }
+                    if (!(data5 === "ready" || data5 === "degraded" || data5 === "unavailable")) {
+                      validate21.errors = [{ instancePath: instancePath + "/collector", schemaPath: "#/$defs/collector_status/enum", keyword: "enum", params: { allowedValues: schema39.enum }, message: "must be equal to one of the allowed values" }];
+                      return false;
+                    }
+                    var valid4 = _errs20 === errors;
+                  } else {
+                    var valid4 = true;
+                  }
+                  if (valid4) {
+                    if (data.endpoint !== void 0) {
+                      let data6 = data.endpoint;
+                      const _errs23 = errors;
+                      if (typeof data6 !== "string" && data6 !== null) {
+                        validate21.errors = [{ instancePath: instancePath + "/endpoint", schemaPath: "#/properties/endpoint/type", keyword: "type", params: { type: schema36.properties.endpoint.type }, message: "must be string,null" }];
+                        return false;
+                      }
+                      var valid4 = _errs23 === errors;
+                    } else {
+                      var valid4 = true;
+                    }
+                    if (valid4) {
+                      if (data.service !== void 0) {
+                        let data7 = data.service;
+                        const _errs25 = errors;
+                        if (typeof data7 !== "string" && data7 !== null) {
+                          validate21.errors = [{ instancePath: instancePath + "/service", schemaPath: "#/properties/service/type", keyword: "type", params: { type: schema36.properties.service.type }, message: "must be string,null" }];
+                          return false;
+                        }
+                        var valid4 = _errs25 === errors;
+                      } else {
+                        var valid4 = true;
+                      }
+                      if (valid4) {
+                        if (data.data_retained !== void 0) {
+                          const _errs27 = errors;
+                          if (typeof data.data_retained !== "boolean") {
+                            validate21.errors = [{ instancePath: instancePath + "/data_retained", schemaPath: "#/properties/data_retained/type", keyword: "type", params: { type: "boolean" }, message: "must be boolean" }];
+                            return false;
+                          }
+                          var valid4 = _errs27 === errors;
+                        } else {
+                          var valid4 = true;
+                        }
+                        if (valid4) {
+                          if (data.collector_degradation_reasons !== void 0) {
+                            let data9 = data.collector_degradation_reasons;
+                            const _errs29 = errors;
+                            if (errors === _errs29) {
+                              if (Array.isArray(data9)) {
+                                if (data9.length > 3) {
+                                  validate21.errors = [{ instancePath: instancePath + "/collector_degradation_reasons", schemaPath: "#/properties/collector_degradation_reasons/maxItems", keyword: "maxItems", params: { limit: 3 }, message: "must NOT have more than 3 items" }];
+                                  return false;
+                                } else {
+                                  var valid9 = true;
+                                  const len0 = data9.length;
+                                  for (let i0 = 0; i0 < len0; i0++) {
+                                    let data10 = data9[i0];
+                                    const _errs31 = errors;
+                                    if (typeof data10 !== "string") {
+                                      validate21.errors = [{ instancePath: instancePath + "/collector_degradation_reasons/" + i0, schemaPath: "#/$defs/collector_degradation_reason/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                                      return false;
+                                    }
+                                    if (!(data10 === "lifecycle_failure" || data10 === "storage_pressure" || data10 === "expired_trace")) {
+                                      validate21.errors = [{ instancePath: instancePath + "/collector_degradation_reasons/" + i0, schemaPath: "#/$defs/collector_degradation_reason/enum", keyword: "enum", params: { allowedValues: schema40.enum }, message: "must be equal to one of the allowed values" }];
+                                      return false;
+                                    }
+                                    var valid9 = _errs31 === errors;
+                                    if (!valid9) {
+                                      break;
+                                    }
+                                  }
+                                }
+                              } else {
+                                validate21.errors = [{ instancePath: instancePath + "/collector_degradation_reasons", schemaPath: "#/properties/collector_degradation_reasons/type", keyword: "type", params: { type: "array" }, message: "must be array" }];
+                                return false;
+                              }
+                            }
+                            var valid4 = _errs29 === errors;
+                          } else {
+                            var valid4 = true;
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else {
+        validate21.errors = [{ instancePath, schemaPath: "#/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+        return false;
+      }
+    }
+    validate21.errors = vErrors;
+    return errors === 0;
+  }
+  validate21.evaluated = { "props": true, "dynamicProps": false, "dynamicItems": false };
+
+  // ui/settings/integration-status-validation.ts
+  function validateCodexIntegrationStatus(value) {
+    return validate_codex_integration_status_v1_default(value);
+  }
+
+  // ui/settings/generated/validate-codex-integration-error-v1.js
+  var validate_codex_integration_error_v1_default = validate22;
+  var schema41 = { "title": "CodexIntegrationErrorV1", "type": "object", "additionalProperties": false, "required": ["code", "message"], "properties": { "code": { "enum": ["integration_failed", "integration_connect_committed_unverified", "integration_disconnect_committed_unverified", "integration_settings_completed_unverified", "integration_outcome_uncertain"] }, "message": { "type": "string", "pattern": "^.{1,256}$" } } };
+  var pattern4 = new RegExp("^.{1,256}$", "u");
+  function validate22(data, { instancePath = "", parentData, parentDataProperty, rootData = data, dynamicAnchors = {} } = {}) {
+    let vErrors = null;
+    let errors = 0;
+    const evaluated0 = validate22.evaluated;
+    if (evaluated0.dynamicProps) {
+      evaluated0.props = void 0;
+    }
+    if (evaluated0.dynamicItems) {
+      evaluated0.items = void 0;
+    }
+    if (errors === 0) {
+      if (data && typeof data == "object" && !Array.isArray(data)) {
+        let missing0;
+        if (data.code === void 0 && (missing0 = "code") || data.message === void 0 && (missing0 = "message")) {
+          validate22.errors = [{ instancePath, schemaPath: "#/required", keyword: "required", params: { missingProperty: missing0 }, message: "must have required property '" + missing0 + "'" }];
+          return false;
+        } else {
+          const _errs1 = errors;
+          for (const key0 in data) {
+            if (!(key0 === "code" || key0 === "message")) {
+              validate22.errors = [{ instancePath, schemaPath: "#/additionalProperties", keyword: "additionalProperties", params: { additionalProperty: key0 }, message: "must NOT have additional properties" }];
+              return false;
+              break;
+            }
+          }
+          if (_errs1 === errors) {
+            if (data.code !== void 0) {
+              let data0 = data.code;
+              const _errs2 = errors;
+              if (!(data0 === "integration_failed" || data0 === "integration_connect_committed_unverified" || data0 === "integration_disconnect_committed_unverified" || data0 === "integration_settings_completed_unverified" || data0 === "integration_outcome_uncertain")) {
+                validate22.errors = [{ instancePath: instancePath + "/code", schemaPath: "#/properties/code/enum", keyword: "enum", params: { allowedValues: schema41.properties.code.enum }, message: "must be equal to one of the allowed values" }];
+                return false;
+              }
+              var valid0 = _errs2 === errors;
+            } else {
+              var valid0 = true;
+            }
+            if (valid0) {
+              if (data.message !== void 0) {
+                let data1 = data.message;
+                const _errs3 = errors;
+                if (errors === _errs3) {
+                  if (typeof data1 === "string") {
+                    if (!pattern4.test(data1)) {
+                      validate22.errors = [{ instancePath: instancePath + "/message", schemaPath: "#/properties/message/pattern", keyword: "pattern", params: { pattern: "^.{1,256}$" }, message: 'must match pattern "^.{1,256}$"' }];
+                      return false;
+                    }
+                  } else {
+                    validate22.errors = [{ instancePath: instancePath + "/message", schemaPath: "#/properties/message/type", keyword: "type", params: { type: "string" }, message: "must be string" }];
+                    return false;
+                  }
+                }
+                var valid0 = _errs3 === errors;
+              } else {
+                var valid0 = true;
+              }
+            }
+          }
+        }
+      } else {
+        validate22.errors = [{ instancePath, schemaPath: "#/type", keyword: "type", params: { type: "object" }, message: "must be object" }];
+        return false;
+      }
+    }
+    validate22.errors = vErrors;
+    return errors === 0;
+  }
+  validate22.evaluated = { "props": true, "dynamicProps": false, "dynamicItems": false };
 
   // ui/settings/main.ts
   var fields = {
@@ -777,8 +1513,8 @@
     },
     "retention.max_record_age_days": {
       path: "retention.max_record_age_days",
-      label: "\uBCF4\uAD00 \uAE30\uAC04",
-      description: "\uC774 \uAE30\uAC04\uBCF4\uB2E4 \uC624\uB798\uB41C trace\uB294 \uB9CC\uB8CC \uB300\uC0C1",
+      label: "\uC218\uB3D9 \uC815\uB9AC \uAE30\uC900\uC77C",
+      description: "\uC790\uB3D9 \uC0AD\uC81C \uAE30\uC900\uACFC \uBCC4\uAC1C\uB85C, \uC774 \uAE30\uAC04\uBCF4\uB2E4 \uC624\uB798\uB41C trace\uB97C \uC218\uB3D9 \uC815\uB9AC \uB300\uC0C1\uC73C\uB85C \uC120\uD0DD",
       min: 1,
       max: 3650,
       step: 1,
@@ -787,8 +1523,8 @@
     },
     "retention.max_archive_records": {
       path: "retention.max_archive_records",
-      label: "archive \uB808\uCF54\uB4DC",
-      description: "\uD558\uB098\uC758 private archive\uC5D0 \uB2F4\uC744 \uCD5C\uB300 \uB808\uCF54\uB4DC \uC218",
+      label: "\uC815\uB9AC \uB808\uCF54\uB4DC \uC0C1\uD55C",
+      description: "\uD55C \uBC88\uC758 \uC218\uB3D9 \uC815\uB9AC \uC791\uC5C5\uC5D0\uC11C archive\uB85C \uC62E\uAE38 \uC218 \uC788\uB294 \uC804\uCCB4 \uB808\uCF54\uB4DC \uC0C1\uD55C",
       min: 1,
       max: 1e5,
       step: 1,
@@ -797,13 +1533,73 @@
     },
     "retention.max_archive_bytes": {
       path: "retention.max_archive_bytes",
-      label: "archive \uD06C\uAE30",
-      description: "\uD558\uB098\uC758 private archive\uC5D0 \uB2F4\uC744 \uCD5C\uB300 \uD06C\uAE30",
+      label: "\uC815\uB9AC \uD06C\uAE30 \uC0C1\uD55C",
+      description: "\uD55C \uBC88\uC758 \uC218\uB3D9 \uC815\uB9AC \uC791\uC5C5\uC5D0\uC11C \uC0DD\uC131\uD558\uB294 archive\uC758 \uC804\uCCB4 \uD06C\uAE30 \uC0C1\uD55C",
       min: 65536,
       max: 268435456,
       step: 1,
       unit: "bytes",
       format: formatBytes
+    },
+    "lifecycle.hot_days": {
+      path: "lifecycle.hot_days",
+      label: "Hot(\uCD5C\uADFC) \uAE30\uC900\uC77C",
+      description: "\uC6D0\uBCF8 \uAD00\uCE21 \uC774\uB825\uC740 \uC81C\uAC70\uD558\uACE0 \uB9AC\uD3EC\uD2B8\uC6A9 \uAE30\uB85D\uC740 \uC720\uC9C0\uD558\uB294 Warm(\uC774\uB825 \uCD95\uC18C) \uB2E8\uACC4\uB85C \uC774\uB3D9",
+      min: 1,
+      max: 3650,
+      step: 1,
+      unit: "days",
+      format: (value) => `${formatNumber(value)}\uC77C`
+    },
+    "lifecycle.warm_days": {
+      path: "lifecycle.warm_days",
+      label: "Warm(\uC774\uB825 \uCD95\uC18C) \uAE30\uC900\uC77C",
+      description: "\uC77C\uBC18 \uB9AC\uD3EC\uD2B8\uC5D0\uC11C \uC81C\uC678\uD558\uACE0 \uC555\uCD95\uD558\uC9C0 \uC54A\uC740 trace\uBCC4 JSON \uBB36\uC74C\uC73C\uB85C \uBCF4\uAD00\uD558\uB294 Cold(\uC7A5\uAE30 \uBCF4\uAD00) \uB2E8\uACC4\uB85C \uC774\uB3D9",
+      min: 1,
+      max: 3650,
+      step: 1,
+      unit: "days",
+      format: (value) => `${formatNumber(value)}\uC77C`
+    },
+    "lifecycle.delete_after_days": {
+      path: "lifecycle.delete_after_days",
+      label: "\uC644\uC804 \uC0AD\uC81C \uAE30\uC900\uC77C",
+      description: "\uCD5C\uC2E0 \uAD00\uCE21 \uC774\uD6C4 \uAD00\uB9AC \uB300\uC0C1 trace\uAC00 \uC601\uAD6C \uC0AD\uC81C\uB418\uB294 \uC2DC\uC810",
+      min: 1,
+      max: 3650,
+      step: 1,
+      unit: "days",
+      format: (value) => `${formatNumber(value)}\uC77C`
+    },
+    "lifecycle.private_raw_days": {
+      path: "lifecycle.private_raw_days",
+      label: "\uC6D0\uBB38 \uC0C1\uC138 \uBCF4\uAD00",
+      description: "\uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uCC45\uC744 \uCF30\uC744 \uB54C private \uC694\uCCAD\xB7\uC751\uB2F5 \uC6D0\uBB38 \uBCF4\uAD00 \uAE30\uAC04",
+      min: 1,
+      max: 3650,
+      step: 1,
+      unit: "days",
+      format: (value) => `${formatNumber(value)}\uC77C`
+    },
+    "lifecycle.maintenance_interval_seconds": {
+      path: "lifecycle.maintenance_interval_seconds",
+      label: "\uC720\uC9C0\uAD00\uB9AC \uC8FC\uAE30",
+      description: "\uB85C\uCEEC \uC218\uC9D1\uAE30\uAC00 \uB2E4\uC74C \uC815\uB9AC \uC791\uC5C5\uC744 \uD655\uC778\uD558\uB294 \uAC04\uACA9",
+      min: 60,
+      max: 86400,
+      step: 1,
+      unit: "seconds",
+      format: formatDurationSeconds
+    },
+    "lifecycle.max_traces_per_pass": {
+      path: "lifecycle.max_traces_per_pass",
+      label: "\uC815\uB9AC \uC791\uC5C5\uB2F9 trace",
+      description: "\uD55C \uBC88\uC758 \uC815\uB9AC \uC791\uC5C5\uC5D0\uC11C \uCC98\uB9AC\uD560 \uCD5C\uB300 trace \uC218",
+      min: 1,
+      max: 128,
+      step: 1,
+      unit: "traces",
+      format: (value) => `${formatNumber(value)}\uAC1C`
     }
   };
   var rootElement = document.querySelector("#app");
@@ -822,7 +1618,12 @@
   var integration = null;
   var integrationUnavailable = false;
   var integrationRequestGeneration = 0;
+  var sessionGeneration = 0;
   var busy = false;
+  var closeInFlight = false;
+  var closeFailureMessage = "";
+  var buttonDisabledBeforeBusy = /* @__PURE__ */ new WeakMap();
+  var inputDisabledBeforeClose = /* @__PURE__ */ new WeakMap();
   var conflicted = false;
   var heartbeatTimer;
   var navigationObserver;
@@ -847,23 +1648,27 @@
       renderExpired();
       return;
     }
+    const session = { generation: sessionGeneration, token };
     try {
       const envelope = await api("/api/config");
+      if (!sessionIsCurrent(session)) return;
       applyEnvelope(envelope);
       let shouldRenderSettings = false;
       try {
-        shouldRenderSettings = await loadInitialIntegrationStatus();
+        shouldRenderSettings = await loadInitialIntegrationStatus(session);
       } catch (error) {
+        if (!sessionIsCurrent(session)) return;
         const apiError = error;
         if (apiError.code === "invalid_session") throw error;
         integration = null;
         integrationUnavailable = true;
         shouldRenderSettings = true;
       }
-      if (!token) return;
+      if (!sessionIsCurrent(session)) return;
       if (shouldRenderSettings) renderSettings();
       heartbeatTimer ??= window.setInterval(() => void heartbeat(), 2e4);
     } catch (error) {
+      if (!sessionIsCurrent(session)) return;
       const apiError = error;
       if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
         expireSession();
@@ -872,17 +1677,22 @@
       }
     }
   }
-  async function loadInitialIntegrationStatus() {
+  async function loadInitialIntegrationStatus(session) {
     const generation = ++integrationRequestGeneration;
     try {
-      const initial = await api("/api/integrations/codex");
-      const next = initial.config === "connected" && initial.collector === "unavailable" ? await new Promise((resolve) => window.setTimeout(resolve, INITIAL_INTEGRATION_RETRY_MS)).then(() => api("/api/integrations/codex")) : initial;
-      if (generation !== integrationRequestGeneration || !token) return false;
+      const initial = await integrationApi("/api/integrations/codex");
+      let next = initial;
+      if (initial.config === "connected" && initial.collector === "unavailable") {
+        await new Promise((resolve) => window.setTimeout(resolve, INITIAL_INTEGRATION_RETRY_MS));
+        if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return false;
+        next = await integrationApi("/api/integrations/codex");
+      }
+      if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return false;
       integration = next;
       integrationUnavailable = false;
       return true;
     } catch (error) {
-      if (generation !== integrationRequestGeneration) return false;
+      if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return false;
       throw error;
     }
   }
@@ -932,7 +1742,8 @@
         <a href="#collection"><i data-lucide="activity"></i>\uC218\uC9D1</a>
         <a href="#privacy"><i data-lucide="shield-check"></i>\uAC1C\uC778\uC815\uBCF4</a>
         <a href="#storage"><i data-lucide="database"></i>\uC800\uC7A5\uC18C</a>
-        <a href="#retention"><i data-lucide="archive"></i>\uBCF4\uAD00</a>
+        <a href="#lifecycle"><i data-lucide="heart-pulse"></i>\uB370\uC774\uD130 \uBCF4\uAD00</a>
+        <a href="#retention"><i data-lucide="archive"></i>\uC218\uB3D9 \uC815\uB9AC</a>
         <div class="nav-note"><strong>Codex</strong><span>${configNavigationStatus()}</span><span>${collectorNavigationStatus()}</span></div>
       </nav>
       <main class="settings-main">
@@ -941,6 +1752,7 @@
           ${collectionSection(draft)}
           ${privacySection(draft)}
           ${storageSection(draft)}
+          ${lifecycleSection(draft)}
           ${retentionSection(draft)}
         </form>
       </main>
@@ -967,8 +1779,10 @@
     bindEvents();
     updateAllVisuals();
     updateDirtyState();
+    setBusy(busy);
     mountIcons();
-    if (focusTarget) {
+    const showingCloseFailure = renderCloseFailure();
+    if (focusTarget && !showingCloseFailure) {
       requestAnimationFrame(() => document.querySelector(`#${focusTarget}`)?.focus());
     }
   }
@@ -995,16 +1809,47 @@
     const ready = integration?.collector === "ready";
     const degraded = integration?.collector === "degraded";
     const conflicted2 = integration?.config === "conflict";
-    const state = integrationUnavailable ? "\uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00" : conflicted2 ? "\uC124\uC815 \uCDA9\uB3CC" : connected && degraded ? "\uB9AC\uD3EC\uD2B8 \uBC18\uC601 \uC9C0\uC5F0" : connected && ready ? "\uC218\uC9D1 \uC911" : connected ? "\uC218\uC9D1\uAE30 \uC751\uB2F5 \uC5C6\uC74C" : "\uC5F0\uACB0 \uC548 \uB428";
-    const detail = integrationUnavailable ? "\uB85C\uCEEC \uC124\uC815\uC740 \uC0AC\uC6A9\uD560 \uC218 \uC788\uC9C0\uB9CC Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC\uB97C \uD655\uC778\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4." : conflicted2 ? "Codex \uC124\uC815\uC774 \uC5F0\uACB0 \uD6C4 \uBCC0\uACBD\uB418\uC5B4 \uC790\uB3D9 \uBCF5\uC6D0\uC744 \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4." : connected && degraded ? "\uC774\uBCA4\uD2B8 \uC218\uC9D1\uC740 \uAC00\uB2A5\uD558\uC9C0\uB9CC \uBAA8\uB2C8\uD130\uB9C1 \uB9AC\uD3EC\uD2B8\uAC00 \uCD5C\uC2E0 \uC0C1\uD0DC\uAC00 \uC544\uB2D9\uB2C8\uB2E4." : connected && ready ? "Codex \uC774\uBCA4\uD2B8\uB97C private local runtime\uC5D0 \uBC18\uC601\uD569\uB2C8\uB2E4." : connected ? "Codex \uC5F0\uACB0\uC740 \uC720\uC9C0\uB418\uC9C0\uB9CC \uB85C\uCEEC \uC218\uC9D1\uAE30\uC5D0 \uC5F0\uACB0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD558\uBA74 \uB2E4\uC74C \uC791\uC5C5\uBD80\uD130 \uAE30\uB85D\uD569\uB2C8\uB2E4.";
+    const degradedCopy = integrationDegradedCopy(
+      integration?.collector_degradation_reasons ?? []
+    );
+    const state = integrationUnavailable ? "\uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00" : conflicted2 ? "\uC124\uC815 \uCDA9\uB3CC" : connected && degraded ? degradedCopy.state : connected && ready ? "\uC218\uC9D1 \uC911" : connected ? "\uC218\uC9D1\uAE30 \uC751\uB2F5 \uC5C6\uC74C" : "\uC5F0\uACB0 \uC548 \uB428";
+    const detail = integrationUnavailable ? "Codex \uC0C1\uD0DC\uB97C \uD655\uC778\uD560 \uB54C\uAE4C\uC9C0 \uC5F0\uACB0 \uBCC0\uACBD\uC744 \uC7A0\uAC14\uC2B5\uB2C8\uB2E4. \uB2E4\uC2DC \uD655\uC778\uC744 \uB20C\uB7EC \uC0C1\uD0DC\uB97C \uC870\uD68C\uD574 \uC8FC\uC138\uC694." : conflicted2 ? "Codex \uC124\uC815\uC774 \uC5F0\uACB0 \uD6C4 \uBCC0\uACBD\uB418\uC5B4 \uC790\uB3D9 \uBCF5\uC6D0\uC744 \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4." : connected && degraded ? degradedCopy.detail : connected && ready ? "Codex \uC774\uBCA4\uD2B8\uB97C private local runtime\uC5D0 \uBC18\uC601\uD569\uB2C8\uB2E4." : connected ? "Codex \uC5F0\uACB0\uC740 \uC720\uC9C0\uB418\uC9C0\uB9CC \uB85C\uCEEC \uC218\uC9D1\uAE30\uC5D0 \uC5F0\uACB0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD558\uBA74 \uB2E4\uC74C \uC791\uC5C5\uBD80\uD130 \uAE30\uB85D\uD569\uB2C8\uB2E4.";
     const action = integrationUnavailable ? `<button class="button secondary" id="refresh-integration" type="button"><i data-lucide="refresh-cw"></i>\uB2E4\uC2DC \uD655\uC778</button>` : connected ? `<button class="button secondary" id="toggle-integration" type="button"><i data-lucide="power"></i>\uC5F0\uACB0 \uD574\uC81C</button>` : `<button class="button primary" id="toggle-integration" type="button"><i data-lucide="cable"></i>Codex \uC5F0\uACB0</button>`;
     const panelState = integrationUnavailable ? "unavailable" : conflicted2 ? "conflict" : degraded ? "degraded" : ready ? "ready" : "idle";
-    const collectorLabel = integrationUnavailable ? "\uD655\uC778 \uBD88\uAC00" : degraded ? "\uB9AC\uD3EC\uD2B8 \uC9C0\uC5F0" : ready ? "\uC815\uC0C1" : "\uC911\uC9C0";
+    const collectorLabel = integrationUnavailable ? "\uD655\uC778 \uBD88\uAC00" : degraded ? "\uC0C1\uD0DC \uC800\uD558" : ready ? "\uC815\uC0C1" : "\uC911\uC9C0";
     return `<div class="integration-panel" data-state="${panelState}" data-config-state="${integration?.config ?? "disconnected"}" data-collector-state="${integration?.collector ?? "unavailable"}">
     <div class="integration-identity"><span class="integration-icon"><i data-lucide="activity"></i></span><div><span>Codex</span><strong>${state}</strong><small>${detail}</small></div></div>
     <div class="integration-meta"><span><b>\uC218\uC9D1\uAE30</b>${collectorLabel}</span><span><b>\uC800\uC7A5</b>\uB85C\uCEEC \uC804\uC6A9</span>${integration?.endpoint ? `<span class="endpoint"><b>Endpoint</b>${escapeHtml(integration.endpoint)}</span>` : ""}</div>
     <div class="integration-actions">${action}<button class="button monitor-button" id="overview-dashboard" type="button"><i data-lucide="external-link"></i>\uB9AC\uD3EC\uD2B8 \uC5F4\uAE30</button></div>
   </div>`;
+  }
+  function integrationDegradedCopy(reasons) {
+    if (reasons.length === 0) {
+      return {
+        state: "\uC218\uC9D1\uAE30 \uC0C1\uD0DC \uC800\uD558",
+        detail: "\uB9AC\uD3EC\uD2B8 \uBC18\uC601 \uB610\uB294 \uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uB9AC\uAC00 \uC9C0\uC5F0\uB420 \uC218 \uC788\uC2B5\uB2C8\uB2E4."
+      };
+    }
+    const labels = {
+      lifecycle_failure: "\uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uB9AC \uBBF8\uC644\uB8CC",
+      storage_pressure: "\uC815\uB9AC\uC6A9 \uC784\uC2DC \uC800\uC7A5 \uACF5\uAC04 \uBD80\uC871",
+      expired_trace: "\uB9CC\uB8CC\uB41C \uC138\uC158 \uB370\uC774\uD130 \uC81C\uC678"
+    };
+    const details = {
+      lifecycle_failure: "\uC77C\uBD80 \uB370\uC774\uD130 \uB610\uB294 \uC624\uB958\uB85C \uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uB9AC \uC791\uC5C5\uC744 \uC644\uB8CC\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4.",
+      storage_pressure: "\uC815\uB9AC \uC791\uC5C5\uC5D0 \uD544\uC694\uD55C \uC784\uC2DC \uC800\uC7A5 \uACF5\uAC04\uC774 \uBD80\uC871\uD574 \uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uB9AC\uAC00 \uC9C0\uC5F0\uB429\uB2C8\uB2E4.",
+      expired_trace: "\uC644\uC804\uD788 \uB9CC\uB8CC\uB41C \uC138\uC158\uC758 \uD6C4\uC18D \uB370\uC774\uD130\uAC00 \uC81C\uC678\uB418\uC5C8\uC2B5\uB2C8\uB2E4. \uD574\uB2F9 \uC791\uC5C5\uC744 \uACC4\uC18D \uAE30\uB85D\uD558\uB824\uBA74 \uC5D0\uC774\uC804\uD2B8\uC5D0\uC11C \uC0C8 \uC138\uC158\uC744 \uC2DC\uC791\uD574\uC57C \uD569\uB2C8\uB2E4."
+    };
+    const reasonOrder = [
+      "lifecycle_failure",
+      "storage_pressure",
+      "expired_trace"
+    ];
+    const orderedReasons = reasonOrder.filter((reason) => reasons.includes(reason));
+    return {
+      state: orderedReasons.map((reason) => labels[reason]).join(" \xB7 "),
+      detail: orderedReasons.map((reason) => details[reason]).join(" ")
+    };
   }
   function configNavigationStatus() {
     if (integrationUnavailable) return "\uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00";
@@ -1015,12 +1860,12 @@
   function collectorNavigationStatus() {
     if (integrationUnavailable) return "collector \uC0C1\uD0DC \uD655\uC778 \uBD88\uAC00";
     if (integration?.collector === "ready") return "collector \uC2E4\uD589 \uC911";
-    if (integration?.collector === "degraded") return "collector \uC2E4\uD589 \uC911 \xB7 \uB9AC\uD3EC\uD2B8 \uC9C0\uC5F0";
+    if (integration?.collector === "degraded") return "collector \uC2E4\uD589 \uC911 \xB7 \uC0C1\uD0DC \uC800\uD558";
     return "collector \uC911\uC9C0\uB428";
   }
   function collectionSection(config) {
     return `<section class="settings-section" id="collection" aria-labelledby="collection-title">
-    ${sectionTitle("activity", "\uC218\uC9D1", "\uD30C\uC77C \uD655\uC778\uACFC durable \uAE30\uB85D \uBC18\uC601 \uAC04\uACA9")}
+    ${sectionTitle("collection", "activity", "\uC218\uC9D1", "\uD30C\uC77C \uD655\uC778\uACFC durable \uAE30\uB85D \uBC18\uC601 \uAC04\uACA9")}
     <div class="section-grid">
       <div class="field-grid">${fieldControl(fields["collection.file_reconcile_interval_ms"], config)}${fieldControl(fields["collection.flush_interval_ms"], config)}</div>
       ${dualTimeline(
@@ -1049,7 +1894,7 @@
   }
   function storageSection(config) {
     return `<section class="settings-section" id="storage" aria-labelledby="storage-title">
-    ${sectionTitle("database", "\uC800\uC7A5\uC18C", "\uB85C\uCEEC \uB370\uC774\uD130\uAC00 \uB118\uC9C0 \uBABB\uD558\uB294 \uB514\uC2A4\uD06C \uC608\uC0B0")}
+    ${sectionTitle("storage", "database", "\uC800\uC7A5\uC18C", "\uB85C\uCEEC \uB370\uC774\uD130\uAC00 \uB118\uC9C0 \uBABB\uD558\uB294 \uB514\uC2A4\uD06C \uC608\uC0B0")}
     <div class="section-grid">
       <div class="field-grid single">${fieldControl(fields["collection.local_storage_budget_bytes"], config)}</div>
       ${singleRuler("storage-visual", "\uC124\uC815 \uC800\uC7A5 \uD55C\uB3C4", fields["collection.local_storage_budget_bytes"], "256 MiB", "20 GiB", true, "\uD604\uC7AC \uC0AC\uC6A9\uB7C9\uC774 \uC544\uB2CC \uD5C8\uC6A9 \uD55C\uB3C4")}
@@ -1068,22 +1913,50 @@
     <div class="privacy-warning"><i data-lucide="shield-check"></i><div><strong>\uBA85\uC2DC\uC801\uC73C\uB85C \uCF20 \uC774\uD6C4\uC758 \uC0C8 turn\uBD80\uD130 \uC801\uC6A9\uB429\uB2C8\uB2E4.</strong><span>\uC6D0\uBB38\uC740 team \uC804\uC1A1\xB7\uC77C\uBC18 \uB9AC\uD3EC\uD2B8\xB7export\uC5D0 \uD3EC\uD568\uB418\uC9C0 \uC54A\uC73C\uBA70, \uC774 Mac\uC758 private localhost \uC0C1\uC138 \uD654\uBA74\uC5D0\uC11C\uB9CC \uC694\uCCAD\uD560 \uB54C \uC77D\uC2B5\uB2C8\uB2E4. \uBBFC\uAC10\uC815\uBCF4\uAC00 \uD3EC\uD568\uB420 \uC218 \uC788\uC2B5\uB2C8\uB2E4.</span></div></div>
   </section>`;
   }
+  function lifecycleSection(config) {
+    const enabled = config.lifecycle.enabled;
+    return `<section class="settings-section" id="lifecycle" aria-labelledby="lifecycle-title">
+    <div class="section-title"><span class="section-icon"><i data-lucide="heart-pulse"></i></span><div><h2 id="lifecycle-title">\uB370\uC774\uD130 \uBCF4\uAD00 \uC815\uCC45</h2><p>\uCD5C\uC2E0 trace \uAD00\uCE21 \uC2DC\uC810\uBD80\uD130 \uB204\uC801\uB41C \uACBD\uACFC \uAE30\uAC04\uC73C\uB85C Hot(\uCD5C\uADFC) \u2192 Warm(\uC774\uB825 \uCD95\uC18C) \u2192 Cold(\uC7A5\uAE30 \uBCF4\uAD00) \u2192 Delete(\uC0AD\uC81C)\uB97C \uC801\uC6A9\uD569\uB2C8\uB2E4.</p></div></div>
+    <label class="collection-toggle lifecycle-toggle" data-boolean-field="lifecycle.enabled">
+      <span><strong>\uC790\uB3D9 \uC815\uB9AC</strong><small id="lifecycle-enabled-copy">${enabled ? "\uCF1C\uC9D0 \xB7 \uB2E4\uC74C \uC815\uB9AC \uC791\uC5C5\uBD80\uD130 \uBCF4\uAD00 \uAE30\uC900\uC744 \uC9C0\uB09C \uAE30\uC874 \uB370\uC774\uD130\uC5D0\uB3C4 \uC801\uC6A9\uB429\uB2C8\uB2E4" : "\uAEBC\uC9D0 \xB7 \uAE30\uC874 \uC218\uB3D9 \uBCF4\uAD00 \uC124\uC815\uACFC \uC6D0\uBB38 \uBCF4\uAD00 \uB3D9\uC791\uC744 \uC720\uC9C0\uD569\uB2C8\uB2E4"}</small></span>
+      <input type="checkbox" id="lifecycle-enabled" ${enabled ? "checked" : ""}>
+      <span class="toggle-track" aria-hidden="true"><span></span></span>
+    </label>
+    <div class="section-grid lifecycle-grid">
+      <div class="field-grid">${fieldControl(fields["lifecycle.hot_days"], config)}${fieldControl(fields["lifecycle.warm_days"], config)}${fieldControl(fields["lifecycle.delete_after_days"], config)}${fieldControl(fields["lifecycle.private_raw_days"], config)}${fieldControl(fields["lifecycle.maintenance_interval_seconds"], config)}${fieldControl(fields["lifecycle.max_traces_per_pass"], config)}</div>
+      ${lifecycleTimeline(config)}
+    </div>
+    <div class="retention-note lifecycle-warning" role="note"><i data-lucide="archive"></i><span><strong>\uC0AD\uC81C\uB294 \uB418\uB3CC\uB9B4 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4.</strong> \uC790\uB3D9 \uC815\uB9AC\uB97C \uCF1C\uAC70\uB098 \uAE30\uC900\uC77C\uC744 \uC904\uC774\uBA74 \uBCF4\uAD00 \uAE30\uC900\uC744 \uC9C0\uB09C \uAE30\uC874 \uB370\uC774\uD130\uAC00 \uB2E4\uC74C \uC815\uB9AC \uC791\uC5C5\uC5D0\uC11C \uC774\uB3D9\uD558\uAC70\uB098 \uC601\uAD6C \uC0AD\uC81C\uB420 \uC218 \uC788\uC2B5\uB2C8\uB2E4. \uC644\uC804\uD788 \uC0AD\uC81C\uB41C \uC138\uC158\uC758 \uC0C8 \uD65C\uB3D9\uC744 \uC218\uC9D1\uD558\uB824\uBA74 \uC5D0\uC774\uC804\uD2B8\uC5D0\uC11C \uC0C8 \uC138\uC158\uC744 \uC2DC\uC791\uD574\uC57C \uD569\uB2C8\uB2E4. \uC124\uC815 \uC800\uC7A5 \uC644\uB8CC\uB294 \uC815\uB9AC \uC2E4\uD589\uC774\uB098 \uB514\uC2A4\uD06C \uACF5\uAC04 \uD68C\uC218\uB97C \uC758\uBBF8\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.</span></div>
+  </section>`;
+  }
+  function lifecycleTimeline(config) {
+    return `<figure class="policy-visual timeline lifecycle-timeline" data-min="1" data-max="3650" data-log="true">
+    <figcaption><span>\uB204\uC801 \uACBD\uACFC \uAE30\uAC04</span><strong data-lifecycle-value>Hot(\uCD5C\uADFC) \u2192 Warm(\uC774\uB825 \uCD95\uC18C) \u2192 Cold(\uC7A5\uAE30 \uBCF4\uAD00) \u2192 Delete(\uC0AD\uC81C)</strong></figcaption>
+    <div class="timeline-track" aria-hidden="true">
+      <span class="timeline-marker first" data-marker data-path="lifecycle.hot_days"><b>Warm ${config.lifecycle.hot_days}\uC77C</b></span>
+      <span class="timeline-marker second" data-marker data-path="lifecycle.warm_days"><b>Cold ${config.lifecycle.warm_days}\uC77C</b></span>
+      <span class="timeline-marker third" data-marker data-path="lifecycle.delete_after_days"><b>Delete ${config.lifecycle.delete_after_days}\uC77C</b></span>
+    </div>
+    <div class="ruler-labels"><span>\uCD5C\uC2E0 \uAD00\uCE21</span><span>10\uB144</span></div>
+    <p>\uAC01 \uAC12\uC740 \uB2E8\uACC4\uBCC4 \uCD94\uAC00 \uAE30\uAC04\uC774 \uC544\uB2C8\uB77C \uCD5C\uC2E0 trace \uAD00\uCE21 \uC774\uD6C4\uC758 \uB204\uC801 \uACBD\uACFC \uAE30\uAC04\uC785\uB2C8\uB2E4.</p>
+  </figure>`;
+  }
   function retentionSection(config) {
     return `<section class="settings-section" id="retention" aria-labelledby="retention-title">
-    ${sectionTitle("archive", "\uBCF4\uAD00", "\uB9CC\uB8CC \uB300\uC0C1\uACFC private archive \uD06C\uAE30 \uC815\uCC45")}
+    ${sectionTitle("retention", "archive", "\uC218\uB3D9 \uC815\uB9AC", "\uC790\uB3D9 \uC0AD\uC81C\uC640 \uBCC4\uAC1C\uC778 \uC218\uB3D9 \uB300\uC0C1 \uAE30\uC900 \uBC0F \uC791\uC5C5\uBCC4 archive \uC0C1\uD55C")}
     <div class="section-grid">
       <div class="field-grid">${fieldControl(fields["retention.max_record_age_days"], config)}${fieldControl(fields["retention.max_archive_records"], config)}${fieldControl(fields["retention.max_archive_bytes"], config)}</div>
       <div class="visual-stack">
-        ${singleRuler("retention-visual", "\uBCF4\uAD00 \uAE30\uAC04", fields["retention.max_record_age_days"], "1\uC77C", "10\uB144", true, "cutoff\uBCF4\uB2E4 \uC624\uB798\uB41C trace\uB294 \uB9CC\uB8CC \uB300\uC0C1")}
-        ${singleRuler("archive-records-visual", "Archive \uB808\uCF54\uB4DC \uC0C1\uD55C", fields["retention.max_archive_records"], "1", "100k", true)}
-        ${singleRuler("archive-bytes-visual", "Archive \uD06C\uAE30 \uC0C1\uD55C", fields["retention.max_archive_bytes"], "64 KiB", "256 MiB", true)}
+        ${singleRuler("retention-visual", "\uC218\uB3D9 \uC815\uB9AC \uAE30\uC900\uC77C", fields["retention.max_record_age_days"], "1\uC77C", "10\uB144", true, "\uAE30\uC900\uC77C\uBCF4\uB2E4 \uC624\uB798\uB41C trace\uB294 \uC218\uB3D9 \uC815\uB9AC \uB300\uC0C1")}
+        ${singleRuler("archive-records-visual", "\uC791\uC5C5\uBCC4 Archive \uB808\uCF54\uB4DC \uC0C1\uD55C", fields["retention.max_archive_records"], "1", "100k", true)}
+        ${singleRuler("archive-bytes-visual", "\uC791\uC5C5\uBCC4 Archive \uD06C\uAE30 \uC0C1\uD55C", fields["retention.max_archive_bytes"], "64 KiB", "256 MiB", true)}
       </div>
     </div>
-    <div class="retention-note"><i data-lucide="archive"></i><span>\uBCF4\uAD00 \uAE30\uAC04\uC744 \uC904\uC5EC\uB3C4 \uC989\uC2DC \uC0AD\uC81C\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. cleanup\uC740 \uBCC4\uB3C4\uC758 retention plan/apply \uACBD\uACC4\uB97C \uB530\uB985\uB2C8\uB2E4.</span></div>
+    <div class="retention-note"><i data-lucide="archive"></i><span>\uC218\uB3D9 \uC815\uB9AC \uAE30\uC900 ${config.retention.max_record_age_days}\uC77C\uC740 \uC790\uB3D9 \uC644\uC804 \uC0AD\uC81C \uAE30\uC900 ${config.lifecycle.delete_after_days}\uC77C\uACFC \uBCC4\uAC1C\uC785\uB2C8\uB2E4. \uB808\uCF54\uB4DC\xB7\uD06C\uAE30 \uC0C1\uD55C\uC740 \uD55C \uBC88\uC758 \uC218\uB3D9 \uC815\uB9AC \uC791\uC5C5\uC5D0 \uD568\uAED8 \uC801\uC6A9\uB429\uB2C8\uB2E4. \uAE30\uC900\uC77C\uC744 \uC904\uC5EC\uB3C4 \uC989\uC2DC \uC0AD\uC81C\uD558\uC9C0 \uC54A\uC73C\uBA70 \uBCC4\uB3C4\uC758 \uACC4\uD68D \uC0DD\uC131\xB7\uC801\uC6A9 \uC808\uCC28\uB97C \uB530\uB985\uB2C8\uB2E4.</span></div>
   </section>`;
   }
-  function sectionTitle(icon, title, description) {
-    return `<div class="section-title"><span class="section-icon"><i data-lucide="${icon}"></i></span><div><h2 id="${title === "\uC218\uC9D1" ? "collection" : title === "\uC800\uC7A5\uC18C" ? "storage" : "retention"}-title">${title}</h2><p>${description}</p></div></div>`;
+  function sectionTitle(id, icon, title, description) {
+    return `<div class="section-title"><span class="section-icon"><i data-lucide="${icon}"></i></span><div><h2 id="${id}-title">${title}</h2><p>${description}</p></div></div>`;
   }
   function summaryItem(icon, label, value) {
     return `<div class="summary-item"><i data-lucide="${icon}"></i><span>${label}</span><strong>${value}</strong></div>`;
@@ -1128,6 +2001,7 @@
     form?.addEventListener("input", handleInput);
     document.querySelector("#enabled")?.addEventListener("change", handleEnabled);
     document.querySelector("#capture-private-codex-turn-details")?.addEventListener("change", handlePrivateDetails);
+    document.querySelector("#lifecycle-enabled")?.addEventListener("change", handleLifecycleEnabled);
     document.querySelector("#discard")?.addEventListener("click", discardChanges);
     document.querySelector("#reset")?.addEventListener("click", openResetDialog);
     document.querySelector("#cancel-reset")?.addEventListener("click", closeResetDialog);
@@ -1158,64 +2032,91 @@
     document.querySelectorAll(".settings-section").forEach((section) => navigationObserver?.observe(section));
   }
   async function toggleIntegration() {
-    if (busy || !integration) return;
-    const lifecycleToken = token;
+    if (busy || closeInFlight || !token || !integration || integrationUnavailable) return;
+    const session = { generation: sessionGeneration, token };
     const generation = ++integrationRequestGeneration;
+    busy = true;
     setBusy(true);
     try {
       const method = integration.config === "connected" ? "DELETE" : "POST";
-      const nextIntegration = await api("/api/integrations/codex", { method });
-      if (token !== lifecycleToken || generation !== integrationRequestGeneration) return;
+      const nextIntegration = await integrationApi("/api/integrations/codex", { method });
+      if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
       integration = nextIntegration;
+      integrationUnavailable = false;
+      busy = false;
       renderSettings("toggle-integration");
       showToast(
         integration.config === "connected" ? "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uC5F0\uACB0\uD588\uC2B5\uB2C8\uB2E4." : "Codex \uC790\uB3D9 \uC218\uC9D1\uC744 \uD574\uC81C\uD588\uC2B5\uB2C8\uB2E4.",
         "success"
       );
     } catch (error) {
-      if (token !== lifecycleToken) return;
-      setBusy(false);
-      showToast(messageOf(error), "error");
+      if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
+      integration = null;
+      integrationUnavailable = true;
+      try {
+        const next = await integrationApi("/api/integrations/codex");
+        if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
+        integration = next;
+        integrationUnavailable = false;
+      } catch (statusError) {
+        if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
+        if (statusError.code === "invalid_session") {
+          busy = false;
+          expireSession();
+          return;
+        }
+      }
+      busy = false;
+      renderSettings(integrationUnavailable ? "refresh-integration" : "toggle-integration");
+      showToast(`${messageOf(error)} ${integrationUnavailable ? "\uC0C1\uD0DC\uB97C \uD655\uC778\uD560 \uC218 \uC5C6\uC5B4 \uBCC0\uACBD\uC744 \uC7A0\uAC14\uC2B5\uB2C8\uB2E4. \uB2E4\uC2DC \uD655\uC778\uC744 \uB20C\uB7EC \uC8FC\uC138\uC694." : "\uD604\uC7AC \uC0C1\uD0DC\uB97C \uB2E4\uC2DC \uD655\uC778\uD588\uC2B5\uB2C8\uB2E4."}`, "error");
     }
   }
   async function refreshIntegration() {
-    if (busy) return;
+    if (busy || closeInFlight || !token) return;
+    const session = { generation: sessionGeneration, token };
     const generation = ++integrationRequestGeneration;
+    busy = true;
     setBusy(true);
     try {
-      const next = await api("/api/integrations/codex");
-      if (generation !== integrationRequestGeneration || !token) return;
+      const next = await integrationApi("/api/integrations/codex");
+      if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return;
       integration = next;
       integrationUnavailable = false;
+      busy = false;
       renderSettings("toggle-integration");
       showToast("Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC\uB97C \uD655\uC778\uD588\uC2B5\uB2C8\uB2E4.", "success");
     } catch (error) {
+      if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return;
+      busy = false;
       const apiError = error;
-      if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
+      if (apiError.code === "invalid_session") {
         expireSession();
         return;
       }
-      setBusy(false);
+      integration = null;
+      integrationUnavailable = true;
+      renderSettings("refresh-integration");
       showToast(messageOf(error), "error");
     }
   }
   async function refreshIntegrationStatus() {
-    if (busy || !persisted || !token) return;
+    if (busy || closeInFlight || !persisted || !token) return;
+    const session = { generation: sessionGeneration, token };
     const generation = ++integrationRequestGeneration;
     const previous = integration;
     const wasUnavailable = integrationUnavailable;
     try {
-      const next = await api("/api/integrations/codex");
-      if (!token || generation !== integrationRequestGeneration) return;
+      const next = await integrationApi("/api/integrations/codex");
+      if (!sessionIsCurrent(session) || generation !== integrationRequestGeneration) return;
       integration = next;
       integrationUnavailable = false;
       if (wasUnavailable || !sameIntegrationStatus(previous, next)) {
         renderSettings();
       }
     } catch (error) {
-      if (generation !== integrationRequestGeneration) return;
+      if (generation !== integrationRequestGeneration || !sessionIsCurrent(session)) return;
       const apiError = error;
-      if (apiError.code === "invalid_session" || apiError.code === "network_failure") {
+      if (apiError.code === "invalid_session") {
         expireSession();
         return;
       }
@@ -1225,14 +2126,18 @@
     }
   }
   function sameIntegrationStatus(left, right) {
-    return left !== null && left.config === right.config && left.collector === right.collector && left.endpoint === right.endpoint && left.service === right.service && left.data_retained === right.data_retained;
+    const rightReasons = right.collector_degradation_reasons;
+    return left !== null && left.config === right.config && left.collector === right.collector && left.endpoint === right.endpoint && left.service === right.service && left.data_retained === right.data_retained && left.collector_degradation_reasons.length === right.collector_degradation_reasons.length && left.collector_degradation_reasons.every((reason) => rightReasons.includes(reason));
   }
   async function openDashboard() {
-    if (busy) return;
+    if (busy || closeInFlight || !token) return;
+    const session = { generation: sessionGeneration, token };
     try {
       await api("/api/dashboard/open", { method: "POST" });
+      if (!sessionIsCurrent(session)) return;
       showToast("\uBAA8\uB2C8\uD130\uB9C1 \uB9AC\uD3EC\uD2B8\uB97C \uC5F4\uC5C8\uC2B5\uB2C8\uB2E4.", "success");
     } catch (error) {
+      if (!sessionIsCurrent(session)) return;
       showToast(messageOf(error), "error");
     }
   }
@@ -1259,7 +2164,7 @@
   }
   function handleInput(event) {
     const input = event.target;
-    if (!(input instanceof HTMLInputElement) || !draft) return;
+    if (closeInFlight || !(input instanceof HTMLInputElement) || !draft) return;
     const path = input.dataset.path;
     if (!path) return;
     const value = Number(input.value);
@@ -1270,7 +2175,7 @@
   }
   function handleEnabled(event) {
     const input = event.target;
-    if (!(input instanceof HTMLInputElement) || !draft) return;
+    if (closeInFlight || !(input instanceof HTMLInputElement) || !draft) return;
     draft.enabled = input.checked;
     setText(
       "enabled-copy",
@@ -1280,11 +2185,21 @@
   }
   function handlePrivateDetails(event) {
     const input = event.target;
-    if (!(input instanceof HTMLInputElement) || !draft) return;
+    if (closeInFlight || !(input instanceof HTMLInputElement) || !draft) return;
     draft.capture_private_codex_turn_details = input.checked;
     setText(
       "private-details-copy",
       input.checked ? "\uC0C8 Codex turn\uC758 \uACBD\uB85C\uC640 \uC694\uCCAD\xB7\uC751\uB2F5\uC744 \uB85C\uCEEC\uC5D0 \uC800\uC7A5\uD569\uB2C8\uB2E4" : "\uAEBC\uC9D0 \xB7 \uC77C\uBC18 \uC9C0\uD45C\uC640 \uD574\uC2DC \uC2DD\uBCC4\uC790\uB9CC \uC800\uC7A5\uD569\uB2C8\uB2E4"
+    );
+    updateDirtyState();
+  }
+  function handleLifecycleEnabled(event) {
+    const input = event.target;
+    if (closeInFlight || !(input instanceof HTMLInputElement) || !draft) return;
+    draft.lifecycle.enabled = input.checked;
+    setText(
+      "lifecycle-enabled-copy",
+      input.checked ? "\uCF1C\uC9D0 \xB7 \uB2E4\uC74C \uC815\uB9AC \uC791\uC5C5\uBD80\uD130 \uBCF4\uAD00 \uAE30\uC900\uC744 \uC9C0\uB09C \uAE30\uC874 \uB370\uC774\uD130\uC5D0\uB3C4 \uC801\uC6A9\uB429\uB2C8\uB2E4" : "\uAEBC\uC9D0 \xB7 \uAE30\uC874 \uC218\uB3D9 \uBCF4\uAD00 \uC124\uC815\uACFC \uC6D0\uBB38 \uBCF4\uAD00 \uB3D9\uC791\uC744 \uC720\uC9C0\uD569\uB2C8\uB2E4"
     );
     updateDirtyState();
   }
@@ -1303,6 +2218,11 @@
       const minimum = Number(owner?.dataset.min ?? field.min);
       const maximum = Number(owner?.dataset.max ?? field.max);
       marker.style.left = `${position(getValue(draft, path), minimum, maximum, owner?.dataset.log === "true")}%`;
+      const label = marker.querySelector("b");
+      if (label && path.startsWith("lifecycle.")) {
+        const stage = path === "lifecycle.hot_days" ? "Warm" : path === "lifecycle.warm_days" ? "Cold" : "Delete";
+        label.textContent = `${stage} ${getValue(draft, path)}\uC77C`;
+      }
     });
     document.querySelectorAll("[data-dual-value]").forEach((output) => {
       const visual = output.closest(".policy-visual");
@@ -1340,15 +2260,15 @@
     document.querySelector("#save-band")?.classList.toggle("dirty", dirty);
     setText("save-title", conflicted ? "\uC678\uBD80 \uBCC0\uACBD \uAC10\uC9C0" : dirty ? `${changed.length + booleanChanges}\uAC1C \uBCC0\uACBD` : "\uC800\uC7A5\uB428");
     setText("save-detail", conflicted ? "\uCD5C\uC2E0 \uC124\uC815\uC744 \uB2E4\uC2DC \uBD88\uB7EC\uC628 \uB4A4 \uD3B8\uC9D1\uD558\uC138\uC694." : dirty ? "\uC800\uC7A5 \uC804\uAE4C\uC9C0 \uC774 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uB9CC \uC720\uC9C0\uB429\uB2C8\uB2E4." : "\uD604\uC7AC \uC124\uC815\uACFC \uAC19\uC2B5\uB2C8\uB2E4.");
-    setDisabled("save", !dirty || busy || conflicted);
-    setDisabled("discard", !dirty || busy);
-    setDisabled("reset", busy);
+    setDisabled("save", !dirty || busy || closeInFlight || conflicted);
+    setDisabled("discard", !dirty || busy || closeInFlight);
+    setDisabled("reset", busy || closeInFlight);
     document.querySelectorAll("[data-field]").forEach((row) => {
       row.classList.toggle("changed", changed.includes(row.dataset.field));
     });
   }
   async function saveDraft() {
-    if (!draft || busy || conflicted) return;
+    if (!draft || busy || closeInFlight || !token || conflicted) return;
     clearErrors();
     const form = document.querySelector("#settings-form");
     if (form && !form.checkValidity()) {
@@ -1356,16 +2276,17 @@
       showToast("\uBE44\uC5B4 \uC788\uAC70\uB098 \uD5C8\uC6A9 \uBC94\uC704\uB97C \uBC97\uC5B4\uB09C \uAC12\uC744 \uD655\uC778\uD558\uC138\uC694.", "error");
       return;
     }
-    if (!validate_local_runtime_config_v3_default(draft)) {
-      const errors = validate_local_runtime_config_v3_default.errors ?? [];
-      for (const error of errors) {
-        const path = error.instancePath?.replace(/^\//, "").replaceAll("/", ".");
+    const validation = validateLocalRuntimeConfig(draft);
+    if (!validation.valid) {
+      for (const error of validation.errors) {
+        const path = error.path;
         if (path in fields) showFieldError(path, error.message ?? "\uD5C8\uC6A9 \uBC94\uC704\uB97C \uD655\uC778\uD558\uC138\uC694.");
       }
       focusFirstInvalid();
       showToast("\uD5C8\uC6A9 \uBC94\uC704\uB97C \uBC97\uC5B4\uB09C \uAC12\uC744 \uD655\uC778\uD558\uC138\uC694.", "error");
       return;
     }
+    const session = { generation: sessionGeneration, token };
     busy = true;
     setBusy(true);
     try {
@@ -1374,16 +2295,20 @@
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ config: draft, revision })
       });
+      if (!sessionIsCurrent(session)) return;
       applyEnvelope(envelope);
       renderSettings("save-title");
       showToast("\uC124\uC815\uC744 \uC800\uC7A5\uD588\uC2B5\uB2C8\uB2E4.", "success");
     } catch (error) {
+      if (!sessionIsCurrent(session)) return;
       const apiError = error;
       if (apiError.code === "config_conflict") {
         try {
-          await rebaseDraftOnLatest();
+          await rebaseDraftOnLatest(session);
+          if (!sessionIsCurrent(session)) return;
           showToast("\uCD5C\uC2E0 \uC124\uC815\uC744 \uBD88\uB7EC\uC640 \uB0B4 \uBCC0\uACBD\uB9CC \uB2E4\uC2DC \uC801\uC6A9\uD588\uC2B5\uB2C8\uB2E4. \uAC80\uD1A0 \uD6C4 \uC800\uC7A5\uD558\uC138\uC694.", "error");
         } catch (rebaseError) {
+          if (!sessionIsCurrent(session)) return;
           const rebaseApiError = rebaseError;
           if (rebaseApiError.code === "invalid_session" || rebaseApiError.code === "network_failure") {
             expireSession();
@@ -1399,18 +2324,22 @@
       }
     } finally {
       busy = false;
-      setBusy(false);
-      updateDirtyState();
+      if (sessionIsCurrent(session)) {
+        setBusy(false);
+        updateDirtyState();
+      }
     }
   }
-  async function rebaseDraftOnLatest() {
+  async function rebaseDraftOnLatest(session) {
     if (!draft || !persisted) return;
     const localDraft = structuredClone(draft);
     const localBase = structuredClone(persisted);
     const changed = changedPaths(localDraft, localBase);
     const enabledChanged = localDraft.enabled !== localBase.enabled;
     const privateDetailsChanged = (localDraft.capture_private_codex_turn_details ?? false) !== (localBase.capture_private_codex_turn_details ?? false);
+    const lifecycleEnabledChanged = localDraft.lifecycle.enabled !== localBase.lifecycle.enabled;
     const latest = await api("/api/config");
+    if (!sessionIsCurrent(session)) return;
     applyEnvelope(latest);
     if (!draft) return;
     for (const path of changed) setValue(draft, path, getValue(localDraft, path));
@@ -1418,17 +2347,19 @@
     if (privateDetailsChanged) {
       draft.capture_private_codex_turn_details = localDraft.capture_private_codex_turn_details ?? false;
     }
+    if (lifecycleEnabledChanged) draft.lifecycle.enabled = localDraft.lifecycle.enabled;
     conflicted = false;
     renderSettings("save-title");
   }
   function discardChanges() {
-    if (!persisted) return;
+    if (closeInFlight || !persisted) return;
     draft = structuredClone(persisted);
     conflicted = false;
     renderSettings("save-title");
     showToast("\uC800\uC7A5\uD558\uC9C0 \uC54A\uC740 \uBCC0\uACBD\uC744 \uCDE8\uC18C\uD588\uC2B5\uB2C8\uB2E4.", "neutral");
   }
   function openResetDialog() {
+    if (closeInFlight) return;
     document.querySelector("#reset-dialog")?.showModal();
   }
   function closeResetDialog() {
@@ -1436,23 +2367,27 @@
     document.querySelector("#reset")?.focus();
   }
   function resetDefaults() {
-    if (!defaults) return;
-    draft = structuredClone(defaults);
+    if (closeInFlight || !defaults || !draft) return;
+    draft = { ...structuredClone(defaults), storage_budget: structuredClone(draft.storage_budget) };
     closeResetDialog();
     renderSettings("reset");
     showToast("\uAE30\uBCF8\uAC12\uC744 \uD3B8\uC9D1\uAC12\uC5D0 \uC801\uC6A9\uD588\uC2B5\uB2C8\uB2E4. \uC800\uC7A5\uD574\uC57C \uBC18\uC601\uB429\uB2C8\uB2E4.", "neutral");
   }
   async function closeSession() {
-    if (busy) return;
-    busy = true;
+    if (closeInFlight || !token) return;
+    const session = { generation: sessionGeneration, token };
+    closeInFlight = true;
+    closeFailureMessage = "";
     setBusy(true);
     setText("close-error", "");
     try {
       await api("/api/shutdown", { method: "POST" });
+      if (!sessionIsCurrent(session)) return;
       if (persisted) draft = structuredClone(persisted);
       conflicted = false;
       expireSession();
     } catch (error) {
+      if (!sessionIsCurrent(session)) return;
       const apiError = error;
       if (apiError.code === "invalid_session") {
         if (persisted) draft = structuredClone(persisted);
@@ -1460,18 +2395,26 @@
         expireSession();
         return;
       }
-      setText(
-        "close-error",
-        "\uC138\uC158\uC744 \uB2EB\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. \uB85C\uCEEC process \uC5F0\uACB0\uC744 \uD655\uC778\uD558\uACE0 \uB2E4\uC2DC \uC2DC\uB3C4\uD558\uC138\uC694."
-      );
-      document.querySelector("#confirm-close")?.focus();
+      closeFailureMessage = "\uC138\uC158\uC744 \uB2EB\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. \uB85C\uCEEC process \uC5F0\uACB0\uC744 \uD655\uC778\uD558\uACE0 \uB2E4\uC2DC \uC2DC\uB3C4\uD558\uC138\uC694.";
     } finally {
-      busy = false;
-      if (token) {
-        setBusy(false);
+      closeInFlight = false;
+      if (sessionIsCurrent(session)) {
+        setBusy(busy);
         updateDirtyState();
+        renderCloseFailure();
       }
     }
+  }
+  function renderCloseFailure() {
+    if (!closeFailureMessage) return false;
+    const dialog = document.querySelector("#close-dialog");
+    const retry = document.querySelector("#confirm-close");
+    if (!dialog || !retry) return false;
+    setText("close-error", closeFailureMessage);
+    if (!dialog.open) dialog.showModal();
+    retry.disabled = false;
+    retry.focus();
+    return true;
   }
   function requestCloseSession() {
     if (isDirty()) {
@@ -1481,23 +2424,32 @@
     }
   }
   function closeCloseDialog() {
+    closeFailureMessage = "";
     document.querySelector("#close-dialog")?.close();
     document.querySelector("#close-session")?.focus();
   }
   async function heartbeat() {
-    if (Date.now() - lastUserActivity >= 6e4) return;
+    if (!token || closeInFlight || Date.now() - lastUserActivity >= 6e4) return;
+    const session = { generation: sessionGeneration, token };
     try {
       await api("/api/heartbeat", { method: "POST" });
+      if (!sessionIsCurrent(session)) return;
       await refreshIntegrationStatus();
     } catch {
+      if (!sessionIsCurrent(session)) return;
       expireSession();
     }
   }
   function expireSession() {
     window.clearInterval(heartbeatTimer);
+    integrationRequestGeneration += 1;
+    sessionGeneration += 1;
     token = "";
     clearSessionToken();
     renderExpired();
+  }
+  function sessionIsCurrent(session) {
+    return token !== "" && token === session.token && sessionGeneration === session.generation;
   }
   function readSessionToken() {
     try {
@@ -1551,6 +2503,22 @@
     if (response.status === 204) return void 0;
     return await response.json();
   }
+  async function integrationApi(path, init = {}) {
+    let value;
+    try {
+      value = await api(path, { ...init, signal: AbortSignal.timeout(5e3) });
+    } catch (error) {
+      const failure = error;
+      if (failure.code?.startsWith("integration_") && !validate_codex_integration_error_v1_default({ code: failure.code, message: failure.message })) {
+        throw new Error("Codex \uBCC0\uACBD \uACB0\uACFC \uC751\uB2F5\uC744 \uD655\uC778\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4. \uC0C1\uD0DC\uB97C \uB2E4\uC2DC \uD655\uC778\uD574\uC57C \uD569\uB2C8\uB2E4.");
+      }
+      throw error;
+    }
+    if (!validateCodexIntegrationStatus(value)) {
+      throw new Error("Codex \uC790\uB3D9 \uC218\uC9D1 \uC0C1\uD0DC \uC751\uB2F5\uC774 \uC62C\uBC14\uB974\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.");
+    }
+    return value;
+  }
   function applyEnvelope(envelope) {
     persisted = structuredClone(envelope.config);
     draft = structuredClone(envelope.config);
@@ -1559,10 +2527,38 @@
     conflicted = false;
   }
   function setBusy(value) {
-    document.querySelector("#settings-form")?.setAttribute("aria-busy", String(value));
-    setText("save-title", value ? "\uC800\uC7A5 \uC911" : "\uC800\uC7A5\uB428");
+    const blocked = value || closeInFlight;
+    document.querySelector("#settings-form")?.setAttribute("aria-busy", String(blocked));
+    if (blocked) setText("save-title", "\uC800\uC7A5 \uC911");
     document.querySelectorAll("button").forEach((button) => {
-      if (button.id !== "close-session") button.disabled = value;
+      if (button.id === "close-session") return;
+      if (button.id === "confirm-close" && !closeInFlight) {
+        if (buttonDisabledBeforeBusy.has(button)) {
+          button.disabled = buttonDisabledBeforeBusy.get(button);
+          buttonDisabledBeforeBusy.delete(button);
+        }
+        return;
+      }
+      if (blocked) {
+        if (!buttonDisabledBeforeBusy.has(button)) {
+          buttonDisabledBeforeBusy.set(button, button.disabled);
+        }
+        button.disabled = true;
+      } else if (buttonDisabledBeforeBusy.has(button)) {
+        button.disabled = buttonDisabledBeforeBusy.get(button);
+        buttonDisabledBeforeBusy.delete(button);
+      }
+    });
+    document.querySelectorAll("#settings-form input").forEach((input) => {
+      if (closeInFlight) {
+        if (!inputDisabledBeforeClose.has(input)) {
+          inputDisabledBeforeClose.set(input, input.disabled);
+        }
+        input.disabled = true;
+      } else if (inputDisabledBeforeClose.has(input)) {
+        input.disabled = inputDisabledBeforeClose.get(input);
+        inputDisabledBeforeClose.delete(input);
+      }
     });
   }
   function showFieldError(path, message) {
@@ -1634,7 +2630,7 @@
   function booleanChangeCount(left, right) {
     return Number(left.enabled !== right.enabled) + Number(
       (left.capture_private_codex_turn_details ?? false) !== (right.capture_private_codex_turn_details ?? false)
-    );
+    ) + Number(left.lifecycle.enabled !== right.lifecycle.enabled);
   }
   function position(value, min, max, logarithmic) {
     const bounded = Math.min(max, Math.max(min, value));
@@ -1645,6 +2641,11 @@
     if (value >= 6e4 && value % 6e4 === 0) return `${formatNumber(value / 6e4)}\uBD84`;
     if (value >= 1e3) return `${formatNumber(value / 1e3)}\uCD08`;
     return `${formatNumber(value)}ms`;
+  }
+  function formatDurationSeconds(value) {
+    if (value >= 3600 && value % 3600 === 0) return `${formatNumber(value / 3600)}\uC2DC\uAC04`;
+    if (value >= 60 && value % 60 === 0) return `${formatNumber(value / 60)}\uBD84`;
+    return `${formatNumber(value)}\uCD08`;
   }
   function formatBytes(value) {
     if (value >= 1073741824) return `${formatDecimal(value / 1073741824)} GiB`;

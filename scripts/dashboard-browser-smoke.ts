@@ -110,7 +110,13 @@ try {
       const pageErrors: string[] = [];
       const externalRequests: string[] = [];
       const failedRequests: string[] = [];
+      const cancelledDashboardRequests: string[] = [];
       let privateDetailRequests = 0;
+      let dashboardQueryRequests = 0;
+      let activeDashboardQueries = 0;
+      let lastDashboardQueryAt = 0;
+      let firstSpanPage: Record<string, unknown> | undefined;
+      let paginationExcludedSpanId: string | undefined;
       page.on("console", (message) => {
         if (message.type() === "error") consoleErrors.push(message.text());
       });
@@ -119,77 +125,162 @@ try {
         const requestUrl = new URL(request.url());
         if (requestUrl.origin !== parsed.origin) externalRequests.push(request.url());
         if (requestUrl.pathname.includes("/details/")) privateDetailRequests += 1;
+        if (requestUrl.pathname.endsWith("/query")) {
+          dashboardQueryRequests += 1;
+          activeDashboardQueries += 1;
+          lastDashboardQueryAt = Date.now();
+        }
       });
-      page.on("requestfailed", (request) => failedRequests.push(request.url()));
-
-      await page.route(dashboardUrl, async (route) => {
-        const response = await route.fetch();
-        let body = addPrivateLookupCoverage(await response.text());
-        if (testCase.name === "mobile") body = addPaginationCoverage(body);
-        await route.fulfill({ response, body });
+      page.on("requestfinished", (request) => {
+        if (new URL(request.url()).pathname.endsWith("/query")) activeDashboardQueries -= 1;
       });
+      page.on("requestfailed", (request) => {
+        const requestUrl = new URL(request.url());
+        if (requestUrl.pathname.endsWith("/query")) activeDashboardQueries -= 1;
+        if (
+          requestUrl.origin === parsed.origin
+          && requestUrl.pathname.endsWith("/query")
+          && /ERR_ABORTED/.test(request.failure()?.errorText ?? "")
+        ) {
+          cancelledDashboardRequests.push(request.url());
+          return;
+        }
+        failedRequests.push(request.url());
+      });
+      const waitForDashboardIdle = async (): Promise<void> => {
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          if (activeDashboardQueries === 0 && Date.now() - lastDashboardQueryAt >= 50) return;
+          await page.waitForTimeout(25);
+        }
+        throw new Error(`dashboard queries did not become idle: active=${activeDashboardQueries}`);
+      };
+      if (testCase.name === "mobile") {
+        await page.route("**/*", async (route) => {
+          const request = dashboardRequest(route.request().url());
+          if (request?.kind !== "spans") {
+            await route.continue();
+            return;
+          }
+          if (request.cursor === "browser-smoke-next") {
+            assert.ok(firstSpanPage);
+            assert.ok(paginationExcludedSpanId);
+            const rows = (firstSpanPage.rows as Array<{ spanId: string }>).filter(
+              (row) => row.spanId !== paginationExcludedSpanId,
+            );
+            assert.ok(rows.length > 0, "synthetic next page needs a deterministic focus fallback");
+            await route.fulfill({
+              json: { ...firstSpanPage, rows, pagination: { nextCursor: null, total: rows.length + 1 } },
+            });
+            return;
+          }
+          const response = await route.fetch();
+          const body = await response.json() as Record<string, unknown>;
+          firstSpanPage = body;
+          await route.fulfill({
+            response,
+            json: { ...body, pagination: { nextCursor: "browser-smoke-next", total: 201 } },
+          });
+        });
+      }
 
       await page.goto(dashboardUrl, { waitUntil: "load" });
       assert.equal(page.url(), dashboardUrl);
-      assert.equal(await page.locator("h1").textContent(), "Agent Observability Report");
-      assert.notEqual(await page.locator("#span-count").textContent(), "0");
+      assert.equal(await page.locator("h1").textContent(), "Agent Observability");
+      await page.waitForFunction(() => document.querySelectorAll(".trace-row").length > 0);
+      assert.match((await page.locator("#filter-status").textContent()) ?? "", /Current snapshot/);
+      assert.match((await page.locator(".timestamp").textContent()) ?? "", /Current snapshot/);
+      await page.locator("#agent-filter option", { hasText: "codex" }).waitFor({ state: "attached" });
+      await page.waitForFunction(() => document.getElementById("kpi-sessions")?.textContent?.startsWith("Exact"));
+      await waitForDashboardIdle();
       await page.locator("#agent-filter").selectOption({ label: "codex" });
+      await page.waitForFunction(() => document.querySelectorAll(".trace-row").length > 0);
       await page.locator(".trace-row:visible").first().click();
+      await page.waitForFunction(() => document.querySelectorAll("#span-table .span-open").length > 0);
       assert.equal(await page.locator(".timeline-row").count() > 0, true);
       await page.locator("#span-table .span-open", { hasText: "LLM request" }).first().click();
-      await page.locator("#private-detail", { hasText: "not an eligible Codex notify turn" }).waitFor();
+      await page.locator("#private-detail", { hasText: "not eligible for private local detail" }).waitFor();
+      assert.match((await page.locator("#details-body").textContent()) ?? "", /Input tokens/);
+      assert.match((await page.locator("#details-body").textContent()) ?? "", /Estimated API cost/);
+      assert.equal(
+        await page.locator("#details-heading").evaluate((element) => document.activeElement === element),
+        true,
+        "opening span details must focus the details heading",
+      );
       assert.equal(privateDetailRequests, 0, "ineligible spans must not request private detail");
-      await page.locator("#span-table .span-open", { hasText: "Private turn" }).first().click();
+      const privateTurnOpener = page.locator("#span-table .span-open", { hasText: "Turn" }).first();
+      const openedSpanId = await privateTurnOpener.getAttribute("data-span-id");
+      const originalOpener = await privateTurnOpener.elementHandle();
+      assert.ok(openedSpanId);
+      assert.ok(originalOpener);
+      await privateTurnOpener.click();
+      await page.locator("#private-detail button", { hasText: "Load private detail" }).waitFor();
+      assert.equal(
+        await page.locator("#details-heading").evaluate((element) => document.activeElement === element),
+        true,
+        "opening span details must focus the details heading",
+      );
+      await page.locator("#private-detail button", { hasText: "Load private detail" }).click();
       await page.locator("#private-detail", { hasText: "PRIVATE_BROWSER_REQUEST" }).waitFor();
       assert.equal(privateDetailRequests, 1);
       assert.match((await page.locator("#private-detail").textContent()) ?? "", /\/private\/project/);
       assert.match((await page.locator("#private-detail").textContent()) ?? "", /PRIVATE_BROWSER_RESPONSE/);
       if (testCase.name === "mobile") {
-        const originalOpener = await page.locator("#span-table .span-open", { hasText: "Private turn" }).first().elementHandle();
-        const openedSpanId = await originalOpener?.getAttribute("data-span-id");
-        assert.ok(originalOpener);
-        assert.ok(openedSpanId);
-        await page.locator(".trace-row[aria-pressed='true']").click();
         assert.equal(await originalOpener.evaluate((element) => element.isConnected), false);
-        const rerenderedOpener = page.locator(`#span-table .span-open[data-span-id="${openedSpanId}"]`);
-        assert.equal(await rerenderedOpener.getAttribute("aria-expanded"), "true");
+        await page.locator("#details-close").click();
+        assert.equal(await page.locator("#span-details").evaluate((element) => element.classList.contains("open")), false);
+        assert.equal(await page.locator(".span-open[aria-expanded='true']").count(), 0);
+        assert.equal((await page.locator("#details-body").textContent())?.includes("PRIVATE_BROWSER_REQUEST"), false);
         assert.equal(
-          await page.locator(`.span-open[data-span-id="${openedSpanId}"]:not([aria-expanded='true'])`).count(),
-          0,
+          await page.locator(`#span-table .span-open[data-span-id="${openedSpanId}"]`).evaluate(
+            (element) => document.activeElement === element,
+          ),
+          true,
+          "close must restore the rerendered table opener",
+        );
+
+        const timelineOpener = page.locator(`.timeline-row .span-open[data-span-id="${openedSpanId}"]`);
+        await timelineOpener.click();
+        await page.locator("#span-details.open").waitFor();
+        assert.equal(
+          await page.locator("#details-heading").evaluate((element) => document.activeElement === element),
+          true,
         );
         await page.locator("#details-close").click();
-        assert.equal(await rerenderedOpener.getAttribute("aria-expanded"), "false");
-        assert.equal(await rerenderedOpener.evaluate((element) => document.activeElement === element), true);
+        assert.equal(
+          await page.locator(`.timeline-row .span-open[data-span-id="${openedSpanId}"]`).evaluate(
+            (element) => document.activeElement === element,
+          ),
+          true,
+          "close must restore the initiating timeline surface",
+        );
 
-        await rerenderedOpener.click();
+        await page.locator(`#span-table .span-open[data-span-id="${openedSpanId}"]`).click();
+        await page.locator("#span-details.open").waitFor();
+        paginationExcludedSpanId = openedSpanId;
+        const nextSpanPage = page.waitForResponse((response) =>
+          dashboardRequest(response.url())?.cursor === "browser-smoke-next",
+        );
+        await page.locator("#span-next").click();
+        await nextSpanPage;
+        await page.waitForFunction(
+          (spanId) => ![...document.querySelectorAll<HTMLElement>(".span-open")]
+            .some((element) => element.dataset.spanId === spanId),
+          openedSpanId,
+        );
+        await page.locator("#details-close").click();
+        assert.equal(await page.locator(".span-open[aria-expanded='true']").count(), 0);
+        assert.equal(
+          await page.locator(".span-open:visible").first().evaluate((element) => document.activeElement === element),
+          true,
+          "close after pagination must focus the first visible span opener",
+        );
+
+        await page.locator("#model-filter option", { hasText: "gpt-test" }).waitFor({ state: "attached" });
         await page.locator("#model-filter").selectOption({ label: "gpt-test" });
         assert.equal(await page.locator(".span-open[aria-expanded='true']").count(), 0);
-        await page.locator("#details-close").click();
-        assert.equal(await page.locator(".span-open[aria-expanded='true']").count(), 0);
-        assert.equal(
-          await page.evaluate(() => document.activeElement?.classList.contains("span-open")),
-          true,
-        );
-
-        await page.locator("#clear-filters").click();
-        await page.locator(".trace-row:visible").first().click();
-        assert.equal(await page.locator("#span-next").isEnabled(), true);
-        const paginatedOpener = page.locator("#span-table .span-open").nth(150);
-        const paginatedSpanId = await paginatedOpener.getAttribute("data-span-id");
-        assert.ok(paginatedSpanId);
-        await paginatedOpener.click();
-        await page.locator("#span-next").click();
-        assert.equal(
-          await page.locator(`.span-open[data-span-id="${paginatedSpanId}"]:visible`).count(),
-          0,
-        );
-        assert.equal(await page.locator(".span-open[aria-expanded='true']").count(), 0);
-        await page.locator("#details-close").click();
-        assert.equal(await page.locator(".span-open[aria-expanded='true']").count(), 0);
-        assert.equal(
-          await page.evaluate(() => document.activeElement?.classList.contains("span-open")),
-          true,
-        );
+        await page.waitForFunction(() => document.getElementById("kpi-sessions")?.textContent?.startsWith("Exact"));
+        await waitForDashboardIdle();
       }
       assert.equal(
         await page.evaluate(
@@ -203,28 +294,50 @@ try {
       assert.deepEqual(failedRequests, []);
       assert.equal(child.exitCode, null, "dashboard must remain available for reload");
 
-      await page.locator("#agent-filter").selectOption({ index: 1 });
-      assert.match(
-        (await page.locator("#filter-status").textContent()) ?? "",
-        /^\d+ spans match the active filters\.$/,
-      );
       if (testCase.name === "desktop") {
+        assert.equal(await page.locator("#save-filter").isEnabled(), true);
         await page.locator("#save-filter").click();
         assert.equal(await page.locator("#saved-filter option").count(), 2);
+        const saved = await page.evaluate(() =>
+          localStorage.getItem("agent-observability.report.v1.saved-filters") ?? "",
+        );
+        assert.equal(saved.includes("PRIVATE_BROWSER_REQUEST"), false);
+        assert.equal(saved.includes("PRIVATE_BROWSER_RESPONSE"), false);
       } else {
         assert.equal(
           await page.locator("#saved-filter option").count(),
           2,
           "saved views must survive a dashboard process restart",
         );
+        await page.locator("#clear-filters").click();
+        await page.locator("#saved-filter").selectOption("0");
+        assert.equal(await page.locator("#agent-filter").inputValue(), "codex");
       }
+      await page.waitForFunction(() => document.getElementById("kpi-sessions")?.textContent?.startsWith("Exact"));
+      await waitForDashboardIdle();
+      const queriesBeforeRefresh = dashboardQueryRequests;
+      const refreshRequest = page.waitForRequest((request) => dashboardRequestKind(request.url()) === "bootstrap");
+      await page.locator("#refresh-dashboard").click();
+      await refreshRequest;
+      assert.equal(dashboardQueryRequests > queriesBeforeRefresh, true);
+      await page.waitForFunction(() => document.getElementById("filter-status")?.textContent?.includes("Current snapshot"));
+      await page.waitForFunction(() => document.getElementById("kpi-sessions")?.textContent?.startsWith("Exact"));
+      await waitForDashboardIdle();
+      assert.equal(page.url(), dashboardUrl, "refresh must not reload or escape the dashboard URL");
       await page.reload({ waitUntil: "load" });
-      assert.notEqual(await page.locator("#span-count").textContent(), "0");
+      await page.waitForFunction(() => document.querySelectorAll(".trace-row").length > 0);
+      await page.waitForFunction(() => document.getElementById("kpi-sessions")?.textContent?.startsWith("Exact"));
+      await waitForDashboardIdle();
       assert.deepEqual(consoleErrors, []);
       assert.deepEqual(pageErrors, []);
       assert.deepEqual(externalRequests, []);
       assert.deepEqual(failedRequests, []);
-      results.push({ name: testCase.name, origin: parsed.origin, reload: true });
+      results.push({
+        name: testCase.name,
+        origin: parsed.origin,
+        reload: true,
+        cancelledDashboardQueries: cancelledDashboardRequests.length,
+      });
       await page.close();
     } finally {
       if (child.exitCode === null) child.kill();
@@ -270,58 +383,23 @@ function readUrl(child: DashboardProcess): Promise<string> {
   });
 }
 
-function addPrivateLookupCoverage(html: string): string {
-  const pattern = /(<script id="report-data" type="application\/json">)([^<]+)(<\/script>)/;
-  const match = html.match(pattern);
-  if (!match?.[2]) throw new Error("dashboard report data was not found");
-  const report = JSON.parse(match[2]) as {
-    spans: Array<Record<string, unknown> & {
-      spanId: string;
-      traceId: string;
-      name: string;
-      turnId?: string;
-      availability: Record<string, { state: string; reason: string }>;
-    }>;
-    traces: Array<Record<string, unknown> & { traceId: string; spans: number }>;
-  };
-  const source = report.spans.find((span) => span.name === "LLM request" && span.turnId !== undefined);
-  if (!source) throw new Error("private lookup coverage span was not found");
-  const privateLookup = { state: "private_lookup", reason: "local_opt_in_lookup_required" };
-  report.spans.push({
-    ...source,
-    spanId: `${source.spanId}-private-turn`,
-    kind: "turn",
-    name: "Private turn",
-    attributes: { source: "codex", event_type: "turn", turn_id: source.turnId },
-    availability: {
-      ...source.availability,
-      sourceLocation: privateLookup,
-      requestContent: privateLookup,
-      responseContent: privateLookup,
-    },
-  });
-  const trace = report.traces.find((candidate) => candidate.traceId === source.traceId);
-  if (trace) trace.spans += 1;
-  return html.replace(pattern, `$1${JSON.stringify(report).replaceAll("<", "\\u003c")}$3`);
+function dashboardRequestKind(url: string): string | undefined {
+  return dashboardRequest(url)?.kind;
 }
 
-function addPaginationCoverage(html: string): string {
-  const pattern = /(<script id="report-data" type="application\/json">)([^<]+)(<\/script>)/;
-  const match = html.match(pattern);
-  if (!match?.[2]) throw new Error("dashboard report data was not found");
-  const report = JSON.parse(match[2]) as {
-    spans: Array<Record<string, unknown> & { spanId: string; traceId: string }>;
-    traces: Array<Record<string, unknown> & { traceId: string; spans: number }>;
-  };
-  const firstByTrace = new Map<string, (typeof report.spans)[number]>();
-  for (const span of report.spans) firstByTrace.set(span.traceId, firstByTrace.get(span.traceId) ?? span);
-  const clones = [...firstByTrace.values()].flatMap((span) =>
-    Array.from({ length: 200 }, (_, index) => ({
-      ...span,
-      spanId: `${span.spanId}-pagination-${index}`,
-    })),
-  );
-  report.spans.push(...clones);
-  for (const trace of report.traces) trace.spans += 200;
-  return html.replace(pattern, `$1${JSON.stringify(report).replaceAll("<", "\\u003c")}$3`);
+function dashboardRequest(url: string): { kind: string; cursor?: string | null } | undefined {
+  const encoded = new URL(url).searchParams.get("request");
+  if (!encoded) return undefined;
+  try {
+    const value = JSON.parse(encoded) as unknown;
+    if (typeof value !== "object" || value === null || !("kind" in value) || typeof value.kind !== "string") {
+      return undefined;
+    }
+    const cursor = "cursor" in value && (typeof value.cursor === "string" || value.cursor === null)
+      ? value.cursor
+      : undefined;
+    return { kind: value.kind, ...(cursor === undefined ? {} : { cursor }) };
+  } catch {
+    return undefined;
+  }
 }

@@ -1,0 +1,56 @@
+{
+  "schemaVersion": "agent_observability.dashboard_query.v1",
+  "kind": "spans",
+  "snapshot": {
+    "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "generation": "42",
+    "visibilityEpoch": "7",
+    "generatedAt": "2026-09-07T00:00:00.000Z",
+    "state": "current"
+  },
+  "scope": {
+    "filters": {},
+    "selectedTraceId": null,
+    "coldExcluded": true
+  },
+  "work": {
+    "state": "complete",
+    "kpis": {
+      "sessions": 1,
+      "turns": 1,
+      "llm": 0,
+      "tools": 1,
+      "errors": 0,
+      "inputTokens": null,
+      "outputTokens": null,
+      "totalTokens": null,
+      "tokenStatus": "unavailable",
+      "estimatedCost": null,
+      "costStatus": "unknown",
+      "currency": null
+    }
+  },
+  "rows": [
+    {
+      "traceId": "id:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "spanId": "id:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "parentSpanId": null,
+      "kind": "tool",
+      "name": "shell",
+      "status": "ok",
+      "startTimeUnixMs": 1,
+      "endTimeUnixMs": null,
+      "repo": "workspace",
+      "availabilityReasons": [
+        {
+          "field": "tokens",
+          "state": "not_applicable",
+          "reason": "span_kind_has_no_token_usage"
+        }
+      ]
+    }
+  ],
+  "pagination": {
+    "nextCursor": null
+  }
+}

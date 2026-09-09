@@ -1,5 +1,46 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageBudgetMode {
+    Legacy,
+    Separated,
+}
+
+/// Versioned configuration only; operational admission is owned by runtime control.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StorageBudgetPolicyV1 {
+    pub mode: StorageBudgetMode,
+    pub retained_target_bytes: u64,
+    pub workspace_budget_bytes: u64,
+    pub minimum_free_bytes: u64,
+}
+
+impl Default for StorageBudgetPolicyV1 {
+    fn default() -> Self {
+        Self {
+            mode: StorageBudgetMode::Legacy,
+            retained_target_bytes: default_budget(),
+            workspace_budget_bytes: default_budget(),
+            minimum_free_bytes: default_budget(),
+        }
+    }
+}
+
+impl StorageBudgetPolicyV1 {
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        for (field, value) in [
+            ("retained_target_bytes", self.retained_target_bytes),
+            ("workspace_budget_bytes", self.workspace_budget_bytes),
+            ("minimum_free_bytes", self.minimum_free_bytes),
+        ] {
+            validate_bounds(field, value, 268_435_456, 21_474_836_480)?;
+        }
+        Ok(())
+    }
+}
+
 const fn default_file() -> u32 {
     5_000
 }
@@ -29,6 +70,100 @@ const fn default_archive_records() -> u32 {
 }
 const fn default_archive_bytes() -> u64 {
     16_777_216
+}
+const fn default_lifecycle_enabled() -> bool {
+    false
+}
+const fn default_hot_days() -> u16 {
+    7
+}
+const fn default_warm_days() -> u16 {
+    30
+}
+const fn default_delete_after_days() -> u16 {
+    90
+}
+const fn default_private_raw_days() -> u16 {
+    7
+}
+const fn default_maintenance_interval_seconds() -> u32 {
+    300
+}
+const fn default_max_traces_per_pass() -> u16 {
+    32
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StorageLifecyclePolicyV1 {
+    #[serde(default = "default_lifecycle_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_hot_days")]
+    pub hot_days: u16,
+    #[serde(default = "default_warm_days")]
+    pub warm_days: u16,
+    #[serde(default = "default_delete_after_days")]
+    pub delete_after_days: u16,
+    #[serde(default = "default_private_raw_days")]
+    pub private_raw_days: u16,
+    #[serde(default = "default_maintenance_interval_seconds")]
+    pub maintenance_interval_seconds: u32,
+    #[serde(default = "default_max_traces_per_pass")]
+    pub max_traces_per_pass: u16,
+}
+
+impl Default for StorageLifecyclePolicyV1 {
+    fn default() -> Self {
+        Self {
+            enabled: default_lifecycle_enabled(),
+            hot_days: default_hot_days(),
+            warm_days: default_warm_days(),
+            delete_after_days: default_delete_after_days(),
+            private_raw_days: default_private_raw_days(),
+            maintenance_interval_seconds: default_maintenance_interval_seconds(),
+            max_traces_per_pass: default_max_traces_per_pass(),
+        }
+    }
+}
+
+impl StorageLifecyclePolicyV1 {
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        validate_bounds("hot_days", u64::from(self.hot_days), 1, 3_650)?;
+        validate_bounds("warm_days", u64::from(self.warm_days), 1, 3_650)?;
+        validate_bounds(
+            "delete_after_days",
+            u64::from(self.delete_after_days),
+            1,
+            3_650,
+        )?;
+        validate_bounds(
+            "private_raw_days",
+            u64::from(self.private_raw_days),
+            1,
+            3_650,
+        )?;
+        validate_bounds(
+            "maintenance_interval_seconds",
+            u64::from(self.maintenance_interval_seconds),
+            60,
+            86_400,
+        )?;
+        validate_bounds(
+            "max_traces_per_pass",
+            u64::from(self.max_traces_per_pass),
+            1,
+            128,
+        )?;
+        if self.hot_days <= self.warm_days && self.warm_days < self.delete_after_days {
+            Ok(())
+        } else {
+            Err(PolicyError::InvalidLifecycleOrder {
+                hot_days: self.hot_days,
+                warm_days: self.warm_days,
+                delete_after_days: self.delete_after_days,
+            })
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -195,6 +330,11 @@ pub enum PolicyError {
         min: u64,
         max: u64,
     },
+    InvalidLifecycleOrder {
+        hot_days: u16,
+        warm_days: u16,
+        delete_after_days: u16,
+    },
 }
 impl std::fmt::Display for PolicyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -206,6 +346,14 @@ impl std::fmt::Display for PolicyError {
                 min,
                 max,
             } => write!(f, "{field}={value} outside {min}..={max}"),
+            Self::InvalidLifecycleOrder {
+                hot_days,
+                warm_days,
+                delete_after_days,
+            } => write!(
+                f,
+                "storage lifecycle requires hot_days <= warm_days < delete_after_days; got {hot_days}, {warm_days}, {delete_after_days}"
+            ),
         }
     }
 }
@@ -289,6 +437,51 @@ mod tests {
                 .validate()
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn storage_lifecycle_defaults_are_disabled_and_ordered() {
+        let policy = StorageLifecyclePolicyV1::default();
+        assert!(!policy.enabled);
+        assert_eq!(policy.hot_days, 7);
+        assert_eq!(policy.warm_days, 30);
+        assert_eq!(policy.delete_after_days, 90);
+        assert_eq!(policy.private_raw_days, 7);
+        assert_eq!(policy.maintenance_interval_seconds, 300);
+        assert_eq!(policy.max_traces_per_pass, 32);
+        policy.validate().unwrap();
+    }
+
+    #[test]
+    fn storage_lifecycle_rejects_invalid_order_and_bounds() {
+        for policy in [
+            StorageLifecyclePolicyV1 {
+                hot_days: 31,
+                ..StorageLifecyclePolicyV1::default()
+            },
+            StorageLifecyclePolicyV1 {
+                warm_days: 90,
+                ..StorageLifecyclePolicyV1::default()
+            },
+            StorageLifecyclePolicyV1 {
+                delete_after_days: 3_651,
+                ..StorageLifecyclePolicyV1::default()
+            },
+            StorageLifecyclePolicyV1 {
+                private_raw_days: 0,
+                ..StorageLifecyclePolicyV1::default()
+            },
+            StorageLifecyclePolicyV1 {
+                maintenance_interval_seconds: 59,
+                ..StorageLifecyclePolicyV1::default()
+            },
+            StorageLifecyclePolicyV1 {
+                max_traces_per_pass: 129,
+                ..StorageLifecyclePolicyV1::default()
+            },
+        ] {
+            assert!(policy.validate().is_err());
         }
     }
 }

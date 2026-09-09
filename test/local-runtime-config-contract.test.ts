@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import validateConfig from "../ui/settings/generated/validate-local-runtime-config-v3.js";
+import { validateLocalRuntimeConfig } from "../ui/settings/config-validation.js";
 
 const fixture = JSON.parse(
-  await readFile("contracts/local-runtime-config-v3.fixture.json", "utf8"),
+  await readFile("contracts/local-runtime-config-v5.fixture.json", "utf8"),
 );
 const parityCases = JSON.parse(
-  await readFile("contracts/local-runtime-config-v3.parity.json", "utf8"),
+  await readFile("contracts/local-runtime-config-v4.parity.json", "utf8"),
 ) as ParityCase[];
 
 interface ParityCase {
@@ -18,15 +18,15 @@ interface ParityCase {
   valid: boolean;
 }
 
-test("generated settings validator accepts the Rust default fixture", () => {
-  assert.equal(validateConfig(structuredClone(fixture)), true, JSON.stringify(validateConfig.errors));
+test("composite v5 settings validator accepts the default fixture", () => {
+  assert.equal(validateLocalRuntimeConfig(structuredClone(fixture)).valid, true);
 });
 
-test("generated settings validator matches the shared Rust parity corpus", () => {
+test("composite v5 validator preserves every inherited v4 parity constraint", () => {
   for (const parityCase of parityCases) {
     const document = structuredClone(fixture);
     applyParityCase(document, parityCase);
-    assert.equal(validateConfig(document), parityCase.valid, parityCase.name);
+    assert.equal(validateLocalRuntimeConfig(document).valid, parityCase.valid, parityCase.name);
   }
 });
 

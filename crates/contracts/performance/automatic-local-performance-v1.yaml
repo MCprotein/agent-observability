@@ -1,6 +1,6 @@
 schema_version: automatic_local_performance.v1
 version: v1.8.3
-protocol_revision: v1.8.3-codex-0.152.1-private-ca-header-ownership-rebase-real-e2e-synthetic-diagnostics-rss-p95-v4
+protocol_revision: v1.8.3-codex-0.152.1-private-ca-header-ownership-rebase-real-e2e-synthetic-diagnostics-rss-p95-v5-paged-snapshot-parity
 purpose: normative automatic release evidence for real Codex compatibility, local lifecycle, privacy, and synthetic collector performance
 profiles:
   release:
@@ -32,7 +32,8 @@ workload:
   notify_boundary: separately verified built agent-observability codex-notify supplement through private-CA HTTPS with the exact private random request header
   collector_boundary: built agent-observability collector-serve subprocess
   payload: bounded synthetic Codex-shaped WebSocket-request/completed OTLP log pairs with opaque identifiers; one bounded notify supplement per measured run whose raw sentinels must be absent from the durable tree
-  readiness: successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, exactly two durable synthetic records per accepted OTLP request plus one notify record, acknowledged report generation, and HTML generatedSpans parity with authoritative SQLite must converge before collector shutdown
+  readiness: successful private-CA HTTPS and exact-header health probe through the centralized local-collector client within a bounded startup deadline; after every measured run, ready health, exactly two durable synthetic records per accepted OTLP request plus one notify record, and one current validated published paged snapshot whose generation, visibility epoch, metadata record count, and indexed row count match authoritative SQLite must converge before collector shutdown
+  convergence_failures: Retry only explicit SQLite busy/locked, catalog Busy, not-ready or proven snapshot consistency races within the existing startup deadline; durable failures stop on the first poll with zero sleeps and map only published_snapshot_open_failed, published_snapshot_authority_failed, published_snapshot_catalog_failed or published_snapshot_validation_failed into manifest errors; public stderr remains automatic_check_failed
   collector_shutdown: bounded child termination and wait
 metrics:
   synthetic_collector_otlp:
@@ -60,7 +61,7 @@ execution:
   build_timeout_seconds: 600
   startup_timeout_seconds: 10
   cleanup_timeout_seconds: 5
-  fail_closed: missing or invalid benchmark metrics, real Codex execution or native OTLP failure, rejected synthetic OTLP requests, Codex version or strict config-load incompatibility, missing notify or report convergence evidence, durable raw sentinels, non-loopback endpoints, timeout, or threshold breach produce non-zero exit
+  fail_closed: missing or invalid benchmark metrics, real Codex execution or native OTLP failure, rejected synthetic OTLP requests, Codex version or strict config-load incompatibility, missing notify or published paged report convergence evidence, durable raw sentinels, non-loopback endpoints, timeout, or threshold breach produce non-zero exit
 evidence:
   output: docs/evidence/local/performance/automatic-<run>/manifest.yaml
   exact_source: full git commit, Rust 1.97.0 locked build command, tested binary, package version, profile, and protocol revision

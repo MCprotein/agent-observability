@@ -12,6 +12,48 @@ fn binary() -> Command {
 }
 
 #[cfg(unix)]
+#[test]
+fn report_waits_for_root_contention_before_creating_the_store() {
+    use agent_observability_local_runtime::{MutationGuard, storage_coherence::StorageBarrier};
+    for initialized in [false, true] {
+        let root = std::env::temp_dir().join(format!(
+            "agentobs-report-root-wait-{}-{initialized}",
+            std::process::id()
+        ));
+        assert!(!root.exists());
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        if initialized {
+            StorageBarrier::initialize(&root, &mutation).unwrap();
+        }
+        let child = binary()
+            .args(["report", root.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let waiting = assert_command_waits(child);
+        assert!(!layout.state.join("store").exists());
+        assert!(!layout.logs.join("agent-observability-report.html").exists());
+        drop(mutation);
+        let output = waiting.finish();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("records=0\n"));
+        assert!(
+            layout
+                .logs
+                .join("agent-observability-report.html")
+                .is_file()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
 fn private_codex_handoff(root: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
@@ -40,9 +82,87 @@ fn spawn_codex_ingest(root: &Path, handoff: &Path) -> Child {
 }
 
 #[cfg(unix)]
-fn assert_ingest_waits(child: &mut Child) {
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    assert!(child.try_wait().unwrap().is_none());
+struct WaitingCommand {
+    child: Child,
+    stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+}
+
+#[cfg(unix)]
+impl WaitingCommand {
+    fn finish(mut self) -> std::process::Output {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command completion timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        std::process::Output {
+            status,
+            stdout: self.stdout.take().unwrap().join().unwrap(),
+            stderr: self.stderr.take().unwrap().join().unwrap(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for WaitingCommand {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.stdout.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.stderr.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_command_waits(mut child: Child) -> WaitingCommand {
+    use std::io::Read as _;
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let stdout = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.take(1024 * 1024).read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let stderr = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut reader = BufReader::new(stderr.take(1024 * 1024));
+        loop {
+            let mut line = Vec::new();
+            if reader.read_until(b'\n', &mut line).unwrap() == 0 {
+                break;
+            }
+            if line == b"waiting=runtime_mutation\n" {
+                let _ = ready_tx.send(());
+            }
+            bytes.extend(line);
+        }
+        bytes
+    });
+    let ingest = WaitingCommand {
+        child,
+        stdout: Some(stdout),
+        stderr: Some(stderr),
+    };
+    assert!(
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .is_ok(),
+        "command did not acknowledge root contention: binary={}",
+        env!("CARGO_BIN_EXE_agent-observability"),
+    );
+    ingest
 }
 
 #[cfg(unix)]
@@ -158,6 +278,42 @@ fn invalid_real_process_command_fails_on_stderr() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown command"));
 }
 
+#[cfg(unix)]
+#[test]
+fn dashboard_durable_startup_failure_exits_nonzero_with_actionable_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agent-observability-cli-dashboard-startup-failure-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let setup = binary()
+        .args(["setup", root.to_str().unwrap(), "--no-open"])
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    let store = installed_store(&root).join("local-store.sqlite3");
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o644)).unwrap();
+    let dashboard = binary()
+        .args(["dashboard-serve", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(!dashboard.status.success());
+    assert!(dashboard.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&dashboard.stderr)
+            .contains("local store permissions are too broad")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn codex_notify_real_process_rejects_before_io_with_zero_exit() {
     let root = std::env::temp_dir().join(format!(
@@ -228,7 +384,7 @@ fn init_and_runtime_check_create_only_private_local_paths() {
         "{}",
         String::from_utf8_lossy(&init.stderr)
     );
-    assert!(String::from_utf8_lossy(&init.stdout).contains("config_schema=local_runtime.v3"));
+    assert!(String::from_utf8_lossy(&init.stdout).contains("config_schema=local_runtime.v5"));
     assert_eq!(
         fs::metadata(&root).unwrap().permissions().mode() & 0o777,
         0o700
@@ -265,7 +421,88 @@ fn init_and_runtime_check_create_only_private_local_paths() {
     assert!(stdout.contains("singleton=held"));
     assert!(stdout.contains("storage_admission=allowed"));
     assert!(stdout.contains("team_ingest=disabled"));
+    assert!(!stdout.contains("storage_accounting="));
+    assert!(!root.join("runtime/storage-accounting.lock").exists());
     let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_check_observes_initialized_ownership_after_store_preparation() {
+    use agent_observability_local_runtime::{MutationGuard, storage_coherence::StorageBarrier};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agentobs-runtime-ownership-process-{}",
+        std::process::id()
+    ));
+    assert!(!root.exists());
+    let layout = install(&root).unwrap();
+    let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+    StorageBarrier::initialize(&root, &mutation).unwrap();
+    drop(mutation);
+    let sentinel = layout.logs.join("unknown-empty");
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&sentinel)
+        .unwrap();
+
+    let check = binary()
+        .args(["runtime-check", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(stdout.contains("storage_accounting=observed\n"), "{stdout}");
+    assert!(stdout.contains("accounting_stage=post_store_open\n"));
+    assert!(stdout.contains("accounting_unknown_bytes=0\n"));
+    assert!(stdout.contains("accounting_unknown_entries=1\n"));
+    assert!(stdout.contains("storage_admission=allowed\n"));
+    assert!(stdout.contains("separated_admission=disabled"));
+    assert!(layout.state.join("store/local-store.sqlite3").is_file());
+    assert_eq!(fs::metadata(&sentinel).unwrap().len(), 0);
+    assert!(!stdout.contains(root.to_str().unwrap()));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_check_rejects_invalid_ownership_without_success_output() {
+    use agent_observability_local_runtime::{MutationGuard, storage_coherence::StorageBarrier};
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "agentobs-runtime-invalid-owner-process-{}",
+        std::process::id()
+    ));
+    assert!(!root.exists());
+    let layout = install(&root).unwrap();
+    let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+    StorageBarrier::initialize(&root, &mutation).unwrap();
+    drop(mutation);
+    let marker = layout.runtime.join("report-dirty");
+    let private = b"private malformed owner sentinel";
+    fs::write(&marker, private).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    let check = binary()
+        .args(["runtime-check", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+    assert!(check.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&check.stderr).contains("storage accounting unavailable"));
+    assert!(!String::from_utf8_lossy(&check.stderr).contains("private malformed owner sentinel"));
+    assert!(!String::from_utf8_lossy(&check.stderr).contains(root.to_str().unwrap()));
+    assert_eq!(fs::read(&marker).unwrap(), private);
+    // The command remains migration-capable; only its subsequent observation is read-only.
+    assert!(layout.state.join("store/local-store.sqlite3").is_file());
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]
@@ -291,9 +528,11 @@ fn setup_and_config_set_work_end_to_end_in_the_real_process() {
     assert!(setup_output.contains("status=ready"));
     assert!(setup_output.contains("collection=manual_import"));
     assert!(setup_output.contains("opened=false"));
-    let dashboard = root.join("logs/agent-observability-report.html");
+    assert!(setup_output.contains("dashboard_command=agentobs dashboard"));
+    assert!(!root.join("logs/agent-observability-report.html").exists());
+    let store = root.join("state/store/local-store.sqlite3");
     assert_eq!(
-        fs::metadata(&dashboard).unwrap().permissions().mode() & 0o777,
+        fs::metadata(&store).unwrap().permissions().mode() & 0o777,
         0o600
     );
 
@@ -328,7 +567,8 @@ fn setup_and_config_set_work_end_to_end_in_the_real_process() {
         0o600
     );
 
-    fs::remove_file(&dashboard).unwrap();
+    let dashboard = root.join("logs/agent-observability-report.html");
+    assert!(!dashboard.exists());
     let dashboard_command = binary()
         .args(["report", root.to_str().unwrap()])
         .output()
@@ -492,6 +732,26 @@ fn retention_plan_is_read_only_and_apply_writes_one_private_archive() {
     );
     assert!(!inside_archive.exists());
 
+    let publication_store = LocalStore::open(installed_store(&runtime)).unwrap();
+    let publication_guard = publication_store.acquire_report_render_guard().unwrap();
+    let html_before = fs::read(&dashboard).unwrap();
+    let busy = binary()
+        .args([
+            "retention-apply",
+            runtime.to_str().unwrap(),
+            plan_id,
+            archive.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!busy.status.success());
+    assert!(String::from_utf8_lossy(&busy.stderr).contains("report publication is busy"));
+    assert_eq!(fs::read(&dashboard).unwrap(), html_before);
+    assert_eq!(fs::read(&projection).unwrap(), before);
+    assert!(!archive.exists());
+    drop(publication_guard);
+    drop(publication_store);
+
     let apply = binary()
         .args([
             "retention-apply",
@@ -507,6 +767,9 @@ fn retention_plan_is_read_only_and_apply_writes_one_private_archive() {
         String::from_utf8_lossy(&apply.stderr)
     );
     assert!(String::from_utf8_lossy(&apply.stdout).contains("applied=1"));
+    let pending_report = fs::read_to_string(&dashboard).unwrap();
+    assert!(pending_report.contains("리포트 갱신 대기"));
+    assert!(!pending_report.contains("generatedSpans"));
     assert_eq!(
         fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
         0o600
@@ -635,15 +898,14 @@ fn concurrent_disable_blocks_manual_ingest_before_admission() {
     let layout = install(&root).unwrap();
     let handoff = private_codex_handoff(&root);
     let guard = ConfigMutationGuard::acquire(&layout).unwrap();
-    let mut ingest = spawn_codex_ingest(&root, &handoff);
-    assert_ingest_waits(&mut ingest);
+    let ingest = assert_command_waits(spawn_codex_ingest(&root, &handoff));
 
     let mut config = load(&layout.config).unwrap();
     config.enabled = false;
     save(&guard, &config).unwrap();
     drop(guard);
 
-    let output = ingest.wait_with_output().unwrap();
+    let output = ingest.finish();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("collection_disabled=1"));
     assert!(!root.join("state/store/local-store.sqlite3").exists());
@@ -662,15 +924,14 @@ fn concurrent_budget_reduction_blocks_manual_ingest_before_commit() {
     let handoff = private_codex_handoff(&root);
     inflate_allocated_accounting(&root);
     let guard = ConfigMutationGuard::acquire(&layout).unwrap();
-    let mut ingest = spawn_codex_ingest(&root, &handoff);
-    assert_ingest_waits(&mut ingest);
+    let ingest = assert_command_waits(spawn_codex_ingest(&root, &handoff));
 
     let mut config = load(&layout.config).unwrap();
     config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
     save(&guard, &config).unwrap();
     drop(guard);
 
-    let output = ingest.wait_with_output().unwrap();
+    let output = ingest.finish();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("storage_blocked=1"));
     assert!(!root.join("state/store/local-store.sqlite3").exists());

@@ -4,10 +4,14 @@ import { existsSync } from "node:fs";
 const generatedJavaScript = new Set([
   "crates/local-ui/src/generated/settings-ui.js",
   "src/report/generated/report-ui.js",
+  "src/report/generated/paged-ui.js",
   "ui/report/generated/validate-report-dto-v2.js",
   "ui/report/generated/view-state.js",
   "ui/report/generated/view-summary.js",
-  "ui/settings/generated/validate-local-runtime-config-v3.js",
+  "ui/settings/generated/validate-local-runtime-config-v4.js",
+  "ui/settings/generated/validate-local-runtime-config-v5.js",
+  "ui/settings/generated/validate-codex-integration-status-v1.js",
+  "ui/settings/generated/validate-codex-integration-error-v1.js",
 ]);
 const managedToolingPrefixes = [".anamnesis/", ".claude/", ".codex/", ".cursor/"];
 

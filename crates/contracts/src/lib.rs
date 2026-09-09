@@ -1,3 +1,5 @@
+pub mod dashboard;
+
 use agent_observability_domain::{
     CorrelationIds, DomainSpanState, LifecycleState, ObservationId, SourceCursor, SourceGeneration,
     SpanId, SpanKind, StatusCode, Timing, TokenUsage, TraceId,
@@ -18,14 +20,68 @@ pub const RETENTION_ARCHIVE_SCHEMA: &str =
     include_str!("../../../contracts/retention-archive-entry-v1.schema.json");
 pub const LOCAL_RUNTIME_CONFIG_V2_SCHEMA: &str =
     include_str!("../../../contracts/local-runtime-config-v2.schema.json");
-pub const LOCAL_RUNTIME_CONFIG_SCHEMA: &str =
+pub const LOCAL_RUNTIME_CONFIG_V3_SCHEMA: &str =
     include_str!("../../../contracts/local-runtime-config-v3.schema.json");
+pub const LOCAL_RUNTIME_CONFIG_V4_SCHEMA: &str =
+    include_str!("../../../contracts/local-runtime-config-v4.schema.json");
+pub const LOCAL_RUNTIME_CONFIG_SCHEMA: &str =
+    include_str!("../../../contracts/local-runtime-config-v5.schema.json");
+pub const LOCAL_COLLECTOR_HEALTH_SCHEMA: &str =
+    include_str!("../../../contracts/local-collector-health-v1.schema.json");
+pub const CODEX_INTEGRATION_STATUS_SCHEMA: &str =
+    include_str!("../../../contracts/codex-integration-status-v1.schema.json");
 pub const ADAPTER_CAPABILITY_V1: &str = include_str!("../capabilities/adapter-capability-v1.yaml");
 pub const DURABLE_RECORD_VERSION: &str = "agent_observability.v1";
 pub const REPORT_DTO_V1_VERSION: &str = "agent_observability.report.v1";
 pub const REPORT_DTO_VERSION: &str = "agent_observability.report.v2";
 pub const MAX_REPORT_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 pub const RETENTION_ARCHIVE_VERSION: &str = "agent_observability.retention_archive.v1";
+pub const LOCAL_COLLECTOR_HEALTH_VERSION: &str = "local_collector_health.v1";
+pub const CODEX_INTEGRATION_STATUS_VERSION: &str = "codex_integration_status.v1";
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexConnectionStatusV1 {
+    Connected,
+    Disconnected,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CollectorStatusV1 {
+    Ready,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexNotifyStatusV1 {
+    AgentobsOwned,
+    ExternalPreserved,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectorDegradationReasonV1 {
+    LifecycleFailure,
+    StoragePressure,
+    ExpiredTrace,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CodexIntegrationStatusV1 {
+    pub schema_version: String,
+    pub config: CodexConnectionStatusV1,
+    pub notify: Option<CodexNotifyStatusV1>,
+    pub collector: CollectorStatusV1,
+    pub endpoint: Option<String>,
+    pub service: Option<String>,
+    pub data_retained: bool,
+    pub collector_degradation_reasons: Vec<CollectorDegradationReasonV1>,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -437,6 +493,7 @@ pub enum AdapterDispositionCode {
     ContentEventIgnored,
     PrimarySuperseded,
     DuplicateObservation,
+    ExpiredTrace,
 }
 
 impl AdapterDispositionCode {
@@ -450,6 +507,7 @@ impl AdapterDispositionCode {
             Self::ContentEventIgnored => "content_event_ignored",
             Self::PrimarySuperseded => "primary_superseded",
             Self::DuplicateObservation => "duplicate_observation",
+            Self::ExpiredTrace => "expired_trace",
         }
     }
 }
@@ -1586,45 +1644,59 @@ impl ReportDtoV2 {
             }
         }
         for span in &self.spans {
-            validate_finite(span.start_time_unix_ms)?;
-            if let Some(end) = span.end_time_unix_ms {
-                validate_finite(end)?;
-            }
-            validate_report_attributes(&span.attributes)?;
-            validate_report_metrics(&span.metrics)?;
-            let token_metrics_present = report_token_metrics_present(&span.metrics);
-            let token_total_present = report_token_total_present(&span.metrics);
-            let token_availability_valid = if token_total_present {
-                span.availability.tokens.state == AvailabilityStateV2::Available
-            } else if token_metrics_present {
-                span.availability.tokens.state == AvailabilityStateV2::SourceUnavailable
-                    && span.availability.tokens.reason == "partial_token_metrics"
-            } else {
-                span.availability.tokens.state != AvailabilityStateV2::Available
-            };
-            if !token_availability_valid {
-                return Err(ContractError::ContradictoryReportAvailability);
-            }
-            for field in [
-                &span.availability.repository,
-                &span.availability.turn,
-                &span.availability.model,
-                &span.availability.tokens,
-                &span.availability.latency,
-                &span.availability.source_location,
-                &span.availability.request_content,
-                &span.availability.response_content,
-            ] {
-                if !valid_availability_reason(field) {
-                    return Err(ContractError::ContradictoryReportAvailability);
-                }
-            }
-            if let Some(amount) = span.estimated_cost {
-                validate_finite(amount)?;
-            }
-            validate_cost(&span.cost)?;
+            span.validate()?;
         }
         Ok(())
+    }
+}
+
+impl ReportSpanV2 {
+    /// Validates one projected span without requiring a complete report allocation.
+    ///
+    /// This is the same nested contract used by [`ReportDtoV2::validate`], not a substitute
+    /// for privacy projection of source or durable records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractError`] for invalid numeric values or contradictory availability.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_finite(self.start_time_unix_ms)?;
+        if let Some(end) = self.end_time_unix_ms {
+            validate_finite(end)?;
+        }
+        validate_report_attributes(&self.attributes)?;
+        validate_report_metrics(&self.metrics)?;
+        let token_metrics_present = report_token_metrics_present(&self.metrics);
+        let token_total_present = report_token_total_present(&self.metrics);
+        let token_availability_valid = if token_total_present {
+            self.availability.tokens.state == AvailabilityStateV2::Available
+        } else if token_metrics_present {
+            self.availability.tokens.state == AvailabilityStateV2::SourceUnavailable
+                && self.availability.tokens.reason == "partial_token_metrics"
+        } else {
+            self.availability.tokens.state != AvailabilityStateV2::Available
+        };
+        if !token_availability_valid {
+            return Err(ContractError::ContradictoryReportAvailability);
+        }
+        for field in [
+            &self.availability.repository,
+            &self.availability.turn,
+            &self.availability.model,
+            &self.availability.tokens,
+            &self.availability.latency,
+            &self.availability.source_location,
+            &self.availability.request_content,
+            &self.availability.response_content,
+        ] {
+            if !valid_availability_reason(field) {
+                return Err(ContractError::ContradictoryReportAvailability);
+            }
+        }
+        if let Some(amount) = self.estimated_cost {
+            validate_finite(amount)?;
+        }
+        validate_cost(&self.cost)
     }
 }
 
@@ -1965,7 +2037,8 @@ impl ContractManifest {
             "retention_archive",
             "agent_observability.retention_archive.v1",
         )?;
-        self.expect("local_runtime_config", "local_runtime.v3")?;
+        self.expect("local_runtime_config", "local_runtime.v5")?;
+        self.expect("local_state", "local_state.v7")?;
         self.expect("durable_schema", "contracts/durable-record-v1.schema.json")?;
         self.expect("report_schema", "contracts/report-dto-v2.schema.json")?;
         self.expect(
@@ -1978,6 +2051,19 @@ impl ContractManifest {
         )?;
         self.expect("report_fixture", "contracts/report-dto-v2.fixture.json")?;
         self.expect("report_parity", "contracts/report-dto-v2.parity.json")?;
+        self.expect("dashboard_query", dashboard::DASHBOARD_QUERY_VERSION)?;
+        self.expect(
+            "dashboard_query_schema",
+            "contracts/dashboard-query-v1.schema.json",
+        )?;
+        self.expect(
+            "dashboard_query_fixture",
+            "contracts/dashboard-query-v1.fixture.json",
+        )?;
+        self.expect(
+            "dashboard_query_parity",
+            "contracts/dashboard-query-v1.parity.json",
+        )?;
         self.expect(
             "private_codex_turn_detail",
             "agent_observability.private_turn_detail.v1",
@@ -1998,19 +2084,37 @@ impl ContractManifest {
         )?;
         self.expect(
             "local_runtime_config_schema",
-            "contracts/local-runtime-config-v3.schema.json",
+            "contracts/local-runtime-config-v5.schema.json",
         )?;
         self.expect(
             "local_runtime_config_compatibility_schema",
-            "contracts/local-runtime-config-v2.schema.json",
+            "contracts/local-runtime-config-v4.schema.json",
         )?;
         self.expect(
             "local_runtime_config_fixture",
-            "contracts/local-runtime-config-v3.fixture.json",
+            "contracts/local-runtime-config-v5.fixture.json",
         )?;
         self.expect(
             "local_runtime_config_parity",
-            "contracts/local-runtime-config-v3.parity.json",
+            "contracts/local-runtime-config-v5.parity.json",
+        )?;
+        self.expect("local_collector_health", LOCAL_COLLECTOR_HEALTH_VERSION)?;
+        self.expect(
+            "local_collector_health_schema",
+            "contracts/local-collector-health-v1.schema.json",
+        )?;
+        self.expect(
+            "local_collector_health_fixture",
+            "contracts/local-collector-health-v1.fixture.json",
+        )?;
+        self.expect("codex_integration_status", CODEX_INTEGRATION_STATUS_VERSION)?;
+        self.expect(
+            "codex_integration_status_schema",
+            "contracts/codex-integration-status-v1.schema.json",
+        )?;
+        self.expect(
+            "codex_integration_status_fixture",
+            "contracts/codex-integration-status-v1.fixture.json",
         )?;
         self.expect("team_ingest", "disabled")?;
         Ok(())
@@ -2104,8 +2208,11 @@ impl Error for ContractError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        ADAPTER_CAPABILITY_V1, AdapterCapabilityManifestV1, CONTRACT_MANIFEST, ContractManifest,
-        DURABLE_RECORD_SCHEMA, LOCAL_RUNTIME_CONFIG_SCHEMA, RATE_TABLE_SCHEMA, REPORT_DTO_SCHEMA,
+        ADAPTER_CAPABILITY_V1, AdapterCapabilityManifestV1, CODEX_INTEGRATION_STATUS_SCHEMA,
+        CODEX_INTEGRATION_STATUS_VERSION, CONTRACT_MANIFEST, CodexConnectionStatusV1,
+        CodexIntegrationStatusV1, CodexNotifyStatusV1, CollectorDegradationReasonV1,
+        CollectorStatusV1, ContractManifest, DURABLE_RECORD_SCHEMA, LOCAL_COLLECTOR_HEALTH_SCHEMA,
+        LOCAL_RUNTIME_CONFIG_SCHEMA, RATE_TABLE_SCHEMA, REPORT_DTO_SCHEMA,
         RETENTION_ARCHIVE_SCHEMA, redact_sensitive_text,
     };
 
@@ -2121,9 +2228,52 @@ mod tests {
             RATE_TABLE_SCHEMA,
             RETENTION_ARCHIVE_SCHEMA,
             LOCAL_RUNTIME_CONFIG_SCHEMA,
+            LOCAL_COLLECTOR_HEALTH_SCHEMA,
+            CODEX_INTEGRATION_STATUS_SCHEMA,
+            super::dashboard::DASHBOARD_QUERY_SCHEMA,
         ] {
             assert!(schema.contains("\"additionalProperties\": false"));
         }
+    }
+
+    #[test]
+    fn codex_integration_status_v1_serializes_closed_typed_reasons() {
+        let status = CodexIntegrationStatusV1 {
+            schema_version: CODEX_INTEGRATION_STATUS_VERSION.into(),
+            config: CodexConnectionStatusV1::Connected,
+            notify: Some(CodexNotifyStatusV1::AgentobsOwned),
+            collector: CollectorStatusV1::Degraded,
+            endpoint: Some("https://127.0.0.1:4318/v1/logs".into()),
+            service: Some("dev.agent-observability.collector".into()),
+            data_retained: true,
+            collector_degradation_reasons: vec![
+                CollectorDegradationReasonV1::LifecycleFailure,
+                CollectorDegradationReasonV1::StoragePressure,
+                CollectorDegradationReasonV1::ExpiredTrace,
+            ],
+        };
+        let value = serde_json::to_value(&status).expect("integration status serializes");
+        assert_eq!(value["schema_version"], CODEX_INTEGRATION_STATUS_VERSION);
+        assert_eq!(value["config"], "connected");
+        assert_eq!(value["notify"], "agentobs_owned");
+        assert_eq!(value["collector"], "degraded");
+        assert_eq!(
+            value["collector_degradation_reasons"],
+            serde_json::json!(["lifecycle_failure", "storage_pressure", "expired_trace"])
+        );
+        assert!(
+            serde_json::from_value::<CodexIntegrationStatusV1>(serde_json::json!({
+                "schema_version": CODEX_INTEGRATION_STATUS_VERSION,
+                "config": "connected",
+                "notify": null,
+                "collector": "degraded",
+                "endpoint": null,
+                "service": null,
+                "data_retained": true,
+                "collector_degradation_reasons": ["unknown"]
+            }))
+            .is_err()
+        );
     }
 
     #[test]

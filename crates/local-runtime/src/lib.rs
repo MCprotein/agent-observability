@@ -11,15 +11,27 @@ pub mod control;
 pub mod ingress;
 pub mod lock;
 pub mod policy;
+pub mod reservation;
 pub mod scheduler;
 pub mod storage;
+pub mod storage_coherence;
+pub mod storage_inventory;
+pub mod storage_policy;
 
 pub use control::{ControlError, RuntimeControl};
 pub use ingress::{Ingress, IngressCounters, IngressMessage, IngressOutcome};
-pub use lock::{MutationGuard, Singleton, SingletonError};
-pub use policy::{CollectionPolicyV1, RetentionPolicyV1};
+pub use lock::{
+    CoordinatedSingletonError, CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+    Singleton, SingletonError,
+};
+pub use policy::{
+    CollectionPolicyV1, RetentionPolicyV1, StorageBudgetMode, StorageBudgetPolicyV1,
+    StorageLifecyclePolicyV1,
+};
+pub use reservation::{REPORT_RESERVATION_METADATA_ALLOWANCE, ReservationError, WriteReservation};
 pub use scheduler::{PressureSample, Schedule, Scheduler, State};
 pub use storage::{Admission, Partition, StorageAccountingError, StorageBudget, StorageError};
+pub use storage_inventory::{StorageAllocationClass, StorageInventoryError};
 
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
@@ -29,6 +41,7 @@ pub const CHANNEL_CAPACITY: usize = 64;
 pub const NORMALIZATION_WORKERS: usize = 1;
 pub use config::{
     ConfigError, ConfigMutationGuard, ConfigServiceError, InstalledLayout,
-    LOCAL_RUNTIME_CONFIG_VERSION, LocalConfigService, LocalRuntimeConfigV3, VersionedLocalConfig,
-    inspect, install, load, revision, save, save_if_revision,
+    LOCAL_RUNTIME_CONFIG_VERSION, LocalConfigService, LocalRuntimeConfigV3, LocalRuntimeConfigV4,
+    LocalRuntimeConfigV5, VersionedLocalConfig, inspect, install, load, revision, save,
+    save_if_revision,
 };

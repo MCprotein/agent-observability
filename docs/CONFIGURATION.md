@@ -69,6 +69,10 @@ integration mutation도 private UI session, exact Host와 Origin을 확인하고
 
 ## Options
 
+The table below describes published v1.10.0. Opt-in lifecycle settings for v1.11.0 are under
+development and tracked separately in [Storage Lifecycle](STORAGE_LIFECYCLE.md); they must not be
+confused with the existing manual `retention-days` cutoff.
+
 | Option | Default | Allowed | Purpose |
 | --- | ---: | ---: | --- |
 | `enabled` | `true` | `true`, `false` | manual import와 automatic collector ingest 허용 여부 |
@@ -84,9 +88,78 @@ integration mutation도 private UI session, exact Host와 Origin을 확인하고
 | `archive-records` | `10000` | `1..100000` | 한 archive의 최대 record 수 |
 | `archive-bytes` | `16777216` | `65536..268435456` | 한 archive의 최대 bytes |
 
-시간 option은 milliseconds, 용량 option은 bytes 단위다. 설정 변경은 자동 cleanup을 실행하지
+위 표의 시간 option은 milliseconds, 용량 option은 bytes 단위다. 게시된 v1.10.0에서는 설정 변경이 자동 cleanup을 실행하지
 않는다. `retention-days` 변경 후 실제 만료 대상은 `retention-plan`으로 확인하고
 `retention-apply`로 명시적으로 적용한다.
+
+### v1.11.0 개발 브랜치: 설정 파일 읽기 제한
+
+개발 브랜치는 `config.json`을 최대 **64 KiB (65,536 bytes)**까지 읽는다. JSON 공백도
+크기에 포함하며 초과하면 `local runtime configuration input is too large` 오류로
+거부한다. 파일을 자동으로 줄이거나 덮어쓰지 않는다. 이 제한은 작은 설정 파일의 읽기
+자원을 보호하는 것으로, 아래의 데이터 저장 예산과 별개다. 정상 CLI/웹이 생성하는 유효한
+설정은 이 범위 안에 들어간다. FIFO 같은 일반 파일이 아닌 경로는 데이터가 오기를
+기다리지 않고 거부하며, 기존 private 권한·symlink 검사도 유지한다.
+
+### v1.11.0 개발 브랜치: 자동 보관 설정
+
+아래 옵션은 아직 게시되지 않은 개발 브랜치에 구현 중이다. `settings`의 **자동 보관** 영역에서
+변경하며, 기존 **수동 정리**의 `retention-days`와 별개다. 기간은 모두 마지막 trace 관측부터
+계산하는 누적 일수다.
+
+| Option | Default | Allowed | Purpose |
+| --- | ---: | --- | --- |
+| `lifecycle-enabled` | `false` | `true`, `false` | 자동 단계 전환과 만료 삭제 활성화 |
+| `hot-days` | `7` | `1..3650` | Hot에서 Warm으로 이동하는 나이 |
+| `warm-days` | `30` | `1..3650` | Warm에서 Cold로 이동하는 나이 |
+| `delete-after-days` | `90` | `1..3650` | 관리 대상 trace를 삭제하는 나이 |
+| `private-raw-days` | `7` | `1..3650` | 원문 상세의 별도 보관 일수 |
+| `maintenance-interval-seconds` | `300` | `60..86400` | 정리 실행 간격(초) |
+| `max-traces-per-pass` | `32` | `1..128` | 한 번에 검사하는 최대 trace 수 |
+
+`hot-days <= warm-days < delete-after-days`여야 한다. `archive-records`, `archive-bytes`는
+단계 전환 작업에도 record/byte 상한을 제공한다. 자동 정리를 켜거나 기간을 줄이면 기존 데이터도
+다음 실행의 삭제 대상이 될 수 있으며 삭제는 되돌릴 수 없다. 개발 브랜치는 기존 v1/v2/v3
+설정을 `local_runtime.v5`로 읽되 자동 정리를 끈 상태로 이전한다. v4에 이미 저장된 자동
+정리 선택은 그대로 보존한다. 설정을 읽는 것만으로 파일을 다시 쓰지는 않는다.
+
+collector가 실행 중일 때 설정을 다시 읽어 적용하며, 마지막 수집 뒤 30초의 조용한 구간에서만
+자동 작업을 시작한다. 지속적인 수집, 잠금 충돌, 용량 부족은 정리를 지연시킬 수 있으므로 만료
+시각의 즉시 삭제를 보장하지 않는다. collector 없는 사용은 `agentobs lifecycle-run <runtime>`으로
+한 번 실행한다. 전체 안전 조건은 [Storage Lifecycle](STORAGE_LIFECYCLE.md)을 따른다.
+
+## 저장 공간 예산
+
+아래는 현재 정책이다. v1.11 후속 [저장 예산 분리 계획](STORAGE_BUDGET_POLICY.md)은
+보관 목표·작업 공간·기기 여유를 구분한다. 개발 브랜치의 P1은 v5 설정 계약과 검증기만
+추가했으며 새 admission 정책은 아직 연결하지 않았다. 기본 모드는 `legacy`이고 기존
+`storage-bytes` 값과 의미는 바뀌지 않는다. `separated`는 계약 검증용으로만 표현 가능하며
+설정 파일 load/save와 runtime 실행은 거부한다. 직접 파일을 편집해 활성화하지 않는다.
+P2/P3 연결과 수용성 검증 전에는 CLI/웹에 새 정책 전환 기능을 노출하지 않는다.
+
+`storage-bytes`의 기본값은 **1 GiB = 1,073,741,824 bytes**이며 설정 범위는
+**256 MiB~20 GiB**다. RAM이나 컴퓨터 전체 디스크의 한도가 아니라 이 도구가 관리하는
+runtime 디렉터리의 디스크 예산이다. DB 외에도 인덱스, 리포트, journal, 임시 파일과
+원자적 교체 중의 이전·새 파일을 포함하고, 파일의 논리적 길이가 아닌 할당된 블록으로 계산한다.
+
+이 수치는 초기 아키텍처 커밋 `9284f3d`에서 **실측 전 planning budget**으로 지정됐고,
+v0.13.0 구현 `6e6b9f1`에 기본값으로 들어갔다. 해당 설계·도입 변경에는 사용자의 평균
+사용량이나 보관 일수에서 1 GiB를 산출한 근거가 없다. 성능검사도 이 값을 고정 기준으로
+사용하지만, 검사 통과가 모든 사용 패턴에서 충분한 용량이라는 뜻은 아니다.
+
+전체 예산 중 `max(32 MiB, 예산/8)`과 파티션 반올림 잔여분은 안전 여유로 남긴다.
+1 GiB 설정에서는 새 쓰기의 사전 심사에 사용하는 유효 한도가 **894 MiB**다.
+현재 할당량에 트랜잭션 임시 공간과 진행 중인 report 예약을 더해 심사하므로,
+현재 파일 합계가 1 GiB 미만이어도 수집이 거부될 수 있다. 기존의 보수적인 수집 정책은
+store 전체 크기와 최대 batch 크기를 추가로 예약한다. 후속
+[P0 결정안](STORAGE_BUDGET_P0.md)은 이 보수적인 산정치를 먼저 유지하면서 명시적
+분리 모드에서 별도 작업 예산으로 심사한다. 아직 구현이나 실제 설치본의 수집 복구를
+의미하지 않는다.
+
+설정 화면 또는 `agentobs config set storage-bytes 2147483648`로 예산을 변경할 수 있다.
+예산을 줄여도 유효기간이 남은 데이터를 임의 삭제하지 않는다. 보관 기간과 자동 삭제는
+별도 [Storage Lifecycle](STORAGE_LIFECYCLE.md) 설정이며, 용량을 늘리는 것만으로
+저장 엔진의 과도한 임시 공간 예약 문제가 해결됐다고 판단하지 않는다.
 
 `enabled`, `private-codex-details`, `batch-records`, `batch-bytes`, `storage-bytes`는 Codex automatic collector가
 요청마다 다시 읽고 적용하므로 UI나 CLI에서 바꾼 뒤 collector를 재시작할 필요가 없다. Codex

@@ -55,7 +55,7 @@ gate를 통과해 추가한다.
 | v0.x | Completed | Local-only PoC를 작은 minor release로 쪼개 검증했다. |
 | v1.x | Active | Local-only stable: Codex, Claude Code, Cursor adapter와 static HTML report를 안정화한다. |
 
-## Active Train: v0.1.0-v1.10.0
+## Active Train: v0.1.0-v1.11.0
 
 | Version | Status | Scope | Exit Evidence |
 | --- | --- | --- | --- |
@@ -97,6 +97,135 @@ gate를 통과해 추가한다.
 | v1.9.1 | Released | Settings status and LaunchAgent recovery hotfix | Refresh Codex integration status without page reload, ignore stale overlapping responses, keep session expiry authoritative, retry one transient startup-unavailable state, and tolerate bounded asynchronous `launchctl bootout` convergence | Exact-source evidence run `33879838197`, independent review in `docs/reviews/v1.9.1.md`, merge `494ddbb8d8d78c6da74d9f30b167ade302616fb3`, and release run `33878650227` passed; public Release, Package, checksums, attestations, fresh v1.9.1 install, Settings QA, and live Codex dashboard growth verified |
 | v1.10.0 | Released | Explainable source context and private detail visibility | Replace ambiguous `unknown` rendering with field-level availability reasons, populate verified project/repository and bounded source-location metadata, and add standalone-only explicit opt-in private request detail storage and inspection; assistant response content remains unavailable unless an official source supplies it | Exact-source evidence run `33979306300`, independent review in `docs/reviews/v1.10.0.md`, merge `4996ece47c179fe47d0ce8dadb65a9621e3abf62`, and release run `34021039994` passed; public Release, Package publication step, all distributable checksums, universal archive attestation, public installer upgrade, and live Chrome dashboard growth verified |
 
+### v1.11.0 — Local storage lifecycle and paged dashboard (In Progress)
+
+**우선순위 재설정 — 2026-09-09.** 새 저장 예산 정책(P3–P5)의 추가 구현은 보류한다.
+이미 검토한 비활성 코드는 활성화하지 않으며, 미완성 복구 사전 검사 테스트는 별도 로컬
+패치로 보존했다. 기존 모드의 실제 사용 검증과 새 정책 개발을 같은 완료 기준으로 섞지 않는다.
+
+**병합 범위 분리 — 2026-09-09 사용자 결정.** 실제 신규 수집 복구는 v1.12.0으로
+분리한다. 이번 PR은 기존 실제 데이터의 대시보드 QA와 최종 독립 리뷰·필수 CI를
+통과하면 병합한다. 병합은 신규 수집 복구나 정식 배포 승인으로 해석하지 않는다.
+새 API·저장 구조·기능을 추가하지 않고 아래 병합 조건에 필요한 작업만 수행한다.
+
+| 항목 | 종료 증거 |
+| --- | --- |
+| 실제 설치 연결 | Codex 설정 충돌 원인 확인, 비소유 설정 보존, 수집기 상태 확인 |
+| 실제 데이터 수집 (후속 버전) | v1.12.0에서 동일 runtime의 새 실제 이벤트 저장을 전후 비교로 확인; 이번 병합 조건에서 제외 |
+| 대시보드 (이번 병합 조건) | 기존 실제 데이터의 일관된 격리 복사본으로 조회·필터·상세·갱신 검증. Chrome 확장 세션의 기존/전용 그룹 탭 사용; 원본 runtime 변경·반복 탭 열기 금지. 화면 QA와 API 검증을 구분 |
+| 병합 판단 (이번 병합 조건) | 정확한 PR head의 필수 CI와 독립 코드·아키텍처 리뷰. 장시간 exact-release 검증은 배포 전 별도 gate로 유지 |
+
+2026-09-09 실제 설치 확인: v1.10.0의 설정 충돌은 공식 `agentobs connect codex`로
+재조정했고, Codex 설정 파일의 SHA-256은 전후 동일하며 외부 notify도 보존됐다.
+수집기 정상화까지 완료한 것은 아니다. 기존 admission 계산은 현재 할당
+508,960,768 + 저장소 전체 예약 464,617,472 + 배치 524,288 = 974,102,528 bytes로,
+허용치 937,426,944 bytes를 초과한다(시점 측정). 별도 `report` 실행도
+`report artifact exceeds the 32 MiB contract`로 실패했다. 예산 인상·원문 삭제·
+새 정책 활성화로 우회하지 않았다.
+
+PR head `227418e`의 macOS automatic smoke는 복구 후 OTLP 단계
+`lifecycle_post_recovery_otlp_failed`로 실패했다. artifact만으로 요청 실패와
+저장 증가 미관측을 구분할 수 없으므로, 설치 환경의 두 제한과 동일 원인이라고 단정하지
+않는다. 이 목록 밖의 개선은 별도 후속 작업으로 기록하고 이번 범위를 늘리지 않는다.
+
+**개발 추가 — 2026-09-08: 저장 예산 분리 (P1 설정 계약 검증 완료, 실제 정책 비활성).**
+사용자가 보관 목표·작업용 공간·기기 디스크 비상 여유를 구분하는 정책 방향을 승인했다.
+상세 계획과 검증 표는 [Storage Budget Policy](docs/STORAGE_BUDGET_POLICY.md)에 있다.
+기존 설치의 `storage-bytes` 의미와 삭제 설정은 보존하고, 새 정책은 명시적으로 선택한다.
+`unsafe`/FFI 예외, 자체 VFS, 실제 설치 변경은 포함하지 않는다.
+
+| 순서 | 계획 작업 | 통과 기준 |
+| --- | --- | --- |
+| P0 | [구체적 결정안](docs/STORAGE_BUDGET_P0.md): 기본값·범위·파일 분류·작업량 산정·호환성 | config P1 착수에 한해 독립 APPROVE; 파일 분류·report 연결은 P2/P3 별도 검증 |
+| P1 | v5 config와 기존 설정 보존 검증 완료; 분리 모드 활성화 차단 | legacy 보존, Rust/TS parity, 경계값·revision 테스트 통과; 독립 코드 APPROVE / 아키텍처 CLEAR |
+| P2 | T/W/F 순수 계산, 제한된 A/X/U 분류, config·예약 descriptor 증거와 공통 잠금 검증; [파일 소유권 기준](docs/STORAGE_OWNERSHIP.md)의 전체 조합을 `runtime-check` 진단에 연결 | TLS·원문/상태·Codex 설정·singleton·LaunchAgent·정적 HTML 분류, 읽기 전용 store/view 조합과 journal 사전 차단을 검증·커밋. 진단은 기존 store 준비 이후이며 쓰기 전 허가가 아님. 동시 연결의 설정 경합 경로를 `21b8105`에서 수정했고 CI `34318160216`의 Linux·macOS·UI가 통과했다. 운영 활성화·장시간 검증은 남아 있음. 정확한 증분·플랫폼 결과는 [review checkpoint](docs/reviews/v1.11.0.md) 참조 |
+| P3–P4 | 수집·보고서·정리 연결, CLI/웹 설정; 비활성 수집 판정(`bac7bdd`), 자기 예약 검증(`1f8ee65`), 보고서 검사 경계·CLI 판정(`9ce305b`, `4fb059e`), 복구 잠금·FIFO 읽기 보강(`dda4a38`, `5d99a69`)을 독립 검토·커밋. 파일 핸들 고갈 회귀·테스트 실행 보강(`4c1cf7c`, `588edb7`) 완료; 비변경 복구 사전 검사와 허가·작업별 연결은 후속으로 남아 있으나 현재 보류. 미완성 테스트는 로컬 패치로 보존 | transaction 유지, 명시적 전환, 실제 적용 revision·중단 이유 표시; 기본 수집 경로와 분리 모드 활성화는 아직 변경하지 않음 |
+| P5 (보류) | 새 정책의 장애·실제 규모·성능·문서 검증; 위 기존 모드 안정화 검증과 구분 | 새 수집→보고서 3세대, crash/replay, Chrome QA, exact-head CI와 독립 리뷰 |
+
+이 계획은 기존 hard-budget 연구의 후속 **정책 변경**이다. 보관 목표나 작업 시작 예산을
+순간 최대 물리 사용량 보장으로 표시하지 않는다. 아래 기존 실험과 실패 근거는 역사로
+유지하며, 계획 승인만으로 수집 복구·구현 완료·릴리즈 통과를 선언하지 않는다.
+
+Configurable Hot/Warm/Cold ages, managed-data expiry, independent raw-detail retention and
+bounded automatic maintenance. Existing installations keep automatic deletion disabled until
+explicitly enabled. No Elasticsearch or external storage dependency is introduced.
+
+Scope and release gates: [Storage Lifecycle](docs/STORAGE_LIFECYCLE.md). Completion requires actual
+tier movement/deletion, versioned configuration parity, replay/crash/pressure safety, settings QA,
+measured performance and independent review. Published stable version remains v1.10.0.
+
+The baseline `dd09e6d` long GitHub performance run passed. Live QA subsequently identified report
+refresh contention; the development fix uses an adaptive quiet window without weakening snapshot or
+deletion fences. Final-head checks, independent review and live recovery must pass before merging;
+the baseline measurement is not evidence for later code changes.
+Live-scale candidate QA also exceeds the 32 MiB single-HTML contract. This is a release blocker:
+The user approved [paged dashboard scope](docs/PAGED_DASHBOARD.md): bounded Rust queries and
+TypeScript page/detail loading, while preserving observations and the standalone HTML export.
+Paged query/index code and browser regressions are implemented in the development branch. The
+approved capacity follow-up adds shared runtime write reservations and a smaller v2 index while
+retaining v1 reads. Private-copy three-generation capacity validation has passed. Integrated release
+review, actual installed collection/recovery acceptance and final-head automatic performance remain gates. See
+[the current review checkpoint](docs/reviews/v1.11.0.md).
+
+The private-copy three-generation capacity check has passed. The remaining acknowledgement journal
+proof cannot use a single-leaf guard on the actual metadata layout. A dedicated fixed-width state
+table and bounded v6→v7 migration were explicitly approved and are implemented in the development
+branch with scoped regression verification complete. [Acknowledgement Storage](docs/ACKNOWLEDGEMENT_STORAGE.md)
+defines the migration and finalization allocation contract. Actual-runtime migration, final-head
+release evidence and merge remain pending; a measurement pass alone does not promote the stable version.
+
+Candidate `4d4261c` passed Linux/macOS/UI CI `34135886327`. Chrome extension QA on an isolated
+demo exposed two display defects, now fixed and independently reviewed: snapshot header state and
+token/cost details. Synthetic Chrome recheck passed; this is not installed-runtime acceptance.
+The subsequent exact-head workflow `34137212497` failed during setup preflight, before sustained
+measurement. A reproducible setup/publication-lock contention defect is corrected in development;
+its passing isolated smoke does not identify the historical workflow failure retroactively.
+Installed collection also remains blocked by conservative write admission. Runtime diagnostics must
+use that same admission policy; reducing transaction headroom requires separate rollback/capacity
+proof, not deletion or a larger budget. Details and evidence boundaries are in the current review.
+The user approved [staged-ingest design and implementation scope](docs/STAGED_INGEST.md).
+Reduced admission remains disabled until write-set/memory bounds, atomic rollback and
+post-publication ingestion capacity pass review and tests; approval does not mean installed recovery.
+The approved scope now includes new-dependency evaluation and a dedicated local ingestion process.
+[Isolated Ingest](docs/ISOLATED_INGEST.md) orders enforcement feasibility, private IPC, guarded
+storage integration, collector parity, real-scale acceptance and release gates. P0 must establish
+the disk/memory enforcement boundary before product integration; no dependency is adopted yet.
+The first shim dependency preflight found no suitable safe pass-through candidate under current
+Rust/unsafe policy. P1 is blocked for that candidate; compare alternatives without treating the
+design-scope approval as runtime recovery or permission to weaken the policy.
+A first existing-schema prerequisite replaces disposition retained-set materialization with a
+scalar rowid cutoff. Regression and synthetic VM-work evidence are in
+[Staged Ingest](docs/STAGED_INGEST.md#structural-path-investigation--disposition-pruning).
+This does not lower admission or close the physical-write/memory proof gate.
+Ordinary CI at `739d60f` passed Linux including five report-refresh repetitions and Report UI;
+macOS collector passed but a separate xtask snapshot test failed on a one-shot `Retry` unwrap.
+The follow-up verifies real contention and exact convergence through the existing bounded loop,
+and repeats the full xtask unit binary on macOS five times. That change was test-only.
+The next run at `1f101a8` passed UI but exposed a staging `Busy` in a macOS repetition and
+a Linux privacy-test notify deadline failure. A deterministic duplicate-descriptor regression
+now covers explicit render-guard unlock; the privacy fixture separates acceptance from the
+unchanged public 250ms fail-open deadline. Ordinary CI at `4f4155f` passed Linux, macOS and UI;
+the exact-revision long release job was skipped, not passed.
+Private-copy compaction reclaimed only 7,159,808 bytes; it is not a capacity recovery solution.
+A separate 1024-byte-page copy reclaimed 115,431,424 bytes with observed table/schema parity,
+but still failed new ingest after two retained views (209,735,680-byte admission deficit).
+The repeatable new-ingest rotation diagnostic and its boundaries are in Staged Ingest.
+Ordinary CI at `4f8c848` also passed all three platforms/surfaces. Local-only report-page
+1024/2048 experiments did not reduce the capacity deficit; the default4096 was restored.
+Geometry work is closed as insufficient. Future-write accounting or a separately reviewed
+authority representation remains the blocker; no reduced reservation or installed migration
+is enabled.
+
+The original-page-size private-copy check also leaves 158,167,040 bytes of deficit even under
+an optimistic whole-authority-only reservation, before journal overhead. Merely excluding
+derived views from the reservation is not a recovery for that copy. The numeric breakdown and
+unchanged-authority refusal check are in
+[Staged Ingest](docs/STAGED_INGEST.md#original-page-size-admission-check--september-8).
+The exact CI trigger remains unconfirmed; neither test stabilization nor smoke substitutes for
+capacity acceptance or release gates. Failed-smoke manifest retention is implemented.
+The earlier long workflow `34135080615` was cancelled before its normative job when those defects
+required a new candidate. Settle final changes before dispatching exact-revision long evidence.
+
 ## Branch Strategy
 
 - `main` is the stable line. It should only receive verified version work.
@@ -129,6 +258,14 @@ gate를 통과해 추가한다.
   condition.
 
 The contributor-facing procedure is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### v1.12.0 — Existing-runtime ingestion recovery (Planned)
+
+v1.11.0 병합 이후 별도 버전·브랜치에서 실제 설치의 storage-admission 수집 차단을
+해결한다. 저장 한도 인상, 원문 삭제, 비활성 정책의 무검증 활성화로 우회하지 않는다.
+현재 데이터·설정 보존, 한도 초과 시 안전한 취소, 재시도·재시작의 중복 방지와
+실제 새 이벤트의 저장→대시보드 반영을 검증한다. P3–P5 전체의 자동 재개를 뜻하지
+않으며, 구체적 구현 범위는 이 수집 복구에 필요한 최소 변경으로 확정한다.
 
 ## Future TODO
 

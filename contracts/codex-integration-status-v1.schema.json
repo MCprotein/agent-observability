@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "codex_integration_status.v1",
+  "title": "CodexIntegrationStatusV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "config",
+    "notify",
+    "collector",
+    "endpoint",
+    "service",
+    "data_retained",
+    "collector_degradation_reasons"
+  ],
+  "properties": {
+    "schema_version": { "const": "codex_integration_status.v1" },
+    "config": { "$ref": "#/$defs/codex_connection_status" },
+    "notify": {
+      "anyOf": [
+        { "$ref": "#/$defs/codex_notify_status" },
+        { "type": "null" }
+      ]
+    },
+    "collector": { "$ref": "#/$defs/collector_status" },
+    "endpoint": { "type": ["string", "null"] },
+    "service": { "type": ["string", "null"] },
+    "data_retained": { "type": "boolean" },
+    "collector_degradation_reasons": {
+      "type": "array",
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/collector_degradation_reason" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "collector": { "const": "degraded" } },
+        "required": ["collector"]
+      },
+      "else": {
+        "properties": {
+          "collector_degradation_reasons": { "type": "array", "maxItems": 0 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "codex_connection_status": {
+      "title": "CodexConnectionStatusV1",
+      "type": "string",
+      "enum": ["connected", "disconnected", "conflict"]
+    },
+    "codex_notify_status": {
+      "title": "CodexNotifyStatusV1",
+      "type": "string",
+      "enum": ["agentobs_owned", "external_preserved"]
+    },
+    "collector_status": {
+      "title": "CollectorStatusV1",
+      "type": "string",
+      "enum": ["ready", "degraded", "unavailable"]
+    },
+    "collector_degradation_reason": {
+      "title": "CollectorDegradationReasonV1",
+      "type": "string",
+      "enum": ["lifecycle_failure", "storage_pressure", "expired_trace"]
+    }
+  }
+}

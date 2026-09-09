@@ -4,10 +4,12 @@ import standaloneCodeModule from "ajv/dist/standalone/index.js";
 import { build } from "esbuild";
 import { compileFromFile } from "json-schema-to-typescript";
 
-const schemaPath = "contracts/local-runtime-config-v3.schema.json";
+const configSchemaPath = "contracts/local-runtime-config-v5.schema.json";
+const integrationStatusSchemaPath = "contracts/codex-integration-status-v1.schema.json";
 const generatedUiPath = "ui/settings/generated";
 const generatedRustPath = "crates/local-ui/src/generated";
-const banner = "Generated from contracts/local-runtime-config-v3.schema.json. Do not edit.";
+const configBanner = "Generated from contracts/local-runtime-config-v5.schema.json. Do not edit.";
+const integrationStatusBanner = "Generated from contracts/codex-integration-status-v1.schema.json. Do not edit.";
 const Ajv2020 = Ajv2020Module as unknown as typeof import("ajv/dist/2020.js").default;
 const standaloneCode = standaloneCodeModule as unknown as typeof import("ajv/dist/standalone/index.js").default;
 
@@ -16,25 +18,56 @@ await Promise.all([
   mkdir(generatedRustPath, { recursive: true }),
 ]);
 
-const declarations = await compileFromFile(schemaPath, {
-  bannerComment: `/* ${banner} */`,
+const configDeclarations = await compileFromFile(configSchemaPath, {
+  bannerComment: `/* ${configBanner} */`,
   style: { singleQuote: false },
 });
-await writeFile(`${generatedUiPath}/local-runtime-config-v3.d.ts`, declarations, "utf8");
+const integrationStatusDeclarations = await compileFromFile(integrationStatusSchemaPath, {
+  bannerComment: `/* ${integrationStatusBanner} */`,
+  style: { singleQuote: false },
+});
+await Promise.all([
+  writeFile(`${generatedUiPath}/local-runtime-config-v5.d.ts`, configDeclarations, "utf8"),
+  writeFile(
+    `${generatedUiPath}/codex-integration-status-v1.d.ts`,
+    integrationStatusDeclarations,
+    "utf8",
+  ),
+]);
 
-const browserSchema = JSON.parse(await readFile(schemaPath, "utf8"));
-delete browserSchema.$schema;
-delete browserSchema.$id;
 const ajv = new Ajv2020({ code: { esm: true, source: true }, strict: true });
-const validate = ajv.compile(browserSchema);
+const compileBrowserValidator = async (path: string) => {
+  const schema = JSON.parse(await readFile(path, "utf8"));
+  delete schema.$schema;
+  delete schema.$id;
+  return ajv.compile(schema);
+};
+const validateConfig = await compileBrowserValidator(configSchemaPath);
+const validateIntegrationStatus = await compileBrowserValidator(integrationStatusSchemaPath);
+const integrationErrorPath = "contracts/codex-integration-error-v1.schema.json";
+await writeFile(`${generatedUiPath}/codex-integration-error-v1.d.ts`, await compileFromFile(integrationErrorPath), "utf8");
+await writeFile(`${generatedUiPath}/validate-codex-integration-error-v1.js`,
+  standaloneCode(ajv, await compileBrowserValidator(integrationErrorPath)), "utf8");
+await writeFile(`${generatedUiPath}/validate-codex-integration-error-v1.d.ts`,
+  "declare const validate: (value: unknown) => boolean;\nexport default validate;\n", "utf8");
 await Promise.all([
   writeFile(
-    `${generatedUiPath}/validate-local-runtime-config-v3.js`,
-    standaloneCode(ajv, validate),
+    `${generatedUiPath}/validate-local-runtime-config-v5.js`,
+    standaloneCode(ajv, validateConfig),
     "utf8",
   ),
   writeFile(
-    `${generatedUiPath}/validate-local-runtime-config-v3.d.ts`,
+    `${generatedUiPath}/validate-local-runtime-config-v5.d.ts`,
+    "declare const validate: ((value: unknown) => boolean) & { errors?: Array<{ instancePath?: string; message?: string }> | null };\nexport default validate;\n",
+    "utf8",
+  ),
+  writeFile(
+    `${generatedUiPath}/validate-codex-integration-status-v1.js`,
+    standaloneCode(ajv, validateIntegrationStatus),
+    "utf8",
+  ),
+  writeFile(
+    `${generatedUiPath}/validate-codex-integration-status-v1.d.ts`,
     "declare const validate: ((value: unknown) => boolean) & { errors?: Array<{ instancePath?: string; message?: string }> | null };\nexport default validate;\n",
     "utf8",
   ),
@@ -48,7 +81,7 @@ await build({
   platform: "browser",
   target: ["es2022"],
   legalComments: "none",
-  banner: { js: `/* ${banner} */` },
+  banner: { js: `/* ${configBanner} */` },
 });
 
 await Promise.all([

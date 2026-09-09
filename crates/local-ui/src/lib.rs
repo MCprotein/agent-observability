@@ -1,22 +1,37 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
+mod dashboard_request;
+mod storage_ownership;
+
+pub use storage_ownership::{
+    DashboardCapabilityStorageOwnershipError, DashboardCapabilityStorageOwnershipEvidence,
+};
+
 use agent_observability_codex_integration::{
     CodexIntegrationStatus, IntegrationError, connect as connect_codex,
     disconnect as disconnect_codex, status as codex_status,
 };
 use agent_observability_contracts::MAX_REPORT_ARTIFACT_BYTES;
+use agent_observability_contracts::dashboard::{
+    DASHBOARD_QUERY_VERSION, DASHBOARD_RESPONSE_MAX_SERIALIZED_UTF8_BYTES, DashboardQueryRequestV1,
+    DashboardQueryResponseV1, DashboardRequestKindV1, DashboardStatusKindV1,
+    DashboardStatusReasonV1, DashboardStatusResponseV1,
+};
 use agent_observability_local_collector::{
     PrivateTurnDetailLookup, REPORT_FILE_NAME, lookup_private_turn_detail,
 };
 use agent_observability_local_runtime::{
-    ConfigServiceError, InstalledLayout, LocalConfigService, LocalRuntimeConfigV3, Singleton,
-    VersionedLocalConfig,
+    ConfigServiceError, CoordinatedSingletonScope, InstalledLayout, LocalConfigService,
+    LocalRuntimeConfigV3, ProductionSingleton, VersionedLocalConfig,
 };
+use agent_observability_local_store::{DashboardQueryService, LocalStore};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, FromRequest, Path as AxumPath, State, rejection::JsonRejection},
+    extract::{
+        DefaultBodyLimit, FromRequest, Path as AxumPath, RawQuery, State, rejection::JsonRejection,
+    },
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -51,6 +66,7 @@ const DASHBOARD_PORT_SPAN: u16 = 12_000;
 const DASHBOARD_START_TIMEOUT: Duration = Duration::from_secs(5);
 const DASHBOARD_PROBE_INTERVAL: Duration = Duration::from_millis(25);
 const DASHBOARD_CAPABILITY_FILE: &str = "capability";
+const DASHBOARD_CAPABILITY_MAX_BYTES: u64 = 65;
 const DASHBOARD_IDENTITY_HEADER: &str = "x-agent-observability-dashboard";
 const IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 const MAX_SESSION_LIFETIME: Duration = Duration::from_hours(1);
@@ -67,6 +83,10 @@ const MAX_CONNECTIONS: usize = 64;
 const SETTINGS_SHELL: &str = include_str!("generated/settings-shell.html");
 const SETTINGS_SCRIPT: &str = include_str!("generated/settings-ui.js");
 const SETTINGS_STYLE: &str = include_str!("generated/settings-ui.css");
+#[cfg(test)]
+static PLATFORM_OPEN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static PLATFORM_OPEN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug)]
 pub enum UiError {
@@ -74,6 +94,7 @@ pub enum UiError {
     Runtime(String),
     Random(String),
     DashboardArtifact(DashboardArtifactError),
+    DashboardCapabilityCleanup { primary: Box<UiError> },
 }
 
 impl std::fmt::Display for UiError {
@@ -85,11 +106,21 @@ impl std::fmt::Display for UiError {
             Self::DashboardArtifact(error) => {
                 write!(formatter, "local dashboard artifact error: {error}")
             }
+            Self::DashboardCapabilityCleanup { primary } => {
+                write!(formatter, "{primary}; dashboard capability cleanup failed")
+            }
         }
     }
 }
 
-impl std::error::Error for UiError {}
+impl std::error::Error for UiError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DashboardCapabilityCleanup { primary } => Some(primary.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DashboardArtifactError {
@@ -156,7 +187,7 @@ pub struct PreparedUi {
     url: String,
     shutdown: Arc<Notify>,
     last_seen: Arc<Mutex<Instant>>,
-    _ui_singleton: Singleton,
+    _ui_singleton: ProductionSingleton,
 }
 
 impl PreparedUi {
@@ -204,7 +235,7 @@ pub struct PreparedDashboard {
     url: String,
     shutdown: Arc<Notify>,
     last_seen: Arc<Mutex<Instant>>,
-    _dashboard_singleton: Singleton,
+    _dashboard_singleton: ProductionSingleton,
 }
 
 impl PreparedDashboard {
@@ -324,6 +355,10 @@ struct DashboardState {
     origin: String,
     token: String,
     report: PathBuf,
+    paged: bool,
+    query_service: Arc<Mutex<DashboardQueryService>>,
+    query_slots: Arc<Semaphore>,
+    initial_snapshot_failure: Option<DashboardStatusReasonV1>,
     root: PathBuf,
     last_seen: Arc<Mutex<Instant>>,
 }
@@ -334,6 +369,11 @@ struct ConfigEnvelope {
     defaults: LocalRuntimeConfigV3,
     revision: String,
     collection_mode: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardLaunchResponse {
+    url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -388,8 +428,9 @@ impl IntoResponse for ApiError {
 }
 
 pub async fn prepare(layout: &InstalledLayout) -> Result<PreparedUi, UiError> {
-    let ui_singleton = Singleton::acquire(&layout.runtime.join("settings-ui"))
-        .map_err(|error| UiError::Runtime(error.to_string()))?;
+    let ui_singleton =
+        ProductionSingleton::acquire(&layout.root, CoordinatedSingletonScope::SettingsUi)
+            .map_err(|error| UiError::Runtime(error.to_string()))?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let address = listener.local_addr()?;
     let host = address.to_string();
@@ -421,22 +462,29 @@ pub async fn prepare(layout: &InstalledLayout) -> Result<PreparedUi, UiError> {
 }
 
 pub async fn prepare_dashboard(layout: &InstalledLayout) -> Result<PreparedDashboard, UiError> {
-    let dashboard_singleton = Singleton::acquire(&layout.runtime.join("dashboard-ui"))
-        .map_err(|error| UiError::Runtime(error.to_string()))?;
-    prepare_dashboard_path(layout, dashboard_singleton).await
+    prepare_dashboard_with_status(layout, None).await
+}
+
+pub async fn prepare_dashboard_with_status(
+    layout: &InstalledLayout,
+    initial_snapshot_failure: Option<DashboardStatusReasonV1>,
+) -> Result<PreparedDashboard, UiError> {
+    let dashboard_singleton =
+        ProductionSingleton::acquire(&layout.root, CoordinatedSingletonScope::DashboardUi)
+            .map_err(|error| UiError::Runtime(error.to_string()))?;
+    prepare_dashboard_path(layout, dashboard_singleton, initial_snapshot_failure).await
 }
 
 async fn prepare_dashboard_path(
     layout: &InstalledLayout,
-    dashboard_singleton: Singleton,
+    dashboard_singleton: ProductionSingleton,
+    initial_snapshot_failure: Option<DashboardStatusReasonV1>,
 ) -> Result<PreparedDashboard, UiError> {
-    let path = layout.root.join("logs").join(REPORT_FILE_NAME);
-    let report = path.clone();
-    tokio::task::spawn_blocking(move || validate_private_report(&path))
-        .await
-        .map_err(|_| UiError::Runtime("local dashboard artifact task failed".into()))?
-        .map_err(UiError::DashboardArtifact)?;
-    let token = load_or_create_dashboard_token(&layout.runtime.join("dashboard-ui"))?;
+    // The interactive shell must be available even when the manual HTML export is absent
+    // or exceeds its independent size bound. Snapshot availability is a query response.
+    let report = layout.root.join("logs").join(REPORT_FILE_NAME);
+    let token =
+        load_or_create_dashboard_token(&layout.runtime.join("dashboard-ui"), &dashboard_singleton)?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, dashboard_port(&layout.root))).await?;
     let address = listener.local_addr()?;
     let host = address.to_string();
@@ -448,6 +496,10 @@ async fn prepare_dashboard_path(
         origin: origin.clone(),
         token: token.clone(),
         report,
+        paged: true,
+        query_service: Arc::new(Mutex::new(dashboard_query_service()?)),
+        query_slots: Arc::new(Semaphore::new(1)),
+        initial_snapshot_failure,
         root: layout.root.clone(),
         last_seen: Arc::clone(&last_seen),
     };
@@ -459,6 +511,12 @@ async fn prepare_dashboard_path(
         last_seen,
         _dashboard_singleton: dashboard_singleton,
     })
+}
+
+fn dashboard_query_service() -> Result<DashboardQueryService, UiError> {
+    let mut secret = [0_u8; 32];
+    getrandom::fill(&mut secret).map_err(|error| UiError::Random(error.to_string()))?;
+    Ok(DashboardQueryService::new(secret))
 }
 
 fn router(state: AppState) -> Router {
@@ -475,6 +533,7 @@ fn router(state: AppState) -> Router {
                 .delete(disconnect_codex_integration),
         )
         .route("/api/dashboard/open", post(open_dashboard))
+        .route("/api/dashboard/launch", post(launch_dashboard))
         .route("/api/heartbeat", post(heartbeat))
         .route("/api/shutdown", post(shutdown))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -488,6 +547,7 @@ fn router(state: AppState) -> Router {
 fn dashboard_router(state: DashboardState) -> Router {
     Router::new()
         .route("/report/{token}", get(dashboard_document))
+        .route("/report/{token}/query", get(dashboard_query))
         .route(
             "/report/{token}/details/{turn_id}",
             get(dashboard_turn_detail),
@@ -523,11 +583,17 @@ async fn dashboard_document(
         return Err(StatusCode::NOT_FOUND);
     }
     touch_last_seen(&state.last_seen).map_err(|()| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let report = state.report;
-    let html = tokio::task::spawn_blocking(move || read_private_report(&report))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let html = if state.paged {
+        agent_observability_static_report::render_paged_dashboard()
+            .map(String::into_bytes)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        let report = state.report;
+        tokio::task::spawn_blocking(move || read_private_report(&report))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| StatusCode::NOT_FOUND)?
+    };
     let mut response = Body::from(html).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -536,6 +602,102 @@ async fn dashboard_document(
     response
         .headers_mut()
         .insert(DASHBOARD_IDENTITY_HEADER, HeaderValue::from_static("1"));
+    Ok(response)
+}
+
+async fn dashboard_query(
+    State(state): State<DashboardState>,
+    AxumPath(token): AxumPath<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, StatusCode> {
+    if !constant_time_equal(token.as_bytes(), state.token.as_bytes()) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let request =
+        dashboard_request::decode_query(raw.as_deref()).map_err(|()| StatusCode::BAD_REQUEST)?;
+    let kind = match &request {
+        DashboardQueryRequestV1::Bootstrap(_) => DashboardRequestKindV1::Bootstrap,
+        DashboardQueryRequestV1::Traces(_) => DashboardRequestKindV1::Traces,
+        DashboardQueryRequestV1::Spans(_) => DashboardRequestKindV1::Spans,
+        DashboardQueryRequestV1::Summary(_) => DashboardRequestKindV1::Summary,
+        DashboardQueryRequestV1::Span(_) => DashboardRequestKindV1::Span,
+        DashboardQueryRequestV1::Facets(_) => DashboardRequestKindV1::Facets,
+    };
+    let Ok(permit) = state.query_slots.clone().try_acquire_owned() else {
+        return query_response(&query_status(kind, DashboardStatusReasonV1::Busy));
+    };
+    touch_last_seen(&state.last_seen).map_err(|()| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let response = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let Ok(mut service) = state.query_service.try_lock() else {
+            return Ok(query_status(kind, DashboardStatusReasonV1::Busy));
+        };
+        // No migration, repairing projection, or retained authority connection on HTTP reads.
+        let store = match LocalStore::open_report_reader(state.root.join("state/store")) {
+            Ok(store) => store,
+            Err(error) => {
+                return reader_failure_reason(&error).map(|reason| query_status(kind, reason));
+            }
+        };
+        let response = service.query(&store, request);
+        Ok(match (&response, state.initial_snapshot_failure) {
+            (DashboardQueryResponseV1::Status(status), Some(reason))
+                if matches!(
+                    status.reason,
+                    DashboardStatusReasonV1::Building | DashboardStatusReasonV1::RefreshPending
+                ) =>
+            {
+                query_status(kind, reason)
+            }
+            _ => response,
+        })
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    query_response(&response)
+}
+
+fn reader_failure_reason(
+    error: &agent_observability_local_store::StoreError,
+) -> Result<DashboardStatusReasonV1, StatusCode> {
+    if error.is_contention() {
+        return Ok(DashboardStatusReasonV1::Busy);
+    }
+    if matches!(error, agent_observability_local_store::StoreError::Io(error)
+        if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(DashboardStatusReasonV1::RefreshPending);
+    }
+    // Never turn corrupt, insecure or otherwise unreadable storage into a retry loop.
+    Err(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn query_status(
+    kind: DashboardRequestKindV1,
+    reason: DashboardStatusReasonV1,
+) -> DashboardQueryResponseV1 {
+    DashboardQueryResponseV1::Status(DashboardStatusResponseV1 {
+        schema_version: DASHBOARD_QUERY_VERSION.into(),
+        kind: DashboardStatusKindV1::Status,
+        request_kind: kind,
+        reason,
+        snapshot: None,
+    })
+}
+
+fn query_response(response: &DashboardQueryResponseV1) -> Result<Response, StatusCode> {
+    response
+        .validate()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let body = serde_json::to_vec(response).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if body.len() > DASHBOARD_RESPONSE_MAX_SERIALIZED_UTF8_BYTES {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let mut response = Body::from(body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     Ok(response)
 }
 
@@ -661,7 +823,7 @@ async fn run_integration(
     tokio::task::spawn_blocking(move || operation(&root, &executable))
         .await
         .map_err(|_| integration_error())?
-        .map_err(|_| integration_error())
+        .map_err(|error| integration_operation_error(&error))
 }
 
 async fn open_dashboard(
@@ -670,15 +832,7 @@ async fn open_dashboard(
 ) -> Result<StatusCode, ApiError> {
     authorize(&state, &headers, true)?;
     touch(&state)?;
-    let root = state.root;
-    let runtime = state.runtime;
-    let dashboard_child = state.dashboard_child;
-    let dashboard_url = tokio::task::spawn_blocking(move || {
-        launch_or_reuse_dashboard(&root, &runtime, &dashboard_child)
-    })
-    .await
-    .map_err(|_| dashboard_error(DashboardOpenError::TaskFailed))?
-    .map_err(dashboard_error)?;
+    let dashboard_url = ensure_dashboard_server(state).await?;
     let open_result = tokio::task::spawn_blocking(move || open_dashboard_target(&dashboard_url))
         .await
         .map_err(|_| DashboardOpenError::TaskFailed)
@@ -688,6 +842,28 @@ async fn open_dashboard(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn launch_dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DashboardLaunchResponse>, ApiError> {
+    authorize(&state, &headers, true)?;
+    touch(&state)?;
+    let url = ensure_dashboard_server(state).await?;
+    Ok(Json(DashboardLaunchResponse { url }))
+}
+
+async fn ensure_dashboard_server(state: AppState) -> Result<String, ApiError> {
+    let root = state.root;
+    let runtime = state.runtime;
+    let dashboard_child = state.dashboard_child;
+    tokio::task::spawn_blocking(move || {
+        launch_or_reuse_dashboard(&root, &runtime, &dashboard_child)
+    })
+    .await
+    .map_err(|_| dashboard_error(DashboardOpenError::TaskFailed))?
+    .map_err(dashboard_error)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DashboardOpenError {
     Artifact(DashboardArtifactError),
@@ -695,13 +871,21 @@ enum DashboardOpenError {
     TaskFailed,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 fn open_dashboard_target(target: &str) -> Result<(), DashboardOpenError> {
     open_local_target(target).map_err(DashboardOpenError::Platform)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(test)))]
 fn open_dashboard_target(_target: &str) -> Result<(), DashboardOpenError> {
+    Err(DashboardOpenError::Platform(
+        PlatformOpenError::UnsupportedPlatform,
+    ))
+}
+
+#[cfg(test)]
+fn open_dashboard_target(_target: &str) -> Result<(), DashboardOpenError> {
+    PLATFORM_OPEN_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Err(DashboardOpenError::Platform(
         PlatformOpenError::UnsupportedPlatform,
     ))
@@ -778,6 +962,46 @@ fn integration_error() -> ApiError {
         "integration_failed",
         "Codex 자동 수집 상태를 확인하거나 변경할 수 없습니다.",
     )
+}
+
+fn integration_operation_error(error: &IntegrationError) -> ApiError {
+    use agent_observability_local_collector::CollectorError;
+    use agent_observability_local_runtime::storage_coherence::StorageCoherenceError;
+
+    let (code, message) = match error {
+        IntegrationError::ConnectCommittedSettingsFinalizationUnverified { .. } => (
+            "integration_connect_committed_unverified",
+            "Codex 연결 변경은 완료됐지만 설정 마무리를 확인하지 못했습니다. 현재 상태를 다시 확인해야 합니다.",
+        ),
+        IntegrationError::DisconnectCommittedSettingsFinalizationUnverified { .. } => (
+            "integration_disconnect_committed_unverified",
+            "Codex 연결 해제 변경은 완료됐지만 설정 마무리를 확인하지 못했습니다. 현재 상태를 다시 확인해야 합니다.",
+        ),
+        IntegrationError::Collector(CollectorError::StorageWriteUnverified {
+            operation_completed: true,
+            ..
+        }) => (
+            "integration_settings_completed_unverified",
+            "설정 쓰기는 완료됐지만 검증하지 못했습니다. Codex 연결 상태를 다시 확인해야 합니다.",
+        ),
+        IntegrationError::Collector(CollectorError::StorageWriteUnverified {
+            operation_completed: false,
+            ..
+        })
+        | IntegrationError::StorageWriteUnverified { .. }
+        | IntegrationError::RecoveryFailed { .. }
+        | IntegrationError::SettingsRollbackFailed { .. }
+        | IntegrationError::SettingsRollbackUnverified { .. } => (
+            "integration_outcome_uncertain",
+            "변경 또는 복원 결과를 확정할 수 없습니다. 현재 상태를 다시 확인해야 합니다.",
+        ),
+        IntegrationError::Storage(StorageCoherenceError::Busy) => (
+            "integration_failed",
+            "다른 저장소 작업이 진행 중입니다. 잠시 후 다시 시도해야 합니다.",
+        ),
+        _ => return integration_error(),
+    };
+    ApiError::new(StatusCode::CONFLICT, code, message)
 }
 
 fn dashboard_error(error: DashboardOpenError) -> ApiError {
@@ -950,8 +1174,6 @@ fn launch_or_reuse_dashboard(
     runtime: &Path,
     child_slot: &Mutex<Option<Child>>,
 ) -> Result<String, DashboardOpenError> {
-    validate_private_report(&root.join("logs").join(REPORT_FILE_NAME))
-        .map_err(DashboardOpenError::Artifact)?;
     if let Some(url) = dashboard_url(runtime, root).map_err(DashboardOpenError::Artifact)?
         && dashboard_probe(&url)
     {
@@ -1037,34 +1259,53 @@ fn dashboard_probe(url: &str) -> bool {
 
 #[cfg(unix)]
 fn read_dashboard_token(dir: &Path) -> Result<Option<String>, DashboardArtifactError> {
+    read_dashboard_token_observing(dir, |_| {}).map(|capability| capability.map(|(_, token)| token))
+}
+
+#[cfg(unix)]
+fn read_dashboard_token_observing(
+    dir: &Path,
+    after_metadata: impl FnOnce(&Path),
+) -> Result<Option<(fs::File, String)>, DashboardArtifactError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let path = dir.join(DASHBOARD_CAPABILITY_FILE);
     let mut file = match fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(DashboardArtifactError::Unsafe),
     };
     let metadata = file.metadata().map_err(|_| DashboardArtifactError::Io)?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 || metadata.len() > 65 {
-        return Err(DashboardArtifactError::Unsafe);
-    }
-    let mut token = String::new();
-    file.read_to_string(&mut token)
-        .map_err(|_| DashboardArtifactError::Io)?;
-    let token = token.trim_end();
-    if token.len() != 64
-        || !token
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > DASHBOARD_CAPABILITY_MAX_BYTES
     {
         return Err(DashboardArtifactError::Unsafe);
     }
-    Ok(Some(token.to_owned()))
+    after_metadata(&path);
+    let mut token = String::new();
+    (&mut file)
+        .take(DASHBOARD_CAPABILITY_MAX_BYTES + 1)
+        .read_to_string(&mut token)
+        .map_err(|_| DashboardArtifactError::Io)?;
+    if u64::try_from(token.len()).unwrap_or(u64::MAX) > DASHBOARD_CAPABILITY_MAX_BYTES {
+        return Err(DashboardArtifactError::Unsafe);
+    }
+    let token = validated_dashboard_token(&token).ok_or(DashboardArtifactError::Unsafe)?;
+    Ok(Some((file, token.to_owned())))
+}
+
+fn validated_dashboard_token(value: &str) -> Option<&str> {
+    let token = value.trim_end();
+    (token.len() == 64
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    .then_some(token)
 }
 
 #[cfg(not(unix))]
@@ -1073,10 +1314,169 @@ fn read_dashboard_token(_dir: &Path) -> Result<Option<String>, DashboardArtifact
 }
 
 #[cfg(unix)]
-fn load_or_create_dashboard_token(dir: &Path) -> Result<String, UiError> {
+fn load_or_create_dashboard_token(
+    dir: &Path,
+    singleton: &ProductionSingleton,
+) -> Result<String, UiError> {
+    load_or_create_dashboard_token_observing(dir, singleton, |_| Ok(()))
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DashboardCapabilityCleanupFailure {
+    Authorization,
+    Identity,
+    Unlink,
+    DirectorySync,
+    Postcondition,
+}
+
+#[cfg(unix)]
+fn dashboard_capability_has_exact_identity(file: &fs::File, path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let held = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    Ok(held.is_file()
+        && named.is_file()
+        && held.permissions().mode() & 0o7777 == 0o600
+        && named.permissions().mode() & 0o7777 == 0o600
+        && held.nlink() == 1
+        && named.nlink() == 1
+        && (held.dev(), held.ino()) == (named.dev(), named.ino()))
+}
+
+#[cfg(unix)]
+fn cleanup_failed_dashboard_capability(
+    dir: &Path,
+    directory: &fs::File,
+    path: &Path,
+    file: &fs::File,
+    singleton: &ProductionSingleton,
+    permit: Option<&agent_observability_local_runtime::storage_coherence::StorageWriteGuard<'_>>,
+    before_sync: &mut impl FnMut(&Path),
+) -> Result<(), DashboardCapabilityCleanupFailure> {
+    let revalidate = || {
+        if let Some(permit) = permit {
+            permit
+                .revalidate()
+                .map_err(|_| DashboardCapabilityCleanupFailure::Authorization)?;
+        }
+        singleton
+            .revalidate()
+            .map_err(|_| DashboardCapabilityCleanupFailure::Authorization)
+    };
+
+    revalidate()?;
+    validate_dashboard_directory(directory, dir)
+        .map_err(|_| DashboardCapabilityCleanupFailure::Identity)?;
+    if !dashboard_capability_has_exact_identity(file, path)
+        .map_err(|_| DashboardCapabilityCleanupFailure::Identity)?
+    {
+        return Err(DashboardCapabilityCleanupFailure::Identity);
+    }
+    fs::remove_file(path).map_err(|_| DashboardCapabilityCleanupFailure::Unlink)?;
+    sync_dashboard_directory(directory, dir, before_sync)
+        .map_err(|_| DashboardCapabilityCleanupFailure::DirectorySync)?;
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(DashboardCapabilityCleanupFailure::Postcondition),
+    }
+    revalidate()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn load_or_create_dashboard_token_observing(
+    dir: &Path,
+    singleton: &ProductionSingleton,
+    after_persist: impl FnOnce(&Path) -> Result<(), UiError>,
+) -> Result<String, UiError> {
+    load_or_create_dashboard_token_with_read_observer(dir, singleton, after_persist, |_| {})
+}
+
+#[cfg(unix)]
+fn load_or_create_dashboard_token_with_read_observer(
+    dir: &Path,
+    singleton: &ProductionSingleton,
+    after_persist: impl FnOnce(&Path) -> Result<(), UiError>,
+    after_read: impl FnOnce(&Path),
+) -> Result<String, UiError> {
+    load_or_create_dashboard_token_with_sync_observer(
+        dir,
+        singleton,
+        after_persist,
+        after_read,
+        |_| {},
+    )
+}
+
+#[cfg(unix)]
+fn validate_dashboard_directory(directory: &fs::File, dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let held = directory.metadata()?;
+    let named = fs::symlink_metadata(dir)?;
+    if !held.is_dir()
+        || !named.is_dir()
+        || held.permissions().mode() & 0o7777 != 0o700
+        || named.permissions().mode() & 0o7777 != 0o700
+        || (held.dev(), held.ino()) != (named.dev(), named.ino())
+    {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_dashboard_directory(
+    directory: &fs::File,
+    dir: &Path,
+    before_sync: &mut impl FnMut(&Path),
+) -> std::io::Result<()> {
+    before_sync(dir);
+    validate_dashboard_directory(directory, dir)?;
+    directory.sync_all()?;
+    validate_dashboard_directory(directory, dir)
+}
+
+#[cfg(unix)]
+fn load_or_create_dashboard_token_with_sync_observer(
+    dir: &Path,
+    singleton: &ProductionSingleton,
+    after_persist: impl FnOnce(&Path) -> Result<(), UiError>,
+    after_read: impl FnOnce(&Path),
+    mut before_sync: impl FnMut(&Path),
+) -> Result<String, UiError> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    if let Some(token) = read_dashboard_token(dir).map_err(UiError::DashboardArtifact)? {
+    let permit = singleton
+        .try_begin_write()
+        .map_err(|error| UiError::Runtime(error.to_string()))?;
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_DIRECTORY)
+        .open(dir)?;
+    validate_dashboard_directory(&directory, dir)?;
+
+    if let Some((file, token)) =
+        read_dashboard_token_observing(dir, |_| {}).map_err(UiError::DashboardArtifact)?
+    {
+        after_read(&dir.join(DASHBOARD_CAPABILITY_FILE));
+        if let Some(permit) = permit.as_ref() {
+            permit
+                .revalidate()
+                .map_err(|error| UiError::Runtime(error.to_string()))?;
+        }
+        singleton
+            .revalidate()
+            .map_err(|error| UiError::Runtime(error.to_string()))?;
+        if !dashboard_capability_has_exact_identity(&file, &dir.join(DASHBOARD_CAPABILITY_FILE))
+            .map_err(|_| UiError::DashboardArtifact(DashboardArtifactError::Io))?
+        {
+            return Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe));
+        }
+        validate_dashboard_directory(&directory, dir)?;
         return Ok(token);
     }
     let token = session_token()?;
@@ -1085,15 +1485,66 @@ fn load_or_create_dashboard_token(dir: &Path) -> Result<String, UiError> {
         .create_new(true)
         .write(true)
         .mode(0o600)
-        .open(path)?;
-    file.write_all(token.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
+        .open(&path)?;
+    let result = (|| {
+        file.write_all(token.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        sync_dashboard_directory(&directory, dir, &mut before_sync)?;
+        after_persist(&path)?;
+        if !dashboard_capability_has_exact_identity(&file, &path)
+            .map_err(|_| UiError::DashboardArtifact(DashboardArtifactError::Io))?
+        {
+            return Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe));
+        }
+        if read_dashboard_token(dir)
+            .map_err(UiError::DashboardArtifact)?
+            .as_deref()
+            != Some(token.as_str())
+        {
+            return Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe));
+        }
+        if let Some(permit) = permit.as_ref() {
+            permit
+                .revalidate()
+                .map_err(|error| UiError::Runtime(error.to_string()))?;
+        }
+        singleton
+            .revalidate()
+            .map_err(|error| UiError::Runtime(error.to_string()))?;
+        if !dashboard_capability_has_exact_identity(&file, &path)
+            .map_err(|_| UiError::DashboardArtifact(DashboardArtifactError::Io))?
+        {
+            return Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe));
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if cleanup_failed_dashboard_capability(
+            dir,
+            &directory,
+            &path,
+            &file,
+            singleton,
+            permit.as_ref(),
+            &mut before_sync,
+        )
+        .is_err()
+        {
+            return Err(UiError::DashboardCapabilityCleanup {
+                primary: Box::new(error),
+            });
+        }
+        return Err(error);
+    }
     Ok(token)
 }
 
 #[cfg(not(unix))]
-fn load_or_create_dashboard_token(_dir: &Path) -> Result<String, UiError> {
+fn load_or_create_dashboard_token(
+    _dir: &Path,
+    _singleton: &ProductionSingleton,
+) -> Result<String, UiError> {
     Err(UiError::DashboardArtifact(
         DashboardArtifactError::Unsupported,
     ))
@@ -1110,11 +1561,6 @@ fn read_private_report(path: &Path) -> Result<Vec<u8>, DashboardArtifactError> {
         return Err(DashboardArtifactError::TooLarge);
     }
     Ok(html)
-}
-
-#[cfg(unix)]
-fn validate_private_report(path: &Path) -> Result<(), DashboardArtifactError> {
-    open_private_report(path).map(|_| ())
 }
 
 #[cfg(unix)]
@@ -1148,11 +1594,6 @@ fn open_private_report(path: &Path) -> Result<(fs::File, u64), DashboardArtifact
 
 #[cfg(not(unix))]
 fn read_private_report(_path: &Path) -> Result<Vec<u8>, DashboardArtifactError> {
-    Err(DashboardArtifactError::Unsupported)
-}
-
-#[cfg(not(unix))]
-fn validate_private_report(_path: &Path) -> Result<(), DashboardArtifactError> {
     Err(DashboardArtifactError::Unsupported)
 }
 
@@ -1297,16 +1738,19 @@ async fn idle_expiry(last_seen: Arc<Mutex<Instant>>, started_at: Instant) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, DASHBOARD_IDENTITY_HEADER, DashboardArtifactError, DashboardOpenError,
-        DashboardState, LocalConfigService, MAX_REPORT_ARTIFACT_BYTES, PlatformOpenError,
-        REPORT_FILE_NAME, constant_time_equal, dashboard_error, dashboard_router,
-        platform_open_command, prepare, prepare_dashboard, read_private_report, router,
-        run_integration, run_platform_opener, session_token,
+        AppState, DASHBOARD_CAPABILITY_FILE, DASHBOARD_IDENTITY_HEADER, DashboardArtifactError,
+        DashboardOpenError, DashboardState, LocalConfigService, MAX_REPORT_ARTIFACT_BYTES,
+        PLATFORM_OPEN_CALLS, PLATFORM_OPEN_TEST_LOCK, PlatformOpenError, REPORT_FILE_NAME, UiError,
+        constant_time_equal, dashboard_error, dashboard_router, load_or_create_dashboard_token,
+        load_or_create_dashboard_token_observing, platform_open_command, prepare,
+        prepare_dashboard, read_private_report, router, run_integration, run_platform_opener,
+        session_token,
     };
     use agent_observability_codex_integration::{CodexIntegrationStatus, IntegrationError};
     use agent_observability_contracts::hash_opaque_identifier;
     use agent_observability_local_runtime::{
         ConfigMutationGuard, LocalRuntimeConfigV3, install, load, revision, save,
+        storage_coherence::StorageCoherenceError,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -1356,6 +1800,145 @@ mod tests {
         Err(IntegrationError::Runtime(
             "/Users/private/AUTOMATIC_RAW_PROMPT_SENTINEL private-key.pem".into(),
         ))
+    }
+
+    #[test]
+    fn integration_unverified_outcomes_are_explicit_and_content_free() {
+        use agent_observability_local_collector::CollectorError;
+
+        let private_error = || CollectorError::Io(std::io::Error::other("/private/SECRET_TOKEN"));
+        let cases = [
+            (
+                IntegrationError::ConnectCommittedSettingsFinalizationUnverified {
+                    finalization: private_error(),
+                },
+                "integration_connect_committed_unverified",
+                true,
+            ),
+            (
+                IntegrationError::DisconnectCommittedSettingsFinalizationUnverified {
+                    finalization: private_error(),
+                },
+                "integration_disconnect_committed_unverified",
+                true,
+            ),
+            (
+                IntegrationError::Collector(CollectorError::StorageWriteUnverified {
+                    operation_completed: true,
+                    primary: None,
+                    verification: Box::new(private_error()),
+                }),
+                "integration_settings_completed_unverified",
+                true,
+            ),
+            (
+                IntegrationError::Collector(CollectorError::StorageWriteUnverified {
+                    operation_completed: false,
+                    primary: Some(Box::new(CollectorError::Runtime(
+                        "/private/PRIMARY_SECRET_TOKEN".into(),
+                    ))),
+                    verification: Box::new(private_error()),
+                }),
+                "integration_outcome_uncertain",
+                true,
+            ),
+            (
+                IntegrationError::StorageWriteUnverified {
+                    operation_completed: true,
+                    primary: Some(Box::new(IntegrationError::Runtime(
+                        "PRIMARY_SECRET_TOKEN".into(),
+                    ))),
+                    verification: StorageCoherenceError::Io(std::io::ErrorKind::PermissionDenied),
+                },
+                "integration_outcome_uncertain",
+                true,
+            ),
+            (
+                IntegrationError::StorageWriteUnverified {
+                    operation_completed: false,
+                    primary: Some(Box::new(IntegrationError::Runtime(
+                        "PRIMARY_SECRET_TOKEN".into(),
+                    ))),
+                    verification: StorageCoherenceError::InvalidIdentity,
+                },
+                "integration_outcome_uncertain",
+                true,
+            ),
+            (
+                IntegrationError::RecoveryFailed {
+                    primary: Box::new(IntegrationError::Runtime("PRIMARY_SECRET_TOKEN".into())),
+                    recovery: Box::new(IntegrationError::Runtime("RECOVERY_SECRET_TOKEN".into())),
+                },
+                "integration_outcome_uncertain",
+                true,
+            ),
+            (
+                IntegrationError::SettingsRollbackUnverified {
+                    primary: Box::new(IntegrationError::Runtime("SECRET_TOKEN".into())),
+                    rollback: private_error(),
+                },
+                "integration_outcome_uncertain",
+                true,
+            ),
+            (
+                IntegrationError::SettingsRollbackFailed {
+                    primary: Box::new(IntegrationError::Runtime("SECRET_TOKEN".into())),
+                    rollback: private_error(),
+                },
+                "integration_outcome_uncertain",
+                true,
+            ),
+            (
+                IntegrationError::Storage(StorageCoherenceError::Busy),
+                "integration_failed",
+                false,
+            ),
+        ];
+        for (error, expected, reconciliation_required) in cases {
+            assert_integration_error_response(&error, expected, reconciliation_required);
+        }
+    }
+
+    fn assert_integration_error_response(
+        error: &IntegrationError,
+        expected: &str,
+        reconciliation_required: bool,
+    ) {
+        let uncertain_write = matches!(
+            error,
+            IntegrationError::StorageWriteUnverified { .. }
+                | IntegrationError::RecoveryFailed { .. }
+        );
+        let response = super::integration_operation_error(error);
+        assert_eq!(response.status, StatusCode::CONFLICT);
+        assert_eq!(response.code, expected);
+        assert_eq!(
+            response.message.contains("다시 확인"),
+            reconciliation_required
+        );
+        if uncertain_write {
+            assert!(!response.message.contains("완료"));
+            assert!(!response.message.contains("변경되지"));
+        }
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../contracts/codex-integration-error-v1.schema.json"
+        ))
+        .unwrap();
+        assert!(
+            schema["properties"]["code"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String(response.code.into()))
+        );
+        let body = serde_json::to_string(&super::ErrorBody {
+            code: response.code,
+            message: response.message,
+        })
+        .unwrap();
+        assert!(!body.contains("SECRET_TOKEN"));
+        assert!(!body.contains("PRIMARY_SECRET_TOKEN"));
+        assert!(!body.contains("RECOVERY_SECRET_TOKEN"));
+        assert!(!body.contains("/private/"));
     }
 
     #[test]
@@ -1465,6 +2048,674 @@ mod tests {
         let command = platform_open_command(target);
         assert_eq!(command.get_program(), std::ffi::OsStr::new("/usr/bin/open"));
         assert_eq!(command.get_args().collect::<Vec<_>>(), [target]);
+    }
+
+    #[test]
+    fn test_build_dashboard_opener_is_fail_closed() {
+        let _opener_guard = PLATFORM_OPEN_TEST_LOCK.lock().unwrap();
+        let calls_before = PLATFORM_OPEN_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            super::open_dashboard_target("http://127.0.0.1:49152/report/private"),
+            Err(DashboardOpenError::Platform(
+                PlatformOpenError::UnsupportedPlatform
+            ))
+        );
+        assert!(
+            PLATFORM_OPEN_CALLS.load(std::sync::atomic::Ordering::SeqCst) > calls_before,
+            "test opener sentinel must record and block the call"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_launch_api_prepares_and_reuses_without_platform_opener() {
+        let _opener_guard = PLATFORM_OPEN_TEST_LOCK.lock().unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let root = std::env::temp_dir().join(format!(
+                    "agent-observability-dashboard-launch-test-{}",
+                    std::process::id()
+                ));
+                let _ = fs::remove_dir_all(&root);
+                let layout = install(&root).unwrap();
+                let report = layout.root.join("logs").join(REPORT_FILE_NAME);
+                assert!(
+                    !report.exists(),
+                    "interactive launch cannot depend on a full HTML export"
+                );
+
+                let dashboard_server = prepare_dashboard(&layout).await.unwrap();
+                let expected_url = dashboard_server.url().to_owned();
+                assert_dashboard_pending_without_store(&dashboard_server).await;
+                assert!(!report.exists());
+                let dashboard_shutdown = Arc::clone(&dashboard_server.shutdown);
+                let dashboard_task = tokio::spawn(dashboard_server.serve());
+                tokio::task::yield_now().await;
+
+                let state = AppState {
+                    config: LocalConfigService::new(&layout),
+                    root: layout.root.clone(),
+                    runtime: layout.runtime.clone(),
+                    host: "127.0.0.1:43191".into(),
+                    origin: "http://127.0.0.1:43191".into(),
+                    token: "test-session".into(),
+                    shutdown: Arc::new(Notify::new()),
+                    last_seen: Arc::new(Mutex::new(Instant::now())),
+                    dashboard_child: Arc::new(Mutex::new(None)),
+                };
+                let app = router(state);
+                let opener_calls_before =
+                    PLATFORM_OPEN_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+
+                let unauthorized = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/dashboard/launch")
+                            .header(header::HOST, "127.0.0.1:43191")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+                let wrong_origin = app
+                    .clone()
+                    .oneshot(api_request(
+                        "POST",
+                        "/api/dashboard/launch",
+                        "127.0.0.1:43191",
+                        Some("http://example.invalid"),
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(wrong_origin.status(), StatusCode::FORBIDDEN);
+
+                for _ in 0..2 {
+                    let response = app
+                        .clone()
+                        .oneshot(api_request(
+                            "POST",
+                            "/api/dashboard/launch",
+                            "127.0.0.1:43191",
+                            Some("http://127.0.0.1:43191"),
+                            None,
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::CACHE_CONTROL)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("no-store, max-age=0")
+                    );
+                    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                    let launch: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(
+                        launch["url"].as_str(),
+                        Some(expected_url.as_str()),
+                        "launch API must return the prepared dashboard URL"
+                    );
+                }
+                assert_eq!(
+                    PLATFORM_OPEN_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                    opener_calls_before,
+                    "launch-only API must never invoke the platform opener"
+                );
+
+                dashboard_shutdown.notify_one();
+                dashboard_task.await.unwrap().unwrap();
+                let _ = fs::remove_dir_all(root);
+            });
+    }
+
+    #[test]
+    fn dashboard_reader_classifies_absence_without_masking_durable_failures() {
+        use agent_observability_local_store::StoreError;
+        assert_eq!(
+            super::reader_failure_reason(&StoreError::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound
+            ))),
+            Ok(super::DashboardStatusReasonV1::RefreshPending)
+        );
+        for error in [
+            StoreError::SchemaMismatch,
+            StoreError::InsecurePermissions,
+            StoreError::Symlink,
+            StoreError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            StoreError::Io(std::io::Error::from(std::io::ErrorKind::InvalidData)),
+        ] {
+            assert_eq!(
+                super::reader_failure_reason(&error),
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_directory_fifo_before_sync_returns_and_releases_permit() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+        use std::os::unix::fs::FileTypeExt;
+
+        const PROBE: &str = "AGENTOBS_DASHBOARD_DIRECTORY_SYNC_PROBE";
+        let Ok(phase) = std::env::var(PROBE) else {
+            for phase in ["publication", "cleanup"] {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::dashboard_directory_fifo_before_sync_returns_and_releases_permit",
+                    ])
+                    .env(PROBE, phase)
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        assert!(status.success(), "{phase}");
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        child.kill().unwrap();
+                        child.wait().unwrap();
+                        panic!("{phase} directory sync blocked on FIFO");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("dashboard-dir-sync-{}", std::process::id()));
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let dir = layout.runtime.join("dashboard-ui");
+        let displaced = layout.runtime.join("displaced-dashboard");
+        let mut syncs = 0;
+        let result = super::load_or_create_dashboard_token_with_sync_observer(
+            &dir,
+            &singleton,
+            |_| Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe)),
+            |_| {},
+            |path| {
+                syncs += 1;
+                if syncs == if phase == "publication" { 1 } else { 2 } {
+                    fs::rename(path, &displaced).unwrap();
+                    assert!(
+                        Command::new("mkfifo")
+                            .args(["-m", "600"])
+                            .arg(path)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert!(fs::symlink_metadata(&dir).unwrap().file_type().is_fifo());
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+        drop(freeze);
+        drop(singleton);
+        assert!(fs::symlink_metadata(&dir).unwrap().file_type().is_fifo());
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_capability_growth_after_metadata_is_rejected() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("dashboard-growth-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join(DASHBOARD_CAPABILITY_FILE);
+        fs::write(&path, "a".repeat(64)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let result = super::read_dashboard_token_observing(&root, |path| {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(&[b' '; 4096])
+                .unwrap();
+        });
+        fs::remove_dir_all(&root).unwrap();
+        assert!(matches!(result, Err(DashboardArtifactError::Unsafe)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_capability_existing_replacement_is_rejected() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "dashboard-existing-replacement-{}",
+            std::process::id()
+        ));
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let dir = layout.runtime.join("dashboard-ui");
+        let token = load_or_create_dashboard_token(&dir, &singleton).unwrap();
+        let result = super::load_or_create_dashboard_token_with_read_observer(
+            &dir,
+            &singleton,
+            |_| Ok(()),
+            |path| {
+                fs::rename(path, dir.join("original")).unwrap();
+                fs::write(path, &token).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            },
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(DASHBOARD_CAPABILITY_FILE)).unwrap(),
+            token
+        );
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+        drop(freeze);
+        drop(singleton);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+        assert!(matches!(
+            result,
+            Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coordinated_dashboard_capability_write_is_busy_without_partial_artifact() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-capability-busy-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = root.join("runtime");
+        let mutation = MutationGuard::try_acquire(&runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+        let dashboard_dir = runtime.join("dashboard-ui");
+
+        let error = load_or_create_dashboard_token(&dashboard_dir, &singleton).unwrap_err();
+        assert!(matches!(
+            error,
+            UiError::Runtime(ref message)
+                if message == "singleton coherence error: storage accounting barrier is busy"
+        ));
+        assert!(!dashboard_dir.join(DASHBOARD_CAPABILITY_FILE).exists());
+
+        drop(freeze);
+        drop(singleton);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_capability_fifo_is_rejected_without_blocking_and_releases_permit() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+
+        const PROBE: &str = "AGENTOBS_DASHBOARD_CAPABILITY_FIFO_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::dashboard_capability_fifo_is_rejected_without_blocking_and_releases_permit",
+                ])
+                .env(PROBE, "1")
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("dashboard capability read blocked on a FIFO");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-capability-fifo-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let capability = layout
+            .runtime
+            .join("dashboard-ui")
+            .join(DASHBOARD_CAPABILITY_FILE);
+        assert!(
+            Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&capability)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert!(matches!(
+            load_or_create_dashboard_token(capability.parent().unwrap(), &singleton),
+            Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        ));
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+
+        drop(freeze);
+        drop(singleton);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_dashboard_capability_creation_removes_owned_artifact() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-capability-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let dashboard_dir = layout.runtime.join("dashboard-ui");
+        let capability = dashboard_dir.join(DASHBOARD_CAPABILITY_FILE);
+
+        let error = load_or_create_dashboard_token_observing(&dashboard_dir, &singleton, |_| {
+            Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            UiError::DashboardArtifact(DashboardArtifactError::Unsafe)
+        ));
+        assert!(!capability.exists());
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+
+        drop(freeze);
+        drop(singleton);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_dashboard_capability_creation_preserves_foreign_replacement() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-capability-replacement-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let dashboard_dir = layout.runtime.join("dashboard-ui");
+        let capability = dashboard_dir.join(DASHBOARD_CAPABILITY_FILE);
+        let displaced = dashboard_dir.join("displaced-capability");
+
+        let error = load_or_create_dashboard_token_observing(&dashboard_dir, &singleton, |path| {
+            fs::rename(path, &displaced)?;
+            let mut foreign = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)?;
+            foreign.write_all(b"FOREIGN_CAPABILITY_SENTINEL")?;
+            foreign.sync_all()?;
+            Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            UiError::DashboardCapabilityCleanup { ref primary }
+                if matches!(primary.as_ref(), UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        ));
+        assert_eq!(
+            fs::read(&capability).unwrap(),
+            b"FOREIGN_CAPABILITY_SENTINEL"
+        );
+        assert_eq!(
+            error.to_string(),
+            "local dashboard artifact error: report is not a private regular file; dashboard capability cleanup failed"
+        );
+
+        drop(singleton);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_capability_cleanup_failure_is_explicit_and_sanitized() {
+        use agent_observability_local_runtime::{
+            CoordinatedSingletonScope, MutationGuard, ProductionSingleton,
+            storage_coherence::StorageBarrier,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-capability-cleanup-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let singleton =
+            ProductionSingleton::acquire(&root, CoordinatedSingletonScope::DashboardUi).unwrap();
+        let dashboard_dir = layout.runtime.join("dashboard-ui");
+        let capability = dashboard_dir.join(DASHBOARD_CAPABILITY_FILE);
+
+        let error = load_or_create_dashboard_token_observing(&dashboard_dir, &singleton, |path| {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o640))?;
+            Err(UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        })
+        .unwrap_err();
+        let token = fs::read_to_string(&capability).unwrap();
+        let rendered = error.to_string();
+        assert!(matches!(
+            error,
+            UiError::DashboardCapabilityCleanup { ref primary }
+                if matches!(primary.as_ref(), UiError::DashboardArtifact(DashboardArtifactError::Unsafe))
+        ));
+        assert_eq!(
+            rendered,
+            "local dashboard artifact error: report is not a private regular file; dashboard capability cleanup failed"
+        );
+        assert!(!rendered.contains(root.to_string_lossy().as_ref()));
+        assert!(!rendered.contains(token.trim()));
+        assert!(capability.exists());
+
+        drop(singleton);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coordinated_dashboard_releases_write_permit_and_preserves_metadata_on_busy_drop() {
+        use agent_observability_local_runtime::{MutationGuard, storage_coherence::StorageBarrier};
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-observability-dashboard-coordinated-lifetime-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let layout = install(&root).unwrap();
+        let mutation = MutationGuard::try_acquire(&layout.runtime).unwrap();
+        let barrier = StorageBarrier::initialize(&root, &mutation).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dashboard = runtime.block_on(prepare_dashboard(&layout)).unwrap();
+        let metadata = layout.runtime.join("dashboard-ui/runtime.meta");
+        let capability = layout.runtime.join("dashboard-ui/capability");
+        let original_metadata = fs::read(&metadata).unwrap();
+        assert!(capability.is_file());
+
+        let freeze = barrier.try_freeze(&mutation).unwrap();
+        drop(dashboard);
+        assert_eq!(fs::read(&metadata).unwrap(), original_metadata);
+        assert!(capability.is_file());
+
+        drop(freeze);
+        drop(barrier);
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dashboard_queries_enforce_scope_and_single_worker_without_creating_store() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let root = std::env::temp_dir().join(format!("agentobs-query-boundary-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            let layout = install(&root).unwrap();
+            let slots = Arc::new(tokio::sync::Semaphore::new(1));
+            let mut permit = Some(Arc::clone(&slots).try_acquire_owned().unwrap());
+            let state = DashboardState {
+                host: "127.0.0.1:43192".into(), origin: "http://127.0.0.1:43192".into(),
+                token: "query-session".into(), report: root.join("absent.html"), paged: true,
+                query_service: Arc::new(Mutex::new(super::DashboardQueryService::new([1; 32]))),
+                query_slots: slots, initial_snapshot_failure: None, root: layout.root.clone(),
+                last_seen: Arc::new(Mutex::new(Instant::now())),
+            };
+            let app = dashboard_router(state);
+            let query = "request=%7B%22schemaVersion%22%3A%22agent_observability.dashboard_query.v1%22%2C%22kind%22%3A%22bootstrap%22%7D";
+            for (method, token, host, origin, encoded, expected) in [
+                ("GET", "wrong", "127.0.0.1:43192", "http://127.0.0.1:43192", query, StatusCode::NOT_FOUND),
+                ("POST", "query-session", "127.0.0.1:43192", "http://127.0.0.1:43192", query, StatusCode::FORBIDDEN),
+                ("GET", "query-session", "localhost:43192", "http://127.0.0.1:43192", query, StatusCode::FORBIDDEN),
+                ("GET", "query-session", "127.0.0.1:43192", "http://example.invalid", query, StatusCode::FORBIDDEN),
+                ("GET", "query-session", "127.0.0.1:43192", "http://127.0.0.1:43192", "request=%", StatusCode::BAD_REQUEST),
+            ] {
+                let response = app.clone().oneshot(Request::builder().method(method)
+                    .uri(format!("/report/{token}/query?{encoded}"))
+                    .header(header::HOST, host).header(header::ORIGIN, origin)
+                    .body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(), expected);
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store, max-age=0");
+            }
+            for expected_reason in ["busy", "refresh_pending"] {
+                let response = app.clone().oneshot(Request::builder()
+                    .uri(format!("/report/query-session/query?{query}"))
+                    .header(header::HOST, "127.0.0.1:43192").body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), 1024).await.unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["reason"], expected_reason);
+                if expected_reason == "busy" { drop(permit.take()); }
+            }
+            assert!(!layout.state.join("store/local-store.sqlite3").exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                drop(super::LocalStore::open(layout.state.join("store")).unwrap());
+                fs::set_permissions(layout.state.join("store/local-store.sqlite3"), fs::Permissions::from_mode(0o644)).unwrap();
+                let response = app.clone().oneshot(Request::builder()
+                    .uri(format!("/report/query-session/query?{query}"))
+                    .header(header::HOST, "127.0.0.1:43192").body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(to_bytes(response.into_body(), 1024).await.unwrap().is_empty());
+            }
+            drop(permit);
+            fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    async fn assert_dashboard_pending_without_store(server: &super::PreparedDashboard) {
+        let local_path = server.url().strip_prefix("http://127.0.0.1:").unwrap();
+        let (port, path) = local_path.split_once('/').unwrap();
+        let host = format!("127.0.0.1:{port}");
+        let query_path = format!(
+            "/{path}/query?request=%7B%22schemaVersion%22%3A%22agent_observability.dashboard_query.v1%22%2C%22kind%22%3A%22bootstrap%22%7D"
+        );
+        let response = server
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(query_path)
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, max-age=0"
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let query: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(query["kind"], "status");
+        assert_eq!(query["reason"], "refresh_pending");
     }
 
     #[test]
@@ -1703,6 +2954,7 @@ mod tests {
                 let mut config: LocalRuntimeConfigV3 =
                     serde_json::from_value(envelope["config"].clone()).unwrap();
                 config.enabled = false;
+                config.storage_budget.workspace_budget_bytes = 805_306_368;
                 let update = serde_json::json!({
                     "config": config,
                     "revision": stale_revision,
@@ -1722,7 +2974,19 @@ mod tests {
                 let bytes = to_bytes(saved.into_body(), 64 * 1024).await.unwrap();
                 let saved_envelope: Value = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(saved_envelope["config"]["enabled"], false);
+                assert_eq!(saved_envelope["config"]["schema_version"], "local_runtime.v5");
+                assert_eq!(saved_envelope["config"]["storage_budget"]["workspace_budget_bytes"], 805_306_368_u64);
                 assert_ne!(saved_envelope["revision"], stale_revision);
+
+                let original_bytes = fs::read(&layout.config).unwrap();
+                let mut separated = saved_envelope["config"].clone();
+                separated["storage_budget"]["mode"] = "separated".into();
+                let denied = app.clone().oneshot(api_request(
+                    "PUT", "/api/config", "127.0.0.1:43191", Some("http://127.0.0.1:43191"),
+                    Some(serde_json::json!({"config": separated, "revision": saved_envelope["revision"]}).to_string()),
+                )).await.unwrap();
+                assert_eq!(denied.status(), StatusCode::UNPROCESSABLE_ENTITY);
+                assert_eq!(fs::read(&layout.config).unwrap(), original_bytes);
 
                 let conflict_response = app
                     .clone()
@@ -1844,6 +3108,10 @@ mod tests {
                     origin: "http://127.0.0.1:43192".into(),
                     token: "dashboard-session".into(),
                     report: report.clone(),
+                    paged: false,
+                    query_service: Arc::new(Mutex::new(super::DashboardQueryService::new([1; 32]))),
+                    query_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+                    initial_snapshot_failure: None,
                     root: layout.root.clone(),
                     last_seen: Arc::new(Mutex::new(Instant::now())),
                 };
