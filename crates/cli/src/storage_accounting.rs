@@ -2,7 +2,8 @@
 //!
 //! The caller owns the all-writer freeze and captures integration evidence inside
 //! that same freeze. This module does not create, recover, clean, cache, or expose
-//! a write-capable store, and its result is observation only, never admission.
+//! a write-capable store. The ownership composer remains observation-only; the private
+//! collector guard applies that evidence to admission but stays dormant and unwired.
 
 #[cfg(target_os = "macos")]
 use agent_observability_codex_integration::LaunchAgentStorageOwnershipEvidence;
@@ -11,11 +12,21 @@ use agent_observability_local_collector::storage_ownership::{
     CollectorPrivateStorageObservation, CollectorStorageOwnershipEvidence,
     CollectorTlsOwnershipEvidence,
 };
+use agent_observability_local_collector::{
+    CollectorIngestPrecommitError, CollectorIngestPrecommitGuard,
+};
 use agent_observability_local_runtime::{
-    InstalledLayout, StorageAllocationClass, StorageInventoryError,
-    config::ConfigAccountingEvidence, lock::storage_ownership::SingletonStorageOwnershipEvidence,
-    reservation::ReportReservationEvidence, storage_coherence::OwnedStorageFreezeGuard,
+    InstalledLayout, LocalRuntimeConfigV3, StorageAllocationClass, StorageBudgetPolicyV1,
+    StorageInventoryError,
+    config::ConfigAccountingEvidence,
+    lock::storage_ownership::SingletonStorageOwnershipEvidence,
+    reservation::ReportReservationEvidence,
+    storage_coherence::OwnedStorageFreezeGuard,
     storage_inventory::StorageAllocationObservationV1,
+    storage_policy::{
+        StorageAllocationSnapshotV1, StorageOperation,
+        evaluate_storage_admission_with_reserved_total,
+    },
 };
 use agent_observability_local_store::ReportViewOwnershipObservation;
 use agent_observability_local_store::storage_ownership::{
@@ -32,6 +43,140 @@ pub(crate) struct AllOwnerStorageObservation {
     pub(crate) allocation: StorageAllocationObservationV1,
     pub(crate) report_reserved_bytes: u64,
     pub(crate) config_revision: String,
+    // Read only by the dormant precommit implementation until activation is reviewed.
+    #[allow(dead_code)]
+    pub(crate) storage_budget_policy: StorageBudgetPolicyV1,
+}
+
+/// Dormant until the CLI collector composition explicitly installs it after resource validation.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct CliCollectorIngestPrecommitGuard;
+
+impl CollectorIngestPrecommitGuard for CliCollectorIngestPrecommitGuard {
+    fn check_precommit(
+        &self,
+        layout: &InstalledLayout,
+        freeze: &OwnedStorageFreezeGuard<'_>,
+        config: &LocalRuntimeConfigV3,
+        max_batch_bytes: u64,
+    ) -> Result<(), CollectorIngestPrecommitError> {
+        use agent_observability_codex_integration::storage_accounting::capture_current_codex_config_snapshot_ownership;
+
+        validate_layout(layout).map_err(|_| CollectorIngestPrecommitError::Unavailable)?;
+        freeze
+            .revalidate()
+            .map_err(|_| CollectorIngestPrecommitError::Unavailable)?;
+
+        let codex = capture_current_codex_config_snapshot_ownership(&layout.root)
+            .map_err(|_| CollectorIngestPrecommitError::Unavailable)?;
+        #[cfg(target_os = "macos")]
+        let launch = agent_observability_codex_integration::storage_accounting::capture_current_launch_agent_storage_ownership(&layout.root)
+            .map_err(|_| CollectorIngestPrecommitError::Unavailable)?;
+
+        check_cli_collector_ingest_precommit_with(
+            layout,
+            freeze,
+            config,
+            max_batch_bytes,
+            &codex,
+            #[cfg(target_os = "macos")]
+            Some(&launch),
+            #[cfg(not(target_os = "macos"))]
+            None,
+            OwnedStorageFreezeGuard::available_space,
+            |root, max_batch_bytes| {
+                agent_observability_local_runtime::control::collector_ingest_estimated_allowance(
+                    root,
+                    max_batch_bytes,
+                )
+                .map_err(|_| ())
+            },
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+// Called only by the dormant guard and its focused tests until activation is reviewed.
+#[allow(dead_code)]
+fn check_cli_collector_ingest_precommit_with<
+    'freeze,
+    'barrier,
+    AvailableSpace,
+    EstimatedAllowance,
+>(
+    layout: &InstalledLayout,
+    freeze: &'freeze OwnedStorageFreezeGuard<'barrier>,
+    config: &LocalRuntimeConfigV3,
+    max_batch_bytes: u64,
+    codex: &CodexConfigSnapshotOwnershipEvidence,
+    launch: Option<&LaunchAgentStorageOwnershipEvidence>,
+    available_space: AvailableSpace,
+    estimated_allowance: EstimatedAllowance,
+) -> Result<(), CollectorIngestPrecommitError>
+where
+    AvailableSpace: FnOnce(
+        &'freeze OwnedStorageFreezeGuard<'barrier>,
+    ) -> Result<
+        u64,
+        agent_observability_local_runtime::storage_coherence::StorageCoherenceError,
+    >,
+    EstimatedAllowance: FnOnce(&Path, u64) -> Result<u64, ()>,
+{
+    config
+        .validate()
+        .map_err(|_| CollectorIngestPrecommitError::Unavailable)?;
+    if max_batch_bytes != u64::from(config.collection.max_batch_bytes) {
+        return Err(CollectorIngestPrecommitError::Unavailable);
+    }
+    let supplied_revision = agent_observability_local_runtime::revision(config)
+        .map_err(|_| CollectorIngestPrecommitError::Unavailable)?;
+
+    with_all_owner_storage_observation(layout, freeze, codex, launch, |observation| {
+        let numeric = (|| {
+            if observation.config_revision != supplied_revision
+                || observation.storage_budget_policy != config.storage_budget
+            {
+                return Err(CollectorIngestPrecommitError::Unavailable);
+            }
+            let filesystem_free_bytes =
+                available_space(freeze).map_err(|_| CollectorIngestPrecommitError::Unavailable)?;
+            let estimated_allowance_bytes = estimated_allowance(&layout.root, max_batch_bytes)
+                .map_err(|()| CollectorIngestPrecommitError::Unavailable)?;
+            evaluate_collector_ingest_precommit(
+                observation,
+                estimated_allowance_bytes,
+                filesystem_free_bytes,
+            )
+        })();
+        // Keep typed rejection nested so owner/store/global postchecks still run.
+        Ok(numeric)
+    })
+    .map_err(|_| CollectorIngestPrecommitError::Unavailable)?
+}
+
+// Called only by the dormant guard and its focused tests until activation is reviewed.
+#[allow(dead_code)]
+fn evaluate_collector_ingest_precommit(
+    observation: &AllOwnerStorageObservation,
+    estimated_allowance_bytes: u64,
+    filesystem_free_bytes: u64,
+) -> Result<(), CollectorIngestPrecommitError> {
+    evaluate_storage_admission_with_reserved_total(
+        &observation.storage_budget_policy,
+        StorageAllocationSnapshotV1 {
+            retained_bytes: observation.allocation.retained_bytes,
+            workspace_bytes: observation.allocation.workspace_bytes,
+            unknown_bytes: observation.allocation.unknown_bytes,
+            unknown_entry_count: observation.allocation.unknown_entry_count,
+        },
+        observation.report_reserved_bytes,
+        Some(estimated_allowance_bytes),
+        filesystem_free_bytes,
+        StorageOperation::Ingest,
+    )
+    .map(|_| ())
+    .map_err(|_| CollectorIngestPrecommitError::Denied)
 }
 
 /// Composes all currently supported ownership evidence under one caller-owned freeze.
@@ -117,6 +262,7 @@ pub(crate) fn with_all_owner_storage_observation<T>(
                 allocation,
                 report_reserved_bytes: reservation.captured_reserved_bytes(),
                 config_revision: config.expected_revision().to_owned(),
+                storage_budget_policy: config.storage_budget_policy().clone(),
             };
             match consume(&observation) {
                 Ok(value) => Ok(value),
@@ -336,7 +482,8 @@ mod tests {
     use agent_observability_codex_integration::LaunchAgentStorageOwnershipEvidence;
     use agent_observability_codex_integration::storage_accounting::capture_codex_config_snapshot_ownership;
     use agent_observability_local_runtime::{
-        RuntimeControl, install, load, storage_coherence::StorageBarrier,
+        LocalRuntimeConfigV3, MutationGuard, RuntimeControl, SingletonError, StorageBudgetMode,
+        install, load, storage_coherence::StorageBarrier,
     };
     use agent_observability_local_store::LocalStore;
     use std::{
@@ -411,6 +558,60 @@ mod tests {
                 #[cfg(not(target_os = "macos"))]
                 None,
                 consume,
+            )
+        }
+
+        fn separated_config(&self) -> LocalRuntimeConfigV3 {
+            let mut config = LocalRuntimeConfigV3::default();
+            config.storage_budget.mode = StorageBudgetMode::Separated;
+            let original = fs::read_to_string(&self.layout.config).unwrap();
+            let updated = original.replacen("\"mode\": \"legacy\"", "\"mode\": \"separated\"", 1);
+            assert_ne!(updated, original);
+            fs::write(&self.layout.config, updated).unwrap();
+            config
+        }
+
+        fn captures(
+            &self,
+        ) -> (
+            CodexConfigSnapshotOwnershipEvidence,
+            Option<LaunchAgentStorageOwnershipEvidence>,
+        ) {
+            let codex =
+                capture_codex_config_snapshot_ownership(&self.layout.root, &self.external_config)
+                    .unwrap();
+            #[cfg(target_os = "macos")]
+            let launch = Some(
+                LaunchAgentStorageOwnershipEvidence::capture(&self.layout.root, &self.home)
+                    .unwrap(),
+            );
+            #[cfg(not(target_os = "macos"))]
+            let launch = None;
+            (codex, launch)
+        }
+
+        fn check_precommit(
+            &self,
+            freeze: &OwnedStorageFreezeGuard<'_>,
+            config: &LocalRuntimeConfigV3,
+            max_batch_bytes: u64,
+        ) -> Result<(), CollectorIngestPrecommitError> {
+            let (codex, launch) = self.captures();
+            check_cli_collector_ingest_precommit_with(
+                &self.layout,
+                freeze,
+                config,
+                max_batch_bytes,
+                &codex,
+                launch.as_ref(),
+                OwnedStorageFreezeGuard::available_space,
+                |root, max_batch_bytes| {
+                    agent_observability_local_runtime::control::collector_ingest_estimated_allowance(
+                        root,
+                        max_batch_bytes,
+                    )
+                    .map_err(|_| ())
+                },
             )
         }
     }
@@ -647,5 +848,259 @@ mod tests {
             "storage accounting unavailable: store ownership observation failed"
         );
         assert!(store_directory.is_dir());
+    }
+
+    #[test]
+    fn separated_precommit_accepts_a_coherent_numeric_snapshot_without_reacquiring_locks() {
+        let fixture = Fixture::new("precommit-allowed");
+        let config = fixture.separated_config();
+        let freeze = fixture.freeze();
+        let (codex, launch) = fixture.captures();
+        let result = check_cli_collector_ingest_precommit_with(
+            &fixture.layout,
+            &freeze,
+            &config,
+            u64::from(config.collection.max_batch_bytes),
+            &codex,
+            launch.as_ref(),
+            |freeze| {
+                let barrier = StorageBarrier::open_existing(&fixture.layout.root).unwrap();
+                assert!(matches!(
+                    barrier.try_begin_write(),
+                    Err(agent_observability_local_runtime::storage_coherence::StorageCoherenceError::Busy)
+                ));
+                assert!(matches!(
+                    MutationGuard::try_acquire(&fixture.layout.runtime),
+                    Err(SingletonError::AlreadyRunning)
+                ));
+                freeze.available_space()
+            },
+            |root, max_batch_bytes| {
+                agent_observability_local_runtime::control::collector_ingest_estimated_allowance(
+                    root,
+                    max_batch_bytes,
+                )
+                .map_err(|_| ())
+            },
+        );
+        assert_eq!(result, Ok(()));
+
+        let store_fixture = Fixture::new("precommit-allowed-current-store");
+        let store_config = store_fixture.separated_config();
+        drop(LocalStore::open(store_fixture.layout.state.join("store")).unwrap());
+        let store_freeze = store_fixture.freeze();
+        assert_eq!(
+            store_fixture.check_precommit(
+                &store_freeze,
+                &store_config,
+                u64::from(store_config.collection.max_batch_bytes),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn dormant_trait_entry_uses_current_read_only_evidence_facades() {
+        let fixture = Fixture::new("precommit-trait-entry");
+        let config = fixture.separated_config();
+        let freeze = fixture.freeze();
+        assert_eq!(
+            CollectorIngestPrecommitGuard::check_precommit(
+                &CliCollectorIngestPrecommitGuard,
+                &fixture.layout,
+                &freeze,
+                &config,
+                u64::from(config.collection.max_batch_bytes),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn separated_precommit_rejects_revision_and_batch_mismatches_as_unavailable() {
+        let fixture = Fixture::new("precommit-input-mismatch");
+        let config = fixture.separated_config();
+        let freeze = fixture.freeze();
+        let mut stale = config.clone();
+        stale.enabled = !stale.enabled;
+        assert_eq!(
+            fixture.check_precommit(&freeze, &stale, u64::from(stale.collection.max_batch_bytes)),
+            Err(CollectorIngestPrecommitError::Unavailable)
+        );
+        assert_eq!(
+            fixture.check_precommit(
+                &freeze,
+                &config,
+                u64::from(config.collection.max_batch_bytes) + 1
+            ),
+            Err(CollectorIngestPrecommitError::Unavailable)
+        );
+        let mut invalid = config.clone();
+        invalid.collection.max_batch_bytes = 0;
+        assert_eq!(
+            fixture.check_precommit(&freeze, &invalid, 0),
+            Err(CollectorIngestPrecommitError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn separated_precommit_denies_a_zero_byte_unknown_entry() {
+        let fixture = Fixture::new("precommit-zero-byte-unknown");
+        let config = fixture.separated_config();
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(fixture.layout.logs.join("unknown.empty"))
+            .unwrap();
+        let freeze = fixture.freeze();
+        assert_eq!(
+            fixture.check_precommit(
+                &freeze,
+                &config,
+                u64::from(config.collection.max_batch_bytes)
+            ),
+            Err(CollectorIngestPrecommitError::Denied)
+        );
+    }
+
+    #[test]
+    fn separated_precommit_distinguishes_probe_errors_from_observed_zero_space() {
+        let fixture = Fixture::new("precommit-probe-results");
+        let config = fixture.separated_config();
+        let freeze = fixture.freeze();
+        let (codex, launch) = fixture.captures();
+        macro_rules! check {
+            ($available_space:expr, $estimated_allowance:expr $(,)?) => {
+                check_cli_collector_ingest_precommit_with(
+                    &fixture.layout,
+                    &freeze,
+                    &config,
+                    u64::from(config.collection.max_batch_bytes),
+                    &codex,
+                    launch.as_ref(),
+                    $available_space,
+                    $estimated_allowance,
+                )
+            };
+        }
+
+        assert_eq!(
+            check!(
+                |_| {
+                    Err(agent_observability_local_runtime::storage_coherence::StorageCoherenceError::Io(
+                        std::io::ErrorKind::Other,
+                    ))
+                },
+                |_, _| Ok(1),
+            ),
+            Err(CollectorIngestPrecommitError::Unavailable)
+        );
+        assert_eq!(
+            check!(|_| Ok(0), |_, _| Ok(1)),
+            Err(CollectorIngestPrecommitError::Denied)
+        );
+        assert_eq!(
+            check!(|_| Ok(u64::MAX), |_, _| Err(())),
+            Err(CollectorIngestPrecommitError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn separated_precommit_counts_the_full_reservation_without_workspace_discount() {
+        let mut config = LocalRuntimeConfigV3::default();
+        config.storage_budget.mode = StorageBudgetMode::Separated;
+        config.storage_budget.workspace_budget_bytes = 256 * 1_048_576;
+        let observation = AllOwnerStorageObservation {
+            allocation: StorageAllocationObservationV1 {
+                retained_bytes: 1,
+                workspace_bytes: 64 * 1_048_576,
+                unknown_bytes: 0,
+                unknown_entry_count: 0,
+            },
+            report_reserved_bytes: 128 * 1_048_576,
+            config_revision: "revision".into(),
+            storage_budget_policy: config.storage_budget.clone(),
+        };
+        assert_eq!(
+            evaluate_collector_ingest_precommit(&observation, 65 * 1_048_576, u64::MAX),
+            Err(CollectorIngestPrecommitError::Denied)
+        );
+    }
+
+    #[test]
+    fn separated_precommit_maps_missing_guard_config_and_store_evidence_to_unavailable() {
+        let guard_fixture = Fixture::new("precommit-wrong-guard");
+        let config_fixture = Fixture::new("precommit-missing-config");
+        let config = config_fixture.separated_config();
+        let wrong_freeze = guard_fixture.freeze();
+        assert_eq!(
+            config_fixture.check_precommit(
+                &wrong_freeze,
+                &config,
+                u64::from(config.collection.max_batch_bytes)
+            ),
+            Err(CollectorIngestPrecommitError::Unavailable)
+        );
+
+        let freeze = config_fixture.freeze();
+        fs::remove_file(&config_fixture.layout.config).unwrap();
+        assert_eq!(
+            config_fixture.check_precommit(
+                &freeze,
+                &config,
+                u64::from(config.collection.max_batch_bytes)
+            ),
+            Err(CollectorIngestPrecommitError::Unavailable)
+        );
+
+        let store_fixture = Fixture::new("precommit-store-error");
+        let store_config = store_fixture.separated_config();
+        let store_directory = store_fixture.layout.state.join("store");
+        drop(LocalStore::open(&store_directory).unwrap());
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(store_directory.join("local-store.sqlite3-journal"))
+            .unwrap();
+        let store_freeze = store_fixture.freeze();
+        assert_eq!(
+            store_fixture.check_precommit(
+                &store_freeze,
+                &store_config,
+                u64::from(store_config.collection.max_batch_bytes)
+            ),
+            Err(CollectorIngestPrecommitError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn allowed_numeric_result_cannot_escape_a_replaced_config_postcheck() {
+        let fixture = Fixture::new("precommit-postcheck");
+        let config = fixture.separated_config();
+        let freeze = fixture.freeze();
+        let (codex, launch) = fixture.captures();
+        let result = check_cli_collector_ingest_precommit_with(
+            &fixture.layout,
+            &freeze,
+            &config,
+            u64::from(config.collection.max_batch_bytes),
+            &codex,
+            launch.as_ref(),
+            OwnedStorageFreezeGuard::available_space,
+            |root, max_batch_bytes| {
+                let allowance = agent_observability_local_runtime::control::collector_ingest_estimated_allowance(
+                    root,
+                    max_batch_bytes,
+                )
+                .map_err(|_| ())?;
+                let replacement = fixture.layout.root.join("replacement-config.json");
+                fs::write(&replacement, fs::read(&fixture.layout.config).unwrap()).unwrap();
+                fs::rename(replacement, &fixture.layout.config).unwrap();
+                Ok(allowance)
+            },
+        );
+        assert_eq!(result, Err(CollectorIngestPrecommitError::Unavailable));
     }
 }
