@@ -1566,7 +1566,7 @@ fn open_private_read(path: &Path) -> Result<File, ReportViewCatalogError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(no_follow_flag());
+        options.custom_flags(no_follow_flag() | super::nonblocking_open_flag());
     }
     let file = options.open(path)?;
     let metadata = file.metadata()?;
@@ -2608,6 +2608,78 @@ mod tests {
             Err(ReportViewCatalogError::CatalogCapacityExceeded)
         ));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_fifo_recovery_returns_without_waiting_and_preserves_normal_catalog() {
+        use std::os::unix::fs::FileTypeExt;
+        const PROBE: &str = "AGENTOBS_CATALOG_RECOVERY_FIFO_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "report_view_catalog::tests::catalog_fifo_recovery_returns_without_waiting_and_preserves_normal_catalog", "--nocapture"])
+                .env(PROBE, "1").spawn().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("catalog recovery blocked on FIFO; child killed and reaped");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let (directory, store) = open_store("catalog-recovery-fifo");
+        let current = publish_report_view(&store, build(&store))
+            .unwrap()
+            .current()
+            .clone();
+        let catalog = directory
+            .join(MANAGED_DIRECTORY_NAME)
+            .join(CATALOG_FILE_NAME);
+        let original = fs::read(&catalog).unwrap();
+        recover_report_view_catalog(&store).unwrap();
+        assert_eq!(fs::read(&catalog).unwrap(), original);
+        let guard = ExistingReportRenderGuard::try_acquire(&store).unwrap();
+        let retained = directory.join("retained-catalog.json");
+        fs::rename(&catalog, &retained).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&catalog)
+                .status()
+                .unwrap()
+                .success()
+        );
+        eprintln!("entering public catalog recovery with FIFO and retained existing guard");
+        assert!(matches!(
+            recover_report_view_catalog_with_existing_guard(&store, &guard),
+            Err(ReportViewCatalogError::Store(StoreError::InvalidPath))
+        ));
+        assert!(
+            fs::symlink_metadata(&catalog)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert_eq!(fs::read(&retained).unwrap(), original);
+        guard.revalidate(&store).unwrap();
+        drop(guard);
+        assert!(matches!(
+            current_report_view(&store),
+            Err(ReportViewCatalogError::Store(StoreError::InvalidPath))
+        ));
+        fs::remove_file(&catalog).unwrap();
+        fs::rename(&retained, &catalog).unwrap();
+        recover_report_view_catalog(&store).unwrap();
+        assert_eq!(current_report_view(&store).unwrap(), Some(current));
+        assert_eq!(fs::read(&catalog).unwrap(), original);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

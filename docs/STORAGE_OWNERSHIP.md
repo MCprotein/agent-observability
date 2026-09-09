@@ -515,3 +515,37 @@ descriptor/path identity를 유지하는 별도 permit 경계에 한정한다.
 하며 경로명으로 다시 획득하지 않는다. 없는 잠금·잘못된 파일·경합·identity 교체 회귀와
 기존 복구 동작을 검증한다. 이 선행 작업은 E=0의 증명, 정책 허가, SQLite journal 복구,
 시작/종료 복구 또는 분리 모드 활성화를 포함하지 않는다.
+
+`dda4a38`에서 이 선행 경계를 구현하고 독립 코드·아키텍처 검토와 7개 집중 회귀를
+통과했다. permit은 기존 directory/database/render descriptor를 유지하며, 같은 경로에
+새 store가 생겨도 기존 권한으로 정리하지 않는다. 기존 public 복구의 생성 동작은 유지한다.
+
+후속 보강에서 `open_private_read`에 기존 nonblocking flag를 no-follow와 함께 적용했다.
+기존 구현은 regular file 검사 전에 FIFO 열기에서 대기했으며, 격리 child의 5초 deadline과
+kill·reap으로 실패를 재현했다. 수정 후 FIFO·catalog 보존, typed 거부, 정상 복구 회귀를
+독립 재검증했고 작성자는 store 222개 테스트(1개 제외), Clippy·formatting을 통과했다.
+기존 권한 검증을 유지하며 새 쓰기·허가·fallback은 추가하지 않았다.
+다음 단계에서는 동일 permit을 유지한 비변경 복구 사전 검사와 정확한 정리 대상 재검증을
+설계한다. authority journal의 존재를 epoch 조회 전에 거부하는 경계가 필요하며,
+명시적 SQL 쓰기가 없다는 사실만으로 SQLite 암묵 쓰기나 E=0을 단정하지 않는다.
+
+#### 다음 증분의 검토안: 비변경 복구 사전 검사
+
+범위는 이미 열린 store와 유지 중인 `ExistingReportRenderGuard`에 한정한다. caller는
+사전 검사·허가·실행 전체에서 같은 root mutation/accounting freeze를 유지한다.
+store 쪽에 runtime dependency나 범용 service를 추가하지 않는다.
+
+1. guard를 재검증하고 기존 `open_private_journal`로 authority journal의 부재를 먼저
+   확인한다. 빈 journal도 거부한다. epoch SELECT 뒤와 실행 전에도 부재를 확인한다.
+2. managed directory, catalog bytes·identity 또는 부재, epoch, 최대 16개 entry의
+   descriptor와 보존/삭제 결정을 사전 검사 결과에 유지한다. snapshot DB는 열지 않는다.
+3. 기존 `cleanup_orphans`의 비변경 대상 선택 부분을 공유하되 legacy 실행·오류 순서는
+   보존한다. 새 경로는 모든 대상을 검증하기 전에 catalog도 삭제하지 않는다.
+4. 첫 unlink 전에 전체 entry 집합·catalog·epoch·모든 identity를 재검증한다. 추가·삭제·
+   교체나 결정 변경이 있으면 모든 파일을 보존하고 거부한다. 검증 후에는 캡처한 대상만
+   기존 catalog-first unlink/fsync 순서로 실행한다.
+
+journal 선행 거부, 알 수 없는 entry·개수 초과, catalog/대상/directory 교체와 entry 추가,
+정상·catalog 부재·stale epoch의 동작을 회귀로 고정한다. 이 검토안은 아직 구현·허가·
+E=0 증명이 아니며, 비협조적인 외부 프로세스가 재검증 후 경로를 바꾸는 공격에 대한
+원자성도 주장하지 않는다. 작업량 허가와 예약 복구 연결은 별도 검증 후 수행한다.
