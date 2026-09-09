@@ -464,7 +464,7 @@ foreground 응답 기준이나 실제 규모 검증을 대체하지 않으며, �
 표본은 [검토 기록](reviews/v1.11.0.md)에 남기며, 내용 파싱이 지배적이라는 가정이나 새 SLO의
 근거로 삼지 않는다. 현재 store는 빈 최신 schema이며, 실제 규모·보고서 catalog·동시성은 별도다.
 
-### 동시 연결의 설정 준비 경합 수정 계획
+### 동시 연결의 설정 준비 경합 수정
 
 CI `34314891405`의 storage-busy 분기와 같은 오류를, lifecycle 진입 후 root mutation을
 다른 thread가 보유한 상태의 `install_settings`에서 재현했다. legacy·initialized 환경 모두
@@ -479,3 +479,26 @@ try-only 동작은 유지한다. root를 얻은 뒤 accounting은 한 번만 시
 실행한다. 새 deadline·전체 작업 재시도·예산 예외·자동 barrier 생성은 추가하지 않는다.
 두 환경에서 기다린 뒤 한 번 성공하는 회귀, 기존 즉시 거부, accounting 경합의 즉시 거부,
 설정/TLS 보존 및 기존 postcheck·primary-error 보존을 검증한 뒤 통합한다.
+
+`21b8105`에서 위 범위를 구현하고 독립 코드·아키텍처 리뷰를 통과했다. 수정 후 설정 경합
+24개와 integration 86개 테스트를 Rust 1.97.0에서 독립 재검증했다. 기존 root 대기는
+timeout이 없으며 새 API에 이를 명시한다. 이 결과를 역사적 CI 원인 확정이나 실제 설치
+수집 복구로 확대하지 않고, 새 CI 결과와 나머지 P3–P5 검증을 별도로 확인한다.
+
+### 다음 P3 증분: 비활성 보고서 시작·게시 검사
+
+보고서 연결은 기존 동작을 기본값으로 유지하는 선택적 경계부터 구현한다. 시작 검사는
+예약 복구나 새 예약 생성 전에 수행한다. 복구 정책 연결 전에는 기존 예약이 있으면 유예하며,
+보고서 허가를 복구 쓰기의 허가로 사용하지 않는다. E는 기존 build ceiling, publication,
+예약 metadata allowance를 checked addition으로 합산한다.
+
+게시 직전에는 owned freeze 재획득, 최신 설정 확인, 정확한 staging 소유권 확인,
+자기 예약 검증, 전체 관측·판정 순서를 지킨다. 첫 선행 작업은 기존 예약 검증을 공유하는
+`RuntimeControl::validated_report_reservation_bytes` 경계다. 검증된 자기 예약만 전체 R에서
+checked subtraction하며, 실제 staging 할당량은 제외하지 않는다. 시작·게시 포트가 있으면
+legacy scope를 허가하지 않고, 포트가 없으면 기존 경로를 유지한다.
+
+게시 거부 시 current view, staging, 예약을 보존하고 게시·승인·정리·예약 해제를 수행하지
+않는다. 잘못된 root/교체된 metadata 거부, 자기 예약만 제외, 시작 거부의 무변경,
+게시 거부의 복구 가능성, 기본 경로 보존을 검증한다. 이 증분은 전체 복구·정리·import·migration
+연결이나 분리 모드 활성화를 포함하지 않는다.
