@@ -1934,6 +1934,9 @@ enum AutomaticLifecycleStage {
     ConcurrentConnectWait,
     ConcurrentConnectOutput,
     ConcurrentConnectOutcome,
+    ConcurrentConnectStorageBusy,
+    ConcurrentConnectRuntimeBusy,
+    ConcurrentConnectSuccessOutput,
     ConcurrentConnectStatus,
     ConcurrentConnectOwnership,
     Disconnect,
@@ -1942,7 +1945,7 @@ enum AutomaticLifecycleStage {
 }
 
 impl AutomaticLifecycleStage {
-    const ALL: [Self; 28] = [
+    const ALL: [Self; 31] = [
         Self::Plist,
         Self::Status,
         Self::PreFailureOtlp,
@@ -1966,6 +1969,9 @@ impl AutomaticLifecycleStage {
         Self::ConcurrentConnectWait,
         Self::ConcurrentConnectOutput,
         Self::ConcurrentConnectOutcome,
+        Self::ConcurrentConnectStorageBusy,
+        Self::ConcurrentConnectRuntimeBusy,
+        Self::ConcurrentConnectSuccessOutput,
         Self::ConcurrentConnectStatus,
         Self::ConcurrentConnectOwnership,
         Self::Disconnect,
@@ -2008,6 +2014,15 @@ impl AutomaticLifecycleStage {
             Self::ConcurrentConnectOutcome => {
                 "automatic lifecycle stage concurrent connect outcome failed"
             }
+            Self::ConcurrentConnectStorageBusy => {
+                "automatic lifecycle stage concurrent connect storage busy"
+            }
+            Self::ConcurrentConnectRuntimeBusy => {
+                "automatic lifecycle stage concurrent connect runtime busy"
+            }
+            Self::ConcurrentConnectSuccessOutput => {
+                "automatic lifecycle stage concurrent connect success output failed"
+            }
             Self::ConcurrentConnectStatus => {
                 "automatic lifecycle stage concurrent connect status failed"
             }
@@ -2045,6 +2060,11 @@ impl AutomaticLifecycleStage {
             Self::ConcurrentConnectWait => "code=lifecycle_concurrent_connect_wait_failed",
             Self::ConcurrentConnectOutput => "code=lifecycle_concurrent_connect_output_failed",
             Self::ConcurrentConnectOutcome => "code=lifecycle_concurrent_connect_outcome_failed",
+            Self::ConcurrentConnectStorageBusy => "code=lifecycle_concurrent_connect_storage_busy",
+            Self::ConcurrentConnectRuntimeBusy => "code=lifecycle_concurrent_connect_runtime_busy",
+            Self::ConcurrentConnectSuccessOutput => {
+                "code=lifecycle_concurrent_connect_success_output_failed"
+            }
             Self::ConcurrentConnectStatus => "code=lifecycle_concurrent_connect_status_failed",
             Self::ConcurrentConnectOwnership => {
                 "code=lifecycle_concurrent_connect_ownership_failed"
@@ -2689,34 +2709,7 @@ fn run_concurrent_automatic_connects(
     for outcome in outcomes {
         completed.push(outcome?);
     }
-    let successes = completed
-        .iter()
-        .filter(|outcome| outcome.status.success())
-        .count();
-    let busy_failures = completed
-        .iter()
-        .filter(|outcome| {
-            !outcome.status.success()
-                && outcome
-                    .stderr
-                    .contains("Codex integration lifecycle is busy")
-        })
-        .count();
-    if !((successes == 1 && busy_failures == 1) || successes == 2) {
-        return Err(AutomaticLifecycleStage::ConcurrentConnectOutcome
-            .failure()
-            .to_owned());
-    }
-    for outcome in completed.iter().filter(|outcome| outcome.status.success()) {
-        automatic_lifecycle_stage(
-            AutomaticLifecycleStage::ConcurrentConnectOutcome,
-            (|| {
-                require_output_line(&outcome.stdout, "integration", "codex")?;
-                require_output_line(&outcome.stdout, "config", "connected")?;
-                require_collector_ready_or_degraded(&outcome.stdout)
-            })(),
-        )?;
-    }
+    validate_automatic_connect_outcomes(&completed)?;
 
     automatic_lifecycle_stage(
         AutomaticLifecycleStage::ConcurrentConnectStatus,
@@ -2737,6 +2730,56 @@ fn run_concurrent_automatic_connects(
         AutomaticLifecycleStage::ConcurrentConnectOwnership,
         ownership.verify(binary, root, cleanup),
     )
+}
+
+fn validate_automatic_connect_outcomes(completed: &[AutomaticConnectOutput]) -> Result<(), String> {
+    if completed.len() != 2 {
+        return Err(AutomaticLifecycleStage::ConcurrentConnectOutcome
+            .failure()
+            .to_owned());
+    }
+    let successes = completed
+        .iter()
+        .filter(|outcome| outcome.status.success())
+        .count();
+    let busy_failures = completed
+        .iter()
+        .filter(|outcome| {
+            !outcome.status.success()
+                && outcome
+                    .stderr
+                    .contains("Codex integration lifecycle is busy")
+        })
+        .count();
+    if !((successes == 1 && busy_failures == 1) || successes == 2) {
+        // Diagnose only exact, content-free failures. These categories do not
+        // count as accepted lifecycle contention or authorize a retry.
+        let has_failure = |message| {
+            completed
+                .iter()
+                .any(|outcome| !outcome.status.success() && outcome.stderr.trim() == message)
+        };
+        let stage = if has_failure("storage accounting barrier is busy") {
+            AutomaticLifecycleStage::ConcurrentConnectStorageBusy
+        } else if has_failure("local runtime is already running") {
+            AutomaticLifecycleStage::ConcurrentConnectRuntimeBusy
+        } else {
+            AutomaticLifecycleStage::ConcurrentConnectOutcome
+        };
+        return Err(stage.failure().to_owned());
+    }
+    for outcome in completed.iter().filter(|outcome| outcome.status.success()) {
+        automatic_lifecycle_stage(
+            AutomaticLifecycleStage::ConcurrentConnectSuccessOutput,
+            (|| {
+                require_output_line(&outcome.stdout, "integration", "codex")?;
+                require_output_line(&outcome.stdout, "config", "connected")?;
+                require_collector_ready_or_degraded(&outcome.stdout)
+            })(),
+        )?;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -6468,6 +6511,9 @@ fn validate_automatic_manifest_privacy(manifest: &str) -> Result<(), String> {
         "  - 'code=lifecycle_concurrent_connect_wait_failed'",
         "  - 'code=lifecycle_concurrent_connect_output_failed'",
         "  - 'code=lifecycle_concurrent_connect_outcome_failed'",
+        "  - 'code=lifecycle_concurrent_connect_storage_busy'",
+        "  - 'code=lifecycle_concurrent_connect_runtime_busy'",
+        "  - 'code=lifecycle_concurrent_connect_success_output_failed'",
         "  - 'code=lifecycle_concurrent_connect_status_failed'",
         "  - 'code=lifecycle_concurrent_connect_ownership_failed'",
         "  - 'code=lifecycle_disconnect_stage_failed'",
@@ -8480,6 +8526,82 @@ mod tests {
             }
             assert!(!safe.contains("SENTINEL"));
             validate_automatic_manifest_privacy(&format!("errors:\n  - '{expected}'\n")).unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_connect_outcomes_keep_contract_and_identify_exact_busy_failures() {
+        use std::os::unix::process::ExitStatusExt;
+        let outcome = |success, stdout: &str, stderr: &str| AutomaticConnectOutput {
+            status: ExitStatus::from_raw(if success { 0 } else { 256 }),
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+        };
+        let ready = "integration=codex\nconfig=connected\ncollector=ready";
+        let degraded = "integration=codex\nconfig=connected\ncollector=degraded";
+        let lifecycle_busy =
+            "Codex integration lifecycle is busy: local runtime is already running";
+        for pair in [
+            [outcome(true, ready, ""), outcome(true, degraded, "")],
+            [outcome(true, ready, ""), outcome(false, "", lifecycle_busy)],
+            [
+                outcome(false, "", lifecycle_busy),
+                outcome(true, degraded, ""),
+            ],
+        ] {
+            assert!(validate_automatic_connect_outcomes(&pair).is_ok());
+        }
+        for (stderr, expected) in [
+            (
+                "storage accounting barrier is busy",
+                "code=lifecycle_concurrent_connect_storage_busy",
+            ),
+            (
+                "local runtime is already running",
+                "code=lifecycle_concurrent_connect_runtime_busy",
+            ),
+            (
+                "/private/RAW_SENTINEL token=SECRET",
+                "code=lifecycle_concurrent_connect_outcome_failed",
+            ),
+            (
+                "storage accounting barrier is busy RAW_SENTINEL",
+                "code=lifecycle_concurrent_connect_outcome_failed",
+            ),
+        ] {
+            let error = validate_automatic_connect_outcomes(&[
+                outcome(true, ready, ""),
+                outcome(false, "", stderr),
+            ])
+            .unwrap_err();
+            assert_eq!(
+                automatic_evidence_error_code(&format!("lifecycle preflight: {error}")),
+                expected
+            );
+            assert!(!error.contains("RAW_SENTINEL"));
+            validate_automatic_manifest_privacy(&format!("errors:\n  - '{expected}'\n")).unwrap();
+        }
+        assert!(
+            validate_automatic_connect_outcomes(&[
+                outcome(false, "", lifecycle_busy),
+                outcome(false, "", lifecycle_busy)
+            ])
+            .is_err()
+        );
+        for invalid in [
+            "integration=other\nconfig=connected\ncollector=ready",
+            "integration=codex\nconfig=conflict\ncollector=ready",
+            "integration=codex\nconfig=connected\ncollector=unavailable",
+        ] {
+            let error = validate_automatic_connect_outcomes(&[
+                outcome(true, ready, ""),
+                outcome(true, invalid, "RAW_SENTINEL"),
+            ])
+            .unwrap_err();
+            assert_eq!(
+                automatic_evidence_error_code(&format!("lifecycle preflight: {error}")),
+                "code=lifecycle_concurrent_connect_success_output_failed"
+            );
         }
     }
 
