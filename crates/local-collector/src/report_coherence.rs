@@ -37,6 +37,15 @@ impl<'a> ReportMutationScope<'a> {
         }
     }
 
+    pub(super) fn required_freeze(
+        &self,
+    ) -> Result<&OwnedStorageFreezeGuard<'a>, super::ReportFailure> {
+        match self {
+            Self::Legacy(_) => Err(super::ReportFailure::Publish),
+            Self::Coordinated(freeze) => Ok(freeze),
+        }
+    }
+
     pub(super) fn revalidate(&self) -> Result<(), super::ReportFailure> {
         match self {
             Self::Legacy(_) => Ok(()),

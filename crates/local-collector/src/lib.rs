@@ -3,10 +3,12 @@
 
 mod ingest_precommit;
 mod report_coherence;
+mod report_precommit;
 mod settings_coordination;
 pub mod storage_ownership;
 
 pub use ingest_precommit::{CollectorIngestPrecommitError, CollectorIngestPrecommitGuard};
+pub use report_precommit::{CollectorReportPrecommitError, CollectorReportPrecommitGuard};
 
 use report_coherence::{ReportMutationScope, ReportWritePermits, report_coherence_failure};
 
@@ -4197,6 +4199,15 @@ fn refresh_report_observing(
     store: &LocalStore,
     on_record: impl FnMut(usize),
 ) -> Result<bool, ReportFailure> {
+    refresh_report_with_precommit_observing(layout, store, None, on_record)
+}
+
+fn refresh_report_with_precommit_observing(
+    layout: &InstalledLayout,
+    store: &LocalStore,
+    precommit: Option<&dyn CollectorReportPrecommitGuard>,
+    on_record: impl FnMut(usize),
+) -> Result<bool, ReportFailure> {
     let mutation = try_report_mutation(layout)?;
     let barrier =
         agent_observability_local_runtime::storage_coherence::StorageBarrier::open_if_initialized(
@@ -4206,6 +4217,11 @@ fn refresh_report_observing(
     let scope = ReportMutationScope::acquire(mutation, barrier.as_ref())?;
     let config = load(&layout.config).map_err(|_| ReportFailure::Publish)?;
     let control = RuntimeControl::new(&config).map_err(report_control_failure)?;
+    let admitted_bytes = if let Some(precommit) = precommit {
+        Some(check_report_start(layout, &scope, &config, precommit)?)
+    } else {
+        None
+    };
     if let Some(stale) = control
         .claim_stale_report_reservation(&layout.root, scope.mutation())
         .map_err(report_control_failure)?
@@ -4216,7 +4232,10 @@ fn refresh_report_observing(
             .release(&layout.root, scope.mutation())
             .map_err(|_| ReportFailure::Publish)?;
     }
-    let admitted_bytes = automatic_report_view_admitted_bytes(layout, &config)?;
+    let admitted_bytes = match admitted_bytes {
+        Some(bytes) => bytes,
+        None => automatic_report_view_admitted_bytes(layout, &config)?,
+    };
     let mut reservation = control
         .reserve_report_build(
             &layout.root,
@@ -4264,6 +4283,22 @@ fn refresh_report_observing(
             staging.identity_file(),
         )
         .map_err(|_| ReportFailure::Publish)?;
+    if let Some(precommit) = precommit {
+        let freeze = scope.required_freeze()?;
+        let self_reservation = control
+            .validated_report_reservation_bytes(&layout.root, scope.mutation(), &reservation)
+            .map_err(report_control_failure)?;
+        precommit
+            .check_publication(
+                layout,
+                freeze,
+                &config,
+                REPORT_VIEW_PUBLICATION_RESERVE_BYTES,
+                self_reservation,
+            )
+            .map_err(report_precommit_failure)?;
+        scope.revalidate()?;
+    }
     let publication = publish_report_view(store, staging).map_err(report_catalog_failure)?;
     if publication.cleanup_pending() {
         return Err(ReportFailure::Publish);
@@ -4277,6 +4312,38 @@ fn refresh_report_observing(
     )?;
     scope.revalidate()?;
     Ok(acknowledged)
+}
+
+fn check_report_start(
+    layout: &InstalledLayout,
+    scope: &ReportMutationScope<'_>,
+    config: &LocalRuntimeConfigV3,
+    precommit: &dyn CollectorReportPrecommitGuard,
+) -> Result<u64, ReportFailure> {
+    let freeze = scope.required_freeze()?;
+    let evidence =
+        agent_observability_local_runtime::reservation::ReportReservationEvidence::capture(
+            &layout.root,
+            scope.mutation(),
+        )
+        .map_err(|error| report_control_failure(ControlError::Reservation(error)))?;
+    // Admission cannot authorize recovery. Defer both active and stale promises.
+    if evidence.captured_reserved_bytes() != 0 {
+        return Err(ReportFailure::RenderGuard);
+    }
+    let admitted_bytes = automatic_report_view_admitted_bytes(layout, config)?;
+    let estimated_allowance = admitted_bytes
+        .checked_add(REPORT_VIEW_PUBLICATION_RESERVE_BYTES)
+        .and_then(|bytes| bytes.checked_add(REPORT_RESERVATION_METADATA_ALLOWANCE))
+        .ok_or(ReportFailure::Capacity)?;
+    precommit
+        .check_start(layout, freeze, config, estimated_allowance)
+        .map_err(report_precommit_failure)?;
+    evidence
+        .revalidate()
+        .map_err(|error| report_control_failure(ControlError::Reservation(error)))?;
+    scope.revalidate()?;
+    Ok(admitted_bytes)
 }
 
 fn acknowledge_report_reservation(
@@ -4305,6 +4372,13 @@ fn try_report_mutation(layout: &InstalledLayout) -> Result<MutationGuard, Report
         SingletonError::AlreadyRunning => ReportFailure::RenderGuard,
         _ => ReportFailure::Publish,
     })
+}
+
+const fn report_precommit_failure(error: CollectorReportPrecommitError) -> ReportFailure {
+    match error {
+        CollectorReportPrecommitError::Denied => ReportFailure::Capacity,
+        CollectorReportPrecommitError::Unavailable => ReportFailure::Publish,
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)] // Direct Result::map_err adapter consumes the source error.
@@ -9538,6 +9612,418 @@ mod tests {
         assert!(!metadata.exists());
         drop(collector);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut snapshot = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                snapshot.extend(snapshot_tree(&path));
+            } else {
+                snapshot.insert(path.clone(), fs::read(path).unwrap());
+            }
+        }
+        snapshot
+    }
+
+    #[derive(Debug, Default)]
+    struct ReportPrecommitTestGuard {
+        deny_start: bool,
+        deny_publication: bool,
+        starts: std::sync::atomic::AtomicUsize,
+        publications: std::sync::atomic::AtomicUsize,
+        start_allowance: std::sync::atomic::AtomicU64,
+        budgets: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl super::CollectorReportPrecommitGuard for ReportPrecommitTestGuard {
+        fn check_start(
+            &self,
+            layout: &agent_observability_local_runtime::InstalledLayout,
+            freeze: &agent_observability_local_runtime::storage_coherence::OwnedStorageFreezeGuard<
+                '_,
+            >,
+            config: &agent_observability_local_runtime::LocalRuntimeConfigV3,
+            estimated_allowance: u64,
+        ) -> Result<(), super::CollectorReportPrecommitError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            self.start_allowance
+                .store(estimated_allowance, Ordering::SeqCst);
+            assert_eq!(
+                estimated_allowance,
+                super::automatic_report_view_admitted_bytes(layout, config).unwrap()
+                    + super::REPORT_VIEW_PUBLICATION_RESERVE_BYTES
+                    + super::REPORT_RESERVATION_METADATA_ALLOWANCE
+            );
+            self.observe(layout, freeze, config);
+            if self.deny_start {
+                Err(super::CollectorReportPrecommitError::Denied)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn check_publication(
+            &self,
+            layout: &agent_observability_local_runtime::InstalledLayout,
+            freeze: &agent_observability_local_runtime::storage_coherence::OwnedStorageFreezeGuard<
+                '_,
+            >,
+            config: &agent_observability_local_runtime::LocalRuntimeConfigV3,
+            publication_allowance: u64,
+            validated_self_reservation_bytes: u64,
+        ) -> Result<(), super::CollectorReportPrecommitError> {
+            self.publications.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                publication_allowance,
+                super::REPORT_VIEW_PUBLICATION_RESERVE_BYTES
+            );
+            let evidence =
+                agent_observability_local_runtime::reservation::ReportReservationEvidence::capture(
+                    &layout.root,
+                    freeze.mutation(),
+                )
+                .unwrap();
+            assert_eq!(
+                validated_self_reservation_bytes,
+                evidence.captured_reserved_bytes()
+            );
+            assert!(validated_self_reservation_bytes > 0);
+            assert_eq!(
+                validated_self_reservation_bytes + super::REPORT_RESERVATION_METADATA_ALLOWANCE,
+                self.start_allowance.load(Ordering::SeqCst)
+            );
+            self.observe(layout, freeze, config);
+            if self.deny_publication {
+                Err(super::CollectorReportPrecommitError::Denied)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ReportPrecommitTestGuard {
+        fn observe(
+            &self,
+            layout: &agent_observability_local_runtime::InstalledLayout,
+            freeze: &agent_observability_local_runtime::storage_coherence::OwnedStorageFreezeGuard<
+                '_,
+            >,
+            config: &agent_observability_local_runtime::LocalRuntimeConfigV3,
+        ) {
+            freeze.revalidate().unwrap();
+            assert!(MutationGuard::try_acquire(&layout.runtime).is_err());
+            let barrier = super::StorageBarrier::open_if_initialized(&layout.root)
+                .unwrap()
+                .unwrap();
+            assert!(barrier.try_begin_write().is_err());
+            self.budgets
+                .lock()
+                .unwrap()
+                .push(config.collection.local_storage_budget_bytes);
+        }
+    }
+
+    #[test]
+    fn report_precommit_start_denial_and_legacy_scope_do_not_mutate() {
+        for coordinated in [false, true] {
+            let root = test_root(&format!("report-port-start-{coordinated}"));
+            let mut collector = collector_state(&root);
+            ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+            if coordinated {
+                let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+                super::StorageBarrier::initialize(&root, &mutation).unwrap();
+            }
+            let before = snapshot_tree(&root);
+            let guard = ReportPrecommitTestGuard {
+                deny_start: true,
+                ..Default::default()
+            };
+            let result = super::refresh_report_with_precommit_observing(
+                &collector.layout,
+                &collector.store,
+                Some(&guard),
+                |_| panic!("projection before admission"),
+            );
+            assert_eq!(
+                result,
+                Err(if coordinated {
+                    super::ReportFailure::Capacity
+                } else {
+                    super::ReportFailure::Publish
+                })
+            );
+            assert_eq!(
+                guard.starts.load(Ordering::SeqCst),
+                usize::from(coordinated)
+            );
+            assert_eq!(guard.publications.load(Ordering::SeqCst), 0);
+            assert_eq!(snapshot_tree(&root), before);
+            assert_eq!(
+                super::StorageBarrier::open_if_initialized(&root)
+                    .unwrap()
+                    .is_some(),
+                coordinated
+            );
+            drop(collector);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn report_precommit_existing_reservation_is_not_recovered() {
+        let root = test_root("report-port-existing");
+        let collector = collector_state(&root);
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        super::StorageBarrier::initialize(&root, &mutation).unwrap();
+        let config = load(&collector.layout.config).unwrap();
+        let reservation = RuntimeControl::new(&config)
+            .unwrap()
+            .reserve_report_build(&root, &mutation, 1024 * 1024)
+            .unwrap();
+        drop(reservation);
+        drop(mutation);
+        let before = snapshot_tree(&root);
+        let guard = ReportPrecommitTestGuard::default();
+        assert_eq!(
+            super::refresh_report_with_precommit_observing(
+                &collector.layout,
+                &collector.store,
+                Some(&guard),
+                |_| panic!("unexpected projection"),
+            ),
+            Err(super::ReportFailure::RenderGuard)
+        );
+        assert_eq!(guard.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(snapshot_tree(&root), before);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_precommit_publication_denial_preserves_recovery_and_latest_config() {
+        let root = test_root("report-port-publication");
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        collector.store.invalidate_report().unwrap();
+        let current = current_report_view(&collector.store).unwrap();
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        super::StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let original_budget = load(&collector.layout.config)
+            .unwrap()
+            .collection
+            .local_storage_budget_bytes;
+        let guard = ReportPrecommitTestGuard {
+            deny_publication: true,
+            ..Default::default()
+        };
+        let mut before_publication = None;
+        let result = super::refresh_report_with_precommit_observing(
+            &collector.layout,
+            &collector.store,
+            Some(&guard),
+            |_| {
+                let mut config = load(&collector.layout.config).unwrap();
+                config.collection.local_storage_budget_bytes = original_budget + 1024 * 1024;
+                // Simulate an external edit in this synthetic fixture. A cooperative config
+                // writer correctly cannot enter while a projection write permit is held.
+                fs::write(
+                    &collector.layout.config,
+                    serde_json::to_vec(&config).unwrap(),
+                )
+                .unwrap();
+                before_publication = Some(
+                    fs::read(collector.layout.runtime.join("report-reservation.meta")).unwrap(),
+                );
+            },
+        );
+        assert_eq!(result, Err(super::ReportFailure::Capacity));
+        assert_eq!(guard.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(guard.publications.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *guard.budgets.lock().unwrap(),
+            vec![original_budget, original_budget + 1024 * 1024]
+        );
+        assert_eq!(current_report_view(&collector.store).unwrap(), current);
+        assert!(collector.store.report_status().unwrap().pending());
+        assert_eq!(
+            fs::read(collector.layout.runtime.join("report-reservation.meta")).unwrap(),
+            before_publication.unwrap()
+        );
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        let evidence =
+            agent_observability_local_runtime::reservation::ReportReservationEvidence::capture(
+                &root, &mutation,
+            )
+            .unwrap();
+        let staging = report_precommit_staging_path(&root);
+        assert!(
+            evidence
+                .matches_staging(&staging, &fs::File::open(&staging).unwrap())
+                .unwrap()
+        );
+        drop(evidence);
+        drop(mutation);
+        // The unchanged default path may perform guarded recovery and finish publication.
+        assert!(refresh_dashboard_snapshot(&root).unwrap());
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn report_precommit_staging_path(root: &Path) -> std::path::PathBuf {
+        fs::read_dir(root.join("state/store/report-views.v1"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".report-view.sqlite3.staging.")
+                    && !path.to_string_lossy().ends_with("-journal")
+            })
+            .expect("retained bound staging")
+    }
+
+    #[test]
+    fn report_precommit_wrong_root_or_missing_accounting_lock_fails_without_creation() {
+        for wrong_root in [false, true] {
+            let root = test_root(&format!("report-port-invalid-root-{wrong_root}"));
+            let collector = collector_state(&root);
+            let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+            super::StorageBarrier::initialize(&root, &mutation).unwrap();
+            drop(mutation);
+            let mut layout = collector.layout.clone();
+            if wrong_root {
+                let other = install(&root.join("other")).unwrap();
+                let mutation = MutationGuard::try_acquire(&other.runtime).unwrap();
+                super::StorageBarrier::initialize(&other.root, &mutation).unwrap();
+                layout.root = other.root;
+            } else {
+                fs::remove_file(layout.runtime.join("storage-accounting.lock")).unwrap();
+            }
+            let before = snapshot_tree(&root);
+            let guard = ReportPrecommitTestGuard::default();
+            assert_eq!(
+                super::refresh_report_with_precommit_observing(
+                    &layout,
+                    &collector.store,
+                    Some(&guard),
+                    |_| panic!("invalid ownership"),
+                ),
+                Err(super::ReportFailure::Publish)
+            );
+            assert_eq!(guard.starts.load(Ordering::SeqCst), 0);
+            assert_eq!(guard.publications.load(Ordering::SeqCst), 0);
+            assert_eq!(snapshot_tree(&root), before);
+            drop(collector);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn report_precommit_success_checks_once_and_releases_scopes() {
+        let root = test_root("report-port-success");
+        let mut collector = collector_state(&root);
+        ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+        let config_guard = ConfigMutationGuard::acquire(&collector.layout).unwrap();
+        let mut config = load(&collector.layout.config).unwrap();
+        config.collection.local_storage_budget_bytes = 256 * 1024 * 1024;
+        save(&config_guard, &config).unwrap();
+        drop(config_guard);
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        let barrier = super::StorageBarrier::initialize(&root, &mutation).unwrap();
+        drop(mutation);
+        let guard = ReportPrecommitTestGuard::default();
+        assert_eq!(
+            super::refresh_report_with_precommit_observing(
+                &collector.layout,
+                &collector.store,
+                Some(&guard),
+                |_| {},
+            ),
+            Ok(true)
+        );
+        assert_eq!(guard.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(guard.publications.load(Ordering::SeqCst), 1);
+        assert!(
+            guard.start_allowance.load(Ordering::SeqCst)
+                < super::MAX_AUTOMATIC_REPORT_VIEW_BYTES
+                    + super::REPORT_VIEW_PUBLICATION_RESERVE_BYTES
+                    + super::REPORT_RESERVATION_METADATA_ALLOWANCE
+        );
+        assert_published_report_view(&root, 1);
+        assert!(
+            !collector
+                .layout
+                .runtime
+                .join("report-reservation.meta")
+                .exists()
+        );
+        let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+        barrier.try_freeze(&mutation).unwrap().revalidate().unwrap();
+        drop(mutation);
+        drop(collector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_precommit_replaced_metadata_or_staging_never_reaches_publication_check() {
+        use std::os::unix::fs::OpenOptionsExt;
+        for replace_staging in [false, true] {
+            let root = test_root(&format!("report-port-replacement-{replace_staging}"));
+            let mut collector = collector_state(&root);
+            ingest_notify_locked(&mut collector, &projected_notify("thread-1", "turn-1")).unwrap();
+            let mutation = MutationGuard::try_acquire(&collector.layout.runtime).unwrap();
+            super::StorageBarrier::initialize(&root, &mutation).unwrap();
+            drop(mutation);
+            let guard = ReportPrecommitTestGuard::default();
+            let mut replaced = None;
+            let result = super::refresh_report_with_precommit_observing(
+                &collector.layout,
+                &collector.store,
+                Some(&guard),
+                |_| {
+                    if replaced.is_some() {
+                        return;
+                    }
+                    let path = if replace_staging {
+                        report_precommit_staging_path(&root)
+                    } else {
+                        collector.layout.runtime.join("report-reservation.meta")
+                    };
+                    let retained = root.join("retained-original");
+                    fs::rename(&path, &retained).unwrap();
+                    OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&path)
+                        .unwrap();
+                    replaced = Some((path, retained));
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(guard.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(guard.publications.load(Ordering::SeqCst), 0);
+            let (path, retained) = replaced.unwrap();
+            assert_eq!(fs::read(path).unwrap(), b"");
+            assert!(retained.exists());
+            assert!(
+                collector
+                    .layout
+                    .runtime
+                    .join("report-reservation.meta")
+                    .exists()
+            );
+            assert!(current_report_view(&collector.store).unwrap().is_none());
+            assert!(collector.store.report_status().unwrap().pending());
+            drop(collector);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
