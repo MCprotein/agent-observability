@@ -4406,12 +4406,14 @@ fn automatic_report_view_admitted_bytes(
         .map_err(|_| ReportFailure::Publish)?
         .writable_headroom(&layout.root)
         .map_err(|_| ReportFailure::Publish)
-        .map(|headroom| {
-            headroom
-                .saturating_sub(REPORT_VIEW_PUBLICATION_RESERVE_BYTES)
-                .saturating_sub(REPORT_RESERVATION_METADATA_ALLOWANCE)
-                .min(MAX_AUTOMATIC_REPORT_VIEW_BYTES)
-        })
+        .map(automatic_report_view_bytes_from_headroom)
+}
+
+fn automatic_report_view_bytes_from_headroom(headroom: u64) -> u64 {
+    headroom
+        .saturating_sub(REPORT_VIEW_PUBLICATION_RESERVE_BYTES)
+        .saturating_sub(REPORT_RESERVATION_METADATA_ALLOWANCE)
+        .min(MAX_AUTOMATIC_REPORT_VIEW_BYTES)
 }
 
 fn build_automatic_report_view_staging(
@@ -5775,6 +5777,34 @@ mod tests {
         drop(guard);
         assert!(refresh_report_from_root(&root).unwrap());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_admission_scalar_preserves_reserve_boundaries_and_ceiling() {
+        let publication = super::REPORT_VIEW_PUBLICATION_RESERVE_BYTES;
+        let metadata = super::REPORT_RESERVATION_METADATA_ALLOWANCE;
+        let overhead = publication + metadata;
+        let maximum = super::MAX_AUTOMATIC_REPORT_VIEW_BYTES;
+        for (headroom, expected) in [
+            (0, 0),
+            (publication - 1, 0),
+            (publication, 0),
+            (publication + 1, 0),
+            (overhead - 1, 0),
+            (overhead, 0),
+            (overhead + 1, 1),
+            (maximum, maximum - overhead),
+            (overhead + maximum - 1, maximum - 1),
+            (overhead + maximum, maximum),
+            (overhead + maximum + 1, maximum),
+            (u64::MAX, maximum),
+        ] {
+            assert_eq!(
+                super::automatic_report_view_bytes_from_headroom(headroom),
+                expected,
+                "headroom={headroom}"
+            );
+        }
     }
 
     #[test]
