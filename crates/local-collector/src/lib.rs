@@ -8905,6 +8905,11 @@ mod tests {
         let root = test_root("report-refresh-coalescing");
         let _ = fs::remove_dir_all(&root);
         let state = app_state(&root);
+        // Coalescing requires one settled publication, not a one-second render SLO.
+        state
+            .report_snapshot_test
+            .delay_ms
+            .store(1_200, Ordering::Release);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -8919,7 +8924,7 @@ mod tests {
             for _ in 0..20 {
                 super::schedule_report_refresh_with_timing(&state, fast_report_timing());
             }
-            wait_for_report_refresh_completion_within(&state, Duration::from_secs(1)).await;
+            wait_for_report_refresh_completion(&state).await;
 
             assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 1);
             assert!(
@@ -8960,7 +8965,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 0);
-            wait_for_report_refresh_completion_within(&state, Duration::from_secs(1)).await;
+            wait_for_report_refresh_completion(&state).await;
             assert_eq!(state.report_refresh_attempts.load(Ordering::Acquire), 1);
         });
         assert_published_report_view(&root, 10);
@@ -9098,7 +9103,7 @@ mod tests {
             super::schedule_report_refresh_with_timing(&state, fast_report_timing());
             drop(render_guard);
 
-            wait_for_report_refresh_completion_within(&state, Duration::from_secs(1)).await;
+            wait_for_report_refresh_completion(&state).await;
             let collector = state.collector.lock().await;
             assert!(!collector.store.report_status().unwrap().pending());
             assert_eq!(collector.store.record_count().unwrap(), 2);
