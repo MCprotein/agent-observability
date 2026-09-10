@@ -3084,13 +3084,10 @@ fn submit_automatic_synthetic_otlp(root: &Path, run: usize, event: usize) -> Res
         .replace("$RUN", &run.to_string())
         .replace("$TIME", &observed_time_unix_nanos.to_string());
     match submit_otlp_json_outcome(root, body.as_bytes())
-        .map_err(|error| format!("run={run} event={event}: {error}"))?
+        .map_err(|_| "synthetic_otlp_transport_failed".to_owned())?
     {
         OtlpSubmissionOutcome::Accepted => Ok(()),
-        OtlpSubmissionOutcome::Rejected { status, category } => Err(format!(
-            "automatic synthetic collector OTLP request was rejected: run={run} event={event} status={status} category={}",
-            category.as_str()
-        )),
+        OtlpSubmissionOutcome::Rejected { .. } => Err("synthetic_otlp_rejected".into()),
     }
 }
 
@@ -3566,16 +3563,78 @@ fn validate_protocol_contract() -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[derive(Clone, Copy, Debug)]
+enum BenchmarkStage {
+    Init,
+    Settings,
+    Spawn,
+    Ready,
+    Warmup,
+    Idle,
+    ActiveSetup,
+    Submit,
+    Network,
+    Notify,
+    Convergence,
+    Privacy,
+    Metrics,
+    Cleanup,
+}
+
+struct BenchmarkProgress {
+    stage: BenchmarkStage,
+    accepted: usize,
+}
+
+fn benchmark_failure_diagnostic(run: usize, progress: &BenchmarkProgress, error: &str) -> String {
+    // Never forward error text: it may contain private paths, headers or payloads.
+    let code = match error {
+        "synthetic_otlp_transport_failed" => "otlp_transport",
+        "synthetic_otlp_rejected" => "otlp_rejected",
+        "automatic published paged snapshot convergence timed out" => "convergence_timeout",
+        "built automatic collector exited before report convergence" => "collector_exited",
+        "published_snapshot_open_failed" => "snapshot_open",
+        "published_snapshot_authority_failed" => "snapshot_authority",
+        "published_snapshot_catalog_failed" => "snapshot_catalog",
+        "published_snapshot_validation_failed" => "snapshot_validation",
+        _ => "operation_failed",
+    };
+    format!(
+        "benchmark_failure run={run} stage={:?} accepted={} code={code}",
+        progress.stage, progress.accepted
+    )
+}
+
 fn execute_automatic_run(
     config: AutomaticConfig,
     run: usize,
     binary: &Path,
     runtime_root: &Path,
 ) -> Result<AutomaticRunResult, String> {
+    let mut progress = BenchmarkProgress {
+        stage: BenchmarkStage::Init,
+        accepted: 0,
+    };
+    let result = execute_automatic_run_observed(config, run, binary, runtime_root, &mut progress);
+    if let Err(error) = &result {
+        eprintln!("{}", benchmark_failure_diagnostic(run, &progress, error));
+    }
+    result
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_automatic_run_observed(
+    config: AutomaticConfig,
+    run: usize,
+    binary: &Path,
+    runtime_root: &Path,
+    progress: &mut BenchmarkProgress,
+) -> Result<AutomaticRunResult, String> {
     let root = runtime_root.join(format!("run-{run}"));
     run_bounded_product_command(binary, &["init", path_text(&root)?], LOCAL_COMMAND_TIMEOUT)?;
+    progress.stage = BenchmarkStage::Settings;
     install_settings(&root).map_err(|error| error.to_string())?;
+    progress.stage = BenchmarkStage::Spawn;
     let mut collector = ChildGuard(
         Command::new(binary)
             .args(["collector-serve", path_text(&root)?])
@@ -3586,10 +3645,12 @@ fn execute_automatic_run(
             .map_err(|error| format!("spawn built local collector: {error}"))?,
     );
     let mut network_monitor = NetworkMonitor::start(collector.id())?;
+    progress.stage = BenchmarkStage::Ready;
     wait_for_automatic_ready(&root, &mut collector)?;
     assert_automatic_network_local(collector.id())?;
 
     let started = Instant::now();
+    progress.stage = BenchmarkStage::Warmup;
     automatic_sample_phase(
         config.warmup,
         config.sample,
@@ -3599,6 +3660,7 @@ fn execute_automatic_run(
         started,
         "warmup",
     )?;
+    progress.stage = BenchmarkStage::Idle;
     let idle_samples = automatic_sample_phase(
         config.idle,
         config.sample,
@@ -3609,6 +3671,7 @@ fn execute_automatic_run(
         "idle",
     )?;
     let idle_cpu_percent = average_sample_cpu(&idle_samples)?;
+    progress.stage = BenchmarkStage::ActiveSetup;
     let mut rss_sampler = start_rss_sampler(collector.id(), AUTOMATIC_RSS_SAMPLE_TARGET)?;
     let active_cpu_before = process_cpu_seconds(collector.id())?;
     let active_started = Instant::now();
@@ -3617,6 +3680,7 @@ fn execute_automatic_run(
     let mut synthetic_otlp_latencies_us = Vec::with_capacity(config.events);
     let mut accepted_primary_requests = 0_usize;
     for event in 0..config.events {
+        progress.stage = BenchmarkStage::Submit;
         if active_started.elapsed() >= config.active_timeout {
             return Err(format!(
                 "automatic active workload exceeded {} ms",
@@ -3630,16 +3694,20 @@ fn execute_automatic_run(
         submit_automatic_synthetic_otlp(&root, run, event)?;
         synthetic_otlp_latencies_us.push(synthetic_started.elapsed().as_micros());
         accepted_primary_requests = accepted_primary_requests.saturating_add(1);
+        progress.accepted = accepted_primary_requests;
         if event % 100 == 0 {
+            progress.stage = BenchmarkStage::Network;
             assert_automatic_network_local(collector.id())?;
             network_monitor.sample()?;
         }
     }
+    progress.stage = BenchmarkStage::Metrics;
     let active_elapsed = active_started.elapsed();
     let active_cpu_after = process_cpu_seconds(collector.id())?;
     let active_cpu_percent =
         interval_cpu_percent(active_cpu_before, active_cpu_after, active_elapsed);
     let notify_payload = automatic_notify_payload(run, config.events);
+    progress.stage = BenchmarkStage::Notify;
     let notify = run_bounded_product_command(
         binary,
         &["codex-notify", path_text(&root)?, &notify_payload],
@@ -3652,9 +3720,13 @@ fn execute_automatic_run(
             notify.trim()
         ));
     }
+    progress.stage = BenchmarkStage::Convergence;
     let convergence = wait_for_automatic_report_convergence(&root, &mut collector)?;
+    progress.stage = BenchmarkStage::Privacy;
     assert_automatic_notify_sentinels_absent(&root)?;
+    progress.stage = BenchmarkStage::Network;
     assert_automatic_network_local(collector.id())?;
+    progress.stage = BenchmarkStage::Metrics;
     let active_peaks = active_sampler.stop()?;
     let rss = rss_sampler.stop()?;
     network_monitor.final_sample()?;
@@ -3667,6 +3739,7 @@ fn execute_automatic_run(
         .max(rss.peak_rss_kib)
         .max(ps_metric(collector.id(), "rss")?);
     let network_evidence = network_monitor.finish()?;
+    progress.stage = BenchmarkStage::Cleanup;
     collector.terminate()?;
     Ok(AutomaticRunResult {
         run,
@@ -9075,6 +9148,55 @@ mod tests {
                 "failed-lifecycle-preflight"
             );
         }
+    }
+
+    #[test]
+    fn benchmark_failure_diagnostic_is_bounded_and_content_free() {
+        let progress = BenchmarkProgress {
+            stage: BenchmarkStage::Submit,
+            accepted: 317,
+        };
+        for raw in [
+            "/Users/private/project Authorization: Bearer secret prompt response",
+            "published_snapshot_open_failed\nraw-secret",
+            "automatic published paged snapshot convergence timed out private-token",
+        ] {
+            assert_eq!(
+                benchmark_failure_diagnostic(1, &progress, raw),
+                "benchmark_failure run=1 stage=Submit accepted=317 code=operation_failed"
+            );
+        }
+        assert_eq!(
+            benchmark_failure_diagnostic(
+                2,
+                &BenchmarkProgress {
+                    stage: BenchmarkStage::Convergence,
+                    accepted: 10_000,
+                },
+                "automatic published paged snapshot convergence timed out"
+            ),
+            "benchmark_failure run=2 stage=Convergence accepted=10000 code=convergence_timeout"
+        );
+    }
+
+    #[test]
+    fn benchmark_failure_progress_preserves_init_error_without_claiming_acceptance() {
+        let mut progress = BenchmarkProgress {
+            stage: BenchmarkStage::Init,
+            accepted: 0,
+        };
+        let result = execute_automatic_run_observed(
+            automatic_config(),
+            1,
+            Path::new("/dev/null/not-an-executable"),
+            Path::new("/dev/null/not-a-runtime"),
+            &mut progress,
+        );
+        let error = result.expect_err("invalid executable must fail");
+        assert_eq!(
+            benchmark_failure_diagnostic(1, &progress, &error),
+            "benchmark_failure run=1 stage=Init accepted=0 code=operation_failed"
+        );
     }
 
     #[test]
