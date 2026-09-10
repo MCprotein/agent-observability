@@ -25,6 +25,27 @@ const SQLITE_PAGE_BYTES: u64 = 4096;
 const SQLITE_CACHE_KIB: i64 = 8 * 1024;
 const SQLITE_WRITE_HEADROOM_BYTES: u64 = 8 * 1024 * 1024;
 const WRITE_BATCH_RECORDS: usize = 128;
+// Split the excluded sentinel into indexed ranges. `repo != 'unknown'` scans
+// every unknown row of a trace for each unresolved span (quadratic for a large
+// unknown-only trace). Seek the first candidate, then its strict successor;
+// DISTINCT would still scan all duplicates of a single known repository.
+const KNOWN_TRACE_REPOSITORIES_SQL: &str = "
+WITH first_repository(repo) AS (
+    SELECT COALESCE(
+        (SELECT repo FROM spans WHERE trace_id=?1 AND repo<'unknown' ORDER BY repo LIMIT 1),
+        (SELECT repo FROM spans WHERE trace_id=?1 AND repo>'unknown' ORDER BY repo LIMIT 1)
+    )
+), candidates(repo) AS (
+    SELECT repo FROM first_repository
+    UNION ALL
+    SELECT COALESCE(
+        (SELECT repo FROM spans WHERE trace_id=?1 AND repo>first_repository.repo
+            AND repo<'unknown' ORDER BY repo LIMIT 1),
+        (SELECT repo FROM spans WHERE trace_id=?1
+            AND repo>max(first_repository.repo, 'unknown') ORDER BY repo LIMIT 1)
+    ) FROM first_repository WHERE repo IS NOT NULL
+)
+SELECT repo FROM candidates WHERE repo IS NOT NULL";
 const WRITE_BATCH_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_STAGING_FILE_COLLISIONS: usize = 64;
 pub const MISSING_RATE_FINGERPRINT: &str = "missing_rate_table";
@@ -868,9 +889,7 @@ fn resolve_unknown_repositories<P: ReportViewPermitFactory>(
             permits,
             ReportViewWritePhase::RepositoryResolutionBatch,
             |connection| {
-                let mut repositories = connection.prepare(
-                    "SELECT DISTINCT repo FROM spans WHERE trace_id=?1 AND repo!='unknown' LIMIT 2",
-                )?;
+                let mut repositories = connection.prepare(KNOWN_TRACE_REPOSITORIES_SQL)?;
                 let mut update = connection
                     .prepare("UPDATE spans SET repo=?1, span_json=?2 WHERE source_order=?3")?;
                 for (source_order, trace_id, repo, span_json) in &batch {
@@ -880,6 +899,11 @@ fn resolve_unknown_repositories<P: ReportViewPermitFactory>(
                     let known = repositories
                         .query_map([trace_id], |row| row.get::<_, String>(0))?
                         .collect::<Result<Vec<_>, _>>()?;
+                    // No candidate leaves both repo and availability unchanged in
+                    // the application resolver. Do not rewrite the same JSON/indexes.
+                    if known.is_empty() {
+                        continue;
+                    }
                     let mut span: ReportSpanV2 = serde_json::from_str(span_json)?;
                     resolve_report_repository(&mut span, known.iter().map(String::as_str));
                     span.validate().map_err(|error| {
@@ -1298,6 +1322,76 @@ mod tests {
                 return Err(ReportViewBuildError::CoordinationDenied);
             }
             Ok(())
+        }
+    }
+
+    #[test]
+    fn unknown_repository_lookup_uses_bounded_index_ranges() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE spans(trace_id TEXT NOT NULL, repo TEXT NOT NULL);
+             CREATE INDEX spans_trace_repo_idx ON spans(trace_id, repo);
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20001)
+             INSERT INTO spans SELECT 'large', 'unknown' FROM n;",
+            )
+            .unwrap();
+        let mut statement = connection.prepare(KNOWN_TRACE_REPOSITORIES_SQL).unwrap();
+        let candidates = statement
+            .query_map(["large"], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(candidates.is_empty());
+        // VM work rather than wall time locks out a full scan per unresolved span.
+        assert!(statement.get_status(rusqlite::StatementStatus::VmStep) < 128);
+        for repo in ["alpha", "zeta"] {
+            connection
+                .execute(
+                    "INSERT INTO spans SELECT ?1, ?1 FROM spans WHERE trace_id='large'",
+                    [repo],
+                )
+                .unwrap();
+            let before = statement.get_status(rusqlite::StatementStatus::VmStep);
+            let candidates = statement
+                .query_map([repo], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(candidates, [repo]);
+            let steps = statement.get_status(rusqlite::StatementStatus::VmStep) - before;
+            assert!(
+                steps < 256,
+                "duplicate candidate scan took {steps} VM steps"
+            );
+        }
+        for (trace, repo) in [
+            ("below", "alpha"),
+            ("below", "alpha"),
+            ("above", "zeta"),
+            ("mixed", "alpha"),
+            ("mixed", "zeta"),
+            ("many", "alpha"),
+            ("many", "beta"),
+            ("many", "zeta"),
+        ] {
+            connection
+                .execute("INSERT INTO spans VALUES (?1, ?2)", params![trace, repo])
+                .unwrap();
+        }
+        for (trace, expected) in [
+            ("large", vec![]),
+            ("below", vec!["alpha"]),
+            ("above", vec!["zeta"]),
+            ("mixed", vec!["alpha", "zeta"]),
+            ("many", vec!["alpha", "beta"]),
+        ] {
+            let actual = statement
+                .query_map([trace], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(actual, expected);
         }
     }
 
